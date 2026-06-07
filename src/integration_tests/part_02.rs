@@ -26,12 +26,14 @@ async fn test_memory_episodes_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     // Episodes are no longer injected — memory is on-demand
     assert!(
         !content.contains("Past Sessions"),
@@ -70,12 +72,14 @@ async fn test_memory_goals_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("PostgreSQL"),
         "Goal descriptions should NOT be bulk-injected into prompt"
@@ -137,12 +141,14 @@ async fn test_memory_error_solutions_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("Error Solutions"),
         "Error solutions should NOT be bulk-injected into prompt"
@@ -168,12 +174,14 @@ async fn test_memory_expertise_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("Expertise Levels"),
         "Expertise levels should NOT be bulk-injected into prompt"
@@ -199,12 +207,14 @@ async fn test_memory_behavior_patterns_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("Observed Patterns"),
         "Behavior patterns should NOT be bulk-injected into prompt"
@@ -230,12 +240,14 @@ async fn test_memory_failure_patterns_injected_into_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("Failure Patterns To Avoid"),
         "Failure patterns should NOT be bulk-injected into prompt"
@@ -271,12 +283,14 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         !content.contains("Failure Patterns To Avoid"),
         "Failure patterns should NOT be bulk-injected into public prompt"
@@ -318,12 +332,14 @@ async fn test_memory_user_profile_affects_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     assert!(
         content.contains("Communication Preferences") && content.contains("brief"),
         "System prompt should include user profile preferences. Tail: ...{}",
@@ -367,12 +383,17 @@ async fn test_full_memory_stack_in_system_prompt() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    // Pillar A: the prompt is split into message zero (core) plus the per-task
+    // context tail (also a system message). Profile/memory sections now live in
+    // the tail, so scan ALL system messages.
+    let content: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content.as_str();
 
     // Profile SHOULD be present (stays in every prompt)
     assert!(
@@ -494,12 +515,14 @@ async fn test_public_channel_hides_personal_memory() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
 
     // Private facts should NOT appear in public channels
     assert!(

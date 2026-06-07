@@ -36,7 +36,14 @@ pub(in crate::agent) struct BootstrapData {
     pub llm_router: Option<Router>,
     pub model: String,
     pub route_failsafe_active: bool,
-    pub system_prompt: String,
+    /// Pillar A: message-zero bytes (the session-static CORE prompt). Cacheable
+    /// prefix; rendered once per task by `render_core_prompt`.
+    pub core_prompt_bytes: String,
+    /// Pillar A: the per-task volatile context tail (timestamp, session context,
+    /// memories, matched skill bodies, resume checkpoint, …). Compiled once per
+    /// task and reused byte-identically across the within-task loop. Inserted at
+    /// the boundary − 1 position (immediately before the current user message).
+    pub task_context_tail: String,
     pub pinned_memories: Vec<Message>,
     pub session_summary: Option<ConversationSummary>,
 }

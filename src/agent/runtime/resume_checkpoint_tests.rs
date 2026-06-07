@@ -181,19 +181,15 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
     let calls = harness.provider.call_log.lock().await;
     assert!(!calls.is_empty());
     let first_call = &calls[0];
-    let system_prompt = first_call
+    // Pillar A: the resume checkpoint moved from the core to the per-task context
+    // tail (also a system message), so scan ALL system messages.
+    let system_prompt: String = first_call
         .messages
         .iter()
-        .find_map(|msg| {
-            if msg.get("role").and_then(|v| v.as_str()) == Some("system") {
-                return msg
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-            None
-        })
-        .expect("expected system prompt");
+        .filter(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("system"))
+        .filter_map(|msg| msg.get("content").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(system_prompt.contains("## Resume Checkpoint"));
     assert!(system_prompt.contains(orphan_task_id));
 

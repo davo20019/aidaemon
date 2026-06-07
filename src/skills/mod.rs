@@ -871,7 +871,7 @@ pub async fn confirm_skills<'a>(
     // Track token usage for skill confirmation LLM calls
     if let (Some(state), Some(usage)) = (state, &response.usage) {
         let _ = state
-            .record_token_usage("background:skill_confirmation", usage)
+            .record_token_usage("background:skill_confirmation", usage, None)
             .await;
     }
 
@@ -1002,7 +1002,7 @@ fn resolve_user_ids(text: &str, user_id_map: &HashMap<String, String>) -> String
 
 pub fn build_system_prompt_with_memory(
     base: &str,
-    skills: &[Skill],
+    _skills: &[Skill],
     active: &[&Skill],
     memory: &MemoryContext,
     _max_facts: usize,
@@ -1092,12 +1092,13 @@ pub fn build_system_prompt_with_memory(
     }
 
     // 14. Available Skills
-    if !skills.is_empty() {
-        prompt.push_str("\n\n## Available Skills\n");
-        for skill in skills {
-            prompt.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
-        }
-    }
+    //
+    // Pillar A Task 6: the skills AVAILABILITY catalog is session-static and now
+    // lives in the CORE prompt (message zero), emitted by
+    // `core_prompt::render_core_prompt` via the `skills_catalog` component. It is
+    // intentionally NOT emitted here anymore to avoid double emission — only the
+    // per-turn matched skill CONTENT (active skill bodies, volatile) is emitted
+    // by this function, which now feeds the per-task context tail.
 
     // Active skill bodies (sanitized to prevent prompt injection from external skill sources)
     for skill in active {

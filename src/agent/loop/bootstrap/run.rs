@@ -258,6 +258,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         completed_naturally: false,
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
+        task_outcome: None,
         replay_notes: Vec::new(),
     };
     if let Some((label, is_positive)) = detect_explicit_outcome_signal(user_text) {
@@ -364,6 +365,14 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         base_tool_defs = defs.clone();
         tool_defs = defs;
     }
+
+    // Pillar A Task 6: canonicalize the roster to name-sorted order at the
+    // bootstrap boundary so all later retain/filter/widen ops begin from a
+    // stable order. The authoritative final sort happens on `effective_tool_defs`
+    // in message_build_phase, but starting canonical keeps intermediate ordering
+    // deterministic.
+    Agent::sort_tool_definitions_by_name(&mut base_tool_defs);
+    Agent::sort_tool_definitions_by_name(&mut tool_defs);
 
     let mut policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
     if (critical_fact_query.is_some() || is_personal_memory_recall_turn)
@@ -545,8 +554,25 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         );
     }
 
+    // 2a. Load conversation summary BEFORE building the prompt. Pillar A: the
+    // session summary now participates in the per-task context tail, so it must
+    // be available when `build_system_prompt_for_message` compiles the tail.
+    let session_summary = if agent.context_window_config.enabled {
+        agent
+            .state
+            .get_conversation_summary(session_id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
     // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
-    let (system_prompt, active_skill_names) = agent
+    // Returns the session-static CORE bytes (message zero) and the per-task
+    // volatile TAIL separately so the assembler can place them at message 0 and
+    // boundary − 1 respectively.
+    let (core_prompt_bytes, task_context_tail, active_skill_names) = agent
         .build_system_prompt_for_message(
             &emitter,
             &task_id,
@@ -557,6 +583,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             tool_defs.len(),
             resume_checkpoint.as_ref(),
             owner_dm_fact_cache.as_deref(),
+            session_summary.as_ref(),
         )
         .await?;
 
@@ -588,18 +615,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         "Context prepared"
     );
 
-    // 2c. Load conversation summary for context window management
-    let session_summary = if agent.context_window_config.enabled {
-        agent
-            .state
-            .get_conversation_summary(session_id)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-
     let data = BootstrapData {
         task_id,
         emitter,
@@ -621,7 +636,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         llm_router,
         model,
         route_failsafe_active,
-        system_prompt,
+        core_prompt_bytes,
+        task_context_tail,
         pinned_memories,
         session_summary,
     };

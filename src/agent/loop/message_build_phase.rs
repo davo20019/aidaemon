@@ -1,7 +1,6 @@
 use super::recall_guardrails::text_relates_to_critical_identity;
 use super::*;
 use crate::execution_policy::PolicyBundle;
-use crate::traits::ConversationSummary;
 
 pub(super) struct MessageBuildCtx<'a> {
     pub session_id: &'a str,
@@ -9,11 +8,16 @@ pub(super) struct MessageBuildCtx<'a> {
     pub user_text: &'a str,
     pub completed_tool_calls: &'a [String],
     pub model: &'a str,
-    pub system_prompt: &'a str,
+    /// Pillar A: message-zero bytes (session-static CORE prompt). Byte-stable
+    /// across the within-task loop so the prefix cache reuses it.
+    pub core_prompt: &'a str,
+    /// Pillar A: the per-task volatile context tail. Inserted at boundary − 1
+    /// (immediately before the current user message). The SAME string is reused
+    /// every iteration of the within-task loop.
+    pub task_context_tail: &'a str,
     pub pinned_memories: &'a [Message],
     pub tool_defs: &'a [Value],
     pub policy_bundle: &'a PolicyBundle,
-    pub session_summary: &'a Option<ConversationSummary>,
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub empty_response_retry_pending: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
@@ -21,12 +25,19 @@ pub(super) struct MessageBuildCtx<'a> {
 
 pub(super) struct MessageBuildData {
     pub messages: Vec<Value>,
+    pub tool_defs: Vec<Value>,
+    /// Estimated input tokens (messages + tool schemas) for this call, used for
+    /// est-vs-actual drift telemetry in the `LlmCall` event.
+    pub est_input_tokens: u32,
 }
 
 const EMPTY_RETRY_MAX_PARENT_CHARS: usize = 800;
 const EXECUTION_CHECKPOINT_MAX_REQUEST_CHARS: usize = 240;
 const EXECUTION_CHECKPOINT_MAX_ACTIVITY_CHARS: usize = 900;
 const EXECUTION_CHECKPOINT_MAX_EVIDENCE_CHARS: usize = 500;
+const RESPONSE_RESERVE_TOKENS: usize = 1_536;
+const MIN_MESSAGE_BUDGET_TOKENS: usize = 1_024;
+const TOKEN_ESTIMATE_SAFETY_MARGIN: usize = 256;
 
 fn trimmed_message_content(message: &Value) -> Option<String> {
     message
@@ -163,6 +174,41 @@ fn build_execution_checkpoint_message(
     Some(lines.join("\n"))
 }
 
+/// Phase 0 observability — project pre-JSON-conversion history `Message`s into
+/// prompt-equivalent JSON for stage fingerprinting. Includes tool metadata
+/// (`tool_calls`, `name`, `tool_call_id`) so a change to any of those is
+/// observable, matching the provider-call fingerprint's complete-message
+/// hashing. Called only inside `tracing::debug!` field expressions, so it runs
+/// only when debug logging is enabled.
+fn project_messages_for_stage_hash(msgs: &[&Message]) -> Vec<Value> {
+    msgs.iter()
+        .map(|m| {
+            let mut obj = json!({ "role": m.role, "content": m.content });
+            if let Some(tc_json) = &m.tool_calls_json {
+                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
+                    obj["tool_calls"] = json!(tcs
+                        .iter()
+                        .map(|tc| json!({
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+            }
+            if let Some(name) = &m.tool_name {
+                if !name.is_empty() {
+                    obj["name"] = json!(name);
+                }
+            }
+            if let Some(tcid) = &m.tool_call_id {
+                obj["tool_call_id"] = json!(tcid);
+            }
+            obj
+        })
+        .collect()
+}
+
 pub(super) async fn run_message_build_phase(
     services: &super::services::AgentServices<'_>,
     ctx: &mut MessageBuildCtx<'_>,
@@ -173,14 +219,45 @@ pub(super) async fn run_message_build_phase(
     let user_text = ctx.user_text;
     let completed_tool_calls = ctx.completed_tool_calls;
     let model = ctx.model;
-    let system_prompt = ctx.system_prompt;
+    let core_prompt = ctx.core_prompt;
+    let task_context_tail = ctx.task_context_tail;
     let pinned_memories = ctx.pinned_memories;
-    let tool_defs = ctx.tool_defs;
+    let original_tool_defs = ctx.tool_defs;
     let policy_bundle = ctx.policy_bundle;
-    let session_summary = ctx.session_summary;
     let pending_system_messages = &mut *ctx.pending_system_messages;
     let empty_response_retry_pending = ctx.empty_response_retry_pending;
     let status_tx = ctx.status_tx;
+
+    let total_context_budget =
+        crate::memory::context_window::model_context_budget(model, &agent.context_window_config);
+    // Pillar A: the system payload is now message zero (core) PLUS the task
+    // context tail. Both occupy budget, so reserve for the sum.
+    let system_tokens = crate::memory::context_window::estimate_tokens(core_prompt)
+        + crate::memory::context_window::estimate_tokens(task_context_tail);
+    let original_tool_tokens =
+        crate::memory::context_window::estimate_tool_definition_tokens(original_tool_defs);
+    let tool_budget = total_context_budget
+        .saturating_sub(system_tokens + RESPONSE_RESERVE_TOKENS + MIN_MESSAGE_BUDGET_TOKENS);
+    let mut effective_tool_defs = crate::memory::context_window::fit_tool_definitions_to_budget(
+        original_tool_defs,
+        tool_budget,
+    );
+
+    if effective_tool_defs != original_tool_defs {
+        info!(
+            session_id,
+            iteration,
+            model,
+            total_context_budget,
+            original_tool_tokens,
+            effective_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
+                &effective_tool_defs
+            ),
+            tool_count = effective_tool_defs.len(),
+            "Compacted tool schema descriptions for model context compatibility"
+        );
+    }
+    let mut tool_defs = effective_tool_defs.as_slice();
 
     // Fetch recent history from canonical event stream.
     // Base limit of 40 queries (120 events), scaled up for long-running tasks
@@ -191,6 +268,14 @@ pub(super) async fn run_message_build_phase(
     // rest.  Capped at 120 to avoid loading entire sessions.
     let history_limit = 40_usize.max(iteration.saturating_mul(3).min(120));
     let mut recent_history = agent.load_recent_history(session_id, history_limit).await?;
+
+    // Phase 0 observability — capture fetch-window facts before any mutation so
+    // the window-decision log can tie `keep_from` movement to fetch mechanics
+    // (the prime suspect for prefix-cache breaks). `recent_history` is ordered
+    // oldest→newest, so `first()` is the oldest fetched persisted message.
+    let fetched_count = recent_history.len();
+    let oldest_fetched_id = recent_history.first().map(|m| m.id.clone());
+    let mut current_user_injected = false;
 
     // Guarantee the current user message is always present in history.
     // In sessions with heavy prior tool use, the 120-event window may not
@@ -222,6 +307,7 @@ pub(super) async fn run_message_build_phase(
             turn_id: synthetic_turn_id,
             ..Message::runtime_defaults()
         });
+        current_user_injected = true;
         info!(
             session_id,
             iteration, "Injected current user message into history (was outside event window)"
@@ -384,6 +470,16 @@ pub(super) async fn run_message_build_phase(
             "Age-based tool result clearing: dropped Prior 2+ results, summarizing Prior 1 results"
         );
     }
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "age_collapse",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
+            &project_messages_for_stage_hash(&deduped_msgs),
+            user_text,
+        ),
+        "Build stage pre-boundary fingerprint"
+    );
 
     // Identify old-interaction assistant messages for content truncation.
     // After collapse, recompute the last-user boundary and collect IDs of
@@ -406,6 +502,17 @@ pub(super) async fn run_message_build_phase(
     // We compute how many old pairs fit within 30% of the available token
     // budget. This naturally adapts: large contexts keep more history, small
     // contexts keep less.
+    //
+    // Phase 0: capture the length entering the window trim so the trim counter
+    // measures window-trim removals alone. The previous counter subtracted from
+    // `pre_collapse_len` (captured before age-based collapse), conflating the
+    // two and masking whether `keep_from` actually moved.
+    let len_before_window_trim = deduped_msgs.len();
+    // Phase 0: the window `keep_from` index chosen on the sliding-window path.
+    // Defaults to 0 on the no-trim paths (`collapse_boundary == None` or no old
+    // user pairs) so the boundary-movement event below fires on every build,
+    // not just when a trim happens.
+    let mut window_keep_from: usize = 0;
     let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
         use crate::memory::context_window::estimate_tokens;
 
@@ -443,19 +550,16 @@ pub(super) async fn run_message_build_phase(
                 .collect();
 
             // Compute available budget: model context - system prompt - tool defs - pinned memories.
-            let system_tokens = estimate_tokens(system_prompt);
+            // System prompt = core (message zero) + task context tail.
+            let system_tokens = estimate_tokens(core_prompt) + estimate_tokens(task_context_tail);
             let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
             let tools_tokens = estimate_tokens(&tools_json);
             let pinned_tokens: usize = pinned_memories
                 .iter()
                 .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
                 .sum();
-            // Use a reasonable default context window (128k tokens).
-            // The exact model budget doesn't matter much — we only use 30% of
-            // the remainder, so over-estimating is safe.
-            let model_budget = 128_000usize;
             let available_budget =
-                model_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
+                total_context_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
 
             let computed_window_size =
                 super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
@@ -488,6 +592,35 @@ pub(super) async fn run_message_build_phase(
             } else {
                 0
             };
+            window_keep_from = keep_from;
+
+            // Phase 0 window-decision log — emitted where persisted `Message`
+            // metadata is still available. Ties `keep_from` (and the oldest
+            // kept message id) to fetch mechanics: a `keep_from` that moves
+            // while the fetch window slides is the prime cache-break suspect.
+            let oldest_kept_msg_id: Option<String> =
+                deduped_msgs.get(keep_from).map(|m| m.id.clone());
+            let boundary_msg_id: Option<String> = deduped_msgs.get(boundary).map(|m| m.id.clone());
+            let identity_preserve_bypass = identity_preserve_indices
+                .iter()
+                .filter(|&&i| i < keep_from)
+                .count();
+            info!(
+                session_id,
+                iteration,
+                current_turn_id = ?current_turn_id,
+                boundary_msg_id = ?boundary_msg_id,
+                oldest_fetched_id = ?oldest_fetched_id,
+                oldest_kept_msg_id = ?oldest_kept_msg_id,
+                keep_from,
+                window_size,
+                identity_preserve_bypass,
+                history_limit,
+                fetched_count,
+                current_user_injected,
+                safe_collapse = last_user_pos.is_none(),
+                "Window decision"
+            );
 
             let trimmed: Vec<&Message> = deduped_msgs
                 .into_iter()
@@ -495,10 +628,14 @@ pub(super) async fn run_message_build_phase(
                 .filter(|(i, _)| *i >= keep_from || identity_preserve_indices.contains(i))
                 .map(|(_, m)| m)
                 .collect();
-            if trimmed.len() < pre_collapse_len {
+            // Report window-trim removals alone (not conflated with collapse),
+            // and log `keep_from` movement explicitly via the oldest kept id.
+            if trimmed.len() < len_before_window_trim {
                 info!(
                     session_id,
-                    old_pairs_trimmed = pre_collapse_len - trimmed.len(),
+                    window_trimmed = len_before_window_trim - trimmed.len(),
+                    keep_from,
+                    oldest_kept_msg_id = ?oldest_kept_msg_id,
                     window_size,
                     available_budget,
                     "Adaptive sliding window: trimmed old conversation pairs"
@@ -509,6 +646,49 @@ pub(super) async fn run_message_build_phase(
     } else {
         deduped_msgs
     };
+
+    // Phase 0 — explicit window-boundary movement event, emitted on every
+    // build (trim or no-trim) so attribution sees a continuous signal. The
+    // oldest *kept* message id (first element of the post-trim list) is the
+    // robust cache-break signal: `keep_from` is an index into a per-build
+    // vector whose composition shifts as the fetch window slides, so a changed
+    // index with an unchanged id is benign re-indexing, whereas a changed id is
+    // a genuine prefix-cache break. We log both, comparing against the previous
+    // build for this session.
+    {
+        let oldest_kept_msg_id: Option<String> = deduped_msgs.first().map(|m| m.id.clone());
+        let mut tracker = agent.window_keep_from_tracker.write().await;
+        let previous = tracker.insert(
+            session_id.to_string(),
+            (window_keep_from, oldest_kept_msg_id.clone()),
+        );
+        if let Some((old_keep_from, old_oldest_kept_id)) = previous {
+            let id_changed = old_oldest_kept_id != oldest_kept_msg_id;
+            if id_changed || old_keep_from != window_keep_from {
+                info!(
+                    session_id,
+                    iteration,
+                    old_keep_from,
+                    new_keep_from = window_keep_from,
+                    old_oldest_kept_id = ?old_oldest_kept_id,
+                    new_oldest_kept_id = ?oldest_kept_msg_id,
+                    oldest_kept_id_changed = id_changed,
+                    "Window trim boundary moved"
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "window_trim",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
+            &project_messages_for_stage_hash(&deduped_msgs),
+            user_text,
+        ),
+        "Build stage pre-boundary fingerprint"
+    );
 
     // Remove duplicate old user messages that have identical content to the
     // current user message. When the same prompt is sent multiple times (e.g.,
@@ -548,6 +728,16 @@ pub(super) async fn run_message_build_phase(
             deduped_msgs
         }
     };
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "duplicate_removal",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
+            &project_messages_for_stage_hash(&deduped_msgs),
+            user_text,
+        ),
+        "Build stage pre-boundary fingerprint"
+    );
 
     let execution_checkpoint = if iteration > 1 {
         let current_boundary = deduped_msgs
@@ -747,6 +937,28 @@ pub(super) async fn run_message_build_phase(
         })
         .collect();
 
+    // Collapse consecutive orphaned-turn placeholders into a single one. When
+    // the agent runs several tool-only iterations in a row, each becomes an
+    // identical "[Action completed]" assistant message. Feeding many identical
+    // placeholders into the model's context invites repetition/degeneration
+    // loops (the model starts regurgitating the placeholder verbatim), so keep
+    // only the first of each consecutive run.
+    {
+        let mut collapsed: Vec<Value> = Vec::with_capacity(messages.len());
+        let mut prev_was_placeholder = false;
+        for m in messages {
+            let is_placeholder = m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("content").and_then(|c| c.as_str()) == Some("[Action completed]")
+                && m.get("tool_calls").is_none();
+            if is_placeholder && prev_was_placeholder {
+                continue;
+            }
+            prev_was_placeholder = is_placeholder;
+            collapsed.push(m);
+        }
+        messages = collapsed;
+    }
+
     // Final safety: drop any tool-role messages that still lack a "name" field
     messages.retain(|m| {
         if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
@@ -768,6 +980,18 @@ pub(super) async fn run_message_build_phase(
 
     // Three-pass fixup: merge → drop orphans → merge again.
     fixup_message_ordering(&mut messages);
+    // Phase 0 stage hash: history is now converted to final JSON message
+    // objects (Prior-1 tool summarization + old-assistant truncation applied
+    // in the filter_map above). A flip here with a stable `keep_from` is
+    // content mutation, not window-trim movement. `messages` is already
+    // complete message objects, so it is hashed directly.
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "json_conversion",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
+        "Build stage pre-boundary fingerprint"
+    );
 
     // Ensure the current user message is in the context.
     // The DB write (append_user_message_with_event) may not yet be visible
@@ -855,6 +1079,18 @@ pub(super) async fn run_message_build_phase(
         }
     }
 
+    // Phase 0 stage hash: the `[Current Task]` marker is a system message
+    // inserted just before the current user (boundary) message, so it falls in
+    // the pre-boundary region. Marker movement between turns is a known cache
+    // boundary; this stage makes it attributable.
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "current_task_marker",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
+        "Build stage pre-boundary fingerprint"
+    );
+
     // Guard against context interleaving: if another user message arrived in
     // this session while the agent was processing (race condition between task
     // registration and queuing), it may appear after the current task's tool
@@ -912,12 +1148,25 @@ pub(super) async fn run_message_build_phase(
             "Collapsed repeated tool errors in current interaction"
         );
     }
+    // Phase 0 stage hash: repeated tool-error collapse. Repeated-error collapse
+    // operates on the current interaction (at/after the boundary), but is
+    // instrumented for completeness and to confirm it does not perturb the
+    // pre-boundary region.
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "tool_error_collapse",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
+        "Build stage pre-boundary fingerprint"
+    );
 
     // Context window enforcement: trim messages to fit token budget
     if agent.context_window_config.enabled {
+        // Reserve for BOTH message zero (core) and the task context tail.
+        let combined_system = format!("{}\n{}", core_prompt, task_context_tail);
         let model_budget = crate::memory::context_window::compute_available_budget(
             model,
-            system_prompt,
+            &combined_system,
             tool_defs,
             &agent.context_window_config,
         );
@@ -937,9 +1186,19 @@ pub(super) async fn run_message_build_phase(
         messages = crate::memory::context_window::fit_messages_with_source_quotas(
             messages,
             effective_budget,
-            session_summary.as_ref().map(|s| s.summary.as_str()),
         );
     }
+    // Phase 0 stage hash: history fitting. `fit_messages_with_source_quotas`
+    // can drop history under budget pressure. Pillar A retired the summary
+    // insertion from the fitter — the summary now lives only in the task
+    // context tail — so this stage now captures the history-trim effect alone.
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "history_fitting",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
+        "Build stage pre-boundary fingerprint"
+    );
 
     // Empty-response recovery: on retry, clear conversational history to avoid
     // repeatedly sending a poisoned context to the provider (Gemini in particular
@@ -956,40 +1215,58 @@ pub(super) async fn run_message_build_phase(
         );
     }
 
-    // Prompt shaping:
-    // - Iterations >1: use compact tool-loop prompt to reduce repeated token overhead.
-    let effective_system_prompt = if iteration > 1 {
-        let style = match policy_bundle.policy.model_profile {
-            ModelProfile::Cheap => ToolLoopPromptStyle::Lite,
-            ModelProfile::Balanced | ModelProfile::Strong => ToolLoopPromptStyle::Standard,
-        };
-        build_tool_loop_system_prompt(system_prompt, style)
-    } else {
-        system_prompt.to_string()
-    };
+    // Pillar A: insert the per-task context TAIL immediately BEFORE the current
+    // user message (boundary − 1). The tail is a single `role:"system"` message
+    // whose content starts with `TASK_CONTEXT_TAIL_MARKER`; the provider-call
+    // fingerprint locates it by that marker. The session summary, current
+    // date/time, session context, query-ranked memory, matched skill bodies, and
+    // resume checkpoint all live INSIDE this string (compiled once per task in
+    // bootstrap and reused byte-identically across the within-task loop).
+    //
+    // This insertion happens BEFORE message zero is inserted, so the boundary is
+    // located against the current `messages` (no leading system prompt yet).
+    if !task_context_tail.is_empty() {
+        let tail_insert_pos = messages
+            .iter()
+            .rposition(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+            })
+            .unwrap_or(messages.len());
+        messages.insert(
+            tail_insert_pos,
+            json!({
+                "role": "system",
+                "content": task_context_tail,
+            }),
+        );
+    }
 
+    // Keep message zero byte-stable across iterations so llama.cpp can reuse the
+    // expensive system-prompt prefix. Message zero is the session-static CORE
+    // prompt ONLY — volatile per-turn material lives in the task context tail
+    // inserted above (Pillar A).
     messages.insert(
         0,
         json!({
             "role": "system",
-            "content": effective_system_prompt,
+            "content": core_prompt,
         }),
     );
 
-    // Inject compaction summary as the second message (after system prompt).
-    // This gives the LLM a condensed overview of earlier conversation turns
-    // that were trimmed by the sliding window, preserving continuity.
-    if let Some(ref summary) = session_summary {
-        if !summary.summary.is_empty() {
-            messages.insert(
-                1,
-                json!({
-                    "role": "system",
-                    "content": format!("[Session Summary]\n{}", summary.summary),
-                }),
-            );
-        }
-    }
+    // Phase 0 stage hash: the task context tail sits at boundary − 1 (inside the
+    // pre-boundary region). Message zero is the core prompt;
+    // `stage_pre_boundary_hash` skips that leading system message, so the tail is
+    // included in the pre-boundary hash and tail churn is attributable. (The
+    // session-summary stage was retired with the index-1 summary insertion; the
+    // provider-call `tail_hash` covers tail attribution at the call boundary.)
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "context_tail",
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
+        "Build stage pre-boundary fingerprint"
+    );
 
     if let Some(checkpoint) = execution_checkpoint {
         messages.push(json!({
@@ -1001,6 +1278,19 @@ pub(super) async fn run_message_build_phase(
             iteration, "Injected execution checkpoint for in-progress task continuity"
         );
     }
+    // Phase 0 stage hash: execution-checkpoint insertion. The checkpoint is
+    // appended at the tail (at/after the boundary) and cannot flip the
+    // pre-boundary hash, so this stage emits a full-payload hash that tracks
+    // tail growth for completeness rather than a pre-boundary hash. The
+    // `serde_json::Value::Array` clone is built only inside the `debug!` field
+    // expression, so it runs only when debug logging is enabled.
+    tracing::debug!(
+        session_id,
+        iteration,
+        stage = "execution_checkpoint",
+        full_payload_hash = %super::prefix_fingerprint::hash_canonical(&serde_json::Value::Array(messages.clone())),
+        "Build stage tail fingerprint"
+    );
 
     // Fresh-context isolation: when history is empty or only contains the current
     // user message (e.g. first message after /clear), inject a boundary marker to
@@ -1042,6 +1332,40 @@ pub(super) async fn run_message_build_phase(
         }));
     }
 
+    // Final enforcement must happen after every prompt component has been inserted.
+    // Earlier trimming cannot account for execution checkpoints and one-shot directives.
+    if agent.context_window_config.enabled {
+        let message_tokens = crate::memory::context_window::estimate_tokens(
+            &serde_json::to_string(&messages).unwrap_or_default(),
+        );
+        let final_tool_budget = total_context_budget.saturating_sub(
+            message_tokens + RESPONSE_RESERVE_TOKENS + TOKEN_ESTIMATE_SAFETY_MARGIN,
+        );
+        let final_tool_defs = crate::memory::context_window::fit_tool_definitions_to_budget(
+            original_tool_defs,
+            final_tool_budget,
+        );
+        if final_tool_defs != effective_tool_defs {
+            info!(
+                session_id,
+                iteration,
+                model,
+                message_tokens,
+                final_tool_budget,
+                before_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
+                    &effective_tool_defs
+                ),
+                after_tool_tokens = crate::memory::context_window::estimate_tool_definition_tokens(
+                    &final_tool_defs
+                ),
+                tool_count = final_tool_defs.len(),
+                "Recompacted tool schemas after final prompt assembly"
+            );
+            effective_tool_defs = final_tool_defs;
+            tool_defs = effective_tool_defs.as_slice();
+        }
+    }
+
     // Emit "Thinking" status for iterations after the first
     if iteration > 1 {
         send_status(status_tx, StatusUpdate::Thinking(iteration));
@@ -1074,9 +1398,9 @@ pub(super) async fn run_message_build_phase(
 
         // Estimate tokens: ~4 chars per token for English text
         let messages_json = serde_json::to_string(&messages).unwrap_or_default();
-        let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
         let est_msg_tokens = messages_json.len() / 4;
-        let est_tool_tokens = tools_json.len() / 4;
+        let est_tool_tokens =
+            crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
         let est_total_tokens = est_msg_tokens + est_tool_tokens;
         let est_msg_tokens_u64 = est_msg_tokens as u64;
         let est_tool_tokens_u64 = est_tool_tokens as u64;
@@ -1119,6 +1443,8 @@ pub(super) async fn run_message_build_phase(
             est_input_tokens = est_total_tokens,
             est_msg_tokens,
             est_tool_tokens,
+            total_context_budget,
+            response_reserve_tokens = RESPONSE_RESERVE_TOKENS,
             est_tool_share_pct = est_tool_share_bps as f64 / 100.0,
             msg_count = messages.len(),
             msgs = ?summary,
@@ -1126,7 +1452,26 @@ pub(super) async fn run_message_build_phase(
         );
     }
 
-    Ok(MessageBuildData { messages })
+    // Pillar A Task 6: name-sort the emitted roster as the FINAL operation before
+    // constructing MessageBuildData. This is the authoritative guarantee that the
+    // provider tool array is in canonical order regardless of any late
+    // append/filter/widen/compaction that mutated `effective_tool_defs` above.
+    // Providers stay order-preserving (no sort in adapters).
+    Agent::sort_tool_definitions_by_name(&mut effective_tool_defs);
+
+    let est_input_tokens = {
+        let messages_json = serde_json::to_string(&messages).unwrap_or_default();
+        let est_msg_tokens = messages_json.len() / 4;
+        let est_tool_tokens =
+            crate::memory::context_window::estimate_tool_definition_tokens(&effective_tool_defs);
+        (est_msg_tokens + est_tool_tokens) as u32
+    };
+
+    Ok(MessageBuildData {
+        messages,
+        tool_defs: effective_tool_defs,
+        est_input_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -1192,7 +1537,7 @@ mod tests {
     async fn sliding_window_retains_pairs_that_fit_budget() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::{ConversationSummary, MessageStore};
+        use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -1229,7 +1574,6 @@ mod tests {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
-        let session_summary: Option<ConversationSummary> = None;
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -1239,11 +1583,11 @@ mod tests {
             user_text: "Why?",
             completed_tool_calls: &[],
             model: "mock-model",
-            system_prompt: "You are a helpful test assistant.",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
             pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
-            session_summary: &session_summary,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
@@ -1286,11 +1630,107 @@ mod tests {
         );
     }
 
+    /// Phase 0: the window-decision path records the session's `keep_from` and
+    /// oldest-kept message id so a later build can emit an explicit
+    /// `Window trim boundary moved` event. This asserts the tracker plumbing,
+    /// not the log output itself.
+    #[tokio::test]
+    async fn window_decision_records_keep_from_tracker_for_session() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Older task"))
+            .await
+            .expect("append oldest user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Older answer"))
+            .await
+            .expect("append oldest assistant");
+        harness
+            .state
+            .append_message(&msg("user", "Why?"))
+            .await
+            .expect("append current user");
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "tracker-session",
+            iteration: 1,
+            user_text: "Why?",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
+
+        let tracker = harness.agent.window_keep_from_tracker.read().await;
+        assert!(
+            tracker.contains_key("tracker-session"),
+            "window-decision path should record a keep_from entry for the session"
+        );
+        // A second build with identical inputs must not panic and must keep a
+        // single entry per session (insert-overwrite, not accumulate).
+        drop(tracker);
+        let mut pending_system_messages2 = Vec::new();
+        let mut ctx2 = MessageBuildCtx {
+            session_id: "tracker-session",
+            iteration: 2,
+            user_text: "Why?",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages2,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx2,
+        )
+        .await
+        .expect("second message build");
+        let tracker = harness.agent.window_keep_from_tracker.read().await;
+        assert_eq!(
+            tracker.len(),
+            1,
+            "tracker should hold one entry per session, not accumulate"
+        );
+    }
+
     #[tokio::test]
     async fn later_iterations_include_execution_checkpoint_after_tool_progress() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::{ConversationSummary, MessageStore};
+        use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -1312,7 +1752,6 @@ mod tests {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
-        let session_summary: Option<ConversationSummary> = None;
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
         let completed_tool_calls = vec!["system_info({})".to_string()];
@@ -1323,11 +1762,11 @@ mod tests {
             user_text: "Find the system details and summarize them.",
             completed_tool_calls: &completed_tool_calls,
             model: "mock-model",
-            system_prompt: "You are a helpful test assistant.",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
             pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
-            session_summary: &session_summary,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
@@ -1363,13 +1802,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn later_iterations_preserve_system_prompt_prefix_without_duplicate_guidance() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Inspect the repository."))
+            .await
+            .expect("append user");
+
+        let system_prompt =
+            "## Identity\nStable identity.\n\n## Tools\nVerbose tool guidance.\n\n## Behavior\nBe precise.";
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut first_pending_system_messages = Vec::new();
+        let mut first_ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "Inspect the repository.",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: system_prompt,
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut first_pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        let first = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut first_ctx,
+        )
+        .await
+        .expect("first message build");
+
+        let mut second_pending_system_messages = Vec::new();
+        let mut second_ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 2,
+            user_text: "Inspect the repository.",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: system_prompt,
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut second_pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        let second = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut second_ctx,
+        )
+        .await
+        .expect("second message build");
+        let first_system = first.messages[0]["content"]
+            .as_str()
+            .expect("first system content");
+        let second_system = second.messages[0]["content"]
+            .as_str()
+            .expect("second system content");
+
+        assert_eq!(first_system, system_prompt);
+        assert_eq!(
+            second_system, first_system,
+            "message zero must remain byte-identical for prompt-cache reuse"
+        );
+        for (iteration, built) in [(1, &first), (2, &second)] {
+            assert!(
+                built.messages.iter().skip(1).all(|message| {
+                    !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("Stable identity."))
+                }),
+                "iteration {iteration} must not duplicate the system prompt later in the request"
+            );
+        }
+    }
+
     /// After 2+ hours idle, the sliding window should NOT include old pairs —
     /// only the compaction summary provides historical context.
     #[tokio::test]
     async fn idle_gap_resets_sliding_window_to_zero() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::{ConversationSummary, MessageStore};
+        use crate::traits::MessageStore;
         use chrono::Duration as ChronoDuration;
 
         let harness = setup_test_agent(MockProvider::new())
@@ -1407,7 +1938,6 @@ mod tests {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
-        let session_summary: Option<ConversationSummary> = None;
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -1417,11 +1947,11 @@ mod tests {
             user_text: "Fresh question now",
             completed_tool_calls: &[],
             model: "mock-model",
-            system_prompt: "You are a helpful test assistant.",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
             pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
-            session_summary: &session_summary,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
@@ -1455,13 +1985,18 @@ mod tests {
         );
     }
 
-    /// When a session summary is present, it should be injected as a
-    /// [Session Summary] system message after the system prompt.
+    /// Pillar A: the session summary now travels INSIDE the per-task context
+    /// tail (compiled in bootstrap). Message-build no longer takes a summary
+    /// argument; instead it inserts the tail (containing `[Session Summary]`) at
+    /// boundary − 1 as a single system message. This test passes the summary via
+    /// `task_context_tail` and asserts it lands in the tail message and NOT at a
+    /// separate index-1 message.
     #[tokio::test]
-    async fn session_summary_injected_when_present() {
+    async fn session_summary_travels_inside_task_context_tail() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::{ConversationSummary, MessageStore};
+        use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
             .await
@@ -1476,14 +2011,9 @@ mod tests {
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
         let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
-        let session_summary = Some(ConversationSummary {
-            session_id: "test-session".to_string(),
-            summary: "User previously asked about deploying a blog. Config was created."
-                .to_string(),
-            message_count: 5,
-            last_message_id: "old-msg-id".to_string(),
-            updated_at: Utc::now(),
-        });
+        let tail = format!(
+            "{TASK_CONTEXT_TAIL_MARKER}\n\n[Session Summary]\nUser previously asked about deploying a blog. Config was created."
+        );
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -1493,11 +2023,11 @@ mod tests {
             user_text: "Current question",
             completed_tool_calls: &[],
             model: "mock-model",
-            system_prompt: "You are a helpful test assistant.",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: &tail,
             pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
-            session_summary: &session_summary,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
             status_tx: &status_tx,
@@ -1509,30 +2039,547 @@ mod tests {
         )
         .await
         .expect("message build");
-        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
 
-        // Summary should be injected as a system message.
-        assert!(
-            serialized.contains("[Session Summary]"),
-            "session summary should be injected as [Session Summary]: {}",
-            serialized
-        );
-        assert!(
-            serialized.contains("deploying a blog"),
-            "session summary content should be present: {}",
-            serialized
-        );
-
-        // The summary should appear as a system message (role=system).
-        let has_summary_system_msg = built.messages.iter().any(|m| {
+        // The summary lives inside the tail message (starts with the marker).
+        let tail_msg = built.messages.iter().find(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("system")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("[Session Summary]"))
+                    .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
         });
+        let tail_content = tail_msg
+            .and_then(|m| m["content"].as_str())
+            .expect("tail message must be present");
         assert!(
-            has_summary_system_msg,
-            "summary should be a system-role message"
+            tail_content.contains("[Session Summary]"),
+            "summary must live inside the task context tail: {tail_content}"
+        );
+        assert!(
+            tail_content.contains("deploying a blog"),
+            "summary content must be present in the tail: {tail_content}"
+        );
+
+        // No separate index-1 [Session Summary] message exists anymore.
+        let summary_only_messages = built
+            .messages
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[Session Summary]"))
+            })
+            .count();
+        assert_eq!(
+            summary_only_messages, 1,
+            "summary must appear exactly once (inside the tail), not as a separate message"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_context_model_compacts_tool_schemas_without_dropping_tools() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::memory::context_window::{estimate_tokens, estimate_tool_definition_tokens};
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .agent
+            .context_window_config
+            .model_budgets
+            .insert("gemma-4-26b".to_string(), 16_384);
+        harness
+            .state
+            .append_message(&msg("user", "List all available tools."))
+            .await
+            .expect("append user");
+
+        let verbose =
+            "Detailed operational guidance for selecting and safely using this tool. ".repeat(300);
+        let tool_defs: Vec<Value> = (0..20)
+            .map(|idx| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{idx}"),
+                        "description": verbose,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": verbose
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": verbose,
+                                    "enum": ["read", "write"]
+                                }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    }
+                })
+            })
+            .collect();
+        assert!(estimate_tool_definition_tokens(&tool_defs) > 16_384);
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "List all available tools.",
+            completed_tool_calls: &[],
+            model: "gemma-4-26b",
+            core_prompt: "You are a helpful test assistant.",
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
+
+        assert_eq!(built.tool_defs.len(), tool_defs.len());
+        // Pillar A: the emitted roster is now name-sorted (lexicographic), so
+        // assert the SET of tool names is preserved and parameter contracts are
+        // intact — not a positional numeric order.
+        let got_names: std::collections::HashSet<String> = built
+            .tool_defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        let expected_names: std::collections::HashSet<String> = (0..tool_defs.len())
+            .map(|idx| format!("tool_{idx}"))
+            .collect();
+        assert_eq!(got_names, expected_names, "all tools must be preserved");
+        for tool in &built.tool_defs {
+            assert_eq!(
+                tool["function"]["parameters"]["properties"]["mode"]["enum"],
+                json!(["read", "write"])
+            );
+        }
+        // Confirm the final order is name-sorted (the authoritative final sort).
+        let ordered_names: Vec<&str> = built
+            .tool_defs
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        let mut sorted = ordered_names.clone();
+        sorted.sort();
+        assert_eq!(ordered_names, sorted, "tool order must be name-sorted");
+
+        let message_tokens =
+            estimate_tokens(&serde_json::to_string(&built.messages).expect("serialize messages"));
+        let tool_tokens = estimate_tool_definition_tokens(&built.tool_defs);
+        assert!(
+            message_tokens + tool_tokens + 1_536 <= 16_384,
+            "request estimate should fit Gemma context: messages={message_tokens}, tools={tool_tokens}"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_context_model_rechecks_budget_after_final_prompt_assembly() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::memory::context_window::{estimate_tokens, estimate_tool_definition_tokens};
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .agent
+            .context_window_config
+            .model_budgets
+            .insert("gemma-4-26b".to_string(), 16_384);
+        harness
+            .state
+            .append_message(&msg("user", "Can you test your tools?"))
+            .await
+            .expect("append user");
+        harness
+            .state
+            .append_message(&tool_msg(
+                "system_info",
+                "OS: macOS\nMemory: 64 GB\nHostname: workstation",
+            ))
+            .await
+            .expect("append tool");
+
+        let verbose = "Detailed parameter guidance for local agent tool execution. ".repeat(40);
+        let tool_defs: Vec<Value> = (0..38)
+            .map(|idx| {
+                let properties: serde_json::Map<String, Value> = (0..8)
+                    .map(|prop_idx| {
+                        (
+                            format!("parameter_{prop_idx}"),
+                            json!({
+                                "type": "string",
+                                "description": verbose,
+                                "enum": ["one", "two", "three"]
+                            }),
+                        )
+                    })
+                    .collect();
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{idx}"),
+                        "description": verbose,
+                        "parameters": {
+                            "type": "object",
+                            "properties": properties,
+                            "required": ["parameter_0"],
+                            "additionalProperties": false
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let mut pending_system_messages = vec![SystemDirective::FreshConversationContext];
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+        let completed_tool_calls = vec!["system_info({})".to_string()];
+        let system_prompt = "Root agent operating guidance and tool policy. ".repeat(650);
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 2,
+            user_text: "Can you test your tools?",
+            completed_tool_calls: &completed_tool_calls,
+            model: "gemma-4-26b",
+            core_prompt: &system_prompt,
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
+
+        assert_eq!(built.tool_defs.len(), tool_defs.len());
+        let message_tokens =
+            estimate_tokens(&serde_json::to_string(&built.messages).expect("serialize messages"));
+        let tool_tokens = estimate_tool_definition_tokens(&built.tool_defs);
+        assert!(
+            message_tokens + tool_tokens + RESPONSE_RESERVE_TOKENS <= 16_384,
+            "final assembled request should fit: messages={message_tokens}, tools={tool_tokens}"
+        );
+    }
+
+    // ---- Pillar A Task 6: payload assembly tests ----
+
+    /// Test 1: exactly one system message starts with TASK_CONTEXT_TAIL_MARKER,
+    /// positioned immediately BEFORE the current user message (boundary − 1).
+    /// Test 2: no standalone `[Session Summary]` message; the summary appears
+    /// ONLY inside the tail.
+    /// Test 3: message zero equals the core bytes exactly (no volatile suffix).
+    #[tokio::test]
+    async fn tail_precedes_current_turn_and_summary_lives_only_in_tail() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Old question"))
+            .await
+            .expect("append old user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Old answer"))
+            .await
+            .expect("append old assistant");
+        harness
+            .state
+            .append_message(&msg("user", "Current question"))
+            .await
+            .expect("append current user");
+
+        let core = "You are aidaemon. CORE PROMPT BODY.";
+        let tail = format!(
+            "{TASK_CONTEXT_TAIL_MARKER}\n\n[Session Summary]\nUser deploying a blog.\n\n[Current Date & Time]\nMonday"
+        );
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "test-session",
+            iteration: 1,
+            user_text: "Current question",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: core,
+            task_context_tail: &tail,
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
+
+        // Test 3: message zero equals the core bytes exactly.
+        assert_eq!(
+            built.messages[0]["content"].as_str(),
+            Some(core),
+            "message zero must be the core prompt bytes with no volatile suffix"
+        );
+
+        // Test 1: exactly one tail message; it precedes the current user message.
+        let tail_positions: Vec<usize> = built
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.get("role").and_then(|r| r.as_str()) == Some("system")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tail_positions.len(), 1, "exactly one tail message expected");
+        let tail_pos = tail_positions[0];
+        let current_user_pos = built
+            .messages
+            .iter()
+            .rposition(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some("Current question")
+            })
+            .expect("current user message present");
+        assert_eq!(
+            tail_pos + 1,
+            current_user_pos,
+            "tail must sit immediately before the current user message (boundary − 1)"
+        );
+
+        // Test 2: no standalone `[Session Summary]` message; summary only in tail.
+        assert!(
+            !built.messages[1]["content"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("[Session Summary]"),
+            "index 1 must not be a standalone session-summary message"
+        );
+        let summary_msgs = built
+            .messages
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("[Session Summary]"))
+            })
+            .count();
+        assert_eq!(
+            summary_msgs, 1,
+            "summary appears exactly once, inside the tail"
+        );
+    }
+
+    /// Test 4: within-task tail reuse — two consecutive build iterations of the
+    /// same task produce a byte-identical tail message.
+    #[tokio::test]
+    async fn within_task_tail_reuse_is_byte_identical() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Same task"))
+            .await
+            .expect("append user");
+
+        let core = "CORE";
+        let tail = format!("{TASK_CONTEXT_TAIL_MARKER}\n\n[Current Date & Time]\nFixed timestamp");
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let tool_defs: Vec<Value> = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let extract_tail = |built: &MessageBuildData| -> String {
+            built
+                .messages
+                .iter()
+                .find(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
+                })
+                .and_then(|m| m["content"].as_str())
+                .expect("tail present")
+                .to_string()
+        };
+
+        let mut p1 = Vec::new();
+        let mut ctx1 = MessageBuildCtx {
+            session_id: "reuse-session",
+            iteration: 1,
+            user_text: "Same task",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: core,
+            task_context_tail: &tail,
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut p1,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        let built1 = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx1,
+        )
+        .await
+        .expect("build 1");
+
+        let mut p2 = Vec::new();
+        let mut ctx2 = MessageBuildCtx {
+            session_id: "reuse-session",
+            iteration: 2,
+            user_text: "Same task",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: core,
+            task_context_tail: &tail,
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut p2,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        let built2 = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx2,
+        )
+        .await
+        .expect("build 2");
+
+        assert_eq!(
+            extract_tail(&built1),
+            extract_tail(&built2),
+            "tail must be byte-identical across within-task iterations"
+        );
+    }
+
+    /// Test 5: the final emitted tool order is name-sorted even when the input
+    /// roster is unsorted — proving the sort happens as the final op before
+    /// MessageBuildData, after any mutation.
+    #[tokio::test]
+    async fn final_tool_order_is_name_sorted_after_mutations() {
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg("user", "Do work"))
+            .await
+            .expect("append user");
+
+        // Deliberately unsorted roster (zebra, alpha, mango).
+        let tool_defs: Vec<Value> = ["zebra_tool", "alpha_tool", "mango_tool"]
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": "x",
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+                    }
+                })
+            })
+            .collect();
+
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let pinned_memories: Vec<Message> = Vec::new();
+        let mut pending = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+
+        let mut ctx = MessageBuildCtx {
+            session_id: "sort-session",
+            iteration: 1,
+            user_text: "Do work",
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: "CORE",
+            task_context_tail: "",
+            pinned_memories: &pinned_memories,
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("build");
+
+        let names: Vec<&str> = built
+            .tool_defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha_tool", "mango_tool", "zebra_tool"],
+            "final tool_defs must be name-sorted"
         );
     }
 }

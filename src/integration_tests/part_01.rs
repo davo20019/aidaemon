@@ -1185,6 +1185,8 @@ async fn test_plain_text_retry_does_not_trip_execution_budget_before_tool_mode()
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 12_000,
                 output_tokens: 6_000,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -1234,6 +1236,8 @@ async fn test_execution_budget_starts_after_tool_handoff_response() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 30_000,
                 output_tokens: 15_000,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -1282,6 +1286,8 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 200,
                 output_tokens: 100,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -1298,6 +1304,8 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 48_000,
                 output_tokens: 24_000,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -1389,8 +1397,9 @@ async fn test_deferred_text_only_turn_switches_to_plain_text_recovery_mode() {
         "initial drafting turn should still expose tools before recovery decides they are unnecessary"
     );
     assert!(
-        call_log[1].tools.is_empty(),
-        "plain-text recovery retry should strip tools to break the deferred-action loop"
+        !call_log[1].tools.is_empty(),
+        "plain-text recovery retains tool defs for prompt-prefix stability; \
+         calling is disabled via tool_choice=none instead"
     );
     assert_eq!(
         call_log[1].options.tool_choice,
@@ -1462,6 +1471,8 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 12,
                 output_tokens: 8,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -1496,8 +1507,9 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
     let call_log = harness.provider.call_log.lock().await.clone();
     assert_eq!(call_log.len(), 2);
     assert!(
-        call_log[1].tools.is_empty(),
-        "text-only recovery should disable tools after side-effecting drift"
+        !call_log[1].tools.is_empty(),
+        "text-only recovery retains tool defs for prompt-prefix stability; \
+         calling is disabled via tool_choice=none after side-effecting drift"
     );
     assert_eq!(
         call_log[1].options.tool_choice,
@@ -1531,6 +1543,8 @@ async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 12,
                 output_tokens: 8,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -2068,12 +2082,16 @@ async fn test_memory_fact_persists_across_turns() {
     // The system prompt sent to the LLM in turn 2 should contain the fact
     let call_log = harness.provider.call_log.lock().await;
     let last_call = call_log.last().unwrap();
-    let system_msg = last_call
+    // Pillar A: remembered facts surface in the per-task context tail (a system
+    // message), so scan ALL system messages.
+    let system_content_owned: String = last_call
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let system_content = system_msg["content"].as_str().unwrap_or("");
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system_content = system_content_owned.as_str();
     assert!(
         system_content.contains("Rust"),
         "System prompt on turn 2 should include the remembered fact about Rust. \

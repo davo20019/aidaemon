@@ -7,6 +7,7 @@ use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
 use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
 use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
 use super::*;
+use crate::events::TaskOutcome;
 
 /// Check if a cancel keyword appears in text without a preceding negation.
 /// Returns false for phrases like "do not stop", "don't cancel", "never stop".
@@ -142,7 +143,8 @@ impl Agent {
             llm_router,
             mut model,
             route_failsafe_active,
-            system_prompt,
+            core_prompt_bytes,
+            task_context_tail,
             pinned_memories,
             mut session_summary,
         } = match bootstrap_outcome {
@@ -237,7 +239,15 @@ impl Agent {
             allow_multi_project_scope = turn_context.allow_multi_project_scope,
             "Turn context resolved"
         );
-        // 3. Agentic loop — runs until natural completion or safety limits
+        // 3. Agentic loop — runs until natural completion or safety limits.
+        //
+        // The whole loop runs inside a `turn` span carrying task_id + session_id
+        // so every downstream log line is correlated with this request without
+        // editing each call site. We use `Instrument` (not a held `enter()`
+        // guard) because the guard pattern is unsound across `.await` points —
+        // it would leak the span onto whatever task the worker thread polls next.
+        let turn_span = tracing::info_span!("turn", task_id = %task_id, session_id = %session_id);
+        tracing::Instrument::instrument(async move {
         let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
         const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
@@ -284,6 +294,7 @@ impl Agent {
                     .needs_tools
                     .unwrap_or(false),
             ),
+            read_files: super::loop_state::ReadFileObservationTracker::default(),
         };
 
         // Task-start planning call: generate a structured plan before the main loop.
@@ -391,6 +402,26 @@ impl Agent {
             turn_state
                 .directives
                 .push_system_message(SystemDirective::EvidenceGroundingRequired);
+        }
+        // Only pin the model to the prior exchange for genuinely vague
+        // challenges ("Are you sure?") — compound/new-task messages that merely
+        // contain a challenge keyword must not be anchored away from their
+        // actual request.
+        if is_reaffirmation_challenge_turn
+            && crate::agent::recall_guardrails::is_vague_reaffirmation_challenge(user_text)
+        {
+            if let Ok(history) = self.state.get_history(session_id, 12).await {
+                if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
+                    &history, user_text,
+                ) {
+                    turn_state.directives.push_system_message(
+                        SystemDirective::ReaffirmationChallengeAnchor {
+                            prior_user_request: anchor.prior_user_request,
+                            prior_assistant_reply: anchor.prior_assistant_reply,
+                        },
+                    );
+                }
+            }
         }
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
         if let Some(known_project_dir) = turn_context.primary_project_scope.clone().or_else(|| {
@@ -635,6 +666,7 @@ impl Agent {
                         &emitter,
                         &task_id,
                         TaskStatus::Cancelled,
+                        TaskOutcome::Failed,
                         task_start,
                         iteration,
                         0,
@@ -692,6 +724,7 @@ impl Agent {
                         &emitter,
                         &task_id,
                         TaskStatus::Completed,
+                        TaskOutcome::Failed,
                         task_start,
                         iteration,
                         turn_state.budget.task_tokens_used() as usize,
@@ -992,27 +1025,32 @@ impl Agent {
 
             let message_build_directives = turn_state.directives.for_message_build_phase();
             let message_build_recovery = turn_state.recovery.for_message_build_phase();
-            let MessageBuildData { mut messages } =
-                super::message_build_phase::run_message_build_phase(
-                    &services,
-                    &mut MessageBuildCtx {
-                        session_id,
-                        iteration,
-                        user_text: &llm_user_text,
-                        completed_tool_calls: &learning_ctx.tool_calls,
-                        model: &model,
-                        system_prompt: &system_prompt,
-                        pinned_memories: &pinned_memories,
-                        tool_defs: &tool_defs,
-                        policy_bundle: &policy_bundle,
-                        session_summary: &session_summary,
-                        pending_system_messages: message_build_directives.pending_system_messages,
-                        empty_response_retry_pending: message_build_recovery
-                            .empty_response_retry_pending,
-                        status_tx: &status_tx,
-                    },
-                )
-                .await?;
+            let message_build_start = Instant::now();
+            let MessageBuildData {
+                mut messages,
+                tool_defs: effective_tool_defs,
+                est_input_tokens,
+            } = super::message_build_phase::run_message_build_phase(
+                &services,
+                &mut MessageBuildCtx {
+                    session_id,
+                    iteration,
+                    user_text: &llm_user_text,
+                    completed_tool_calls: &learning_ctx.tool_calls,
+                    model: &model,
+                    core_prompt: &core_prompt_bytes,
+                    task_context_tail: &task_context_tail,
+                    pinned_memories: &pinned_memories,
+                    tool_defs: &tool_defs,
+                    policy_bundle: &policy_bundle,
+                    pending_system_messages: message_build_directives.pending_system_messages,
+                    empty_response_retry_pending: message_build_recovery
+                        .empty_response_retry_pending,
+                    status_tx: &status_tx,
+                },
+            )
+            .await?;
+            let message_build_ms = message_build_start.elapsed().as_millis() as u64;
 
             let llm_stall = turn_state.stall.for_llm_phase();
             let llm_recovery = turn_state.recovery.for_llm_phase();
@@ -1038,7 +1076,7 @@ impl Agent {
                     llm_router: llm_router.clone(),
                     model: &model,
                     user_role,
-                    tool_defs: &tool_defs,
+                    tool_defs: &effective_tool_defs,
                     status_tx: &status_tx,
                     resolved_goal_id: &resolved_goal_id,
                     is_scheduled_goal,
@@ -1061,6 +1099,8 @@ impl Agent {
                     truncated_text_prefix: llm_recovery.truncated_text_prefix,
                     provider_timeout_ms: llm_budget.provider_timeout_ms,
                     thinking_truncation_count: llm_recovery.thinking_truncation_count,
+                    est_input_tokens,
+                    build_ms: message_build_ms,
                 },
             )
             .await?;
@@ -1291,6 +1331,7 @@ impl Agent {
                     tool_result_cache: tool_execution_counters.tool_result_cache,
                     execution_state: &mut execution_state,
                     validation_state: tool_execution_evidence.validation_state,
+                    read_file_tracker: &mut turn_state.read_files,
                 },
             )
             .await?;
@@ -1345,6 +1386,8 @@ impl Agent {
                 }
             }
         }
+        }, turn_span)
+        .await
     }
 }
 

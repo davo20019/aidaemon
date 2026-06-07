@@ -49,12 +49,14 @@ async fn test_same_channel_fact_recall() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     // Facts are on-demand now, NOT injected into prompt
     assert!(
         !content.contains("NextJS"),
@@ -110,12 +112,14 @@ async fn test_cross_channel_fact_blocked() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
 
     // The fact should NOT be in the main facts section
     // (It may appear in cross-channel hints section, which is expected)
@@ -148,12 +152,14 @@ async fn test_dm_recalls_all_facts() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
 
     // Facts are on-demand — system prompt has capabilities, not data
     assert!(
@@ -205,12 +211,14 @@ async fn test_private_facts_never_in_channels() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
 
     assert!(
         !content.contains("window seats") && !content.contains("Prefers window"),
@@ -263,12 +271,14 @@ async fn test_cross_channel_hints() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
 
     // The cross-channel hint section may or may not appear depending on embedding similarity.
     // What matters is that the fact does NOT appear in the main facts section as a normal fact.
@@ -325,12 +335,14 @@ async fn test_legacy_facts_backward_compat() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let sys = call_log[0]
+    let content_owned: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m["role"] == "system")
-        .unwrap();
-    let content = sys["content"].as_str().unwrap();
+        .filter(|m| m["role"] == "system")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = content_owned.as_str();
     // Facts are on-demand now — not bulk-injected into system prompt
     assert!(
         !content.contains("Neovim"),

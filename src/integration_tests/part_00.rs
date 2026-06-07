@@ -8,7 +8,8 @@ use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads,
     setup_test_agent_root, setup_test_agent_root_with_extra_tools_and_llm_timeout,
-    setup_test_agent_with_models, MockProvider, MockTool,
+    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
+    MockTool,
 };
 use crate::tools::{EditFileTool, ReadFileTool};
 use crate::traits::store_prelude::*;
@@ -52,6 +53,8 @@ async fn test_empty_llm_response_retried_then_fallback() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -63,6 +66,8 @@ async fn test_empty_llm_response_retried_then_fallback() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 20,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -132,6 +137,104 @@ async fn test_tool_execution() {
     // Agent should have called the LLM twice (tool call + final response)
     assert_eq!(harness.provider.call_count().await, 2);
     assert_eq!(response, "Here is your system info.");
+}
+
+#[tokio::test]
+async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical_reads() {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    writeln!(file, "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta").unwrap();
+    let path = file.path().to_string_lossy().into_owned();
+    let first_args = json!({"path": path, "start_line": 1, "end_line": 3}).to_string();
+    let overlap_args = json!({"path": path, "start_line": 2, "end_line": 5}).to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("read_file", &first_args),
+        MockProvider::tool_call_response("read_file", &first_args),
+        MockProvider::tool_call_response("read_file", &overlap_args),
+        MockProvider::text_response("The cached resume section contains beta and gamma."),
+    ]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(ReadFileTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "semantic_read_cache",
+            "Inspect the resume section and answer from the file.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "The cached resume section contains beta and gamma."
+    );
+    let physical_reads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE session_id = ? AND event_type = 'tool_call' \
+         AND json_extract(data, '$.name') = 'read_file'",
+    )
+    .bind("semantic_read_cache")
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(physical_reads, 1);
+
+    let calls = harness.provider.call_log.lock().await;
+    let all_tool_content = calls
+        .iter()
+        .flat_map(|call| call.messages.iter())
+        .filter(|message| message.get("role").and_then(|value| value.as_str()) == Some("tool"))
+        .filter_map(|message| message.get("content").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all_tool_content.contains("complete task-local file artifact"));
+    assert!(all_tool_content.contains("Uncovered intervals: 4-5"));
+}
+
+#[tokio::test]
+async fn test_llm_call_event_emitted_with_telemetry() {
+    // A normal turn should emit exactly one LlmCall observability event whose
+    // token telemetry matches the mock provider's reported usage (10 in / 5 out).
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "llm_obs_session",
+            "Hello there",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let since = Utc::now() - chrono::Duration::hours(1);
+    let event_store = crate::events::EventStore::new(harness.state.pool())
+        .await
+        .expect("event store from harness pool");
+    let stats = event_store
+        .get_llm_stats(since)
+        .await
+        .expect("llm stats should compute");
+
+    assert_eq!(stats.total_calls, 1, "expected one LlmCall event");
+    assert_eq!(stats.avg_input_tokens, 10);
+    assert_eq!(stats.avg_output_tokens, 5);
+    assert_eq!(stats.fell_back_count, 0);
+    // Latency is recorded (may be ~0ms against an instant mock provider).
+    assert!(stats.p95_latency_ms >= stats.p50_latency_ms);
 }
 
 #[tokio::test]
@@ -732,15 +835,16 @@ async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
         .unwrap();
 
     let call_log = harness.provider.call_log.lock().await;
-    let system_msg = call_log[0]
+    // Pillar A: critical facts now live in the per-task context tail (a system
+    // message), not message zero. Scan ALL system messages.
+    let system_content: String = call_log[0]
         .messages
         .iter()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-        .expect("system message should be present");
-    let system_content = system_msg
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system_content = system_content.as_str();
 
     assert!(
         system_content.contains("CRITICAL FACTS"),

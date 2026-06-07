@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::config::ContextWindowConfig;
+use crate::events::EventStore;
 use crate::traits::{ModelProvider, StateStore};
 use crate::types::UserRole;
 
@@ -33,6 +34,112 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+/// Estimate the serialized token cost of OpenAI-format tool definitions.
+pub fn estimate_tool_definition_tokens(tool_defs: &[Value]) -> usize {
+    let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
+    estimate_tokens(&tools_json)
+}
+
+/// Return the configured total context window for a model.
+pub fn model_context_budget(model: &str, config: &ContextWindowConfig) -> usize {
+    config
+        .model_budgets
+        .get(model)
+        .copied()
+        .unwrap_or(config.default_budget)
+}
+
+fn truncate_description(value: &mut Value, max_chars: usize) {
+    let Some(text) = value.as_str() else {
+        return;
+    };
+    if text.chars().count() <= max_chars {
+        return;
+    }
+
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(3)).collect();
+    truncated.push_str("...");
+    *value = Value::String(truncated);
+}
+
+fn compact_schema_metadata(value: &mut Value, description_limit: usize) {
+    match value {
+        Value::Object(map) => {
+            for annotation in ["title", "examples", "$comment", "default"] {
+                map.remove(annotation);
+            }
+            if let Some(description) = map.get_mut("description") {
+                truncate_description(description, description_limit);
+            }
+            for child in map.values_mut() {
+                compact_schema_metadata(child, description_limit);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                compact_schema_metadata(child, description_limit);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compact_parameter_annotations(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for annotation in ["description", "title", "examples", "$comment", "default"] {
+                map.remove(annotation);
+            }
+            for child in map.values_mut() {
+                compact_parameter_annotations(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                compact_parameter_annotations(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reduce descriptive tool-schema overhead while preserving the complete callable surface.
+///
+/// Tool entries, function names, parameter properties, required fields, enums, and validation
+/// constraints are retained. Only annotation-only metadata and verbose descriptions are reduced.
+pub fn fit_tool_definitions_to_budget(tool_defs: &[Value], budget_tokens: usize) -> Vec<Value> {
+    if estimate_tool_definition_tokens(tool_defs) <= budget_tokens {
+        return tool_defs.to_vec();
+    }
+
+    let mut compacted = tool_defs.to_vec();
+    for description_limit in [512, 256, 128, 64, 32] {
+        compacted = tool_defs.to_vec();
+        for definition in &mut compacted {
+            compact_schema_metadata(definition, description_limit);
+        }
+        if estimate_tool_definition_tokens(&compacted) <= budget_tokens {
+            break;
+        }
+    }
+
+    if estimate_tool_definition_tokens(&compacted) > budget_tokens {
+        compacted = tool_defs.to_vec();
+        for definition in &mut compacted {
+            if let Some(function) = definition.get_mut("function") {
+                if let Some(description) = function.get_mut("description") {
+                    truncate_description(description, 32);
+                }
+                if let Some(parameters) = function.get_mut("parameters") {
+                    compact_parameter_annotations(parameters);
+                }
+            }
+        }
+    }
+
+    compacted
+}
+
 /// Compute the available token budget for conversation history.
 ///
 /// Subtracts system prompt, tool definitions, and response reserve from the model's
@@ -43,15 +150,10 @@ pub fn compute_available_budget(
     tool_defs: &[Value],
     config: &ContextWindowConfig,
 ) -> usize {
-    let total_budget = config
-        .model_budgets
-        .get(model)
-        .copied()
-        .unwrap_or(config.default_budget);
+    let total_budget = model_context_budget(model, config);
 
     let system_tokens = estimate_tokens(system_prompt);
-    let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
-    let tools_tokens = estimate_tokens(&tools_json);
+    let tools_tokens = estimate_tool_definition_tokens(tool_defs);
     let response_reserve = 1536;
 
     total_budget.saturating_sub(system_tokens + tools_tokens + response_reserve)
@@ -62,14 +164,12 @@ pub fn compute_available_budget(
 /// If messages fit within budget, returns them unchanged (no-op for short conversations).
 /// If over budget:
 /// 1. Keeps the first user message (anchor) + last N messages (current context)
-/// 2. Injects a conversation summary (if available) after the anchor
-/// 3. Drops oldest messages from the middle until under budget
+/// 2. Drops oldest messages from the middle until under budget
+///
+/// Pillar A: the session summary is no longer inserted here — it lives only in
+/// the per-task context tail (`build_system_prompt_for_message`).
 #[allow(dead_code)]
-pub fn fit_messages_to_budget(
-    messages: Vec<Value>,
-    budget_tokens: usize,
-    session_summary: Option<&str>,
-) -> Vec<Value> {
+pub fn fit_messages_to_budget(messages: Vec<Value>, budget_tokens: usize) -> Vec<Value> {
     // Quick check: if under budget, return as-is
     let messages_json = serde_json::to_string(&messages).unwrap_or_default();
     let current_tokens = estimate_tokens(&messages_json);
@@ -88,21 +188,13 @@ pub fn fit_messages_to_budget(
     let anchor = messages[0].clone();
     let recent: Vec<Value> = messages[msg_count - keep_recent..].to_vec();
 
-    // Build result: anchor + optional summary + recent messages
-    let mut result = Vec::with_capacity(keep_recent + 2);
+    // Build result: anchor + recent messages
+    let mut result = Vec::with_capacity(keep_recent + 1);
     result.push(anchor);
-
-    // Inject summary as a system message if available
-    if let Some(summary) = session_summary {
-        result.push(json!({
-            "role": "system",
-            "content": format!("[Conversation summary: {}]", summary)
-        }));
-    }
 
     result.extend(recent);
 
-    let dropped = msg_count - result.len() + if session_summary.is_some() { 1 } else { 0 };
+    let dropped = msg_count - result.len();
     info!(
         original_count = msg_count,
         result_count = result.len(),
@@ -128,11 +220,10 @@ fn role_quota(role: &str) -> usize {
 ///
 /// Compared to `fit_messages_to_budget`, this keeps a more balanced slice of
 /// user/assistant/tool context under strict budgets.
-pub fn fit_messages_with_source_quotas(
-    messages: Vec<Value>,
-    budget_tokens: usize,
-    session_summary: Option<&str>,
-) -> Vec<Value> {
+///
+/// Pillar A: the session summary is no longer inserted here — it lives only in
+/// the per-task context tail (`build_system_prompt_for_message`).
+pub fn fit_messages_with_source_quotas(messages: Vec<Value>, budget_tokens: usize) -> Vec<Value> {
     let messages_json = serde_json::to_string(&messages).unwrap_or_default();
     let current_tokens = estimate_tokens(&messages_json);
     if current_tokens <= budget_tokens {
@@ -197,20 +288,6 @@ pub fn fit_messages_with_source_quotas(
         .iter()
         .map(|idx| messages[*idx].clone())
         .collect();
-
-    // Optional summary insertion after the anchor.
-    if let Some(summary) = session_summary {
-        if !summary.trim().is_empty() {
-            let insert_at = 1.min(result.len());
-            result.insert(
-                insert_at,
-                json!({
-                    "role": "system",
-                    "content": format!("[Conversation summary: {}]", summary)
-                }),
-            );
-        }
-    }
 
     // Trim oldest non-anchor messages until under budget.
     loop {
@@ -399,6 +476,7 @@ pub async fn summarize_messages(
     model: &str,
     messages: &[Value],
     state: Option<&Arc<dyn StateStore>>,
+    event_store: Option<Arc<EventStore>>,
 ) -> anyhow::Result<String> {
     // Build a condensed representation of messages for the LLM
     let mut conversation_text = String::new();
@@ -444,13 +522,20 @@ pub async fn summarize_messages(
         }),
     ];
 
+    let call_start = std::time::Instant::now();
     let response = provider.chat(model, &llm_messages, &[]).await?;
 
-    // Track token usage for summarization LLM calls
-    if let (Some(state), Some(usage)) = (state, &response.usage) {
-        let _ = state
-            .record_token_usage("background:summarization", usage)
-            .await;
+    if let (Some(state), Some(event_store)) = (state, event_store) {
+        crate::events::record_background_model_call_telemetry(
+            event_store,
+            state.as_ref(),
+            "background:summarization",
+            "summarization",
+            model,
+            &response,
+            call_start.elapsed(),
+        )
+        .await;
     }
 
     response
@@ -529,6 +614,7 @@ pub async fn extract_inline_facts(
     user_message: &str,
     assistant_response: &str,
     state: Option<&Arc<dyn StateStore>>,
+    event_store: Option<Arc<EventStore>>,
 ) -> anyhow::Result<Vec<InlineFact>> {
     // Acquire semaphore permit to limit concurrent extraction calls
     let _permit = EXTRACTION_SEMAPHORE.acquire().await?;
@@ -562,13 +648,20 @@ pub async fn extract_inline_facts(
         }),
     ];
 
+    let call_start = std::time::Instant::now();
     let response = provider.chat(model, &llm_messages, &[]).await?;
 
-    // Track token usage for progressive extraction LLM calls
-    if let (Some(state), Some(usage)) = (state, &response.usage) {
-        let _ = state
-            .record_token_usage("background:progressive_extraction", usage)
-            .await;
+    if let (Some(state), Some(event_store)) = (state, event_store) {
+        crate::events::record_background_model_call_telemetry(
+            event_store,
+            state.as_ref(),
+            "background:progressive_extraction",
+            "progressive_extraction",
+            model,
+            &response,
+            call_start.elapsed(),
+        )
+        .await;
     }
 
     let text = match response.content {
@@ -623,6 +716,7 @@ pub fn spawn_progressive_extraction(
     provider: Arc<dyn ModelProvider>,
     fast_model: String,
     state: Arc<dyn StateStore>,
+    event_store: Arc<EventStore>,
     user_text: String,
     assistant_response: String,
     channel_id: Option<String>,
@@ -643,6 +737,7 @@ pub fn spawn_progressive_extraction(
             &user_text,
             &assistant_response,
             Some(&state),
+            Some(event_store.clone()),
         )
         .await
         {
@@ -680,10 +775,12 @@ pub fn spawn_progressive_extraction(
 
 /// Run incremental summarization in the background.
 /// Summarizes older messages and stores the summary for future context injection.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_incremental_summarization(
     provider: Arc<dyn ModelProvider>,
     fast_model: String,
     state: Arc<dyn StateStore>,
+    event_store: Arc<EventStore>,
     session_id: String,
     threshold: usize,
     window: usize,
@@ -722,7 +819,15 @@ pub fn spawn_incremental_summarization(
             })
             .collect();
 
-        match summarize_messages(&provider, &fast_model, &to_summarize, Some(&state)).await {
+        match summarize_messages(
+            &provider,
+            &fast_model,
+            &to_summarize,
+            Some(&state),
+            Some(event_store),
+        )
+        .await
+        {
             Ok(text) => {
                 let last_msg_id = history[to_summarize_count - 1].id.clone();
                 let summary = crate::traits::ConversationSummary {
@@ -770,7 +875,7 @@ mod tests {
             json!({"role": "assistant", "content": "Hi there"}),
         ];
         // Huge budget — messages should pass through unchanged
-        let result = fit_messages_to_budget(messages.clone(), 100_000, None);
+        let result = fit_messages_to_budget(messages.clone(), 100_000);
         assert_eq!(result.len(), 2);
         assert_eq!(result, messages);
     }
@@ -784,20 +889,22 @@ mod tests {
             messages.push(json!({"role": role, "content": format!("Message number {}", i)}));
         }
 
-        // Very small budget to force trimming
-        let result =
-            fit_messages_to_budget(messages.clone(), 50, Some("We discussed topics A and B"));
-        // Should have: anchor(1) + summary(1) + recent(8) = 10
-        assert_eq!(result.len(), 10);
+        // Very small budget to force trimming. Pillar A: the summary is no
+        // longer injected by the fitter (it lives in the task context tail), so
+        // the result is anchor(1) + recent(8) = 9 with no summary message.
+        let result = fit_messages_to_budget(messages.clone(), 50);
+        assert_eq!(result.len(), 9);
         // First should be the anchor (first user message)
         assert_eq!(result[0]["content"], "Message number 0");
-        // Second should be the injected summary
-        assert!(result[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Conversation summary"));
+        // No injected summary message anywhere.
+        assert!(result.iter().all(|m| {
+            !m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Conversation summary")
+        }));
         // Last should be the last original message
-        assert_eq!(result[9]["content"], "Message number 14");
+        assert_eq!(result[8]["content"], "Message number 14");
     }
 
     #[test]
@@ -808,7 +915,7 @@ mod tests {
             messages.push(json!({"role": role, "content": format!("Message {}", i)}));
         }
 
-        let result = fit_messages_to_budget(messages, 50, None);
+        let result = fit_messages_to_budget(messages, 50);
         // Should have: anchor(1) + recent(8) = 9
         assert_eq!(result.len(), 9);
         assert_eq!(result[0]["content"], "Message 0");
@@ -829,11 +936,18 @@ mod tests {
             messages.push(json!({"role": role, "content": format!("msg-{i}")}));
         }
 
-        let result = fit_messages_with_source_quotas(messages, 40, Some("summary"));
+        let result = fit_messages_with_source_quotas(messages, 40);
         assert!(!result.is_empty());
         assert_eq!(result[0]["role"], "user");
         let tail = result.last().unwrap()["content"].as_str().unwrap();
         assert!(tail.contains("msg-17"));
+        // Pillar A: no summary message is injected by the fitter anymore.
+        assert!(result.iter().all(|m| {
+            !m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Conversation summary")
+        }));
     }
 
     #[test]
@@ -892,6 +1006,101 @@ mod tests {
         let budget = compute_available_budget("big-model", "system prompt", &[], &config);
         let expected = 100000 - estimate_tokens("system prompt") - estimate_tokens("[]") - 1536;
         assert_eq!(budget, expected);
+    }
+
+    #[test]
+    fn test_fit_tool_definitions_under_budget_is_unchanged() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to read."
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        })];
+
+        let compacted = fit_tool_definitions_to_budget(&tools, 10_000);
+        assert_eq!(compacted, tools);
+    }
+
+    #[test]
+    fn test_fit_tool_definitions_preserves_tools_and_parameter_contracts() {
+        let verbose = "Detailed operational guidance. ".repeat(200);
+        let tools: Vec<Value> = (0..12)
+            .map(|idx| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("verbose_tool_{idx}"),
+                        "description": verbose,
+                        "parameters": {
+                            "type": "object",
+                            "title": "Verbose tool input",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": verbose,
+                                    "examples": ["/tmp/example"]
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": verbose,
+                                    "enum": ["read", "write"]
+                                }
+                            },
+                            "required": ["path", "mode"],
+                            "additionalProperties": false
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let original_tokens = estimate_tool_definition_tokens(&tools);
+        let compacted = fit_tool_definitions_to_budget(&tools, 2_000);
+
+        assert_eq!(compacted.len(), tools.len());
+        assert!(
+            estimate_tool_definition_tokens(&compacted) < original_tokens,
+            "verbose schemas should be reduced"
+        );
+        assert!(
+            estimate_tool_definition_tokens(&compacted) <= 2_000,
+            "compacted schemas should fit the requested budget"
+        );
+
+        for (idx, tool) in compacted.iter().enumerate() {
+            assert_eq!(
+                tool["function"]["name"],
+                Value::String(format!("verbose_tool_{idx}"))
+            );
+            assert_eq!(
+                tool["function"]["parameters"]["properties"]["path"]["type"],
+                "string"
+            );
+            assert_eq!(
+                tool["function"]["parameters"]["properties"]["mode"]["enum"],
+                json!(["read", "write"])
+            );
+            assert_eq!(
+                tool["function"]["parameters"]["required"],
+                json!(["path", "mode"])
+            );
+            assert_eq!(
+                tool["function"]["parameters"]["additionalProperties"],
+                false
+            );
+        }
     }
 
     #[test]
