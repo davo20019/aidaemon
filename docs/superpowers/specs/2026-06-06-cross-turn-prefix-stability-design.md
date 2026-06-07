@@ -448,6 +448,13 @@ suite plus a short live smoke (representative tasks exercising terminal,
 file tools, memory tools, web tools), and the prose is reduced to a guide —
 not removed.
 
+**Measured post-C baseline (2026-06-07):** median per-call payload
+**16,238 tokens** (Phase 0: ~22.3k; −27%), median turn-start evaluated
+**15,565 tokens**, `tool_defs_hash` stable (1 hash across 56 calls),
+criterion 1 PASS, cause table unchanged in shape (system churn 9/15
+dominant). These are the comparators for Pillars A/B; the ≥80% target means
+post-A/B median turn-start evaluation at or below ~3.1k tokens.
+
 **Sequencing:** Pillar C lands **first**. It is small, independent, causes a
 single one-time `tool_defs_hash` break, and re-baselines payload size before
 the stability work measures itself — avoiding mid-phase attribution noise.

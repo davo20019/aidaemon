@@ -642,7 +642,7 @@ Fill this table during Tasks 1, 7, and 8, then commit it in Task 9:
 | Compact full-request bytes | 91,732 | 52,627¹ |
 | `## Tools` section bytes | 17,999 | ~1,084 |
 | Sum of 11 slimmed schemas (wire) | 14,534 | 10,446 (−4,088) |
-| Median prompt tokens | ~22.3k (Phase 0 run) | — (Task 8) |
+| Median prompt tokens | ~22.3k (Phase 0 run) | 16,238 (−27%) |
 
 ¹ Tool-definition and full-request post-C numbers are NOT directly
 comparable to pre-C: a concurrent (non-Pillar-C) workstream changed the
@@ -651,13 +651,24 @@ to enforcing (27 → 17 exposed for this request). Pillar C's attributable
 reductions are the base-prompt catalog (−16.9k) and the slimmed-schema sum
 (−4.1k). NOTE for Pillar A: per-request roster filtering is the spec's
 "per-turn dynamic tool gating" anti-pattern — reconcile before Pillar A.
-| Payload reduction | — | — |
-| `tool_defs_hash` stable within run | — | — |
-| Common live smoke | — | — |
-| Affected-guidance live smoke | — | — |
+| Payload reduction | — | 27% (median tokens) |
+| `tool_defs_hash` stable within run | — | YES (1 hash / 56 calls) |
+| Common live smoke | — | PASS 6/6 |
+| Affected-guidance live smoke | — | PASS 4/4 valid (CLI items N/A: tools disabled) |
 
 Pre-C measured 2026-06-07 02:26Z, dump of iter002 of "What files are in my
 home directory right now?" (owner DM, 38-tool roster). Top prompt sections:
 Tools 17,999 / Current Session Activity 10,624 (volatile — Pillar A's
 concern) / Core Rules 3,564 / Available Skills 3,201 / Tool Selection Guide
 2,972 (keeper).
+
+**Post-C attribution run (2026-06-07 13:17–13:38Z, 10 turns, single session,
+shadow tool filter):** join 86=86 clean; criterion 1 PASS (0 within-task
+system flips); median prompt 16,238 tokens; **median turn-start evaluated
+15,565 tokens** (the A/B baseline; ≥80% target ⇒ post-A/B turn-start eval
+≤ ~3.1k); cause table: system_prompt_churn 9/15, keep_from 4/15,
+age_collapse 2/15. Breaks observed: 16 (below Phase 0's 20-floor — fine for
+a baseline; the post-A/B gate run should add extension turns to reach 20).
+Analysis: `python3 scripts/cache-attribution.py --daemon-log
+/tmp/post-c-baseline-segment.log --session
+"aidaemon_beca_coding_bot:301753035" --llama-from-line 28999`.

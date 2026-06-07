@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`[tools].disabled` config**: omit built-in tools at startup by machine name (requires `/restart`). **Off by default:** `git_info`, `git_commit` (use `run_command`/`terminal`), `policy_metrics`, `check_environment`, `service_status`, `project_inspect` (use `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack channel history; opt-in), `tool_trace` (redundant alias — use `goal_trace` with `action: "tool_trace"`). Set `disabled = []` to register all base tools. Optional: add `goal_trace` to disable forensics entirely.
+- **`[health].enabled` defaults to `false`**: the `health_probe` tool and background uptime monitor are opt-in. Set `enabled = true` and add `[health].probes` (or let the agent create probes) when you want scheduled service checks and failure alerts.
+- **`[cli_agents].enabled` defaults to `false`**: `cli_agent` and `manage_cli_agents` are opt-in (~1.6k schema tokens combined). Set `enabled = true` when you want aidaemon to delegate to installed CLI coding agents (Claude Code, Codex, etc.).
+- **`[diagnostics].enabled` defaults to `false`**: the `self_diagnose` tool is opt-in (~560 schema tokens). `record_decision_points` stays on by default; use `db_probe`, the dashboard, or CLI agents for operator debugging.
+- Sliding-window cache-reuse observability (Phase 0): per-LLM-call prefix fingerprint (`info!`) with region sub-hashes (system prompt, pre-boundary history, tool definitions, session summary) plus `force_text`/boundary metadata, a window-decision log tying `keep_from` movement to fetch mechanics, an explicit per-build window-boundary movement event (`old_keep_from`/`new_keep_from` plus old/new oldest-kept message ids, emitted on every build so the boundary signal is continuous across trim and no-trim paths), split window-trim counters distinct from age-based collapse, and per-stage pre-boundary fingerprints (`debug!`) across the full message-build pipeline so prefix-cache breaks can be attributed to the exact transform that changed the prompt. Hashes never include raw message content.
+- **Opt-in LLM request payload dumps**: setting `AIDAEMON_DUMP_LLM_REQUESTS=1` (default `llm_request_dumps/` directory) or `AIDAEMON_DUMP_LLM_REQUESTS=/path/to/dir` writes each finalized provider request (messages + tool definitions + model/iteration metadata) as a pretty-printed JSON file, so the exact composition of input tokens can be inspected. Dumps contain raw conversation content — local debugging only.
+
+### Changed
+
+- **Per-call LLM payload reduced 27%** (median 22.3k → 16.2k tokens; Pillar C
+  of the cross-turn prefix stability design): the duplicative `## Tools`
+  catalog in the system prompt (−16.9k bytes) was replaced by compact
+  routing, delegation, and runtime API guidance with all load-bearing rules
+  migrated into the owning tool schemas, and eleven admin-tool schemas were
+  compressed (−4.1k bytes) under test-enforced byte budgets. Tool roster
+  membership is unchanged; tool-selection behavior verified by integration
+  suites and a live smoke.
+
+- **Background terminal completion no longer dumps raw stdout**: when a backgrounded command finishes, the user now gets a short "Background terminal command completed after Ns" status ping, and the actual output is fed back through the agent so it returns a formatted, summarized reply. The raw output is only delivered verbatim (in a code block) as a fallback when the agent re-engagement is unavailable or produces nothing, so content is never lost.
+
+### Fixed
+
+- **`[Action completed]` placeholder no longer leaks to users**: the internal sliding-window placeholder for orphaned tool-call-only turns is now stripped from user-facing replies, and consecutive placeholders are collapsed to a single one in the model's context (in both the live message-build path and the skeleton-extraction path). Flooding the context with identical placeholders was inviting the model to regurgitate them verbatim.
+- **Degeneration/repetition guard on final replies**: a new conservative guard collapses runaway model repetition loops (4+ consecutive identical lines or repeated sentence cycles) before a reply is sanitized and sent, preventing the wall-of-duplicated-text + chunked-message spam seen when a model (especially a local one) collapses into a loop.
+- Marked the encryption-only `db_probe` diagnostic binary as feature-gated so `cargo binstall aidaemon` accepts release archives that contain only the main `aidaemon` executable.
+
 ## [0.10.0] - 2026-06-05
 
 ### Added
