@@ -219,6 +219,32 @@ struct ManageMcpArgs {
     _session_id: String,
 }
 
+fn manage_mcp_schema() -> Value {
+    json!({
+        "name": "manage_mcp",
+        "description": "Manage MCP servers at runtime. set_env stores env vars in OS keychain, never in chat.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable"]
+                },
+                "name": { "type": "string", "description": "Server name" },
+                "command": {
+                    "type": "string",
+                    "description": "Spawn command (add). Allowed: npx, uvx, node, python, python3"
+                },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Command args (add)" },
+                "key": { "type": "string", "description": "Env var name (set_env)" },
+                "value": { "type": "string", "description": "Env var value (set_env); stored in keychain" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageMcpTool {
     fn name(&self) -> &str {
@@ -230,50 +256,7 @@ impl Tool for ManageMcpTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_mcp",
-            "description": "Manage MCP servers dynamically. Actions:\n\
-                - add: Add and start a new MCP server (requires name, command, args)\n\
-                - list: List all registered MCP servers and their tools\n\
-                - remove: Remove an MCP server (requires name)\n\
-                - set_env: Store an API key or env var for a server in the OS keychain (requires name, key, value)\n\
-                - restart: Restart a server with fresh env from keychain (requires name)\n\
-                - enable: Enable a disabled dynamic MCP server (requires name)\n\
-                - disable: Disable a dynamic MCP server without deleting it (requires name)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable"],
-                        "description": "The action to perform"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Server name (required for add, remove, set_env, restart, enable, disable)"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Command to spawn the server (required for add). Allowed: npx, uvx, node, python, python3"
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Arguments for the server command (for add)"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Environment variable name (for set_env)"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Environment variable value (for set_env). Stored in OS keychain, never in chat."
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_mcp_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -352,5 +335,24 @@ impl Tool for ManageMcpTool {
                 other
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&manage_mcp_schema()).unwrap().len();
+        assert!(
+            bytes <= 850,
+            "manage_mcp schema is {bytes} bytes, budget is 850"
+        );
     }
 }

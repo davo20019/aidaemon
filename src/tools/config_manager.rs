@@ -1368,6 +1368,36 @@ fn default_true() -> bool {
     true
 }
 
+fn manage_config_schema() -> Value {
+    json!({
+        "name": "manage_config",
+        "description": "Read or update aidaemon config.toml with backup and validation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider"],
+                    "description": "Config action"
+                },
+                "key": { "type": "string", "description": "TOML key path (get/set)" },
+                "value": { "type": "string", "description": "TOML literal (set)" },
+                "provider": { "type": "string" },
+                "api_key": { "type": "string" },
+                "base_url": { "type": "string" },
+                "gateway_token": { "type": "string" },
+                "primary_model": { "type": "string" },
+                "fast_model": { "type": "string" },
+                "smart_model": { "type": "string" },
+                "failover_index": { "type": "integer", "description": "Index for remove_failover_provider" },
+                "save_secrets_to_keychain": { "type": "boolean" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ConfigManagerTool {
     fn name(&self) -> &str {
@@ -1379,66 +1409,7 @@ impl Tool for ConfigManagerTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_config",
-            "description": "Read or update aidaemon config.toml with backup and validation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider"],
-                        "description": "Config action"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "TOML key path for get/set"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "New TOML literal for set"
-                    },
-                    "provider": {
-                        "type": "string",
-                        "description": "Provider preset"
-                    },
-                    "api_key": {
-                        "type": "string",
-                        "description": "Provider API key"
-                    },
-                    "base_url": {
-                        "type": "string",
-                        "description": "Optional provider base URL"
-                    },
-                    "gateway_token": {
-                        "type": "string",
-                        "description": "Optional gateway token"
-                    },
-                    "primary_model": {
-                        "type": "string",
-                        "description": "Optional primary model override"
-                    },
-                    "fast_model": {
-                        "type": "string",
-                        "description": "Optional fast model override"
-                    },
-                    "smart_model": {
-                        "type": "string",
-                        "description": "Optional smart model override"
-                    },
-                    "failover_index": {
-                        "type": "integer",
-                        "description": "Failover index for removal"
-                    },
-                    "save_secrets_to_keychain": {
-                        "type": "boolean",
-                        "description": "Store API keys in keychain"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_config_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1699,6 +1670,26 @@ mod tests {
             }
         });
         ConfigManagerTool::new(config_path, ApprovalBroker::new(tx))
+    }
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        // NOTE: plan ceiling was 900. manage_config has a 9-value action enum
+        // (including 4 named failover-provider actions required by the base prompt)
+        // plus 12 parameters. Structural floor is ~672 bytes; ceiling 950 gives
+        // comfortable room for short descriptions on non-obvious params.
+        let bytes = serde_json::to_string(&manage_config_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 950,
+            "manage_config schema is {bytes} bytes, budget is 950"
+        );
     }
 
     #[test]

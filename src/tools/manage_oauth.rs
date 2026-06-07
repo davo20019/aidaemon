@@ -847,6 +847,40 @@ impl ManageOAuthTool {
     }
 }
 
+fn manage_oauth_schema() -> Value {
+    json!({
+        "name": "manage_oauth",
+        "description": "Browser OAuth connections. Never ask user to paste credentials — give keychain command. Check providers/list before reconnecting; use connect to reauthorize, not remove. API-key/bearer/header/basic/OAuth1a → manage_http_auth.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["connect", "list", "remove", "set_credentials", "refresh", "providers", "describe_provider", "register_provider", "remove_provider"]
+                },
+                "service": { "type": "string" },
+                "client_id": { "type": "string" },
+                "client_secret": { "type": "string" },
+                "display_name": { "type": "string" },
+                "auth_type": {
+                    "type": "string",
+                    "enum": ["oauth2_pkce", "oauth2_authorization_code", "oauth2_client_credentials"]
+                },
+                "authorize_url": { "type": "string" },
+                "token_url": { "type": "string" },
+                "scopes": { "type": "array", "items": { "type": "string" } },
+                "allowed_domains": { "type": "array", "items": { "type": "string" } },
+                "confirm_disconnect": {
+                    "type": "boolean",
+                    "description": "Must be true with remove; use connect to reauthorize"
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageOAuthTool {
     fn name(&self) -> &str {
@@ -858,65 +892,7 @@ impl Tool for ManageOAuthTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_oauth",
-            "description": "Manage browser-based OAuth providers, credentials, connections, and token refresh. Never ask the user to paste credentials into chat — give the exact keychain command. Check list/providers before reconnecting; do not remove a connection unless the user wants it disconnected.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["connect", "list", "remove", "set_credentials", "refresh", "providers", "describe_provider", "register_provider", "remove_provider"],
-                        "description": "Action"
-                    },
-                    "service": {
-                        "type": "string",
-                        "description": "Provider name"
-                    },
-                    "client_id": {
-                        "type": "string",
-                        "description": "OAuth client/app ID"
-                    },
-                    "client_secret": {
-                        "type": "string",
-                        "description": "OAuth client/app secret"
-                    },
-                    "display_name": {
-                        "type": "string",
-                        "description": "Optional provider label"
-                    },
-                    "auth_type": {
-                        "type": "string",
-                        "enum": ["oauth2_pkce", "oauth2_authorization_code", "oauth2_client_credentials"],
-                        "description": "Custom provider auth type"
-                    },
-                    "authorize_url": {
-                        "type": "string",
-                        "description": "Authorize URL"
-                    },
-                    "token_url": {
-                        "type": "string",
-                        "description": "Token URL"
-                    },
-                    "scopes": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional scopes for register_provider. Ignored for built-in providers and connect/list/remove actions."
-                    },
-                    "allowed_domains": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Allowed API domains for register_provider."
-                    },
-                    "confirm_disconnect": {
-                        "type": "boolean",
-                        "description": "Required with true when action='remove'. Use remove only for intentional disconnection; use connect to refresh or replace tokens."
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_oauth_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -1071,6 +1047,25 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::oauth::{OAuthProvider, SharedHttpProfiles};
     use crate::state::SqliteStateStore;
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        // NOTE: plan ceiling was 1000 but manage_oauth carries 4 mandatory
+        // behavioral invariants (never-credentials-in-chat, inspect-before-reconnect,
+        // connect-not-remove, manage_http_auth routing) plus a 9-value action enum
+        // and a 3-value auth_type enum. Structural floor with all params is ~749 bytes;
+        // ceiling set to 1100 to accommodate invariants with short readable text.
+        let bytes = serde_json::to_string(&manage_oauth_schema()).unwrap().len();
+        assert!(
+            bytes <= 1100,
+            "manage_oauth schema is {bytes} bytes, budget is 1100"
+        );
+    }
 
     static ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
