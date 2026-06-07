@@ -241,6 +241,36 @@ struct ManageArgs {
     _channel_visibility: Option<String>,
 }
 
+fn manage_memories_schema() -> Value {
+    json!({
+        "name": "manage_memories",
+        "description": "Memories+goals.Goal id prefix ok.Not for storing,use remember_fact.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled", "trigger_now"]
+                },
+                "limit": { "type": "integer" },
+                "category": { "type": "string" },
+                "key": { "type": "string" },
+                "privacy": { "type": "string", "enum": ["global", "channel", "private"] },
+                "query": { "type": "string" },
+                "goal": { "type": "string" },
+                "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+                "goal_id": { "type": "string" },
+                "schedule_id": { "type": "string" },
+                "schedule": { "type": "string" },
+                "schedules": { "type": "array", "items": { "type": "string" } },
+                "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageMemoriesTool {
     fn name(&self) -> &str {
@@ -252,82 +282,7 @@ impl Tool for ManageMemoriesTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_memories",
-            "description": "Manage memories and goals.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "forget", "set_privacy", "search", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled", "trigger_now"],
-                        "description": "Action"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max items"
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Category filter"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Fact key"
-                    },
-                    "privacy": {
-                        "type": "string",
-                        "enum": ["global", "channel", "private"],
-                        "description": "Target privacy"
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search term"
-                    },
-                    "goal": {
-                        "type": "string",
-                        "description": "Goal description"
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high", "critical"],
-                        "description": "Goal priority"
-                    },
-                    "goal_id": {
-                        "type": "string",
-                        "description": "Goal ID"
-                    },
-                    "schedule_id": {
-                        "type": "string",
-                        "description": "Schedule ID"
-                    },
-                    "schedule": {
-                        "type": "string",
-                        "description": "Schedule"
-                    },
-                    "schedules": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Schedules"
-                    },
-                    "fire_policy": {
-                        "type": "string",
-                        "enum": ["coalesce", "always_fire"],
-                        "description": "Fire policy"
-                    },
-                    "is_one_shot": {
-                        "type": "boolean",
-                        "description": "Delete after first run"
-                    },
-                    "is_paused": {
-                        "type": "boolean",
-                        "description": "Start paused"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_memories_schema()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -1829,6 +1784,22 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&manage_memories_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 1100,
+            "manage_memories schema is {bytes} bytes, budget is 1100"
+        );
+    }
 
     async fn setup_state() -> Arc<dyn StateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();

@@ -32,11 +32,34 @@ fn schema_segment(source: &str) -> Option<&str> {
     Some(segment)
 }
 
+/// Returns the full source region covering schema-related definitions:
+/// the inline `fn schema` body plus any private helper such as
+/// `fn <tool>_schema() -> Value` that the method may delegate to.
+fn schema_source_region(source: &str) -> Option<&str> {
+    // If the schema fn delegates to a private helper (Pillar-C pattern), find
+    // the helper's definition start so we capture the JSON content.
+    // Convention: helper is `fn <name>_schema() -> Value {` appearing before
+    // `impl Tool for`.
+    let start = if let Some(pos) = source.find("_schema() -> Value {") {
+        // Walk back to the `fn ` keyword
+        let prefix = &source[..pos];
+        prefix.rfind("fn ").map(|fn_pos| fn_pos).unwrap_or(0)
+    } else {
+        // No helper — fall through to schema_segment
+        let (_, after) = source.split_once("fn schema(&self) -> Value {")?;
+        return after.split_once("async fn call(").map(|(seg, _)| seg);
+    };
+
+    let region = &source[start..];
+    let (segment, _) = region.split_once("async fn call(")?;
+    Some(segment)
+}
+
 #[test]
 fn all_tool_schemas_disable_additional_properties() {
     for file in tool_source_files() {
         let source = fs::read_to_string(&file).expect("read tool source");
-        let segment = schema_segment(&source)
+        let segment = schema_source_region(&source)
             .unwrap_or_else(|| panic!("Could not locate schema segment in {}", file.display()));
         assert!(
             segment.contains("\"additionalProperties\": false"),

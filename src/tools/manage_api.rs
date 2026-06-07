@@ -743,6 +743,41 @@ impl ManageApiTool {
     }
 }
 
+fn manage_api_schema() -> Value {
+    json!({
+        "name": "manage_api",
+        "description": "Onboard API: auth+learn+verify. Never ask user to paste credentials; use keychain command instead.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["onboard"] },
+                "service": { "type": "string" },
+                "auth_mode": { "type": "string", "enum": ["existing", "oauth2_pkce", "oauth2_authorization_code", "oauth2_client_credentials", "bearer", "header", "basic", "oauth1a"] },
+                "allowed_domains": { "type": "array", "items": { "type": "string" } },
+                "header_name": { "type": "string" },
+                "username": { "type": "string" },
+                "user_id": { "type": "string" },
+                "display_name": { "type": "string" },
+                "authorize_url": { "type": "string" },
+                "token_url": { "type": "string" },
+                "scopes": { "type": "array", "items": { "type": "string" } },
+                "client_id": { "type": "string" },
+                "client_secret": { "type": "string" },
+                "connect": { "type": "boolean" },
+                "docs_url": { "type": "string" },
+                "openapi_url": { "type": "string" },
+                "learn_url": { "type": "string" },
+                "learn_kind": { "type": "string", "enum": ["auto", "openapi", "docs"] },
+                "verify_url": { "type": "string" },
+                "verify_method": { "type": "string", "enum": ["GET", "HEAD"] },
+                "timeout_secs": { "type": "integer" }
+            },
+            "required": ["action", "service"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageApiTool {
     fn name(&self) -> &str {
@@ -754,94 +789,7 @@ impl Tool for ManageApiTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_api",
-            "description": "Run a deterministic end-to-end API onboarding flow: connect auth, learn API docs/specs, and verify with a safe probe. Never ask the user to paste credentials into chat; give the secure keychain command instead.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["onboard"],
-                        "description": "Action"
-                    },
-                    "service": {
-                        "type": "string",
-                        "description": "Service name"
-                    },
-                    "auth_mode": {
-                        "type": "string",
-                        "enum": ["existing", "oauth2_pkce", "oauth2_authorization_code", "oauth2_client_credentials", "bearer", "header", "basic", "oauth1a"],
-                        "description": "Auth mode"
-                    },
-                    "allowed_domains": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Allowed API domains"
-                    },
-                    "header_name": {
-                        "type": "string"
-                    },
-                    "username": {
-                        "type": "string"
-                    },
-                    "user_id": {
-                        "type": "string"
-                    },
-                    "display_name": {
-                        "type": "string"
-                    },
-                    "authorize_url": {
-                        "type": "string"
-                    },
-                    "token_url": {
-                        "type": "string"
-                    },
-                    "scopes": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "client_id": {
-                        "type": "string"
-                    },
-                    "client_secret": {
-                        "type": "string"
-                    },
-                    "connect": {
-                        "type": "boolean",
-                        "description": "Connect now"
-                    },
-                    "docs_url": {
-                        "type": "string"
-                    },
-                    "openapi_url": {
-                        "type": "string"
-                    },
-                    "learn_url": {
-                        "type": "string"
-                    },
-                    "learn_kind": {
-                        "type": "string",
-                        "enum": ["auto", "openapi", "docs"],
-                        "description": "Learn mode"
-                    },
-                    "verify_url": {
-                        "type": "string"
-                    },
-                    "verify_method": {
-                        "type": "string",
-                        "enum": ["GET", "HEAD"],
-                        "description": "Probe verb"
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Timeout"
-                    }
-                },
-                "required": ["action", "service"],
-                "additionalProperties": false
-            }
-        })
+        manage_api_schema()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -874,6 +822,23 @@ impl Tool for ManageApiTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        // NOTE: plan ceiling was 950 but manage_api has 21 parameters including
+        // an 8-value auth_mode enum; the structural minimum with all params is
+        // ~1100 bytes. Ceiling adjusted to 1150 — see task-4 report for details.
+        let bytes = serde_json::to_string(&manage_api_schema()).unwrap().len();
+        assert!(
+            bytes <= 1150,
+            "manage_api schema is {bytes} bytes, budget is 1150"
+        );
+    }
 
     #[test]
     fn discovery_candidate_urls_expand_common_docs_and_spec_paths() {

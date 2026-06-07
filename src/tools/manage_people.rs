@@ -53,6 +53,39 @@ struct ManagePeopleArgs {
     inactive_days: Option<u32>,
 }
 
+fn manage_people_schema() -> Value {
+    json!({
+        "name": "manage_people",
+        "description": "Owner's contacts: people, relationships, facts. Use add_fact to store new info.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"]
+                },
+                "name": { "type": "string" },
+                "id": { "type": "integer" },
+                "relationship": { "type": "string" },
+                "notes": { "type": "string" },
+                "communication_style": { "type": "string" },
+                "language": { "type": "string" },
+                "person_name": { "type": "string" },
+                "category": { "type": "string" },
+                "key": { "type": "string" },
+                "value": { "type": "string" },
+                "platform_id": { "type": "string" },
+                "display_name": { "type": "string" },
+                "fact_id": { "type": "integer" },
+                "within_days": { "type": "integer" },
+                "inactive_days": { "type": "integer" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManagePeopleTool {
     fn name(&self) -> &str {
@@ -64,82 +97,7 @@ impl Tool for ManagePeopleTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_people",
-            "description": "Manage the owner's contacts and social circle: people, relationship notes, reminders, and linked facts. When you learn something about someone the owner knows (birthday, preference, etc.), store it with add_fact.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"],
-                        "description": "Action"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Person name"
-                    },
-                    "id": {
-                        "type": "integer",
-                        "description": "Person id"
-                    },
-                    "relationship": {
-                        "type": "string",
-                        "description": "Relationship type"
-                    },
-                    "notes": {
-                        "type": "string",
-                        "description": "Free-form notes"
-                    },
-                    "communication_style": {
-                        "type": "string",
-                        "description": "Preferred communication style"
-                    },
-                    "language": {
-                        "type": "string",
-                        "description": "Preferred language"
-                    },
-                    "person_name": {
-                        "type": "string",
-                        "description": "Person name for fact/link actions"
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Fact category"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Fact key"
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Fact value"
-                    },
-                    "platform_id": {
-                        "type": "string",
-                        "description": "Platform-qualified id"
-                    },
-                    "display_name": {
-                        "type": "string",
-                        "description": "Platform display name"
-                    },
-                    "fact_id": {
-                        "type": "integer",
-                        "description": "Fact id"
-                    },
-                    "within_days": {
-                        "type": "integer",
-                        "description": "Upcoming-date window"
-                    },
-                    "inactive_days": {
-                        "type": "integer",
-                        "description": "Reconnect threshold"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_people_schema()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -856,6 +814,22 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::store_prelude::*;
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&manage_people_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 1000,
+            "manage_people schema is {bytes} bytes, budget is 1000"
+        );
+    }
 
     async fn setup_tool() -> ManagePeopleTool {
         let db_file = tempfile::NamedTempFile::new().unwrap();
