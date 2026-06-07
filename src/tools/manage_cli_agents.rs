@@ -180,7 +180,7 @@ struct ManageCliAgentsArgs {
 fn manage_cli_agents_schema() -> Value {
     json!({
         "name": "manage_cli_agents",
-        "description": "Manage CLI AI agents (claude/gemini/codex/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Use only to add custom agents or view history.",
+        "description": "Manage CLI AI agents (claude/gemini/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Discovery is automatic — use only to add custom agents or inspect invocation history.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -191,11 +191,11 @@ fn manage_cli_agents_schema() -> Value {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Agent name (add/remove/enable/disable)"
+                    "description": "Name (add/remove/enable/disable)"
                 },
                 "command": {
                     "type": "string",
-                    "description": "Command executable; must be installed (add)"
+                    "description": "Executable; must be installed (add)"
                 },
                 "args": {
                     "type": "array",
@@ -208,7 +208,7 @@ fn manage_cli_agents_schema() -> Value {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Seconds before background handoff (add)"
+                    "description": "Timeout secs (add)"
                 },
                 "max_output_chars": {
                     "type": "integer",
@@ -216,7 +216,7 @@ fn manage_cli_agents_schema() -> Value {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Invocations to show (history, default 10)"
+                    "description": "Results to show (history, default 10)"
                 }
             },
             "required": ["action"],
@@ -232,7 +232,7 @@ impl Tool for ManageCliAgentsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage CLI AI agents (claude/gemini/codex/etc.). Actions: add (requires approval), remove, list, enable, disable, history."
+        "Manage CLI AI agents (claude/gemini/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Discovery is automatic — use only to add custom agents or inspect invocation history."
     }
 
     fn schema(&self) -> Value {
