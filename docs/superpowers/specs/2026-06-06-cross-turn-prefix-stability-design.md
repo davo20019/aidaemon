@@ -87,7 +87,17 @@ The promised invariants are:
    never changes again (absent a content_fp change from a late write, which
    is logged).
 3. **Within a task, each iteration's payload is a strict prefix extension**
-   of the previous iteration's payload.
+   of the previous iteration's payload, **absent a logged prefix mutation**.
+   Three retained recovery mechanisms legitimately rewrite current-turn
+   bytes and are explicitly excluded from the invariant: repeated-tool-error
+   collapse (`collapse_repeated_tool_errors`), history-fitting overflow
+   trimming, and the empty-response retry rebuild. Each must emit
+   `Prefix mutation reason=<mechanism>` when it fires so every within-task
+   re-evaluation is attributable. Tests assert strict prefix extension on
+   mutation-free paths AND assert the log line fires on each mutator path.
+   (History-fitting overflow should become rare: whole-turn eviction at the
+   60% low-water mark leaves headroom that the per-iteration fitter
+   previously had to create.)
 4. **Turn-start re-evaluation is bounded by the prior task's tail + current
    region** (archived[N] + tail[N+1] + new user message), not by an assumed
    constant. The bound is measured, then a threshold is set.
@@ -157,14 +167,45 @@ The logical layout must survive into the final provider payload:
 
 ## Pillar B — turn-anchored fetch and monotonic rendering
 
+### Canonical history source and turn identity (prerequisite)
+
+The primary history source is the event store, and event hydration does not
+carry turn identity today: `ConversationTurn::into_message` sets
+`turn_id: None` explicitly (`src/events/conversation_turn.rs:190`), so a
+turn-keyed fetch cannot be built on hydrated events as they stand. This
+phase therefore requires:
+
+- `turn_id` added to the canonical conversation event payloads
+  (user message, assistant response, tool call/result) and propagated
+  through projection/hydration into `Message.turn_id`;
+- a single **canonical monotonic sequence** for ordering: the event store's
+  insertion sequence, propagated through hydration. Timestamps are forbidden
+  as an ordering key anywhere in the fetch or render path (event queries
+  that currently order by timestamp are migrated for this path). The
+  sequence is unique, so no tie-breaking rule is needed; the plan names the
+  concrete column and adds the supporting index
+  `(session_id, turn_seq, msg_seq)`.
+- **Migration/fallback:** events written before `turn_id` existed hydrate
+  with `turn_id = NULL` and fall under the legacy rule below (excluded from
+  reconstruction; covered by the session summary). No retroactive grouping
+  is attempted.
+
 ### Fetch
 
 Replace the message-count window (`history_limit`, splits turns, slides
 every build) with: fetch all messages with turn start sequence in
-`[anchor_turn .. current_turn]`. Ordering is **(turn start sequence, message
-sequence)** using monotonic identifiers (e.g., rowid), never timestamps.
-The anchor is the only fetch parameter; nothing slides unless the anchor
-moves.
+`[anchor_turn .. current_turn]`, ordered by
+**(turn start sequence, message sequence)** as defined above. The anchor is
+the only fetch parameter; nothing slides unless the anchor moves.
+
+**Anchor initialization (no anchor in memory — first build of a session, or
+after daemon restart):** walk turns backward from the most recent,
+accumulating provider-equivalent estimated tokens per archived rendering,
+and stop at the last whole turn that fits within the **60% low-water mark**
+of the context budget; that turn becomes the anchor. The walk is a bounded,
+paged query (never an unbounded session load), and the same low-water rule
+used by eviction governs it, so a restart lands on the same anchor a
+long-running daemon would have converged to.
 
 Edge cases (defined, not discovered):
 
@@ -188,7 +229,14 @@ Edge cases (defined, not discovered):
 - `mode = Archived`: the single permanent form. Survivorship is explicit:
   - the user message text survives **in full**;
   - the final assistant reply survives, truncated by the existing
-    deterministic rule (`MAX_OLD_ASSISTANT_CONTENT_CHARS`);
+    deterministic rule (`MAX_OLD_ASSISTANT_CONTENT_CHARS`). **Selection
+    rule:** the final reply is the last assistant-role record in the turn's
+    sequence with non-empty content — tool-call-bearing assistant records
+    contribute only their content (tool_calls stripped by the existing
+    orphan rule); recovery retries and checkpoints are assistant/system
+    records earlier in the sequence and lose by position; a turn whose last
+    assistant record has empty content (tool-only or crashed turn) renders
+    the deterministic `[task interrupted]`/no-reply placeholder;
   - tool results survive as deterministic summaries;
   - messages matching the identity-critical detector
     (`text_relates_to_critical_identity`) survive **verbatim** — identity
@@ -208,8 +256,14 @@ all absorbed by this mechanism and deleted.
 `HashMap<turn_id, CachedRender { content_fp, renderer_version, mode, bytes }>`
 per session, in-memory.
 
-- `content_fp` covers **every rendered field** after canonicalization:
-  message content, role, annotations, tool-call JSON, tool results.
+- `content_fp` is the hash of the **canonical serialization of the complete
+  ordered render input** — every message in sequence order with all fields
+  (role, content, tool_name, tool_call_id, tool_calls_json, annotations,
+  and the sequence position itself). The only excluded fields are an
+  explicit denylist of never-rendered fields (`embedding`, `importance`,
+  `created_at`; finalized in the plan). Anything not on the denylist is in
+  the fingerprint by default — omissions fail closed (spurious re-render),
+  never open (stale bytes).
 - Lookup requires `content_fp + renderer_version + mode` to match; any
   mismatch re-renders and replaces.
 - Debug/test builds always re-render and assert byte equality against the
@@ -236,6 +290,9 @@ this phase. New lines:
 
 - `Core prompt invalidated component=<name>` (info)
 - `Turn render cache hit` (debug/sampled) / `miss` / `fp_mismatch` (info)
+- `Prefix mutation reason=<mechanism>` (info) — emitted by each retained
+  within-task mutator (repeated-tool-error collapse, history-fitting
+  overflow, empty-response retry rebuild)
 
 After this phase, a `prefix_hash_system` cross-turn flip without a matching
 `Core prompt invalidated` line is a bug by definition.
@@ -246,17 +303,24 @@ After this phase, a `prefix_hash_system` cross-turn flip without a matching
   single-component change → correct `component` named); `render_turn`
   golden-byte tests per mode including incomplete-turn and identity-critical
   fixtures; cache fp/version/mode mismatch behavior.
-- **Integration (MockProvider call-log assertions):**
-  1. within a task, iteration k+1's payload is a strict prefix extension of
-     iteration k's;
-  2. across two turns, core + archived[..N-1] is byte-identical and
-     archived[N] is byte-stable in a third turn;
-  3. storing a fact between turns changes the tail only (core bytes
+- **Integration — prefix assertions run on canonical serialized request
+  bodies, not internal message Vecs.** Internal-message comparisons cannot
+  prove byte stability: prefix reuse depends on the request body after
+  adapter conversion, and `anthropic_native` merges adjacent roles and
+  hoists every system message. Each adapter's request builder is exercised
+  directly (unit seam over the body-construction function), and the
+  cross-iteration/cross-turn invariants are asserted on those bodies:
+  1. within a task, iteration k+1's body is a strict prefix extension of
+     iteration k's (mutation-free path), and each mutator path emits its
+     `Prefix mutation` line instead;
+  2. across two turns, core + archived[..N-1] is byte-identical in the
+     bodies and archived[N] is byte-stable in a third turn;
+  3. storing a fact between turns changes the tail region only (core bytes
      identical);
   4. a skills-catalog change between turns produces exactly one
      `Core prompt invalidated component=skills` and new core bytes;
-  5. provider payload-shape test per adapter (system-message ordering /
-     deterministic extraction).
+  5. per-adapter determinism: same logical messages → identical serialized
+     body bytes (incl. the Anthropic system-hoist/role-merge mapping).
 - **Identity regression:** existing identity/security integration tests run
   against archived-form history.
 - **Live:** re-run the 10-turn attribution protocol with
@@ -268,11 +332,12 @@ After this phase, a `prefix_hash_system` cross-turn flip without a matching
 2. Live re-run: criterion 1 (within-task system stability) stays PASS, and
    every cross-turn `prefix_hash_system` flip pairs with a logged core
    invalidation.
-3. Live re-run: median turn-start evaluated tokens reduced by **≥80%**
-   versus the Phase 0 baseline (~22.3k median). The first instrumented
-   re-run establishes the measured bound (archived[N] + tail + user message);
-   the absolute token threshold for regression-gating is set from that
-   measurement, not assumed in advance.
+3. Live re-run: median turn-start evaluated tokens reduced versus the
+   Phase 0 baseline (~22.3k median). **≥80% reduction is the target** (the
+   expected bound — archived[N] + tail + user message — is a few thousand
+   tokens of a ~22k payload), not a pass/fail gate: the first valid
+   instrumented re-run establishes the measured bound, and the regression
+   threshold used for gating thereafter is set from that measurement.
 
 ## Out of scope
 
