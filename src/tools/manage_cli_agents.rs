@@ -177,6 +177,54 @@ struct ManageCliAgentsArgs {
     _session_id: Option<String>,
 }
 
+fn manage_cli_agents_schema() -> Value {
+    json!({
+        "name": "manage_cli_agents",
+        "description": "Manage CLI AI agents (claude/gemini/codex/etc.). Actions: add (requires approval), remove, list, enable, disable, history. Use only to add custom agents or view history.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "remove", "list", "enable", "disable", "history"],
+                    "description": "Action"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Agent name (add/remove/enable/disable)"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Command executable; must be installed (add)"
+                },
+                "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Extra CLI args (add)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description (add)"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds before background handoff (add)"
+                },
+                "max_output_chars": {
+                    "type": "integer",
+                    "description": "Max output chars (add)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Invocations to show (history, default 10)"
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for ManageCliAgentsTool {
     fn name(&self) -> &str {
@@ -184,61 +232,11 @@ impl Tool for ManageCliAgentsTool {
     }
 
     fn description(&self) -> &str {
-        "Add, remove, list, enable, disable CLI-based AI agents, or view invocation history"
+        "Manage CLI AI agents (claude/gemini/codex/etc.). Actions: add (requires approval), remove, list, enable, disable, history."
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "name": "manage_cli_agents",
-            "description": "Manage CLI-based AI agents (Claude Code, Gemini CLI, Codex, etc.). Actions:\n\
-                - add: Register a new CLI agent (requires name, command; optional args, description, timeout_secs, max_output_chars)\n\
-                - remove: Remove a CLI agent (requires name)\n\
-                - list: List all registered CLI agents with status\n\
-                - enable: Enable a disabled CLI agent (requires name)\n\
-                - disable: Disable a CLI agent without removing it (requires name)\n\
-                - history: Show recent CLI agent invocations (optional limit, default 10)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["add", "remove", "list", "enable", "disable", "history"],
-                        "description": "The action to perform"
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Agent name (required for add, remove, enable, disable)"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Command to run the agent (required for add). Must be installed on the system."
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Command-line arguments for the agent (for add)"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Description of the agent (for add)"
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Timeout in seconds before moving to background (for add)"
-                    },
-                    "max_output_chars": {
-                        "type": "integer",
-                        "description": "Max output characters to capture (for add)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of invocations to show (for history, default 10)"
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        })
+        manage_cli_agents_schema()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -310,5 +308,26 @@ impl Tool for ManageCliAgentsTool {
                 other
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let bytes = serde_json::to_string(&manage_cli_agents_schema())
+            .unwrap()
+            .len();
+        assert!(
+            bytes <= 1000,
+            "manage_cli_agents schema is {bytes} bytes, budget is 1000"
+        );
     }
 }

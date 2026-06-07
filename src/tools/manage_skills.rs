@@ -3068,7 +3068,7 @@ impl Tool for ManageSkillsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage skills at runtime. Actions: add (from URL), add_inline (raw markdown), learn_api (ingest an OpenAPI spec or docs page into a reusable API guide skill), list, remove (also dismiss matching pending drafts), remove_all (bulk remove with optional dry_run), enable, disable, browse (search registries), install (from registry), update (re-fetch from source), review (approve/dismiss auto-promoted skill drafts)."
+        "Manage skills: add, add_inline, learn_api, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources."
     }
 
     fn schema(&self) -> Value {
@@ -3084,46 +3084,39 @@ impl Tool for ManageSkillsTool {
                         "description": "Action"
                     },
                     "url": {
-                        "type": "string",
-                        "description": "Source URL"
+                        "type": "string"
                     },
                     "content": {
                         "type": "string",
-                        "description": "Inline skill markdown"
+                        "description": "Inline markdown (add_inline)"
                     },
                     "name": {
-                        "type": "string",
-                        "description": "Skill or API name"
+                        "type": "string"
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Optional auth profile"
+                        "description": "Auth profile for learn_api"
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["auto", "openapi", "docs"],
-                        "description": "Learning mode"
+                        "enum": ["auto", "openapi", "docs"]
                     },
                     "names": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Skill names for remove_all"
+                        "description": "Names (remove_all)"
                     },
                     "query": {
-                        "type": "string",
-                        "description": "Browse query"
+                        "type": "string"
                     },
                     "draft_id": {
-                        "type": "integer",
-                        "description": "Draft ID for review"
+                        "type": "integer"
                     },
                     "approve": {
-                        "type": "boolean",
-                        "description": "Approve or dismiss draft"
+                        "type": "boolean"
                     },
                     "dry_run": {
-                        "type": "boolean",
-                        "description": "Preview remove_all only"
+                        "type": "boolean"
                     }
                 },
                 "required": ["action"],
@@ -4051,5 +4044,30 @@ mutation CreateWidget {
         assert!(note.contains("no triggers"));
         assert!(note.contains("use skill manual-only"));
         assert!(note.contains("$manual-only"));
+    }
+
+    #[tokio::test]
+    async fn schema_fits_payload_budget() {
+        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
+        // admin-tool schemas ride in EVERY provider call; this ceiling is the
+        // per-tool payload budget. If you trip this assert by adding features,
+        // compress the description text — do not raise the ceiling without
+        // updating the Pillar C implementation plan.
+        let (tool, _state, _skills_dir) = setup_tool().await;
+        let bytes = serde_json::to_string(&tool.schema()).unwrap().len();
+        assert!(
+            bytes <= 1000,
+            "manage_skills schema is {bytes} bytes, budget is 1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_description_keeps_action_discoverability() {
+        let (tool, _state, _skills_dir) = setup_tool().await;
+        let schema = tool.schema();
+        let description = schema["description"].as_str().unwrap();
+        for action in ["learn_api", "remove_all", "review"] {
+            assert!(description.contains(action), "missing action {action}");
+        }
     }
 }
