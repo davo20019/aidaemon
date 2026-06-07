@@ -20,7 +20,7 @@ impl Tool for EditFileTool {
     fn schema(&self) -> Value {
         json!({
             "name": "edit_file",
-            "description": "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous.",
+            "description": "Find and replace text in a file. Use this instead of terminal sed/awk. Shows context around the change. Fails safely if the text isn't found or is ambiguous. On not-found/ambiguous text, read_file the same path and retry once before asking the user.",
             "parameters": {
                 "type": "object",
                 "properties": {

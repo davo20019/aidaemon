@@ -66,7 +66,7 @@ impl Tool for ManagePeopleTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_people",
-            "description": "Manage people, relationship notes, reminders, and linked facts.",
+            "description": "Manage the owner's contacts and social circle: people, relationship notes, reminders, and linked facts. When you learn something about someone the owner knows (birthday, preference, etc.), store it with add_fact.",
             "parameters": {
                 "type": "object",
                 "properties": {

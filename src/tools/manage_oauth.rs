@@ -860,7 +860,7 @@ impl Tool for ManageOAuthTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_oauth",
-            "description": "Manage OAuth providers, credentials, connections, and token refresh.",
+            "description": "Manage browser-based OAuth providers, credentials, connections, and token refresh. Never ask the user to paste credentials into chat — give the exact keychain command. Check list/providers before reconnecting; do not remove a connection unless the user wants it disconnected.",
             "parameters": {
                 "type": "object",
                 "properties": {

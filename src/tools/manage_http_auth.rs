@@ -1048,7 +1048,7 @@ impl Tool for ManageHttpAuthTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_http_auth",
-            "description": "Create, inspect, verify, and remove manual HTTP auth profiles.",
+            "description": "Create, inspect, verify, and remove manual HTTP auth profiles (API key/token/basic/header/OAuth1a). Never ask the user to paste secrets into chat — give the exact keychain command. After secrets are stored or rotated, run verify before the first live call to refresh runtime auth without a restart.",
             "parameters": {
                 "type": "object",
                 "properties": {

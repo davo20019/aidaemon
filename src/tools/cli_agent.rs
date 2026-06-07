@@ -2912,8 +2912,10 @@ impl Tool for CliAgentTool {
         json!({
             "name": "cli_agent",
             "description": format!(
-                "Delegate coding work to an installed CLI agent. Available agents: {}. \
-                 Use manage_memories for scheduling. Long runs can be checked or cancelled.",
+                "Delegate complex multi-step coding/research/analysis work to an installed CLI agent. \
+                 Available agents: {}. If `tool` is omitted, the runtime auto-selects the first installed \
+                 agent (claude, gemini, codex, copilot, aider). Use manage_memories for scheduling. \
+                 Long runs can be checked or cancelled.",
                 tools_help
             ),
             "parameters": {
@@ -2935,7 +2937,7 @@ impl Tool for CliAgentTool {
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Absolute working directory"
+                        "description": "Absolute working directory. Always set this so the runtime can detect conflicts; two agents must not run concurrently in the same working_dir."
                     },
                     "task_id": {
                         "type": "string",
@@ -2943,11 +2945,11 @@ impl Tool for CliAgentTool {
                     },
                     "system_instruction": {
                         "type": "string",
-                        "description": "Optional system instruction"
+                        "description": "Optional system instruction shaping the agent into a specialist (e.g. 'You are a security auditor')"
                     },
                     "async_mode": {
                         "type": "boolean",
-                        "description": "Run in background"
+                        "description": "Run in background; use true to dispatch independent sub-tasks in parallel"
                     }
                 },
                 "required": ["action"],

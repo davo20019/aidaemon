@@ -1305,98 +1305,19 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
     let manage_oauth_table_row =
         "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
 
-    let spawn_tool_doc = if config.subagents.enabled {
-        format!(
-            "\n- `spawn_agent`: Spawn a sub-agent to handle a complex sub-task autonomously. \
-            Parameters: `mission` (high-level role, e.g. 'Research assistant for Python packaging'), \
-            `task` (the specific question or job), and optional `background` (boolean, default false). \
-            The sub-agent gets its own reasoning loop with access to all tools. \
-            Use this when a task benefits from isolated, focused context. \
-            Keep `mission` and `task` minimal — the sub-agent starts fresh with the same tools you have, \
-            so reference files by path instead of pasting their contents, and omit prior tool output or \
-            conversation history the sub-agent does not strictly need. \
-            Set `background: true` for long-running tasks — the agent returns immediately and \
-            the result is delivered through the parent session when the sub-agent finishes. \
-            Sub-agents can nest up to {} levels deep.",
-            config.subagents.max_depth
-        )
-    } else {
-        String::new()
-    };
-
     let browser_table_row = if cfg!(feature = "browser") && config.browser.enabled {
         "| Visit website, search web | browser | terminal (curl/wget) |\n"
     } else {
         ""
     };
 
-    let browser_tool_doc = if cfg!(feature = "browser") && config.browser.enabled {
-        "- `browser`: Control a headless browser for web interactions. Actions: navigate (go to URL), \
-screenshot (capture page and send as photo), click (click element by CSS selector), \
-fill (type text into input), get_text (extract visible text), execute_js (run JavaScript), \
-wait (wait for element to appear), close (end browser session). The browser session persists \
-across tool calls so you can chain multi-step workflows (e.g. navigate -> fill form -> click -> screenshot)."
-    } else {
-        ""
-    };
-
-    let send_file_tool_doc = if config.files.enabled {
-        "\n- `send_file`: Send a file to the user via Telegram. Parameters: `file_path` (absolute path to the file), \
-        `caption` (optional description). The file must be within allowed directories. Sensitive files (.ssh, .env, \
-        credentials, etc.) are blocked. When the user sends you a file, it's saved to the inbox directory and you \
-        can process it with terminal commands (cat, pdftotext, etc.), then send results back with this tool."
-    } else {
-        ""
-    };
-
-    let cli_agent_tool_doc = if config.cli_agents.enabled {
-        "\n- `cli_agent`: YOUR PRIMARY TOOL FOR COMPLEX TASKS. CLI agents are specialized AI \
-        agents running natively on this machine — more powerful than your built-in tools \
-        with deeper integration, larger context windows, and sophisticated agentic loops. \
-        They also use the user's subscription (no extra API cost).\n\
-        \n  YOUR ROLE: You are the user's PROXY. The user tells you what they want — you \
-        handle everything else. You act as \"the human\" for CLI agents:\n\
-        - Answer their questions using your knowledge, memory, and task context\n\
-        - Make routine decisions on the user's behalf\n\
-        - Only escalate to the real user for genuinely important decisions\n\
-        \n  WORKFLOW:\n\
-        1. UNDERSTAND — break the user's request into clear sub-tasks\n\
-        2. CRAFT EXPERT PROMPTS — shape each CLI agent into a specialist via system_instruction \
-        (e.g. \"You are a security auditor\", \"You are a data analyst\")\n\
-        3. DISPATCH — send tasks to CLI agents. Use async_mode=true for parallel sub-tasks.\n\
-        \n  COORDINATION RULES (hard constraints):\n\
-        - NEVER send the same (or very similar) task to multiple agents — pick one agent per sub-task.\n\
-        - NEVER dispatch two agents to the same working_dir concurrently — the runtime will block the second call.\n\
-        - ALWAYS specify working_dir for every cli_agent call so the runtime can detect conflicts.\n\
-        4. REVIEW — inspect the output and file changes. Validate correctness.\n\
-        5. REPORT — give the user a clear summary.\n\
-        \n  ROUTING RULES:\n\
-        - Complex multi-step tasks -> use `cli_agent` when available at runtime\n\
-        - Tasks needing many file reads/writes -> cli_agent\n\
-        - Research requiring multiple searches -> cli_agent\n\
-        - Simple quick answers, memory lookups, one-off commands -> handle directly\n\
-        - If a cli_agent fails -> retry with a different agent, or fallback to direct tools\n\
-        - In delegated executor/non-owner-complex flows, `terminal`, `browser`, and `run_command` \
-          are structurally hidden when `cli_agent` is available\n\
-        \n  NO DOUBLE-DIPPING: When you delegate a task to a cli_agent, do NOT also perform the \
-        same work yourself with your own tools (web_search, web_fetch, terminal, etc.). \
-        The cli_agent handles it end-to-end. If you need to research AND build, dispatch \
-        them as separate cli_agent calls — don't research yourself and build with cli_agent.\n\
-        \n  Parameters: tool (optional specific agent), prompt (the task), working_dir (project path), \
-        system_instruction (specialist role), async_mode (true for parallel dispatch).\n\
-        If tool is omitted, the runtime auto-selects the first installed agent in this order: \
-        claude, gemini, codex, copilot, aider.\n\
-        \n  Availability is dynamic at runtime: if `cli_agent` is currently unavailable, \
-        use `manage_cli_agents` (list/add/enable) or fallback tools for this turn."
-    } else {
-        ""
-    };
-
-    let manage_cli_agents_tool_doc = if config.cli_agents.enabled {
-        "\n- `manage_cli_agents`: Install and manage CLI-based AI agents (Claude Code, Gemini CLI, Codex, \
-        Copilot, Aider, or custom agents). Actions: add (register a new agent), remove (unregister), \
-        list (show all agents with status), enable/disable (toggle), history (show recent invocations). \
-        CLI agents are auto-discovered at startup if installed. Use this to add custom agents or manage existing ones."
+    let cli_agent_guidance = if config.cli_agents.enabled {
+        "\n\n## CLI Agent Delegation\n\
+        Use cli_agent for complex multi-step work when available. Always set working_dir.\n\
+        Do not send the same task to multiple agents or run agents concurrently in the\n\
+        same working_dir. After delegating, do not duplicate the same work with direct\n\
+        tools; review the agent's result and use direct tools only for validation or\n\
+        clearly separate follow-up work."
     } else {
         ""
     };
@@ -1409,102 +1330,6 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
     } else {
         ""
     };
-
-    let health_probe_tool_doc = if config.health.enabled {
-        "\n- `health_probe`: Monitor services, endpoints, and health checks. \
-        Actions: list (show all probes and their status), add (create a new probe with name, url, \
-        and optional interval/headers/expected_status), remove (delete by name), history (show recent \
-        results for a probe), run (execute a probe immediately). Prefer this over terminal (curl, ping) \
-        for ongoing monitoring — it tracks history and alerts automatically."
-    } else {
-        ""
-    };
-
-    let manage_skills_tool_doc = if config.skills.enabled {
-        "\n- `manage_skills`: Add, list, remove, browse, install, update, review, or generate skills from API docs/specs. \
-        Actions: add (from URL), add_inline (from raw markdown), learn_api (fetch an OpenAPI spec or docs page and turn it into a reusable API guide skill), list (show all skills), \
-        remove (by name), remove_all (bulk remove by names, optional dry_run), browse (search skill registries), \
-        install (from registry by name), update (refresh a skill from its source), \
-        review (approve/dismiss auto-promoted skill drafts). \
-        Skills are reusable procedures that activate automatically when triggered by keywords. \
-        For newly connected APIs, prefer `learn_api` over hand-writing guide skills from scratch."
-    } else {
-        ""
-    };
-
-    let use_skill_tool_doc = if config.skills.enabled {
-        "\n- `use_skill`: Activate a saved skill or procedure by name. The skill's content is \
-        injected into your context so you can follow its instructions. Use `manage_skills` with \
-        action 'list' to see available skills."
-    } else {
-        ""
-    };
-
-    let skill_resources_tool_doc = if config.skills.enabled {
-        "\n- `skill_resources`: Access resources bundled with a skill (scripts, references, assets). \
-        Actions: list (show available resources for a skill), read (load a specific resource file on demand). \
-        Use this to load supporting files from directory-based skills without cluttering the context."
-    } else {
-        ""
-    };
-
-    let manage_api_tool_doc =
-        "\n- `manage_api`: Run a deterministic API onboarding flow when the user wants one end-to-end path. \
-        Action: onboard. \
-        It composes the existing API tools for you: manual auth (`manage_http_auth`) or browser OAuth (`manage_oauth`), \
-        API-guide generation (`manage_skills` with `learn_api` when skills are enabled), and a safe live probe (`http_request`). \
-        Prefer this when the user says things like \"connect this API and make sure it works\" or \"set up this service end-to-end.\" \
-        Provide `auth_mode`, the service name, and whichever docs/OpenAPI and verify URLs you know. \
-        For OAuth 2.0 APIs it can register the provider, connect it, learn the API docs/spec, and verify the connection in one deterministic tool flow. \
-        For API-key/bearer/header/basic/OAuth1a APIs it can create/update the manual auth profile, refresh runtime auth state, learn the docs/spec, and then verify with a safe probe. \
-        When the learned source is an OpenAPI spec, it can auto-derive a safe read-only probe from the spec. \
-        When the API is GraphQL and an endpoint is available, it can learn from GraphQL schema introspection and use that as the safe verification probe. \
-        NEVER ask the user to paste secrets into chat if you can instead tell them the exact secure CLI/keychain command to run.";
-
-    let manage_http_auth_tool_doc =
-        "\n- `manage_http_auth`: Create, inspect, verify, and remove manual HTTP auth profiles for any API \
-        that uses bearer tokens, custom header auth, basic auth, or OAuth 1.0a credentials. \
-        Actions: list, describe, upsert, remove, verify. \
-        Use this when the user wants to connect an API with an API key/token/username-password flow \
-        rather than a browser OAuth authorization flow. \
-        \n  Prefer this over hand-editing `[http_auth.<name>]` with `manage_config`. \
-        It writes the profile structure to config, tells the user the exact `aidaemon keychain set http_auth_<profile>_<field>` \
-        commands for missing secrets, binds any already-stored keychain/.env secrets it finds, and refreshes the live runtime auth profile. \
-        NEVER ask the user to paste secrets into chat. If secrets are missing, tell them the exact CLI commands to run. \
-        After the user stores or rotates credentials, use `verify` before the first live API call so the runtime auth profile is refreshed without a restart. \
-        If the user already knows the safe read-only endpoint to test, provide it to `verify` with a GET/HEAD URL on an allowed domain.";
-
-    let manage_oauth_tool_doc =
-        "\n- `manage_oauth`: Connect external services via OAuth. \
-        This covers both built-in providers (Twitter/X, GitHub, Google, etc.) and custom OAuth 2.0 providers \
-        that the user wants to add from scratch. \
-        Actions: providers (show built-in/custom providers and whether credentials are already stored), \
-        describe_provider (show setup details, callback URL, domains, scopes, and exact keychain commands), \
-        register_provider (add a custom OAuth 2.0 provider definition), \
-        connect (start the OAuth browser flow), list (show connected services), remove (disconnect a service), \
-        set_credentials (store app client ID/secret), refresh (manually refresh an expired token), \
-        remove_provider (delete a custom provider definition after it has been disconnected). \
-        \n  **When a user wants to connect a new OAuth API:** \
-        \n  1. Use `providers` first. If the service is not listed and it is a standard OAuth 2.0 API, use `register_provider`. \
-        \n  2. For `register_provider`, gather or confirm: auth type, token URL, allowed API domains, optional scopes, and an optional display name. For browser-based auth types, you also need authorize URL. \
-        \n  3. Tell the user to create their app in that service's developer portal and register the daemon callback URL shown by `describe_provider` \
-        (typically `http://localhost:<port>/oauth/callback`, unless the daemon is configured with a public callback URL). \
-        \n  4. Tell the user to store the client credentials securely from their terminal using \
-        `aidaemon keychain set oauth_<service>_client_id` and `aidaemon keychain set oauth_<service>_client_secret`. \
-        NEVER ask the user to paste credentials in chat. \
-        \n  5. Then use `connect` to send the authorization link. \
-        \n  **After connecting, use `http_request` directly** — an auth profile is automatically created \
-        with the service name (for example `auth_profile=\"twitter\"` or `auth_profile=\"linear\"`). \
-        Do NOT reconnect if the service is already connected; check `list` first. \
-        If you do need to reauthorize or refresh scopes, use `connect` again; it replaces the stored connection only after the new OAuth flow succeeds. \
-        Do NOT call `remove` first unless the user explicitly wants the service disconnected. \
-        If a connection was removed or expired, do NOT assume the app credentials are gone. \
-        Use `providers` or `describe_provider` first to see whether credentials are already stored. \
-        Only ask the user for client ID/secret if the provider actually reports that credentials are missing. \
-        Do NOT ask the user where their `.env` or keychain entries are located unless they explicitly asked for config help. \
-        \n  Custom onboarding supports OAuth 2.0 PKCE, OAuth 2.0 authorization code, and OAuth 2.0 client credentials. \
-        If the API uses API keys, bearer tokens, custom headers, basic auth, or OAuth 1.0a tokens, use `manage_http_auth` instead. \
-        Use plain language with the user — say \"connect your account\" not \"configure OAuth credentials.\"";
 
     let profile_names: Vec<&str> = config.http_auth.keys().map(|s| s.as_str()).collect();
 
@@ -1521,66 +1346,24 @@ across tool calls so you can chain multi-step workflows (e.g. navigate -> fill f
         .map(|s| s.as_str())
         .collect();
 
-    let skill_warning = if profiles_missing_skills.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n  **ACTION REQUIRED — Missing API guides:** The following API connections are set up \
-            but don't have a \"skill\" yet: {}. \
-            \n  A skill is like a cheat sheet — it tells you which URLs to call, what parameters to send, \
-            and what responses to expect. Without one, you have the credentials but don't know the API's \
-            actual endpoints. You MUST create a skill before using these APIs. \
-            \n  **When the user asks about one of these APIs, follow this flow:** \
-            \n  1. Explain that you need to learn the API first by reading its documentation. Frame it as: \
-            \"Before I can use [API name] for you, I need to learn how it works. I can do this by reading \
-            the official documentation.\" \
-            \n  2. Ask: \"Do you have the API docs URL you'd like me to read? You can paste a link, \
-            or I can search for the official docs myself.\" \
-            \n  3. If the user wants a full connect + learn + verify flow, prefer `manage_api` so the steps stay deterministic. \
-            Otherwise, if the user pastes a URL, use `manage_skills` with action `learn_api` directly. If not, use `web_search` \
-            to find the official API reference or OpenAPI/Swagger URL first, then pass that URL to `manage_skills` \
-            with action `learn_api`. \
-            \n  4. Prefer OpenAPI/Swagger specs when available because they produce a more complete guide automatically. \
-            Use docs-page ingestion when that's all you have. The saved skill becomes your reusable API reference. \
-            \n  5. Show the user a plain-language summary of what you can now do (e.g., \"I've learned the Twitter API! \
-            I can now post tweets, read your timeline, search, and manage likes for you.\") \
-            \n  6. Then proceed with the user's original request. \
-            \n  Keep explanations simple — the user may not be technical. Don't use jargon like \"skill\", \
-            \"endpoint\", or \"auth profile.\" Say things like \"I'll remember how this API works\" instead \
-            of \"I'll create a skill.\"",
-            profiles_missing_skills.join(", ")
-        )
-    };
-
-    let http_request_tool_doc = format!(
-        "\n- `http_request`: Make authenticated HTTP requests to external APIs. \
-        Available manual auth profiles: {}. OAuth-connected profiles also become available automatically after connection. \
-        Each profile is bound to specific domains — credentials are only sent to allowed domains. HTTPS only. \
-        GET requests without auth may not need approval; write operations (POST/PUT/PATCH/DELETE) always require approval. \
-        Parameters: method, url, auth_profile (optional), headers, body, content_type, query_params, \
-        timeout_secs, follow_redirects, max_response_bytes. \
-        If the user wants deterministic end-to-end onboarding, prefer `manage_api` before using this tool directly. \
-        To add more API integrations, use `manage_http_auth` for API keys/tokens/basic/header/OAuth1a setups, \
-        or use `manage_oauth` for browser-based OAuth where available. \
-        When you have credentials but still need to learn the API surface, use `manage_skills` with action `learn_api` \
-        on the official docs or OpenAPI/Swagger URL before improvising requests. \
-        Before using a newly added manual profile, run `manage_http_auth(action='verify', profile=...)` so the live runtime auth state is refreshed without a restart.{}",
+    let api_runtime_context = format!(
+        "\n\n## API Runtime Context\n\
+        Available manual HTTP auth profiles: {}.\n\
+        Profiles missing API guides: {}.\n\
+        For a missing guide, use manage_api for end-to-end onboarding or \
+        manage_skills(action='learn_api') with official docs/OpenAPI.\n\
+        Never ask the user to paste credentials into chat.",
         if profile_names.is_empty() {
-            "(none yet)".to_string()
+            "none".to_string()
         } else {
             profile_names.join(", ")
         },
-        skill_warning
+        if profiles_missing_skills.is_empty() {
+            "none".to_string()
+        } else {
+            profiles_missing_skills.join(", ")
+        },
     );
-
-    let manage_people_tool_doc =
-        "\n- `manage_people`: Track the owner's contacts and social circle. \
-        Use 'enable'/'disable' to toggle People Intelligence at runtime, 'status' to check state. \
-        Other actions: add (new person), list (all people), view (person details + facts), update (person fields), \
-        remove (delete person), add_fact (store a fact about someone — birthday, preference, etc.), \
-        remove_fact (by ID), link (connect platform ID to person), export (all data as JSON), \
-        purge (full cascade delete), audit (review auto-extracted facts), confirm (verify a fact). \
-        When you learn something about someone the owner knows, store it with add_fact.";
 
     let social_intelligence_guidelines =
         "\n\n## Social Intelligence — BE PROACTIVE\n\
@@ -1727,18 +1510,18 @@ treating an error as active — stale log lines may only describe a past failure
 | Task | Preferred Tool | Fallback |
 |------|---------------|----------|
 {browser_table_row}| Search the web | web_search | terminal (curl for APIs) |
-| Read web pages, articles, docs | web_fetch | terminal (curl) if web_fetch fails (JS-rendered pages) |
+| Read web pages, articles, docs | web_fetch | http_request for REST/JSON APIs; browser for login/JS pages; terminal (curl) if web_fetch fails |
 | Read file contents | read_file | — |
 | Write/create files | write_file | — |
 | Edit text in files | edit_file | — |
 | Search code/files | search_files | terminal (grep) |
 | Understand a project | project_inspect | — |
-| Run build/test/lint | run_command | terminal |
+| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |
 | Git repository state | git_info | terminal (git) |
 | Stage and commit | git_commit | terminal (git) |
 | Check runtimes/tools | check_environment | terminal |
 | Check ports/containers | service_status | terminal |
-| Run commands, scripts, get real-time data | terminal | — |
+| Run commands, scripts, get real-time data (only when no dedicated tool fits) | terminal | — |
 | Get system specs, current time/date | system_info, terminal | — |
 | Store user info | remember_fact | — |
 | User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
@@ -1752,57 +1535,9 @@ treating an error as active — stale log lines may only describe a past failure
 {send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
 
 ## Tools
-- `read_file`: Read file contents with line numbers plus basic metadata (size, modified time). Supports line ranges and `tail_lines` for large files/logs. Use instead of terminal cat/head/tail.
-- `write_file`: Write or create files with atomic writes and automatic backup. Use instead of terminal echo/cat/heredoc redirection. ALWAYS prefer write_file over `cat > file << 'EOF'` in terminal — heredoc commands trigger approval flow and may be too long.
-- `edit_file`: Find and replace text in files. Validates uniqueness, shows context around changes. Use instead of terminal sed/awk. If it fails with not-found/ambiguous text, call `read_file` for the same path and retry once before asking the user.
-- `search_files`: Search by filename glob and/or content regex. Auto-skips .git/node_modules/target. Use instead of terminal find/grep.
-- `project_inspect`: Understand project(s) in one call: type detection, metadata, git info, directory structure. For multiple folders, prefer one batched call with `paths` instead of many repeated single-path calls.
-- `run_command`: Run safe build/test/lint commands (cargo, npm, pytest, go, git read-only, ls, etc.) without approval flow. For arbitrary/dangerous commands, use terminal.
-- `git_info`: Get comprehensive git state: status, log, branches, remotes, diff, stash — all in one call.
-- `git_commit`: Stage files and commit. Validates changes exist. Use instead of separate git add + git commit terminal calls.
-- `check_environment`: Check available runtimes/tools and their versions in parallel. Detects config files (.nvmrc, Dockerfile, etc).
-- `service_status`: Check listening ports, Docker containers, and dev processes. Platform-aware (macOS/Linux).
-- `terminal`: Run shell commands (git, npm, pip, cargo, docker, curl, etc.). \
-Use for coding tasks, builds, deployments, and system administration. \
-Check if a dedicated tool exists first (read_file, write_file, edit_file, search_files, run_command, git_info, git_commit). \
-For recursive code/text search, prefer `search_files`; if using `terminal`, avoid broad `grep -r` over `.` without `--include` / `--exclude-dir` filters. \
-Commands that aren't pre-approved go through the user approval flow. \
-IMPORTANT: If a user sends a command chain (using &&, ||, ;, or |) that contains ANY dangerous segment, \
-refuse the ENTIRE chain. Never split a dangerous chain to execute only the \"safe\" parts — \
-ask the user which specific operation they want instead.
-- `system_info`: Get CPU, memory, and OS information.
-- `remember_fact`: Store important facts about the user for long-term memory. Categories: \
-user (personal info), preference (tool/workflow prefs), project (current work), technical \
-(environment details), relationship (communication patterns), behavior (observed patterns).
-- `manage_config`: Read and update your own config.toml. Use this for configuration changes: \
-add owner IDs (`set` key `users.owner_ids.telegram` etc.), change model names, \
-update API keys, toggle features, configure project path aliases (`set` key `path_aliases.projects`). \
-Use this tool directly for config operations. \
-For primary provider changes, prefer `action='switch_provider'` (guided, asks for minimal details). \
-For provider failover setup, use `action='list_failover_providers'`, `action='add_failover_provider'`, and `action='remove_failover_provider'`. \
-Use `action='list_provider_presets'` first when the user is unsure.
-- `scheduled_goal_runs`: Run and debug scheduled-goal executions without terminal/sqlite. \
-ONLY for recurring/scheduled goals and run diagnostics. Do NOT use for learning or storing facts. \
-Actions: run_now (trigger a scheduled goal immediately), run_history (recent runs + status mix), \
-last_failure (latest failed/blocked run with recent activity), unblock_hints (concrete fix suggestions).
-- `goal_trace`: Observability trace for goals/tasks/tools. \
-Actions: goal_trace (timeline, retries, durations, tool sequence), \
-tool_trace (activity events grouped by tool, with filters).
-- `tool_trace`: Alias for `goal_trace(action='tool_trace')` with the same behavior. \
-Use this when you specifically need per-tool execution forensics.
-- `self_diagnose`: Diagnose why a task failed. \
-Actions: list_tasks (recent task outcomes), timeline (full task event timeline), \
-diagnose (ranked root causes with evidence), compare (find divergence between two tasks).
-- `web_search`: Search the web. Returns titles, URLs, and snippets for your query. \
-Use to find current information, research topics, check facts. \
-Make focused queries — one search is almost always enough. For factual lookups \
-(weather, time, scores, prices, exchange rates, simple questions), a single search \
-suffices — do NOT re-search with rephrased queries. Synthesize results promptly; \
-do not over-research.
-- `web_fetch`: Fetch a readable web page and extract its content. Strips ads/navigation. \
-Do NOT use it for REST/JSON API endpoints or machine-readable responses; use `http_request` for APIs instead. \
-For login-required sites, use `browser` instead.
-{browser_tool_doc}{send_file_tool_doc}{spawn_tool_doc}{cli_agent_tool_doc}{manage_cli_agents_tool_doc}{health_probe_tool_doc}{manage_skills_tool_doc}{use_skill_tool_doc}{skill_resources_tool_doc}{manage_people_tool_doc}{http_request_tool_doc}{manage_api_tool_doc}{manage_http_auth_tool_doc}{manage_oauth_tool_doc}{direct_mode_doc}
+Your tool schemas are the authoritative reference for what each tool does and
+how to call it. Use the Tool Selection Guide table above to pick the right
+tool for a task; consult the schema for parameters and semantics.{cli_agent_guidance}{api_runtime_context}{direct_mode_doc}
 
 ## Built-in Channels
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
@@ -2131,5 +1866,136 @@ mod tests {
 
         let unchanged = state.get_goal(&user_goal.id).await.unwrap().unwrap();
         assert_eq!(unchanged.status, "active");
+    }
+
+    fn parse_config(toml_str: &str) -> AppConfig {
+        toml::from_str(toml_str).expect("prompt test config should parse")
+    }
+
+    fn minimal_config() -> AppConfig {
+        parse_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test"
+
+[provider.models]
+primary = "gpt-4o"
+"#,
+        )
+    }
+
+    #[test]
+    fn base_prompt_replaces_catalog_with_pointer() {
+        let config = minimal_config();
+        let prompt = build_base_system_prompt(&config, &[]);
+
+        // Pointer text is present.
+        assert!(
+            prompt.contains("Your tool schemas are the authoritative reference"),
+            "expected the Tools pointer text"
+        );
+        // Old static catalog entry is gone.
+        assert!(
+            !prompt.contains("- `read_file`: Read file contents with line numbers"),
+            "old static read_file catalog entry should be removed"
+        );
+        assert!(
+            !prompt.contains("YOUR PRIMARY TOOL FOR COMPLEX TASKS"),
+            "old cli_agent orchestration essay should be removed"
+        );
+        // Critical routing rows remain.
+        assert!(prompt.contains("## Tool Selection Guide"));
+        assert!(prompt.contains("| Read file contents | read_file"));
+        assert!(prompt.contains(
+            "| Read web pages, articles, docs | web_fetch | http_request for REST/JSON APIs; browser for login/JS pages"
+        ));
+        assert!(prompt.contains(
+            "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
+        ));
+    }
+
+    #[test]
+    fn cli_agent_guidance_conditional_on_config() {
+        let enabled = parse_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test"
+
+[provider.models]
+primary = "gpt-4o"
+
+[cli_agents]
+enabled = true
+"#,
+        );
+        let prompt = build_base_system_prompt(&enabled, &[]);
+        assert!(prompt.contains("## CLI Agent Delegation"));
+        assert!(prompt.contains("Always set working_dir"));
+
+        let disabled = parse_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test"
+
+[provider.models]
+primary = "gpt-4o"
+
+[cli_agents]
+enabled = false
+"#,
+        );
+        let prompt = build_base_system_prompt(&disabled, &[]);
+        assert!(!prompt.contains("## CLI Agent Delegation"));
+    }
+
+    #[test]
+    fn api_runtime_context_reflects_profiles_and_missing_guides() {
+        let config = parse_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "test"
+
+[provider.models]
+primary = "gpt-4o"
+
+[http_auth.stripe]
+auth_type = "bearer"
+allowed_domains = ["api.stripe.com"]
+
+[http_auth.twitter]
+auth_type = "bearer"
+allowed_domains = ["api.twitter.com"]
+"#,
+        );
+
+        // Only "twitter" has a matching skill guide; "stripe" is missing one.
+        let prompt = build_base_system_prompt(&config, &["twitter".to_string()]);
+        assert!(prompt.contains("## API Runtime Context"));
+        assert!(
+            prompt.contains("Available manual HTTP auth profiles: stripe, twitter")
+                || prompt.contains("Available manual HTTP auth profiles: twitter, stripe"),
+            "configured profile names should appear"
+        );
+        assert!(
+            prompt.contains("Profiles missing API guides: stripe."),
+            "stripe should be reported as missing a guide; twitter should not"
+        );
+        assert!(prompt.contains("Never ask the user to paste credentials into chat."));
+    }
+
+    #[test]
+    fn api_runtime_context_reports_none_when_empty() {
+        let config = minimal_config();
+        let prompt = build_base_system_prompt(&config, &[]);
+        assert!(prompt.contains("Available manual HTTP auth profiles: none."));
+        assert!(prompt.contains("Profiles missing API guides: none."));
     }
 }

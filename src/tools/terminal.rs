@@ -1945,7 +1945,7 @@ impl Tool for TerminalTool {
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation.",
+            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
             "parameters": {
                 "type": "object",
                 "properties": {

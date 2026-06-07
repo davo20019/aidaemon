@@ -756,7 +756,7 @@ impl Tool for ManageApiTool {
     fn schema(&self) -> Value {
         json!({
             "name": "manage_api",
-            "description": "Connect auth, learn API docs/specs, and verify with a safe probe.",
+            "description": "Run a deterministic end-to-end API onboarding flow: connect auth, learn API docs/specs, and verify with a safe probe. Never ask the user to paste credentials into chat; give the secure keychain command instead.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -22,7 +22,7 @@ impl Tool for WriteFileTool {
     fn schema(&self) -> Value {
         json!({
             "name": "write_file",
-            "description": "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting.",
+            "description": "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.",
             "parameters": {
                 "type": "object",
                 "properties": {

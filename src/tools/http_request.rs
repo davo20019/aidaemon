@@ -1474,7 +1474,7 @@ impl Tool for HttpRequestTool {
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
             "parameters": {
                 "type": "object",
                 "properties": {
