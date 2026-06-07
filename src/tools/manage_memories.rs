@@ -244,7 +244,7 @@ struct ManageArgs {
 fn manage_memories_schema() -> Value {
     json!({
         "name": "manage_memories",
-        "description": "Memories+goals.Goal id prefix ok.Not for storing,use remember_fact.",
+        "description": "Manage memories and goals. Goal id prefix ok. Use remember_fact.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -263,7 +263,9 @@ fn manage_memories_schema() -> Value {
                 "schedule_id": { "type": "string" },
                 "schedule": { "type": "string" },
                 "schedules": { "type": "array", "items": { "type": "string" } },
-                "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] }
+                "fire_policy": { "type": "string", "enum": ["coalesce", "always_fire"] },
+                "is_one_shot": { "type": "boolean", "description": "One-shot schedule (fire once then complete)" },
+                "is_paused": { "type": "boolean", "description": "Create paused" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -1796,8 +1798,8 @@ mod tests {
             .unwrap()
             .len();
         assert!(
-            bytes <= 1100,
-            "manage_memories schema is {bytes} bytes, budget is 1100"
+            bytes <= 1250,
+            "manage_memories schema is {bytes} bytes, budget is 1250"
         );
     }
 
