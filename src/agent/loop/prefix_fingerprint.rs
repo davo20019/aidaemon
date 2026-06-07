@@ -68,10 +68,25 @@ pub(crate) struct ProviderCallFingerprint {
     /// disabled via tool_choice=none), so their hash is computed normally —
     /// stability across a force-text turn is part of the signal.
     pub tool_defs_hash: String,
-    /// Hash of the `[Session Summary]` message at index one, if present;
-    /// empty string otherwise. Surfaced separately so index-one churn is
-    /// immediately visible.
+    /// Retired by Pillar A; summary participates in `tail_hash` instead.
+    /// Field stays for parser/back-compat but is always written as an empty
+    /// string.
     pub session_summary_hash: String,
+    /// Hash of the task-context tail message (the message whose content starts
+    /// with `TASK_CONTEXT_TAIL_MARKER`) within the `[1..boundary)` region.
+    /// Empty string when no tail message is present.
+    ///
+    /// Diagnosis rule: an archived flip WITHOUT a Window decision / Prefix
+    /// mutation / fp_mismatch is a bug. A tail-only flip is expected and
+    /// normal (per-turn date/time update).
+    pub tail_hash: String,
+    /// Hash of the pre-boundary archived region `[1..boundary)` EXCLUDING the
+    /// tail message. Equals `hash_pre_boundary` when no tail is present.
+    ///
+    /// Diagnosis rule: `prefix_hash_archived` flipping without a Window
+    /// decision / Prefix mutation / fp_mismatch = bug; tail-only flip =
+    /// expected.
+    pub prefix_hash_archived: String,
     /// Marks force-text iterations (plain-text required; tool calling
     /// disabled via tool_choice=none while tool definitions stay in the
     /// payload). The mode marker for attribution; it does not affect any
@@ -79,10 +94,10 @@ pub(crate) struct ProviderCallFingerprint {
     pub force_text: bool,
 }
 
-/// Marker prefix for the message-build session summary (see
-/// `message_build_phase.rs`). Used to locate the index-one summary so its
-/// churn can be hashed independently of the rest of the pre-boundary region.
-const SESSION_SUMMARY_MARKER: &str = "[Session Summary]";
+/// Marker prefix for the task context tail message. SHARED between the tail
+/// builder (`system_prompt.rs`) and this module so the constant never drifts.
+/// The tail builder re-exports this constant; do not duplicate the literal.
+pub(crate) const TASK_CONTEXT_TAIL_MARKER: &str = "[Task Context]";
 
 /// Build the [`ProviderCallFingerprint`] for the final provider payload.
 ///
@@ -110,15 +125,40 @@ pub(crate) fn provider_call_fingerprint(
         hash_canonical(&Value::Array(effective_tools.to_vec()))
     };
 
-    let session_summary_hash = messages
+    // Locate the tail message within [1..boundary). The tail is identified by
+    // its content starting with TASK_CONTEXT_TAIL_MARKER.
+    let tail_idx = messages
         .iter()
-        .find(|m| {
+        .enumerate()
+        .skip(1)
+        .take(boundary_pos.saturating_sub(1))
+        .find(|(_, m)| {
             m.get("content")
                 .and_then(|c| c.as_str())
-                .is_some_and(|s| s.starts_with(SESSION_SUMMARY_MARKER))
+                .is_some_and(|s| s.starts_with(TASK_CONTEXT_TAIL_MARKER))
         })
-        .map(hash_canonical)
+        .map(|(i, _)| i);
+
+    let tail_hash = tail_idx
+        .map(|i| hash_canonical(&messages[i]))
         .unwrap_or_default();
+
+    // prefix_hash_archived = hash of [1..boundary) EXCLUDING the tail message.
+    let prefix_hash_archived = {
+        let archived: Vec<Value> = messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(boundary_pos.saturating_sub(1))
+            .filter(|(i, _)| Some(*i) != tail_idx)
+            .map(|(_, m)| m.clone())
+            .collect();
+        hash_canonical(&Value::Array(archived))
+    };
+
+    // session_summary_hash is retired: always empty. The summary now
+    // participates in tail_hash when the tail builder includes it.
+    let session_summary_hash = String::new();
 
     ProviderCallFingerprint {
         hash_system,
@@ -127,6 +167,8 @@ pub(crate) fn provider_call_fingerprint(
         message_count: messages.len(),
         tool_defs_hash,
         session_summary_hash,
+        tail_hash,
+        prefix_hash_archived,
         force_text,
     }
 }
@@ -399,7 +441,9 @@ mod tests {
     }
 
     #[test]
-    fn session_summary_hash_present_only_when_summary_message_exists() {
+    fn session_summary_hash_is_always_empty_after_retirement() {
+        // Pillar A retires session_summary_hash; the field stays for
+        // parser/back-compat but must always be the empty string.
         let mut messages = sample_messages();
         let without = provider_call_fingerprint(&messages, "current question", &[], false);
         assert_eq!(without.session_summary_hash, "");
@@ -408,8 +452,11 @@ mod tests {
             1,
             json!({"role": "system", "content": "[Session Summary]\nUser likes coffee."}),
         );
-        let with = provider_call_fingerprint(&messages, "current question", &[], false);
-        assert_ne!(with.session_summary_hash, "");
+        let with_summary = provider_call_fingerprint(&messages, "current question", &[], false);
+        assert_eq!(
+            with_summary.session_summary_hash, "",
+            "session_summary_hash retired: must be empty even when summary message is present"
+        );
     }
 
     #[test]
@@ -464,5 +511,61 @@ mod tests {
         let a = json!({"outer": {"b": 1, "a": 2}, "list": [{"y": 1, "x": 2}]});
         let b = json!({"list": [{"x": 2, "y": 1}], "outer": {"a": 2, "b": 1}});
         assert_eq!(hash_canonical(&a), hash_canonical(&b));
+    }
+
+    #[test]
+    fn tail_hash_separates_tail_from_archived_region() {
+        // Payload: [system, history-a, history-b, TAIL, user]. The tail is
+        // located by TASK_CONTEXT_TAIL_MARKER; prefix_hash_archived covers
+        // [1..boundary) EXCLUDING the tail; tail_hash covers the tail alone.
+        let mut messages = sample_messages();
+        // The tail sits immediately BEFORE the current user message, INSIDE the
+        // [1..boundary) region the fingerprint searches. In sample_messages() the
+        // current user message ("current question") is at index 3 and its tool
+        // chain follows it (indices 4-5) — the last message is a `tool`, NOT the
+        // user message. Locate the insertion via boundary_pos so the fixture stays
+        // correct (and inside the searched region) regardless of the sample shape.
+        let tail_pos = boundary_pos(&messages, "current question");
+        messages.insert(
+            tail_pos,
+            serde_json::json!({
+                "role": "system",
+                "content": format!("{TASK_CONTEXT_TAIL_MARKER}\n[Current Date & Time]\nstub"),
+            }),
+        );
+        let fp = provider_call_fingerprint(&messages, "current question", &[], false);
+        assert!(!fp.tail_hash.is_empty(), "tail must be located and hashed");
+
+        // Changing ONLY the tail flips tail_hash and pre_boundary, but NOT archived.
+        let mut tail_changed = messages.clone();
+        tail_changed[tail_pos]["content"] =
+            format!("{TASK_CONTEXT_TAIL_MARKER}\n[Current Date & Time]\nother").into();
+        let fp2 = provider_call_fingerprint(&tail_changed, "current question", &[], false);
+        assert_ne!(fp.tail_hash, fp2.tail_hash);
+        assert_eq!(fp.prefix_hash_archived, fp2.prefix_hash_archived);
+        assert_ne!(fp.hash_pre_boundary, fp2.hash_pre_boundary);
+
+        // Changing an archived message flips archived but not tail.
+        let mut hist_changed = messages.clone();
+        hist_changed[1]["content"] = "mutated history".into();
+        let fp3 = provider_call_fingerprint(&hist_changed, "current question", &[], false);
+        assert_ne!(fp.prefix_hash_archived, fp3.prefix_hash_archived);
+        assert_eq!(fp.tail_hash, fp3.tail_hash);
+    }
+
+    #[test]
+    fn no_tail_marker_means_empty_tail_hash_and_archived_equals_pre_boundary() {
+        let messages = sample_messages();
+        let fp = provider_call_fingerprint(&messages, "current question", &[], false);
+        assert!(fp.tail_hash.is_empty());
+        assert_eq!(fp.prefix_hash_archived, fp.hash_pre_boundary);
+    }
+
+    #[test]
+    fn session_summary_hash_is_retired() {
+        // Field stays for parser compatibility but always reports empty.
+        let messages = sample_messages();
+        let fp = provider_call_fingerprint(&messages, "current question", &[], false);
+        assert!(fp.session_summary_hash.is_empty());
     }
 }

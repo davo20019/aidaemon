@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::events::TaskOutcome;
 use crate::traits::ProviderResponse;
 
 /// Check if the continuation text has significant word overlap with the prefix,
@@ -19,7 +20,10 @@ fn has_significant_overlap(prefix: &str, continuation: &str) -> bool {
     let prefix_words = normalize(prefix);
     let cont_words = normalize(continuation);
 
-    if prefix_words.is_empty() || cont_words.is_empty() {
+    // A short continuation cannot be a complete rewrite of a long response.
+    // Treating phrase overlap in a brief tail as a rewrite can discard the
+    // entire saved prefix and expose a response that starts mid-word.
+    if prefix_words.is_empty() || cont_words.len() < 20 {
         return false;
     }
 
@@ -142,6 +146,7 @@ async fn finalize_external_action_timeout_ack(
             emitter,
             task_id,
             TaskStatus::Completed,
+            TaskOutcome::Failed,
             task_start,
             iteration,
             learning_ctx.tool_calls.len(),
@@ -151,6 +156,7 @@ async fn finalize_external_action_timeout_ack(
         .await;
 
     learning_ctx.completed_naturally = true;
+    learning_ctx.task_outcome = Some(TaskOutcome::Failed);
     let learning_ctx_for_task = learning_ctx.clone();
     let state = agent.state.clone();
     tokio::spawn(async move {
@@ -415,6 +421,8 @@ pub(super) async fn run_llm_phase(
             iteration,
             prefix_hash_system = %prefix_fp.hash_system,
             prefix_hash_pre_boundary = %prefix_fp.hash_pre_boundary,
+            prefix_hash_archived = %prefix_fp.prefix_hash_archived,
+            tail_hash = %prefix_fp.tail_hash,
             boundary_pos = prefix_fp.boundary_pos,
             message_count = prefix_fp.message_count,
             tool_defs_hash = %prefix_fp.tool_defs_hash,
@@ -559,12 +567,19 @@ pub(super) async fn run_llm_phase(
             attempts = llm_telemetry.attempts,
             "LLM call completed"
         );
-        let _ = emitter
-            .emit(
-                EventType::LlmCall,
-                LlmCallData {
+        crate::events::record_model_call_telemetry(
+            emitter,
+            services.agent.state.as_ref(),
+            crate::events::ModelCallTelemetryInput {
+                session_id: session_id.to_string(),
+                task_id: task_id.to_string(),
+                call_purpose: None,
+                iteration: Some(iteration as u32),
+                llm_call: LlmCallData {
+                    call_id: None,
+                    call_purpose: None,
                     task_id: task_id.to_string(),
-                    iteration: iteration as u32,
+                    iteration: Some(iteration as u32),
                     model: model.to_string(),
                     final_model: Some(final_model),
                     fell_back: llm_telemetry.fell_back,
@@ -582,12 +597,17 @@ pub(super) async fn run_llm_phase(
                     prefix_hash_pre_boundary: Some(prefix_fp.hash_pre_boundary.clone()),
                     tool_defs_hash: Some(prefix_fp.tool_defs_hash.clone()),
                     session_summary_hash: Some(prefix_fp.session_summary_hash.clone()),
+                    tail_hash: Some(prefix_fp.tail_hash.clone()),
+                    prefix_hash_archived: Some(prefix_fp.prefix_hash_archived.clone()),
                     boundary_pos: Some(prefix_fp.boundary_pos),
                     message_count: Some(prefix_fp.message_count),
                     force_text: prefix_fp.force_text,
+                    token_usage_present: resp.usage.is_some(),
                 },
-            )
-            .await;
+                token_usage: resp.usage.clone(),
+            },
+        )
+        .await;
     }
 
     let llm_text_closeout_candidate = resp.tool_calls.is_empty()
@@ -613,15 +633,6 @@ pub(super) async fn run_llm_phase(
             task_tokens_used = *task_tokens_used,
             "LLM token usage"
         );
-        if let Err(e) = services
-            .agent
-            .state
-            .record_token_usage(session_id, usage)
-            .await
-        {
-            warn!(session_id, error = %e, "Failed to record token usage");
-        }
-
         // Goal budget accounting: increment tokens_used_today for daily
         // admission control. Scheduled runs use a separate per-run budget
         // once they have started.
@@ -759,12 +770,14 @@ pub(super) async fn run_llm_phase(
                                     if status == TaskStatus::Failed {
                                         record_failed_task_tokens(*task_tokens_used);
                                     }
+                                    let outcome = TaskOutcome::Failed;
                                     services
                                         .agent
                                         .emit_task_end(
                                             emitter,
                                             task_id,
                                             status,
+                                            outcome,
                                             task_start,
                                             iteration,
                                             learning_ctx.tool_calls.len(),
@@ -887,12 +900,14 @@ pub(super) async fn run_llm_phase(
                                 if status == TaskStatus::Failed {
                                     record_failed_task_tokens(*task_tokens_used);
                                 }
+                                let outcome = TaskOutcome::Failed;
                                 services
                                     .agent
                                     .emit_task_end(
                                         emitter,
                                         task_id,
                                         status,
+                                        outcome,
                                         task_start,
                                         iteration,
                                         learning_ctx.tool_calls.len(),
@@ -1153,6 +1168,19 @@ mod tests {
         assert!(
             !has_significant_overlap(prefix, continuation),
             "Should allow genuine continuation with no overlap"
+        );
+    }
+
+    #[test]
+    fn overlap_does_not_replace_prefix_with_short_continuation_tail() {
+        let prefix = "Which company or role are you targeting? After comparing the resumes, \
+                      the AI Expert version is the strongest choice because it emphasizes the \
+                      architecture experience that makes the chosen one";
+        let continuation = "even stronger. Which company or role are you looking at right now?";
+
+        assert!(
+            !has_significant_overlap(prefix, continuation),
+            "a short continuation tail must not replace the saved response prefix"
         );
     }
 

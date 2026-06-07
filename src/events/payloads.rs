@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use super::TaskStatus;
+use super::{TaskOutcome, TaskStatus};
 use crate::traits::MessageAnnotation;
 
 // =============================================================================
@@ -167,6 +167,110 @@ pub struct ToolResultData {
 }
 
 // =============================================================================
+// LLM Events
+// =============================================================================
+
+/// Data for LlmCall event — per-call latency and token telemetry.
+///
+/// Emitted once per LLM provider call in the agent loop (including the root
+/// orchestrator turns that `task_activity` rows do not cover). Captures the
+/// missing "how long did the model take?" signal plus fallback metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmCallData {
+    /// Unique identifier correlating this event with a token_usage row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// Background or auxiliary call purpose (e.g. summarization, intent_classifier).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_purpose: Option<String>,
+    /// Associated task ID.
+    pub task_id: String,
+    /// Iteration where this call occurred (1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// Model requested for this call.
+    pub model: String,
+    /// Model that actually produced the response (differs from `model` on fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_model: Option<String>,
+    /// Whether the call fell back to a different model/provider.
+    #[serde(default)]
+    pub fell_back: bool,
+    /// Number of provider attempts made (1 = no retry/fallback).
+    #[serde(default)]
+    pub attempts: u32,
+    /// End-to-end latency including any recovery/fallback, in milliseconds.
+    pub latency_ms: u64,
+    /// Actual input (prompt) tokens reported by the provider.
+    #[serde(default)]
+    pub input_tokens: u32,
+    /// Actual output (completion) tokens reported by the provider.
+    #[serde(default)]
+    pub output_tokens: u32,
+    /// Input tokens served from a provider-side cache, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u32>,
+    /// Input tokens newly written into a provider-side cache, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Input tokens that were not provider-cache hits (`input_tokens - cached_input_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_input_tokens: Option<u32>,
+    /// Estimated input tokens computed at message-build time (for est-vs-actual drift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub est_input_tokens: Option<u32>,
+    /// Number of tool calls requested in the response.
+    #[serde(default)]
+    pub tool_calls_count: u32,
+    /// Message-build phase duration for this iteration, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_ms: Option<u64>,
+    /// Hash of message zero (system prompt) for prefix-cache attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash_system: Option<String>,
+    /// Hash of the pre-current-turn history region for prefix-cache attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash_pre_boundary: Option<String>,
+    /// Hash of effective tool definitions sent to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_defs_hash: Option<String>,
+    /// Hash of the injected session summary message, if present.
+    /// Retired by Pillar A; always written as `None`/empty. Kept for
+    /// parser/back-compat so older event rows can still be deserialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_summary_hash: Option<String>,
+    /// Hash of the task-context tail message (`[Task Context]` marker) within
+    /// the `[1..boundary)` region. `None`/empty when no tail is present.
+    ///
+    /// Diagnosis rule: `prefix_hash_archived` flipping WITHOUT a Window
+    /// decision / Prefix mutation / fp_mismatch = bug; tail-only flip =
+    /// expected (per-turn date/time update in the tail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_hash: Option<String>,
+    /// Hash of the pre-boundary archived region `[1..boundary)` EXCLUDING the
+    /// tail message. Equals `prefix_hash_pre_boundary` when no tail is
+    /// present.
+    ///
+    /// Diagnosis rule: `prefix_hash_archived` flipping WITHOUT a Window
+    /// decision / Prefix mutation / fp_mismatch = bug; tail-only flip =
+    /// expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash_archived: Option<String>,
+    /// Index of the current-turn boundary in the final provider payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_pos: Option<usize>,
+    /// Number of messages in the final provider payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    /// Whether this call forced text-only mode and omitted tool definitions.
+    #[serde(default)]
+    pub force_text: bool,
+    /// Whether provider token usage was available for this call.
+    #[serde(default)]
+    pub token_usage_present: bool,
+}
+
+// =============================================================================
 // Agent Thinking Events
 // =============================================================================
 
@@ -320,6 +424,7 @@ pub enum DecisionType {
     ExecutionFailureClassification,
     PostExecutionValidation,
     RepetitiveCallDetection,
+    SemanticReadDecision,
     ConsecutiveSameToolDetection,
     AlternatingPatternDetection,
     ToolBudgetBlock,
@@ -327,6 +432,7 @@ pub enum DecisionType {
     StoppingCondition,
     InstructionsSnapshot,
     BudgetAutoExtension,
+    LlmEfficiencyAlert,
 }
 
 impl DecisionType {
@@ -343,6 +449,7 @@ impl DecisionType {
             DecisionType::ExecutionFailureClassification => "execution_failure_classification",
             DecisionType::PostExecutionValidation => "post_execution_validation",
             DecisionType::RepetitiveCallDetection => "repetitive_call_detection",
+            DecisionType::SemanticReadDecision => "semantic_read_decision",
             DecisionType::ConsecutiveSameToolDetection => "consecutive_same_tool_detection",
             DecisionType::AlternatingPatternDetection => "alternating_pattern_detection",
             DecisionType::ToolBudgetBlock => "tool_budget_block",
@@ -350,6 +457,7 @@ impl DecisionType {
             DecisionType::StoppingCondition => "stopping_condition",
             DecisionType::InstructionsSnapshot => "instructions_snapshot",
             DecisionType::BudgetAutoExtension => "budget_auto_extension",
+            DecisionType::LlmEfficiencyAlert => "llm_efficiency_alert",
         }
     }
 }
@@ -413,6 +521,9 @@ pub struct TaskEndData {
     pub task_id: String,
     /// How the task ended
     pub status: TaskStatus,
+    /// Semantic result delivered by this execution.
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
     /// Total duration in seconds
     pub duration_secs: u64,
     /// Number of thinking iterations
@@ -425,6 +536,45 @@ pub struct TaskEndData {
     /// Brief summary of what was accomplished
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Per-task efficiency rollup captured when the task ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efficiency: Option<TaskEfficiencyData>,
+}
+
+impl TaskEndData {
+    /// Single resolver for semantic outcome, including legacy fallback from status.
+    pub fn effective_outcome(&self) -> TaskOutcome {
+        if let Some(outcome) = self.outcome {
+            return outcome;
+        }
+        match self.status {
+            TaskStatus::Completed => TaskOutcome::Succeeded,
+            TaskStatus::Cancelled | TaskStatus::Failed => TaskOutcome::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEfficiencyData {
+    pub llm_calls: u64,
+    pub attempts: u64,
+    pub fell_back_count: u64,
+    pub p95_latency_ms: u64,
+    pub max_latency_ms: u64,
+    pub max_latency_iteration: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_input_tokens: Option<u64>,
+    pub est_input_drift: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
 }
 
 // =============================================================================
@@ -706,6 +856,206 @@ mod tests {
         assert_eq!(data.idempotency_key.as_deref(), Some("idem-task-1-c1"));
         assert_eq!(data.policy_rev, Some(3));
         assert_eq!(data.risk_score, Some(0.72));
+    }
+
+    #[test]
+    fn llm_call_data_serde_roundtrip() {
+        let data = LlmCallData {
+            call_id: Some("call-42".to_string()),
+            call_purpose: Some("agent_loop".to_string()),
+            task_id: "task-42".to_string(),
+            iteration: Some(2),
+            model: "primary".to_string(),
+            final_model: Some("fallback".to_string()),
+            fell_back: true,
+            attempts: 3,
+            latency_ms: 1234,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: Some(60),
+            cache_creation_input_tokens: Some(10),
+            fresh_input_tokens: Some(40),
+            est_input_tokens: Some(120),
+            tool_calls_count: 1,
+            build_ms: Some(7),
+            prefix_hash_system: Some("sys-hash".to_string()),
+            prefix_hash_pre_boundary: Some("pre-hash".to_string()),
+            tool_defs_hash: Some("tools-hash".to_string()),
+            // session_summary_hash: retired by Pillar A; always None at write time.
+            session_summary_hash: None,
+            tail_hash: Some("tail-hash".to_string()),
+            prefix_hash_archived: Some("archived-hash".to_string()),
+            boundary_pos: Some(12),
+            message_count: Some(18),
+            force_text: true,
+            token_usage_present: true,
+        };
+        let json = serde_json::to_value(&data).expect("serialize");
+        let back: LlmCallData = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.task_id, "task-42");
+        assert_eq!(back.iteration, Some(2));
+        assert_eq!(back.final_model.as_deref(), Some("fallback"));
+        assert!(back.fell_back);
+        assert_eq!(back.attempts, 3);
+        assert_eq!(back.latency_ms, 1234);
+        assert_eq!(back.input_tokens, 100);
+        assert_eq!(back.output_tokens, 50);
+        assert_eq!(back.cached_input_tokens, Some(60));
+        assert_eq!(back.cache_creation_input_tokens, Some(10));
+        assert_eq!(back.fresh_input_tokens, Some(40));
+        assert_eq!(back.est_input_tokens, Some(120));
+        assert_eq!(back.tool_calls_count, 1);
+        assert_eq!(back.build_ms, Some(7));
+        assert_eq!(back.prefix_hash_system.as_deref(), Some("sys-hash"));
+        assert_eq!(back.prefix_hash_pre_boundary.as_deref(), Some("pre-hash"));
+        assert_eq!(back.tool_defs_hash.as_deref(), Some("tools-hash"));
+        // session_summary_hash is retired; None skips serialization, deserializes as None.
+        assert!(back.session_summary_hash.is_none());
+        assert_eq!(back.tail_hash.as_deref(), Some("tail-hash"));
+        assert_eq!(back.prefix_hash_archived.as_deref(), Some("archived-hash"));
+        assert_eq!(back.boundary_pos, Some(12));
+        assert_eq!(back.message_count, Some(18));
+        assert!(back.force_text);
+    }
+
+    #[test]
+    fn llm_call_data_minimal_defaults() {
+        // Only required fields present; optionals/defaults fill in.
+        let data: LlmCallData = serde_json::from_value(json!({
+            "task_id": "t1",
+            "iteration": 1,
+            "model": "m",
+            "latency_ms": 0
+        }))
+        .expect("deserialize minimal LlmCallData");
+        assert!(!data.fell_back);
+        assert_eq!(data.attempts, 0);
+        assert_eq!(data.input_tokens, 0);
+        assert!(data.cached_input_tokens.is_none());
+        assert!(data.cache_creation_input_tokens.is_none());
+        assert!(data.fresh_input_tokens.is_none());
+        assert!(data.final_model.is_none());
+        assert!(data.est_input_tokens.is_none());
+        assert!(data.build_ms.is_none());
+        assert!(data.prefix_hash_system.is_none());
+        assert!(data.prefix_hash_pre_boundary.is_none());
+        assert!(data.tool_defs_hash.is_none());
+        assert!(data.session_summary_hash.is_none());
+        assert!(data.tail_hash.is_none());
+        assert!(data.prefix_hash_archived.is_none());
+        assert!(data.boundary_pos.is_none());
+        assert!(data.message_count.is_none());
+        assert!(!data.force_text);
+    }
+
+    #[test]
+    fn task_end_data_defaults_efficiency_to_none() {
+        let data: TaskEndData = serde_json::from_value(json!({
+            "task_id": "t1",
+            "status": "completed",
+            "duration_secs": 5,
+            "iterations": 2,
+            "tool_calls_count": 1
+        }))
+        .expect("deserialize minimal TaskEndData");
+
+        assert!(data.efficiency.is_none());
+        assert!(data.outcome.is_none());
+        assert_eq!(data.effective_outcome(), TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn task_end_legacy_failed_status_defaults_outcome_to_failed() {
+        let data: TaskEndData = serde_json::from_value(json!({
+            "task_id": "t1",
+            "status": "failed",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 0
+        }))
+        .expect("deserialize legacy failed task end");
+        assert_eq!(data.effective_outcome(), TaskOutcome::Failed);
+    }
+
+    #[test]
+    fn task_end_outcome_precedence_over_status() {
+        let data: TaskEndData = serde_json::from_value(json!({
+            "task_id": "t1",
+            "status": "completed",
+            "outcome": "partial",
+            "duration_secs": 1,
+            "iterations": 1,
+            "tool_calls_count": 0
+        }))
+        .expect("deserialize partial completed task end");
+        assert_eq!(data.effective_outcome(), TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn task_end_all_status_outcome_combinations_serialize() {
+        for status in ["completed", "failed", "cancelled"] {
+            for outcome in ["succeeded", "partial", "failed"] {
+                let value = json!({
+                    "task_id": "t1",
+                    "status": status,
+                    "outcome": outcome,
+                    "duration_secs": 1,
+                    "iterations": 1,
+                    "tool_calls_count": 0
+                });
+                let data: TaskEndData =
+                    serde_json::from_value(value).expect("deserialize task end combo");
+                assert_eq!(data.outcome.map(|o| o.as_str()), Some(outcome));
+            }
+        }
+    }
+
+    #[test]
+    fn task_end_data_roundtrips_efficiency_summary() {
+        let data = TaskEndData {
+            task_id: "t2".to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some(TaskOutcome::Succeeded),
+            duration_secs: 10,
+            iterations: 3,
+            tool_calls_count: 2,
+            error: None,
+            summary: Some("done".to_string()),
+            efficiency: Some(TaskEfficiencyData {
+                llm_calls: 3,
+                attempts: 4,
+                fell_back_count: 1,
+                p95_latency_ms: 900,
+                max_latency_ms: 1200,
+                max_latency_iteration: 2,
+                input_tokens: 42_000,
+                output_tokens: 700,
+                cached_input_tokens: Some(32_000),
+                cache_creation_input_tokens: Some(1_000),
+                fresh_input_tokens: Some(10_000),
+                est_input_drift: -300,
+                final_model: Some("fallback".to_string()),
+                reasons: vec!["1 fallback(s)".to_string()],
+            }),
+        };
+
+        let json = serde_json::to_value(&data).expect("serialize");
+        let back: TaskEndData = serde_json::from_value(json).expect("deserialize");
+        let efficiency = back.efficiency.expect("efficiency summary");
+        assert_eq!(efficiency.llm_calls, 3);
+        assert_eq!(efficiency.attempts, 4);
+        assert_eq!(efficiency.fell_back_count, 1);
+        assert_eq!(efficiency.p95_latency_ms, 900);
+        assert_eq!(efficiency.max_latency_ms, 1200);
+        assert_eq!(efficiency.max_latency_iteration, 2);
+        assert_eq!(efficiency.input_tokens, 42_000);
+        assert_eq!(efficiency.output_tokens, 700);
+        assert_eq!(efficiency.cached_input_tokens, Some(32_000));
+        assert_eq!(efficiency.cache_creation_input_tokens, Some(1_000));
+        assert_eq!(efficiency.fresh_input_tokens, Some(10_000));
+        assert_eq!(efficiency.est_input_drift, -300);
+        assert_eq!(efficiency.final_model.as_deref(), Some("fallback"));
+        assert_eq!(efficiency.reasons, vec!["1 fallback(s)"]);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
 use super::{
-    DecisionPointData, DecisionType, Event, EventType, PolicyDecisionData, TaskEndData, TaskStatus,
-    ToolResultData,
+    DecisionPointData, DecisionType, Event, EventType, LlmCallData, PolicyDecisionData,
+    TaskEndData, TaskStatus, ToolResultData,
 };
 use crate::traits::Message;
 
@@ -30,9 +30,14 @@ pub struct TaskWindowStats {
     pub cancelled: u64,
     pub stalled: u64,
     pub error_events: u64,
+    pub outcome_succeeded: u64,
+    pub outcome_partial: u64,
+    pub outcome_failed: u64,
+    pub outcome_unknown: u64,
     pub completion_rate: f64,
     pub error_rate: f64,
     pub stall_rate: f64,
+    pub semantic_success_rate: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +50,74 @@ pub struct ToolStats {
     pub common_errors: Vec<(String, u64)>,
 }
 
+/// Aggregated latency + token telemetry over recent `LlmCall` events.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LlmStats {
+    pub total_calls: u64,
+    pub avg_latency_ms: u64,
+    pub p50_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    pub max_latency_ms: u64,
+    pub fell_back_count: u64,
+    pub avg_input_tokens: u64,
+    pub avg_output_tokens: u64,
+}
+
+/// Per-task rollup of `LlmCall` telemetry. Powers the self-diagnosis LLM
+/// summary (Tier 1) and the per-turn efficiency reflection signal (Tier 2).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskLlmSummary {
+    pub total_calls: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cached_input_tokens: u64,
+    pub cached_input_token_samples: u64,
+    pub total_cache_creation_input_tokens: u64,
+    pub cache_creation_input_token_samples: u64,
+    /// Sum of estimated input tokens over calls that carried an estimate.
+    pub total_est_input_tokens: u64,
+    /// Sum of actual input tokens over calls that carried an estimate
+    /// (paired denominator for drift, so the comparison is apples-to-apples).
+    pub actual_input_tokens_with_est: u64,
+    /// Number of calls that carried an input-token estimate.
+    pub est_samples: u64,
+    pub avg_latency_ms: u64,
+    pub p50_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    pub max_latency_ms: u64,
+    /// Iteration (1-based) of the slowest call in the task.
+    pub max_latency_iteration: u32,
+    pub fell_back_count: u64,
+    /// Sum of provider attempts across calls (attempts > calls ⇒ retries).
+    pub total_attempts: u64,
+    /// Model that produced the final call (helps distinguish model vs logic).
+    pub final_model: Option<String>,
+}
+
+impl TaskLlmSummary {
+    /// Signed est-vs-actual input-token drift over calls that had an estimate.
+    /// Positive ⇒ estimate ran high (over-counted); negative ⇒ under-counted.
+    pub fn est_input_drift(&self) -> i64 {
+        self.total_est_input_tokens as i64 - self.actual_input_tokens_with_est as i64
+    }
+
+    /// Whether this turn looks notably inefficient and worth flagging.
+    /// Tuned to be quiet on healthy turns: fires on retries/fallback, heavy
+    /// iteration loops, or large est-vs-actual token drift.
+    pub fn is_inefficient(&self) -> bool {
+        let retried = self.total_attempts > self.total_calls;
+        let looped = self.total_calls >= 8;
+        let drift_ratio = if self.actual_input_tokens_with_est > 0 {
+            (self.est_input_drift().unsigned_abs() as f64)
+                / (self.actual_input_tokens_with_est as f64)
+        } else {
+            0.0
+        };
+        let big_drift = self.est_samples > 0 && drift_ratio >= 0.30;
+        self.fell_back_count > 0 || retried || looped || big_drift
+    }
+}
+
 impl Default for TaskWindowStats {
     fn default() -> Self {
         Self {
@@ -54,9 +127,14 @@ impl Default for TaskWindowStats {
             cancelled: 0,
             stalled: 0,
             error_events: 0,
+            outcome_succeeded: 0,
+            outcome_partial: 0,
+            outcome_failed: 0,
+            outcome_unknown: 0,
             completion_rate: 1.0,
             error_rate: 0.0,
             stall_rate: 0.0,
+            semantic_success_rate: 1.0,
         }
     }
 }
@@ -429,7 +507,7 @@ impl EventStore {
             events.retain(|e| {
                 e.parse_data::<TaskEndData>()
                     .ok()
-                    .is_some_and(|d| matches!(d.status, TaskStatus::Failed))
+                    .is_some_and(|d| d.effective_outcome() != crate::events::TaskOutcome::Succeeded)
             });
         }
         events.truncate(limit.max(1));
@@ -730,6 +808,7 @@ impl EventStore {
                 serde_json::to_value(TaskEndData {
                     task_id: task_id.clone(),
                     status: TaskStatus::Failed,
+                    outcome: Some(crate::events::TaskOutcome::Failed),
                     duration_secs,
                     iterations: 0,
                     tool_calls_count: 0,
@@ -738,6 +817,7 @@ impl EventStore {
                         stale_after_mins
                     )),
                     summary: Some("Recovered stale in-flight task".to_string()),
+                    efficiency: None,
                 })?,
             );
             self.append(event).await?;
@@ -840,6 +920,152 @@ impl EventStore {
             avg_duration_ms,
             common_errors,
         })
+    }
+
+    /// Aggregate latency + token telemetry over recent `LlmCall` events.
+    /// Powers the dashboard `/api/llm/latency` endpoint and ad-hoc diagnostics.
+    pub async fn get_llm_stats(&self, since: DateTime<Utc>) -> anyhow::Result<LlmStats> {
+        let since_str = since.to_rfc3339();
+        let rows = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE event_type = 'llm_call'
+              AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 2000
+            "#,
+        )
+        .bind(&since_str)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut latencies: Vec<u64> = Vec::with_capacity(rows.len());
+        let mut latency_sum: u128 = 0;
+        let mut input_sum: u128 = 0;
+        let mut output_sum: u128 = 0;
+        let mut fell_back_count = 0u64;
+
+        for row in rows {
+            let data_str: String = row.get("data");
+            let call: LlmCallData = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            latencies.push(call.latency_ms);
+            latency_sum += call.latency_ms as u128;
+            input_sum += call.input_tokens as u128;
+            output_sum += call.output_tokens as u128;
+            if call.fell_back {
+                fell_back_count += 1;
+            }
+        }
+
+        let total_calls = latencies.len() as u64;
+        if total_calls == 0 {
+            return Ok(LlmStats::default());
+        }
+
+        latencies.sort_unstable();
+        let percentile = |sorted: &[u64], pct: f64| -> u64 {
+            if sorted.is_empty() {
+                return 0;
+            }
+            // Nearest-rank percentile.
+            let rank = (pct / 100.0 * sorted.len() as f64).ceil() as usize;
+            let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+            sorted[idx]
+        };
+
+        Ok(LlmStats {
+            total_calls,
+            avg_latency_ms: (latency_sum / total_calls as u128) as u64,
+            p50_latency_ms: percentile(&latencies, 50.0),
+            p95_latency_ms: percentile(&latencies, 95.0),
+            max_latency_ms: *latencies.last().unwrap_or(&0),
+            fell_back_count,
+            avg_input_tokens: (input_sum / total_calls as u128) as u64,
+            avg_output_tokens: (output_sum / total_calls as u128) as u64,
+        })
+    }
+
+    /// Roll up `LlmCall` telemetry for a single task. Used by `self_diagnose`
+    /// (Tier 1) and the per-turn efficiency signal at task end (Tier 2).
+    pub async fn get_task_llm_stats(&self, task_id: &str) -> anyhow::Result<TaskLlmSummary> {
+        let rows = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE event_type = 'llm_call'
+              AND task_id = ?
+            ORDER BY created_at ASC
+            LIMIT 2000
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut summary = TaskLlmSummary::default();
+        let mut latencies: Vec<u64> = Vec::with_capacity(rows.len());
+        let mut latency_sum: u128 = 0;
+        let mut max_latency = 0u64;
+
+        for row in rows {
+            let data_str: String = row.get("data");
+            let call: LlmCallData = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            summary.total_calls += 1;
+            summary.total_input_tokens += call.input_tokens as u64;
+            summary.total_output_tokens += call.output_tokens as u64;
+            if let Some(cached) = call.cached_input_tokens {
+                summary.cached_input_token_samples += 1;
+                summary.total_cached_input_tokens += cached as u64;
+            }
+            if let Some(created) = call.cache_creation_input_tokens {
+                summary.cache_creation_input_token_samples += 1;
+                summary.total_cache_creation_input_tokens += created as u64;
+            }
+            summary.total_attempts += call.attempts.max(1) as u64;
+            if call.fell_back {
+                summary.fell_back_count += 1;
+            }
+            if let Some(est) = call.est_input_tokens {
+                summary.est_samples += 1;
+                summary.total_est_input_tokens += est as u64;
+                summary.actual_input_tokens_with_est += call.input_tokens as u64;
+            }
+            latencies.push(call.latency_ms);
+            latency_sum += call.latency_ms as u128;
+            if call.latency_ms >= max_latency {
+                max_latency = call.latency_ms;
+                summary.max_latency_iteration = call.iteration.unwrap_or(0);
+            }
+            // Last row wins (ASC order) so this is the final model used.
+            summary.final_model = call.final_model.or(Some(call.model));
+        }
+
+        if summary.total_calls == 0 {
+            return Ok(summary);
+        }
+
+        latencies.sort_unstable();
+        let percentile = |sorted: &[u64], pct: f64| -> u64 {
+            if sorted.is_empty() {
+                return 0;
+            }
+            let rank = (pct / 100.0 * sorted.len() as f64).ceil() as usize;
+            let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+            sorted[idx]
+        };
+
+        summary.avg_latency_ms = (latency_sum / summary.total_calls as u128) as u64;
+        summary.p50_latency_ms = percentile(&latencies, 50.0);
+        summary.p95_latency_ms = percentile(&latencies, 95.0);
+        summary.max_latency_ms = max_latency;
+        Ok(summary)
     }
 
     /// Get the last completed task for a session
@@ -1056,6 +1282,11 @@ impl EventStore {
                     TaskStatus::Failed => stats.failed += 1,
                     TaskStatus::Cancelled => stats.cancelled += 1,
                 }
+                match data.effective_outcome() {
+                    crate::events::TaskOutcome::Succeeded => stats.outcome_succeeded += 1,
+                    crate::events::TaskOutcome::Partial => stats.outcome_partial += 1,
+                    crate::events::TaskOutcome::Failed => stats.outcome_failed += 1,
+                }
                 let stalled = data
                     .error
                     .as_deref()
@@ -1069,6 +1300,8 @@ impl EventStore {
                 if stalled {
                     stats.stalled += 1;
                 }
+            } else {
+                stats.outcome_unknown += 1;
             }
         }
         stats.error_events = errors.len() as u64;
@@ -1077,6 +1310,11 @@ impl EventStore {
             stats.completion_rate = stats.completed as f64 / stats.total as f64;
             stats.error_rate = stats.error_events as f64 / stats.total as f64;
             stats.stall_rate = stats.stalled as f64 / stats.total as f64;
+            let semantic_known = stats.total.saturating_sub(stats.outcome_unknown);
+            if semantic_known > 0 {
+                stats.semantic_success_rate =
+                    stats.outcome_succeeded as f64 / semantic_known as f64;
+            }
         }
 
         Ok(stats)
@@ -1275,11 +1513,16 @@ mod tests {
         let payload = TaskEndData {
             task_id: task_id.to_string(),
             status,
+            outcome: Some(match status {
+                TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
+                TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
+            }),
             duration_secs: 1,
             iterations: 1,
             tool_calls_count: 0,
             error: error.map(str::to_string),
             summary: summary.map(str::to_string),
+            efficiency: None,
         };
         append_event_at(
             store,
@@ -1953,6 +2196,176 @@ mod tests {
         assert_eq!(stats.successful, 1);
         assert_eq!(stats.failed, 0);
         assert_eq!(stats.avg_duration_ms, 120);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_llm_call(
+        store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        iteration: u32,
+        latency_ms: u64,
+        input_tokens: u32,
+        est_input_tokens: Option<u32>,
+        fell_back: bool,
+        attempts: u32,
+        final_model: Option<&str>,
+        cached_input_tokens: Option<u32>,
+        cache_creation_input_tokens: Option<u32>,
+        created_at: DateTime<Utc>,
+    ) {
+        let payload = LlmCallData {
+            call_id: None,
+            call_purpose: None,
+            task_id: task_id.to_string(),
+            iteration: Some(iteration),
+            model: "primary-model".to_string(),
+            final_model: final_model.map(str::to_string),
+            fell_back,
+            attempts,
+            latency_ms,
+            input_tokens,
+            output_tokens: 100,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            fresh_input_tokens: cached_input_tokens
+                .map(|cached| input_tokens.saturating_sub(cached)),
+            est_input_tokens,
+            tool_calls_count: 0,
+            build_ms: Some(5),
+            prefix_hash_system: None,
+            prefix_hash_pre_boundary: None,
+            tool_defs_hash: None,
+            session_summary_hash: None,
+            tail_hash: None,
+            prefix_hash_archived: None,
+            boundary_pos: None,
+            message_count: None,
+            force_text: false,
+            token_usage_present: true,
+        };
+        append_event_at(
+            store,
+            session_id,
+            EventType::LlmCall,
+            serde_json::to_value(payload).expect("serialize llm call"),
+            created_at,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_task_llm_stats_aggregates_latency_and_drift() {
+        let (store, _db_file) = setup_store().await;
+        let now = Utc::now();
+        let session = "s-llm-task";
+        let task = "task-llm-1";
+
+        // Two calls in this task; second is slower, fell back, and retried.
+        append_llm_call(
+            &store,
+            session,
+            task,
+            1,
+            100,
+            1000,
+            Some(1200),
+            false,
+            1,
+            None,
+            Some(700),
+            Some(50),
+            now - Duration::minutes(2),
+        )
+        .await;
+        append_llm_call(
+            &store,
+            session,
+            task,
+            2,
+            500,
+            2000,
+            Some(2000),
+            true,
+            3,
+            Some("fallback-model"),
+            Some(1000),
+            None,
+            now - Duration::minutes(1),
+        )
+        .await;
+        // A call belonging to a different task must be excluded.
+        append_llm_call(
+            &store,
+            session,
+            "other-task",
+            1,
+            9999,
+            50,
+            None,
+            false,
+            1,
+            None,
+            Some(49),
+            None,
+            now - Duration::seconds(30),
+        )
+        .await;
+
+        let s = store
+            .get_task_llm_stats(task)
+            .await
+            .expect("task llm stats");
+
+        assert_eq!(s.total_calls, 2);
+        assert_eq!(s.total_input_tokens, 3000);
+        assert_eq!(s.total_cached_input_tokens, 1700);
+        assert_eq!(s.cached_input_token_samples, 2);
+        assert_eq!(s.total_cache_creation_input_tokens, 50);
+        assert_eq!(s.cache_creation_input_token_samples, 1);
+        assert_eq!(s.total_attempts, 4);
+        assert_eq!(s.fell_back_count, 1);
+        assert_eq!(s.max_latency_ms, 500);
+        assert_eq!(s.max_latency_iteration, 2);
+        assert_eq!(s.est_samples, 2);
+        // est 1200+2000=3200 vs actual 1000+2000=3000 ⇒ over-estimated by 200.
+        assert_eq!(s.total_est_input_tokens, 3200);
+        assert_eq!(s.actual_input_tokens_with_est, 3000);
+        assert_eq!(s.est_input_drift(), 200);
+        assert_eq!(s.final_model.as_deref(), Some("fallback-model"));
+        // Fallback + retries ⇒ flagged inefficient.
+        assert!(s.is_inefficient());
+    }
+
+    #[test]
+    fn task_llm_summary_healthy_turn_is_not_flagged() {
+        let s = TaskLlmSummary {
+            total_calls: 3,
+            total_attempts: 3,
+            fell_back_count: 0,
+            est_samples: 3,
+            total_est_input_tokens: 1050,
+            actual_input_tokens_with_est: 1000,
+            ..Default::default()
+        };
+        // 5% drift, no retries/fallbacks, light loop ⇒ healthy.
+        assert_eq!(s.est_input_drift(), 50);
+        assert!(!s.is_inefficient());
+    }
+
+    #[test]
+    fn task_llm_summary_large_token_drift_is_flagged() {
+        let s = TaskLlmSummary {
+            total_calls: 2,
+            total_attempts: 2,
+            fell_back_count: 0,
+            est_samples: 2,
+            total_est_input_tokens: 2000,
+            actual_input_tokens_with_est: 1000,
+            ..Default::default()
+        };
+        // 100% over-estimate ⇒ flagged even without fallbacks/retries.
+        assert!(s.is_inefficient());
     }
 
     #[test]
