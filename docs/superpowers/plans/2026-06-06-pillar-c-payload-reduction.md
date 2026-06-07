@@ -637,11 +637,20 @@ Fill this table during Tasks 1, 7, and 8, then commit it in Task 9:
 
 | Metric | Pre-C | Post-C |
 |---|---:|---:|
-| Base system prompt bytes | 52,880 | — |
-| Complete tool-definition bytes | 36,710 (38 tools) | — |
-| Compact full-request bytes | 91,732 | — |
-| `## Tools` section bytes | 17,999 | — |
-| Median prompt tokens | ~22.3k (Phase 0 run) | — |
+| Base system prompt bytes | 52,880 | 35,104 |
+| Complete tool-definition bytes | 36,710 (38 tools) | 14,878 (17 exposed)¹ |
+| Compact full-request bytes | 91,732 | 52,627¹ |
+| `## Tools` section bytes | 17,999 | ~1,084 |
+| Sum of 11 slimmed schemas (wire) | 14,534 | 10,446 (−4,088) |
+| Median prompt tokens | ~22.3k (Phase 0 run) | — (Task 8) |
+
+¹ Tool-definition and full-request post-C numbers are NOT directly
+comparable to pre-C: a concurrent (non-Pillar-C) workstream changed the
+registered roster (38 → 27) and switched the policy tool filter from shadow
+to enforcing (27 → 17 exposed for this request). Pillar C's attributable
+reductions are the base-prompt catalog (−16.9k) and the slimmed-schema sum
+(−4.1k). NOTE for Pillar A: per-request roster filtering is the spec's
+"per-turn dynamic tool gating" anti-pattern — reconcile before Pillar A.
 | Payload reduction | — | — |
 | `tool_defs_hash` stable within run | — | — |
 | Common live smoke | — | — |
