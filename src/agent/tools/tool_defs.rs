@@ -65,10 +65,17 @@ impl Agent {
         Ok(())
     }
 
-    /// Build OpenAI-format tool definitions plus capability metadata map.
-    pub(super) async fn tool_definitions_with_capabilities(
+    /// Build OpenAI-format tool definitions plus capability metadata for the
+    /// statically registered tools only. This collection is query-independent:
+    /// it iterates `self.tools` (the fixed registered set), validates each
+    /// schema, and performs NO user-message gating, NO MCP-trigger matching, and
+    /// NO per-turn policy/personal-memory restrictions. It is the shared source
+    /// for both `tool_definitions_with_capabilities` (which appends MCP-triggered
+    /// tools) and `session_static_tool_roster` (which hashes into the Pillar A
+    /// core). Keep these two callers using this helper so the static collection
+    /// is never duplicated.
+    pub(super) fn registered_tool_definitions_with_capabilities(
         &self,
-        user_message: &str,
     ) -> (Vec<Value>, HashMap<String, ToolCapabilities>) {
         let mut defs: Vec<Value> = Vec::new();
         let mut capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
@@ -97,6 +104,16 @@ impl Agent {
                 }
             }
         }
+
+        (defs, capabilities)
+    }
+
+    /// Build OpenAI-format tool definitions plus capability metadata map.
+    pub(super) async fn tool_definitions_with_capabilities(
+        &self,
+        user_message: &str,
+    ) -> (Vec<Value>, HashMap<String, ToolCapabilities>) {
+        let (mut defs, mut capabilities) = self.registered_tool_definitions_with_capabilities();
 
         // MCP composition stage 1: explicit trigger matching
         if let Some(ref registry) = self.mcp_registry {
@@ -153,6 +170,67 @@ impl Agent {
         def.get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
+    }
+
+    /// Session-static tool roster for the Pillar A core prompt: `(tool name,
+    /// serialized schema)` pairs, sorted by tool name.
+    ///
+    /// This is intentionally query-independent. It is built from the statically
+    /// registered, currently-available tools (`registered_tool_definitions_with_capabilities`),
+    /// applies ONLY the session-static channel-visibility class (the
+    /// `PublicExternal` allowlist), and deliberately EXCLUDES:
+    /// - MCP-trigger matching (per user message),
+    /// - per-turn policy filtering, personal-memory restriction, and
+    ///   untrusted-external-reference restriction.
+    ///
+    /// Non-owners receive tools based on role (no tool access), so the roster is
+    /// empty for any non-`Owner` role — matching the `tools_allowed_for_user`
+    /// gate in bootstrap.
+    #[allow(dead_code)] // consumed by Task 4 core assembly / Task 7
+    pub(super) fn session_static_tool_roster(
+        &self,
+        user_role: UserRole,
+        visibility: ChannelVisibility,
+    ) -> Vec<(String, String)> {
+        if user_role != UserRole::Owner {
+            return Vec::new();
+        }
+
+        let (mut defs, _caps) = self.registered_tool_definitions_with_capabilities();
+
+        // Channel-visibility class is session-static and so stays in the core.
+        if visibility == ChannelVisibility::PublicExternal {
+            let allowed = ["web_search", "remember_fact", "system_info"];
+            defs.retain(|d| {
+                Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
+            });
+        }
+
+        let mut roster: Vec<(String, String)> = defs
+            .iter()
+            .filter_map(|d| {
+                let name = Self::tool_name_from_definition(d)?.to_string();
+                // Deterministic serialization: serde_json preserves the schema's
+                // per-construction-site key order, so this is stable for a given
+                // tool version.
+                Some((name, d.to_string()))
+            })
+            .collect();
+        roster.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        roster
+    }
+
+    /// Sort tool definitions in place by tool name, using serialized definition
+    /// bytes as a deterministic tie-breaker. Consumed by Task 6 payload assembly
+    /// (both after bootstrap assembly and on the final effective provider
+    /// subset) to enforce a stable provider tool-array ordering.
+    #[allow(dead_code)] // consumed by Task 6 payload assembly
+    pub(super) fn sort_tool_definitions_by_name(defs: &mut [Value]) {
+        defs.sort_by(|a, b| {
+            let an = Self::tool_name_from_definition(a).unwrap_or("");
+            let bn = Self::tool_name_from_definition(b).unwrap_or("");
+            an.cmp(bn).then_with(|| a.to_string().cmp(&b.to_string()))
+        });
     }
 
     fn request_requires_connected_api_setup_tools(user_message: &str) -> bool {
@@ -507,6 +585,97 @@ mod tests {
         assert!(caps.contains_key("web_search"));
         assert!(!caps.contains_key("cli_agent"));
         assert!(!harness.agent.has_cli_agents_available());
+    }
+
+    #[tokio::test]
+    async fn session_static_roster_is_query_independent_and_sorted() {
+        let t1 = Arc::new(MockTool::new("zebra_tool", "z", "ok")) as Arc<dyn Tool>;
+        let t2 = Arc::new(MockTool::new("alpha_tool", "a", "ok")) as Arc<dyn Tool>;
+        let harness =
+            setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![t1, t2])
+                .await
+                .unwrap();
+
+        let roster_a = harness
+            .agent
+            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::Private);
+        let roster_b = harness
+            .agent
+            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::Private);
+        // Query-independent: identical regardless of any user message.
+        assert_eq!(roster_a, roster_b);
+
+        let names: Vec<&str> = roster_a.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"alpha_tool"));
+        assert!(names.contains(&"zebra_tool"));
+        // Sorted by name.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+    }
+
+    #[tokio::test]
+    async fn session_static_roster_empty_for_non_owner() {
+        let t1 = Arc::new(MockTool::new("alpha_tool", "a", "ok")) as Arc<dyn Tool>;
+        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![t1])
+            .await
+            .unwrap();
+
+        assert!(harness
+            .agent
+            .session_static_tool_roster(UserRole::Guest, ChannelVisibility::Private)
+            .is_empty());
+        assert!(harness
+            .agent
+            .session_static_tool_roster(UserRole::Public, ChannelVisibility::Private)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_static_roster_applies_public_external_allowlist() {
+        let web = Arc::new(MockTool::new("web_search", "search", "ok")) as Arc<dyn Tool>;
+        let other = Arc::new(MockTool::new("alpha_tool", "a", "ok")) as Arc<dyn Tool>;
+        let harness =
+            setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![web, other])
+                .await
+                .unwrap();
+
+        let roster = harness
+            .agent
+            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::PublicExternal);
+        let names: Vec<&str> = roster.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"web_search"));
+        assert!(!names.contains(&"alpha_tool"));
+    }
+
+    #[test]
+    fn sort_tool_definitions_by_name_orders_by_name() {
+        let mut defs = vec![
+            named_tool_def("zebra"),
+            named_tool_def("alpha"),
+            named_tool_def("mango"),
+        ];
+        Agent::sort_tool_definitions_by_name(&mut defs);
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .collect();
+        assert_eq!(names, vec!["alpha", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn sort_tool_definitions_by_name_tiebreaks_on_serialized_bytes() {
+        // Same name, different bodies — deterministic order by serialized bytes.
+        let mut a = named_tool_def("dup");
+        a["function"]["description"] = json!("aaa");
+        let mut b = named_tool_def("dup");
+        b["function"]["description"] = json!("bbb");
+
+        let mut defs1 = vec![b.clone(), a.clone()];
+        let mut defs2 = vec![a.clone(), b.clone()];
+        Agent::sort_tool_definitions_by_name(&mut defs1);
+        Agent::sort_tool_definitions_by_name(&mut defs2);
+        assert_eq!(defs1, defs2);
     }
 
     #[tokio::test]

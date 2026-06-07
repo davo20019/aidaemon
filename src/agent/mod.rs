@@ -16,7 +16,7 @@ use crate::channels::ChannelHub;
 use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
-    SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
+    LlmCallData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
     ThinkingStartData, ToolCallData, ToolCallInfo, ToolResultData,
 };
 use crate::execution_policy::{ApprovalMode, ExecutionPolicy, ModelProfile};
@@ -89,8 +89,8 @@ use response_analysis::has_action_promise;
 #[cfg(test)]
 use response_analysis::sanitize_response_analysis;
 use response_analysis::{
-    is_substantive_text_response, looks_like_deferred_action_response,
-    looks_like_multi_part_request,
+    claims_completed_side_effect, is_substantive_text_response,
+    looks_like_deferred_action_response, looks_like_multi_part_request,
 };
 #[path = "intent/keywords.rs"]
 mod intent_keywords;
@@ -155,8 +155,11 @@ use loop_utils::{
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;
+#[path = "runtime/task_outcome.rs"]
+mod task_outcome;
 use post_task::LearningContext;
 pub(in crate::agent) use post_task::ReplayNoteCategory;
+pub(in crate::agent) use task_outcome::{response_has_user_value, TaskOutcomeDerivation};
 #[allow(dead_code, unused_imports)]
 #[path = "loop/state/mod.rs"]
 mod loop_state;
@@ -173,6 +176,8 @@ mod completion_checks;
 mod completion_contract;
 #[path = "loop/completion_phase.rs"]
 mod completion_phase;
+#[path = "runtime/core_prompt.rs"]
+mod core_prompt;
 #[path = "runtime/dialogue_state.rs"]
 mod dialogue_state;
 #[path = "loop/direct_return.rs"]
@@ -212,6 +217,7 @@ pub(in crate::agent) use history::VerificationTargetKind;
 mod compaction;
 #[path = "runtime/llm.rs"]
 mod llm;
+pub(in crate::agent) use llm::LlmCallTelemetry;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
 #[path = "loop/main_loop.rs"]
@@ -220,6 +226,10 @@ mod main_loop;
 mod message_build_phase;
 #[path = "runtime/models.rs"]
 mod models;
+#[path = "loop/prefix_fingerprint.rs"]
+mod prefix_fingerprint;
+#[path = "loop/request_dump.rs"]
+mod request_dump;
 #[path = "runtime/resume.rs"]
 mod resume;
 #[path = "loop/sliding_window.rs"]
@@ -248,11 +258,8 @@ mod tool_prelude_phase;
 mod tool_result_notices;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
-use system_prompt::{build_tool_loop_system_prompt, format_goal_context, ToolLoopPromptStyle};
+use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
-
-#[cfg(test)]
-use system_prompt::strip_markdown_section;
 
 // Policy runtime metrics, route-drift monitor, and bounded autotuning.
 // Implementation lives in `policy_metrics.rs` (Phase 5 decoupling).
@@ -292,6 +299,11 @@ pub(in crate::agent) use agent_helpers::{
     IntentGateDecision, ResumeCheckpoint, ResumeExecutionSnapshot,
 };
 pub use agent_helpers::{send_status, touch_heartbeat};
+
+/// Phase 0 per-session window-boundary memory: `session_id` →
+/// (last `keep_from` index, last oldest-kept persisted message id). Used by
+/// `message_build_phase` to emit an explicit boundary-movement event.
+type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Option<String>)>>>;
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
@@ -357,6 +369,13 @@ pub struct Agent {
     /// `message_build_phase` uses this stamp to find the current-task
     /// boundary without inferring from message content.
     current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Phase 0 observability — per-session memory of the last sliding-window
+    /// trim decision (`keep_from` index + oldest-kept persisted message id).
+    /// Lets `message_build_phase` emit an explicit movement event when the
+    /// window boundary shifts between builds, which is the prime suspect for
+    /// llama.cpp prefix-cache breaks. In-memory, lost on restart (the
+    /// server-side KV cache is stale then anyway).
+    window_keep_from_tracker: WindowBoundaryMemory,
     /// Test-only override for the execution budget selected at the start of
     /// the agent loop. When `Some`, `select_initial_execution_budget` is
     /// bypassed and this budget is used instead.
@@ -410,8 +429,8 @@ pub(in crate::agent) use goal_dispatch::{
     is_low_signal_task_lead_reply, looks_like_evidence_grounding_challenge,
     looks_like_false_capability_denial_after_tool_success, looks_like_incomplete_live_work_summary,
     parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
-    strip_leading_wait, task_has_scheduled_provenance, truncate_goal_result_text,
-    user_facing_task_description,
+    salvageable_task_lead_result, strip_leading_wait, task_has_scheduled_provenance,
+    truncate_goal_result_text, user_facing_task_description,
 };
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
@@ -757,6 +776,7 @@ mod final_reply_marker_tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
         let mut tool_failure_count = HashMap::new();
