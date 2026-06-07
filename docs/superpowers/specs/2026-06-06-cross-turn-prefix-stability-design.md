@@ -66,15 +66,20 @@ Per task (turn) N, iteration 1:
                                 procedures, matched skill content,
                                 current-speaker/people context, resume
                                 checkpoint. Compiled once per task.
-[k+2..] CURRENT TURN            current user message, then append-only
-                                assistant/tool exchanges and system
-                                directives as iterations proceed.
+[k+2..] CURRENT TURN            current user message, then persisted
+                                assistant/tool exchanges (stable region),
+                                followed by a TRANSIENT SUFFIX of
+                                regenerated execution checkpoints and
+                                one-shot system directives.
 ```
 
-The tail sits **before** the current turn. Every within-task iteration is a
-strict prefix extension (appends only). Nothing about turn N's payload is a
-prefix promise for turn N+1 at or after the tail position — see the
-invariants below for what is promised.
+The tail sits **before** the current turn. Within a task, the **stable
+region** (everything through the persisted current-turn messages) extends
+monotonically across iterations, while the **transient suffix**
+(checkpoints, one-shot directives) may be replaced each iteration — see
+invariant 3. Nothing about turn N's payload is a prefix promise for turn
+N+1 at or after the tail position — see the invariants below for what is
+promised.
 
 ### Cross-turn prefix invariants
 
@@ -299,9 +304,13 @@ per session, in-memory.
   (role, content, tool_name, tool_call_id, tool_calls_json, annotations,
   and the sequence position itself). The only excluded fields are an
   explicit denylist of never-rendered fields (`embedding`, `importance`,
-  `created_at`; finalized in the plan). Anything not on the denylist is in
-  the fingerprint by default — omissions fail closed (spurious re-render),
-  never open (stale bytes).
+  `created_at`; finalized in the plan). `Message.id` is never rendered
+  either but is deliberately **retained** in the fingerprint: it is
+  DB-stable, uniquely identifies the row, and with the synthetic-user path
+  deleted it cannot vary between rebuilds — fail-closed keeps it harmless
+  and it strengthens identity of the input set. Anything not on the
+  denylist is in the fingerprint by default — omissions fail closed
+  (spurious re-render), never open (stale bytes).
 - Lookup requires `content_fp + renderer_version + mode` to match; any
   mismatch re-renders and replaces.
 - Debug/test builds always re-render and assert byte equality against the
@@ -332,10 +341,11 @@ final rendered content) with a 10% safety margin, not raw message lengths.
 context budget, the payload carries **zero archived turns** (current turn +
 core + tail only), a `warn!` names the overflowing components, and any
 further reduction (tail compaction, schema slimming) is a Pillar C concern —
-the eviction mechanism never truncates inside a turn. Eviction is the only operation that rewrites the
-prefix head; it is rare and deep by construction. The anchor is in-memory;
-persisting it is deferred unless warm-across-restart behavior becomes a
-requirement.
+the eviction mechanism never truncates inside a turn.
+
+Eviction is the only operation that rewrites the prefix head; it is rare
+and deep by construction. The anchor is in-memory; persisting it is
+deferred unless warm-across-restart behavior becomes a requirement.
 
 ## Pillar C — payload reduction
 
@@ -377,6 +387,30 @@ this phase. New lines:
 - `Prefix mutation reason=<mechanism>` (info) — emitted by each retained
   within-task mutator (repeated-tool-error collapse, history-fitting
   overflow, empty-response retry rebuild)
+
+**New fingerprint region: the tail must be separable in live logs.** Under
+this design the task tail sits inside the fingerprint's pre-boundary region,
+so `prefix_hash_pre_boundary` flips on every turn **by design** (expected
+tail replacement) — making expected tail churn and unexpected
+archived-region instability indistinguishable, which would demote the
+invariant-1/2 guarantees to test-only properties. The provider-call
+fingerprint therefore gains two fields:
+
+- `tail_hash` — the tail message located by its deterministic marker and
+  hashed separately;
+- `prefix_hash_archived` — the pre-boundary region **excluding** the tail.
+
+`prefix_hash_pre_boundary` keeps its existing semantics for cross-phase
+comparability. The live diagnosis rule becomes: an `prefix_hash_archived`
+flip without a matching eviction (`Window decision`) or `Prefix mutation`
+line is an archived-region bug; a tail-only flip is expected. Diffing
+`AIDAEMON_DUMP_LLM_REQUESTS` output remains the exception path, not the
+routine one.
+
+The `session_summary_hash` index-1 special case retires when the summary
+moves into the tail: the field reports empty, and the summary participates
+in `tail_hash`. `scripts/cache-attribution.py` is updated to parse the new
+fields and to attribute tail-only flips as expected.
 
 After this phase, a `prefix_hash_system` cross-turn flip without a matching
 `Core prompt invalidated` line is a bug by definition.
@@ -433,18 +467,26 @@ serialization.
 ## Exit criteria
 
 1. All four cross-turn prefix invariants hold in integration tests.
-2. Live re-run: criterion 1 (within-task system stability) stays PASS, and
-   every cross-turn `prefix_hash_system` flip pairs with a logged core
-   invalidation.
-3. Live re-run: median turn-start evaluated tokens reduced versus the
-   Phase 0 baseline (~22.3k median). **≥80% reduction is the target** (the
-   expected bound — archived[N] + tail + user message — is a few thousand
-   tokens of a ~22k payload), not a pass/fail gate: the first valid
-   instrumented re-run establishes the measured bound, and the regression
-   threshold used for gating thereafter is set from that measurement.
-4. Pillar C: median per-call payload at or below ~17k tokens, with the
-   tool-selection integration suite green and the live smoke showing no
-   tool-selection regressions.
+2. Live re-run: criterion 1 (within-task system stability) stays PASS;
+   every cross-turn `prefix_hash_system` flip pairs with a logged
+   `Core prompt invalidated` line; and every `prefix_hash_archived` flip
+   pairs with a logged eviction (`Window decision`) or `Prefix mutation`
+   line. Tail-only flips (`tail_hash` changed, `prefix_hash_archived`
+   stable) are expected and pass.
+3. Baselines are sequenced with Pillar C: the Phase 0 baseline (~22.3k
+   median payload, ~22.3k median turn-start re-eval) applies to Pillar C
+   only. **After Pillar C lands, a fresh attribution re-run establishes the
+   post-C baseline** (expected ~16–17k), and Pillars A/B are measured
+   against **that**, not Phase 0 — otherwise the absolute re-eval bound
+   (archived[N] + tail + user ≈ 4–5k) would read as ~70–75% against a
+   payload that no longer exists. **≥80% reduction of median turn-start
+   evaluated tokens versus the post-C baseline is the target**, not a
+   pass/fail gate: the first valid post-A/B re-run establishes the measured
+   bound, and the regression threshold used for gating thereafter is set
+   from that measurement.
+4. Pillar C gate (against the Phase 0 baseline): median per-call payload at
+   or below ~17k tokens, with the tool-selection integration suite green
+   and the live smoke showing no tool-selection regressions.
 
 ## Out of scope
 
