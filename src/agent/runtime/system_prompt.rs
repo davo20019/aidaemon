@@ -596,7 +596,7 @@ impl Agent {
         let core_prompt_bytes = {
             let mut cache = self.core_prompts.write().await;
             let decision = core_prompt::core_cache_decision(cache.get(session_id), &core_inputs);
-            if !decision.hit {
+            if !decision.changed.is_empty() {
                 info!(
                     session_id = %session_id,
                     component = %decision.changed.join(","),

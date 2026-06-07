@@ -15,8 +15,12 @@ use serde_json::json;
 /// deliberately excluded so the core hash is stable across ordinary query
 /// changes within a session.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 pub(crate) struct CoreInputs {
+    /// Both `base_template` and `persona` are sourced from the same configured
+    /// system prompt today (both equal `self.system_prompt`). They are kept as
+    /// separate hash components to allow future divergence — `base_template` may
+    /// be pre-processed independently of `persona` (e.g., tool-prose stripped)
+    /// without collapsing the component-attribution surface.
     pub base_template: String,
     /// (tool name, serialized schema) — sorted by name in canonical form.
     /// SOURCED FROM the session-static `core_tool_roster` (registered tools for
@@ -30,6 +34,10 @@ pub(crate) struct CoreInputs {
     /// (specialist kind, description).
     pub specialists: Vec<(String, String)>,
     pub channel_rules: String,
+    /// Equal to `base_template` at present (both = the configured system prompt).
+    /// Kept as a separate hash component so that future independent pre-processing
+    /// of either field is reflected in component-attributed invalidation without
+    /// requiring a schema change.
     pub persona: String,
 }
 
@@ -37,13 +45,11 @@ pub(crate) struct CoreInputs {
 /// fixed order. Component attribution lets a later task name exactly which input
 /// changed when the core invalidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 pub(crate) struct ComponentHashes {
     /// (component name, hash) pairs in a fixed, declaration order.
     entries: [(&'static str, String); Self::COMPONENT_COUNT],
 }
 
-#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 impl ComponentHashes {
     const COMPONENT_COUNT: usize = 6;
 
@@ -69,7 +75,6 @@ impl ComponentHashes {
     }
 }
 
-#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 impl CoreInputs {
     /// Hash each component independently. Unordered collections (tool roster,
     /// skills catalog) are sorted by name BEFORE hashing so ordering differences
@@ -96,7 +101,9 @@ impl CoreInputs {
         }
     }
 
-    /// Aggregate hash over all component hashes.
+    /// Aggregate hash over all component hashes. Used in tests only; the
+    /// production cache path calls `component_hashes().aggregate()` directly.
+    #[allow(dead_code)]
     pub(crate) fn aggregate_hash(&self) -> String {
         self.component_hashes().aggregate()
     }
@@ -114,18 +121,25 @@ pub(crate) struct CachedCore {
 }
 
 /// Outcome of a cache decision for one task's core inputs.
+///
+/// A HIT is indicated by `changed.is_empty()` (no components diffed). A MISS
+/// has one or more named components; for the very first task of a session (no
+/// prior entry) `changed == ["initial"]`. `updated_entry` is `None` on a HIT
+/// (existing entry is already correct) and `Some` on every MISS.
 pub(crate) struct CoreCacheDecision {
     /// Rendered (or reused) core bytes to feed into the prompt.
     pub bytes: String,
     /// The (possibly new) cache entry to store under the session id. `None` only
     /// on a HIT, where the existing entry is already correct.
     pub updated_entry: Option<CachedCore>,
-    /// `true` on a cache HIT (bytes reused verbatim, no render happened).
-    pub hit: bool,
     /// On a MISS, the component name(s) that changed. For the very first task of
-    /// a session (no prior entry) this is `["initial"]`. Empty on a HIT.
+    /// a session (no prior entry) this is `[INITIAL_COMPONENT]`. Empty on a HIT.
     pub changed: Vec<String>,
 }
+
+/// Sentinel placed in [`CoreCacheDecision::changed`] for the very first task of
+/// a session (no prior cache entry to diff against).
+const INITIAL_COMPONENT: &str = "initial";
 
 /// Pure cache decision over a prior entry and freshly assembled inputs.
 ///
@@ -136,10 +150,10 @@ pub(crate) struct CoreCacheDecision {
 /// entry to insert.
 ///
 /// - HIT: `prev` present and `prev.aggregate == new.aggregate()` → reuse
-///   `prev.bytes`, no render, `updated_entry = None`, `hit = true`.
+///   `prev.bytes`, no render, `updated_entry = None`, `changed` is empty.
 /// - MISS (changed): `prev` present but aggregate differs → render, name changed
 ///   components via `prev.components.diff(&new)`, return a fresh entry.
-/// - MISS (initial): no `prev` → render, `changed = ["initial"]`.
+/// - MISS (initial): no `prev` → render, `changed = [INITIAL_COMPONENT]`.
 pub(crate) fn core_cache_decision(
     prev: Option<&CachedCore>,
     inputs: &CoreInputs,
@@ -152,7 +166,6 @@ pub(crate) fn core_cache_decision(
             return CoreCacheDecision {
                 bytes: prev.bytes.clone(),
                 updated_entry: None,
-                hit: true,
                 changed: Vec::new(),
             };
         }
@@ -165,7 +178,7 @@ pub(crate) fn core_cache_decision(
             .into_iter()
             .map(|s| s.to_string())
             .collect(),
-        None => vec!["initial".to_string()],
+        None => vec![INITIAL_COMPONENT.to_string()],
     };
 
     let bytes = render_core_prompt(inputs);
@@ -178,7 +191,6 @@ pub(crate) fn core_cache_decision(
     CoreCacheDecision {
         bytes,
         updated_entry: Some(updated_entry),
-        hit: false,
         changed,
     }
 }
@@ -459,15 +471,20 @@ mod tests {
         let inputs = test_core_inputs();
         // First task: initial miss.
         let first = core_cache_decision(None, &inputs);
-        assert!(!first.hit);
-        assert_eq!(first.changed, vec!["initial".to_string()]);
+        assert!(
+            !first.changed.is_empty(),
+            "initial miss must name a component"
+        );
+        assert_eq!(first.changed, vec![INITIAL_COMPONENT.to_string()]);
         let entry = first.updated_entry.expect("initial miss stores an entry");
 
-        // Second task, unchanged inputs: HIT, bytes reused verbatim, no change.
+        // Second task, unchanged inputs: HIT (changed is empty), bytes reused verbatim.
         let second = core_cache_decision(Some(&entry), &inputs);
-        assert!(second.hit, "unchanged inputs must be a cache HIT");
+        assert!(
+            second.changed.is_empty(),
+            "unchanged inputs must be a cache HIT (changed empty)"
+        );
         assert!(second.updated_entry.is_none(), "HIT must not re-store");
-        assert!(second.changed.is_empty(), "HIT names no changed component");
         assert_eq!(second.bytes, entry.bytes, "HIT reuses bytes verbatim");
     }
 
@@ -484,7 +501,7 @@ mod tests {
         toggled.skills_catalog[0].2 = !toggled.skills_catalog[0].2;
 
         let second = core_cache_decision(Some(&entry), &toggled);
-        assert!(!second.hit, "a skill toggle must be a MISS");
+        assert!(!second.changed.is_empty(), "a skill toggle must be a MISS");
         assert_eq!(
             second.changed,
             vec!["skills_catalog".to_string()],
@@ -547,7 +564,7 @@ mod tests {
         let entry = first.updated_entry.expect("initial miss stores an entry");
         let second = core_cache_decision(Some(&entry), &inputs_b);
         assert!(
-            second.hit,
+            second.changed.is_empty(),
             "distinct queries with identical session-static inputs must HIT (query-independent core)"
         );
         assert_eq!(
