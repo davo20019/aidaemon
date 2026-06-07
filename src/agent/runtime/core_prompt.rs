@@ -15,7 +15,7 @@ use serde_json::json;
 /// deliberately excluded so the core hash is stable across ordinary query
 /// changes within a session.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // consumed by Task 4 system-prompt core assembly
+#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 pub(crate) struct CoreInputs {
     pub base_template: String,
     /// (tool name, serialized schema) — sorted by name in canonical form.
@@ -37,13 +37,13 @@ pub(crate) struct CoreInputs {
 /// fixed order. Component attribution lets a later task name exactly which input
 /// changed when the core invalidates.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by Task 4 system-prompt core assembly
+#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 pub(crate) struct ComponentHashes {
     /// (component name, hash) pairs in a fixed, declaration order.
     entries: [(&'static str, String); Self::COMPONENT_COUNT],
 }
 
-#[allow(dead_code)] // consumed by Task 4 system-prompt core assembly
+#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 impl ComponentHashes {
     const COMPONENT_COUNT: usize = 6;
 
@@ -69,7 +69,7 @@ impl ComponentHashes {
     }
 }
 
-#[allow(dead_code)] // consumed by Task 4 system-prompt core assembly
+#[allow(dead_code)] // hashing API — production callers added in Task 7 (per-session core cache)
 impl CoreInputs {
     /// Hash each component independently. Unordered collections (tool roster,
     /// skills catalog) are sorted by name BEFORE hashing so ordering differences
@@ -179,9 +179,19 @@ pub(crate) fn render_core_prompt(inputs: &CoreInputs) -> String {
     if !inputs.skills_catalog.is_empty() {
         let mut skills_catalog = inputs.skills_catalog.clone();
         skills_catalog.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        out.push_str("\n\n## Available Skills\n");
-        for (name, description, _enabled) in &skills_catalog {
-            out.push_str(&format!("- **{}**: {}\n", name, description));
+        let enabled_skills: Vec<_> = skills_catalog
+            .iter()
+            .filter(|(_, _, enabled)| *enabled)
+            .collect();
+        if !enabled_skills.is_empty() {
+            out.push_str("\n\n## Available Skills\n");
+            for (name, description, _enabled) in &enabled_skills {
+                out.push_str("- **");
+                out.push_str(name);
+                out.push_str("**: ");
+                out.push_str(description);
+                out.push('\n');
+            }
         }
     }
 
@@ -308,6 +318,55 @@ mod tests {
         b.skills_catalog.push(("s3".into(), "d3".into(), true));
         let diff = a.component_hashes().diff(&b.component_hashes());
         assert_eq!(diff, vec!["skills_catalog"]);
+    }
+
+    #[test]
+    fn render_core_prompt_skips_disabled_skills() {
+        let inputs = CoreInputs {
+            base_template: "T".into(),
+            tool_roster: vec![],
+            skills_catalog: vec![
+                ("enabled_skill".into(), "does something".into(), true),
+                ("disabled_skill".into(), "should not appear".into(), false),
+            ],
+            specialists: vec![],
+            channel_rules: String::new(),
+            persona: "P".into(),
+        };
+        let out = render_core_prompt(&inputs);
+        assert!(
+            out.contains("enabled_skill"),
+            "enabled skill must appear in the output"
+        );
+        assert!(
+            !out.contains("disabled_skill"),
+            "disabled skill must NOT appear in the output"
+        );
+    }
+
+    #[test]
+    fn render_core_prompt_splices_specialists_before_tools_anchor() {
+        let inputs = CoreInputs {
+            base_template: "Intro\n\n## Tools\nuse them".into(),
+            tool_roster: vec![],
+            skills_catalog: vec![],
+            specialists: vec![("researcher".into(), "Deep research tasks".into())],
+            channel_rules: String::new(),
+            persona: "P".into(),
+        };
+        let out = render_core_prompt(&inputs);
+        let specialists_pos = out
+            .find("## Available Specialists")
+            .expect("## Available Specialists block must be present");
+        let tools_pos = out
+            .find("## Tools")
+            .expect("## Tools anchor must be present");
+        assert!(
+            specialists_pos < tools_pos,
+            "## Available Specialists (at {}) must appear before ## Tools (at {})",
+            specialists_pos,
+            tools_pos
+        );
     }
 
     #[test]
