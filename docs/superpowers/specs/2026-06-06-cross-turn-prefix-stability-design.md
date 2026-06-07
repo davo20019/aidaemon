@@ -248,33 +248,42 @@ phase therefore requires:
   (user message, assistant response, tool call/result) **and to the
   task-completion record** (`EventType::TaskEnd`) and propagated through
   projection/hydration into `Message.turn_id`. The completion record must be
-  turn-attributable because the archived render's terminal-state distinction
-  (`[completed: N tool steps, no text reply]` vs `[task interrupted]`,
-  §Rendering) is derived from whether the turn has a completion record —
-  without `turn_id` on it the renderer cannot tell the two apart.
-- **Completion status is an explicit render input, not just a flag.** The
-  per-turn render input carries a `terminal_state ∈ {completed,
-  interrupted}` field derived from the completion record, and `content_fp`
-  (§Render cache) includes it. Otherwise a tool-only turn that later acquires
-  a completion record (or a crash that never does) would render differently
-  while hashing identically — a stale-cache hazard precisely in the
+  turn-attributable because the archived render's terminal-state placeholder
+  (§Rendering) is derived from it — without `turn_id` on it the renderer
+  cannot attribute the outcome to the turn.
+- **Completion status is an explicit render input, and preserves the real
+  outcome.** `TaskEnd` carries a `TaskStatus` of `Completed`, `Cancelled`, or
+  `Failed` (`src/events/mod.rs:209`); collapsing all three into "completed"
+  would render a failed or cancelled tool-only turn as `[completed: …]`. The
+  per-turn render input therefore carries
+  `terminal_state ∈ {completed, failed, cancelled, interrupted}` — the first
+  three mirror `TaskStatus`; `interrupted` is the absence of any `TaskEnd`
+  record (crash). `content_fp` (§Render cache) includes `terminal_state`, so
+  a tool-only turn that later acquires a completion record — or whose outcome
+  changes — re-renders rather than serving a stale entry, precisely in the
   no-text-reply case where the message set alone is ambiguous.
-- a single **canonical monotonic sequence** for ordering, derived from the
-  event store's existing insertion id (`events.id`; no new atomic counter):
-  - `turn_seq` = the insertion id of the turn's first event (its user
-    message), carried on every message of that turn (a late write inherits
-    its turn's `turn_seq` via `turn_id`, so it groups and ranges with that
-    turn, not at the session tail);
-  - `msg_seq` = the message's own insertion id, which orders messages
-    **within** a turn; a late write's id is large, so it deterministically
-    sorts last inside its turn — exactly its append position.
+- a single **canonical monotonic ordering** built from the event store's
+  existing insertion id (`events.id`; no new atomic counter):
+  - `msg_seq` = the message's own `events.id`, ordering messages **within** a
+    turn; a late write's id is large, so it deterministically sorts last
+    inside its turn — exactly its append position. This needs no new storage
+    (it is the existing row id).
+  - `turn_seq` = the `events.id` of the turn's first event (its user
+    message), used to order and range whole turns. This is a **cross-row
+    value** — a message's `turn_seq` lives on a *different* row (the turn's
+    user event, reached via `turn_id`) — so it **cannot** be produced by a
+    SQLite expression index over the message row. The design requires it
+    materialized: either denormalized onto every event row at write time
+    (stamp the turn's start id when the row is inserted) or a
+    `turn_id → start events.id` mapping joined at fetch time. The plan picks
+    between those two; a pure expression index is explicitly ruled out. A
+    late write inherits its turn's `turn_seq` through `turn_id`, so it groups
+    and ranges with that turn, not at the session tail.
 
   Timestamps are forbidden as an ordering key anywhere in the fetch or render
   path (event queries that currently order by timestamp are migrated for this
-  path). Insertion ids are unique, so no tie-breaking rule is needed; whether
-  `turn_seq`/`msg_seq` are persisted columns or expressed as an indexed
-  projection over `events.id` is a plan decision, but the supporting index is
-  `(session_id, turn_seq, msg_seq)`.
+  path). Insertion ids are unique, so no tie-breaking rule is needed; the
+  supporting index is `(session_id, turn_seq, msg_seq)`.
 - **Migration/fallback:** events written before `turn_id` existed hydrate
   with `turn_id = NULL` and fall under the legacy rule below (excluded from
   reconstruction; covered by the session summary). No retroactive grouping
@@ -309,8 +318,9 @@ Edge cases (defined, not discovered):
   turn_id-stamped message. Pre-turn_id history is not reconstructed into the
   payload; the session summary covers it. (One-time cost at upgrade.)
 - **Incomplete/crashed turns** (no final assistant message): archived form
-  renders the user message, a deterministic `[task interrupted]` placeholder,
-  and tool summaries.
+  renders the user message, the `terminal_state`-selected placeholder
+  (§Rendering — `[task interrupted]` when no `TaskEnd` record exists, or the
+  `failed`/`cancelled` form when one does), and tool summaries.
 - **Late writes** (a message appended under an already-archived turn_id,
   e.g., a background notifier): the turn's content_fp changes → cache
   mismatch → re-render once, prefix break localized to that turn, logged.
@@ -331,10 +341,12 @@ Edge cases (defined, not discovered):
     assistant records contribute only their content (tool_calls stripped by
     the existing orphan rule); recovery retries and checkpoints lose by
     position. If **no** assistant record in the turn has non-empty content,
-    the placeholder depends on turn completion status: a turn with a
-    completion record (successful tool-only turn) renders the deterministic
-    `[completed: N tool steps, no text reply]`; a turn without one
-    (crashed/interrupted) renders `[task interrupted]`;
+    the placeholder is selected by `terminal_state` (§prerequisite):
+    `completed` → `[completed: N tool steps, no text reply]`, `failed` →
+    `[failed: N tool steps, no text reply]`, `cancelled` →
+    `[cancelled: N tool steps, no text reply]`, and `interrupted` (no
+    `TaskEnd` record) → `[task interrupted]`. The status string is fixed
+    per state so the placeholder is deterministic;
   - tool results survive as deterministic summaries;
   - messages matching the identity-critical detector
     (`text_relates_to_critical_identity`) survive **verbatim** — identity
@@ -436,8 +448,8 @@ the stability work measures itself — avoiding mid-phase attribution noise.
 
 ## Observability
 
-Phase 0 instrumentation is untouched — it is the measurement harness for
-this phase. New lines:
+Phase 0 instrumentation is retained and extended — it is the measurement
+harness for this phase. New lines:
 
 - `Core prompt invalidated component=<name>` (info)
 - `Turn render cache hit` (debug/sampled) / `miss` / `fp_mismatch` (info)

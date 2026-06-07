@@ -86,11 +86,16 @@ const SESSION_SUMMARY_MARKER: &str = "[Session Summary]";
 
 /// Build the [`ProviderCallFingerprint`] for the final provider payload.
 ///
-/// `effective_tools` is the actual tool set passed to the provider — empty in
-/// force-text mode. The tool hash preserves the array order so that a
-/// reordering (a genuine cache break) is observable; it is *not* name-sorted
-/// here (that name-sorted form is the Phase 1 validity hash, a different
-/// concern).
+/// `effective_tools` is the actual tool set passed to the provider. In
+/// force-text mode the definitions are *retained* (see `effective_tools_for_call`
+/// in `llm_phase.rs`: tool defs stay in the payload for prefix-cache stability;
+/// only calling is disabled via `tool_choice=none`), so `tool_defs_hash` stays
+/// stable across a force-text turn. The hash is empty only when
+/// `effective_tools` is genuinely empty. The tool hash preserves the array
+/// order so that a reordering (a genuine cache break) is observable; it is
+/// *not* name-sorted here (that name-sorted form is the Phase 1 validity hash,
+/// a different concern). `force_text` is recorded as a fingerprint tag, not
+/// used to alter any hash.
 pub(crate) fn provider_call_fingerprint(
     messages: &[Value],
     user_text: &str,
