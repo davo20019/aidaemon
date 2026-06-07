@@ -1,6 +1,8 @@
-# Cross-Turn Prefix Stability (Phase 1)
+# Cross-Turn Prefix Stability & Payload Reduction (Phase 1)
 
 **Status:** Draft — pending review
+**Covers:** prefix stability (Pillars A/B) and payload reduction (Pillar C,
+lands first)
 **Depends on:** Phase 0 observability (shipped; see
 `2026-06-06-sliding-window-hysteresis-design.md`)
 **Supersedes:** the within-task `keep_from` anchor from the hysteresis spec's
@@ -27,8 +29,10 @@ slide that mutates collapse inputs mid-task.
 
 ## Requirements (settled during design review)
 
-1. Scope: both pillars together — **A:** message-zero freeze/split,
-   **B:** monotonic turn rendering with turn-anchored fetch.
+1. Scope: three pillars in one phase — **A:** message-zero freeze/split,
+   **B:** monotonic turn rendering with turn-anchored fetch, **C:** payload
+   reduction (added during review; mandatory, lands **first**, carries its
+   own exit gate).
 2. Volatile per-message context moves to a **task context tail** message;
    the stable core keeps no memory-derived content.
 3. Core recompilation is **event-driven** (content-hash invalidation), never
@@ -92,18 +96,30 @@ invariants are:
 2. **Turn N's archived rendering is byte-stable from turn N+1 onward** — it
    never changes again (absent a content_fp change from a late write, which
    is logged).
-3. **Within a task, each iteration's payload is a strict prefix extension**
-   of the previous iteration's payload, **absent a logged prefix mutation**.
-   Three retained recovery mechanisms legitimately rewrite current-turn
-   bytes and are explicitly excluded from the invariant: repeated-tool-error
-   collapse (`collapse_repeated_tool_errors`), history-fitting overflow
-   trimming, and the empty-response retry rebuild. Each must emit
-   `Prefix mutation reason=<mechanism>` when it fires so every within-task
-   re-evaluation is attributable. Tests assert strict prefix extension on
-   mutation-free paths AND assert the log line fires on each mutator path.
-   (History-fitting overflow should become rare: whole-turn eviction at the
-   60% low-water mark leaves headroom that the per-iteration fitter
-   previously had to create.)
+3. **Within a task, the payload decomposes into a stable region and a
+   transient suffix, and the stable region extends monotonically.**
+   - The **stable region** — core, archived turns, task tail, and persisted
+     current-turn messages — is a strict prefix extension of the previous
+     iteration's stable region, absent a logged prefix mutation.
+   - The **transient suffix** — execution checkpoints (regenerated each
+     iteration, not persisted; `message_build_phase.rs:1248`) and one-shot
+     system directives (`message_build_phase.rs:1293`) — is replaceable by
+     design: it disappears next iteration and new persisted messages occupy
+     its positions. Strict whole-sequence prefix extension is therefore NOT
+     promised even on clean paths.
+   - **Within-task re-evaluation is bounded by the previous iteration's
+     transient suffix plus newly appended messages.** Checkpoints and
+     directives stay small for this reason; their size is part of the
+     measured bound.
+
+   Three retained recovery mechanisms additionally rewrite **stable-region**
+   bytes and are excluded from the invariant: repeated-tool-error collapse
+   (`collapse_repeated_tool_errors`), history-fitting overflow trimming, and
+   the empty-response retry rebuild. Each must emit
+   `Prefix mutation reason=<mechanism>` when it fires so every stable-region
+   re-evaluation is attributable. (History-fitting overflow should become
+   rare: whole-turn eviction at the low-water mark leaves headroom the
+   per-iteration fitter previously had to create.)
 4. **Turn-start re-evaluation is bounded by the prior task's tail + current
    region** (archived[N] + tail[N+1] + new user message), not by an assumed
    constant. The bound is measured, then a threshold is set.
@@ -397,9 +413,10 @@ serialization.
   payload head every turn; for those two, only deterministic conversion is
   asserted (cache wins there are out of scope, per §Pillar A).
 
-  1. within a task, iteration k+1's converted message sequence extends
-     iteration k's element-wise (mutation-free path), and each mutator path
-     emits its `Prefix mutation` line instead;
+  1. within a task, iteration k+1's **stable region** extends iteration k's
+     element-wise (mutation-free path), with the transient suffix
+     (checkpoints, one-shot directives) identified and excluded by the test
+     harness; each mutator path emits its `Prefix mutation` line instead;
   2. across two turns (OpenAI-compatible adapter), core + archived[..N-1]
      elements are identical and archived[N] is stable in a third turn;
   3. storing a fact between turns changes the tail element only (core
