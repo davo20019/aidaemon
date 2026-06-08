@@ -4482,6 +4482,12 @@ impl TelegramChannel {
             return;
         }
 
+        // Stable per-message identity for dedup. Telegram's `message_id` is
+        // unique per chat and reused on webhook/poll redeliveries, but a user
+        // re-typing the same text gets a NEW message_id — so this drops genuine
+        // duplicates while letting a deliberate re-ask through.
+        let dedup_key = msg.id.0.to_string();
+
         // Check if a task is already running - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
             let daemon_uptime = self.started_at.elapsed();
@@ -4509,7 +4515,7 @@ impl TelegramChannel {
             // instead of stranding the message in an undrained queue.
             match self
                 .task_registry
-                .queue_message_if_running(&session_id, &text)
+                .queue_message_if_running(&session_id, &text, Some(&dedup_key))
                 .await
             {
                 QueueOutcome::Queued(queue_pos) => {
@@ -4552,7 +4558,11 @@ impl TelegramChannel {
 
         // Dedup gate: atomically mark this message as "seen" so concurrent
         // webhook handlers for the same text don't ALL start direct processing.
-        if !self.task_registry.mark_seen(&session_id, &text).await {
+        if !self
+            .task_registry
+            .mark_seen(&session_id, &text, Some(&dedup_key))
+            .await
+        {
             debug!(
                 session_id,
                 "Dropped duplicate message (direct processing race)"

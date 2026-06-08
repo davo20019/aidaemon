@@ -992,6 +992,17 @@ impl SlackChannel {
 
         info!(session_id, user_id = %user, "Received Slack message");
 
+        // Stable per-message identity for dedup. Slack's `ts` is unique per
+        // message and reused on Events API retries, but a user re-typing the
+        // same text gets a new `ts` — so this drops genuine duplicates while
+        // letting a deliberate re-ask through. Fall back to text-hash dedup when
+        // `ts` is absent (malformed event).
+        let dedup_key: Option<&str> = if ts.is_empty() {
+            None
+        } else {
+            Some(ts.as_str())
+        };
+
         // Check if a task is already running for this session - if so, queue this message
         if self.task_registry.has_running_task(&session_id).await {
             let daemon_uptime = self.started_at.elapsed();
@@ -1019,7 +1030,7 @@ impl SlackChannel {
             // direct processing instead of stranding the message.
             match self
                 .task_registry
-                .queue_message_if_running(&session_id, &agent_text)
+                .queue_message_if_running(&session_id, &agent_text, dedup_key)
                 .await
             {
                 QueueOutcome::Queued(queue_pos) => {
@@ -1060,7 +1071,11 @@ impl SlackChannel {
 
         // Dedup gate: atomically mark this message as "seen" so concurrent
         // handlers for the same text don't ALL start direct processing.
-        if !self.task_registry.mark_seen(&session_id, &agent_text).await {
+        if !self
+            .task_registry
+            .mark_seen(&session_id, &agent_text, dedup_key)
+            .await
+        {
             debug!(
                 session_id,
                 "Dropped duplicate message (direct processing race)"

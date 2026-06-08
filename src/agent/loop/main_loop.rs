@@ -41,6 +41,41 @@ fn cancel_keyword_not_negated(text: &str, keyword: &str) -> bool {
     true
 }
 
+/// Build a user-facing message when the force-text safety net fires and there
+/// is no salvageable tool output to return.
+///
+/// The legacy fallback ("I ran into a processing limit. Please try again or
+/// rephrase your request.") is misleading: the common real cause is a terse,
+/// under-specified request (e.g. a bare "web search" with no query) that the
+/// model could never turn into an actionable tool call, so it spun producing
+/// low-signal stubs until the safety net tripped — no tool ever ran, so there
+/// is nothing to salvage. In that case, ask for the missing detail instead of
+/// claiming a limit the user can do nothing about.
+fn build_stuck_no_output_fallback(user_text: &str) -> String {
+    let trimmed = user_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // A short message that names a lookup action but carries no object is the
+    // classic "couldn't form a query" case. 60 chars comfortably covers bare
+    // commands like "web search" / "look it up" without matching real queries.
+    let is_terse = trimmed.chars().count() <= 60;
+    let mentions_search = [
+        "search",
+        "look up",
+        "look it up",
+        "google",
+        "find out",
+        "web search",
+    ]
+    .iter()
+    .any(|kw| contains_keyword_as_words(&lower, kw));
+    if is_terse && mentions_search {
+        return "I wasn't sure what to search for. What would you like me to look up?".to_string();
+    }
+    "I wasn't able to complete that. Could you rephrase with a bit more detail about what \
+     you'd like me to do?"
+        .to_string()
+}
+
 fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecision {
     let mut intent_gate = infer_intent_gate(user_text, "");
     let lower = user_text.trim().to_ascii_lowercase();
@@ -422,6 +457,25 @@ impl Agent {
                 }
             }
         }
+        // Coreference grounding: a follow-up that carries its person referent
+        // only via a pronoun ("...what can you infer about her?") is prone to
+        // binding the pronoun to the salient pinned-profile person instead of
+        // the actual subject of the prior exchange. Anchor it to that exchange
+        // and force a memory lookup before answering.
+        else if crate::agent::recall_guardrails::looks_like_pronoun_referent_followup(user_text) {
+            if let Ok(history) = self.state.get_history(session_id, 12).await {
+                if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
+                    &history, user_text,
+                ) {
+                    turn_state.directives.push_system_message(
+                        SystemDirective::CoreferenceGroundingRequired {
+                            prior_user_request: anchor.prior_user_request,
+                            prior_assistant_reply: anchor.prior_assistant_reply,
+                        },
+                    );
+                }
+            }
+        }
         // Best-effort project directory hint (seeded from user text, refined by tool calls).
         if let Some(known_project_dir) = turn_context.primary_project_scope.clone().or_else(|| {
             super::tool_execution_phase::extract_project_dir_hint_with_aliases(
@@ -694,10 +748,7 @@ impl Agent {
                         self, session_id, 2000,
                     )
                     .await
-                    .unwrap_or_else(|| {
-                        "I ran into a processing limit. Please try again or rephrase your request."
-                            .to_string()
-                    });
+                    .unwrap_or_else(|| build_stuck_no_output_fallback(user_text));
                     let assistant_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -1455,5 +1506,49 @@ mod cancel_intent_tests {
             "actually never mind about that whole thing I asked earlier, let me think about it",
         );
         assert!(intent.cancel_intent.unwrap_or(false));
+    }
+}
+
+#[cfg(test)]
+mod stuck_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn bare_web_search_asks_for_query() {
+        // The exact case that produced the misleading "processing limit" reply:
+        // a query-less "Web search" command the model could not act on.
+        let msg = build_stuck_no_output_fallback("Web search");
+        assert!(msg.contains("what would you like me to look up") || msg.contains("search for"));
+        assert!(!msg.contains("processing limit"));
+    }
+
+    #[test]
+    fn bare_look_it_up_asks_for_query() {
+        let msg = build_stuck_no_output_fallback("look it up");
+        assert!(msg.to_lowercase().contains("look up"));
+    }
+
+    #[test]
+    fn detailed_search_query_does_not_get_clarifying_prompt() {
+        // A request with an actual subject should not be treated as query-less;
+        // it falls through to the generic rephrase message.
+        let msg = build_stuck_no_output_fallback(
+            "search the web for what Conchi is a nickname for and summarize the top results",
+        );
+        assert!(msg.contains("rephrase"));
+    }
+
+    #[test]
+    fn non_search_request_falls_through_to_generic() {
+        let msg = build_stuck_no_output_fallback("build me a dashboard");
+        assert!(msg.contains("rephrase"));
+        assert!(!msg.contains("processing limit"));
+    }
+
+    #[test]
+    fn fallback_never_emits_legacy_processing_limit_string() {
+        for input in ["Web search", "do something", "", "look up cats"] {
+            assert!(!build_stuck_no_output_fallback(input).contains("processing limit"));
+        }
     }
 }

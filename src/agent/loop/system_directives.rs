@@ -170,6 +170,14 @@ pub(in crate::agent) enum SystemDirective {
         prior_user_request: Option<String>,
         prior_assistant_reply: String,
     },
+    /// A follow-up question carries its person referent only via a pronoun
+    /// ("...what can you infer about her?"). Anchor the pronoun to the prior
+    /// exchange's subject and force a memory lookup so it is not bound to a
+    /// salient pinned-profile person (e.g. the pinned partner).
+    CoreferenceGroundingRequired {
+        prior_user_request: Option<String>,
+        prior_assistant_reply: String,
+    },
 }
 
 impl SystemDirective {
@@ -502,6 +510,28 @@ impl SystemDirective {
                 );
                 lines.join("\n")
             }
+            Self::CoreferenceGroundingRequired {
+                prior_user_request,
+                prior_assistant_reply,
+            } => {
+                let mut lines = vec![
+                    "[SYSTEM] PRONOUN REFERENT: The user's pronoun (\"her\"/\"him\"/\"she\"/\"he\") refers to the subject of the exchange below — NOT to anyone in your pinned core profile (e.g. the pinned partner or children). Do NOT assume it means the partner.".to_string(),
+                ];
+                if let Some(request) = prior_user_request {
+                    lines.push(format!(
+                        "Immediately prior user message: \"{}\"",
+                        crate::utils::truncate_str(request, 240)
+                    ));
+                }
+                lines.push(format!(
+                    "Your prior answer: \"{}\"",
+                    crate::utils::truncate_str(prior_assistant_reply, 400)
+                ));
+                lines.push(
+                    "Before answering, call manage_memories to look up that specific person. If you find nothing, say so plainly instead of substituting a different person.".to_string(),
+                );
+                lines.join("\n")
+            }
         }
     }
 }
@@ -672,6 +702,22 @@ mod tests {
         assert!(rendered.contains("How many R's in strawberry?"));
         assert!(rendered.contains("There are 3 R's in strawberry."));
         assert!(rendered.contains("Do NOT mention unrelated earlier topics"));
+    }
+
+    #[test]
+    fn coreference_grounding_render_anchors_pronoun_and_forces_lookup() {
+        let rendered = SystemDirective::CoreferenceGroundingRequired {
+            prior_user_request: Some("Where is my mom from?".to_string()),
+            prior_assistant_reply: "I don't have info about Consuelo Montesdeoca.".to_string(),
+        }
+        .render();
+
+        assert!(rendered.contains("PRONOUN REFERENT"));
+        assert!(rendered.contains("Where is my mom from?"));
+        assert!(rendered.contains("Consuelo Montesdeoca"));
+        // Must steer away from the pinned partner and toward a lookup.
+        assert!(rendered.contains("NOT"));
+        assert!(rendered.contains("manage_memories"));
     }
 
     #[test]

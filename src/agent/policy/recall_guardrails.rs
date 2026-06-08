@@ -479,6 +479,70 @@ pub(super) fn user_is_reaffirmation_challenge(user_text: &str) -> bool {
         || contains_keyword_as_words(&lower, "certain")
 }
 
+/// Detect a follow-up question whose person referent is carried ONLY by a
+/// third-person pronoun ("...what can you infer about her?"), with no explicit
+/// subject named in the message itself.
+///
+/// On a small model these turns are prone to a *coreference hijack*: the pronoun
+/// gets bound to whoever is most salient in the injected core-profile block
+/// (e.g. the pinned partner) instead of the actual subject of the immediately
+/// preceding exchange. Telemetry: user asked "Where is my mom from?" then
+/// "...what can you infer?" and the model answered about the pinned partner.
+/// When this fires, the loop anchors the pronoun to the prior exchange and
+/// forces a memory lookup before answering.
+pub(super) fn looks_like_pronoun_referent_followup(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 200 {
+        return false;
+    }
+
+    // Must lean on a third-person *personal* pronoun for the referent.
+    let has_person_pronoun = contains_keyword_as_words(&lower, "her")
+        || contains_keyword_as_words(&lower, "him")
+        || contains_keyword_as_words(&lower, "she")
+        || contains_keyword_as_words(&lower, "he")
+        || contains_keyword_as_words(&lower, "his")
+        || contains_keyword_as_words(&lower, "hers");
+    if !has_person_pronoun {
+        return false;
+    }
+
+    // If the message names its own subject ("my mom", "my wife", ...) there is
+    // no ambiguity to resolve — the pronoun is anchored within the message.
+    let names_own_subject = contains_keyword_as_words(&lower, "my")
+        && (contains_keyword_as_words(&lower, "mom")
+            || contains_keyword_as_words(&lower, "mother")
+            || contains_keyword_as_words(&lower, "dad")
+            || contains_keyword_as_words(&lower, "father")
+            || contains_keyword_as_words(&lower, "wife")
+            || contains_keyword_as_words(&lower, "husband")
+            || contains_keyword_as_words(&lower, "partner")
+            || contains_keyword_as_words(&lower, "spouse")
+            || contains_keyword_as_words(&lower, "daughter")
+            || contains_keyword_as_words(&lower, "son")
+            || contains_keyword_as_words(&lower, "kid")
+            || contains_keyword_as_words(&lower, "kids")
+            || contains_keyword_as_words(&lower, "child")
+            || contains_keyword_as_words(&lower, "children"));
+    if names_own_subject {
+        return false;
+    }
+
+    // Recall / inference shaped: the model is being asked to reason about or
+    // recall facts about the pronoun's referent.
+    contains_keyword_as_words(&lower, "infer")
+        || contains_keyword_as_words(&lower, "guess")
+        || contains_keyword_as_words(&lower, "think")
+        || contains_keyword_as_words(&lower, "know about")
+        || contains_keyword_as_words(&lower, "tell me about")
+        || contains_keyword_as_words(&lower, "what about")
+        || contains_keyword_as_words(&lower, "what do you know")
+        || contains_keyword_as_words(&lower, "where is")
+        || contains_keyword_as_words(&lower, "where's")
+        || contains_keyword_as_words(&lower, "who is")
+        || contains_keyword_as_words(&lower, "who's")
+}
+
 /// A reaffirmation challenge is only "vague" — and safe to anchor hard to the
 /// immediately previous exchange — when the message is short and carries no
 /// new task of its own. Long or statement-shaped messages that merely contain
@@ -715,6 +779,39 @@ mod tests {
         assert!(!looks_like_personal_memory_store_request(
             "Do I have a dog?"
         ));
+    }
+
+    #[test]
+    fn detects_pronoun_referent_followup() {
+        // The telemetry case: pronoun-only referent + inference cue.
+        assert!(looks_like_pronoun_referent_followup(
+            "Based on what you know about me and her what can you infer?"
+        ));
+        assert!(looks_like_pronoun_referent_followup(
+            "What do you know about him?"
+        ));
+        assert!(looks_like_pronoun_referent_followup("Where is she from?"));
+        assert!(looks_like_pronoun_referent_followup("Tell me about her"));
+    }
+
+    #[test]
+    fn pronoun_referent_followup_ignores_explicit_subject() {
+        // Message names its own subject — no ambiguity to resolve.
+        assert!(!looks_like_pronoun_referent_followup(
+            "Where is my mom from?"
+        ));
+        assert!(!looks_like_pronoun_referent_followup(
+            "What do you know about my wife?"
+        ));
+        // No referential person pronoun.
+        assert!(!looks_like_pronoun_referent_followup("What can you infer?"));
+        assert!(!looks_like_pronoun_referent_followup(
+            "What do you know about me?"
+        ));
+        // No recall/inference cue.
+        assert!(!looks_like_pronoun_referent_followup("Tell her I said hi"));
+        // Empty / overly long.
+        assert!(!looks_like_pronoun_referent_followup(""));
     }
 
     #[test]

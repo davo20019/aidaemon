@@ -245,9 +245,16 @@ impl TaskRegistry {
     /// Call this at the start of **direct** message processing (when no task
     /// is already running) to prevent concurrent webhook handlers from all
     /// bypassing `queue_message()` and starting separate processing flows.
-    pub async fn mark_seen(&self, session_id: &str, text: &str) -> bool {
+    ///
+    /// `dedup_key` is the channel's stable per-message identity (e.g. Telegram
+    /// `message_id`, Slack `ts`, Discord message id) — the correct idempotency
+    /// key for webhook/poll redeliveries. When `Some`, dedup is keyed on it so a
+    /// user *re-typing the same text* (which gets a NEW message id) is treated
+    /// as a fresh request rather than a duplicate. Falls back to hashing `text`
+    /// when `None`, preserving the legacy content-based behavior.
+    pub async fn mark_seen(&self, session_id: &str, text: &str, dedup_key: Option<&str>) -> bool {
         let now = Utc::now();
-        let hash = Self::text_hash(text);
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
         let key = (session_id.to_string(), hash);
         let mut seen = self.recently_seen.write().await;
         seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
@@ -267,9 +274,14 @@ impl TaskRegistry {
     /// Channel loops now use [`Self::queue_message_if_running`]; retained
     /// for queue-only callers and tests.
     #[allow(dead_code)]
-    pub async fn queue_message(&self, session_id: &str, text: &str) -> Option<usize> {
+    pub async fn queue_message(
+        &self,
+        session_id: &str,
+        text: &str,
+        dedup_key: Option<&str>,
+    ) -> Option<usize> {
         let now = Utc::now();
-        let hash = Self::text_hash(text);
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
         let key = (session_id.to_string(), hash);
 
         // Check recently_seen first — this survives queue pops and catches
@@ -345,7 +357,12 @@ impl TaskRegistry {
     /// Lock order: `tasks` → `recently_seen` → `queues` (same as
     /// [`finalize_and_drain`]), so the two operations serialize and the
     /// caller can trust the [`QueueOutcome`].
-    pub async fn queue_message_if_running(&self, session_id: &str, text: &str) -> QueueOutcome {
+    pub async fn queue_message_if_running(
+        &self,
+        session_id: &str,
+        text: &str,
+        dedup_key: Option<&str>,
+    ) -> QueueOutcome {
         let tasks = self.tasks.read().await;
         let running = tasks.values().any(|h| {
             h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
@@ -358,7 +375,7 @@ impl TaskRegistry {
         // finalize_and_drain (which takes the write lock first) cannot
         // finalize-and-drain between our check and our push.
         let now = Utc::now();
-        let hash = Self::text_hash(text);
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
         let key = (session_id.to_string(), hash);
         {
             let mut seen = self.recently_seen.write().await;
@@ -434,15 +451,17 @@ mod tests {
         let session = "test-session";
 
         // First message queues normally
-        let result = registry.queue_message(session, "hello world").await;
+        let result = registry.queue_message(session, "hello world", None).await;
         assert_eq!(result, Some(1));
 
         // Identical message within dedup window is deduplicated
-        let result = registry.queue_message(session, "hello world").await;
+        let result = registry.queue_message(session, "hello world", None).await;
         assert_eq!(result, None);
 
         // Different message queues normally
-        let result = registry.queue_message(session, "different message").await;
+        let result = registry
+            .queue_message(session, "different message", None)
+            .await;
         assert_eq!(result, Some(2));
 
         // Only 2 messages in queue (not 3)
@@ -453,11 +472,11 @@ mod tests {
     async fn test_queue_allows_same_message_different_sessions() {
         let registry = TaskRegistry::new(10);
 
-        let result = registry.queue_message("session-a", "hello").await;
+        let result = registry.queue_message("session-a", "hello", None).await;
         assert_eq!(result, Some(1));
 
         // Same message but different session — should queue
-        let result = registry.queue_message("session-b", "hello").await;
+        let result = registry.queue_message("session-b", "hello", None).await;
         assert_eq!(result, Some(1));
     }
 
@@ -466,7 +485,7 @@ mod tests {
         let registry = TaskRegistry::new(10);
         let session = "test-session";
 
-        let result = registry.queue_message(session, "hello").await;
+        let result = registry.queue_message(session, "hello", None).await;
         assert_eq!(result, Some(1));
 
         // Pop the message
@@ -476,7 +495,7 @@ mod tests {
 
         // Same message should STILL be deduplicated after pop (within dedup window).
         // This prevents webhook retry duplicates from re-entering the queue.
-        let result = registry.queue_message(session, "hello").await;
+        let result = registry.queue_message(session, "hello", None).await;
         assert_eq!(result, None);
     }
 
@@ -486,16 +505,20 @@ mod tests {
         let session = "test-session";
 
         // First call returns true (proceed)
-        assert!(registry.mark_seen(session, "hello world").await);
+        assert!(registry.mark_seen(session, "hello world", None).await);
 
         // Second call with same text returns false (duplicate)
-        assert!(!registry.mark_seen(session, "hello world").await);
+        assert!(!registry.mark_seen(session, "hello world", None).await);
 
         // Different text returns true
-        assert!(registry.mark_seen(session, "different text").await);
+        assert!(registry.mark_seen(session, "different text", None).await);
 
         // Different session with same text returns true
-        assert!(registry.mark_seen("other-session", "hello world").await);
+        assert!(
+            registry
+                .mark_seen("other-session", "hello world", None)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -504,10 +527,10 @@ mod tests {
         let session = "test-session";
 
         // mark_seen first (simulates direct processing)
-        assert!(registry.mark_seen(session, "hello").await);
+        assert!(registry.mark_seen(session, "hello", None).await);
 
         // queue_message for the same text should be deduplicated
-        let result = registry.queue_message(session, "hello").await;
+        let result = registry.queue_message(session, "hello", None).await;
         assert_eq!(result, None);
     }
 
@@ -517,10 +540,12 @@ mod tests {
         let session = "test-session";
 
         // Simulate a long message fragmented into 4 parts
-        registry.queue_message(session, "Part 1: Hello").await;
-        registry.queue_message(session, "Part 2: World").await;
-        registry.queue_message(session, "Part 3: How are").await;
-        registry.queue_message(session, "Part 4: you?").await;
+        registry.queue_message(session, "Part 1: Hello", None).await;
+        registry.queue_message(session, "Part 2: World", None).await;
+        registry
+            .queue_message(session, "Part 3: How are", None)
+            .await;
+        registry.queue_message(session, "Part 4: you?", None).await;
         assert_eq!(registry.queue_len(session).await, 4);
 
         // pop_all should coalesce into a single message
@@ -542,7 +567,7 @@ mod tests {
         let registry = TaskRegistry::new(10);
         let session = "test-session";
 
-        registry.queue_message(session, "only one").await;
+        registry.queue_message(session, "only one", None).await;
         let result = registry.pop_all_queued_messages(session).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().text, "only one");
@@ -555,7 +580,7 @@ mod tests {
         let (_task_id, _token) = registry.register(session, "long task").await;
 
         match registry
-            .queue_message_if_running(session, "follow-up")
+            .queue_message_if_running(session, "follow-up", None)
             .await
         {
             QueueOutcome::Queued(pos) => assert_eq!(pos, 1),
@@ -571,7 +596,9 @@ mod tests {
         // No running task: the caller must process directly instead of
         // queueing into a queue nobody will ever drain.
         assert!(matches!(
-            registry.queue_message_if_running(session, "orphan").await,
+            registry
+                .queue_message_if_running(session, "orphan", None)
+                .await,
             QueueOutcome::NoRunningTask
         ));
         assert_eq!(registry.queue_len(session).await, 0);
@@ -589,7 +616,7 @@ mod tests {
 
         assert!(matches!(
             registry
-                .queue_message_if_running(session, "late message")
+                .queue_message_if_running(session, "late message", None)
                 .await,
             QueueOutcome::NoRunningTask
         ));
@@ -602,11 +629,15 @@ mod tests {
         let (_task_id, _token) = registry.register(session, "task").await;
 
         assert!(matches!(
-            registry.queue_message_if_running(session, "hello").await,
+            registry
+                .queue_message_if_running(session, "hello", None)
+                .await,
             QueueOutcome::Queued(1)
         ));
         assert!(matches!(
-            registry.queue_message_if_running(session, "hello").await,
+            registry
+                .queue_message_if_running(session, "hello", None)
+                .await,
             QueueOutcome::Duplicate
         ));
     }
@@ -616,8 +647,12 @@ mod tests {
         let registry = TaskRegistry::new(10);
         let session = "test-session";
         let (task_id, _token) = registry.register(session, "task").await;
-        registry.queue_message_if_running(session, "queued A").await;
-        registry.queue_message_if_running(session, "queued B").await;
+        registry
+            .queue_message_if_running(session, "queued A", None)
+            .await;
+        registry
+            .queue_message_if_running(session, "queued B", None)
+            .await;
 
         let drained = registry.finalize_and_drain(task_id, session, None).await;
         assert_eq!(drained.unwrap().text, "queued A\nqueued B");
@@ -638,6 +673,69 @@ mod tests {
         assert!(!registry.has_running_task(session).await);
         let entries = registry.list_for_session(session).await;
         assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    // Regression: a user re-typing the SAME text gets a new per-message
+    // identity (Telegram message_id / Slack ts / Discord id). With a distinct
+    // dedup_key, the re-ask must be treated as a fresh request — not silently
+    // swallowed by the 120s text-dedup window. (Screenshot bug: "who is my
+    // wife?" sent twice, second got no reply.)
+    #[tokio::test]
+    async fn test_mark_seen_allows_reask_with_distinct_message_id() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // First send of "who is my wife?" with message_id 100.
+        assert!(
+            registry
+                .mark_seen(session, "who is my wife?", Some("100"))
+                .await
+        );
+
+        // Deliberate re-ask: identical text, NEW message_id 101 → proceed.
+        assert!(
+            registry
+                .mark_seen(session, "who is my wife?", Some("101"))
+                .await
+        );
+
+        // True redelivery of message_id 100 (poll/webhook retry) → dropped.
+        assert!(
+            !registry
+                .mark_seen(session, "who is my wife?", Some("100"))
+                .await
+        );
+    }
+
+    // Regression: the queued path (task already running) must also key on the
+    // per-message identity so a re-ask queues behind the running task instead
+    // of being dropped as a Duplicate.
+    #[tokio::test]
+    async fn test_queue_if_running_allows_reask_with_distinct_message_id() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "task").await;
+
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "status?", Some("200"))
+                .await,
+            QueueOutcome::Queued(1)
+        ));
+        // Same text, new message_id → fresh request, queues again.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "status?", Some("201"))
+                .await,
+            QueueOutcome::Queued(2)
+        ));
+        // Redelivery of message_id 200 → dropped as Duplicate.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "status?", Some("200"))
+                .await,
+            QueueOutcome::Duplicate
+        ));
     }
 
     #[tokio::test]

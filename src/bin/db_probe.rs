@@ -83,15 +83,14 @@ fn telemetry_reconciliation_counts(
     let mut event_frequencies = std::collections::HashMap::<String, usize>::new();
     let mut legacy_event_rows = 0usize;
     for (call_id, usage_present) in event_rows {
-        if call_id.as_deref().map_or(true, str::is_empty) {
+        if call_id.as_deref().is_none_or(str::is_empty) {
             legacy_event_rows += 1;
         }
         if !usage_present {
             continue;
         }
-        match call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
-            Some(call_id) => *event_frequencies.entry(call_id.to_string()).or_insert(0) += 1,
-            None => {}
+        if let Some(call_id) = call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
+            *event_frequencies.entry(call_id.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -705,6 +704,10 @@ async fn main() -> anyhow::Result<()> {
             unknown += 1;
             continue;
         };
+        // Whitelist of known terminal statuses; anything else is bucketed as
+        // "unknown". Not an unwrap_or — arbitrary status strings must NOT pass
+        // through.
+        #[allow(clippy::manual_unwrap_or)]
         let status = match value.get("status").and_then(|v| v.as_str()) {
             Some(status @ ("completed" | "failed" | "cancelled")) => status,
             _ => "unknown",

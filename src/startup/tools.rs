@@ -926,6 +926,12 @@ mod tests {
         config.subagents.enabled = subagents_enabled;
         config.cli_agents.enabled = false;
         config.oauth.enabled = false;
+        // Validate the full manifest⇄construction contract: every base tool must
+        // be constructible. The default `[tools].disabled` set would otherwise
+        // omit several base tools and break the positional alignment with
+        // BASE_TOOL_REGISTRY. The disable behavior itself is covered by
+        // `disabled_tools_are_omitted_from_base_registry`.
+        config.tools.disabled.clear();
 
         let io_temp = TempDir::new()?;
         config.files.inbox_dir = io_temp.path().join("inbox").display().to_string();

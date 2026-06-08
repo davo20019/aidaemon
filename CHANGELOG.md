@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-08
+
 ### Added
 
 - **`[tools].disabled` config**: omit built-in tools at startup by machine name (requires `/restart`). **Off by default:** `git_info`, `git_commit` (use `run_command`/`terminal`), `policy_metrics`, `check_environment`, `service_status`, `project_inspect` (use `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack channel history; opt-in), `tool_trace` (redundant alias — use `goal_trace` with `action: "tool_trace"`). Set `disabled = []` to register all base tools. Optional: add `goal_trace` to disable forensics entirely.
@@ -44,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[Action completed]` placeholder no longer leaks to users**: the internal sliding-window placeholder for orphaned tool-call-only turns is now stripped from user-facing replies, and consecutive placeholders are collapsed to a single one in the model's context (in both the live message-build path and the skeleton-extraction path). Flooding the context with identical placeholders was inviting the model to regurgitate them verbatim.
 - **Degeneration/repetition guard on final replies**: a new conservative guard collapses runaway model repetition loops (4+ consecutive identical lines or repeated sentence cycles) before a reply is sanitized and sent, preventing the wall-of-duplicated-text + chunked-message spam seen when a model (especially a local one) collapses into a loop.
 - Marked the encryption-only `db_probe` diagnostic binary as feature-gated so `cargo binstall aidaemon` accepts release archives that contain only the main `aidaemon` executable.
+- **Re-typing the same message is no longer dropped as a duplicate**: message dedup now keys on the channel's stable per-message identity (Telegram `message_id`, Slack `ts`, Discord message id) instead of hashing the text. Webhook/poll redeliveries of the *same* message (which reuse the id) are still suppressed, but a user deliberately re-sending the same text (which gets a new id) is treated as a fresh request. Falls back to content hashing when no id is available.
+- **Pronoun follow-ups no longer bind to the pinned core-profile person**: a follow-up that carries its subject only via a third-person pronoun ("…what can you infer about her?") was prone to a coreference hijack — small models bound the pronoun to whoever was most salient in the injected core profile (e.g. the pinned partner) instead of the actual subject of the prior exchange. The loop now detects this shape, anchors the pronoun to the immediately preceding exchange, and forces a memory lookup before answering, returning "I don't know" rather than substituting a different person.
+- **Clearer message when a terse request can't be turned into an action**: the force-text safety net no longer emits the misleading "I ran into a processing limit" when the real cause is an under-specified request (e.g. a bare "web search" with no query) that never produced a tool call. It now asks for the missing detail instead.
 
 ## [0.10.0] - 2026-06-05
 

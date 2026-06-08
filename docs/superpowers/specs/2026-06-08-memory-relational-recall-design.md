@@ -1,6 +1,6 @@
 # Memory: Reliable Relational Recall — Design
 
-> Status: **design proposed, revised after code-verified review → ready for plan.**
+> Status: **design proposed, revised after code-verified review + live re-test → ready for plan.**
 > Date: 2026-06-08.
 > Revision note: Bug 2 narrowed to derived recall; Bug 3 people-injection claim corrected
 > (graph is fetched but not rendered in owner DMs); Fix 1 widened to close the tail `CRITICAL FACTS`
@@ -9,7 +9,7 @@
 > **Generalization revision:** Fix 2 reframed from a partner/children block to a **salience-selected
 > core *profile*** (auto-salience + user pin override, bounded, session-frozen) so it fixes the *class*
 > — any high-salience fact dropping out of recall — not just the wife/children instance.
-> **Fix 3 added:** a **loop-level "search-before-deny" groundedness gate** (in `stopping_phase`, not a
+> **Fix 3 added:** a **loop-level "search-before-deny" groundedness gate** (in `completion_phase`, not a
 > prompt-only rule) so the long-tail/non-core lookups are trustworthy — the agent may not deny knowledge
 > of a named entity it never searched for. No schema; sliced as **0d**, independent of 0a-0c.
 > **Implementation-readiness revision (2nd review pass):** split the profile gate from the
@@ -18,6 +18,62 @@
 > algorithm; added per-source salience rules (`person_facts` has no `recall_count`); added partner
 > merge/render rules (the real shredded-pairing bug); sliced Phase 0 into 0a/0b/0c; flagged the
 > owner-DM integration test that must be rewritten.
+> **3rd review pass:** resolved the Fix 1 `personal_facts` arm contradiction by slice-aligning the
+> tail-block removal (0a removes relationships only; 0b removes `personal_facts` — closes the 0a-only
+> identity regression); defined "session start" and distinguished structural edits vs `remember_fact`
+> for cache busting; gave children the same name↔date pairing rigor as partner; revised the PR sequence
+> so **0d ships in its own PR** (riskiest heuristic piece, not bundled with the first PR); pointed Fix 3
+> at `completion_phase` + the existing `tool_result_indicates_no_evidence` / `looks_like_personal_memory_recall_question`
+> helpers, narrowed its trigger to personal-recall (no general-knowledge mis-fire), specified entity
+> extraction + empty/tool-unavailable fallbacks, and clarified Fix 2 (not Fix 3) fixes the transcript.
+> **4th review pass (post-fix live re-test, 2026-06-08):** a fresh-context re-test (after shipping the
+> coreference pronoun gate, below) showed Fix 2's premise — *facts-in-context ⇒ correct answer* — is
+> **necessary but not sufficient**: with partner/children/parent facts all present in context, the model
+> still (a) **misattributed** the owner's own father (`father: Galo`) as the *children's* father and
+> (b) **failed to derive** "Bella's mom" — answering both **without searching** (2 lookups in ~17 turns).
+> Three changes result: **(1)** Fix 2's render gains an explicit-**ownership** rule (`Your father: Galo
+> Loor`, never a bare `father: Galo`) — the Galo bug is subject-ambiguity, not the name↔date pairing Fix 2
+> already handles; **(2)** Fix 3's trigger moves **off the keyword lists**
+> (`looks_like_personal_memory_recall_question` + denial-phrase list + lowercase proper-noun extraction)
+> **onto the existing LLM intent classifier** (`agent/intent/llm_classifier.rs`), with the keyword lists
+> demoted to an optional cheap pre-filter — the gate fires rarely, so a semantic decision there is cheap
+> and generalizes across phrasings/languages; **(3)** a **minimal owner-relationship edge slice (0e)** is
+> pulled forward from Phase 1 — kinship queries ("whose dad/mom") resolve by edge traversal,
+> deterministically, with **no phrase matching**. Related shipped fix: a **coreference pronoun gate**
+> (`looks_like_pronoun_referent_followup` → `CoreferenceGroundingRequired`) now anchors "...infer about
+> *her*?" to the conversational subject and forces a lookup — it is itself keyword-based and is a
+> candidate to fold into the same classifier (2).
+> **5th review pass (consistency + 0e correctness):** fixed the co-parent contradiction (deriving a
+> mother from partner∧parent is the biology the spec forbids — now stored-edge = exact, co-parent =
+> labeled inference); dropped the unimplementable `∧ female` clause (`Person` has no gender field,
+> verified); added 0e's missing **delivery contract** (classifier-gated in-loop traversal → system
+> directive, no phrase matching) and a **precedence order** for the three relational mechanisms
+> (0e → Fix 3 → coreference); narrowed PR1 to "fixes the *dump* transcript, not the re-test kinship —
+> that's PR3"; called out that Fix 3/0e are the **first production wiring** of the shadow-only
+> `llm_classifier` (new `needs_grounding` fn, fail-open, owner-DM-gated); moved "who's <child>'s mom?"
+> out of the 0b test suite into 0e; aligned merge/render test + data-flow with rule 4's `Your partner:`;
+> scoped rule 4 to owner-only facts; de-stale-d Bug 2 (presence ≠ correct derivation).
+> **6th review pass (provenance gap — live forensics, 2026-06-08):** a second live probe — "when did I
+> first mention Consuelo Montesdeoca?" — exposed a **fourth** failure class the prior fixes don't touch:
+> **memory provenance is destroyed by consolidate-then-prune.** Verified: messages are events; the
+> Consolidator distills them into facts/episodes/goals and the Pruner then physically deletes them
+> (`events/store.rs:342` `DELETE FROM events WHERE consolidated_at IS NOT NULL AND created_at < ?`) — a
+> term with ~12 message hits vanished to **0** within ~25 min. So "when/where did I learn X" is
+> structurally unanswerable: only the distilled fact survives, with no link to the originating utterance,
+> and the model also misroutes such questions to `goal_trace`. New **slice 0f**: capture provenance
+> (`first_seen_at`, `source` ∈ {user_stated, derived, inferred}, `source_excerpt`/event id) **at
+> consolidation time, before pruning**, + a `manage_memories(action='provenance')` recall path routed via
+> the same classifier (so it stops grabbing `goal_trace`). Bonus: `source=derived` makes the
+> bot-fabricated "Conchi" (web-searched, never user-stated) answerable honestly instead of masquerading as
+> a user fact. Open question added on prune-timing aggressiveness.
+> **7th review pass (sequencing + consistency):** resolved the **PR3↔PR4 classifier cycle** — the shared
+> `{intent, entity}` classifier now ships in **PR3** (0e needs it), PR4/PR6 only consume it; deleted the
+> stale "Fix 2 fixes Bella's mom / gate never fires" scope note (invalidated by the live re-test);
+> aligned Phase 1 co-parent language with 0e (stored edge = exact, partner∧parent = labeled inference,
+> never asserted); flagged that `facts`/`person_facts` **already have a `source` column** (verified) so
+> 0f must *repurpose* it with a backfill decision, not add it; split 0f into **PR2.5 capture (early,
+> time-sensitive) + PR6 recall (depends on PR3)**; added the minimum-shippable-path floor (PR1+PR2+PR3),
+> a 0e migration-from-flat-facts test, and a precedence-keyway integration test.
 > Companion to [`memory-graph-analysis.md`](../../memory-graph-analysis.md) and
 > [`memory-system-design-notes.md`](../../memory-system-design-notes.md) (the polyglot-memory brainstorm).
 > This spec narrows that long-term direction in response to a **concrete, reproduced failure**.
@@ -49,6 +105,22 @@ Aracely Zambrano is your partner. Birthday June 30, 1990.   ✓ correct
 The agent **can** reason "Bella → you → Aracely" (it does so for "who is bella's mom?"), but the
 same class of question intermittently fails or returns a garbled bullet dump. This is not a
 missing-data problem and not (primarily) a missing-graph problem.
+
+### Live re-test (2026-06-08, post-coreference-fix) — presence is not enough
+
+A fresh-context re-test confirmed the diagnosis and sharpened it. With the owner's partner, children,
+and parent all present in the injected profile, on a **fresh** session:
+
+```
+who's cami's dad?        → "Galo Loor."                ✗  (Galo is the OWNER's father, not the children's)
+whose Bella's mom?       → "I don't have information…"  ✗  (Aracely is partner + mother — derivable)
+```
+
+Telemetry: across ~17 turns the model issued **2** `manage_memories` calls total — both failing
+relational turns answered from the **in-context profile with no search**. Two consequences for this
+spec: (1) a flat `father: Galo` line is read as *the nearest subject's* father → **render ownership
+explicitly** (Fix 2 revision); (2) presence alone doesn't make derivation reliable → **edges + a
+groundedness gate that doesn't depend on keyword scoping** (slice 0e + revised Fix 3).
 
 ## Root cause (verified in code)
 
@@ -96,6 +168,13 @@ the LLM path and depend on whatever the semantic `facts` retriever surfaces that
 most important relationships are subject to the same lottery as trivia, which is what makes that
 question intermittent.
 
+**But the live re-test (above) sharpened this:** retrieval variance is **not the whole story for derived
+recall.** With partner + children + parent facts *all present* in context, the model still misattributed
+(Galo) and failed to derive (Bella→mom). So derived kinship has **two** failure modes — (i) the fact
+isn't retrieved (Bug 2), and (ii) the fact *is* present but **subject-binding / derivation** fails. Fix 2
+addresses (i) by guaranteeing presence; (ii) is why 0e (edge traversal) and Fix 3 (assertion gate) exist.
+Presence is necessary, not sufficient.
+
 ### Bug 3 — The structured entity layer already exists, and the broken path ignores it
 
 `route_people_fact` (`src/memory/manager.rs:823-962`) already routes `category == "people"` facts
@@ -126,13 +205,15 @@ Goal 4 (associative recall), but it sits one layer *below* the proximate causes 
 table sandwiched between a dump-everything guardrail (Bug 1) and a coin-flip retriever (Bug 2) still
 produces this transcript. So this spec splits the work:
 
-- **Phase 0 (this spec's priority):** stop the embarrassment now on data we can eyeball. Three
-  complementary fixes: **Fix 1** stops the bad deterministic dump, **Fix 2** guarantees the
-  high-salience core is always present (cached), **Fix 3** makes the long-tail lookup trustworthy via a
-  loop-level groundedness gate. **Note:** the generalization of Fix 2 (salience profile + snapshot + pin
-  schema) plus Fix 3 makes Phase 0 several times the original wife/children fix — it is no longer "two
-  surgical fixes." Phase 0 is therefore sliced (see **Phase 0 sequencing** below) so a minimal
-  relationship fix can ship first if time-boxed.
+- **Phase 0 (this spec's priority):** stop the embarrassment now on data we can eyeball. **Fix 1** stops
+  the bad deterministic dump, **Fix 2** guarantees the high-salience core is always present (cached),
+  **0e** makes kinship derivation deterministic via owner-relationship edges, **Fix 3** makes the
+  long-tail lookup trustworthy via a loop-level groundedness gate, and **0f** preserves provenance.
+  **Scope honesty:** this started as "two surgical fixes" but, driven by two live re-tests, Phase 0 is now
+  **six slices (0a-0f)** — effectively a relational-memory + provenance rewrite, not a surgical patch.
+  That may be the right call, but it is a deliberate expansion, not the original framing. Phase 0 is
+  sliced (see **Phase 0 sequencing** below) with an explicit **minimum shippable path** (PR1+PR2+PR3) so
+  the surgical core can ship first if time-boxed.
 - **Phase 1 (durable):** explicit relationship edges + traversal, the Goal-4 layer — built on the
   clean foundation Phase 0 establishes. Detailed later; scoped but not fully specified here.
 
@@ -158,14 +239,23 @@ flow through the normal LLM path, which already answers correctly when the facts
   block** if both are present. So Fix 1 MUST also stop `relationships` from flowing into that block:
   drop the `relationships` arm of `build_critical_facts_prompt_block` and stop
   `extract_critical_fact_summary` populating `summary.relationships` (delegate relationships entirely
-  to Fix 2). Leave the `personal_facts` / name arms of that block untouched.
-- **Generalize the tail-block cleanup, don't special-case relationships:** because Fix 2 becomes the
-  single cache-resident home for *all* stable owner-identity context, the tail `CRITICAL FACTS`
-  *context-injection* block is now redundant for its **`personal_facts` arm too**, not only
-  `relationships`. Both arms migrate to Fix 2; the volatile tail block stops injecting owner-identity
-  context entirely (avoids double-emission and the "exact values, do not infer" instruction fighting
-  the LLM). This keeps the fix at the level of the *mechanism* (deterministic dump beats LLM) rather
-  than the relationship instance.
+  to Fix 2).
+- **Tail-block removal is slice-aligned — never remove an arm before CORE covers it (resolves the
+  arm-migration question, and the 0a regression):** the end state is that the tail `CRITICAL FACTS`
+  context-injection block stops emitting owner-identity context entirely (**both** `relationships`
+  *and* `personal_facts`), because Fix 2 becomes the single cache-resident home for all stable
+  owner-identity context (avoids double-emission and the "exact values, do not infer" instruction
+  fighting the LLM). But because Fix 2 lands in slices, the removal must track it so nothing regresses
+  in between:
+  - **In 0a** (CORE carries a *relationship*-only section): remove **only** the `relationships` arm
+    from the tail block. **Keep** the `personal_facts` / name arms in the tail — 0a's CORE section does
+    not cover employer/location/allergy yet, and removing them now would regress non-relationship
+    identity recall (the 0a-only risk @cursor flagged).
+  - **In 0b** (CORE carries the full salience *profile*): remove the `personal_facts` arm too, now that
+    CORE covers it. After 0b the tail identity block is fully retired.
+
+  This keeps the fix at the level of the *mechanism* (deterministic dump beats LLM) while never leaving
+  a window where identity context lives in neither place.
 - **Keep the scalar question-answer short-circuits** (`OwnerName` / `AssistantName` in
   `detect_critical_fact_query`): those answer a direct "what's my name?" with a scalar lookup, no
   shredding, and are a separate mechanism from context injection (answers Open Question #4 — only the
@@ -231,22 +321,47 @@ children fallback:
    heuristic (a value parseable as a date → birthday; otherwise → name), never emitting a bare
    `partner: <date>` line. If the pairing is ambiguous, render name only and drop the unattached date.
 2. **Children:** same precedence (per resolved Open Question #1) — `people` records with a child-like
-   role first, owner-linked / flat facts as fallback.
+   role first, owner-linked / flat facts as fallback. The flat fallback needs the **same name↔date
+   pairing heuristic as partner**: shredded `children`→`Bella` / `children`→`August 20, 2020` rows must
+   merge into `Bella (b. 2020-08-20)`, never a bare `children: <date>` line. With multiple children the
+   pairing is genuinely ambiguous across un-keyed flat rows — if names and dates can't be associated
+   deterministically, render names only and drop unattached dates rather than guess a wrong pairing.
 3. The render never emits a label with a lone date value — that exact output is the bug.
+4. **Explicit relationship ownership (the Galo bug — verified in live re-test):** every relationship
+   line names **whose** relation it is, from the owner's perspective. Render the owner's *ascending*
+   relations as `Your father: Galo Loor` / `Your mother: …`, partner as `Your partner: Aracely …`,
+   children as `Your children: Bella …` — never a bare `father: Galo` / `partner: Aracely` that a flat
+   reader (or the LLM) can re-bind to the nearest entity in the question. This is pure rendering (no
+   keywords, no schema) and is what stops "who's Cami's dad?" from grabbing the owner's *own* father.
+   **Applies only to owner-scoped facts:** a `person_facts` `father:` row belonging to *another* person
+   must NOT get the "Your" prefix — qualify ownership from the fact's subject, not unconditionally.
+   Ownership labels are necessary but not sufficient for *derived* relations (Bella→mom) — those need
+   the 0e edges.
 
 **Cache-stability guard — frozen membership, content-hashed (resolves the "frozen vs per-turn"
 tension):** salience inputs like `recall_count` change every turn; hashed live they would thrash the
 cache. Pin the algorithm precisely:
 
+0. **"Session start" defined:** the freeze runs on the **first owner-DM turn for a `session_id`** —
+   i.e. when `core_profile` is first assembled for that session — **not** on daemon restart or a calendar
+   day boundary. For a long-lived reused `session_id` (e.g. a persistent Telegram DM), the frozen
+   membership persists across days until a structural edit busts it; that is intended (stability over
+   freshness within a session).
 1. **Session start:** load the union source → score (per-source salience above) → select the top-N
    ordered **fact-ID list** → **freeze that ID list for the session.**
-2. **Each turn:** re-fetch *content* for the frozen IDs **plus** any pinned/newly-added facts → render →
-   the `core_profile` component hash = `canonical(sorted [(id, value, pinned)] of the rendered set)`.
-   **`recall_count` and `recency` are inputs to selection only and are NOT in the hash.**
-3. **Mid-session structural edit** (pin/unpin, add a child via `manage_people`, change a partner's
-   value): membership or content changes → hash changes → cache busts **exactly once**, then restabilizes.
-4. **Mid-session `recall_count` bump:** changes neither the frozen ID list nor the hashed content →
-   **no re-render, no thrash.**
+2. **Each turn:** re-fetch *content* for the frozen IDs **plus** any facts whose **membership** changed
+   structurally this session (see step 3) → render → the `core_profile` component hash =
+   `canonical(sorted [(id, value, pinned)] of the rendered set)`. **`recall_count` and `recency` are
+   inputs to selection only and are NOT in the hash.**
+3. **What changes membership mid-session (busts the hash once):** only *structural* edits — `pin`/`unpin`
+   (0c), a `manage_people` add/edit (new child, changed partner value). These recompute the frozen ID
+   list and bust the hash exactly once, then restabilize.
+4. **What does NOT change membership mid-session:** (a) a `recall_count` bump — changes neither the
+   frozen ID list nor the hashed content; (b) a plain **`remember_fact`** mid-session — the new fact is
+   available same-session via the normal/tail + Fix 3 search paths, but it does **not** enter the frozen
+   core membership until the next session (this is the "Accepted limitation" below; `remember_fact` is
+   *not* a structural membership edit, unlike `pin`/`manage_people`). Both → **no core re-render, no
+   thrash.**
 
 This gives both properties at once: passive recall drift is invisible to the cache (property the
 freeze buys), while a genuine edit still propagates the same session (property the per-turn content
@@ -272,14 +387,58 @@ branch is **inert until that column lands** — v1 auto-salience never hits it.
 | **0a** | Fix 1 + a minimal deterministic **relationship** section in CORE (partner/children via people-graph-first + flat fallback, with the merge/render rules above) | none | Low — fixes the transcript |
 | **0b** | Generalize 0a's section to the full **salience profile** (top-N across categories, frozen snapshot, per-source salience) | none | Medium — fixes the class |
 | **0c** | `pinned` column + `manage_memories(pin/unpin)` + pin override in selection | yes | Low, additive |
-| **0d** | Fix 3 — search-before-deny groundedness gate (+ bounded retry + soft prompt rule) | none | Medium — heuristic detector, but bounded |
+| **0d** | Fix 3 — classifier-triggered search-before-deny groundedness gate (+ bounded retry + soft prompt rule) | none | Medium — semantic detector, bounded |
+| **0e** | Minimal owner-relationship **edges** (owner—partner/child/parent→ + inverses), pulled forward from Phase 1; kinship queries resolve by traversal — no phrase matching | yes | Medium — small schema, high payoff (kills the Galo / derived-recall bugs) |
+| **0f** | Provenance capture at consolidation (`first_seen_at`/`source`/excerpt, **before** prune) + `manage_memories(action='provenance')` recall routed via the classifier | yes | Low-med — additive schema; capture is time-sensitive (land early) |
 
-0a alone closes the reproduced failure and the leaks; 0b delivers the *class* fix this spec argues for;
-0c adds user control; **0d** makes the long-tail (non-core) lookups trustworthy and is **independent**
-of 0a-0c (no shared schema or code — can land in parallel or after). **Pin tests (force-include a
-low-salience pinned fact, etc.) belong to 0c** — do not assert them before the column exists. The plan
-author chooses 0a-only (time-boxed) vs 0a+0b vs all four; the spec recommends 0a+0b+0d in the first PR
-(the trio that fixes the user-visible failure class), 0c as a fast follow.
+0a alone closes the reproduced *dump* failure and the leaks; 0b delivers the *class* fix this spec argues
+for; **0e** makes kinship / derived recall deterministic (the live-re-test Galo / Bella's-mom bugs); 0c
+adds user control; **0d** makes the long-tail (non-core) lookups trustworthy. 0d's *code* is
+**independent** of 0a-0c/0e (no shared schema; lives in `completion_phase`, not `core_prompt`) — but note
+one soft dependency: its no-op-path test assumes 0b's core profile exists. **Pin tests (force-include a
+low-salience pinned fact, etc.) belong to 0c** — do not assert them before the column exists. 0e's edges
+are also what let 0d's forced search resolve a derived denial by traversal rather than re-deriving from
+flat facts. **0f** is orthogonal to all of the above — it adds *provenance* (when/how a fact was learned),
+the one recall class 0a-0e don't address; its capture half should land **early** because provenance can
+only be stamped going forward (the prune already destroyed the past).
+
+**Recommended PR sequence (revised — 0d ships separately):**
+
+| PR | Contents | What it actually closes |
+|----|----------|-------------------------|
+| **PR1** | 0a + Fix 1 (relationships arm removed from tail; `personal_facts` kept) + Fix 2 rule 4 (explicit-ownership render) | The **original garbled-dump transcript** + the *display* half of the Galo bug (`Your father: Galo`, never re-bound to the child). **Does NOT** make derived kinship correct — "who's Bella's mom?" still waits for PR3. |
+| **PR2** | 0b salience profile (+ remove `personal_facts` tail arm) | The *class* fix for **direct** recall (wife, allergy, employer). Not kinship derivation. |
+| **PR2.5** | 0f **capture** only (provenance stamping at consolidation, before prune) — *not* the recall action | Stops the bleeding: provenance can only accrue forward, so land the capture hook early. No user-facing change yet. |
+| **PR3** | **Shared intent classifier** (`needs_grounding` + `kinship` + `provenance` outputs, one call) + 0e owner-relationship edges + traversal + **kinship injection path** | The live-re-test kinship failures (Cami's-dad→owner, Bella's-mom→Aracely). This is the PR that fixes the re-test, not PR1. |
+| **PR4** | 0d completion-phase groundedness **gate** (consumes the PR3 classifier; adds the block-and-retry) | The long tail + assertion fallback (entities 0e's owner-star edges don't cover). |
+| **PR5** | 0c pins + `manage_memories(pin/unpin)` | User control. |
+| **PR6** | 0f **recall** (`manage_memories(action='provenance')`, routed via the PR3 classifier's `provenance` intent) | "When/where did I learn X" + honest `derived` sourcing (the "Conchi" fabrication). |
+
+**Classifier-dependency resolution (critical sequencing — Option A):** 0e's kinship injection is
+**classifier-gated**, and 0d and 0f also route through a classifier. Rather than ship the classifier in
+PR4 (which 0e/PR3 precedes) or build three calls, **PR3 ships the one shared classifier** with a single
+output struct — e.g. `{ intent: kinship | provenance | needs_grounding | none, entity: Option<String> }`
+— and PR4/PR6 only **consume** it (PR4 adds the gate, PR6 adds the recall route). This removes the
+PR3-needs-PR4 cycle and the "one classifier, two/three outputs" promise becomes a concrete deliverable
+owned by PR3. Name that struct once in the plan.
+
+**Honest scoping:** the *original* transcript (garbled partner dump) is closed by PR1+PR2; the **live
+re-test** failures are closed by **PR3 (0e + classifier)**. Rule 4 only stops the *prompt* from misreading
+`Your father: Galo` as the child's father — it does not make Bella→mom derivable. Do not claim the
+re-test is fixed before 0e lands.
+
+**Minimum shippable path (if time-boxed):** **PR1 + PR2 + PR3** (dump + direct recall + kinship) is the
+must-have set — it closes both the original transcript and the live re-test. **PR2.5 (0f capture)** is
+high-value-early because it is time-sensitive and tiny. **PR4 (gate), PR5 (pins), PR6 (provenance
+recall)** are deferrable. The plan should offer this as the floor.
+
+**Do NOT bundle 0d into the first PR.** It is the single *riskiest* piece — a heuristic behavioral gate
+with a real false-positive surface and loop re-entry — and it is exactly the kind of change that needs
+isolated bake time and trigger metrics. Co-shipping it with the already-medium-risk 0b enlarges the
+blast radius of the first PR for no sequencing benefit (0d doesn't depend on 0b's *code*). Ship
+**PR1+PR2 first** (these close the reproduced failure and the class), then **0d as its own PR**. 0a
+alone remains the time-boxed escape hatch — with the documented caveat that 0a keeps `personal_facts`
+in the tail, so non-relationship identity recall is unaffected until 0b.
 
 **Where it goes — the caching decision:** inject it into the **session-static CORE prompt**
 (`src/agent/runtime/core_prompt.rs` → `render_core_prompt`), NOT the volatile per-turn tail.
@@ -373,34 +532,200 @@ alone. aidaemon's loop already evaluates outputs and forces re-iteration via str
 gates today check **task completion / mutation success** — none checks **answer groundedness**. Fix 3
 adds that missing category of evaluation as a real gate.
 
-**The gate (in `stopping_phase` / completion, before a reply is delivered):**
+**Anchor it in `completion_phase.rs`, not the generic "stopping_phase":** that is where the
+`verification_block_count` counter and the existing forced-continuation machinery already live
+(`completion_contract.rs:78`, `completion_phase.rs:1009/1156`). Build Fix 3 as a sibling gate there so
+it reuses the proven block-and-retry plumbing rather than a parallel mechanism.
 
-1. **Trigger detection** — the candidate reply makes a *negative-knowledge claim* ("I don't have / I
-   don't know / no record of / no information about …") **about an entity the user named** (person /
-   proper noun / identity term in the user message), **and** no memory-lookup tool
-   (`manage_people` view, `manage_memories` search, people/facts retrieval) was invoked **this turn**.
-2. **Intervention** — do **not** send the denial. Inject a forced-continuation directive: *"You
-   asserted you don't know about `<entity>` but did not search memory. Call `manage_people` /
-   `manage_memories` for `<entity>` before answering."* — mirroring the existing forced-nudge pattern
-   (edit-stall hint, read-saturation nudge).
-3. **Bounded escape** — cap forced retries with a dedicated monotonic counter (same shape as
+**Trigger via the LLM intent classifier, not keyword lists (revised — addresses the keyword-rot
+objection).** The decision "is this reply an *ungrounded* answer to a *personal-recall* question?" is a
+semantic judgment; approximating it with `looks_like_personal_memory_recall_question` + a denial-phrase
+list + lowercase proper-noun extraction is exactly the brittle, per-phrasing surface this codebase keeps
+accreting (it misses paraphrases and other languages — e.g. "quién es el papá de Cami" matches none of
+the lists). The gate fires on a small minority of turns, so it is the **cheapest possible place** to
+spend one classifier call. Route it through the existing `src/agent/intent/llm_classifier.rs`:
+
+- **Primary signal — classifier.** Add a lightweight intent: *given* `(user_text, candidate_reply,
+  whether a lookup tool fired this turn)`, return `{ needs_grounding: bool, entity: Option<String> }` —
+  true when the candidate reply **asserts or denies a specific personal fact** (about a person/relationship
+  the owner would expect the agent to know) that was **not** retrieved this turn. The classifier returns
+  the entity span too, replacing the fragile hand-rolled extractor.
+- **Optional cheap pre-filter (cost guard, not the decision).** To avoid a classifier call on every turn,
+  a fast word-boundary denial-phrase check (`tool_result_indicates_no_evidence`) **plus** "no
+  `is_personal_memory_tool` call this turn" may gate *whether the classifier runs*. This is a
+  recall-biased pre-filter (a false positive just costs one classifier call, which then says no); it must
+  **never** be the sole trigger, and the **assertion** case — a confident *wrong* answer like "Galo is
+  Cami's dad", which carries no denial phrase — bypasses the pre-filter and relies on the classifier when
+  budget allows. Keep `looks_like_personal_memory_recall_question` only as part of this pre-filter, never
+  as the scoping authority.
+
+1. **General-knowledge guard is now the classifier's job.** "Who is the president of France?" → "I don't
+   have information" must not fire the gate; the classifier distinguishes public-figure / general-knowledge
+   from personal-recall directly, instead of relying on a keyword allow-list to approximate it.
+2. **Entity comes from the classifier.** No separate lowercase proper-noun span heuristic. Empty/`None`
+   entity → force a generic `manage_memories(search)` over the user message; if the classifier is
+   unavailable (provider error / disabled), **fall back to the pre-filter-only path** (denial phrase +
+   no-lookup) so the gate degrades to today's keyword behavior rather than vanishing — and if even the
+   entity is unscoped there, let the denial through rather than force a blind search.
+3. **Intervention** — do **not** send the denial. Inject a forced-continuation directive: *"You asserted
+   you don't know about `<entity>` but did not search memory. Call `manage_people` / `manage_memories`
+   for `<entity>` before answering."* If `manage_people` is disabled (runtime `people_enabled = false`),
+   point only at `manage_memories`; if **both** lookup tools are unavailable, **skip the gate** (there is
+   nothing to force). Mirrors the existing forced-nudge pattern (edit-stall hint, read-saturation nudge).
+4. **Bounded escape** — cap forced retries with a dedicated monotonic counter (same shape as
    `verification_block_count`): after K (≈2) attempts, allow the denial through so the gate can never
    infinite-loop. A genuine "not in memory" answer survives — it just must be *earned* by a real search
-   first.
+   first. **Log every gate trigger** (entity, fired/escaped) so the heuristic can be tuned against real
+   traffic.
 
-**Detector honesty (the tuning surface):** "is this a negative-knowledge claim about a named entity?"
-is heuristic — pattern-match on denial phrases + the user having referenced a person/proper noun. The
-codebase already does this class of detection (cancel-intent, deferred-action, low-signal completion),
-so it is consistent, but false positives (blocking a legitimate "I can't help with that") and false
-negatives are real. Mitigations: keep patterns narrow and word-boundary matched
-(`contains_keyword_as_words`); scope the trigger to identity/people questions; the bounded escape caps
-the cost of a wrong trigger at K wasted iterations.
+**Detector honesty (the tuning surface):** "is this an ungrounded personal-fact claim?" is a judgment,
+now made by the classifier rather than phrase lists — which is *more* robust to paraphrase/language but
+is not free of error (a mis-classification is possible). The sharpest false-positive case is the
+**nuanced partial answer** — "I don't have Juan's *phone number*, but he's your coworker" is grounded
+and must NOT block; this is exactly the kind of distinction a classifier handles better than a denial
+regex, so the classifier prompt must call it out with that example. The bounded escape (below) caps the
+cost of any wrong trigger at K wasted iterations regardless, so the gate stays safe while the classifier
+is tuned against logged triggers.
+
+**Honest cost — denials are no longer free (not just wrong ones):** because aidaemon recalls mostly via
+*automatic context injection*, not tool calls, "no lookup tool this turn" is true on the vast majority
+of turns. So when the gate *correctly* fires on a genuine unknown, it **always** costs a forced
+search + an extra LLM turn before the (now earned) denial. That is the intended trade — correctness over
+latency on denials — but state it plainly; it is not only mis-triggers that cost iterations.
+
+**Scope note — what each fix actually owns (corrected after the live re-test).** Fix 2 guarantees
+partner/children are *present* in CORE, which fixes the **original dump** transcript and direct recall —
+but the live re-test proved presence is **not** enough for *derived* kinship: "who's bella's mom?" still
+failed with everything in context. **0e (edge traversal) owns kinship derivation**, not Fix 2 and not
+Fix 3. Fix 3 owns a *third* class: a denial/assertion about an entity in memory but **not** resolvable by
+the core profile or an owner-star edge (the "who is Juan Perez?" coworker case). So: PR1+PR2 close the
+dump; **PR3/0e** closes the re-test kinship; **0d/Fix 3** closes the long tail. Do not conflate them.
+
+**Positive synergy with Fix 2's accepted limitation:** Fix 3 partially *covers* the mid-session gap —
+a fact the user stated this session that never reached the frozen core profile will still be found,
+because the gate forces a search before letting a denial through. The two fixes reinforce each other.
 
 **Layering (defense in depth):** keep the soft prompt rule *and* add the gate. Prompt nudges the model
 to search proactively; the gate refuses to let a denial through unsearched. Neither alone is trusted.
 
-**No schema.** Pure loop/policy logic + prompt text. Generalizes beyond denials later — the same gate
-shape can enforce "don't *assert* a specific fact you didn't retrieve," not just "don't deny."
+**Classifier wiring — this is the first production decision-path use of `llm_classifier` (verified):**
+the module is today **shadow-mode scaffolding** ("*not* wired into the agent's decision path") and its
+`classify_intent` returns a coarse `LlmIntentClass` (schedule / memory-storage / recall / action /
+knowledge / other) — **not** the `{ intent, entity }` shape these fixes need. So the **classifier ships in
+PR3** (it's on 0e's critical path), and PR4/PR6 consume it:
+- Add a **new** classifier function with a **single shared output struct** —
+  `{ intent: kinship | provenance | needs_grounding | none, entity: Option<String> }` — not three calls,
+  not an overload of `classify_intent`. One call serves 0e's kinship flag (PR3), Fix 3's groundedness
+  (PR4), and 0f's provenance routing (PR6).
+- **Fail-open**, matching the module's existing ~5s-timeout / any-error → no-op contract: a classifier
+  error degrades to the pre-filter-only path (Fix 3) and to "no kinship injection" (0e), never to a hang
+  or a blocked reply.
+- Gate behind a config flag, **default on in owner DMs only** (where personal-recall lives), so the
+  classifier never runs for non-owner / public traffic.
+- Budget: the pre-filter keeps the classifier off the vast majority of turns; state the per-turn cap so
+  PR4 isn't estimated as "a regex change."
+
+**No schema.** Pure loop/policy logic + prompt text + the new classifier call. Generalizes beyond denials
+later — the same gate shape can enforce "don't *assert* a specific fact you didn't retrieve," not just
+"don't deny."
+
+### Slice 0e: Minimal owner-relationship edges (pulled forward from Phase 1)
+
+Fix 2's ownership-labeled render (rule 4) stops the **display** ambiguity ("whose father?"), but it does
+not make **derived** relations answerable — "who's Bella's mom?" requires connecting *owner—child→Bella*
+with *owner—partner→Aracely*. The live re-test proved presence + ownership labels are not enough for that
+hop: the model must be able to *traverse*, or it guesses / denies. 0e adds the smallest edge layer that
+makes the reproduced kinship questions deterministic — owner-centric only, not the full graph.
+
+- **Schema:** a single directed-edge store keyed to the owner Person — `(subject_person_id, relation,
+  object_person_id)` with `relation ∈ {partner, child, parent}` and a stored inverse (`parent`↔`child`;
+  `partner` symmetric). Either a small `relationship_edges` table or reuse `person_facts` with a typed
+  `relation` + `object_person_id` FK. Children become **owner-linked entities** here (the spec already
+  flags they are orphan flat facts today).
+- **Population:** derive edges from existing data at migration time (owner's `partner`/`children`/parent
+  facts + `people` records) and keep them in sync when `manage_people` / `remember_fact` writes a
+  relationship. No new user action required.
+- **Retrieval — direct edges are ground truth; co-parent is an *inference*, not "deterministic"
+  (resolves an internal contradiction):** a parent named by a **stored edge** is exact —
+  `dad_of(X) = { p : p —parent→ X }` returns the owner when `owner —parent→ X` is stored, and that is
+  what makes "who's Cami's dad? → you, not Galo" reliable. But deriving a *mother* from
+  `partner(owner) ∧ owner —parent→ X` is the **partner-of-a-parent-is-the-other-parent assumption** —
+  exactly the biology this spec says elsewhere to **never assert** (step-parent, ex-partner, remarriage
+  all break it). Two honest options; the plan picks one:
+  - **Preferred — store both parent edges.** When the data supports it, persist `Aracely —parent→ Bella`
+    *as its own edge* (not derived), so `mom_of(Bella)` is a real edge lookup. This is the only way the
+    answer is genuinely deterministic.
+  - **Otherwise — return co-parent as a labeled *hint*, not fact.** Hand the LLM
+    "owner —parent→ Bella; owner —partner→ Aracely (possible co-parent)" and let it phrase tentatively
+    ("Aracely, your partner, is most likely Bella's mom") rather than asserting it as ground truth.
+
+  **Drop the `∧ female` clause entirely (verified):** `Person` has **no gender/sex field** in the schema
+  or `traits.rs`, so a gender predicate is unimplementable in 0e v1 and not needed — the owner's known
+  partner edge already supplies the co-parent candidate. Gender inference is out of scope.
+- **Delivery contract — when traversal runs and where the result goes (was unspecified):** 0e is useless
+  if the edges exist but never reach the LLM. **Do NOT add a phrase-matching trigger.** Run the kinship
+  resolver **in the loop, gated by the same Fix 3 intent classifier** (one classifier, two outputs):
+  when the classifier flags a turn as a **kinship/relationship question over the owner star**, the loop
+  (a) runs the deterministic traversal, (b) injects the resolved entities/edges as a **system directive**
+  (same mechanism as `CoreferenceGroundingRequired`) *before* the LLM composes its answer. This keeps
+  "no phrase lists" intact (the classifier decides, not keywords) and makes the kinship answer
+  edge-driven rather than re-derived from flat facts. Precomputing every kinship line into CORE is
+  rejected — unbounded (N children × relations) and still leaves derivation to the model.
+- **Why this and not another rule:** there is **no keyword surface** — "who's Cami's dad", "quién es el
+  papá de Cami", "Bella's mother?" all resolve through the same `child`/`parent`/`partner` edges via the
+  classifier, not a phrase list. It is the structural answer to the class the keyword objection is about.
+- **Composition / precedence (three mechanisms now touch relational recall — order them explicitly):**
+  per turn, at most one intervention fires, in this priority:
+  1. **0e traversal** — if the classifier flags an owner-star kinship question *and* an edge resolves it,
+     inject the traversal result and let the LLM phrase it. No gate, no forced search.
+  2. **Fix 3 gate** — only if 0e did **not** resolve it (no edge / non-kinship / long-tail entity) and the
+     reply asserts/denies an unretrieved personal fact. Forces a search.
+  3. **Coreference gate** (shipped, keyword-based `looks_like_pronoun_referent_followup`) — governs
+     pronoun-referent binding ("...about *her*?"), orthogonal to kinship; if it and Fix 3 both match,
+     the coreference anchor runs first (it determines *which* entity Fix 3/0e would even be about). This
+     keyway prevents double-forcing a lookup in one turn. The coreference gate is a candidate to fold into
+     the same classifier later (noted in Phase 1).
+
+### Slice 0f: Provenance preservation (capture-at-consolidation) + recall
+
+0a-0e make recall *correct*; 0f makes it *accountable* — answering "when/where did I learn this?" and
+"did I actually tell you, or did you infer it?". The live forensics showed this is impossible today: the
+**Pruner deletes consolidated events** (`events/store.rs:342`), so by the time the user asks, the
+originating utterance is gone and only the distilled fact remains — with no backlink. The model compounds
+it by misrouting "when did I…" to `goal_trace`.
+
+**Why it must live at consolidation:** the raw text exists *only* in the event, and the event is pruned
+after consolidation. Provenance must be stamped onto the fact **at extraction time, before the prune** —
+it cannot be reconstructed later. This makes 0f's *capture* half time-sensitive: it only protects facts
+learned **after** it ships (historical provenance is already lost — see Out of scope).
+
+- **Capture (in the Consolidator, before prune):** when a fact is extracted from an event, stamp:
+  - `first_seen_at` — the originating event's timestamp (the answer to "when").
+  - `source` ∈ `{user_stated, derived, inferred, imported}` — `user_stated` only when the value came from
+    a user message; `derived` for web-search/tool-derived values (the "Conchi" case); `inferred` for
+    consolidation-LLM guesses. This is the truthfulness lever. **NB — `facts` and `person_facts` ALREADY
+    have a `source` column (verified):** `person_facts.source` defaults to `'agent'`; `facts.source` is
+    bound on every insert (facts.rs:489/495) with free-text like `'agent'`/`'user'`/tool name. 0f does
+    **not** add `source` — it must **repurpose** that column to this controlled vocabulary, which forces a
+    **backfill decision for existing rows** (they cannot be retroactively proven `user_stated` → backfill
+    to `inferred`/`unknown`). Decide repurpose-in-place vs a new `origin` column explicitly; do not add a
+    duplicate "source".
+  - `first_seen_at`, `source_excerpt` (short, bounded), and/or `source_event_id` ARE net-new — the
+    "when/where". `source_event_id` may dangle after prune; `source_excerpt` is the durable copy.
+  - **Default must not be `user_stated`** — default to `inferred`/`unknown` and set `user_stated` only on
+    a verified user-message origin, or the fabrication problem persists.
+- **Recall path:** `manage_memories(action='provenance', query)` returns matching facts with
+  `first_seen_at` + `source` + excerpt. Route "when/where/how did I tell you X" to it via the **same
+  classifier** added in 0d (a `provenance` intent), so the model stops reaching for `goal_trace`. The
+  closest-available answer for a *pre-0f* fact is its `created_at` (extraction time), labeled clearly as
+  *"recorded"*, not *"you told me"*.
+- **Truthfulness synergy:** with `source` populated, a `derived` value is answered honestly ("I inferred
+  'Conchi' from a web search — you didn't tell me that") instead of being recalled as a user fact. Same
+  groundedness principle as Fix 3, applied to *storage* rather than *reply*.
+- **Capture half is independent of 0a-0e** (own schema + consolidator hook) and worth landing **early**
+  (PR2.5) so provenance accrues, even though it fixes no reproduced transcript. **The recall half is NOT
+  independent** — `manage_memories(action='provenance')` routes through the PR3 shared classifier's
+  `provenance` intent, so it depends on PR3. State that dependency, don't claim full independence.
 
 ### Phase 0 data flow (after)
 
@@ -412,18 +737,23 @@ user: "who is my wife?"
     salience-selected (not hard-coded to relationships):
         ## About you
         Name: David Loor · Location: … · Employer: …      ← identity (also salience-selected)
-        Partner: Aracely Zambrano (b. 1990-06-30)
-        Children: Bella (b. 2012-05-17), Cami (b. 2020-08-20)
+        Your partner: Aracely Zambrano (b. 1990-06-30)    ← explicit ownership (Fix 2 rule 4)
+        Your children: Bella (b. 2012-05-17), Cami (b. 2020-08-20)
+        Your father: Galo Loor                            ← owner's OWN parent, never a bare `father:`
         Allergy: penicillin   [pinned]                    ← arbitrary high-salience / pinned fact
   → LLM answers naturally: "Your wife is Aracely Zambrano."
 user: "who's bella's mom?"
-  → same cached block present every turn
-  → LLM reasons Bella → you → Aracely → "Aracely, your partner, is Bella's mom."
+  → same cached block present every turn (with explicit-ownership lines)
+  → (Fix 3/0e classifier) flags owner-star kinship → loop traverses edges, injects result as a directive:
+      exact if `Aracely —parent→ Bella` is stored; else co-parent *candidate* (owner—child→Bella ∧
+      owner—partner→Aracely) — labeled as inference, not asserted as biology
+  → LLM phrases from the injected edges → "Aracely, your partner, is Bella's mom." (tentative if inferred)
 user: "am I allergic to anything?"
   → same block → "Yes — penicillin."   (the *class* fix: not a relationship, still reliable)
 user: "who is Juan Perez?"            (a coworker — NOT in the core profile)
   → not in CORE block → LLM is about to answer "I don't have information about Juan"
-  → (Fix 3 gate) negative-knowledge claim about a named entity + no lookup this turn → BLOCKED
+  → (Fix 3 gate) intent classifier flags: personal-recall answer asserting/denying a specific fact with
+    no lookup this turn → BLOCKED
   → forced retry → LLM calls manage_people(view, "Juan Perez") → fact found → answers correctly
      (or, after a real search, legitimately: "I don't have anything on Juan" — now *earned*)
 ```
@@ -437,14 +767,22 @@ denial through unsearched — not because of a hard-coded reply for one question
 
 Once Phase 0 is in, promote relationships from string keys to **explicit, queryable edges** so
 associative recall generalizes beyond the bounded core-profile block (which guarantees the top-N but
-can't traverse arbitrary connections):
+can't traverse arbitrary connections).
 
-- Explicit edges: `owner —partner_of→ Aracely`, `owner —child_of→ Bella/Cami` (and inverse). Convert
-  children from orphan flat facts into owner-linked entities.
+**Note (4th pass):** the *minimal* owner-centric edges — `owner —partner→ Aracely`,
+`owner —child→ Bella/Cami`, `owner —parent→ Galo` and inverses — are **pulled forward into Phase 0 as
+slice 0e**, because the live re-test showed they are on the critical path for the reproduced kinship bugs
+(whose-dad / whose-mom), not a later nicety. Phase 1 below is then the *generalization* beyond the
+owner-centric star:
+
+- Explicit edges **beyond the owner star** (person↔person edges not involving the owner) and richer
+  relation types. Convert any remaining orphan flat facts into owner-linked entities.
 - Relation-typed retrieval: a relationship question resolves a role → entity deterministically, then
   expands 1 hop for context, instead of semantic-cosine-on-flat-facts.
-- Co-parent / derived relations by **query-time traversal** (partner-of-owner ∧ parent-of-child),
-  not materialized assumptions — avoids asserting biological/step relationships the data doesn't
+- Co-parent / derived relations resolved the **same way 0e settled it** — a stored parent edge is exact;
+  `partner-of-owner ∧ parent-of-child` is a **labeled co-parent inference, surfaced as a hint, never
+  asserted as ground truth** (and never materialized as a stored `parent` edge). This avoids the
+  biological/step assumption the data doesn't
   support. The LLM phrases the connective answer.
 
 This is the entity/edge layer from the companion brainstorm. `sqlite-vec` (the original "step 1")
@@ -460,10 +798,11 @@ the critical path for relational recall.
   `CoreRelationships` today); `OwnerName`/`AssistantName` queries still classify. Update the existing
   `detects_critical_fact_queries` / `deterministic_reply_uses_critical_facts` tests in
   `recall_guardrails.rs` for the removed arm.
-- **Unit (Fix 1, tail leak):** the tail `CRITICAL FACTS` *context-injection* block no longer emits
-  owner-identity context — **neither** the `relationships` arm (no `partner:`/`children:` line, no
-  `partner: <date>` bullet given shredded facts) **nor** the `personal_facts` arm. Asserts both leak
-  paths are closed and that owner-identity context is delegated entirely to Fix 2 (no double-emission).
+- **Unit (Fix 1, tail leak — slice-aware):** after **0a**, the tail `CRITICAL FACTS` block no longer
+  emits the `relationships` arm (no `partner:`/`children:` line, no `partner: <date>` bullet given
+  shredded facts) but **still emits `personal_facts`** (kept until 0b). After **0b**, it emits neither
+  arm — owner-identity context is delegated entirely to Fix 2 (no double-emission). Assert the
+  slice-appropriate state, not "both removed" unconditionally.
 - **Unit (Fix 2):** core-profile block renders deterministically (byte-identical for identical
   inputs); role synonyms (wife/spouse/husband → partner) resolve to the partner entity; empty graph
   renders an empty/omitted block, not an error.
@@ -475,11 +814,49 @@ the critical path for relational recall.
   exists.
 - **Unit (Fix 2 merge/render):** seed **shredded** flat facts (`partner`→`Aracely`,
   `partner`→`June 30, 1990` as two rows, mirroring the real transcript) and assert the rendered block
-  pairs them into `Partner: Aracely (b. 1990-06-30)` and **never** emits a bare `partner: <date>` line.
-  Also seed the people-graph form (`Person{relationship: partner}` + a `person_facts` birthday) and
-  assert it wins over the flat fallback. This is the test that proves the actual bug is fixed.
+  pairs them into `Your partner: Aracely (b. 1990-06-30)` (ownership-qualified per rule 4) and **never**
+  emits a bare `partner: <date>` line. Also seed the people-graph form (`Person{relationship: partner}` +
+  a `person_facts` birthday) and assert it wins over the flat fallback. This is the test that proves the
+  actual bug is fixed.
 - **Unit (Fix 2 per-source salience):** a partner stored only as a `Person`/`person_facts` (no
   `recall_count`) still ranks into the profile above high-`recall_count` flat trivia.
+- **Unit (Fix 2 rule 4 — explicit ownership):** seed an owner `father`/`parent` fact and assert the
+  rendered line is `Your father: Galo Loor` (ownership-qualified), and that **no** bare `father: Galo`
+  line is ever emitted. This is the render-level guard against the live-re-test Galo misattribution.
+- **Unit (0e migration — from today's data shape):** children are **flat facts** today (Bug 3), so the
+  migration must derive `owner —child→ Bella/Cami` (+ inverse `owner —parent→` ) from those flat
+  `children` facts, `owner —partner→ Aracely` from the partner Person/facts, and `owner —parent→ Galo`
+  from the owner's parent facts. Assert the migration produces these from realistic seed data (flat child
+  rows, not pre-linked entities), and — for the **exact** `mom_of` path — optionally creates
+  `Aracely —parent→ Bella/Cami` when partner+child are both owner-linked.
+- **Unit (0e edges):** migration derives `owner —child→ Bella/Cami`, `owner —partner→ Aracely`,
+  `owner —parent→ Galo` (+ inverses) from seeded facts/people. **Exact-edge cases:** `dad_of("Cami")`
+  returns the **owner** (not the owner's father Galo) via the stored `owner —parent→ Cami` edge;
+  `grandparent_of("Bella")` returns Galo via two stored hops. **Co-parent (inference) case:** with only
+  `owner —parent→ Bella` + `owner —partner→ Aracely` stored, `mom_of("Bella")` returns Aracely **labeled
+  as a co-parent candidate, not ground truth** (or, if the dual edge `Aracely —parent→ Bella` is stored,
+  as exact). Assert the inference is **never silently materialized** as a stored `parent` edge, and that
+  the `∧ female` predicate is absent (no gender field).
+- **Integration (0e, mock LLM):** in an owner DM seeded via edges, "who's Cami's dad?" resolves to the
+  owner and "whose Bella's mom?" resolves to Aracely **across repeated turns, no variance, no forced
+  search** — the exact pair the live re-test failed. Assert the resolved entities reach the system
+  prompt / tool result the LLM sees.
+- **Integration (precedence keyway — 0e/Fix3/coreference):** a turn that matches **both** the coreference
+  gate and a kinship question ("who's *her* mom?" after Bella was the subject) fires **exactly one**
+  intervention in the defined order (coreference anchors the referent → 0e traverses → no Fix 3 forced
+  search). Assert no double-forced lookup and that the precedence order (0e → Fix 3 → coreference anchor
+  first) holds.
+- **Unit (0f capture):** a fact extracted from a user-message event gets `source = user_stated` and
+  `first_seen_at` = the event's timestamp; a fact extracted from a web_search/tool-derived value gets
+  `source = derived`; a consolidation-LLM guess gets `source = inferred`. Assert the **default is not**
+  `user_stated`.
+- **Unit (0f survives prune):** stamp provenance, then run the Pruner (`DELETE FROM events WHERE
+  consolidated_at IS NOT NULL`); assert the fact still answers `first_seen_at`/`source`/excerpt —
+  provenance lives on the fact, not the deleted event.
+- **Integration (0f recall routing):** "when did I tell you my mom is X?" routes via the classifier to
+  `manage_memories(action='provenance')`, **not** `goal_trace`, and returns `first_seen_at` + `source`; a
+  `derived` fact ("Conchi") is reported as inferred, not user-stated. This is the exact live-forensics
+  failure (the bot picked `goal_trace` twice).
 - **Gate regression (Fix 1+2):** owner DM with `people_enabled = false` and identity flat facts
   present still renders a core profile (people-graph subsection empty, flat-identity half present);
   non-owner session renders no profile.
@@ -489,15 +866,20 @@ the critical path for relational recall.
 - **Cache invariants:** the new core component participates in the aggregate hash; unchanged
   relationships → cache HIT (block byte-stable across turns); a changed relationship → exactly one
   re-render. Extends the existing `core_prompt.rs` cache-decision tests.
-- **Integration (mock LLM):** in an owner DM seeded with a partner + 2 children **and** a
-  non-relationship high-salience fact (e.g. a pinned allergy), "who is my wife?", "who is my spouse?",
-  "who's <child>'s mom?", **and "am I allergic to anything?"** all surface the relevant fact in the
-  system prompt and let the LLM answer — across repeated turns (no variance). The allergy case is the
-  generality proof: a non-relationship recall is just as reliable. **Assert on the system-prompt bytes**
-  (the core-profile block is present), not only on mock LLM output.
+- **Integration (mock LLM) — 0b is DIRECT recall only, NOT kinship derivation:** in an owner DM seeded
+  with a partner + 2 children **and** a non-relationship high-salience fact (for 0b use a
+  **high-`recall_count`** allergy/employer — *not* a pinned one; pinned-fact inclusion is a 0c test),
+  "who is my wife?", "who is my spouse?", **and "am I allergic to anything?"** all surface the relevant
+  fact in the system prompt and let the LLM answer — across repeated turns (no variance). The allergy
+  case is the generality proof: a non-relationship recall is just as reliable. **Assert on the
+  system-prompt bytes** (the core-profile block is present), not only on mock LLM output. **Do NOT put
+  "who's <child>'s mom?" in this 0b suite** — the live re-test showed that can fail even with the full
+  profile present; it belongs to the **0e integration** test above (kinship is edge-derived, not a
+  presence guarantee).
 - **Seed via the graph, not flat facts:** integration tests must seed with `upsert_person` +
-  person-facts (and, for the fallback path, owner identity-category flat facts + a pinned fact), so
-  Fix 2's actual source of truth and the pin override are both exercised — not just `upsert_fact`.
+  person-facts (and, for the fallback path, owner identity-category flat facts), so Fix 2's actual
+  source of truth is exercised — not just `upsert_fact`. (Add a pinned fact to the seed only in the 0c
+  test suite, once the column exists.)
 - **Cache bust:** update the partner via `manage_people`; assert `core_cache_decision` reports the
   `core_profile` component changed on the next turn (and only that component).
 - **Regression:** "who is aracely?" (direct entity lookup) still works. Note `text_relates_to_critical_identity`
@@ -508,10 +890,22 @@ the critical path for relational recall.
   (`src/integration_tests/part_00.rs:784`) asserts the old `CRITICAL FACTS` block with
   `partner: Alice`-style lines. Fix 1 removes that block's identity arms, so this test must be rewritten
   to assert the **core-profile** block instead. Budget for it — it is not optional.
-- **Unit (Fix 3 detector):** the negative-knowledge detector fires on "I don't have information about
-  Juan", "I don't know who that is", "no record of …" when the user named an entity, and does **not**
-  fire on a benign answer or a refusal unrelated to memory. Word-boundary matched; covers
-  false-positive guards (e.g. "I don't think you should…" must NOT trigger).
+- **Unit (Fix 3 classifier trigger):** with a **mocked classifier**, the gate fires when it returns
+  `needs_grounding=true` and is suppressed when false. Cases the *classifier prompt* must get right
+  (assert via fixture, not regex): (a) "who is the president of France?" → "I don't have information" →
+  **no fire** (general knowledge); (b) nuanced partial "I don't have Juan's phone number, but he's your
+  coworker" → **no fire** (grounded); (c) a confident *assertion* with no lookup ("Galo is Cami's dad")
+  → **fire** — the case the old denial-phrase list could never catch (no denial phrase). **Pre-filter
+  test:** the cheap denial-phrase + no-lookup pre-filter only gates *whether the classifier runs*, never
+  the final decision; assert a denial-phrase reply with a lookup this turn does not even call the
+  classifier.
+- **Unit (Fix 3 classifier-unavailable fallback):** classifier mocked to error → the gate degrades to
+  the pre-filter-only (denial phrase + no-lookup) path rather than disappearing.
+- **Unit (Fix 3 entity from classifier):** the entity returned by the classifier is passed to the forced
+  directive; the **empty-entity fallback** is exercised (classifier returns `entity=None` → generic
+  `manage_memories` search, or gate skip — assert it does not interpolate an empty `<entity>`).
+- **Unit (Fix 3 tool availability):** with `people_enabled = false` the directive points only at
+  `manage_memories`; with **both** lookup tools unavailable the gate is skipped (no forced retry).
 - **Integration (Fix 3 gate, mock LLM):** a person exists in memory but is **not** in the core profile;
   scripted LLM denies on turn 1 **without** a lookup → the gate blocks the reply and forces a retry;
   turn 2 the LLM calls `manage_people(view)` and answers correctly. Assert the denial was **not**
@@ -529,6 +923,9 @@ the critical path for relational recall.
 - The full polyglot memory build (typed numeric records, artifacts, reflection loop, decay).
 - Re-extraction / backfill of historically shredded flat facts — Phase 1 entity work may revisit;
   not required for Phase 0 since the people graph is already the source of truth.
+- **Historical provenance backfill (0f):** facts learned **before** 0f ships have already lost their
+  originating event to the Pruner; their provenance is unrecoverable (only `created_at` survives). 0f is
+  capture-forward only — it cannot reconstruct when you first said something the system already pruned.
 
 ## Open questions
 
@@ -556,3 +953,8 @@ the critical path for relational recall.
 - [ ] Should Fix 2's deterministic block let us *shrink* the volatile per-turn people injection
       (avoid double-emission)? (Defer; measure first — and note per Bug 3 there is little owner-DM
       people text to shrink today, since the graph is fetched but not rendered.)
+- [ ] **Prune-timing aggressiveness (0f-adjacent):** consolidated events are pruned within minutes
+      (~25 min observed in live forensics), which is what makes raw-utterance provenance unrecoverable and
+      may also hurt recent-conversation recall. 0f preserves *fact* provenance regardless, but should the
+      event-prune cutoff be lengthened, or an append-only utterance log kept, so the *raw* record survives
+      longer? (Heavier; measure recall impact before changing the prune contract.)
