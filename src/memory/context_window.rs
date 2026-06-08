@@ -193,14 +193,24 @@ fn role_quota(role: &str) -> usize {
 ///
 /// Pillar B (Task 7): callers scope this to the CURRENT-TURN region only —
 /// archived turns are whole-turn-evicted upstream and never trimmed here.
-pub fn fit_messages_with_source_quotas(messages: Vec<Value>, budget_tokens: usize) -> Vec<Value> {
+///
+/// Returns `(fitted_messages, dropped)` where `dropped` is the number of
+/// messages removed from the input (`input_len - fitted_len`). The result is
+/// always a subset of the input (this never adds messages), so the count is an
+/// accurate "did anything get dropped?" signal — Pillar B (Task 8) keys the
+/// `history_fitting` prefix-mutation attribution line off `dropped > 0`.
+pub fn fit_messages_with_source_quotas(
+    messages: Vec<Value>,
+    budget_tokens: usize,
+) -> (Vec<Value>, usize) {
+    let input_len = messages.len();
     let messages_json = serde_json::to_string(&messages).unwrap_or_default();
     let current_tokens = estimate_tokens(&messages_json);
     if current_tokens <= budget_tokens {
-        return messages;
+        return (messages, 0);
     }
     if messages.len() <= 2 {
-        return messages;
+        return (messages, 0);
     }
 
     let mut selected_indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
@@ -283,7 +293,8 @@ pub fn fit_messages_with_source_quotas(messages: Vec<Value>, budget_tokens: usiz
         "Context window: applied source quotas"
     );
 
-    result
+    let dropped = input_len.saturating_sub(result.len());
+    (result, dropped)
 }
 
 /// Compress a tool result if it exceeds the character limit.
@@ -852,8 +863,11 @@ mod tests {
             messages.push(json!({"role": role, "content": format!("msg-{i}")}));
         }
 
-        let result = fit_messages_with_source_quotas(messages, 40);
+        let (result, dropped) = fit_messages_with_source_quotas(messages, 40);
         assert!(!result.is_empty());
+        // Pillar B (Task 8): the fitter reports how many messages it dropped so
+        // the call site can attribute the `history_fitting` prefix mutation.
+        assert!(dropped > 0, "tight budget must drop at least one message");
         assert_eq!(result[0]["role"], "user");
         let tail = result.last().unwrap()["content"].as_str().unwrap();
         assert!(tail.contains("msg-17"));
@@ -864,6 +878,20 @@ mod tests {
                 .unwrap_or("")
                 .contains("Conversation summary")
         }));
+    }
+
+    #[test]
+    fn test_fit_with_source_quotas_reports_zero_dropped_when_under_budget() {
+        // Pillar B (Task 8): when nothing is dropped, `dropped` must be 0 so the
+        // call site stays silent (no unattributed prefix mutation logged).
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let original_len = messages.len();
+        let (result, dropped) = fit_messages_with_source_quotas(messages, 100_000);
+        assert_eq!(dropped, 0);
+        assert_eq!(result.len(), original_len);
     }
 
     #[test]

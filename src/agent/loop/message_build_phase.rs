@@ -733,11 +733,15 @@ pub(super) async fn run_message_build_phase(
     // context blow-up during retry loops (keep the latest error details).
     let collapsed_tool_errors = super::loop_utils::collapse_repeated_tool_errors(&mut messages);
     if collapsed_tool_errors > 0 {
+        // Pillar B (Task 8): collapsing earlier repeated-error payloads into short
+        // notes rewrites stable-region bytes. Attribute it so the prefix-invariant
+        // gate (Task 11) does not read this as an unattributed prefix break.
         info!(
             session_id,
             iteration,
             collapsed_tool_errors,
-            "Collapsed repeated tool errors in current interaction"
+            reason = "repeated_tool_error_collapse",
+            "Prefix mutation"
         );
     }
     // Phase 0 stage hash: repeated tool-error collapse. Repeated-error collapse
@@ -793,23 +797,23 @@ pub(super) async fn run_message_build_phase(
             .unwrap_or(0);
         let archived_prefix: Vec<Value> = messages[..current_region_idx].to_vec();
         let current_region: Vec<Value> = messages[current_region_idx..].to_vec();
-        let before_current = current_region.len();
         // The archived prefix already consumed `archived_budget`; the current
         // region is fit against the remaining budget.
         let archived_prefix_tokens = crate::memory::context_window::estimate_tokens(
             &serde_json::to_string(&archived_prefix).unwrap_or_default(),
         );
         let current_budget = effective_budget.saturating_sub(archived_prefix_tokens);
-        let fitted_current = crate::memory::context_window::fit_messages_with_source_quotas(
-            current_region,
-            current_budget,
-        );
-        let dropped = before_current.saturating_sub(fitted_current.len());
+        let (fitted_current, dropped) =
+            crate::memory::context_window::fit_messages_with_source_quotas(
+                current_region,
+                current_budget,
+            );
         messages = archived_prefix;
         messages.extend(fitted_current);
         if dropped > 0 {
-            // Task 8 finalizes this attribution line; a placeholder is sufficient
-            // here so the stable-region mutation is not unattributed.
+            // Pillar B (Task 8): fitting rewrote stable-region bytes by dropping
+            // current-turn messages. Attribute it so the prefix-invariant gate
+            // (Task 11) does not read this as an unattributed prefix break.
             info!(
                 session_id,
                 iteration,
@@ -834,7 +838,11 @@ pub(super) async fn run_message_build_phase(
     // can get "stuck" returning empty candidates for a given session history).
     if empty_response_retry_pending && !is_trigger_session(session_id) {
         let before = messages.len();
-        messages = build_empty_response_retry_messages(&messages, user_text);
+        let rebuilt = build_empty_response_retry_messages(&messages, user_text);
+        // Fire the prefix-mutation attribution ONLY when the rebuild actually
+        // changes the messages (non-zero effect), so quiet turns stay silent.
+        let mutated = rebuilt != messages;
+        messages = rebuilt;
         info!(
             session_id,
             iteration,
@@ -842,6 +850,17 @@ pub(super) async fn run_message_build_phase(
             after = messages.len(),
             "Empty-response recovery: reduced history while preserving immediate parent context"
         );
+        if mutated {
+            // Pillar B (Task 8): the retry rebuild rewrote stable-region bytes by
+            // collapsing prior history. Attribute it so the prefix-invariant gate
+            // (Task 11) does not read this as an unattributed prefix break.
+            info!(
+                session_id,
+                iteration,
+                reason = "empty_response_retry",
+                "Prefix mutation"
+            );
+        }
     }
 
     // Pillar A: insert the per-task context TAIL immediately BEFORE the current
