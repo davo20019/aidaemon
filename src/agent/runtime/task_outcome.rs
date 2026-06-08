@@ -117,6 +117,9 @@ pub struct TaskOutcomeDerivation {
     pub required_actions: RequestedActionSummary,
     pub has_unrecovered_model_error: bool,
     pub terminal_cause: Option<TaskTerminalCause>,
+    /// True when this turn moved a long-running command to the background with a
+    /// "will notify you when done" ack. A deferral is not a failure.
+    pub deferred_to_background: bool,
 }
 
 impl TaskOutcomeDerivation {
@@ -137,11 +140,21 @@ impl TaskOutcomeDerivation {
             ),
             has_unrecovered_model_error,
             terminal_cause,
+            deferred_to_background: execution.background_handoff_active,
         }
     }
 
     pub fn derive_outcome(&self) -> TaskOutcome {
-        if self.terminal_cause.is_some() || self.has_unrecovered_model_error {
+        if self.has_unrecovered_model_error {
+            return TaskOutcome::Failed;
+        }
+        // A long-running command moved to the background (with a "will notify you
+        // when done" ack) is a deferral, not a failure — score it Partial even
+        // though no final user-facing answer was produced this turn.
+        if self.deferred_to_background {
+            return TaskOutcome::Partial;
+        }
+        if self.terminal_cause.is_some() {
             return TaskOutcome::Failed;
         }
         if !self.response_produced || !self.response_has_user_value {
@@ -275,6 +288,7 @@ mod tests {
             },
             has_unrecovered_model_error: false,
             terminal_cause: None,
+            deferred_to_background: false,
         }
     }
 
@@ -306,6 +320,37 @@ mod tests {
     fn failed_on_empty_response() {
         let mut d = base_derivation();
         d.response_has_user_value = false;
+        assert_eq!(d.derive_outcome(), TaskOutcome::Failed);
+    }
+
+    #[test]
+    fn deferred_to_background_is_partial_not_failed() {
+        // A long command moved to background with an ack is a deferral. Even with
+        // no final user-facing answer this turn, it must score Partial, not Failed.
+        let mut d = base_derivation();
+        d.deferred_to_background = true;
+        d.response_has_user_value = false;
+        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
+
+        // With a valid reply and no error it is still Partial (a deferral).
+        let mut d = base_derivation();
+        d.deferred_to_background = true;
+        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn genuine_error_still_fails_even_when_deferred() {
+        // An unrecovered model error outranks the deferral signal.
+        let mut d = base_derivation();
+        d.deferred_to_background = true;
+        d.has_unrecovered_model_error = true;
+        assert_eq!(d.derive_outcome(), TaskOutcome::Failed);
+    }
+
+    #[test]
+    fn cancelled_while_not_deferred_still_fails() {
+        let mut d = base_derivation();
+        d.terminal_cause = Some(TaskTerminalCause::Cancelled);
         assert_eq!(d.derive_outcome(), TaskOutcome::Failed);
     }
 

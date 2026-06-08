@@ -30,11 +30,15 @@ pub(super) async fn execute_tool_call_io(
     tc: &ToolCall,
     ctx: &ToolExecutionIoCtx<'_>,
 ) -> ToolExecutionIoResult {
+    let (start_label, start_summary) = crate::tools::sanitize::user_facing_tool_activity(
+        &tc.name,
+        &summarize_tool_args(&tc.name, ctx.effective_arguments),
+    );
     send_status(
         ctx.status_tx,
         StatusUpdate::ToolStart {
-            name: tc.name.clone(),
-            summary: summarize_tool_args(&tc.name, ctx.effective_arguments),
+            name: start_label,
+            summary: start_summary,
         },
     );
 

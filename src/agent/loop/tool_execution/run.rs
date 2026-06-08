@@ -1370,11 +1370,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             // productive multi-step runs are never artificially stopped.
             execution_state.extend_budget_on_progress();
 
+            let (complete_label, complete_summary) =
+                crate::tools::sanitize::user_facing_tool_activity(
+                    &tc.name,
+                    &summarize_completed_tool_result(&result_text),
+                );
             send_status(
                 &status_tx,
                 StatusUpdate::ToolComplete {
-                    name: tc.name.clone(),
-                    summary: summarize_completed_tool_result(&result_text),
+                    name: complete_label,
+                    summary: complete_summary,
                 },
             );
             let caps = available_capabilities

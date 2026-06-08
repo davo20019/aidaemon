@@ -289,12 +289,15 @@ async fn test_full_stack_status_updates_received() {
     }
 
     // Verify we got tool lifecycle events
+    // Status pings carry user-facing labels, not raw internal tool names —
+    // `terminal` is relabeled to "running a command" (see
+    // `sanitize::user_facing_tool_activity`).
     let has_tool_start = updates
         .iter()
-        .any(|u| matches!(u, StatusUpdate::ToolStart { name, .. } if name == "terminal"));
-    let has_tool_complete = updates
-        .iter()
-        .any(|u| matches!(u, StatusUpdate::ToolComplete { name, .. } if name == "terminal"));
+        .any(|u| matches!(u, StatusUpdate::ToolStart { name, .. } if name == "running a command"));
+    let has_tool_complete = updates.iter().any(
+        |u| matches!(u, StatusUpdate::ToolComplete { name, .. } if name == "running a command"),
+    );
     let has_thinking = updates
         .iter()
         .any(|u| matches!(u, StatusUpdate::Thinking(_)));

@@ -2174,9 +2174,13 @@ impl CliAgentTool {
 
                     // Emit error status
                     if let Some(ref tx) = status_tx {
+                        let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                            tool_name,
+                            "killed - infinite loop detected",
+                        );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: tool_name.to_string(),
-                            summary: "killed - infinite loop detected".to_string(),
+                            name: label,
+                            summary,
                         });
                     }
 
@@ -2220,13 +2224,15 @@ impl CliAgentTool {
 
                 // Emit completion status
                 if let Some(ref tx) = status_tx {
-                    let summary = if exit_code == Some(0) {
+                    let raw_summary = if exit_code == Some(0) {
                         "completed successfully".to_string()
                     } else {
                         format!("exited with code {:?}", exit_code)
                     };
+                    let (label, summary) =
+                        crate::tools::sanitize::user_facing_tool_activity(tool_name, &raw_summary);
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
-                        name: tool_name.to_string(),
+                        name: label,
                         summary,
                     });
                 }

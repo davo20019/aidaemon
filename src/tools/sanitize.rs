@@ -569,6 +569,59 @@ pub fn redact_secrets(text: &str) -> String {
     result
 }
 
+/// Maximum length of a user-facing status-ping summary (characters, not bytes).
+const STATUS_SUMMARY_MAX_CHARS: usize = 80;
+
+/// Map an internal tool name to a friendly, user-facing label for live status
+/// pings. Internal orchestration names (`spawn_agent`, `cli_agent`) and raw tool
+/// names should never surface to the user. Unknown names pass through unchanged
+/// so nothing silently breaks.
+fn friendly_tool_label(name: &str) -> String {
+    match name {
+        "spawn_agent" => "delegating to a specialist",
+        "cli_agent" => "delegating to a CLI agent",
+        "read_file" => "reading a file",
+        "write_file" => "writing a file",
+        "edit_file" => "editing a file",
+        "search_files" => "searching files",
+        "terminal" | "run_command" => "running a command",
+        "web_search" => "searching the web",
+        "web_fetch" => "fetching a page",
+        "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Tools whose summaries carry raw commands and absolute paths. For these we
+/// suppress the summary entirely so only the friendly label shows.
+fn summary_is_command_bearing(name: &str) -> bool {
+    matches!(name, "terminal" | "run_command")
+}
+
+/// Produce a user-facing `(label, clean_summary)` pair for a live status ping
+/// (`StatusUpdate::ToolStart` / `ToolComplete`). Relabels internal/technical tool
+/// names to friendly text and sanitizes the summary so raw commands, absolute
+/// paths, and secrets never leak to the user.
+///
+/// - The label hides orchestration internals like `spawn_agent`.
+/// - Command-bearing tools (terminal) return an empty summary — only the label
+///   shows, never the raw command or absolute paths.
+/// - All other summaries are passed through `redact_secrets` and length-capped
+///   using char-safe truncation.
+pub fn user_facing_tool_activity(name: &str, summary: &str) -> (String, String) {
+    let label = friendly_tool_label(name);
+
+    if summary_is_command_bearing(name) {
+        // Never expose the raw command / absolute paths; the label is enough.
+        return (label, String::new());
+    }
+
+    let cleaned = redact_secrets(summary);
+    let cleaned = crate::utils::truncate_str(cleaned.trim(), STATUS_SUMMARY_MAX_CHARS);
+    (label, cleaned)
+}
+
 /// Known internal tool names that should never appear in user-facing replies.
 /// The LLM sometimes wraps these in backticks (e.g. `send_file`) or mentions
 /// them as plain text (e.g. "the send_file tool").  This list covers all
@@ -878,6 +931,47 @@ pub fn is_trusted_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_facing_activity_relabels_internal_tool_names() {
+        let (label, _summary) = user_facing_tool_activity("spawn_agent", "executor: do the thing");
+        assert_eq!(label, "delegating to a specialist");
+        assert_ne!(label, "spawn_agent");
+        assert!(!label.contains("spawn_agent"));
+
+        let (label, _) = user_facing_tool_activity("cli_agent", "claude working");
+        assert_eq!(label, "delegating to a CLI agent");
+    }
+
+    #[test]
+    fn user_facing_activity_hides_raw_command_and_paths() {
+        let summary = "cd '/Users/davidloor/projects/resume/google' && pdftotext resume.pdf -";
+        let (label, clean) = user_facing_tool_activity("terminal", summary);
+        assert_eq!(label, "running a command");
+        // The raw absolute path / full command must not appear verbatim.
+        assert!(!clean.contains("/Users/davidloor/projects/resume"));
+        assert!(!clean.contains("pdftotext"));
+        assert!(!clean.contains("&&"));
+        // Rendered as both channels would: "Using {label}: {clean}" / "✓ {label}: {clean}".
+        let rendered_start = format!("Using {label}: {clean}");
+        let rendered_done = format!("✓ {label}: {clean}");
+        assert!(!rendered_start.contains("spawn_agent"));
+        assert!(!rendered_done.contains("/Users/davidloor"));
+    }
+
+    #[test]
+    fn user_facing_activity_unknown_tool_passes_through() {
+        let (label, clean) = user_facing_tool_activity("some_future_tool", "did something useful");
+        assert_eq!(label, "some_future_tool");
+        assert_eq!(clean, "did something useful");
+    }
+
+    #[test]
+    fn user_facing_activity_caps_long_summary() {
+        let long = "a".repeat(300);
+        let (_label, clean) = user_facing_tool_activity("web_search", &long);
+        assert!(clean.chars().count() <= STATUS_SUMMARY_MAX_CHARS);
+    }
 
     #[test]
     fn test_strip_system_tags() {
