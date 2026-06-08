@@ -175,54 +175,6 @@ pub fn compute_available_budget(
     compute_available_budget_precomputed(model, estimate_tokens(system_prompt), tool_defs, config)
 }
 
-/// Fit conversation messages into a token budget.
-///
-/// If messages fit within budget, returns them unchanged (no-op for short conversations).
-/// If over budget:
-/// 1. Keeps the first user message (anchor) + last N messages (current context)
-/// 2. Drops oldest messages from the middle until under budget
-///
-/// Pillar A: the session summary is no longer inserted here — it lives only in
-/// the per-task context tail (`build_system_prompt_for_message`).
-#[allow(dead_code)]
-pub fn fit_messages_to_budget(messages: Vec<Value>, budget_tokens: usize) -> Vec<Value> {
-    // Quick check: if under budget, return as-is
-    let messages_json = serde_json::to_string(&messages).unwrap_or_default();
-    let current_tokens = estimate_tokens(&messages_json);
-
-    if current_tokens <= budget_tokens {
-        return messages;
-    }
-
-    let msg_count = messages.len();
-    if msg_count <= 2 {
-        return messages;
-    }
-
-    // Keep first user message (anchor) + last 8 messages (current context)
-    let keep_recent = 8.min(msg_count - 1);
-    let anchor = messages[0].clone();
-    let recent: Vec<Value> = messages[msg_count - keep_recent..].to_vec();
-
-    // Build result: anchor + recent messages
-    let mut result = Vec::with_capacity(keep_recent + 1);
-    result.push(anchor);
-
-    result.extend(recent);
-
-    let dropped = msg_count - result.len();
-    info!(
-        original_count = msg_count,
-        result_count = result.len(),
-        dropped,
-        original_tokens = current_tokens,
-        budget_tokens,
-        "Context window: trimmed messages to fit budget"
-    );
-
-    result
-}
-
 fn role_quota(role: &str) -> usize {
     match role {
         "user" => 10,
@@ -234,11 +186,13 @@ fn role_quota(role: &str) -> usize {
 
 /// Fit messages to a budget using role-aware quotas and recency ranking.
 ///
-/// Compared to `fit_messages_to_budget`, this keeps a more balanced slice of
-/// user/assistant/tool context under strict budgets.
+/// Keeps a balanced slice of user/assistant/tool context under strict budgets.
 ///
 /// Pillar A: the session summary is no longer inserted here — it lives only in
 /// the per-task context tail (`build_system_prompt_for_message`).
+///
+/// Pillar B (Task 7): callers scope this to the CURRENT-TURN region only —
+/// archived turns are whole-turn-evicted upstream and never trimmed here.
 pub fn fit_messages_with_source_quotas(messages: Vec<Value>, budget_tokens: usize) -> Vec<Value> {
     let messages_json = serde_json::to_string(&messages).unwrap_or_default();
     let current_tokens = estimate_tokens(&messages_json);
@@ -882,60 +836,6 @@ mod tests {
                                                          // ~1000 chars should be ~250 tokens
         let long = "a".repeat(1000);
         assert_eq!(estimate_tokens(&long), 250);
-    }
-
-    #[test]
-    fn test_fit_messages_under_budget() {
-        let messages = vec![
-            json!({"role": "user", "content": "Hello"}),
-            json!({"role": "assistant", "content": "Hi there"}),
-        ];
-        // Huge budget — messages should pass through unchanged
-        let result = fit_messages_to_budget(messages.clone(), 100_000);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result, messages);
-    }
-
-    #[test]
-    fn test_fit_messages_over_budget() {
-        let mut messages = Vec::new();
-        // Create 15 messages
-        for i in 0..15 {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            messages.push(json!({"role": role, "content": format!("Message number {}", i)}));
-        }
-
-        // Very small budget to force trimming. Pillar A: the summary is no
-        // longer injected by the fitter (it lives in the task context tail), so
-        // the result is anchor(1) + recent(8) = 9 with no summary message.
-        let result = fit_messages_to_budget(messages.clone(), 50);
-        assert_eq!(result.len(), 9);
-        // First should be the anchor (first user message)
-        assert_eq!(result[0]["content"], "Message number 0");
-        // No injected summary message anywhere.
-        assert!(result.iter().all(|m| {
-            !m["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Conversation summary")
-        }));
-        // Last should be the last original message
-        assert_eq!(result[8]["content"], "Message number 14");
-    }
-
-    #[test]
-    fn test_fit_messages_over_budget_no_summary() {
-        let mut messages = Vec::new();
-        for i in 0..10 {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            messages.push(json!({"role": role, "content": format!("Message {}", i)}));
-        }
-
-        let result = fit_messages_to_budget(messages, 50);
-        // Should have: anchor(1) + recent(8) = 9
-        assert_eq!(result.len(), 9);
-        assert_eq!(result[0]["content"], "Message 0");
-        assert_eq!(result[8]["content"], "Message 9");
     }
 
     #[test]

@@ -602,33 +602,11 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         )
         .await?;
 
-    // 2b. Retrieve Context ONCE (Optimization)
-    // Canonical read path: events first, state-context fallback.
-    let mut initial_history = agent
-        .load_initial_history(session_id, user_text, 50)
-        .await?;
-
-    // Optimize: Identify "Pinned" memories (Relevant/Salient but old) to avoid re-fetching
-    let recency_window = 20;
-    let recent_ids: std::collections::HashSet<String> = initial_history
-        .iter()
-        .rev()
-        .take(recency_window)
-        .map(|m| m.id.clone())
-        .collect();
-
-    let pinned_memories: Vec<Message> = initial_history
-        .drain(..)
-        .filter(|m| !recent_ids.contains(&m.id))
-        .collect();
-
-    info!(
-        session_id,
-        total_context = initial_history.len(),
-        pinned_old_memories = pinned_memories.len(),
-        depth = agent.depth,
-        "Context prepared"
-    );
+    // Pillar B (Task 7): historical conversation retention is now owned
+    // entirely by the turn-anchored fetch in `message_build_phase`
+    // (`get_turns_from_anchor`). The old `load_initial_history` + pinned/recent
+    // split is removed — the whole-turn anchor is the single retention
+    // mechanism, so this bootstrap no longer pre-loads or pins history.
 
     let data = BootstrapData {
         task_id,
@@ -653,7 +631,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         route_failsafe_active,
         core_prompt_bytes,
         task_context_tail,
-        pinned_memories,
         session_summary,
     };
 

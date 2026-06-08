@@ -44,6 +44,5 @@ pub(in crate::agent) struct BootstrapData {
     /// task and reused byte-identically across the within-task loop. Inserted at
     /// the boundary − 1 position (immediately before the current user message).
     pub task_context_tail: String,
-    pub pinned_memories: Vec<Message>,
     pub session_summary: Option<ConversationSummary>,
 }

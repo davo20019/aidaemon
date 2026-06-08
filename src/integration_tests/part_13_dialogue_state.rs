@@ -242,18 +242,13 @@ async fn test_new_request_drops_previous_failed_search_exchange_from_prompt() {
         }),
         "current request should still be present in the prompt"
     );
-    assert!(
-        !second_call.messages.iter().any(|msg| {
-            if msg.get("role").and_then(|role| role.as_str()) == Some("system") {
-                return false;
-            }
-            msg.get("content")
-                .and_then(|content| content.as_str())
-                .is_some_and(|content| content.contains("tallest buildings"))
-        }),
-        "fresh requests should not inherit the prior failed search topic: {:?}",
-        second_call.messages
-    );
+    // Pillar B (Task 7): under turn-anchored whole-turn history, the prior turn
+    // IS retained as ARCHIVED context (the prior user message survives verbatim),
+    // so we no longer assert its absence. What MUST still be dropped is the
+    // learned-helplessness failure boilerplate: `render_archived` excludes
+    // `is_failure_boilerplate` assistant text and substitutes a terminal-state
+    // placeholder, so the poisoning "I wasn't able to..." reply never re-enters
+    // the prompt to trigger giving-up behavior.
     assert!(
         !second_call.messages.iter().any(|msg| {
             if msg.get("role").and_then(|role| role.as_str()) == Some("system") {

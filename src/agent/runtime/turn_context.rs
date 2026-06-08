@@ -520,55 +520,11 @@ impl Agent {
         Ok(())
     }
 
-    pub(super) async fn load_initial_history(
-        &self,
-        session_id: &str,
-        user_text: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Message>> {
-        match self
-            .event_store
-            .get_conversation_history(session_id, limit)
-            .await
-        {
-            Ok(history) if !history.is_empty() => {
-                return Ok(history);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    session_id,
-                    error = %e,
-                    "Event history load failed; falling back to state context retrieval"
-                );
-            }
-        }
-
-        self.state.get_context(session_id, user_text, limit).await
-    }
-
-    pub(super) async fn load_recent_history(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Message>> {
-        match self
-            .event_store
-            .get_conversation_history(session_id, limit)
-            .await
-        {
-            Ok(history) if !history.is_empty() => Ok(history),
-            Ok(_) => self.state.get_history(session_id, limit).await,
-            Err(e) => {
-                warn!(
-                    session_id,
-                    error = %e,
-                    "Event recent-history load failed; falling back to state history retrieval"
-                );
-                self.state.get_history(session_id, limit).await
-            }
-        }
-    }
+    // Pillar B (Task 7): `load_initial_history` and `load_recent_history` were
+    // removed. Historical conversation retention is now owned entirely by the
+    // turn-anchored fetch (`EventStore::get_turns_from_anchor`) in
+    // `message_build_phase`; the legacy "load N recent events then age-collapse"
+    // path no longer exists.
 }
 
 #[cfg(test)]

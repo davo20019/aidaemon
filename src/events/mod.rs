@@ -18,7 +18,7 @@ pub mod terminal_state;
 pub use consolidation::{Consolidator, Pruner};
 pub use context::SessionContextCompiler;
 #[allow(unused_imports)]
-pub use conversation_turn::{turn_from_event, ConversationTurn, ConversationTurnRole};
+pub use conversation_turn::{turn_from_event, ConversationTurn, ConversationTurnRole, FetchedTurn};
 pub use model_call_telemetry::{
     record_background_model_call_telemetry, record_model_call_telemetry, ModelCallTelemetryInput,
 };

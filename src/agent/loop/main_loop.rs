@@ -145,7 +145,6 @@ impl Agent {
             route_failsafe_active,
             core_prompt_bytes,
             task_context_tail,
-            pinned_memories,
             mut session_summary,
         } = match bootstrap_outcome {
             BootstrapOutcome::Return(result) => return result,
@@ -1040,7 +1039,6 @@ impl Agent {
                     model: &model,
                     core_prompt: &core_prompt_bytes,
                     task_context_tail: &task_context_tail,
-                    pinned_memories: &pinned_memories,
                     tool_defs: &tool_defs,
                     policy_bundle: &policy_bundle,
                     pending_system_messages: message_build_directives.pending_system_messages,

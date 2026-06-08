@@ -1,4 +1,3 @@
-use super::recall_guardrails::text_relates_to_critical_identity;
 use super::*;
 use crate::execution_policy::PolicyBundle;
 
@@ -15,7 +14,6 @@ pub(super) struct MessageBuildCtx<'a> {
     /// (immediately before the current user message). The SAME string is reused
     /// every iteration of the within-task loop.
     pub task_context_tail: &'a str,
-    pub pinned_memories: &'a [Message],
     pub tool_defs: &'a [Value],
     pub policy_bundle: &'a PolicyBundle,
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
@@ -38,6 +36,13 @@ const EXECUTION_CHECKPOINT_MAX_EVIDENCE_CHARS: usize = 500;
 const RESPONSE_RESERVE_TOKENS: usize = 1_536;
 const MIN_MESSAGE_BUDGET_TOKENS: usize = 1_024;
 const TOKEN_ESTIMATE_SAFETY_MARGIN: usize = 256;
+/// Pillar B (Task 7): fixed token reserve for the in-flight current turn — the
+/// current user message plus expected tool-chain headroom. Held constant across
+/// turns so the archived-region budget does not churn build-to-build (a
+/// per-turn-derived reserve would shift the eviction boundary every iteration).
+const CURRENT_TURN_RESERVE_TOKENS: usize = 4_000;
+/// Pillar B (Task 7): safety margin applied to the archived-region budget.
+const ARCHIVED_BUDGET_SAFETY_MARGIN: f64 = 0.10;
 
 fn trimmed_message_content(message: &Value) -> Option<String> {
     message
@@ -174,41 +179,6 @@ fn build_execution_checkpoint_message(
     Some(lines.join("\n"))
 }
 
-/// Phase 0 observability — project pre-JSON-conversion history `Message`s into
-/// prompt-equivalent JSON for stage fingerprinting. Includes tool metadata
-/// (`tool_calls`, `name`, `tool_call_id`) so a change to any of those is
-/// observable, matching the provider-call fingerprint's complete-message
-/// hashing. Called only inside `tracing::debug!` field expressions, so it runs
-/// only when debug logging is enabled.
-fn project_messages_for_stage_hash(msgs: &[&Message]) -> Vec<Value> {
-    msgs.iter()
-        .map(|m| {
-            let mut obj = json!({ "role": m.role, "content": m.content });
-            if let Some(tc_json) = &m.tool_calls_json {
-                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                    obj["tool_calls"] = json!(tcs
-                        .iter()
-                        .map(|tc| json!({
-                            "id": tc.id,
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                        }))
-                        .collect::<Vec<_>>());
-                }
-            }
-            if let Some(name) = &m.tool_name {
-                if !name.is_empty() {
-                    obj["name"] = json!(name);
-                }
-            }
-            if let Some(tcid) = &m.tool_call_id {
-                obj["tool_call_id"] = json!(tcid);
-            }
-            obj
-        })
-        .collect()
-}
-
 pub(super) async fn run_message_build_phase(
     services: &super::services::AgentServices<'_>,
     ctx: &mut MessageBuildCtx<'_>,
@@ -221,7 +191,6 @@ pub(super) async fn run_message_build_phase(
     let model = ctx.model;
     let core_prompt = ctx.core_prompt;
     let task_context_tail = ctx.task_context_tail;
-    let pinned_memories = ctx.pinned_memories;
     let original_tool_defs = ctx.tool_defs;
     let policy_bundle = ctx.policy_bundle;
     let pending_system_messages = &mut *ctx.pending_system_messages;
@@ -259,43 +228,129 @@ pub(super) async fn run_message_build_phase(
     }
     let mut tool_defs = effective_tool_defs.as_slice();
 
-    // Fetch recent history from canonical event stream.
-    // Base limit of 40 queries (120 events), scaled up for long-running tasks
-    // so that early tool calls from the current task are not pushed out of the
-    // window by their own later iterations.  Each iteration generates ~3
-    // messages (assistant, tool result(s), sometimes parallel calls), so
-    // iteration*3 covers the current task plus old-pair trimming removes the
-    // rest.  Capped at 120 to avoid loading entire sessions.
-    let history_limit = 40_usize.max(iteration.saturating_mul(3).min(120));
-    let mut recent_history = agent.load_recent_history(session_id, history_limit).await?;
+    // ============================================================
+    // Pillar B (Task 7): turn-anchored fetch → render → evict.
+    //
+    // This replaces the legacy fetch → age-collapse → sliding-window →
+    // JSON-conversion stages. The archived region is whole-turn rendered (never
+    // partially trimmed), anchored at `agent.turn_anchors[session_id]`, and
+    // carried byte-stable across the within-task loop via the per-turn render
+    // cache. Only the current turn is full/append-only.
+    // ============================================================
 
-    // Phase 0 observability — capture fetch-window facts before any mutation so
-    // the window-decision log can tie `keep_from` movement to fetch mechanics
-    // (the prime suspect for prefix-cache breaks). `recent_history` is ordered
-    // oldest→newest, so `first()` is the oldest fetched persisted message.
-    let fetched_count = recent_history.len();
-    let oldest_fetched_id = recent_history.first().map(|m| m.id.clone());
-    let mut current_user_injected = false;
+    use crate::events::TerminalState;
 
-    // Guarantee the current user message is always present in history.
-    // In sessions with heavy prior tool use, the 120-event window may not
-    // include the current user message (it was just committed). Without it,
-    // last_user_pos=None triggers the safe-collapse fallback which degrades
-    // context quality. Appending it ensures the collapse boundary is always
-    // correctly placed at the current task's user message.
-    // Check if the current user message is ALREADY in history as the LAST user
-    // message. We must check it's the last, not just any match: when the same
-    // prompt is sent multiple times, an old instance with identical text would
-    // falsely satisfy a content-only check. This causes rposition to find the
-    // OLD instance as the collapse boundary, keeping the old attempt's entire
-    // tool chain as "current interaction" — the model then thinks the task is
-    // already done and produces confused responses like "Did you mean to send something?".
-    let last_user_msg = recent_history.iter().rev().find(|m| m.role == "user");
-    let user_msg_present = last_user_msg.is_some_and(|m| m.content.as_deref() == Some(user_text));
-    if !user_msg_present && !user_text.is_empty() {
-        let synthetic_turn_id = agent.current_turn_ids.read().await.get(session_id).cloned();
-        recent_history.push(Message {
-            id: format!("synthetic-user-{}", uuid::Uuid::new_v4()),
+    // Step 0: archived-region budget. Wire it from the SAME budget sources the
+    // legacy code used — no invented numbers. `core` is the cached core bytes
+    // (already computed by Pillar A); `tools` is the name-sorted tool array this
+    // build will send; `tail` is the `[Task Context]` tail string.
+    let core_tokens = crate::memory::context_window::estimate_tokens(core_prompt);
+    let tail_tokens = crate::memory::context_window::estimate_tokens(task_context_tail);
+    let tool_tokens_for_budget =
+        crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
+    let archived_budget = super::turn_eviction::archived_budget(
+        total_context_budget,
+        core_tokens,
+        tool_tokens_for_budget,
+        tail_tokens,
+        CURRENT_TURN_RESERVE_TOKENS,
+        crate::memory::context_window::CONTEXT_RESPONSE_RESERVE_TOKENS,
+        ARCHIVED_BUDGET_SAFETY_MARGIN,
+    );
+
+    let current_turn_id: Option<String> =
+        agent.current_turn_ids.read().await.get(session_id).cloned();
+
+    // Step 1: anchor resolve. Read the per-session anchor; on cold start /
+    // restart, initialize via the BOUNDED reverse-walk page (NEVER a
+    // full-session `get_turns_from_anchor(.., 0)`).
+    let anchor: i64 = {
+        let existing = agent.turn_anchors.read().await.get(session_id).copied();
+        match existing {
+            Some(a) => a,
+            None => {
+                // Reverse-walk newest→oldest, accumulating each turn's Archived
+                // estimate, stopping at the last turn that keeps the running
+                // total <= low_water(archived_budget).
+                let low_water = super::turn_eviction::low_water(archived_budget);
+                let mut before: Option<i64> = None;
+                let mut accumulated: usize = 0;
+                let mut init_anchor: Option<i64> = None;
+                loop {
+                    let page = agent
+                        .event_store
+                        .get_recent_turns_page(session_id, before, 1)
+                        .await?;
+                    let Some(turn) = page.into_iter().next() else {
+                        break;
+                    };
+                    let terminal_state = TerminalState::from_task_status(turn.terminal_status);
+                    let rendered = super::turn_render::render_turn(
+                        &turn.messages,
+                        super::turn_render::RenderMode::Archived { terminal_state },
+                        super::turn_render::RENDERER_VERSION,
+                    );
+                    let est = crate::memory::context_window::estimate_tokens(
+                        &serde_json::to_string(&rendered).unwrap_or_default(),
+                    );
+                    if init_anchor.is_none() {
+                        // The newest turn is the (about-to-be) current turn. It is
+                        // not part of the archived region, so its tokens are NOT
+                        // counted against low_water; set the anchor floor here and
+                        // walk past it to reach the archived turns.
+                        init_anchor = Some(turn.turn_seq);
+                        before = Some(turn.turn_seq);
+                        continue;
+                    }
+                    // Stop once adding this archived turn would exceed low_water.
+                    if accumulated + est > low_water {
+                        break;
+                    }
+                    accumulated = accumulated.saturating_add(est);
+                    init_anchor = Some(turn.turn_seq);
+                    before = Some(turn.turn_seq);
+                }
+                let resolved = init_anchor.unwrap_or(0);
+                agent
+                    .turn_anchors
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), resolved);
+                info!(
+                    session_id,
+                    anchor = resolved,
+                    archived_budget,
+                    "anchor initialized (cold start)"
+                );
+                resolved
+            }
+        }
+    };
+
+    // Step 2: fetch whole turns from the anchor.
+    let mut turns = agent
+        .event_store
+        .get_turns_from_anchor(session_id, anchor)
+        .await?;
+
+    // Identify the current turn = last FetchedTurn whose turn_id == current_turn_id.
+    let last_is_current = turns
+        .last()
+        .map(|t| t.turn_id.as_deref() == current_turn_id.as_deref() && current_turn_id.is_some())
+        .unwrap_or(false);
+
+    if !last_is_current {
+        // Current-turn fallback (replaces `current_user_injected`). The happy
+        // path persists the current UserMessage event before this build runs,
+        // so the fetch ends in the current turn. This covers (a) the documented
+        // not-yet-committed race and (b) legacy turn_id=NULL rows excluded by
+        // the anchored fetch. Synthesize a current turn from the in-process
+        // user_text + current_turn_id so the payload always ends in the current
+        // user message.
+        let synthetic_turn_id = current_turn_id.clone();
+        let synthetic_seq = turns.last().map(|t| t.turn_seq + 1).unwrap_or(0);
+        let current_user = Message {
+            id: format!("synthetic-current-user-{}", uuid::Uuid::new_v4()),
             session_id: session_id.to_string(),
             role: "user".to_string(),
             content: Some(user_text.to_string()),
@@ -304,694 +359,231 @@ pub(super) async fn run_message_build_phase(
             tool_calls_json: None,
             created_at: chrono::Utc::now(),
             importance: 1.0,
-            turn_id: synthetic_turn_id,
+            turn_id: synthetic_turn_id.clone(),
             ..Message::runtime_defaults()
+        };
+        turns.push(crate::events::FetchedTurn {
+            turn_id: synthetic_turn_id,
+            turn_seq: synthetic_seq,
+            messages: vec![current_user],
+            terminal_status: None,
         });
-        current_user_injected = true;
-        info!(
+        warn!(
             session_id,
-            iteration, "Injected current user message into history (was outside event window)"
+            "current turn absent from fetch; injected in-process"
+        );
+    } else {
+        // Happy-path assertion: the fetch ends in the current turn.
+        debug_assert!(
+            turns
+                .last()
+                .map(|t| t.turn_id.as_deref() == current_turn_id.as_deref())
+                .unwrap_or(false),
+            "turn-anchored fetch must end in the current turn on the happy path"
         );
     }
 
-    // Merge Pinned + Recent using iterators to avoid cloning the Message structs
-    let mut seen_ids: std::collections::HashSet<&String> = std::collections::HashSet::new();
+    // Split off the current turn (always the last entry now).
+    let current_turn = turns.pop().expect("at least the current turn is present");
+    // `turns` now holds only archived turns (oldest→newest).
 
-    // Deduplicated, ordered message list
-    let deduped_msgs: Vec<&Message> = pinned_memories
-        .iter()
-        .chain(recent_history.iter())
-        .filter(|m| seen_ids.insert(&m.id))
-        .collect();
+    // Step 3: evict. Render each archived turn (Archived mode) to estimate over
+    // the FINAL bytes, then plan_eviction. Cache the renders so step 4 reuses
+    // them (and to drive the debug re-render assertion).
+    struct ArchivedRender {
+        turn_id: Option<String>,
+        turn_seq: i64,
+        content_fp: String,
+        bytes: Vec<Value>,
+        cache_hit: bool,
+        cache_reason: &'static str,
+    }
 
-    // Collapse tool intermediates from previous interactions to prevent context bleeding.
-    // Without this, old tool call chains (e.g., manage_people calls from a prior question)
-    // overwhelm the current question's context and confuse the LLM.
-    // Only the current interaction (after the last user message) keeps full tool chains.
-    //
-    // We drop tool-role messages (results) but keep assistant messages even if they
-    // have tool_calls — the JSON conversion below strips orphaned tool_calls and drops
-    // content-less assistant messages automatically. This preserves the assistant's
-    // reasoning text and budget/timeout summaries as context for the next interaction.
-    let identity_preserve_indices: std::collections::HashSet<usize> = deduped_msgs
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, msg)| {
-            let content = msg.content.as_deref()?;
-            if text_relates_to_critical_identity(content) {
-                Some(idx)
-            } else {
-                None
+    let mut archived_renders: Vec<ArchivedRender> = Vec::with_capacity(turns.len());
+    {
+        // One read-lock snapshot of this session's render cache for the decision;
+        // writes happen after the loop to avoid holding the lock across renders.
+        let prev_cache = agent.turn_renders.read().await;
+        let session_cache = prev_cache.get(session_id);
+        for turn in &turns {
+            let terminal_state = TerminalState::from_task_status(turn.terminal_status);
+            let fp = super::turn_render_cache::content_fp(&turn.messages, terminal_state);
+            let prev = turn
+                .turn_id
+                .as_deref()
+                .and_then(|tid| session_cache.and_then(|c| c.get(tid)));
+            let render_fn = || {
+                super::turn_render::render_turn(
+                    &turn.messages,
+                    super::turn_render::RenderMode::Archived { terminal_state },
+                    super::turn_render::RENDERER_VERSION,
+                )
+            };
+            let (bytes, hit, reason) = super::turn_render_cache::render_cache_decision(
+                prev,
+                &fp,
+                super::turn_render::RENDERER_VERSION,
+                "archived",
+                render_fn,
+            );
+            // Determinism guard: on a cache HIT, debug/test builds re-render and
+            // assert the cached bytes still match (nondeterminism = panic). On a
+            // miss `bytes` is itself a fresh render, so re-rendering would compare
+            // a fresh render against itself — skip it.
+            #[cfg(debug_assertions)]
+            if hit {
+                let fresh = super::turn_render::render_turn(
+                    &turn.messages,
+                    super::turn_render::RenderMode::Archived { terminal_state },
+                    super::turn_render::RENDERER_VERSION,
+                );
+                assert_eq!(
+                    fresh, bytes,
+                    "archived render must be deterministic for turn {:?}",
+                    turn.turn_id
+                );
             }
-        })
-        .flat_map(|idx| {
-            let start = idx.saturating_sub(1);
-            let end = (idx + 2).min(deduped_msgs.len().saturating_sub(1));
-            start..=end
+            archived_renders.push(ArchivedRender {
+                turn_id: turn.turn_id.clone(),
+                turn_seq: turn.turn_seq,
+                content_fp: fp,
+                bytes,
+                cache_hit: hit,
+                cache_reason: reason,
+            });
+        }
+    }
+
+    let rendered_for_plan: Vec<super::turn_eviction::RenderedTurn> = archived_renders
+        .iter()
+        .map(|r| super::turn_eviction::RenderedTurn {
+            turn_seq: r.turn_seq,
+            est_tokens: crate::memory::context_window::estimate_tokens(
+                &serde_json::to_string(&r.bytes).unwrap_or_default(),
+            ),
         })
         .collect();
-    // Find the boundary between old and current interactions.
-    //
-    // Primary: match by `turn_id`. Every message written during this
-    // turn was auto-stamped with the same id by `append_message_canonical`,
-    // so the first user-role message with the current turn_id marks the
-    // boundary — no content inference, no race-condition window where the
-    // same text sent twice picks the wrong instance.
-    //
-    // Fallback: content match against `user_text`. Covers messages
-    // persisted before this field existed and any code path that bypasses
-    // the auto-stamping layer.
-    let current_turn_id: Option<String> =
-        agent.current_turn_ids.read().await.get(session_id).cloned();
-    let last_user_pos: Option<usize> = current_turn_id
-        .as_deref()
-        .and_then(|tid| {
-            deduped_msgs
-                .iter()
-                .position(|m| m.role == "user" && m.turn_id.as_deref() == Some(tid))
-        })
-        .or_else(|| {
-            deduped_msgs
-                .iter()
-                .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-        });
-    if last_user_pos.is_none() {
+    let plan = super::turn_eviction::plan_eviction(&rendered_for_plan, archived_budget);
+
+    if plan.degenerate {
         warn!(
             session_id,
             iteration,
-            total = deduped_msgs.len(),
-            "Collapse boundary: last_user_pos=None (should be rare after synthetic injection)"
+            archived_budget,
+            core_tokens,
+            tool_tokens = tool_tokens_for_budget,
+            tail_tokens,
+            current_turn_reserve = CURRENT_TURN_RESERVE_TOKENS,
+            "Archived budget degenerate: non-evictable components exceed context; zero archived turns"
         );
     }
-    let pre_collapse_len = deduped_msgs.len();
-    // Find "Prior 1" start: the user message immediately before the boundary.
-    // Tool results in [prior_1_start, boundary) are summarized (not dropped).
-    // Tool results before prior_1_start are dropped entirely (Prior 2+).
-    let prior_1_start: Option<usize> = last_user_pos.and_then(|boundary| {
-        deduped_msgs[..boundary]
-            .iter()
-            .rposition(|m| m.role == "user")
-    });
-    // Collect message IDs of tool results in the Prior 1 range for summary
-    // replacement during JSON conversion. We collect IDs (not indices) because
-    // the Vec is rebuilt by the filter below.
-    let prior_1_tool_ids: std::collections::HashSet<String> =
-        if let (Some(p1_start), Some(boundary)) = (prior_1_start, last_user_pos) {
-            deduped_msgs[p1_start..boundary]
-                .iter()
-                .filter(|m| m.role == "tool")
-                .map(|m| m.id.clone())
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-    let deduped_msgs: Vec<&Message> = if let Some(boundary) = last_user_pos {
-        let p1 = prior_1_start.unwrap_or(boundary);
-        deduped_msgs
-            .into_iter()
-            .enumerate()
-            .filter(|(i, m)| {
-                if *i >= boundary {
-                    true // current interaction: keep everything
-                } else if *i >= p1 {
-                    // Prior 1 interaction: keep tool results (they will be
-                    // summarized during JSON conversion), keep everything else
-                    true
-                } else {
-                    // Prior 2+ interactions: drop tool results only; assistant
-                    // messages survive (orphan stripping handles their
-                    // tool_calls in JSON conversion)
-                    m.role != "tool" || identity_preserve_indices.contains(i)
-                }
-            })
-            .map(|(_, m)| m)
-            .collect()
-    } else {
-        // Current user message not in history yet (race condition or history
-        // window too small). Keep the most recent tool results intact — they
-        // are very likely from the CURRENT task's previous iterations.
-        // Collapse only older tool results to prevent context bloat.
-        const KEEP_RECENT_TOOL_RESULTS: usize = 8;
-        let tool_positions: Vec<usize> = deduped_msgs
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role == "tool")
-            .map(|(i, _)| i)
-            .collect();
-        let protect_from = if tool_positions.len() > KEEP_RECENT_TOOL_RESULTS {
-            tool_positions[tool_positions.len() - KEEP_RECENT_TOOL_RESULTS]
-        } else {
-            0
-        };
-        warn!(
-                session_id,
-                iteration,
-                total_tool_results = tool_positions.len(),
-                protect_from,
-                "Current user message not in history — using safe collapse (keeping recent tool results)"
-            );
-        deduped_msgs
-            .into_iter()
-            .enumerate()
-            .filter(|(i, m)| {
-                // Keep non-tool messages, recent tool results, and identity-critical ones;
-                // collapse old tool results.
-                m.role != "tool" || *i >= protect_from || identity_preserve_indices.contains(i)
-            })
-            .map(|(_, m)| m)
-            .collect()
-    };
-    let collapsed = pre_collapse_len.saturating_sub(deduped_msgs.len());
-    if collapsed > 0 || !prior_1_tool_ids.is_empty() {
-        info!(
-            session_id,
-            dropped = collapsed,
-            summarized = prior_1_tool_ids.len(),
-            "Age-based tool result clearing: dropped Prior 2+ results, summarizing Prior 1 results"
-        );
-    }
-    tracing::debug!(
-        session_id,
-        iteration,
-        stage = "age_collapse",
-        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
-            &project_messages_for_stage_hash(&deduped_msgs),
-            user_text,
-        ),
-        "Build stage pre-boundary fingerprint"
-    );
 
-    // Identify old-interaction assistant messages for content truncation.
-    // After collapse, recompute the last-user boundary and collect IDs of
-    // assistant messages before it — their full text is stale context.
-    // Exception: the assistant message immediately before the boundary is exempt
-    // from truncation — it typically contains the budget/timeout response with
-    // handoff context (activity summary, files read, commands run) that the next
-    // interaction needs to avoid re-exploring from scratch.
-    // However, when the current message is a clearly NEW task (very different from
-    // the prior user message), the old handoff context is harmful — truncate it too.
-    // Anchor to the current user message by content (not just any last user message).
-    // Without content matching, stray user messages from race conditions can shift
-    // the boundary and cause wrong assistant messages to survive truncation.
-    let collapse_boundary = deduped_msgs
-        .iter()
-        .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-        .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-
-    // Adaptive sliding window: keep `window_size` prior conversation pairs.
-    // We compute how many old pairs fit within 30% of the available token
-    // budget. This naturally adapts: large contexts keep more history, small
-    // contexts keep less.
-    //
-    // Phase 0: capture the length entering the window trim so the trim counter
-    // measures window-trim removals alone. The previous counter subtracted from
-    // `pre_collapse_len` (captured before age-based collapse), conflating the
-    // two and masking whether `keep_from` actually moved.
-    let len_before_window_trim = deduped_msgs.len();
-    // Phase 0: the window `keep_from` index chosen on the sliding-window path.
-    // Defaults to 0 on the no-trim paths (`collapse_boundary == None` or no old
-    // user pairs) so the boundary-movement event below fires on every build,
-    // not just when a trim happens.
-    let mut window_keep_from: usize = 0;
-    let deduped_msgs: Vec<&Message> = if let Some(boundary) = collapse_boundary {
-        use crate::memory::context_window::estimate_tokens;
-
-        // Identify old user-assistant pair boundaries.
-        let old_user_positions: Vec<usize> = deduped_msgs
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| *i < boundary && m.role == "user")
-            .map(|(i, _)| i)
-            .collect();
-
-        if old_user_positions.is_empty() {
-            deduped_msgs
-        } else {
-            // Build skeleton token estimates for each old pair.
-            // A "pair" spans from one user message to the next (or to the boundary).
-            let skeleton_pairs: Vec<(usize, usize)> = old_user_positions
-                .iter()
-                .enumerate()
-                .map(|(pair_idx, &user_pos)| {
-                    let pair_end = if pair_idx + 1 < old_user_positions.len() {
-                        old_user_positions[pair_idx + 1]
-                    } else {
-                        boundary
-                    };
-                    let user_tokens =
-                        estimate_tokens(deduped_msgs[user_pos].content.as_deref().unwrap_or(""));
-                    let assistant_tokens: usize = deduped_msgs[user_pos + 1..pair_end]
-                        .iter()
-                        .filter(|m| m.role == "assistant")
-                        .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
-                        .sum();
-                    (user_tokens, assistant_tokens)
-                })
-                .collect();
-
-            // Compute available budget: model context - system prompt - tool defs - pinned memories.
-            // System prompt = core (message zero) + task context tail.
-            let system_tokens = estimate_tokens(core_prompt) + estimate_tokens(task_context_tail);
-            let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
-            let tools_tokens = estimate_tokens(&tools_json);
-            let pinned_tokens: usize = pinned_memories
-                .iter()
-                .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
-                .sum();
-            let available_budget =
-                total_context_budget.saturating_sub(system_tokens + tools_tokens + pinned_tokens);
-
-            let computed_window_size =
-                super::sliding_window::calculate_window_size(&skeleton_pairs, available_budget);
-
-            // Idle gap reset: after 2+ hours of inactivity, don't inject stale
-            // raw messages into the window — they'd appear as if typed seconds ago.
-            // The compaction summary (if available) provides historical context instead.
-            let idle_gap_detected = boundary > 0
-                && deduped_msgs
-                    .get(boundary.saturating_sub(1))
-                    .is_some_and(|m| {
-                        let now = chrono::Utc::now();
-                        now.signed_duration_since(m.created_at).num_seconds() > 7200
-                    });
-            let window_size = if idle_gap_detected {
-                info!(
-                    session_id,
-                    "Idle gap detected (>2h): resetting sliding window to 0"
-                );
-                0
-            } else {
-                computed_window_size
-            };
-
-            // Keep the last `window_size` old pairs + everything at/after boundary.
-            let keep_from = if window_size == 0 {
-                boundary
-            } else if old_user_positions.len() > window_size {
-                old_user_positions[old_user_positions.len() - window_size]
-            } else {
-                0
-            };
-            window_keep_from = keep_from;
-
-            // Phase 0 window-decision log — emitted where persisted `Message`
-            // metadata is still available. Ties `keep_from` (and the oldest
-            // kept message id) to fetch mechanics: a `keep_from` that moves
-            // while the fetch window slides is the prime cache-break suspect.
-            let oldest_kept_msg_id: Option<String> =
-                deduped_msgs.get(keep_from).map(|m| m.id.clone());
-            let boundary_msg_id: Option<String> = deduped_msgs.get(boundary).map(|m| m.id.clone());
-            let identity_preserve_bypass = identity_preserve_indices
-                .iter()
-                .filter(|&&i| i < keep_from)
-                .count();
-            info!(
-                session_id,
-                iteration,
-                current_turn_id = ?current_turn_id,
-                boundary_msg_id = ?boundary_msg_id,
-                oldest_fetched_id = ?oldest_fetched_id,
-                oldest_kept_msg_id = ?oldest_kept_msg_id,
-                keep_from,
-                window_size,
-                identity_preserve_bypass,
-                history_limit,
-                fetched_count,
-                current_user_injected,
-                safe_collapse = last_user_pos.is_none(),
-                "Window decision"
-            );
-
-            let trimmed: Vec<&Message> = deduped_msgs
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| *i >= keep_from || identity_preserve_indices.contains(i))
-                .map(|(_, m)| m)
-                .collect();
-            // Report window-trim removals alone (not conflated with collapse),
-            // and log `keep_from` movement explicitly via the oldest kept id.
-            if trimmed.len() < len_before_window_trim {
-                info!(
-                    session_id,
-                    window_trimmed = len_before_window_trim - trimmed.len(),
-                    keep_from,
-                    oldest_kept_msg_id = ?oldest_kept_msg_id,
-                    window_size,
-                    available_budget,
-                    "Adaptive sliding window: trimmed old conversation pairs"
-                );
-            }
-            trimmed
+    if plan.evicted_count > 0 {
+        // Advance the anchor, drop evicted renders, and prune their cache entries.
+        let evicted: Vec<ArchivedRender> = archived_renders.drain(..plan.evicted_count).collect();
+        {
+            let mut anchors = agent.turn_anchors.write().await;
+            anchors.insert(session_id.to_string(), plan.new_anchor_turn_seq);
         }
-    } else {
-        deduped_msgs
-    };
-
-    // Phase 0 — explicit window-boundary movement event, emitted on every
-    // build (trim or no-trim) so attribution sees a continuous signal. The
-    // oldest *kept* message id (first element of the post-trim list) is the
-    // robust cache-break signal: `keep_from` is an index into a per-build
-    // vector whose composition shifts as the fetch window slides, so a changed
-    // index with an unchanged id is benign re-indexing, whereas a changed id is
-    // a genuine prefix-cache break. We log both, comparing against the previous
-    // build for this session.
-    {
-        let oldest_kept_msg_id: Option<String> = deduped_msgs.first().map(|m| m.id.clone());
-        let mut tracker = agent.window_keep_from_tracker.write().await;
-        let previous = tracker.insert(
-            session_id.to_string(),
-            (window_keep_from, oldest_kept_msg_id.clone()),
-        );
-        if let Some((old_keep_from, old_oldest_kept_id)) = previous {
-            let id_changed = old_oldest_kept_id != oldest_kept_msg_id;
-            if id_changed || old_keep_from != window_keep_from {
-                info!(
-                    session_id,
-                    iteration,
-                    old_keep_from,
-                    new_keep_from = window_keep_from,
-                    old_oldest_kept_id = ?old_oldest_kept_id,
-                    new_oldest_kept_id = ?oldest_kept_msg_id,
-                    oldest_kept_id_changed = id_changed,
-                    "Window trim boundary moved"
-                );
-            }
-        }
-    }
-
-    tracing::debug!(
-        session_id,
-        iteration,
-        stage = "window_trim",
-        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
-            &project_messages_for_stage_hash(&deduped_msgs),
-            user_text,
-        ),
-        "Build stage pre-boundary fingerprint"
-    );
-
-    // Remove duplicate old user messages that have identical content to the
-    // current user message. When the same prompt is sent multiple times (e.g.,
-    // retrying after a failed response), the old instances with truncated/failed
-    // responses confuse the model into thinking the task was already handled.
-    // Also remove the assistant response immediately following each duplicate.
-    let deduped_msgs: Vec<&Message> = {
-        let boundary = deduped_msgs
-            .iter()
-            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-        if let Some(boundary) = boundary {
-            let mut skip_indices = std::collections::HashSet::new();
-            for (i, m) in deduped_msgs.iter().enumerate() {
-                if i < boundary && m.role == "user" && m.content.as_deref() == Some(user_text) {
-                    skip_indices.insert(i);
-                    // Also remove the assistant response immediately after
-                    if i + 1 < boundary && deduped_msgs[i + 1].role == "assistant" {
-                        skip_indices.insert(i + 1);
+        {
+            let mut cache = agent.turn_renders.write().await;
+            if let Some(session_cache) = cache.get_mut(session_id) {
+                for r in &evicted {
+                    if let Some(tid) = r.turn_id.as_deref() {
+                        session_cache.remove(tid);
                     }
                 }
             }
-            if !skip_indices.is_empty() {
+        }
+        info!(
+            session_id,
+            iteration,
+            new_anchor = plan.new_anchor_turn_seq,
+            turns_evicted = plan.evicted_count,
+            kept_est_tokens = plan.kept_est_tokens,
+            archived_kept = archived_renders.len(),
+            archived_budget,
+            "Window decision"
+        );
+    }
+    if plan.degenerate {
+        // Degenerate: carry zero archived turns.
+        archived_renders.clear();
+    }
+
+    // Step 4 (storage): persist the kept archived renders into the cache and
+    // emit per-turn hit/miss logging.
+    {
+        let mut cache = agent.turn_renders.write().await;
+        let session_cache = cache.entry(session_id.to_string()).or_default();
+        for r in &archived_renders {
+            if r.cache_hit {
+                tracing::debug!(
+                    session_id,
+                    turn_id = ?r.turn_id,
+                    "archived render cache hit"
+                );
+            } else {
                 info!(
                     session_id,
-                    duplicates_removed = skip_indices.len(),
-                    "Removed duplicate old user messages matching current prompt"
+                    turn_id = ?r.turn_id,
+                    reason = r.cache_reason,
+                    "archived render cache miss"
                 );
             }
-            deduped_msgs
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !skip_indices.contains(i))
-                .map(|(_, m)| m)
-                .collect()
-        } else {
-            deduped_msgs
+            if let Some(tid) = r.turn_id.as_deref() {
+                session_cache.insert(
+                    tid.to_string(),
+                    super::turn_render_cache::CachedRender {
+                        content_fp: r.content_fp.clone(),
+                        renderer_version: super::turn_render::RENDERER_VERSION,
+                        mode_tag: "archived".to_string(),
+                        bytes: r.bytes.clone(),
+                    },
+                );
+            }
         }
-    };
+    }
+
+    // Step 5: render the current turn (full / append-only).
+    let current_rendered = super::turn_render::render_turn(
+        &current_turn.messages,
+        super::turn_render::RenderMode::Current,
+        super::turn_render::RENDERER_VERSION,
+    );
+
+    // Step 6 (assembly, part 1): archived turns first, then the current turn.
+    // Pillar A tail + core insertion happen further below, unchanged.
+    let mut messages: Vec<Value> = Vec::new();
+    for r in &archived_renders {
+        messages.extend(r.bytes.iter().cloned());
+    }
+    // The current region begins here. Current-region fitting (step 7) re-locates
+    // it by the current user message (content == user_text) AFTER provider-validity
+    // fixups, so no fragile index is threaded across the intervening passes.
+    messages.extend(current_rendered);
+
+    // Three-pass fixup: merge → drop orphans → merge again (provider-validity).
+    fixup_message_ordering(&mut messages);
+
     tracing::debug!(
         session_id,
         iteration,
-        stage = "duplicate_removal",
-        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(
-            &project_messages_for_stage_hash(&deduped_msgs),
-            user_text,
-        ),
+        stage = "turn_anchored_assembly",
+        archived_turns = archived_renders.len(),
+        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
         "Build stage pre-boundary fingerprint"
     );
 
+    // Execution checkpoint (iteration > 1): a system reminder of the active
+    // request + completed work, anchored to the CURRENT turn's messages (the
+    // current interaction). Appended at the tail further below.
     let execution_checkpoint = if iteration > 1 {
-        let current_boundary = deduped_msgs
-            .iter()
-            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"));
-        let current_interaction: Vec<&Message> = current_boundary
-            .map(|boundary| deduped_msgs.iter().skip(boundary).copied().collect())
-            .unwrap_or_default();
+        let current_interaction: Vec<&Message> = current_turn.messages.iter().collect();
         build_execution_checkpoint_message(user_text, completed_tool_calls, &current_interaction)
     } else {
         None
     };
-
-    let old_interaction_assistant_ids: std::collections::HashSet<&str> = if let Some(boundary) =
-        deduped_msgs
-            .iter()
-            .rposition(|m| m.role == "user" && m.content.as_deref() == Some(user_text))
-            .or_else(|| deduped_msgs.iter().rposition(|m| m.role == "user"))
-    {
-        // Find the immediately-prior assistant message (right before boundary).
-        // Always exempt it from truncation: it is the single highest-value
-        // carryover message when the user sends a terse follow-up like "why?".
-        let prior_assistant_id: Option<&str> = (0..boundary)
-            .rev()
-            .find(|&i| deduped_msgs[i].role == "assistant")
-            .map(|i| deduped_msgs[i].id.as_str());
-
-        deduped_msgs
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| {
-                *i < boundary
-                    && m.role == "assistant"
-                    && Some(m.id.as_str()) != prior_assistant_id
-                    && !m
-                        .content
-                        .as_deref()
-                        .is_some_and(text_relates_to_critical_identity)
-            })
-            .map(|(_, m)| m.id.as_str())
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-
-    // Collect tool result ids present in this context window (tool_call_id on tool-role
-    // messages with a non-empty tool name). Used to drop assistant tool_calls that would
-    // otherwise be orphaned.
-    let tool_result_ids: std::collections::HashSet<&str> = deduped_msgs
-        .iter()
-        .filter(|m| m.role == "tool" && m.tool_name.as_ref().is_some_and(|n| !n.is_empty()))
-        .filter_map(|m| m.tool_call_id.as_deref())
-        .collect();
-
-    // Build lookup: tool_call_id → (tool_name, arguments_json) from assistant
-    // messages. Used to generate 1-line summaries for Prior 1 tool results.
-    let tool_call_info: std::collections::HashMap<String, (String, String)> =
-        if !prior_1_tool_ids.is_empty() {
-            let mut map = std::collections::HashMap::new();
-            for m in deduped_msgs.iter() {
-                if m.role == "assistant" {
-                    if let Some(tc_json) = &m.tool_calls_json {
-                        if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                            for tc in &tcs {
-                                map.insert(tc.id.clone(), (tc.name.clone(), tc.arguments.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-            map
-        } else {
-            std::collections::HashMap::new()
-        };
-
-    let mut messages: Vec<Value> = deduped_msgs
-        .iter()
-        // Skip tool results with empty/missing tool_name
-        .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
-        .filter_map(|m| {
-            // Truncate stale assistant content from prior interactions.
-            // We only shorten long messages to save tokens — we do NOT
-            // append marker text (e.g. "[prior turn]") because LLMs tend
-            // to echo such markers, producing empty or garbage replies.
-            let is_old_assistant = old_interaction_assistant_ids.contains(m.id.as_str());
-
-            // Age-based tool result summarization: Prior 1 tool results get
-            // their verbose content replaced with a deterministic 1-line summary.
-            // Exception: identity-critical tool results keep their full content.
-            let is_identity_critical = m
-                .content
-                .as_deref()
-                .is_some_and(text_relates_to_critical_identity);
-            let content =
-                if m.role == "tool" && prior_1_tool_ids.contains(&m.id) && !is_identity_critical {
-                    let tc_id = m.tool_call_id.as_deref().unwrap_or("");
-                    let (tool_name, args_json) = tool_call_info
-                        .get(tc_id)
-                        .map(|(n, a)| (n.as_str(), a.as_str()))
-                        .unwrap_or_else(|| (m.tool_name.as_deref().unwrap_or("unknown"), ""));
-                    let result_content = m.content.as_deref().unwrap_or("");
-                    Some(super::sliding_window::summarize_tool_result(
-                        tool_name,
-                        args_json,
-                        result_content,
-                    ))
-                } else if is_old_assistant {
-                    m.content.as_ref().map(|c| {
-                        if c.len() > MAX_OLD_ASSISTANT_CONTENT_CHARS {
-                            let truncated: String =
-                                c.chars().take(MAX_OLD_ASSISTANT_CONTENT_CHARS).collect();
-                            format!("{}…", truncated)
-                        } else {
-                            c.clone()
-                        }
-                    })
-                } else {
-                    m.content.clone()
-                };
-
-            // Prevent stall/failure responses from accumulating as prompt context.
-            // These messages are user-visible (stored in history) but poison
-            // subsequent turns — the LLM reads its own prior "I failed" messages
-            // and gives up without even trying ("learned helplessness").
-            if m.role == "assistant"
-                && m.tool_calls_json.is_none()
-                && content.as_deref().is_some_and(|c| {
-                    let t = c.trim_start();
-                    t.starts_with("I wasn't able to process that request.")
-                        || t.starts_with("I wasn't able to complete this task.")
-                        || t.starts_with("I made some progress but wasn't able to fully complete")
-                        || t.starts_with("I seem to be stuck on this task.")
-                        || t.starts_with("I've reached my processing limit")
-                        || t.starts_with("This goal hit its daily processing budget")
-                        || t.starts_with("This scheduled goal hit its daily processing budget")
-                        || t.starts_with("This scheduled run hit its per-run processing budget")
-                        || t.starts_with("I sent the requested file(s), but ran into issues")
-                        || t.starts_with(
-                            "I completed the main deliverable but wasn't able to finish",
-                        )
-                })
-            {
-                return None;
-            }
-
-            let mut obj = json!({
-                "role": m.role,
-                "content": content,
-            });
-            // For assistant messages with tool_calls, convert from ToolCall struct format
-            // to OpenAI wire format and strip any that lack a matching tool result
-            if let Some(tc_json) = &m.tool_calls_json {
-                if let Ok(tcs) = serde_json::from_str::<Vec<ToolCall>>(tc_json) {
-                    let filtered: Vec<Value> = tcs
-                        .iter()
-                        .filter(|tc| tool_result_ids.contains(tc.id.as_str()))
-                        .map(|tc| {
-                            let mut val = json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.arguments
-                                }
-                            });
-                            if let Some(ref extra) = tc.extra_content {
-                                val["extra_content"] = extra.clone();
-                            }
-                            val
-                        })
-                        .collect();
-                    if !filtered.is_empty() {
-                        obj["tool_calls"] = json!(filtered);
-                        if m.content.is_none() {
-                            obj["content"] = Value::Null;
-                        }
-                    } else if m.content.is_none()
-                        || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
-                    {
-                        // Assistant message had tool_calls but all were orphaned,
-                        // and no text content — replace with [Action completed] to
-                        // prevent dangling user messages (completion compulsion bug)
-                        obj["content"] = json!("[Action completed]");
-                    }
-                }
-            }
-            if let Some(name) = &m.tool_name {
-                if !name.is_empty() {
-                    obj["name"] = json!(name);
-                }
-            }
-            if let Some(tcid) = &m.tool_call_id {
-                obj["tool_call_id"] = json!(tcid);
-            }
-            Some(obj)
-        })
-        .collect();
-
-    // Collapse consecutive orphaned-turn placeholders into a single one. When
-    // the agent runs several tool-only iterations in a row, each becomes an
-    // identical "[Action completed]" assistant message. Feeding many identical
-    // placeholders into the model's context invites repetition/degeneration
-    // loops (the model starts regurgitating the placeholder verbatim), so keep
-    // only the first of each consecutive run.
-    {
-        let mut collapsed: Vec<Value> = Vec::with_capacity(messages.len());
-        let mut prev_was_placeholder = false;
-        for m in messages {
-            let is_placeholder = m.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                && m.get("content").and_then(|c| c.as_str()) == Some("[Action completed]")
-                && m.get("tool_calls").is_none();
-            if is_placeholder && prev_was_placeholder {
-                continue;
-            }
-            prev_was_placeholder = is_placeholder;
-            collapsed.push(m);
-        }
-        messages = collapsed;
-    }
-
-    // Final safety: drop any tool-role messages that still lack a "name" field
-    messages.retain(|m| {
-        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
-            let has_name = m
-                .get("name")
-                .and_then(|n| n.as_str())
-                .is_some_and(|n| !n.is_empty());
-            if !has_name {
-                warn!(
-                    "Dropping tool message with missing/empty name: tool_call_id={:?}",
-                    m.get("tool_call_id")
-                );
-            }
-            has_name
-        } else {
-            true
-        }
-    });
-
-    // Three-pass fixup: merge → drop orphans → merge again.
-    fixup_message_ordering(&mut messages);
-    // Phase 0 stage hash: history is now converted to final JSON message
-    // objects (Prior-1 tool summarization + old-assistant truncation applied
-    // in the filter_map above). A flip here with a stable `keep_from` is
-    // content mutation, not window-trim movement. `messages` is already
-    // complete message objects, so it is hashed directly.
-    tracing::debug!(
-        session_id,
-        iteration,
-        stage = "json_conversion",
-        pre_boundary_hash = %super::prefix_fingerprint::stage_pre_boundary_hash(&messages, user_text),
-        "Build stage pre-boundary fingerprint"
-    );
 
     // Ensure the current user message is in the context.
     // The DB write (append_user_message_with_event) may not yet be visible
@@ -1160,11 +752,14 @@ pub(super) async fn run_message_build_phase(
         "Build stage pre-boundary fingerprint"
     );
 
-    // Context window enforcement: trim messages to fit token budget
+    // Context window enforcement: trim messages to fit token budget.
+    //
+    // Pillar B (Task 7): fitting is scoped to the CURRENT-TURN region only.
+    // Archived turns are whole-turn-evicted upstream (spec invariant 3) and must
+    // never be trimmed here — only the current turn (everything from the current
+    // user message onward) is handed to `fit_messages_with_source_quotas`.
     if agent.context_window_config.enabled {
         // Reserve for BOTH message zero (core) and the task context tail.
-        // Use the additive idiom (matching the sliding-window estimate at :554)
-        // to avoid a throwaway String allocation.
         let system_tokens = crate::memory::context_window::estimate_tokens(core_prompt)
             + crate::memory::context_window::estimate_tokens(task_context_tail);
         let model_budget = crate::memory::context_window::compute_available_budget_precomputed(
@@ -1186,15 +781,46 @@ pub(super) async fn run_message_build_phase(
         } else {
             model_budget
         };
-        messages = crate::memory::context_window::fit_messages_with_source_quotas(
-            messages,
-            effective_budget,
+        // Locate the current-turn region: from the current user message (last
+        // occurrence matching `user_text`) to the end of `messages`. Archived
+        // turns precede it and are left untouched.
+        let current_region_idx = messages
+            .iter()
+            .rposition(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+            })
+            .unwrap_or(0);
+        let archived_prefix: Vec<Value> = messages[..current_region_idx].to_vec();
+        let current_region: Vec<Value> = messages[current_region_idx..].to_vec();
+        let before_current = current_region.len();
+        // The archived prefix already consumed `archived_budget`; the current
+        // region is fit against the remaining budget.
+        let archived_prefix_tokens = crate::memory::context_window::estimate_tokens(
+            &serde_json::to_string(&archived_prefix).unwrap_or_default(),
         );
+        let current_budget = effective_budget.saturating_sub(archived_prefix_tokens);
+        let fitted_current = crate::memory::context_window::fit_messages_with_source_quotas(
+            current_region,
+            current_budget,
+        );
+        let dropped = before_current.saturating_sub(fitted_current.len());
+        messages = archived_prefix;
+        messages.extend(fitted_current);
+        if dropped > 0 {
+            // Task 8 finalizes this attribution line; a placeholder is sufficient
+            // here so the stable-region mutation is not unattributed.
+            info!(
+                session_id,
+                iteration,
+                dropped,
+                reason = "history_fitting",
+                "Prefix mutation"
+            );
+        }
     }
-    // Phase 0 stage hash: history fitting. `fit_messages_with_source_quotas`
-    // can drop history under budget pressure. Pillar A retired the summary
-    // insertion from the fitter — the summary now lives only in the task
-    // context tail — so this stage now captures the history-trim effect alone.
+    // Phase 0 stage hash: history fitting. Fitting is now current-region only;
+    // archived turns are whole-turn-evicted upstream and never trimmed here.
     tracing::debug!(
         session_id,
         iteration,
@@ -1512,6 +1138,106 @@ mod tests {
         }
     }
 
+    // ====================================================================
+    // Pillar B (Task 7): turn-anchored build-phase test scaffolding.
+    //
+    // The turn-anchored fetch reads the CANONICAL `events` table (rows with a
+    // non-NULL `turn_id`), not the `messages` table. These helpers seed whole
+    // turns into events over the harness's shared pool so the build phase
+    // reconstructs them via `get_turns_from_anchor`.
+    // ====================================================================
+
+    use crate::events::{Event, EventStore, EventType};
+
+    /// Emit a complete user→assistant(+tool_call)→tool→assistant turn into the
+    /// events table under `turn_id`. `tool` is `Some((name, result))` to include
+    /// a tool step. `final_assistant` is the turn's winning reply. A `task_end`
+    /// with `status` closes the turn so the renderer derives the terminal state.
+    async fn seed_turn(
+        store: &EventStore,
+        session: &str,
+        turn_id: &str,
+        user: &str,
+        tool: Option<(&str, &str)>,
+        final_assistant: &str,
+        status: &str,
+    ) {
+        store
+            .append(Event::new(
+                session,
+                EventType::UserMessage,
+                json!({ "content": user, "turn_id": turn_id }),
+            ))
+            .await
+            .expect("seed user_message");
+        if let Some((name, result)) = tool {
+            let call_id = format!("call-{turn_id}-{name}");
+            store
+                .append(Event::new(
+                    session,
+                    EventType::AssistantResponse,
+                    json!({
+                        "content": serde_json::Value::Null,
+                        "tool_calls": [{ "id": call_id, "name": name, "arguments": "{}" }],
+                        "turn_id": turn_id,
+                    }),
+                ))
+                .await
+                .expect("seed assistant tool-call");
+            store
+                .append(Event::new(
+                    session,
+                    EventType::ToolResult,
+                    json!({
+                        "tool_call_id": call_id,
+                        "name": name,
+                        "result": result,
+                        "success": true,
+                        "duration_ms": 1,
+                        "turn_id": turn_id,
+                    }),
+                ))
+                .await
+                .expect("seed tool_result");
+        }
+        store
+            .append(Event::new(
+                session,
+                EventType::AssistantResponse,
+                json!({ "content": final_assistant, "turn_id": turn_id }),
+            ))
+            .await
+            .expect("seed final assistant");
+        store
+            .append(Event::new(
+                session,
+                EventType::TaskEnd,
+                json!({ "status": status, "turn_id": turn_id }),
+            ))
+            .await
+            .expect("seed task_end");
+    }
+
+    /// A sibling `EventStore` over the harness's shared pool — the agent's own
+    /// `event_store` reads the same DB, so seeded events are visible to the
+    /// build phase.
+    async fn seed_store(harness: &crate::testing::TestHarness) -> EventStore {
+        EventStore::new(harness.state.pool())
+            .await
+            .expect("sibling event store")
+    }
+
+    /// Stash `turn_id` as the session's current turn so the build phase matches
+    /// the current turn by id (mirrors what bootstrap does on a real turn).
+    async fn set_current_turn(harness: &crate::testing::TestHarness, session: &str, turn_id: &str) {
+        harness
+            .agent
+            .current_turn_ids
+            .write()
+            .await
+            .insert(session.to_string(), turn_id.to_string());
+    }
+
     #[test]
     fn empty_retry_preserves_parent_pair_and_current_user() {
         let messages = vec![
@@ -1537,223 +1263,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sliding_window_retains_pairs_that_fit_budget() {
-        use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::MessageStore;
-
-        let harness = setup_test_agent(MockProvider::new())
-            .await
-            .expect("test harness");
-        harness
-            .state
-            .append_message(&msg("user", "Older task"))
-            .await
-            .expect("append oldest user");
-        harness
-            .state
-            .append_message(&msg("assistant", "Older answer"))
-            .await
-            .expect("append oldest assistant");
-        harness
-            .state
-            .append_message(&msg(
-                "user",
-                "Please work in ~/projects/blog.aidaemon.ai/src/content/posts",
-            ))
-            .await
-            .expect("append prior user");
-        harness
-            .state
-            .append_message(&msg("assistant", "Which posts should I update?"))
-            .await
-            .expect("append prior assistant");
-        harness
-            .state
-            .append_message(&msg("user", "Why?"))
-            .await
-            .expect("append current user");
-
-        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
-        let tool_defs: Vec<Value> = Vec::new();
-        let mut pending_system_messages = Vec::new();
-        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
-
-        let mut ctx = MessageBuildCtx {
-            session_id: "test-session",
-            iteration: 1,
-            user_text: "Why?",
-            completed_tool_calls: &[],
-            model: "mock-model",
-            core_prompt: "You are a helpful test assistant.",
-            task_context_tail: "",
-            pinned_memories: &pinned_memories,
-            tool_defs: &tool_defs,
-            policy_bundle: &policy_bundle,
-            pending_system_messages: &mut pending_system_messages,
-            empty_response_retry_pending: false,
-            status_tx: &status_tx,
-        };
-
-        let built = run_message_build_phase(
-            &crate::agent::services::AgentServices::new(&harness.agent),
-            &mut ctx,
-        )
-        .await
-        .expect("message build");
-        let serialized = serde_json::to_string(&built.messages).expect("serialize messages");
-
-        // Adaptive sliding window keeps all pairs that fit within 30% of the
-        // token budget. Both small pairs easily fit, so all are retained.
-        assert!(
-            serialized.contains("blog.aidaemon.ai"),
-            "immediately prior user turn should be retained: {}",
-            serialized
-        );
-        assert!(
-            serialized.contains("Which posts should I update?"),
-            "immediately prior assistant turn should be retained: {}",
-            serialized
-        );
-        assert!(
-            serialized.contains("Older task"),
-            "older pair within budget should be retained by sliding window: {}",
-            serialized
-        );
-        assert!(
-            serialized.contains("Older answer"),
-            "older assistant within budget should be retained: {}",
-            serialized
-        );
-        assert!(
-            serialized.contains("Why?"),
-            "current user message should remain present: {}",
-            serialized
-        );
-    }
-
-    /// Phase 0: the window-decision path records the session's `keep_from` and
-    /// oldest-kept message id so a later build can emit an explicit
-    /// `Window trim boundary moved` event. This asserts the tracker plumbing,
-    /// not the log output itself.
-    #[tokio::test]
-    async fn window_decision_records_keep_from_tracker_for_session() {
-        use crate::execution_policy::PolicyBundle;
-        use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::MessageStore;
-
-        let harness = setup_test_agent(MockProvider::new())
-            .await
-            .expect("test harness");
-        harness
-            .state
-            .append_message(&msg("user", "Older task"))
-            .await
-            .expect("append oldest user");
-        harness
-            .state
-            .append_message(&msg("assistant", "Older answer"))
-            .await
-            .expect("append oldest assistant");
-        harness
-            .state
-            .append_message(&msg("user", "Why?"))
-            .await
-            .expect("append current user");
-
-        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
-        let tool_defs: Vec<Value> = Vec::new();
-        let mut pending_system_messages = Vec::new();
-        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
-
-        let mut ctx = MessageBuildCtx {
-            session_id: "tracker-session",
-            iteration: 1,
-            user_text: "Why?",
-            completed_tool_calls: &[],
-            model: "mock-model",
-            core_prompt: "You are a helpful test assistant.",
-            task_context_tail: "",
-            pinned_memories: &pinned_memories,
-            tool_defs: &tool_defs,
-            policy_bundle: &policy_bundle,
-            pending_system_messages: &mut pending_system_messages,
-            empty_response_retry_pending: false,
-            status_tx: &status_tx,
-        };
-
-        run_message_build_phase(
-            &crate::agent::services::AgentServices::new(&harness.agent),
-            &mut ctx,
-        )
-        .await
-        .expect("message build");
-
-        let tracker = harness.agent.window_keep_from_tracker.read().await;
-        assert!(
-            tracker.contains_key("tracker-session"),
-            "window-decision path should record a keep_from entry for the session"
-        );
-        // A second build with identical inputs must not panic and must keep a
-        // single entry per session (insert-overwrite, not accumulate).
-        drop(tracker);
-        let mut pending_system_messages2 = Vec::new();
-        let mut ctx2 = MessageBuildCtx {
-            session_id: "tracker-session",
-            iteration: 2,
-            user_text: "Why?",
-            completed_tool_calls: &[],
-            model: "mock-model",
-            core_prompt: "You are a helpful test assistant.",
-            task_context_tail: "",
-            pinned_memories: &pinned_memories,
-            tool_defs: &tool_defs,
-            policy_bundle: &policy_bundle,
-            pending_system_messages: &mut pending_system_messages2,
-            empty_response_retry_pending: false,
-            status_tx: &status_tx,
-        };
-        run_message_build_phase(
-            &crate::agent::services::AgentServices::new(&harness.agent),
-            &mut ctx2,
-        )
-        .await
-        .expect("second message build");
-        let tracker = harness.agent.window_keep_from_tracker.read().await;
-        assert_eq!(
-            tracker.len(),
-            1,
-            "tracker should hold one entry per session, not accumulate"
-        );
-    }
-
-    #[tokio::test]
     async fn later_iterations_include_execution_checkpoint_after_tool_progress() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
-        use crate::traits::MessageStore;
 
         let harness = setup_test_agent(MockProvider::new())
             .await
             .expect("test harness");
-        harness
-            .state
-            .append_message(&msg("user", "Find the system details and summarize them."))
-            .await
-            .expect("append user");
-        harness
-            .state
-            .append_message(&tool_msg(
-                "system_info",
-                "OS: macOS 15.0\nMemory: 16 GB\nHostname: dev-machine",
+        // Pillar B: seed the CURRENT (in-flight) turn into events — user message
+        // plus a completed system_info tool step. The current turn is rendered
+        // full/append-only, so the checkpoint can surface the tool evidence.
+        // No task_end: the turn is still in progress at iteration 2.
+        let store = seed_store(&harness).await;
+        let turn = "turn-checkpoint";
+        store
+            .append(Event::new(
+                "test-session",
+                EventType::UserMessage,
+                json!({ "content": "Find the system details and summarize them.", "turn_id": turn }),
             ))
             .await
-            .expect("append tool");
+            .expect("seed current user");
+        store
+            .append(Event::new(
+                "test-session",
+                EventType::AssistantResponse,
+                json!({
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{ "id": "call-sysinfo", "name": "system_info", "arguments": "{}" }],
+                    "turn_id": turn,
+                }),
+            ))
+            .await
+            .expect("seed assistant tool-call");
+        store
+            .append(Event::new(
+                "test-session",
+                EventType::ToolResult,
+                json!({
+                    "tool_call_id": "call-sysinfo",
+                    "name": "system_info",
+                    "result": "OS: macOS 15.0\nMemory: 16 GB\nHostname: dev-machine",
+                    "success": true,
+                    "duration_ms": 1,
+                    "turn_id": turn,
+                }),
+            ))
+            .await
+            .expect("seed tool_result");
+        set_current_turn(&harness, "test-session", turn).await;
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
@@ -1767,7 +1327,6 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -1823,7 +1382,6 @@ mod tests {
         let system_prompt =
             "## Identity\nStable identity.\n\n## Tools\nVerbose tool guidance.\n\n## Behavior\nBe precise.";
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -1836,7 +1394,6 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut first_pending_system_messages,
@@ -1859,7 +1416,6 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut second_pending_system_messages,
@@ -1897,10 +1453,14 @@ mod tests {
         }
     }
 
-    /// After 2+ hours idle, the sliding window should NOT include old pairs —
-    /// only the compaction summary provides historical context.
+    /// Pillar B (Task 7): historical conversation comes ONLY from the
+    /// turn-anchored fetch over canonical `events` (rows with a non-NULL
+    /// `turn_id`). Plain `messages`-table rows that never became turn-stamped
+    /// events (e.g. legacy/idle-gap pairs) are NOT reconstructed, so they never
+    /// leak into the payload — the current user turn is the only content. (This
+    /// supersedes the deleted idle-gap sliding-window reset.)
     #[tokio::test]
-    async fn idle_gap_resets_sliding_window_to_zero() {
+    async fn non_event_history_is_not_reconstructed_into_payload() {
         use crate::execution_policy::PolicyBundle;
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::MessageStore;
@@ -1939,7 +1499,6 @@ mod tests {
             .expect("append current user");
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
@@ -1952,7 +1511,6 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2012,7 +1570,6 @@ mod tests {
             .expect("append user");
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let tail = format!(
             "{TASK_CONTEXT_TAIL_MARKER}\n\n[Session Summary]\nUser previously asked about deploying a blog. Config was created."
@@ -2028,7 +1585,6 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: &tail,
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2131,7 +1687,6 @@ mod tests {
         assert!(estimate_tool_definition_tokens(&tool_defs) > 16_384);
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -2143,7 +1698,6 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2257,7 +1811,6 @@ mod tests {
             .collect();
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let mut pending_system_messages = vec![SystemDirective::FreshConversationContext];
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
         let completed_tool_calls = vec!["system_info({})".to_string()];
@@ -2271,7 +1824,6 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: &system_prompt,
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2335,7 +1887,6 @@ mod tests {
         );
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let mut pending_system_messages = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
@@ -2348,7 +1899,6 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2443,7 +1993,6 @@ mod tests {
         let core = "CORE";
         let tail = format!("{TASK_CONTEXT_TAIL_MARKER}\n\n[Current Date & Time]\nFixed timestamp");
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let tool_defs: Vec<Value> = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -2470,7 +2019,6 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p1,
@@ -2493,7 +2041,6 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p2,
@@ -2548,7 +2095,6 @@ mod tests {
             .collect();
 
         let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
-        let pinned_memories: Vec<Message> = Vec::new();
         let mut pending = Vec::new();
         let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
 
@@ -2560,7 +2106,6 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE",
             task_context_tail: "",
-            pinned_memories: &pinned_memories,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending,
@@ -2584,5 +2129,661 @@ mod tests {
             vec!["alpha_tool", "mango_tool", "zebra_tool"],
             "final tool_defs must be name-sorted"
         );
+    }
+
+    // ====================================================================
+    // Pillar B (Task 7): turn-anchored build-phase tests (the 10 from the plan).
+    // ====================================================================
+
+    use crate::execution_policy::PolicyBundle;
+    use crate::testing::{setup_test_agent, MockProvider, TestHarness};
+
+    /// Build a payload for `session`/`user_text` at `iteration`, using the
+    /// turn-anchored path. Returns the built messages.
+    async fn build_payload(
+        harness: &TestHarness,
+        session: &str,
+        user_text: &str,
+        iteration: usize,
+    ) -> Vec<Value> {
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let tool_defs: Vec<Value> = Vec::new();
+        let mut pending_system_messages = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+        let mut ctx = MessageBuildCtx {
+            session_id: session,
+            iteration,
+            user_text,
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: "CORE-PROMPT-BYTES",
+            task_context_tail: "[Task Context] tail",
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending_system_messages,
+            empty_response_retry_pending: false,
+            status_tx: &status_tx,
+        };
+        run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build")
+        .messages
+    }
+
+    fn count_occurrences(messages: &[Value], needle: &str) -> usize {
+        serde_json::to_string(messages)
+            .unwrap_or_default()
+            .matches(needle)
+            .count()
+    }
+
+    /// 1. Archived turns are whole and in Archived form, positioned between the
+    ///    core (index 0) and the `[Task Context]` tail.
+    #[tokio::test]
+    async fn archived_turns_are_whole_and_in_archived_form() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        // Two completed archived turns.
+        seed_turn(
+            &store,
+            "s1",
+            "t1",
+            "first question",
+            Some(("terminal", "exit_code: 0")),
+            "first answer",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "s1",
+            "t2",
+            "second question",
+            Some(("read_file", "10 lines")),
+            "second answer",
+            "completed",
+        )
+        .await;
+        // Current turn (in events) under turn id t3.
+        seed_turn(
+            &store,
+            "s1",
+            "t3",
+            "third question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s1", "t3").await;
+
+        let messages = build_payload(&harness, "s1", "third question", 1).await;
+        let serialized = serde_json::to_string(&messages).unwrap();
+
+        // Core at index 0.
+        assert_eq!(messages[0]["content"].as_str(), Some("CORE-PROMPT-BYTES"));
+        // Both archived user messages present (whole/full).
+        assert!(serialized.contains("first question"), "{serialized}");
+        assert!(serialized.contains("second question"), "{serialized}");
+        // Archived tool results are SUMMARIZED (compact 1-liner form).
+        assert!(
+            messages.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("tool")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.starts_with("terminal:"))
+            }),
+            "archived terminal result should be summarized: {serialized}"
+        );
+        // Exactly one tail marker, and the archived turns precede it.
+        let tail_pos = messages.iter().position(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.starts_with(TASK_CONTEXT_TAIL_MARKER))
+        });
+        let tail_pos = tail_pos.expect("tail present");
+        let first_q_pos = messages
+            .iter()
+            .position(|m| m.get("content").and_then(|c| c.as_str()) == Some("first question"))
+            .expect("first archived user present");
+        assert!(
+            first_q_pos < tail_pos,
+            "archived turns must precede the tail"
+        );
+    }
+
+    /// 2. Cross-turn archived stability: archived turn 1's bytes are identical
+    ///    when built in turn 2 vs turn 3 (render-cache hit; no fp_mismatch).
+    #[tokio::test]
+    async fn cross_turn_archived_render_is_byte_stable() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "s2",
+            "t1",
+            "marker-ONE question",
+            Some(("terminal", "exit_code: 0")),
+            "answer one",
+            "completed",
+        )
+        .await;
+
+        // Build turn 2 (current = t2).
+        seed_turn(
+            &store,
+            "s2",
+            "t2",
+            "marker-TWO question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s2", "t2").await;
+        let build_a = build_payload(&harness, "s2", "marker-TWO question", 1).await;
+
+        // Close t2, open t3 as current.
+        store
+            .append(Event::new(
+                "s2",
+                EventType::TaskEnd,
+                json!({"status":"completed","turn_id":"t2"}),
+            ))
+            .await
+            .unwrap();
+        seed_turn(
+            &store,
+            "s2",
+            "t3",
+            "marker-THREE question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s2", "t3").await;
+        let build_b = build_payload(&harness, "s2", "marker-THREE question", 1).await;
+
+        // The rendered archived-turn-1 region (everything up to its 'answer one')
+        // must be byte-identical across both builds.
+        let extract_t1 = |msgs: &[Value]| -> Vec<Value> {
+            let end = msgs
+                .iter()
+                .position(|m| m.get("content").and_then(|c| c.as_str()) == Some("answer one"))
+                .expect("answer one present");
+            msgs[..=end].to_vec()
+        };
+        assert_eq!(
+            extract_t1(&build_a),
+            extract_t1(&build_b),
+            "archived turn 1 must be byte-identical across builds (render-cache hit)"
+        );
+    }
+
+    /// 3. The current turn is full/append-only (NOT summarized).
+    #[tokio::test]
+    async fn current_turn_is_full_not_summarized() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        let long_user = "DETAILED current request ".repeat(8);
+        store
+            .append(Event::new(
+                "s3",
+                EventType::UserMessage,
+                json!({"content": long_user, "turn_id":"tc"}),
+            ))
+            .await
+            .unwrap();
+        set_current_turn(&harness, "s3", "tc").await;
+
+        let messages = build_payload(&harness, "s3", &long_user, 1).await;
+        // The full (untruncated) current user text is present verbatim.
+        assert!(
+            messages.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content").and_then(|c| c.as_str()) == Some(long_user.as_str())
+            }),
+            "current user message must be full/verbatim"
+        );
+    }
+
+    /// 4. Tail + core position preserved: exactly one tail marker at boundary−1,
+    ///    message zero equals the core bytes.
+    #[tokio::test]
+    async fn tail_and_core_positions_preserved() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "s4",
+            "t1",
+            "old question",
+            None,
+            "old answer",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "s4",
+            "t2",
+            "current question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s4", "t2").await;
+
+        let messages = build_payload(&harness, "s4", "current question", 1).await;
+        assert_eq!(messages[0]["content"].as_str(), Some("CORE-PROMPT-BYTES"));
+        let tail_positions: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.starts_with(TASK_CONTEXT_TAIL_MARKER))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tail_positions.len(), 1, "exactly one tail marker");
+        // Tail sits immediately before the current user message (boundary − 1).
+        let tail_idx = tail_positions[0];
+        assert_eq!(
+            messages[tail_idx + 1]["role"].as_str(),
+            Some("user"),
+            "tail must sit at boundary − 1 (immediately before current user)"
+        );
+        assert_eq!(
+            messages[tail_idx + 1]["content"].as_str(),
+            Some("current question")
+        );
+    }
+
+    /// 5. Eviction advances the anchor: a tiny archived budget evicts the oldest
+    ///    whole turns; no archived turn is partially trimmed.
+    #[tokio::test]
+    async fn eviction_advances_anchor_and_evicts_whole_turns() {
+        let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        // Tiny model budget so archived_budget is small but positive.
+        harness.agent.context_window_config.default_budget = 5900;
+        let store = seed_store(&harness).await;
+        // Several archived turns with sizeable content so they exceed the budget.
+        let big = "lots of detail ".repeat(20);
+        for i in 1..=4 {
+            seed_turn(
+                &store,
+                "s5",
+                &format!("t{i}"),
+                &format!("OLDMARK-{i} {big}"),
+                None,
+                &format!("answer {i}"),
+                "completed",
+            )
+            .await;
+        }
+        seed_turn(
+            &store,
+            "s5",
+            "tcur",
+            "current request",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s5", "tcur").await;
+
+        let anchor_before = harness.agent.turn_anchors.read().await.get("s5").copied();
+        let messages = build_payload(&harness, "s5", "current request", 1).await;
+        let anchor_after = harness.agent.turn_anchors.read().await.get("s5").copied();
+
+        assert!(anchor_after.is_some(), "anchor recorded");
+        assert!(
+            anchor_after != anchor_before || anchor_before.is_none(),
+            "eviction should advance the anchor"
+        );
+        // The oldest turn marker must have been evicted (whole-turn).
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(
+            !serialized.contains("OLDMARK-1"),
+            "oldest whole turn should be evicted: {serialized}"
+        );
+        // Current request always present.
+        assert!(serialized.contains("current request"));
+    }
+
+    /// 6. Late write re-renders exactly one turn: appending a tool message under
+    ///    an already-archived turn flips that turn's content_fp (one re-render),
+    ///    the OTHER archived turn stays byte-identical.
+    #[tokio::test]
+    async fn late_write_re_renders_only_the_affected_turn() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "s6",
+            "t1",
+            "alpha question",
+            Some(("terminal", "exit_code: 0")),
+            "alpha answer",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "s6",
+            "t2",
+            "beta question",
+            Some(("read_file", "5 lines")),
+            "beta answer",
+            "completed",
+        )
+        .await;
+        seed_turn(
+            &store,
+            "s6",
+            "t3",
+            "current question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s6", "t3").await;
+
+        let first = build_payload(&harness, "s6", "current question", 1).await;
+        // Late write under already-archived t1: a complete assistant tool-call +
+        // its tool result (a realistic background-notifier append). Both share
+        // turn_id t1 and land with ids higher than t1's original rows.
+        store
+            .append(Event::new(
+                "s6",
+                EventType::AssistantResponse,
+                json!({
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{ "id": "late-call", "name": "web_search", "arguments": "{}" }],
+                    "turn_id": "t1",
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                "s6",
+                EventType::ToolResult,
+                json!({
+                    "tool_call_id": "late-call",
+                    "name": "web_search",
+                    "result": "LATEWRITE-marker",
+                    "success": true,
+                    "duration_ms": 1,
+                    "turn_id": "t1",
+                }),
+            ))
+            .await
+            .unwrap();
+        let second = build_payload(&harness, "s6", "current question", 1).await;
+
+        // t2's archived region (its user..answer) must be byte-identical across builds.
+        let extract_region = |msgs: &[Value], start_marker: &str, end_marker: &str| -> Vec<Value> {
+            let s = msgs
+                .iter()
+                .position(|m| m.get("content").and_then(|c| c.as_str()) == Some(start_marker))
+                .expect("start marker");
+            let e = msgs
+                .iter()
+                .position(|m| m.get("content").and_then(|c| c.as_str()) == Some(end_marker))
+                .expect("end marker");
+            msgs[s..=e].to_vec()
+        };
+        assert_eq!(
+            extract_region(&first, "beta question", "beta answer"),
+            extract_region(&second, "beta question", "beta answer"),
+            "unaffected archived turn t2 must stay byte-identical"
+        );
+        // t1's archived region (alpha question .. just before beta question) MUST
+        // change: the late tool step adds a new summarized tool message at the END
+        // of t1 (highest id within the turn), so the region capture must extend
+        // past "alpha answer" up to the start of the next turn.
+        let extract_t1 = |msgs: &[Value]| -> Vec<Value> {
+            let s = msgs
+                .iter()
+                .position(|m| m.get("content").and_then(|c| c.as_str()) == Some("alpha question"))
+                .expect("alpha question");
+            let e = msgs
+                .iter()
+                .position(|m| m.get("content").and_then(|c| c.as_str()) == Some("beta question"))
+                .expect("beta question");
+            msgs[s..e].to_vec()
+        };
+        let first_t1 = extract_t1(&first);
+        let second_t1 = extract_t1(&second);
+        assert_ne!(
+            first_t1, second_t1,
+            "affected archived turn t1 must be re-rendered after the late write"
+        );
+        // The late web_search step appears as a new summarized tool message.
+        assert!(
+            second_t1.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("tool")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.starts_with("web_search:"))
+            }),
+            "late web_search step must appear (summarized) in the re-rendered turn"
+        );
+    }
+
+    /// 7. No synthetic user / no age_collapse fingerprint on the happy path.
+    #[tokio::test]
+    async fn no_synthetic_user_and_no_age_collapse_on_happy_path() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        seed_turn(
+            &store,
+            "s7",
+            "t1",
+            "current question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s7", "t1").await;
+
+        let messages = build_payload(&harness, "s7", "current question", 1).await;
+        let serialized = serde_json::to_string(&messages).unwrap();
+        // No synthetic-user id leaks into content (the in-process fallback did
+        // not fire because the current turn is present in the fetch).
+        assert!(
+            !serialized.contains("synthetic-current-user-"),
+            "no synthetic user id on the happy path: {serialized}"
+        );
+        // No legacy age_collapse stage marker anywhere.
+        assert!(!serialized.contains("age_collapse"));
+    }
+
+    /// 8. Current-turn fallback fires when the current row is absent: simulate
+    ///    the race (current turn not yet in events) and assert the payload still
+    ///    ends in the current user turn (full/append-only).
+    #[tokio::test]
+    async fn current_turn_fallback_injects_when_row_absent() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        // One archived turn exists, but the CURRENT turn's user row is NOT yet
+        // committed to events (the documented race). current_turn_ids points at
+        // a turn id with no rows.
+        seed_turn(
+            &store,
+            "s8",
+            "t1",
+            "old question",
+            None,
+            "old answer",
+            "completed",
+        )
+        .await;
+        set_current_turn(&harness, "s8", "t-not-committed").await;
+
+        let messages = build_payload(&harness, "s8", "RACE current text", 1).await;
+        // Payload must still end in the current user message (full/append-only).
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
+        assert!(
+            last_user.is_some_and(
+                |m| m.get("content").and_then(|c| c.as_str()) == Some("RACE current text")
+            ),
+            "fallback must inject the current user message: {:?}",
+            serde_json::to_string(&messages)
+        );
+    }
+
+    /// 9. Render cache prunes on eviction: after an eviction advances the anchor,
+    ///    `turn_renders[session]` no longer holds entries for evicted turn ids.
+    #[tokio::test]
+    async fn render_cache_prunes_evicted_turns() {
+        let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        harness.agent.context_window_config.default_budget = 5900;
+        let store = seed_store(&harness).await;
+        let big = "detail ".repeat(20);
+        for i in 1..=4 {
+            seed_turn(
+                &store,
+                "s9",
+                &format!("t{i}"),
+                &format!("turn {i} {big}"),
+                None,
+                &format!("answer {i}"),
+                "completed",
+            )
+            .await;
+        }
+        seed_turn(
+            &store,
+            "s9",
+            "tcur",
+            "current request",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s9", "tcur").await;
+
+        let _ = build_payload(&harness, "s9", "current request", 1).await;
+        let cache = harness.agent.turn_renders.read().await;
+        let session_cache = cache.get("s9");
+        // The oldest evicted turn ids must NOT remain cached (no unbounded growth).
+        if let Some(sc) = session_cache {
+            assert!(
+                !sc.contains_key("t1"),
+                "evicted turn t1 must be pruned from the render cache"
+            );
+        }
+        // Anchor advanced past t1.
+        let anchor = harness.agent.turn_anchors.read().await.get("s9").copied();
+        assert!(anchor.is_some());
+    }
+
+    /// 10. No duplicate pinned-history path: unique content markers appear at
+    ///     most once, and every emitted historical marker belongs to a turn at
+    ///     or after the anchor.
+    #[tokio::test]
+    async fn no_duplicate_pinned_history_path() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        // More than the former 20-message recency window, each with a unique marker.
+        for i in 1..=12 {
+            seed_turn(
+                &store,
+                "s10",
+                &format!("t{i}"),
+                &format!("UNIQUEMARK-{i:02}-X"),
+                None,
+                &format!("reply-{i}"),
+                "completed",
+            )
+            .await;
+        }
+        seed_turn(
+            &store,
+            "s10",
+            "tcur",
+            "current request UNIQUEMARK-CUR",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s10", "tcur").await;
+
+        let messages = build_payload(&harness, "s10", "current request UNIQUEMARK-CUR", 1).await;
+
+        // Every marker present occurs at most once (no duplicate canonical-history path).
+        for i in 1..=12 {
+            let needle = format!("UNIQUEMARK-{i:02}-X");
+            let occ = count_occurrences(&messages, &needle);
+            assert!(
+                occ <= 1,
+                "marker {needle} must occur at most once, got {occ}"
+            );
+        }
+
+        // Every emitted historical marker belongs to a turn whose turn_seq >= anchor.
+        let anchor = harness
+            .agent
+            .turn_anchors
+            .read()
+            .await
+            .get("s10")
+            .copied()
+            .expect("anchor recorded");
+        let store2 = seed_store(&harness).await;
+        let turns = store2.get_turns_from_anchor("s10", anchor).await.unwrap();
+        let serialized = serde_json::to_string(&messages).unwrap();
+        for i in 1..=12 {
+            let needle = format!("UNIQUEMARK-{i:02}-X");
+            if serialized.contains(&needle) {
+                let belongs = turns.iter().any(|t| {
+                    t.turn_seq >= anchor
+                        && t.messages
+                            .iter()
+                            .any(|m| m.content.as_deref().is_some_and(|c| c.contains(&needle)))
+                });
+                assert!(
+                    belongs,
+                    "emitted marker {needle} must belong to a turn >= anchor"
+                );
+            }
+        }
+
+        // Compile-time guarantee that the pinned_memories plumbing is gone:
+        // MessageBuildCtx has no such field (this references all current fields).
+        let _assert_no_pinned = |c: &MessageBuildCtx| {
+            let MessageBuildCtx {
+                session_id: _,
+                iteration: _,
+                user_text: _,
+                completed_tool_calls: _,
+                model: _,
+                core_prompt: _,
+                task_context_tail: _,
+                tool_defs: _,
+                policy_bundle: _,
+                pending_system_messages: _,
+                empty_response_retry_pending: _,
+                status_tx: _,
+            } = c;
+        };
     }
 }

@@ -195,36 +195,6 @@ fn extract_write_outcome(result: &str) -> String {
     }
 }
 
-/// Calculate how many prior conversation pairs fit within a token budget.
-///
-/// Returns `min(5, pairs_that_fit_in_30%_of_budget)`.
-/// Iterates from most recent (end of slice) backward, accumulating token estimates
-/// until 30% of the available budget is exhausted.
-///
-/// Each element of `skeleton_pairs` is `(user_token_estimate, assistant_token_estimate)`.
-pub(super) fn calculate_window_size(
-    skeleton_pairs: &[(usize, usize)],
-    available_budget: usize,
-) -> usize {
-    let budget_30pct = available_budget * 30 / 100;
-    let mut used = 0usize;
-    let mut count = 0usize;
-
-    for &(user_tokens, assistant_tokens) in skeleton_pairs.iter().rev() {
-        let pair_cost = user_tokens + assistant_tokens;
-        if used + pair_cost > budget_30pct {
-            break;
-        }
-        used += pair_cost;
-        count += 1;
-        if count >= 5 {
-            break;
-        }
-    }
-
-    count
-}
-
 /// Extract a skeleton from a sequence of messages belonging to one interaction.
 ///
 /// The skeleton preserves signal while minimizing tokens:
@@ -270,12 +240,22 @@ pub(super) fn extract_skeleton(messages: &[Value]) -> Vec<Value> {
                     }
                     result.push(skeleton);
                 } else {
-                    // No text content (tool-call-only assistant message)
-                    // Replace with placeholder to prevent dangling user messages
-                    result.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": "[Action completed]",
-                    }));
+                    // No text content (tool-call-only assistant message).
+                    // Replace with a placeholder to prevent dangling user
+                    // messages, but collapse consecutive placeholders into one:
+                    // many identical placeholders in context invite model
+                    // repetition/degeneration loops.
+                    let prev_is_placeholder = result.last().is_some_and(|m| {
+                        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                            && m.get("content").and_then(|c| c.as_str())
+                                == Some("[Action completed]")
+                    });
+                    if !prev_is_placeholder {
+                        result.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": "[Action completed]",
+                        }));
+                    }
                 }
             }
             // Drop tool messages and system messages
@@ -564,55 +544,6 @@ mod tests {
         assert!(!looks_like_http_status("99 too short"));
     }
 
-    // ─── calculate_window_size tests ───
-
-    #[test]
-    fn test_window_size_all_five_fit() {
-        // 5 small pairs: each ~50 tokens. Budget 10000 → 30% = 3000. All fit easily.
-        let pairs = vec![(25, 25); 5];
-        assert_eq!(calculate_window_size(&pairs, 10000), 5);
-    }
-
-    #[test]
-    fn test_window_size_budget_limited() {
-        // 5 pairs, each ~500 tokens. Budget 4000 → 30% = 1200. Only 2 fit (1000 < 1200 < 1500).
-        let pairs = vec![(250, 250); 5];
-        assert_eq!(calculate_window_size(&pairs, 4000), 2);
-    }
-
-    #[test]
-    fn test_window_size_tiny_budget_zero() {
-        // Budget 100 → 30% = 30. Each pair is 200 tokens. None fit.
-        let pairs = vec![(100, 100); 3];
-        assert_eq!(calculate_window_size(&pairs, 100), 0);
-    }
-
-    #[test]
-    fn test_window_size_empty_pairs() {
-        assert_eq!(calculate_window_size(&[], 10000), 0);
-    }
-
-    #[test]
-    fn test_window_size_large_budget_caps_at_five() {
-        // 10 pairs, huge budget. Should cap at 5.
-        let pairs = vec![(10, 10); 10];
-        assert_eq!(calculate_window_size(&pairs, 1_000_000), 5);
-    }
-
-    #[test]
-    fn test_window_size_exactly_at_boundary() {
-        // 30% of 1000 = 300. 3 pairs of 100 each = 300. Should fit exactly 3.
-        let pairs = vec![(50, 50); 5];
-        assert_eq!(calculate_window_size(&pairs, 1000), 3);
-    }
-
-    #[test]
-    fn test_window_size_just_over_boundary() {
-        // 30% of 1000 = 300. 3 pairs: 101 each = 303 > 300. Only 2 fit.
-        let pairs = vec![(51, 50); 5];
-        assert_eq!(calculate_window_size(&pairs, 1000), 2);
-    }
-
     // ─── extract_skeleton tests ───
 
     #[test]
@@ -680,6 +611,38 @@ mod tests {
         ];
         let skeleton = extract_skeleton(&messages);
         assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[1]["content"], "[Action completed]");
+    }
+
+    #[test]
+    fn test_skeleton_collapses_consecutive_placeholders() {
+        // Several tool-only iterations in a row must collapse to ONE placeholder
+        // so the model's context isn't flooded with identical "[Action completed]"
+        // lines (which invite repetition/degeneration loops).
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Find my files"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "function": {"name": "glob", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "a", "tool_call_id": "tc1", "name": "glob"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc2", "function": {"name": "glob", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "b", "tool_call_id": "tc2", "name": "glob"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc3", "function": {"name": "glob", "arguments": "{}"}}]
+            }),
+        ];
+        let skeleton = extract_skeleton(&messages);
+        // Expected: user, [Action completed] (single, collapsed)
+        assert_eq!(skeleton.len(), 2);
+        assert_eq!(skeleton[0]["content"], "Find my files");
         assert_eq!(skeleton[1]["content"], "[Action completed]");
     }
 

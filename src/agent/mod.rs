@@ -398,12 +398,13 @@ pub struct Agent {
     /// `message_build_phase` uses this stamp to find the current-task
     /// boundary without inferring from message content.
     current_turn_ids: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
-    /// Phase 0 observability — per-session memory of the last sliding-window
-    /// trim decision (`keep_from` index + oldest-kept persisted message id).
-    /// Lets `message_build_phase` emit an explicit movement event when the
-    /// window boundary shifts between builds, which is the prime suspect for
-    /// llama.cpp prefix-cache breaks. In-memory, lost on restart (the
-    /// server-side KV cache is stale then anyway).
+    /// DEPRECATED (Pillar B Task 7): retired. This tracked the legacy
+    /// sliding-window `keep_from` boundary; the boundary signal is now the
+    /// turn-anchor (`turn_anchors`). The age-ladder/sliding-window block that
+    /// wrote here was deleted in Task 7, so the field is now unused (left in
+    /// place to avoid churning the `Agent` constructor; remove in a later
+    /// cleanup pass). No code reads or writes it.
+    #[allow(dead_code)]
     window_keep_from_tracker: WindowBoundaryMemory,
     /// Test-only override for the execution budget selected at the start of
     /// the agent loop. When `Some`, `select_initial_execution_budget` is
@@ -421,15 +422,12 @@ pub struct Agent {
     /// Pillar B per-session/per-turn render cache (Task 5). Keyed by
     /// `session_id` then `turn_id`; reuses rendered turn bytes verbatim across
     /// builds when `content_fp` + `renderer_version` + `mode` are unchanged.
-    /// Consumed by the message-build integration in Task 7 (Pillar B); unused
-    /// until then.
-    #[allow(dead_code)]
+    /// Consumed by the message-build integration (Pillar B Task 7).
     turn_renders: TurnRenderCache,
     /// Pillar B per-session anchor tracker (Task 6). Keyed by `session_id`;
     /// maps to the anchor `turn_seq` of the oldest archived turn carried into
     /// the payload. Eviction advances it. Consumed by the message-build
-    /// integration in Task 7 (Pillar B); unused until then.
-    #[allow(dead_code)]
+    /// integration (Pillar B Task 7).
     turn_anchors: TurnAnchorMemory,
 }
 

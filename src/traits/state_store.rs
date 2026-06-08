@@ -18,6 +18,12 @@ pub trait MessageStore: Send + Sync {
 
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls `get_history`.
+    ///
+    /// Pillar B (Task 7): the last production caller (`load_initial_history`)
+    /// was removed when the turn-anchored fetch took over history retention.
+    /// Retained as part of the `MessageStore` contract (still exercised by the
+    /// sqlite store tests); allow dead_code until a future caller or removal.
+    #[allow(dead_code)]
     async fn get_context(
         &self,
         session_id: &str,
@@ -152,6 +158,7 @@ pub trait TokenUsageStore: Send + Sync {
         &self,
         _session_id: &str,
         _usage: &super::TokenUsage,
+        _call_id: Option<&str>,
     ) -> anyhow::Result<()> {
         Ok(()) // default no-op
     }

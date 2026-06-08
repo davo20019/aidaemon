@@ -294,6 +294,8 @@ async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -587,8 +589,11 @@ async fn test_synthesized_done_persisted() {
 
 /// Regression: old interaction assistant responses should be truncated so
 /// stale context from long prior turns doesn't pollute subsequent replies.
-/// Exception: the immediately-prior assistant message (e.g., budget/timeout response)
-/// is preserved untruncated to provide handoff context.
+///
+/// Pillar B (Task 7): the archived renderer (`render_archived`) truncates the
+/// winning assistant of EVERY archived turn — the legacy "immediately-prior
+/// assistant preserved untruncated" exemption was retired (handoff context now
+/// lives in the per-task context tail, not in raw archived assistant bytes).
 #[tokio::test]
 async fn test_old_interaction_assistant_content_truncated() {
     let long_response_1 = "B".repeat(500);
@@ -649,8 +654,8 @@ async fn test_old_interaction_assistant_content_truncated() {
         .unwrap();
     assert_eq!(r3, "Short answer.");
 
-    // Verify: Turn 1's 500-char response (2+ turns back) is truncated in Turn 3,
-    // but Turn 2's response (immediately prior) is preserved untruncated.
+    // Verify: BOTH prior turns' 500-char responses are truncated in Turn 3 —
+    // every archived turn's winning assistant is truncated by `render_archived`.
     let call_log = harness.provider.call_log.lock().await;
     let turn3_call = call_log.last().unwrap();
     let assistant_msgs: Vec<&serde_json::Value> = turn3_call
@@ -659,32 +664,33 @@ async fn test_old_interaction_assistant_content_truncated() {
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
         .collect();
 
-    // Turn 1's response (BBB...) should be truncated (it's NOT the immediately-prior)
-    let has_truncated = assistant_msgs.iter().any(|m| {
+    // Turn 1's response (BBB...) should be truncated (archived).
+    let has_truncated_b = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
             .is_some_and(|s| s.starts_with('B') && s.ends_with('…') && s.len() < 500)
     });
     assert!(
-        has_truncated,
+        has_truncated_b,
         "Turn 1's long assistant response should be truncated in Turn 3's context"
     );
 
-    // Turn 2's response (AAA...) should be preserved untruncated (immediately-prior)
-    let has_preserved = assistant_msgs.iter().any(|m| {
+    // Turn 2's response (AAA...) is ALSO truncated now (no immediately-prior
+    // exemption under the turn-anchored archived renderer).
+    let has_truncated_a = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.starts_with('A') && s.len() == 500)
+            .is_some_and(|s| s.starts_with('A') && s.ends_with('…') && s.len() < 500)
     });
     assert!(
-        has_preserved,
-        "Turn 2's assistant response (immediately prior) should be preserved untruncated"
+        has_truncated_a,
+        "Turn 2's assistant response should also be truncated (archived)"
     );
 
     // Truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
     for m in &assistant_msgs {
         if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if content.starts_with('B') && content.ends_with('…') {
+            if (content.starts_with('B') || content.starts_with('A')) && content.ends_with('…') {
                 // 200 chars + "…" (3 bytes) = ~203 bytes max
                 assert!(
                     content.len() <= 210,
