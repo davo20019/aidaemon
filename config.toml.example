@@ -36,6 +36,12 @@ base_url = "https://openrouter.ai/api/v1"
 # background tasks (memory consolidation, summarization, etc.) can't evict it
 # between turns — keeping prompt-cache hits warm. Requires llama-server started
 # with --parallel >= 2. Leave disabled for cloud APIs (they reject unknown params).
+#
+# IMPORTANT for sliding-window-attention models (e.g. Gemma): also start
+# llama-server with --swa-full, or cross-turn KV reuse won't happen at all —
+# llama re-processes the full prompt every turn regardless of prefix stability.
+# --swa-full keeps a full-size KV cache for the SWA layers (more KV memory; size
+# -c accordingly). Slot routing alone does not fix this; the two work together.
 # [provider.slot_routing]
 # enabled = false          # opt-in; no id_slot is sent when false
 # interactive_slot = 0     # slot the interactive conversation pins to
