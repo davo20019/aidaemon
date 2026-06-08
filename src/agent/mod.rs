@@ -260,6 +260,8 @@ mod tool_prelude_phase;
 mod tool_result_notices;
 #[path = "loop/turn_render.rs"]
 pub(crate) mod turn_render;
+#[path = "loop/turn_render_cache.rs"]
+pub(crate) mod turn_render_cache;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 use system_prompt::format_goal_context;
@@ -315,6 +317,13 @@ type WindowBoundaryMemory = Arc<tokio::sync::RwLock<HashMap<String, (usize, Opti
 /// component(s) are logged (`Core prompt invalidated component=...`) and the
 /// entry is replaced. In-memory, lost on restart.
 type CorePromptCache = Arc<tokio::sync::RwLock<HashMap<String, core_prompt::CachedCore>>>;
+
+/// Pillar B per-session/per-turn render cache: `session_id` → (`turn_id` →
+/// [`turn_render_cache::CachedRender`]). Reuses rendered turn bytes verbatim
+/// when `content_fp` + `renderer_version` + `mode` all match; on a miss the
+/// turn is re-rendered and the entry replaced. In-memory, lost on restart.
+type TurnRenderCache =
+    Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, turn_render_cache::CachedRender>>>>;
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
@@ -400,6 +409,13 @@ pub struct Agent {
     /// reuses rendered core bytes verbatim across tasks when the session-static
     /// inputs are unchanged, and logs the changed component on invalidation.
     core_prompts: CorePromptCache,
+    /// Pillar B per-session/per-turn render cache (Task 5). Keyed by
+    /// `session_id` then `turn_id`; reuses rendered turn bytes verbatim across
+    /// builds when `content_fp` + `renderer_version` + `mode` are unchanged.
+    /// Consumed by the message-build integration in Task 7 (Pillar B); unused
+    /// until then.
+    #[allow(dead_code)]
+    turn_renders: TurnRenderCache,
 }
 
 struct AgentLimits {

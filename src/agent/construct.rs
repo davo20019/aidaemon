@@ -140,6 +140,7 @@ impl Agent {
             execution_budget_override: None,
             specialists,
             core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -305,6 +306,7 @@ impl Agent {
             execution_budget_override: None,
             specialists,
             core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 }
