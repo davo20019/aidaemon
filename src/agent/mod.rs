@@ -89,7 +89,7 @@ use response_analysis::has_action_promise;
 #[cfg(test)]
 use response_analysis::sanitize_response_analysis;
 use response_analysis::{
-    claims_completed_side_effect, is_substantive_text_response,
+    claims_completed_side_effect, claims_delegation_started, is_substantive_text_response,
     looks_like_deferred_action_response, looks_like_multi_part_request,
 };
 #[path = "intent/keywords.rs"]
@@ -258,6 +258,8 @@ mod tool_execution_phase;
 mod tool_prelude_phase;
 #[path = "loop/tool_result_notices.rs"]
 mod tool_result_notices;
+#[path = "loop/turn_render.rs"]
+pub(crate) mod turn_render;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 use system_prompt::format_goal_context;
