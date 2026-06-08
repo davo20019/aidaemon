@@ -271,7 +271,132 @@ fn extract_target_preview(arguments: &str) -> Option<String> {
     None
 }
 
+/// Normalize a user reply for affirmation matching: trim, lowercase, and strip
+/// surrounding punctuation (preserving interior apostrophes for contractions).
+fn normalize_affirmation_text(text: &str) -> String {
+    text.trim()
+        .trim_matches(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
+        .to_ascii_lowercase()
+}
+
+/// True for short, unambiguous affirmative/approval replies (e.g. "yes",
+/// "go ahead", "try that"). A bare affirmation carries no action signal by
+/// itself — its intent lives in the proposal the assistant just made.
+fn is_short_affirmation_or_approval(text: &str) -> bool {
+    let normalized = normalize_affirmation_text(text);
+    if normalized.is_empty() {
+        return false;
+    }
+    // Questions are never approvals.
+    if normalized.contains('?') {
+        return false;
+    }
+    // Short replies only: a long sentence is doing more than approving.
+    if normalized.split_whitespace().count() > 6 {
+        return false;
+    }
+    // Explicit refusal short-circuits.
+    if contains_keyword_as_words(&normalized, "no")
+        || contains_keyword_as_words(&normalized, "don't")
+        || contains_keyword_as_words(&normalized, "stop")
+    {
+        return false;
+    }
+
+    const SINGLE_WORD_AFFIRMATIONS: &[&str] = &[
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "proceed", "sgtm", "please",
+    ];
+    if SINGLE_WORD_AFFIRMATIONS
+        .iter()
+        .any(|w| contains_keyword_as_words(&normalized, w))
+    {
+        return true;
+    }
+
+    const APPROVAL_PHRASES: &[&str] = &[
+        "go ahead",
+        "do it",
+        "please do",
+        "please proceed",
+        "try that",
+        "try it",
+        "let's do it",
+        "lets do it",
+        "sounds good",
+        "go for it",
+        "yes please",
+        "that works",
+    ];
+    APPROVAL_PHRASES
+        .iter()
+        .any(|phrase| contains_keyword_as_words(&normalized, phrase))
+}
+
+/// Inspect the most recent assistant-role message in `recent_messages` and
+/// return true if it proposed/offered to do something the user could approve.
+fn assistant_proposed_action(recent_messages: &[Value]) -> bool {
+    let Some(content) = recent_messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+    else {
+        return false;
+    };
+    let lower = content.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const PROPOSAL_PHRASES: &[&str] = &[
+        "would you like me to",
+        "want me to",
+        "do you want me to",
+        "shall i",
+        "should i",
+        "would you like",
+        "i can run",
+        "i could run",
+        "let me know if you'd like",
+        "want me to run",
+        "like me to",
+    ];
+    if PROPOSAL_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    // Fallback: a question that also references a concrete action.
+    if lower.ends_with('?') {
+        const ACTION_WORDS: &[&str] = &[
+            "run", "extract", "create", "generate", "build", "fetch", "script", "execute", "try",
+        ];
+        if ACTION_WORDS
+            .iter()
+            .any(|w| contains_keyword_as_words(&lower, w))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// True when the current turn is a short approval of an action the assistant
+/// proposed in its prior turn. Requires BOTH the affirmation and a real prior
+/// proposal so genuine text-only turns are unaffected.
+fn turn_is_approval_of_prior_proposal(turn_context: &TurnContext) -> bool {
+    is_short_affirmation_or_approval(&turn_context.goal_user_text)
+        && assistant_proposed_action(&turn_context.recent_messages)
+}
+
 fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
+    // A bare affirmation ("yes", "try that") carries no action signal by
+    // itself — its intent is the proposal the assistant just made. When the
+    // current turn approves a prior proposal, tools must stay allowed so the
+    // model can actually carry out the approved action.
+    if turn_is_approval_of_prior_proposal(turn_context) {
+        return false;
+    }
     // ConnectedContentMode::DraftOnly is deliberately excluded here.
     // Keyword-based "authoring only" classification is too brittle —
     // "create 3 blog posts in ~/projects/X and commit" gets misclassified
@@ -1253,6 +1378,125 @@ pub(super) async fn run_tool_prelude_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn_with(
+        goal_user_text: &str,
+        recent_messages: Vec<Value>,
+        expects_mutation: bool,
+        requires_observation: bool,
+    ) -> TurnContext {
+        TurnContext {
+            goal_user_text: goal_user_text.to_string(),
+            recent_messages,
+            completion_contract: CompletionContract {
+                expects_mutation,
+                requires_observation,
+                ..CompletionContract::default()
+            },
+            ..TurnContext::default()
+        }
+    }
+
+    fn assistant_proposal_msg() -> Value {
+        json!({
+            "role": "assistant",
+            "content": "I found a PDF. Would you like me to try running a Python script to extract the text block-by-block?"
+        })
+    }
+
+    #[test]
+    fn plain_text_gate_allows_tools_for_approval_of_prior_proposal() {
+        // Regression case: bare affirmation in response to an assistant proposal.
+        // Even though the contract is text-only, tools must remain allowed.
+        let tc = turn_with(
+            "Yes, try that",
+            vec![
+                json!({"role": "user", "content": "Can you extract the text from this PDF?"}),
+                assistant_proposal_msg(),
+            ],
+            false,
+            false,
+        );
+        assert!(!turn_prefers_plain_text_completion(&tc));
+    }
+
+    #[test]
+    fn plain_text_gate_unchanged_for_plain_question() {
+        // No affirmation: genuine text-only turn stays text-only.
+        let tc = turn_with(
+            "what's my name?",
+            vec![assistant_proposal_msg()],
+            false,
+            false,
+        );
+        assert!(turn_prefers_plain_text_completion(&tc));
+    }
+
+    #[test]
+    fn plain_text_gate_unchanged_for_bare_yes_without_proposal() {
+        // Affirmation but no prior proposal: stay conservative (text-only).
+        let tc = turn_with(
+            "yes",
+            vec![
+                json!({"role": "user", "content": "Tell me about cats."}),
+                json!({"role": "assistant", "content": "Cats are small domesticated mammals."}),
+            ],
+            false,
+            false,
+        );
+        assert!(turn_prefers_plain_text_completion(&tc));
+    }
+
+    #[test]
+    fn is_short_affirmation_or_approval_positive() {
+        assert!(is_short_affirmation_or_approval("Yes, try that"));
+        assert!(is_short_affirmation_or_approval("go ahead"));
+        assert!(is_short_affirmation_or_approval("do it"));
+        assert!(is_short_affirmation_or_approval("sure"));
+        assert!(is_short_affirmation_or_approval("yes please"));
+        assert!(is_short_affirmation_or_approval("please proceed"));
+        assert!(is_short_affirmation_or_approval("sgtm"));
+        assert!(is_short_affirmation_or_approval("OK!"));
+    }
+
+    #[test]
+    fn is_short_affirmation_or_approval_negative() {
+        assert!(!is_short_affirmation_or_approval(""));
+        assert!(!is_short_affirmation_or_approval("what is the weather?"));
+        assert!(!is_short_affirmation_or_approval(
+            "yes can you also generate a chart and email it to my whole team tomorrow morning"
+        ));
+        assert!(!is_short_affirmation_or_approval("no don't"));
+    }
+
+    #[test]
+    fn assistant_proposed_action_positive() {
+        assert!(assistant_proposed_action(&[json!({
+            "role": "assistant",
+            "content": "Would you like me to run that for you?"
+        })]));
+        assert!(assistant_proposed_action(&[json!({
+            "role": "assistant",
+            "content": "I can run the extraction script if you want."
+        })]));
+        assert!(assistant_proposed_action(&[json!({
+            "role": "assistant",
+            "content": "Should I create the file?"
+        })]));
+    }
+
+    #[test]
+    fn assistant_proposed_action_negative() {
+        assert!(!assistant_proposed_action(&[json!({
+            "role": "assistant",
+            "content": "Cats are small domesticated mammals."
+        })]));
+        // No assistant message at all.
+        assert!(!assistant_proposed_action(&[json!({
+            "role": "user",
+            "content": "Would you like me to run that?"
+        })]));
+    }
 
     fn base_plan() -> PlanState {
         PlanState {
