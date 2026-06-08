@@ -258,6 +258,8 @@ mod tool_execution_phase;
 mod tool_prelude_phase;
 #[path = "loop/tool_result_notices.rs"]
 mod tool_result_notices;
+#[path = "loop/turn_eviction.rs"]
+pub(crate) mod turn_eviction;
 #[path = "loop/turn_render.rs"]
 pub(crate) mod turn_render;
 #[path = "loop/turn_render_cache.rs"]
@@ -324,6 +326,13 @@ type CorePromptCache = Arc<tokio::sync::RwLock<HashMap<String, core_prompt::Cach
 /// turn is re-rendered and the entry replaced. In-memory, lost on restart.
 type TurnRenderCache =
     Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, turn_render_cache::CachedRender>>>>;
+
+/// Pillar B per-session in-memory anchor: `session_id` → anchor `turn_seq`. The
+/// archived region carried into each payload starts at this turn; eviction
+/// advances it. In-memory, lost on restart (one re-prefill per restart is
+/// accepted). Consumed by the message-build integration in Task 7; unused until
+/// then.
+type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;
 
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
@@ -416,6 +425,12 @@ pub struct Agent {
     /// until then.
     #[allow(dead_code)]
     turn_renders: TurnRenderCache,
+    /// Pillar B per-session anchor tracker (Task 6). Keyed by `session_id`;
+    /// maps to the anchor `turn_seq` of the oldest archived turn carried into
+    /// the payload. Eviction advances it. Consumed by the message-build
+    /// integration in Task 7 (Pillar B); unused until then.
+    #[allow(dead_code)]
+    turn_anchors: TurnAnchorMemory,
 }
 
 struct AgentLimits {
