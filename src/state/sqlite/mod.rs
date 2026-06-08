@@ -1539,3 +1539,37 @@ mod token_usage;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod turn_id_hydration_tests {
+    use super::*;
+    use crate::events::{Event, EventStore, EventType};
+
+    #[tokio::test]
+    async fn hydrate_propagates_turn_id_from_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("turn_id_hydration.db");
+        let db_path = db_path.to_str().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            .await
+            .unwrap();
+
+        // Append a user-message event carrying a turn_id through the event store,
+        // sharing the same pool the state store hydrates from.
+        let events = EventStore::new(store.pool()).await.unwrap();
+        let ev = Event::new(
+            "sess-hydrate",
+            EventType::UserMessage,
+            serde_json::json!({"content": "hello", "turn_id": "turn-hydrate"}),
+        );
+        events.append(ev).await.unwrap();
+
+        let hydrated = store.hydrate("sess-hydrate").await.unwrap();
+        let msg = hydrated
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("hydrated user message");
+        assert_eq!(msg.turn_id.as_deref(), Some("turn-hydrate"));
+    }
+}

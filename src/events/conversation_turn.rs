@@ -18,6 +18,7 @@ pub struct ConversationTurn {
     pub tool_name: Option<String>,
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     pub annotations: Vec<MessageAnnotation>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,10 @@ pub fn turn_from_event(
     created_at: DateTime<Utc>,
 ) -> Option<ConversationTurn> {
     let message_id = message_id_from_event_data(data, event_id);
+    let turn_id = data
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     match event_type {
         "user_message" => Some(ConversationTurn {
             event_id,
@@ -110,6 +115,7 @@ pub fn turn_from_event(
             tool_name: None,
             tool_calls: None,
             annotations: annotations_from_event_data(data),
+            turn_id: turn_id.clone(),
         }),
         "assistant_response" => Some(ConversationTurn {
             event_id,
@@ -125,6 +131,7 @@ pub fn turn_from_event(
             tool_name: None,
             tool_calls: tool_calls_from_assistant_response(data),
             annotations: annotations_from_event_data(data),
+            turn_id: turn_id.clone(),
         }),
         "tool_result" => Some(ConversationTurn {
             event_id,
@@ -152,6 +159,7 @@ pub fn turn_from_event(
             ),
             tool_calls: None,
             annotations: annotations_from_event_data(data),
+            turn_id: turn_id.clone(),
         }),
         _ => None,
     }
@@ -187,11 +195,10 @@ impl ConversationTurn {
             annotations: self.annotations,
             importance: 0.5,
             embedding: None,
-            // turn_id is not currently part of the event payload, so messages
-            // reconstructed from events on hydrate carry None here. Boundary
-            // detection falls back to content matching for these — same
-            // behavior as before this field existed.
-            turn_id: None,
+            // turn_id flows through from the event payload (Pillar B Task 2),
+            // so messages reconstructed on hydrate carry the turn's opening
+            // user-message UUID. Legacy events without it remain None.
+            turn_id: self.turn_id,
         }
     }
 }
@@ -201,6 +208,22 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn into_message_propagates_turn_id() {
+        let data = json!({"message_id": "m1", "content": "hello", "turn_id": "turn-9"});
+        let turn = turn_from_event(1, "sess", "user_message", &data, Utc::now()).unwrap();
+        assert_eq!(turn.turn_id.as_deref(), Some("turn-9"));
+        let msg = turn.into_message();
+        assert_eq!(msg.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn into_message_turn_id_none_for_legacy_event() {
+        let data = json!({"message_id": "m1", "content": "hello"});
+        let turn = turn_from_event(1, "sess", "user_message", &data, Utc::now()).unwrap();
+        assert!(turn.into_message().turn_id.is_none());
+    }
 
     #[test]
     fn tool_result_projection_round_trips_annotations() {

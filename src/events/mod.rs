@@ -13,6 +13,7 @@ mod conversation_turn;
 mod model_call_telemetry;
 mod payloads;
 mod store;
+pub mod terminal_state;
 
 pub use consolidation::{Consolidator, Pruner};
 pub use context::SessionContextCompiler;
@@ -28,6 +29,8 @@ pub use store::{
     TaskWindowStats, ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport,
     WriteConsistencyThresholds,
 };
+#[allow(unused_imports)]
+pub use terminal_state::TerminalState;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
