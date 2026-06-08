@@ -294,8 +294,8 @@ impl EventStore {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name, turn_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&event.session_id)
@@ -304,6 +304,7 @@ impl EventStore {
         .bind(&created_at_str)
         .bind(&event.task_id)
         .bind(&event.tool_name)
+        .bind(&event.turn_id)
         .execute(&self.pool)
         .await?;
 
@@ -359,7 +360,7 @@ impl EventStore {
 
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND created_at >= ?
             ORDER BY created_at ASC
@@ -389,7 +390,7 @@ impl EventStore {
 
         let query = format!(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND event_type IN ({})
             ORDER BY created_at DESC
@@ -416,7 +417,7 @@ impl EventStore {
     ) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ?
             ORDER BY created_at DESC
@@ -438,7 +439,7 @@ impl EventStore {
     pub async fn query_task_events(&self, task_id: &str) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE task_id = ?
             ORDER BY created_at ASC
@@ -459,7 +460,7 @@ impl EventStore {
     ) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND task_id = ?
             ORDER BY created_at ASC
@@ -489,7 +490,7 @@ impl EventStore {
         .max(1);
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ?
               AND event_type = 'task_end'
@@ -522,7 +523,7 @@ impl EventStore {
     ) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND task_id = ? AND event_type = 'decision_point'
             ORDER BY created_at ASC
@@ -546,7 +547,7 @@ impl EventStore {
         let fetch_limit = limit.max(1).saturating_mul(5).max(20);
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND event_type = 'decision_point'
             ORDER BY created_at DESC
@@ -572,7 +573,7 @@ impl EventStore {
     pub async fn query_unconsolidated(&self, session_id: &str) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND consolidated_at IS NULL
             ORDER BY created_at ASC
@@ -672,7 +673,7 @@ impl EventStore {
     pub async fn get_last_error(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND event_type = 'error'
             ORDER BY created_at DESC
@@ -695,7 +696,7 @@ impl EventStore {
 
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND event_type IN ('task_start', 'task_end') AND created_at >= ?
             ORDER BY created_at DESC
@@ -818,6 +819,9 @@ impl EventStore {
                     )),
                     summary: Some("Recovered stale in-flight task".to_string()),
                     efficiency: None,
+                    // Watchdog-synthesized TaskEnd has no in-process turn
+                    // context; legacy/unscoped => None.
+                    turn_id: None,
                 })?,
             );
             self.append(event).await?;
@@ -1072,7 +1076,7 @@ impl EventStore {
     pub async fn get_last_completed_task(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE session_id = ? AND event_type = 'task_end'
             ORDER BY created_at DESC
@@ -1096,7 +1100,7 @@ impl EventStore {
     ) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
             FROM events
             WHERE event_type = ? AND created_at >= ? AND created_at < ?
             ORDER BY created_at ASC
@@ -1335,6 +1339,7 @@ impl EventStore {
             let consolidated_at_str: Option<String> = row.get("consolidated_at");
             let task_id: Option<String> = row.get("task_id");
             let tool_name: Option<String> = row.get("tool_name");
+            let turn_id: Option<String> = row.get("turn_id");
 
             let event_type = match EventType::from_str(&event_type_str) {
                 Some(et) => et,
@@ -1365,6 +1370,7 @@ impl EventStore {
                 consolidated_at,
                 task_id,
                 tool_name,
+                turn_id,
             });
         }
         Ok(events)
@@ -1461,6 +1467,42 @@ mod tests {
         (store, db_file)
     }
 
+    #[tokio::test]
+    async fn append_persists_and_reads_back_turn_id() {
+        let (store, _db) = setup_store().await;
+        let data = serde_json::json!({"content": "hi", "turn_id": "turn-abc"});
+        let ev = Event::new("sess-1", EventType::UserMessage, data);
+        assert_eq!(
+            ev.turn_id.as_deref(),
+            Some("turn-abc"),
+            "Event::new extracts turn_id from data"
+        );
+        let id = store.append(ev).await.unwrap();
+        let rows = store
+            .query_events("sess-1", Utc::now() - Duration::days(1))
+            .await
+            .unwrap();
+        let got = rows.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(got.turn_id.as_deref(), Some("turn-abc"));
+    }
+
+    #[tokio::test]
+    async fn append_turn_id_null_when_absent() {
+        let (store, _db) = setup_store().await;
+        let ev = Event::new(
+            "sess-1",
+            EventType::UserMessage,
+            serde_json::json!({"content": "hi"}),
+        );
+        assert!(ev.turn_id.is_none());
+        let id = store.append(ev).await.unwrap();
+        let rows = store
+            .query_events("sess-1", Utc::now() - Duration::days(1))
+            .await
+            .unwrap();
+        assert!(rows.iter().find(|e| e.id == id).unwrap().turn_id.is_none());
+    }
+
     async fn append_event_at(
         store: &EventStore,
         session_id: &str,
@@ -1523,6 +1565,7 @@ mod tests {
             error: error.map(str::to_string),
             summary: summary.map(str::to_string),
             efficiency: None,
+            turn_id: None,
         };
         append_event_at(
             store,

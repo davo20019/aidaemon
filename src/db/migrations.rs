@@ -17,9 +17,26 @@ pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
             created_at TEXT NOT NULL,
             consolidated_at TEXT,
             task_id TEXT,
-            tool_name TEXT
+            tool_name TEXT,
+            turn_id TEXT
         )
         "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Pillar B: turn-anchored history. `turn_id` is a globally-unique UUID
+    // (the opening user-message id of a conversation turn). Existing databases
+    // get the column via a best-effort idempotent ALTER (fresh DBs already have
+    // it from CREATE TABLE above, where this ALTER harmlessly reports a
+    // duplicate column and is discarded). On a large existing events table the
+    // one-time index build below is a startup stall on first run after upgrade.
+    let _ = sqlx::query("ALTER TABLE events ADD COLUMN turn_id TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_turn
+         ON events(session_id, turn_id, id)",
     )
     .execute(pool)
     .await?;

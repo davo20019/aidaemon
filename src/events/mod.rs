@@ -10,6 +10,7 @@
 mod consolidation;
 mod context;
 mod conversation_turn;
+mod model_call_telemetry;
 mod payloads;
 mod store;
 
@@ -17,11 +18,15 @@ pub use consolidation::{Consolidator, Pruner};
 pub use context::SessionContextCompiler;
 #[allow(unused_imports)]
 pub use conversation_turn::{turn_from_event, ConversationTurn, ConversationTurnRole};
+pub use model_call_telemetry::{
+    record_background_model_call_telemetry, record_model_call_telemetry, ModelCallTelemetryInput,
+};
 pub use payloads::*;
 #[allow(unused_imports)]
 pub use store::{
-    EventEmitter, EventStore, PolicyGraduationReport, SessionWriteDrift, TaskWindowStats,
-    ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport, WriteConsistencyThresholds,
+    EventEmitter, EventStore, LlmStats, PolicyGraduationReport, SessionWriteDrift, TaskLlmSummary,
+    TaskWindowStats, ToolStats, WriteConsistencyGateStatus, WriteConsistencyReport,
+    WriteConsistencyThresholds,
 };
 
 use chrono::{DateTime, Utc};
@@ -44,6 +49,10 @@ pub struct Event {
     /// Optional tool name for indexing (extracted from data)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Optional turn ID for turn-anchored history (extracted from data).
+    /// Globally-unique UUID = the opening user-message id of the turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 impl Event {
@@ -57,6 +66,10 @@ impl Event {
             .and_then(|v| v.as_str())
             .map(String::from);
         let tool_name = data.get("name").and_then(|v| v.as_str()).map(String::from);
+        let turn_id = data
+            .get("turn_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         Self {
             id: 0, // Will be set by database
@@ -67,6 +80,7 @@ impl Event {
             consolidated_at: None,
             task_id,
             tool_name,
+            turn_id,
         }
     }
 
@@ -97,6 +111,10 @@ pub enum EventType {
     ToolCall,
     /// Tool execution completed
     ToolResult,
+
+    // === LLM Lifecycle ===
+    /// A single LLM provider call completed (with latency + token telemetry)
+    LlmCall,
 
     // === Agent Thinking ===
     /// Agent started a new thinking iteration
@@ -141,6 +159,7 @@ impl EventType {
             EventType::AssistantResponse => "assistant_response",
             EventType::ToolCall => "tool_call",
             EventType::ToolResult => "tool_result",
+            EventType::LlmCall => "llm_call",
             EventType::ThinkingStart => "thinking_start",
             EventType::PolicyDecision => "policy_decision",
             EventType::DecisionPoint => "decision_point",
@@ -164,6 +183,7 @@ impl EventType {
             "assistant_response" => Some(EventType::AssistantResponse),
             "tool_call" => Some(EventType::ToolCall),
             "tool_result" => Some(EventType::ToolResult),
+            "llm_call" => Some(EventType::LlmCall),
             "thinking_start" => Some(EventType::ThinkingStart),
             "policy_decision" => Some(EventType::PolicyDecision),
             "decision_point" => Some(EventType::DecisionPoint),
@@ -205,6 +225,39 @@ pub enum TaskStatus {
     Failed,
 }
 
+/// Semantic outcome delivered by a task execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Succeeded,
+    Partial,
+    Failed,
+}
+
+impl TaskOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskOutcome::Succeeded => "succeeded",
+            TaskOutcome::Partial => "partial",
+            TaskOutcome::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "succeeded" => Some(TaskOutcome::Succeeded),
+            "partial" => Some(TaskOutcome::Partial),
+            "failed" => Some(TaskOutcome::Failed),
+            _ => None,
+        }
+    }
+
+    /// Maps semantic outcome to learning success signal.
+    pub fn task_success(&self) -> bool {
+        matches!(self, TaskOutcome::Succeeded)
+    }
+}
+
 impl TaskStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -234,6 +287,7 @@ mod tests {
             EventType::SessionStart,
             EventType::UserMessage,
             EventType::ToolCall,
+            EventType::LlmCall,
             EventType::PolicyDecision,
             EventType::DecisionPoint,
             EventType::TaskEnd,

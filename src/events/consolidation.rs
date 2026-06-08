@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use super::{
     DecisionPointData, ErrorData, TaskEndData, TaskStartData, ToolCallData, ToolResultData,
 };
-use super::{Event, EventStore, EventType, TaskStatus};
+use super::{Event, EventStore, EventType, TaskOutcome};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
@@ -338,7 +338,7 @@ impl Consolidator {
             };
 
             // Only extract from successful tasks
-            if end_data.status != TaskStatus::Completed {
+            if end_data.effective_outcome() != crate::events::TaskOutcome::Succeeded {
                 continue;
             }
 
@@ -477,7 +477,8 @@ impl Consolidator {
                     // Infer domain from tool usage
                     let domain = self.infer_domain_from_task(&data.task_id, events);
                     if let Some(domain) = domain {
-                        let success = data.status == TaskStatus::Completed;
+                        let success =
+                            data.effective_outcome() == crate::events::TaskOutcome::Succeeded;
                         updates.push((domain, success));
                     }
                 }
@@ -508,7 +509,7 @@ impl Consolidator {
                 .rev()
                 .find(|event| event.event_type == EventType::TaskEnd)
                 .and_then(|event| event.parse_data::<TaskEndData>().ok())
-                .map(|data| data.status);
+                .map(|data| data.effective_outcome());
             let mut seen_for_task: HashSet<(String, String)> = HashSet::new();
 
             for (idx, event) in task_evts.iter().enumerate() {
@@ -627,10 +628,10 @@ impl Consolidator {
 
         let outcome = if let Some(end_event) = last_task_end {
             if let Ok(data) = end_event.parse_data::<TaskEndData>() {
-                match data.status {
-                    TaskStatus::Completed => "successful",
-                    TaskStatus::Cancelled => "cancelled",
-                    TaskStatus::Failed => "failed",
+                match data.effective_outcome() {
+                    TaskOutcome::Succeeded => "successful",
+                    TaskOutcome::Partial => "partial",
+                    TaskOutcome::Failed => "failed",
                 }
             } else {
                 "unknown"
@@ -758,6 +759,7 @@ impl Consolidator {
             serde_json::json!({"role": "user", "content": user_prompt}),
         ];
 
+        let call_start = std::time::Instant::now();
         let response = match provider.chat(&fast_model, &llm_messages, &[]).await {
             Ok(r) => r,
             Err(e) => {
@@ -766,11 +768,17 @@ impl Consolidator {
             }
         };
 
-        // Track token usage for background LLM calls
-        if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
-            let _ = state
-                .record_token_usage("background:consolidation", usage)
-                .await;
+        if let Some(state) = &self.state {
+            crate::events::record_background_model_call_telemetry(
+                self.event_store.clone(),
+                state.as_ref(),
+                "background:consolidation",
+                "consolidation",
+                &fast_model,
+                &response,
+                call_start.elapsed(),
+            )
+            .await;
         }
 
         let text = response.content?;
@@ -1129,7 +1137,7 @@ fn next_successful_tool_after(task_events: &[&Event], start_idx: usize) -> Optio
 
 fn build_failure_pattern_observation(
     decision: &DecisionPointData,
-    task_outcome: Option<TaskStatus>,
+    task_outcome: Option<TaskOutcome>,
     recovery_tool: Option<&str>,
 ) -> Option<FailurePatternObservation> {
     let code = decision
@@ -1472,13 +1480,13 @@ fn build_failure_pattern_observation(
 
 fn failure_pattern_confidence(
     base: f32,
-    task_outcome: Option<TaskStatus>,
+    task_outcome: Option<TaskOutcome>,
     recovery_tool: Option<&str>,
 ) -> f32 {
     let outcome_bonus = match task_outcome {
-        Some(TaskStatus::Failed) => 0.08,
-        Some(TaskStatus::Cancelled) => 0.04,
-        Some(TaskStatus::Completed) => 0.0,
+        Some(TaskOutcome::Failed) => 0.08,
+        Some(TaskOutcome::Partial) => 0.04,
+        Some(TaskOutcome::Succeeded) => 0.0,
         None => 0.0,
     };
     let recovery_bonus = if recovery_tool.is_some() { 0.03 } else { 0.0 };
@@ -1488,7 +1496,7 @@ fn failure_pattern_confidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{DiagnosticSeverity, Event, EventType};
+    use crate::events::{DiagnosticSeverity, Event, EventType, TaskStatus};
     use crate::memory::embeddings::EmbeddingService;
     use crate::plans::PlanStore;
     use crate::state::SqliteStateStore;
@@ -1597,11 +1605,14 @@ mod tests {
             serde_json::to_value(TaskEndData {
                 task_id: task_id.to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 3,
                 iterations: 4,
                 tool_calls_count: 4,
                 error: Some("Repetitive tool calls".to_string()),
                 summary: Some("Agent stopped due to repetitive terminal loop".to_string()),
+                efficiency: None,
+                turn_id: None,
             })
             .expect("serialize task end"),
         );
@@ -1686,11 +1697,14 @@ mod tests {
             serde_json::to_value(TaskEndData {
                 task_id: task_id.to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 2,
                 iterations: 1,
                 tool_calls_count: 0,
                 error: Some("missing evidence".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             })
             .expect("serialize task end"),
         );

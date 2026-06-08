@@ -95,15 +95,17 @@ impl DiagnoseTool {
         for event in rows {
             if let Ok(end) = event.parse_data::<TaskEndData>() {
                 let status = end.status.as_str();
+                let outcome = end.effective_outcome().as_str();
                 let err = end
                     .error
                     .as_deref()
                     .map(|s| truncate_str(s, 120))
                     .unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!(
-                    "- `{}` status={} duration={}s iterations={} tool_calls={} at {}\n  error: {}\n",
+                    "- `{}` status={} outcome={} duration={}s iterations={} tool_calls={} at {}\n  error: {}\n",
                     end.task_id,
                     status,
+                    outcome,
                     end.duration_secs,
                     end.iterations,
                     end.tool_calls_count,
@@ -206,8 +208,9 @@ impl DiagnoseTool {
                         .map(|e| truncate_str(e, 120))
                         .unwrap_or_else(|| "-".to_string());
                     format!(
-                        "task_end {} duration={}s tool_calls={} err={}",
+                        "task_end {} outcome={} duration={}s tool_calls={} err={}",
                         data.status.as_str(),
+                        data.effective_outcome().as_str(),
                         data.duration_secs,
                         data.tool_calls_count,
                         detail
@@ -545,7 +548,7 @@ impl DiagnoseTool {
                 }
                 EventType::TaskEnd => {
                     if let Ok(data) = event.parse_data::<TaskEndData>() {
-                        if matches!(data.status, crate::events::TaskStatus::Failed) {
+                        if data.effective_outcome() == crate::events::TaskOutcome::Failed {
                             if data
                                 .error
                                 .as_deref()
@@ -840,6 +843,7 @@ Rules: no invented event IDs; confidence 0..1.",
 
         let runtime_snapshot = self.llm_runtime.snapshot();
         let fast_model = runtime_snapshot.fast_model();
+        let call_start = std::time::Instant::now();
         let resp: ProviderResponse = match runtime_snapshot
             .provider()
             .chat(&fast_model, &messages, &[])
@@ -848,13 +852,16 @@ Rules: no invented event IDs; confidence 0..1.",
             Ok(r) => r,
             Err(_) => return None,
         };
-        // Track token usage for diagnostic LLM calls
-        if let Some(usage) = &resp.usage {
-            let _ = self
-                .state
-                .record_token_usage("background:diagnose", usage)
-                .await;
-        }
+        crate::events::record_background_model_call_telemetry(
+            self.event_store.clone(),
+            self.state.as_ref(),
+            "background:diagnose",
+            "diagnose",
+            &fast_model,
+            &resp,
+            call_start.elapsed(),
+        )
+        .await;
         let raw = resp.content.or(resp.thinking)?;
         let json_text = extract_json_object(&raw)?;
         serde_json::from_str::<LlmDiagnosisResponse>(&json_text).ok()
@@ -1596,7 +1603,7 @@ Rules: no invented event IDs; confidence 0..1.",
         let recovery_section = self
             .build_resume_recovery_section(session_id, &resolved_task, &events)
             .await;
-        Ok(self.format_diagnosis(
+        let diagnosis = self.format_diagnosis(
             &resolved_task,
             &merged,
             &execution_replay_section,
@@ -1604,7 +1611,81 @@ Rules: no invented event IDs; confidence 0..1.",
             &route_reason_trends,
             &context_scope_guards,
             &recovery_section,
-        ))
+        );
+        let llm_section = self.build_llm_telemetry_section(&resolved_task).await;
+        Ok(format!("{diagnosis}{llm_section}"))
+    }
+
+    /// Render a compact `LlmCall` telemetry block for a task: latency
+    /// distribution, fallback/retry counts, and est-vs-actual token drift.
+    /// Returns an empty string when no LLM-call telemetry exists for the task.
+    async fn build_llm_telemetry_section(&self, task_id: &str) -> String {
+        let summary = match self.event_store.get_task_llm_stats(task_id).await {
+            Ok(s) if s.total_calls > 0 => s,
+            _ => return String::new(),
+        };
+
+        let mut out = String::from("\n\n## LLM Calls\n\n");
+        out.push_str(&format!(
+            "- Calls: {} (attempts: {}{})\n",
+            summary.total_calls,
+            summary.total_attempts,
+            if summary.total_attempts > summary.total_calls {
+                " — retries occurred"
+            } else {
+                ""
+            }
+        ));
+        out.push_str(&format!(
+            "- Latency: avg {}ms, p50 {}ms, p95 {}ms, max {}ms (slowest at iteration {})\n",
+            summary.avg_latency_ms,
+            summary.p50_latency_ms,
+            summary.p95_latency_ms,
+            summary.max_latency_ms,
+            summary.max_latency_iteration,
+        ));
+        if let Some(model) = &summary.final_model {
+            out.push_str(&format!("- Final model: {model}\n"));
+        }
+        if summary.fell_back_count > 0 {
+            out.push_str(&format!(
+                "- ⚠️ Fallbacks: {} call(s) fell back to a different model/provider\n",
+                summary.fell_back_count
+            ));
+        }
+        out.push_str(&format!(
+            "- Tokens: {} input, {} output\n",
+            summary.total_input_tokens, summary.total_output_tokens,
+        ));
+        if summary.est_samples > 0 {
+            let drift = summary.est_input_drift();
+            let pct = if summary.actual_input_tokens_with_est > 0 {
+                (drift as f64 / summary.actual_input_tokens_with_est as f64) * 100.0
+            } else {
+                0.0
+            };
+            let direction = if drift > 0 {
+                "over-estimated"
+            } else if drift < 0 {
+                "under-estimated"
+            } else {
+                "exact"
+            };
+            out.push_str(&format!(
+                "- Token estimate drift: est {} vs actual {} over {} call(s) — {} by {} ({:+.0}%)\n",
+                summary.total_est_input_tokens,
+                summary.actual_input_tokens_with_est,
+                summary.est_samples,
+                direction,
+                drift.abs(),
+                pct,
+            ));
+        }
+        out.push_str(
+            "\n_Note: latency reflects the model/provider, not agent logic — \
+             check `final_model` before attributing slowness to the harness._\n",
+        );
+        out
     }
 
     fn signature_for_event(&self, event: &Event) -> String {
@@ -1789,13 +1870,13 @@ impl Tool for DiagnoseTool {
     }
 
     fn description(&self) -> &str {
-        "Diagnose why an agent task failed using event timelines, decision points, and evidence-linked root-cause ranking."
+        "Diagnose why an agent task failed using event timelines, decision points, evidence-linked root-cause ranking, and per-task LLM telemetry (latency, fallbacks, token-estimate drift)."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "self_diagnose",
-            "description": "Diagnose why a PREVIOUS agent task failed. ONLY use when the user explicitly asks why something failed or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
+            "description": "Diagnose why a PREVIOUS agent task failed or behaved inefficiently. The diagnose action also reports per-task LLM telemetry (latency p50/p95/max, model fallbacks/retries, and est-vs-actual input-token drift) so you can tell whether slowness came from the model/provider vs the harness. ONLY use when the user explicitly asks why something failed/was slow or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1914,6 +1995,8 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                     model: "mock".to_string(),
                 }),
                 thinking: None,
@@ -2009,11 +2092,14 @@ mod tests {
             TaskEndData {
                 task_id: "t1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 3,
                 iterations: 1,
                 tool_calls_count: 2,
                 error: Some("boom".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2025,11 +2111,14 @@ mod tests {
             TaskEndData {
                 task_id: "t2".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 3,
                 iterations: 1,
                 tool_calls_count: 2,
                 error: Some("other".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t2"),
         )
@@ -2055,6 +2144,7 @@ mod tests {
                 description: "Test".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2095,6 +2185,7 @@ mod tests {
                 description: "Run".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2118,11 +2209,14 @@ mod tests {
             TaskEndData {
                 task_id: "t1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 2,
                 iterations: 1,
                 tool_calls_count: 1,
                 error: Some("failed".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2148,6 +2242,7 @@ mod tests {
                 description: "Deploy app".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t-replay"),
         )
@@ -2224,11 +2319,14 @@ mod tests {
             TaskEndData {
                 task_id: "t-replay".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 3,
                 iterations: 3,
                 tool_calls_count: 0,
                 error: Some("blocked".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t-replay"),
         )
@@ -2259,6 +2357,7 @@ mod tests {
                 description: "Run".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2323,11 +2422,14 @@ mod tests {
             TaskEndData {
                 task_id: "t1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 2,
                 iterations: 2,
                 tool_calls_count: 1,
                 error: Some("failed".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2356,6 +2458,7 @@ mod tests {
                 description: "Run".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t-ctx"),
         )
@@ -2375,11 +2478,14 @@ mod tests {
             TaskEndData {
                 task_id: "t-ctx".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 1,
                 iterations: 1,
                 tool_calls_count: 0,
                 error: Some("failed".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t-ctx"),
         )
@@ -2408,6 +2514,7 @@ mod tests {
                 description: "Run".to_string(),
                 parent_task_id: None,
                 user_message: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2431,11 +2538,14 @@ mod tests {
             TaskEndData {
                 task_id: "t1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 2,
                 iterations: 1,
                 tool_calls_count: 1,
                 error: Some("failed".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("t1"),
         )
@@ -2541,6 +2651,7 @@ mod tests {
                 description: "Build website and deploy".to_string(),
                 parent_task_id: None,
                 user_message: Some("Build website and deploy".to_string()),
+                turn_id: None,
             },
             Some("parent-1"),
         )
@@ -2574,6 +2685,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 annotations: Vec::new(),
+                turn_id: None,
             },
             Some("parent-1"),
         )
@@ -2585,6 +2697,7 @@ mod tests {
             TaskEndData {
                 task_id: "parent-1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 42,
                 iterations: 3,
                 tool_calls_count: 1,
@@ -2593,6 +2706,8 @@ mod tests {
                         .to_string(),
                 ),
                 summary: Some("Recovered from checkpoint after interruption".to_string()),
+                efficiency: None,
+                turn_id: None,
             },
             Some("parent-1"),
         )
@@ -2608,6 +2723,7 @@ mod tests {
                 description: "resume: Build website and deploy".to_string(),
                 parent_task_id: Some("parent-1".to_string()),
                 user_message: Some("continue".to_string()),
+                turn_id: None,
             },
             Some("child-1"),
         )
@@ -2619,11 +2735,14 @@ mod tests {
             TaskEndData {
                 task_id: "child-1".to_string(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: 10,
                 iterations: 1,
                 tool_calls_count: 0,
                 error: Some("still failing".to_string()),
                 summary: None,
+                efficiency: None,
+                turn_id: None,
             },
             Some("child-1"),
         )
@@ -2657,6 +2776,7 @@ mod tests {
                 error: None,
                 task_id: Some("t1".to_string()),
                 annotations: Vec::new(),
+                turn_id: None,
             },
             Some("t1"),
         )

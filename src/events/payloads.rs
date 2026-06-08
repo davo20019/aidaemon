@@ -68,6 +68,9 @@ pub struct UserMessageData {
     /// Role of the speaker when the message was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_role: Option<String>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Data for AssistantResponse event
@@ -93,6 +96,9 @@ pub struct AssistantResponseData {
     /// Structured annotations attached to the rendered content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<MessageAnnotation>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Tool call information (subset of ToolCall for storage)
@@ -137,6 +143,9 @@ pub struct ToolCallData {
     /// Optional risk score (0.0-1.0) observed at tool-call time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_score: Option<f32>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Data for ToolResult event
@@ -164,6 +173,9 @@ pub struct ToolResultData {
     /// Structured annotations attached to the rendered content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<MessageAnnotation>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 // =============================================================================
@@ -515,6 +527,9 @@ pub struct TaskStartData {
     /// The full user message that triggered this task
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_message: Option<String>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// Data for TaskEnd event
@@ -542,6 +557,10 @@ pub struct TaskEndData {
     /// Per-task efficiency rollup captured when the task ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub efficiency: Option<TaskEfficiencyData>,
+    /// Turn ID (globally-unique UUID = this turn's opening user-message id).
+    /// For recovery TaskEnd this is the interrupted task's ORIGINAL turn_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 impl TaskEndData {
@@ -731,6 +750,7 @@ impl ToolCallData {
             idempotency_key: None,
             policy_rev: None,
             risk_score: None,
+            turn_id: None,
         }
     }
 
@@ -1040,6 +1060,7 @@ mod tests {
                 final_model: Some("fallback".to_string()),
                 reasons: vec!["1 fallback(s)".to_string()],
             }),
+            turn_id: None,
         };
 
         let json = serde_json::to_value(&data).expect("serialize");
@@ -1059,6 +1080,134 @@ mod tests {
         assert_eq!(efficiency.est_input_drift, -300);
         assert_eq!(efficiency.final_model.as_deref(), Some("fallback"));
         assert_eq!(efficiency.reasons, vec!["1 fallback(s)"]);
+    }
+
+    #[test]
+    fn conversation_payloads_turn_id_survives_roundtrip() {
+        // UserMessageData
+        let um = UserMessageData {
+            content: "hi".to_string(),
+            message_id: None,
+            has_attachments: false,
+            annotations: vec![],
+            user_role: None,
+            turn_id: Some("t1".to_string()),
+        };
+        let back: UserMessageData =
+            serde_json::from_value(serde_json::to_value(&um).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+
+        // AssistantResponseData
+        let ar = AssistantResponseData {
+            message_id: None,
+            content: Some("ok".to_string()),
+            tool_calls: None,
+            model: "m".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            annotations: vec![],
+            turn_id: Some("t1".to_string()),
+        };
+        let back: AssistantResponseData =
+            serde_json::from_value(serde_json::to_value(&ar).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+
+        // ToolCallData
+        let tc = ToolCallData {
+            tool_call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "README.md"}),
+            summary: None,
+            task_id: None,
+            idempotency_key: None,
+            policy_rev: None,
+            risk_score: None,
+            turn_id: Some("t1".to_string()),
+        };
+        let back: ToolCallData =
+            serde_json::from_value(serde_json::to_value(&tc).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+
+        // ToolResultData
+        let tr = ToolResultData {
+            message_id: None,
+            tool_call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            result: "data".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: None,
+            annotations: vec![],
+            turn_id: Some("t1".to_string()),
+        };
+        let back: ToolResultData =
+            serde_json::from_value(serde_json::to_value(&tr).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+
+        // TaskStartData
+        let ts = TaskStartData {
+            task_id: "task-1".to_string(),
+            description: "do x".to_string(),
+            parent_task_id: None,
+            user_message: None,
+            turn_id: Some("t1".to_string()),
+        };
+        let back: TaskStartData =
+            serde_json::from_value(serde_json::to_value(&ts).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+
+        // TaskEndData
+        let te = TaskEndData {
+            task_id: "task-1".to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some(TaskOutcome::Succeeded),
+            duration_secs: 1,
+            iterations: 1,
+            tool_calls_count: 0,
+            error: None,
+            summary: None,
+            efficiency: None,
+            turn_id: Some("t1".to_string()),
+        };
+        let back: TaskEndData = serde_json::from_value(serde_json::to_value(&te).unwrap()).unwrap();
+        assert_eq!(back.turn_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn conversation_payloads_turn_id_absent_defaults_to_none() {
+        // Minimal JSON without a turn_id key deserializes to None (back-compat).
+        let um: UserMessageData = serde_json::from_value(json!({"content": "hi"})).unwrap();
+        assert!(um.turn_id.is_none());
+
+        let ar: AssistantResponseData = serde_json::from_value(json!({"model": "m"})).unwrap();
+        assert!(ar.turn_id.is_none());
+
+        let tc: ToolCallData = serde_json::from_value(json!({
+            "tool_call_id": "c1", "name": "read_file", "arguments": {}
+        }))
+        .unwrap();
+        assert!(tc.turn_id.is_none());
+
+        let tr: ToolResultData = serde_json::from_value(json!({
+            "tool_call_id": "c1", "name": "read_file", "result": "x",
+            "success": true, "duration_ms": 1
+        }))
+        .unwrap();
+        assert!(tr.turn_id.is_none());
+
+        let ts: TaskStartData = serde_json::from_value(json!({
+            "task_id": "task-1", "description": "do x"
+        }))
+        .unwrap();
+        assert!(ts.turn_id.is_none());
+
+        let te: TaskEndData = serde_json::from_value(json!({
+            "task_id": "task-1", "status": "completed",
+            "duration_secs": 1, "iterations": 1, "tool_calls_count": 0
+        }))
+        .unwrap();
+        assert!(te.turn_id.is_none());
     }
 
     #[test]

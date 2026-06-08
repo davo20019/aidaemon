@@ -32,6 +32,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 description: "Build website and deploy".to_string(),
                 parent_task_id: None,
                 user_message: Some("Build website and deploy".to_string()),
+                turn_id: None,
             },
         )
         .await
@@ -63,6 +64,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 input_tokens: None,
                 output_tokens: None,
                 annotations: Vec::new(),
+                turn_id: None,
             },
         )
         .await
@@ -80,6 +82,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 error: None,
                 task_id: Some(orphan_task_id.to_string()),
                 annotations: Vec::new(),
+                turn_id: None,
             },
         )
         .await
@@ -205,6 +208,12 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         .expect("expected orphan task_end after resume");
     let orphan_end_data = orphan_end.parse_data::<TaskEndData>().unwrap();
     assert_eq!(orphan_end_data.status, TaskStatus::Failed);
+    // Legacy case: the orphan TaskStart had turn_id = None, so the recovery
+    // TaskEnd must NOT borrow the new resume turn — it stays None.
+    assert!(
+        orphan_end_data.turn_id.is_none(),
+        "legacy recovery TaskEnd must keep turn_id = None, not borrow resume turn"
+    );
     assert!(
         orphan_end_data
             .error
@@ -231,4 +240,118 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         resumed_start.is_some(),
         "expected resumed task_start to reference orphan as parent"
     );
+}
+
+#[tokio::test]
+async fn recovery_task_end_uses_checkpoint_turn_id_not_resume_turn() {
+    // An interrupted task whose original turn is `turn-old`. The recovery
+    // TaskEnd MUST attribute to turn-old, never the new resume turn.
+    let provider = MockProvider::new();
+    let harness = setup_test_agent(provider).await.unwrap();
+    let session_id = "resume_turn_session";
+    let orphan_task_id = "task-orphan-turnid";
+
+    let emitter =
+        crate::events::EventEmitter::new(harness.agent.event_store.clone(), session_id.to_string())
+            .with_task_id(orphan_task_id.to_string());
+    emitter
+        .emit(
+            EventType::TaskStart,
+            TaskStartData {
+                task_id: orphan_task_id.to_string(),
+                description: "Interrupted work".to_string(),
+                parent_task_id: None,
+                user_message: Some("do the work".to_string()),
+                turn_id: Some("turn-old".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let checkpoint = crate::agent::resume::build_resume_checkpoint(&harness.agent, session_id)
+        .await
+        .unwrap()
+        .expect("expected resume checkpoint");
+    assert_eq!(
+        checkpoint.turn_id.as_deref(),
+        Some("turn-old"),
+        "checkpoint carries the interrupted task's original turn_id"
+    );
+
+    crate::agent::resume::mark_task_interrupted_for_resume(
+        &harness.agent,
+        session_id,
+        &checkpoint,
+        "task-resume-new",
+    )
+    .await;
+
+    let orphan_events = harness
+        .agent
+        .event_store
+        .query_task_events_for_session(session_id, orphan_task_id)
+        .await
+        .unwrap();
+    let orphan_end = orphan_events
+        .iter()
+        .find(|e| e.event_type == EventType::TaskEnd)
+        .expect("expected recovery task_end");
+    // The first-class indexed column must carry turn-old.
+    assert_eq!(orphan_end.turn_id.as_deref(), Some("turn-old"));
+    let end_data = orphan_end.parse_data::<TaskEndData>().unwrap();
+    assert_eq!(end_data.turn_id.as_deref(), Some("turn-old"));
+}
+
+#[tokio::test]
+async fn normal_task_stamps_active_turn_on_conversation_and_task_events() {
+    // Drive a normal task to completion and assert UserMessage,
+    // AssistantResponse, TaskStart, and TaskEnd all carry the same active
+    // turn UUID (the turn's opening user-message id).
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("All done.")]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let session_id = "normal_turn_session";
+
+    let reply = harness
+        .agent
+        .handle_message(
+            session_id,
+            "please do a thing",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "All done.");
+
+    let events = harness
+        .agent
+        .event_store
+        .query_events(session_id, chrono::Utc::now() - chrono::Duration::days(1))
+        .await
+        .unwrap();
+
+    let user_turn = events
+        .iter()
+        .find(|e| e.event_type == EventType::UserMessage)
+        .and_then(|e| e.turn_id.clone())
+        .expect("UserMessage must carry a turn_id");
+
+    for et in [
+        EventType::AssistantResponse,
+        EventType::TaskStart,
+        EventType::TaskEnd,
+    ] {
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == et)
+            .unwrap_or_else(|| panic!("missing {:?} event", et));
+        assert_eq!(
+            ev.turn_id.as_deref(),
+            Some(user_turn.as_str()),
+            "{:?} must carry the active turn UUID",
+            et
+        );
+    }
 }

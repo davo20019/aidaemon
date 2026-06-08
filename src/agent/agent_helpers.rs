@@ -306,6 +306,10 @@ pub(in crate::agent) struct ResumeCheckpoint {
     pub(in crate::agent) last_tool_summary: Option<String>,
     pub(in crate::agent) last_error: Option<String>,
     pub(in crate::agent) execution_snapshot: Option<ResumeExecutionSnapshot>,
+    /// The interrupted task's ORIGINAL turn_id (from its TaskStart event).
+    /// Recovery TaskEnd MUST use this, never the new resume turn. None for
+    /// legacy tasks whose TaskStart predates turn_id persistence.
+    pub(in crate::agent) turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

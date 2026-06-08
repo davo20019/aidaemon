@@ -62,6 +62,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         user_text.to_string()
     };
 
+    // The user message's own id is also the turn_id for this conversation
+    // turn (see the longer note below). Generate and stash it BEFORE the
+    // TaskStart emit so TaskStartData carries the active turn — recovery
+    // correctness (Task 1, revision-log #14) depends on TaskStart being
+    // turn-stamped.
+    let user_msg_id = Uuid::new_v4().to_string();
+    agent
+        .current_turn_ids
+        .write()
+        .await
+        .insert(session_id.to_string(), user_msg_id.clone());
+
     // Emit TaskStart event
     let _ = emitter
         .emit(
@@ -71,6 +83,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 description: task_description.chars().take(200).collect(),
                 parent_task_id: resumed_from_task_id,
                 user_message: Some(user_text.to_string()),
+                turn_id: Some(user_msg_id.clone()),
             },
         )
         .await;
@@ -88,19 +101,13 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // 1. Persist the user message
     //
     // The user message's own id is also the turn_id for this conversation
-    // turn. We stash it on the agent so every subsequent message written
+    // turn (generated and stashed in `current_turn_ids` above, before the
+    // TaskStart emit). It is stashed so every subsequent message written
     // during this turn (assistant replies, tool results) is auto-stamped
     // with the same turn_id by `append_message_canonical`. This lets
     // boundary detection in `message_build_phase` group the turn without
     // inferring from message content — historically a source of bugs when
     // the same text is sent twice or arrives out of order.
-    let user_msg_id = Uuid::new_v4().to_string();
-    agent
-        .current_turn_ids
-        .write()
-        .await
-        .insert(session_id.to_string(), user_msg_id.clone());
-
     let user_msg = Message {
         content: Some(user_text.to_string()),
         importance: 0.5, // Will be updated by score_message below

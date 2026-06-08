@@ -342,6 +342,23 @@ impl Agent {
         }
     }
 
+    /// Resolve the turn_id to stamp on an emitted event for `msg`. Prefer the
+    /// message's own turn_id (set for the user message in bootstrap); fall back
+    /// to the active turn in `current_turn_ids` for assistant/tool messages that
+    /// were constructed without it. Mirrors the auto-stamp in
+    /// `append_message_canonical` so the emitted event and the canonical row
+    /// share the same turn_id.
+    async fn resolve_event_turn_id(&self, msg: &Message) -> Option<String> {
+        if msg.turn_id.is_some() {
+            return msg.turn_id.clone();
+        }
+        self.current_turn_ids
+            .read()
+            .await
+            .get(&msg.session_id)
+            .cloned()
+    }
+
     pub(super) async fn append_message_canonical(&self, msg: &Message) -> anyhow::Result<()> {
         // Auto-stamp turn_id from the per-session map so every message
         // written during a turn shares the same id. Messages that already
@@ -394,6 +411,10 @@ impl Agent {
                     "platform": channel_ctx.platform.clone(),
                     "sender_id": channel_ctx.sender_id.clone(),
                     "user_role": user_role.to_string(),
+                    // Pillar B: stamp the turn_id onto the emitted event so the
+                    // turn-anchored fetch (which filters turn_id IS NOT NULL)
+                    // returns this message. Without this the row is NULL.
+                    "turn_id": normalized_msg.turn_id,
                 }),
             )
             .await?;
@@ -417,6 +438,7 @@ impl Agent {
         output_tokens: Option<u32>,
     ) -> anyhow::Result<()> {
         let normalized_msg = msg.with_inferred_annotations();
+        let turn_id = self.resolve_event_turn_id(normalized_msg.as_ref()).await;
         let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
             serde_json::from_str::<Vec<ToolCall>>(raw)
                 .ok()
@@ -444,6 +466,7 @@ impl Agent {
                     input_tokens,
                     output_tokens,
                     annotations: normalized_msg.annotations.clone(),
+                    turn_id,
                 },
             )
             .await?;
@@ -468,6 +491,7 @@ impl Agent {
         task_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let normalized_msg = msg.with_inferred_annotations();
+        let turn_id = self.resolve_event_turn_id(normalized_msg.as_ref()).await;
         emitter
             .emit(
                 EventType::ToolResult,
@@ -487,6 +511,7 @@ impl Agent {
                     error,
                     task_id: task_id.map(str::to_string),
                     annotations: normalized_msg.annotations.clone(),
+                    turn_id,
                 },
             )
             .await?;

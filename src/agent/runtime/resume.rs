@@ -167,6 +167,9 @@ pub(in crate::agent) async fn build_resume_checkpoint(
         last_tool_summary,
         last_error,
         execution_snapshot,
+        // Carry the interrupted task's original turn_id (legacy = None) so the
+        // recovery TaskEnd attributes to the correct turn, not the resume turn.
+        turn_id: active_task_event.turn_id.clone(),
     }))
 }
 
@@ -200,11 +203,17 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
             TaskEndData {
                 task_id: checkpoint.task_id.clone(),
                 status: TaskStatus::Failed,
+                outcome: Some(crate::events::TaskOutcome::Failed),
                 duration_secs: checkpoint.elapsed_secs,
                 iterations: checkpoint.last_iteration,
                 tool_calls_count: checkpoint.tool_results_count,
                 error: Some(error),
                 summary: Some("Recovered from checkpoint after interruption".to_string()),
+                efficiency: None,
+                // Recovery MUST use the checkpoint's original turn_id, never
+                // current_turn_ids (which points at the new resume turn).
+                // Legacy (TaskStart.turn_id == None) => None here.
+                turn_id: checkpoint.turn_id.clone(),
             },
         )
         .await;

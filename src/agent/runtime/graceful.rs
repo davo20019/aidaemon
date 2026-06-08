@@ -935,23 +935,36 @@ impl Agent {
         emitter: &crate::events::EventEmitter,
         task_id: &str,
         status: TaskStatus,
+        outcome: crate::events::TaskOutcome,
         task_start: Instant,
         iteration: usize,
         tool_calls_count: usize,
         error: Option<String>,
         summary: Option<String>,
     ) {
+        let efficiency = self.task_efficiency_data(task_id).await;
+        // Stamp the active turn so the normal TaskEnd carries turn identity
+        // (recovery TaskEnd uses the checkpoint's original turn_id instead).
+        let turn_id = self
+            .current_turn_ids
+            .read()
+            .await
+            .get(emitter.session_id())
+            .cloned();
         let _ = emitter
             .emit(
                 EventType::TaskEnd,
                 TaskEndData {
                     task_id: task_id.to_string(),
                     status,
+                    outcome: Some(outcome),
                     duration_secs: task_start.elapsed().as_secs(),
                     iterations: iteration as u32,
                     tool_calls_count: tool_calls_count as u32,
                     error,
                     summary,
+                    efficiency,
+                    turn_id,
                 },
             )
             .await;
@@ -972,6 +985,134 @@ impl Agent {
         }
         self.run_task_end_tool_hooks(task_id, emitter.session_id())
             .await;
+        self.emit_turn_efficiency_signal(emitter, task_id, iteration)
+            .await;
+    }
+
+    /// Tier 2 reflection signal: roll up this turn's `LlmCall` telemetry and
+    /// log it. When the turn looks inefficient (fallbacks, retries, heavy
+    /// iteration loops, or large token-estimate drift), also emit a warning
+    /// `DecisionPoint` so the agent's own `self_diagnose` surfaces it.
+    async fn task_efficiency_data(
+        &self,
+        task_id: &str,
+    ) -> Option<crate::events::TaskEfficiencyData> {
+        let summary = self.event_store.get_task_llm_stats(task_id).await.ok()?;
+        if summary.total_calls == 0 {
+            return None;
+        }
+        let drift = summary.est_input_drift();
+        let reasons = Self::task_efficiency_reasons(&summary, drift);
+        Some(crate::events::TaskEfficiencyData {
+            llm_calls: summary.total_calls,
+            attempts: summary.total_attempts,
+            fell_back_count: summary.fell_back_count,
+            p95_latency_ms: summary.p95_latency_ms,
+            max_latency_ms: summary.max_latency_ms,
+            max_latency_iteration: summary.max_latency_iteration,
+            input_tokens: summary.total_input_tokens,
+            output_tokens: summary.total_output_tokens,
+            cached_input_tokens: if summary.cached_input_token_samples > 0 {
+                Some(summary.total_cached_input_tokens)
+            } else {
+                None
+            },
+            cache_creation_input_tokens: if summary.cache_creation_input_token_samples > 0 {
+                Some(summary.total_cache_creation_input_tokens)
+            } else {
+                None
+            },
+            fresh_input_tokens: if summary.cached_input_token_samples > 0 {
+                Some(
+                    summary
+                        .total_input_tokens
+                        .saturating_sub(summary.total_cached_input_tokens),
+                )
+            } else {
+                None
+            },
+            est_input_drift: drift,
+            final_model: summary.final_model,
+            reasons,
+        })
+    }
+
+    fn task_efficiency_reasons(summary: &crate::events::TaskLlmSummary, drift: i64) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if summary.fell_back_count > 0 {
+            reasons.push(format!("{} fallback(s)", summary.fell_back_count));
+        }
+        if summary.total_attempts > summary.total_calls {
+            reasons.push(format!(
+                "{} retry attempt(s) over {} call(s)",
+                summary.total_attempts - summary.total_calls,
+                summary.total_calls
+            ));
+        }
+        if summary.total_calls >= 8 {
+            reasons.push(format!("{} LLM calls (heavy loop)", summary.total_calls));
+        }
+        if summary.est_samples > 0 && summary.actual_input_tokens_with_est > 0 {
+            let pct = (drift.abs() as f64 / summary.actual_input_tokens_with_est as f64) * 100.0;
+            if pct >= 30.0 {
+                reasons.push(format!("token estimate off by {pct:.0}%"));
+            }
+        }
+        reasons
+    }
+
+    async fn emit_turn_efficiency_signal(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+    ) {
+        let summary = match self.event_store.get_task_llm_stats(task_id).await {
+            Ok(s) if s.total_calls > 0 => s,
+            _ => return,
+        };
+        let drift = summary.est_input_drift();
+        info!(
+            task_id,
+            session_id = emitter.session_id(),
+            llm_calls = summary.total_calls,
+            attempts = summary.total_attempts,
+            fell_back = summary.fell_back_count,
+            p95_latency_ms = summary.p95_latency_ms,
+            max_latency_ms = summary.max_latency_ms,
+            input_tokens = summary.total_input_tokens,
+            output_tokens = summary.total_output_tokens,
+            est_input_drift = drift,
+            final_model = summary.final_model.as_deref().unwrap_or("?"),
+            "Turn efficiency summary"
+        );
+
+        if !summary.is_inefficient() {
+            return;
+        }
+        let reasons = Self::task_efficiency_reasons(&summary, drift);
+        let summary_text = format!("Inefficient turn: {}", reasons.join(", "));
+        self.emit_warning_decision_point(
+            emitter,
+            task_id,
+            iteration,
+            DecisionType::LlmEfficiencyAlert,
+            summary_text,
+            json!({
+                "reason": reasons.join(", "),
+                "llm_calls": summary.total_calls,
+                "attempts": summary.total_attempts,
+                "fell_back_count": summary.fell_back_count,
+                "p95_latency_ms": summary.p95_latency_ms,
+                "max_latency_ms": summary.max_latency_ms,
+                "max_latency_iteration": summary.max_latency_iteration,
+                "input_tokens": summary.total_input_tokens,
+                "output_tokens": summary.total_output_tokens,
+                "est_input_drift": drift,
+                "final_model": summary.final_model,
+            }),
+        )
+        .await;
     }
 
     pub(super) async fn emit_decision_point(
