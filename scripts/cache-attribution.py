@@ -104,6 +104,20 @@ def parse_fields(line):
     return {k: parse_field_value(v) for k, v in FIELD_RE.findall(line)}
 
 
+def _new_pending():
+    """Empty per-session build accumulator. `evicted`/`mutations`/
+    `late_write_rerender` are the Pillar B expected-cause signals; they stay
+    falsy/empty when the corresponding lines are absent, so old logs attribute
+    exactly as before (back-compat)."""
+    return {
+        "stages": {},
+        "window": None,
+        "evicted": False,
+        "mutations": [],
+        "late_write_rerender": False,
+    }
+
+
 def parse_daemon_log(lines, session):
     """Returns (calls, invalid_lines, provider_calls).
 
@@ -136,25 +150,50 @@ def parse_daemon_log(lines, session):
             continue
         if "Build stage pre-boundary fingerprint" in line:
             f = parse_fields(line)
-            p = pending.setdefault(
-                f.get("session_id"), {"stages": {}, "window": None}
-            )
+            p = pending.setdefault(f.get("session_id"), _new_pending())
             p["stages"][f.get("stage")] = f.get("pre_boundary_hash")
         elif "Build stage tail fingerprint" in line:
             f = parse_fields(line)
-            p = pending.setdefault(
-                f.get("session_id"), {"stages": {}, "window": None}
-            )
+            p = pending.setdefault(f.get("session_id"), _new_pending())
             p["stages"][f.get("stage")] = f.get("full_payload_hash")
         elif "Window decision" in line:
             f = parse_fields(line)
-            pending.setdefault(
-                f.get("session_id"), {"stages": {}, "window": None}
-            )["window"] = f
+            p = pending.setdefault(f.get("session_id"), _new_pending())
+            p["window"] = f
+            # Pillar B: a `Window decision` carrying `turns_evicted > 0` is an
+            # anchor advance — the oldest whole archived turns dropped, so the
+            # prefix_hash_archived flip it causes is EXPECTED (eviction), not an
+            # unattributed archived-region bug. The pre-Pillar-B `Window
+            # decision` line (keep_from/oldest_kept_msg_id, no `turns_evicted`)
+            # leaves this flag False, so old behaviour is unchanged.
+            te = f.get("turns_evicted")
+            if isinstance(te, int) and te > 0:
+                p["evicted"] = True
+        elif "Prefix mutation" in line:
+            # Pillar B (Task 8): a retained stable-region mutator fired this
+            # build (reason ∈ {repeated_tool_error_collapse, history_fitting,
+            # empty_response_retry}). It rewrote stable-region bytes on purpose,
+            # so the resulting archived flip is EXPECTED (logged mutation).
+            f = parse_fields(line)
+            p = pending.setdefault(f.get("session_id"), _new_pending())
+            r = f.get("reason")
+            if r is not None:
+                p["mutations"].append(r)
+        elif "archived render cache miss" in line:
+            # Pillar B (Task 5/7): a render-cache miss with reason=fp_mismatch is
+            # a late write / late completion record re-rendering exactly one
+            # archived turn. The archived flip it causes is EXPECTED (logged
+            # late-write re-render). Other miss reasons (miss / version_mismatch
+            # / mode_mismatch) are cold-cache / version churn, not late writes,
+            # and do not set the flag.
+            f = parse_fields(line)
+            p = pending.setdefault(f.get("session_id"), _new_pending())
+            if f.get("reason") == "fp_mismatch":
+                p["late_write_rerender"] = True
         elif "Provider-call prefix fingerprint" in line:
             f = parse_fields(line)
             sess = f.get("session_id")
-            p = pending.pop(sess, {"stages": {}, "window": None})
+            p = pending.pop(sess, _new_pending())
             call = {
                 "lineno": lineno,
                 "session": sess,
@@ -174,6 +213,12 @@ def parse_daemon_log(lines, session):
                 "force_text": f.get("force_text"),
                 "window": p["window"],
                 "stages": p["stages"],
+                # Pillar B expected-cause signals for the build that preceded
+                # this provider call (all default to falsy/empty so absent lines
+                # reproduce pre-Pillar-B attribution exactly — back-compat).
+                "evicted": p["evicted"],
+                "mutations": p["mutations"],
+                "late_write_rerender": p["late_write_rerender"],
             }
             calls.append(call)
             pending_fp = call
@@ -386,6 +431,32 @@ def attribute(call, prev):
             changes.append("tail_only")
             return "tail_replacement (expected)", changes, False
 
+    # Pillar B: an archived-region flip is EXPECTED iff this build logged one of
+    # the three accounted-for causes (spec exit criterion: every
+    # prefix_hash_archived flip pairs with a logged eviction, a Prefix mutation,
+    # or a render-cache fp_mismatch; a flip with NONE of these is an
+    # archived-region bug → pre_boundary_changed_unattributed). This classifies
+    # ONLY the archived flip that would otherwise be unattributed — a real
+    # higher-priority cause (system / tool_defs / keep_from / drift / stage) in
+    # the same build still wins below. When no archived flip occurred, or the
+    # signals are absent (old logs), this resolves to None and behaviour is
+    # unchanged.
+    archived_changed = both_have_archived and archived_cur != archived_prev
+    expected_archived_cause = None
+    expected_archived_change = None
+    if archived_changed:
+        if call.get("evicted"):
+            expected_archived_cause = "eviction (expected)"
+            expected_archived_change = "eviction"
+        elif call.get("mutations"):
+            expected_archived_cause = "prefix_mutation (expected)"
+            expected_archived_change = "prefix_mutation:" + ",".join(
+                call["mutations"]
+            )
+        elif call.get("late_write_rerender"):
+            expected_archived_cause = "late_write_rerender (expected)"
+            expected_archived_change = "late_write_rerender"
+
     if system:
         primary = "system_prompt_churn"
     elif tool_defs:
@@ -398,6 +469,11 @@ def attribute(call, prev):
         primary = f"content_mutation@{divergent_stage}"
     elif pre_boundary_stable:
         primary = "post_build_or_tail" + ("(force_text)" if call["force_text"] else "")
+    elif expected_archived_cause is not None:
+        # Archived region flipped, but a logged eviction / Prefix mutation /
+        # fp_mismatch accounts for it — expected, NOT an unattributed bug.
+        primary = expected_archived_cause
+        changes.append(expected_archived_change)
     else:
         primary = "pre_boundary_changed_unattributed"
 
@@ -647,6 +723,43 @@ def _window_line(sess, it, turn, keep_from, oldest_kept, bypass=0):
         f"keep_from={keep_from} window_size=4 identity_preserve_bypass={bypass} "
         f"history_limit=40 fetched_count=30 current_user_injected=false "
         f"safe_collapse=false"
+    )
+
+
+def _eviction_window_line(sess, it, turns_evicted=1, new_anchor=4):
+    """Pillar B `Window decision` line emitted when the anchor advances.
+
+    Mirrors the info! at message_build_phase.rs (fields: new_anchor,
+    turns_evicted, kept_est_tokens, archived_kept, archived_budget). This is the
+    eviction-flavoured `Window decision`, distinct from the legacy keep_from
+    variant in `_window_line`.
+    """
+    return (
+        f"2026-06-06T20:00:00.000000Z  INFO aidaemon::agent::message_build_phase: "
+        f'Window decision session_id="{sess}" iteration={it} '
+        f"new_anchor={new_anchor} turns_evicted={turns_evicted} "
+        f"kept_est_tokens=3000 archived_kept=2 archived_budget=4000"
+    )
+
+
+def _prefix_mutation_line(sess, it, reason):
+    """Pillar B (Task 8) `Prefix mutation` line — a retained stable-region
+    mutator fired (reason ∈ {repeated_tool_error_collapse, history_fitting,
+    empty_response_retry}). Mirrors the info! at message_build_phase.rs."""
+    return (
+        f"2026-06-06T20:00:00.000000Z  INFO aidaemon::agent::message_build_phase: "
+        f'Prefix mutation session_id="{sess}" iteration={it} reason="{reason}"'
+    )
+
+
+def _render_cache_miss_line(sess, turn_id="turn-1", reason="fp_mismatch"):
+    """Pillar B (Task 5/7) `archived render cache miss` line. reason=fp_mismatch
+    is the late-write re-render signal. Mirrors the info! at
+    message_build_phase.rs (fields: turn_id, reason)."""
+    return (
+        f"2026-06-06T20:00:00.000000Z  INFO aidaemon::agent::message_build_phase: "
+        f'archived render cache miss session_id="{sess}" '
+        f'turn_id=Some("{turn_id}") reason="{reason}"'
     )
 
 
@@ -1047,6 +1160,163 @@ def self_test():
     count_str = report_text.split("tail-only flips (expected):")[1].strip().split()[0]
     assert count_str == "1", (
         f"tail-only flips count must be '1' in report, got {count_str!r}"
+    )
+
+    # ------------------------------------------------------------------
+    # Pillar B (Task 9): eviction / prefix_mutation / late_write_rerender
+    # expected causes for archived-region flips.
+    # ------------------------------------------------------------------
+
+    # Test B1: archived flip + eviction Window decision (turns_evicted>0)
+    # → eviction (expected), NOT pre_boundary_changed_unattributed.
+    # Under Pillar B the legacy keep_from `Window decision` is gone: a window
+    # line is emitted ONLY when the anchor advances (eviction). Non-eviction
+    # builds emit no window line, so `window` stays None and the keep_from/drift
+    # comparison never fires — the archived flip is classified purely by the
+    # eviction / mutation / fp_mismatch signals (or unattributed if absent).
+    sessB = "telegram:7"
+    daemon_b = []
+    llama_b = []
+    daemon_b += _stage_lines(sessB, 1, {})
+    daemon_b.append(
+        _provider_line(
+            sessB, 1, "sysB1", "preB1",
+            tail_hash="tailB", prefix_hash_archived="archB1",
+        )
+    )
+    daemon_b.append(_calling_line())
+    llama_b += _llama_req(201, 10000, 0, 10000)
+    # call 1: anchor advances (eviction) → archived flips, expected.
+    daemon_b += _stage_lines(sessB, 2, {})
+    daemon_b.append(_eviction_window_line(sessB, 2, turns_evicted=2, new_anchor=5))
+    daemon_b.append(
+        _provider_line(
+            sessB, 2, "sysB1", "preB2",
+            tail_hash="tailB", prefix_hash_archived="archB2",
+        )
+    )
+    daemon_b.append(_calling_line())
+    llama_b += _llama_req(202, 9000, 0, 9000)  # break (eviction)
+    # call 2: archived flips with a Prefix mutation logged → expected.
+    daemon_b += _stage_lines(sessB, 3, {})
+    daemon_b.append(_prefix_mutation_line(sessB, 3, "history_fitting"))
+    daemon_b.append(
+        _provider_line(
+            sessB, 3, "sysB1", "preB3",
+            tail_hash="tailB", prefix_hash_archived="archB3",
+        )
+    )
+    daemon_b.append(_calling_line())
+    llama_b += _llama_req(203, 9000, 0, 9000)  # break (prefix_mutation)
+    # call 3: archived flips with a render-cache fp_mismatch logged → expected.
+    daemon_b += _stage_lines(sessB, 4, {})
+    daemon_b.append(_render_cache_miss_line(sessB, "turn-old", "fp_mismatch"))
+    daemon_b.append(
+        _provider_line(
+            sessB, 4, "sysB1", "preB4",
+            tail_hash="tailB", prefix_hash_archived="archB4",
+        )
+    )
+    daemon_b.append(_calling_line())
+    llama_b += _llama_req(204, 9000, 0, 9000)  # break (late_write_rerender)
+    # call 4: archived flips with NO accounting signal → unattributed bug.
+    daemon_b += _stage_lines(sessB, 5, {})
+    daemon_b.append(
+        _provider_line(
+            sessB, 5, "sysB1", "preB5",
+            tail_hash="tailB", prefix_hash_archived="archB5",
+        )
+    )
+    daemon_b.append(_calling_line())
+    llama_b += _llama_req(205, 9000, 0, 9000)  # break (unattributed)
+
+    calls_b, _, pc_b = parse_daemon_log(daemon_b, sessB)
+    assert len(calls_b) == 5, f"B: expected 5 calls, got {len(calls_b)}"
+    # Per-build signals captured on the right call.
+    assert calls_b[1]["evicted"] is True, "eviction Window decision not captured"
+    assert calls_b[0]["evicted"] is False
+    assert calls_b[2]["mutations"] == ["history_fitting"]
+    assert calls_b[3]["late_write_rerender"] is True
+    assert calls_b[4]["evicted"] is False
+    assert calls_b[4]["mutations"] == []
+    assert calls_b[4]["late_write_rerender"] is False
+
+    reqs_b = parse_llama_log(llama_b, 0)
+    res_b = analyze(calls_b, reqs_b, 5000, 0.2, pc_b)
+    jb = res_b["joined"]
+    assert jb[1]["primary_cause"] == "eviction (expected)", (
+        f"B call 1: expected eviction (expected), got {jb[1]['primary_cause']!r}"
+    )
+    assert "eviction" in jb[1]["changes"]
+    assert jb[2]["primary_cause"] == "prefix_mutation (expected)", (
+        f"B call 2: expected prefix_mutation (expected), got {jb[2]['primary_cause']!r}"
+    )
+    assert any(c.startswith("prefix_mutation:") for c in jb[2]["changes"])
+    assert jb[3]["primary_cause"] == "late_write_rerender (expected)", (
+        f"B call 3: expected late_write_rerender (expected), got {jb[3]['primary_cause']!r}"
+    )
+    assert "late_write_rerender" in jb[3]["changes"]
+    assert jb[4]["primary_cause"] == "pre_boundary_changed_unattributed", (
+        f"B call 4: archived flip with no signal must stay unattributed, "
+        f"got {jb[4]['primary_cause']!r}"
+    )
+
+    # Test B2: a real higher-priority cause in the SAME build as an eviction
+    # still wins (the expected-cause path only classifies the otherwise-
+    # unattributed flip — it must not mask system/tool_defs/keep_from churn).
+    c_evict_sys_prev = {
+        "hash_system": "sysQ_v1",
+        "hash_pre_boundary": "preQ_v1",
+        "prefix_hash_archived": "archQ_v1",
+        "tail_hash": "tailQ",
+        "tool_defs_hash": "td1",
+        "session_summary_hash": "ss1",
+        "force_text": False,
+        "window": None,
+        "stages": {},
+        "evicted": False,
+        "mutations": [],
+        "late_write_rerender": False,
+    }
+    c_evict_sys_cur = {
+        "hash_system": "sysQ_v2",          # system churned too
+        "hash_pre_boundary": "preQ_v2",
+        "prefix_hash_archived": "archQ_v2",  # archived flipped
+        "tail_hash": "tailQ",
+        "tool_defs_hash": "td1",
+        "session_summary_hash": "ss1",
+        "force_text": False,
+        "window": None,
+        "stages": {},
+        "evicted": True,                    # eviction logged
+        "mutations": [],
+        "late_write_rerender": False,
+    }
+    cause_b2, _, _ = attribute(c_evict_sys_cur, c_evict_sys_prev)
+    assert cause_b2 == "system_prompt_churn", (
+        f"B2: real system churn must win over eviction, got {cause_b2!r}"
+    )
+
+    # Test B3: back-compat — old logs (no eviction/mutation/fp_mismatch lines)
+    # with an archived flip still classify as pre_boundary_changed_unattributed.
+    # This re-uses the Pillar A archived-flip dicts (no Pillar B keys present),
+    # so attribute() reads the signals via .get() → None and behaves as before.
+    cause_b3, _, _ = attribute(c_arch_cur, c_arch_prev)
+    assert cause_b3 == "pre_boundary_changed_unattributed", (
+        f"B3 back-compat: archived flip with no signals must be unattributed, "
+        f"got {cause_b3!r}"
+    )
+
+    # Test B4: back-compat — a legacy `Window decision` (keep_from variant, no
+    # `turns_evicted`) must NOT set the eviction flag.
+    legacy_only = _stage_lines("telegram:8", 1, {}) + [
+        _window_line("telegram:8", 1, "tL", 0, "mL1"),
+        _provider_line("telegram:8", 1, "sysL", "preL"),
+        _calling_line(),
+    ]
+    calls_legacy, _, _ = parse_daemon_log(legacy_only, "telegram:8")
+    assert calls_legacy[0]["evicted"] is False, (
+        "legacy keep_from Window decision must not set the eviction flag"
     )
 
     print(report(res, []))

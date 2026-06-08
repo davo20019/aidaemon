@@ -868,6 +868,79 @@ mod tests {
         );
     }
 
+    // ---- Pillar B (Task 9): cross-turn prefix invariant at the adapter ----
+
+    /// Cross-turn archived stability at the adapter boundary. Pillar B inserts
+    /// whole ARCHIVED turns BETWEEN the stable core (index 0) and the per-task
+    /// `[Task Context]` tail. When a later turn archives one MORE whole turn, the
+    /// payload it builds extends the `core + archived[..N-1]` region without
+    /// rewriting any earlier element. The OpenAI adapter must preserve that
+    /// element-wise: converting the turn-2 sequence and the turn-3 sequence
+    /// yields message arrays whose shared `core + archived` prefix is
+    /// byte-identical, element-for-element. This is the adapter-boundary
+    /// companion to the full-loop call_log assertion in
+    /// `integration_tests::pillar_b_cross_turn_archived_prefix_is_byte_identical`.
+    #[test]
+    fn test_pillar_b_openai_cross_turn_archived_prefix_is_byte_identical() {
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+
+        let core = json!({"role":"system","content":"core prompt (stable)"});
+        // One archived turn = user + assistant rendered pair.
+        let archived_turn_1 = [
+            json!({"role":"user","content":"archived turn 1 ask"}),
+            json!({"role":"assistant","content":"archived turn 1 reply"}),
+        ];
+        let archived_turn_2 = [
+            json!({"role":"user","content":"archived turn 2 ask"}),
+            json!({"role":"assistant","content":"archived turn 2 reply"}),
+        ];
+
+        // Turn 2 build: core + [archived turn 1] + tail + current user.
+        let turn2 = vec![
+            core.clone(),
+            archived_turn_1[0].clone(),
+            archived_turn_1[1].clone(),
+            json!({"role":"system","content":"[Task Context] turn 2 tail"}),
+            json!({"role":"user","content":"turn 2 current ask"}),
+        ];
+        // Turn 3 build: core + [archived turn 1, archived turn 2] + tail + user.
+        // The archived region EXTENDS turn 2's: turn 1 stays in place, turn 2 is
+        // appended after it, then a fresh transient tail + current user.
+        let turn3 = vec![
+            core.clone(),
+            archived_turn_1[0].clone(),
+            archived_turn_1[1].clone(),
+            archived_turn_2[0].clone(),
+            archived_turn_2[1].clone(),
+            json!({"role":"system","content":"[Task Context] turn 3 tail"}),
+            json!({"role":"user","content":"turn 3 current ask"}),
+        ];
+
+        let body2 =
+            provider.build_request_body("gpt-4o-mini", &turn2, &[], &ChatOptions::default());
+        let body3 =
+            provider.build_request_body("gpt-4o-mini", &turn3, &[], &ChatOptions::default());
+        let arr2 = body2["messages"].as_array().expect("messages array");
+        let arr3 = body3["messages"].as_array().expect("messages array");
+
+        // Shared stable prefix = core (1) + archived turn 1 (2) = 3 elements.
+        // Those three must be byte-identical element-for-element across turns;
+        // turn 3 appends archived turn 2 + its own tail after them.
+        let shared = 3;
+        for i in 0..shared {
+            assert_eq!(
+                serde_json::to_string(&arr2[i]).unwrap(),
+                serde_json::to_string(&arr3[i]).unwrap(),
+                "core+archived[..N-1] element {i} must be byte-identical across turns"
+            );
+        }
+        // Sanity: turn 3 genuinely carries the additional archived turn inline,
+        // in source order, immediately after the shared prefix.
+        assert_eq!(arr3[3]["content"], "archived turn 2 ask");
+        assert_eq!(arr3[4]["content"], "archived turn 2 reply");
+    }
+
     #[test]
     fn test_cached_input_tokens_from_openai_usage_details() {
         let usage = json!({
