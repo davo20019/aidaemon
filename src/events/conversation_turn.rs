@@ -3,7 +3,64 @@ use serde_json::Value;
 
 use crate::traits::{Message, MessageAnnotation, ToolCall};
 
-use super::ToolCallInfo;
+use super::{TaskStatus, ToolCallInfo};
+
+/// A whole conversation turn fetched and grouped from canonical events.
+///
+/// Produced by the turn-anchored fetch (`EventStore::get_turns_from_anchor`
+/// and `get_recent_turns_page`). All ordering is by `events.id` only —
+/// `turn_seq` is the immutable `MIN(events.id)` over the turn's rows, and the
+/// messages within are ordered by `msg_seq` (each event's own `id`).
+#[derive(Debug, Clone)]
+pub struct FetchedTurn {
+    /// The turn's globally-unique UUID. `Some` for all reconstructed turns;
+    /// legacy `turn_id IS NULL` rows are excluded from the fetch entirely.
+    pub turn_id: Option<String>,
+    /// `MIN(events.id)` over the turn (immutable once the opening event lands).
+    pub turn_seq: i64,
+    /// Hydrated messages, ordered by `msg_seq` (`events.id`) within the turn.
+    pub messages: Vec<Message>,
+    /// Latest `TaskEnd` status for the turn; `None` => renderer derives
+    /// `Interrupted`.
+    pub terminal_status: Option<TaskStatus>,
+}
+
+/// A single conversation row as projected from the turn-anchored fetch query.
+/// Carries the per-turn invariants (`turn_seq`, latest terminal `status`) that
+/// are constant within a turn group, alongside the hydrated message.
+pub struct FetchedRow {
+    pub turn_id: Option<String>,
+    pub turn_seq: i64,
+    pub terminal_status: Option<TaskStatus>,
+    pub message: Message,
+}
+
+/// Group already-ordered conversation rows into whole turns.
+///
+/// Rows MUST arrive ordered by `(turn_seq ASC, msg_seq ASC)` — the queries
+/// guarantee this — so a single linear pass groups consecutive rows sharing a
+/// `turn_id`. `turn_seq` and `terminal_status` are constant within a group, so
+/// the first row of each group fixes them. Turns may have no user message
+/// (scheduled/background); grouping never synthesizes one.
+pub fn group_rows_into_turns(rows: Vec<FetchedRow>) -> Vec<FetchedTurn> {
+    let mut turns: Vec<FetchedTurn> = Vec::new();
+    for row in rows {
+        match turns.last_mut() {
+            Some(last) if last.turn_id == row.turn_id && last.turn_seq == row.turn_seq => {
+                last.messages.push(row.message);
+            }
+            _ => {
+                turns.push(FetchedTurn {
+                    turn_id: row.turn_id,
+                    turn_seq: row.turn_seq,
+                    messages: vec![row.message],
+                    terminal_status: row.terminal_status,
+                });
+            }
+        }
+    }
+    turns
+}
 
 /// Event-native conversation item projected from canonical conversation events.
 #[derive(Debug, Clone)]

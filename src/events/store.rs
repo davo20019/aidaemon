@@ -11,6 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
 use tracing::{info, warn};
 
+use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
 use super::{
     DecisionPointData, DecisionType, Event, EventType, LlmCallData, PolicyDecisionData,
     TaskEndData, TaskStatus, ToolResultData,
@@ -663,6 +664,171 @@ impl EventStore {
         }
 
         Ok(crate::conversation::truncate_with_anchor(messages, limit))
+    }
+
+    // =========================================================================
+    // Read Operations - Turn-Anchored Conversation Fetch (Pillar B)
+    // =========================================================================
+
+    /// Fetch all whole turns whose turn-start sequence is `>= anchor_turn_seq`,
+    /// ordered by `(turn_seq, msg_seq)` — id-only ordering, no timestamps.
+    ///
+    /// `turn_seq = MIN(events.id)` per `turn_id`, computed at fetch time via a
+    /// join subquery (immutable: a later, higher id cannot lower the MIN).
+    /// `msg_seq = events.id`. Legacy `turn_id IS NULL` rows are excluded.
+    /// Each turn's `terminal_status` comes from a LEFT JOIN to its latest
+    /// `task_end` (`MAX(id)` among that turn's `task_end` rows — latest-wins),
+    /// folded into the same query (no N+1). `task_end` is not part of the
+    /// reconstructed conversation rows.
+    ///
+    /// `anchor_turn_seq = 0` is a full-session scan; do NOT use it as a
+    /// cold-start init path for long-lived sessions — use
+    /// [`Self::get_recent_turns_page`] for bounded, reverse-walked init.
+    pub async fn get_turns_from_anchor(
+        &self,
+        session_id: &str,
+        anchor_turn_seq: i64,
+    ) -> anyhow::Result<Vec<FetchedTurn>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT e.id, e.event_type, e.data, e.created_at, e.turn_id, t.turn_seq, s.status
+            FROM events e
+            JOIN (
+                SELECT turn_id, MIN(id) AS turn_seq
+                FROM events
+                WHERE session_id = ?1 AND turn_id IS NOT NULL
+                GROUP BY turn_id
+            ) t ON e.turn_id = t.turn_id
+            LEFT JOIN (
+                SELECT te.turn_id,
+                       json_extract(te.data, '$.status') AS status,
+                       te.id
+                FROM events te
+                WHERE te.session_id = ?1 AND te.turn_id IS NOT NULL
+                  AND te.event_type = 'task_end'
+                  AND te.id = (SELECT MAX(te2.id) FROM events te2
+                               WHERE te2.session_id = ?1
+                                 AND te2.turn_id = te.turn_id
+                                 AND te2.event_type = 'task_end')
+            ) s ON e.turn_id = s.turn_id
+            WHERE e.session_id = ?1
+              AND e.turn_id IS NOT NULL
+              AND t.turn_seq >= ?2
+              AND e.event_type IN ('user_message','assistant_response','tool_result')
+            ORDER BY t.turn_seq ASC, e.id ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(anchor_turn_seq)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(group_rows_into_turns(self.fetched_rows(session_id, rows)?))
+    }
+
+    /// Reverse-walk a bounded page of the most recent turns for cold-start
+    /// init. Turns are selected newest→oldest (`turn_seq DESC`, `LIMIT`) in a
+    /// `selected_turns` CTE BEFORE message rows are expanded, so `LIMIT` counts
+    /// whole turns — a large turn is never split or skipped. The returned rows
+    /// are grouped oldest→newest within the page. For the next reverse page,
+    /// pass `before_turn_seq = page.first().turn_seq`.
+    pub async fn get_recent_turns_page(
+        &self,
+        session_id: &str,
+        before_turn_seq: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<FetchedTurn>> {
+        let rows = sqlx::query(
+            r#"
+            WITH turn_starts AS (
+                SELECT turn_id, MIN(id) AS turn_seq
+                FROM events
+                WHERE session_id = ?1 AND turn_id IS NOT NULL
+                GROUP BY turn_id
+            ),
+            selected_turns AS (
+                SELECT turn_id, turn_seq
+                FROM turn_starts
+                WHERE (?2 IS NULL OR turn_seq < ?2)
+                ORDER BY turn_seq DESC
+                LIMIT ?3
+            )
+            SELECT e.id, e.event_type, e.data, e.created_at, e.turn_id,
+                   selected_turns.turn_seq, s.status
+            FROM selected_turns
+            JOIN events e
+              ON e.session_id = ?1 AND e.turn_id = selected_turns.turn_id
+            LEFT JOIN (
+                SELECT te.turn_id,
+                       json_extract(te.data, '$.status') AS status
+                FROM events te
+                WHERE te.session_id = ?1
+                  AND te.turn_id IS NOT NULL
+                  AND te.event_type = 'task_end'
+                  AND te.id = (
+                      SELECT MAX(te2.id)
+                      FROM events te2
+                      WHERE te2.session_id = ?1
+                        AND te2.turn_id = te.turn_id
+                        AND te2.event_type = 'task_end'
+                  )
+            ) s
+              ON s.turn_id = selected_turns.turn_id
+            WHERE e.event_type IN ('user_message','assistant_response','tool_result')
+            ORDER BY selected_turns.turn_seq ASC, e.id ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(before_turn_seq)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(group_rows_into_turns(self.fetched_rows(session_id, rows)?))
+    }
+
+    /// Project turn-anchored query rows into [`FetchedRow`]s: hydrate each
+    /// conversation row through `turn_from_event(...).into_message()` (turn_id
+    /// flows through) and carry the per-turn `turn_seq` + latest terminal
+    /// `status`. No `created_at` ordering anywhere; rows arrive pre-ordered by
+    /// `(turn_seq, id)`.
+    fn fetched_rows(
+        &self,
+        session_id: &str,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> anyhow::Result<Vec<FetchedRow>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.get("id");
+            let event_type: String = row.get("event_type");
+            let data_str: String = row.get("data");
+            let created_at_str: String = row.get("created_at");
+            let turn_id: Option<String> = row.get("turn_id");
+            let turn_seq: i64 = row.get("turn_seq");
+            let status_str: Option<String> = row.get("status");
+
+            let data: serde_json::Value = serde_json::from_str(&data_str)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            let Some(message) =
+                crate::events::turn_from_event(id, session_id, &event_type, &data, created_at)
+                    .map(|turn| turn.into_message())
+            else {
+                continue;
+            };
+
+            let terminal_status = status_str.as_deref().and_then(TaskStatus::from_str);
+
+            out.push(FetchedRow {
+                turn_id,
+                turn_seq,
+                terminal_status,
+                message,
+            });
+        }
+        Ok(out)
     }
 
     // =========================================================================
@@ -2439,5 +2605,219 @@ mod tests {
             max_missing_message_id_events: 1,
         });
         assert!(relaxed.passed);
+    }
+}
+
+#[cfg(test)]
+mod turn_anchored_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build an `EventStore` over a temp DB. The backing tempfile is leaked so
+    /// the open pool keeps a valid file for the lifetime of the test without
+    /// the caller having to thread a guard through every helper.
+    async fn test_event_store() -> EventStore {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let path = db_file.into_temp_path().keep().expect("keep temp db path");
+        let db_url = format!("sqlite:{}", path.display());
+        let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
+        EventStore::new(pool).await.expect("init event store")
+    }
+
+    async fn append_user(store: &EventStore, session: &str, turn_id: &str, content: &str) {
+        let ev = Event::new(
+            session,
+            EventType::UserMessage,
+            json!({ "content": content, "turn_id": turn_id }),
+        );
+        store.append(ev).await.expect("append user_message");
+    }
+
+    async fn append_assistant(store: &EventStore, session: &str, turn_id: &str, content: &str) {
+        let ev = Event::new(
+            session,
+            EventType::AssistantResponse,
+            json!({ "content": content, "turn_id": turn_id }),
+        );
+        store.append(ev).await.expect("append assistant_response");
+    }
+
+    async fn append_tool(store: &EventStore, session: &str, turn_id: &str, content: &str) {
+        let ev = Event::new(
+            session,
+            EventType::ToolResult,
+            json!({
+                "tool_call_id": format!("tc-{turn_id}-{content}"),
+                "name": "terminal",
+                "result": content,
+                "success": true,
+                "duration_ms": 1,
+                "turn_id": turn_id,
+            }),
+        );
+        store.append(ev).await.expect("append tool_result");
+    }
+
+    async fn append_legacy_user(store: &EventStore, session: &str, content: &str) {
+        // Legacy row: no turn_id in data ⇒ turn_id column NULL.
+        let ev = Event::new(
+            session,
+            EventType::UserMessage,
+            json!({ "content": content }),
+        );
+        assert!(ev.turn_id.is_none());
+        store.append(ev).await.expect("append legacy user_message");
+    }
+
+    async fn append_task_end(store: &EventStore, session: &str, turn_id: &str, status: &str) {
+        let ev = Event::new(
+            session,
+            EventType::TaskEnd,
+            json!({ "status": status, "turn_id": turn_id }),
+        );
+        store.append(ev).await.expect("append task_end");
+    }
+
+    #[tokio::test]
+    async fn turn_anchored_fetch_orders_by_turn_then_msg_seq() {
+        let store = test_event_store().await;
+        // Turn A: user(id1) assistant(id2). Turn B: user(id3) tool(id4).
+        append_user(&store, "sess", "turn-A", "a-user").await;
+        append_assistant(&store, "sess", "turn-A", "a-asst").await;
+        append_user(&store, "sess", "turn-B", "b-user").await;
+        append_tool(&store, "sess", "turn-B", "b-tool").await;
+        let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        // Two whole turns, in turn_seq order; within each, msg_seq (id) order.
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_id.as_deref(), Some("turn-A"));
+        assert_eq!(
+            turns[0]
+                .messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(turns[1].turn_id.as_deref(), Some("turn-B"));
+    }
+
+    #[tokio::test]
+    async fn turn_anchored_fetch_late_write_sorts_last_within_its_turn() {
+        let store = test_event_store().await;
+        append_user(&store, "sess", "turn-A", "a-user").await; // id1
+        append_assistant(&store, "sess", "turn-A", "a-asst").await; // id2
+        append_user(&store, "sess", "turn-B", "b-user").await; // id3
+                                                               // Late write under already-finished turn-A (id4 > id3) — a background notifier.
+        append_tool(&store, "sess", "turn-A", "late-tool").await; // id4
+        let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        // turn-A's turn_seq is MIN(id)=1 < turn-B's 3, so turn-A still sorts first;
+        // the late tool (id4) sorts LAST inside turn-A by msg_seq.
+        assert_eq!(turns[0].turn_id.as_deref(), Some("turn-A"));
+        assert_eq!(
+            turns[0].messages.last().unwrap().content.as_deref(),
+            Some("late-tool")
+        );
+        assert_eq!(turns[1].turn_id.as_deref(), Some("turn-B"));
+    }
+
+    #[tokio::test]
+    async fn turn_anchored_fetch_respects_anchor_floor_and_excludes_legacy_null() {
+        let store = test_event_store().await;
+        append_legacy_user(&store, "sess", "legacy").await; // turn_id NULL
+        append_user(&store, "sess", "turn-A", "a-user").await; // turn_seq = its id
+        append_user(&store, "sess", "turn-B", "b-user").await;
+        let all = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        // Legacy NULL-turn rows are excluded from reconstruction (covered by summary).
+        assert!(all.iter().all(|t| t.turn_id.is_some()));
+        // Anchor at turn-B's turn_seq drops turn-A.
+        let b_seq = all
+            .iter()
+            .find(|t| t.turn_id.as_deref() == Some("turn-B"))
+            .unwrap()
+            .turn_seq;
+        let from_b = store.get_turns_from_anchor("sess", b_seq).await.unwrap();
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_b[0].turn_id.as_deref(), Some("turn-B"));
+    }
+
+    #[tokio::test]
+    async fn turn_seq_is_immutable_across_late_writes() {
+        let store = test_event_store().await;
+        append_user(&store, "sess", "turn-A", "a-user").await; // id1, turn_seq = 1
+        append_assistant(&store, "sess", "turn-A", "a-asst").await;
+        let before = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        let a_seq = before
+            .iter()
+            .find(|t| t.turn_id.as_deref() == Some("turn-A"))
+            .unwrap()
+            .turn_seq;
+        append_tool(&store, "sess", "turn-A", "late-tool").await; // higher id, must not lower MIN
+        let after = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        let a_seq2 = after
+            .iter()
+            .find(|t| t.turn_id.as_deref() == Some("turn-A"))
+            .unwrap()
+            .turn_seq;
+        assert_eq!(
+            a_seq, a_seq2,
+            "turn_seq = MIN(id) is immutable; the anchor relies on this"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_groups_turn_with_no_user_message() {
+        // Scheduled/background turn: starts with a tool/assistant, no user_message.
+        let store = test_event_store().await;
+        append_assistant(&store, "sess", "turn-bg", "bg-asst").await;
+        append_tool(&store, "sess", "turn-bg", "bg-tool").await;
+        let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id.as_deref(), Some("turn-bg"));
+        assert!(
+            turns[0].messages.iter().all(|m| m.role != "user"),
+            "no synthesized user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_carries_latest_terminal_status() {
+        let store = test_event_store().await;
+        append_user(&store, "sess", "turn-A", "a-user").await;
+        append_task_end(&store, "sess", "turn-A", "failed").await; // earlier
+        append_task_end(&store, "sess", "turn-A", "completed").await; // latest wins
+        let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+        let a = turns
+            .iter()
+            .find(|t| t.turn_id.as_deref() == Some("turn-A"))
+            .unwrap();
+        assert_eq!(a.terminal_status, Some(TaskStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn recent_turn_page_limits_turns_not_message_rows() {
+        let store = test_event_store().await;
+        // Newest turn has more messages than the page's turn limit. The page must
+        // still return every row in that selected turn.
+        append_user(&store, "sess", "turn-A", "a-user").await;
+        append_user(&store, "sess", "turn-B", "b-user").await;
+        append_assistant(&store, "sess", "turn-B", "b-a1").await;
+        append_tool(&store, "sess", "turn-B", "b-t1").await;
+        append_assistant(&store, "sess", "turn-B", "b-a2").await;
+
+        let page1 = store.get_recent_turns_page("sess", None, 1).await.unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].turn_id.as_deref(), Some("turn-B"));
+        assert_eq!(
+            page1[0].messages.len(),
+            4,
+            "LIMIT applies to turns, not rows"
+        );
+
+        let page2 = store
+            .get_recent_turns_page("sess", Some(page1[0].turn_seq), 1)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].turn_id.as_deref(), Some("turn-A"));
     }
 }
