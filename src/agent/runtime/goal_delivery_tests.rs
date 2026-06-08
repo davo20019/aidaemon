@@ -150,3 +150,28 @@ fn goal_task_results_summary_returns_fallback_when_no_results() {
     let summary = build_goal_task_results_summary(&[task], "fallback summary");
     assert_eq!(summary, "fallback summary");
 }
+
+#[test]
+fn salvageable_task_lead_result_returns_substantive_answer() {
+    let reply = "Here is the summary of the source files in src/agent/loop/:\n\n* main_loop.rs: orchestrates the turn lifecycle.\n* llm_phase.rs: handles the LLM call.";
+    let salvaged = salvageable_task_lead_result(Some(reply));
+    assert_eq!(salvaged.as_deref(), Some(reply));
+}
+
+#[test]
+fn salvageable_task_lead_result_rejects_none_and_empty() {
+    assert!(salvageable_task_lead_result(None).is_none());
+    assert!(salvageable_task_lead_result(Some("   ")).is_none());
+}
+
+#[test]
+fn salvageable_task_lead_result_rejects_low_signal_reply() {
+    assert!(salvageable_task_lead_result(Some("Done.")).is_none());
+    assert!(salvageable_task_lead_result(Some("Goal completed successfully")).is_none());
+}
+
+#[test]
+fn salvageable_task_lead_result_rejects_incomplete_work_reply() {
+    let reply = "I completed part of the request, but I haven't verified the final outcome yet.\n\nI need a final read-only check before I can claim success.";
+    assert!(salvageable_task_lead_result(Some(reply)).is_none());
+}

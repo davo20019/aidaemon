@@ -956,6 +956,8 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -967,6 +969,8 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -978,6 +982,8 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,

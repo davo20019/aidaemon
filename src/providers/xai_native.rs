@@ -282,10 +282,15 @@ impl XaiNativeProvider {
                     });
                 }
             }
-        } else if !matches!(options.tool_choice, ToolChoiceMode::Auto) {
+        } else if !matches!(
+            options.tool_choice,
+            ToolChoiceMode::Auto | ToolChoiceMode::None
+        ) {
+            // `None` with no tools is a no-op by definition — only
+            // Required/Specific indicate a real caller bug worth warning about.
             warn!(
                 tool_choice = ?options.tool_choice,
-                "Ignoring non-auto tool_choice because no tools were provided"
+                "Ignoring tool_choice that requires tools because no tools were provided"
             );
         }
 
@@ -302,9 +307,22 @@ impl XaiNativeProvider {
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .or_else(|| u.get("completion_tokens").and_then(Value::as_u64))?;
+            let cached_input_tokens = u
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    u.get("prompt_tokens_details")
+                        .and_then(|details| details.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                })
+                .or_else(|| u.get("cached_tokens").and_then(Value::as_u64))
+                .map(|tokens| tokens.min(u32::MAX as u64) as u32);
             Some(TokenUsage {
                 input_tokens: input_tokens as u32,
                 output_tokens: output_tokens as u32,
+                cached_input_tokens,
+                cache_creation_input_tokens: None,
                 model: model.to_string(),
             })
         })
@@ -624,5 +642,23 @@ mod tests {
         assert_eq!(parsed.content.as_deref(), Some("Fallback text"));
         assert_eq!(parsed.usage.as_ref().unwrap().input_tokens, 3);
         assert_eq!(parsed.usage.as_ref().unwrap().output_tokens, 5);
+    }
+
+    #[test]
+    fn parse_usage_extracts_cached_input_tokens_from_details() {
+        let payload = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 7,
+                "input_tokens_details": {
+                    "cached_tokens": 64
+                }
+            }
+        });
+
+        let usage = XaiNativeProvider::parse_usage(&payload, "grok-4").expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, Some(64));
+        assert_eq!(usage.fresh_input_tokens(), Some(36));
     }
 }

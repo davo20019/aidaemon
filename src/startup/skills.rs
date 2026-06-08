@@ -95,20 +95,26 @@ pub async fn register_skills_tools(
         }
     }
 
-    tools.push(Arc::new(UseSkillTool::new(dir.clone())));
-    info!("use_skill tool enabled");
+    if config.tools.is_enabled("use_skill") {
+        tools.push(Arc::new(UseSkillTool::new(dir.clone())));
+        info!("use_skill tool enabled");
+    }
 
-    tools.push(Arc::new(SkillResourcesTool::new(
-        dir.clone(),
-        fs_resolver as Arc<dyn crate::skills::ResourceResolver>,
-    )));
-    info!("skill_resources tool enabled");
+    if config.tools.is_enabled("skill_resources") {
+        tools.push(Arc::new(SkillResourcesTool::new(
+            dir.clone(),
+            fs_resolver as Arc<dyn crate::skills::ResourceResolver>,
+        )));
+        info!("skill_resources tool enabled");
+    }
 
-    let manage_skills = ManageSkillsTool::new(dir.clone(), state, approval_tx)
-        .with_http_profiles(http_profiles)
-        .with_registries(config.skills.registries.clone());
-    tools.push(Arc::new(manage_skills));
-    info!("manage_skills tool enabled");
+    if config.tools.is_enabled("manage_skills") {
+        let manage_skills = ManageSkillsTool::new(dir.clone(), state, approval_tx)
+            .with_http_profiles(http_profiles)
+            .with_registries(config.skills.registries.clone());
+        tools.push(Arc::new(manage_skills));
+        info!("manage_skills tool enabled");
+    }
 
     Ok(Some(dir))
 }

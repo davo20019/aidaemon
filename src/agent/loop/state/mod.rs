@@ -3,6 +3,7 @@ mod counters;
 mod directives;
 mod evidence;
 mod failure;
+mod read_file_tracker;
 mod recovery;
 mod reflection;
 mod stall;
@@ -12,6 +13,10 @@ pub(super) use counters::LoopCounters;
 pub(super) use directives::PendingDirectives;
 pub(super) use evidence::EvidenceLedger;
 pub(super) use failure::FailureLedger;
+pub(super) use read_file_tracker::{
+    canonical_path_from_arguments, LineInterval, ReadDecision, ReadFileObservationTracker,
+    ReadRequest,
+};
 pub(super) use recovery::RecoveryState;
 pub(super) use reflection::ReflectionState;
 pub(super) use stall::StallTracker;
@@ -26,4 +31,5 @@ pub(super) struct TurnState {
     pub reflection: ReflectionState,
     pub directives: PendingDirectives,
     pub counters: LoopCounters,
+    pub read_files: ReadFileObservationTracker,
 }

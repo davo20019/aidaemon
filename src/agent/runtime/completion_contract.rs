@@ -930,4 +930,46 @@ mod tests {
         assert_eq!(progress.failed_external_mutation_count, 0);
         assert!(!progress.external_mutation_reconciliation_attempted);
     }
+
+    // Regression tests from the 2026-06-06 attribution run: the mutation
+    // expectation misfired in BOTH directions across builds. Read-only
+    // phrasings were blocked with expects_mutation=true on the older build,
+    // while the turn-10 delete request must keep expects_mutation=true so
+    // the zero-tool fabrication guard can fire.
+    #[test]
+    fn read_only_file_inspection_does_not_expect_mutation() {
+        let contract = infer_completion_contract(
+            "Read each of the three files back and tell me which one is longest.",
+            &[],
+        );
+        assert!(
+            !contract.expects_mutation,
+            "read-only inspection must not expect a mutation (got {:?})",
+            contract.task_kind
+        );
+
+        let contract = infer_completion_contract(
+            "Open all four files and tell me which two are most similar in length.",
+            &[],
+        );
+        assert!(!contract.expects_mutation);
+    }
+
+    #[test]
+    fn delete_and_create_requests_expect_mutation() {
+        // Turn-10 fabrication case: "delete" must keep the contract armed.
+        let contract = infer_completion_contract("Delete the cachetest2 folder entirely.", &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+        assert!(contract.expects_mutation);
+
+        let contract = infer_completion_contract(
+            "Make a folder ~/tmp/cachetest2 and create four files in it.",
+            &[],
+        );
+        assert!(contract.expects_mutation);
+
+        let contract =
+            infer_completion_contract("Remove west.txt and execute tally.py once more.", &[]);
+        assert!(contract.expects_mutation);
+    }
 }

@@ -1,3 +1,4 @@
+use crate::agent::loop_state::ReadFileObservationTracker;
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
@@ -87,6 +88,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub resolved_goal_id: Option<&'a str>,
     pub execution_state: &'a mut ExecutionState,
     pub validation_state: &'a mut ValidationState,
+    pub read_file_tracker: &'a mut ReadFileObservationTracker,
     /// Cache of last successful tool results keyed by call hash.
     /// Used to replay read_file/search_files content when the repetitive
     /// redirect fires, so the model retains data lost to context truncation.

@@ -1521,6 +1521,121 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
     );
 }
 
+struct SpawnAgentMock;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SpawnAgentMock {
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
+
+    fn description(&self) -> &str {
+        "delegate analysis to a specialist"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "spawn_agent",
+            "description": "delegate analysis to a specialist",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mission": { "type": "string" },
+                    "task": { "type": "string" }
+                },
+                "required": ["mission", "task"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok("Resume review found weak impact metrics and excessive task-oriented bullets."
+            .to_string())
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_text_answer_turn_allows_spawn_agent_delegation() {
+    let provider = MockProvider::with_responses(vec![
+        ProviderResponse {
+            content: Some("I will delegate the resume review.".to_string()),
+            tool_calls: vec![crate::traits::ToolCall {
+                id: "resume_review_spawn".to_string(),
+                name: "spawn_agent".to_string(),
+                arguments: json!({
+                    "mission": "Review the resume",
+                    "task": "Analyze the resume and identify flaws"
+                })
+                .to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            thinking: None,
+            response_note: None,
+        },
+        MockProvider::text_response(
+            "The main flaws are weak impact metrics and too many task-oriented bullets.",
+        ),
+    ]);
+    let extra_tools = vec![Arc::new(SpawnAgentMock) as Arc<dyn crate::traits::Tool>];
+    let mut harness = setup_full_stack_test_agent_with_extra_tools(provider, extra_tools)
+        .await
+        .unwrap();
+    harness.agent.set_test_orchestrator_mode();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "resume_review_spawn",
+            "Analyze that resume. Any flaws?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await;
+    let result_call = calls.iter().find(|call| {
+        call.messages.iter().any(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                && message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content| content.contains("weak impact metrics"))
+        })
+    });
+    let result_call = result_call.unwrap_or_else(|| {
+        panic!(
+            "spawn_agent result was not present; response={response:?}, calls={:?}",
+            calls.iter().map(|call| &call.messages).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        result_call.options.tool_choice,
+        crate::traits::ToolChoiceMode::Auto,
+        "spawn_agent delegation must not force the follow-up into text-only mode"
+    );
+    assert!(!result_call.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.contains("should be answered directly in plain text"))
+    }));
+}
+
 #[tokio::test]
 async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
     let temp_path = std::env::temp_dir().join(format!(

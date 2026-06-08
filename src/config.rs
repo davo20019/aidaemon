@@ -399,6 +399,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub tools: ToolsConfig,
+    #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
 }
 
@@ -426,6 +428,9 @@ pub struct ProviderConfig {
     /// TOML key: `[[provider.fallbacks]]`
     #[serde(default, alias = "failover")]
     pub fallbacks: Vec<ProviderConfig>,
+    /// Opt-in llama.cpp slot routing (`id_slot` pinning). Disabled by default.
+    #[serde(default)]
+    pub slot_routing: SlotRoutingConfig,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -445,6 +450,7 @@ impl fmt::Debug for ProviderConfig {
             .field("max_tokens", &self.max_tokens)
             .field("models", &self.models)
             .field("fallback_provider_count", &self.fallbacks.len())
+            .field("slot_routing", &self.slot_routing)
             .finish()
     }
 }
@@ -515,6 +521,46 @@ fn default_true() -> bool {
 
 fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
+}
+
+fn default_background_slot() -> u32 {
+    1
+}
+
+/// Opt-in llama.cpp slot routing (`id_slot` pinning).
+///
+/// When a local llama.cpp server runs with `--parallel N` (N KV cache slots),
+/// llama assigns each request to the best-prefix-match-or-LRU slot by default.
+/// Constant background tasks (memory consolidation, summarization, extraction)
+/// then evict the idle interactive conversation's slot, forcing a full
+/// re-evaluation on the user's next turn.
+///
+/// When `enabled`, the interactive generation loop is pinned to
+/// `interactive_slot` and every other call defaults to `background_slot`,
+/// keeping the conversation's KV cache warm. The `id_slot` request field is
+/// ONLY emitted when `enabled == true` — cloud APIs reject unknown params, so
+/// the default (disabled) is safe for all providers.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SlotRoutingConfig {
+    /// Master switch. Default `false` (no `id_slot` ever sent).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Slot pinned for the interactive conversation. Default `0`.
+    #[serde(default)]
+    pub interactive_slot: u32,
+    /// Slot used for all background/non-interactive calls. Default `1`.
+    #[serde(default = "default_background_slot")]
+    pub background_slot: u32,
+}
+
+impl Default for SlotRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interactive_slot: 0,
+            background_slot: default_background_slot(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1697,7 +1743,7 @@ fn default_task_token_budget() -> Option<u64> {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CliAgentsConfig {
-    #[serde(default)]
+    #[serde(default = "default_cli_agents_enabled")]
     pub enabled: bool,
     #[serde(default = "default_cli_agents_timeout_secs")]
     pub timeout_secs: u64,
@@ -1710,12 +1756,16 @@ pub struct CliAgentsConfig {
 impl Default for CliAgentsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: default_cli_agents_enabled(),
             timeout_secs: default_cli_agents_timeout_secs(),
             max_output_chars: default_cli_agents_max_output_chars(),
             tools: HashMap::new(),
         }
     }
+}
+
+fn default_cli_agents_enabled() -> bool {
+    false
 }
 
 fn default_cli_agents_timeout_secs() -> u64 {
@@ -1776,7 +1826,7 @@ pub struct HealthConfig {
 }
 
 fn default_health_enabled() -> bool {
-    true
+    false
 }
 
 fn default_health_tick_interval_secs() -> u64 {
@@ -2202,9 +2252,53 @@ fn default_diagnostics_max_events() -> usize {
     200
 }
 
+fn default_disabled_tools() -> Vec<String> {
+    vec![
+        "git_info".to_string(),
+        "git_commit".to_string(),
+        "policy_metrics".to_string(),
+        "check_environment".to_string(),
+        "service_status".to_string(),
+        "project_inspect".to_string(),
+        "read_channel_history".to_string(),
+        "tool_trace".to_string(),
+    ]
+}
+
+/// Startup tool registration controls.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolsConfig {
+    /// Built-in tool machine names to omit at daemon startup (requires `/restart`).
+    /// Off by default: `git_info`, `git_commit` (use `run_command`/`terminal`), plus
+    /// `policy_metrics`, `check_environment`, `service_status`, `project_inspect` (use
+    /// `read_file`/`search_files`/`terminal`), `read_channel_history` (Slack opt-in),
+    /// `tool_trace` (use `goal_trace` with `action: "tool_trace"` instead). Set `disabled = []`
+    /// to register everything. Example extras: `["goal_trace"]` to disable forensics entirely.
+    #[serde(default = "default_disabled_tools")]
+    pub disabled: Vec<String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            disabled: default_disabled_tools(),
+        }
+    }
+}
+
+impl ToolsConfig {
+    pub fn is_enabled(&self, tool_name: &str) -> bool {
+        !self.disabled.iter().any(|name| name == tool_name)
+    }
+}
+
+fn default_diagnostics_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiagnosticsConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_diagnostics_enabled")]
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub record_decision_points: bool,
@@ -2217,7 +2311,7 @@ pub struct DiagnosticsConfig {
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: default_diagnostics_enabled(),
             record_decision_points: true,
             max_events: default_diagnostics_max_events(),
             include_raw_tool_args: false,
@@ -2533,6 +2627,86 @@ mod tests {
         } else {
             std::env::remove_var(name);
         }
+    }
+
+    #[test]
+    fn cli_agents_config_defaults_to_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.cli_agents.enabled);
+    }
+
+    #[test]
+    fn health_config_defaults_to_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.health.enabled);
+    }
+
+    #[test]
+    fn diagnostics_config_defaults_to_disabled() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.diagnostics.enabled);
+        assert!(config.diagnostics.record_decision_points);
+    }
+
+    #[test]
+    fn tools_config_defaults_disable_low_value_base_tools() {
+        let config = ToolsConfig::default();
+        for tool in [
+            "git_info",
+            "git_commit",
+            "policy_metrics",
+            "check_environment",
+            "service_status",
+            "project_inspect",
+            "read_channel_history",
+            "tool_trace",
+        ] {
+            assert!(
+                !config.is_enabled(tool),
+                "expected {tool} to be disabled by default"
+            );
+        }
+        assert!(config.is_enabled("terminal"));
+        assert!(config.is_enabled("goal_trace"));
+        assert!(!config.is_enabled("tool_trace"));
+        assert!(config.is_enabled("search_files"));
+    }
+
+    #[test]
+    fn tools_disabled_list_parses_from_config() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test"
+            [tools]
+            disabled = ["policy_metrics", "service_status"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.tools.disabled,
+            vec!["policy_metrics".to_string(), "service_status".to_string()]
+        );
+        assert!(!config.tools.is_enabled("policy_metrics"));
+        assert!(config.tools.is_enabled("terminal"));
     }
 
     #[test]

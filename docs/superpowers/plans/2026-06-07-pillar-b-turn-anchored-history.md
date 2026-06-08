@@ -6,9 +6,31 @@
 
 **Architecture:** Per `docs/superpowers/specs/2026-06-06-cross-turn-prefix-stability-design.md` §Pillar B. Three layers land in order: (1) **turn identity** — `turn_id` on the canonical conversation events + `TaskEnd`, a `terminal_state` derivation, and a monotonic `(turn_seq, msg_seq)` ordering built from the existing `events.id` (turn_seq = MIN(id) per turn, joined at fetch — no denormalization, no new counter); (2) **turn-anchored fetch + pure `render_turn`** with a per-session/per-turn render cache keyed by a content fingerprint; (3) **whole-turn eviction** at an in-memory anchor against an archived-region budget. The age ladder (Prior-1/Prior-2 collapse, message-count trim, `current_user_injected` synthetic-user path, index-based identity-preserve bypass) is deleted and absorbed by the new mechanism. Pillar A's stable core, `[Task Context]` tail, core cache, and the `tail_hash`/`prefix_hash_archived` fingerprint regions already shipped and are the measurement harness this plan builds against.
 
-**Tech Stack:** Rust; `sqlx`/SQLite (event store); existing modules `src/events/` (`mod.rs`, `payloads.rs`, `store.rs`, `conversation_turn.rs`), `src/db/migrations.rs`, `src/state/sqlite/mod.rs`, `src/agent/loop/message_build_phase.rs`, `src/agent/loop/sliding_window.rs`, `src/agent/loop/prefix_fingerprint.rs`, `src/agent/mod.rs`, `src/agent/construct.rs`; new module `src/agent/loop/turn_render.rs`; `scripts/cache-attribution.py`.
+**Tech Stack:** Rust; `sqlx`/SQLite (event store); existing modules `src/events/` (`mod.rs`, `payloads.rs`, `store.rs`, `conversation_turn.rs`), `src/db/migrations.rs` (`migrate_events` — called by both `EventStore` and state startup), `src/state/sqlite/mod.rs`, `src/agent/loop/message_build_phase.rs`, `src/agent/loop/sliding_window.rs`, `src/agent/loop/prefix_fingerprint.rs`, `src/agent/mod.rs`, `src/agent/construct.rs`; new module `src/agent/loop/turn_render.rs`; `scripts/cache-attribution.py`.
 
 **Baselines (comparators):** post-C run 2026-06-07 — median payload 16,238 tokens; median turn-start evaluated 15,565 tokens. Pillar A made the core cross-turn stable (verified: `prefix_hash_system` constant across turns, one `Core prompt invalidated component=initial`, then cache hits) and left `prefix_hash_archived` churning by design — that churn is exactly what Pillar B removes. Spec exit target: **≥80% reduction of median turn-start evaluated tokens vs the post-C baseline** (the absolute bound is archived[N] + tail + new user ≈ 4–5k); this is a measured target whose first valid re-run sets the gating threshold, not a hard pass/fail.
+
+---
+
+## Revision log (post-review)
+
+Incorporates two independent reviews (2026-06-07). Changes folded into the tasks below:
+
+1. **Current-user happens-before — VERIFIED (Task 7).** Traced 2026-06-07: `handle_message_impl` runs `run_bootstrap_phase` (awaited) before the loop calls `run_message_build_phase`; bootstrap step 1 (`bootstrap/run.rs`) stashes `current_turn_ids[session_id]` and persists the user message via `append_user_message_with_event`, which `await`s both the `UserMessage` event emit and `append_message_canonical`. So the user-message event is in the events table before any fetch — deleting `current_user_injected` is sound **conditioned on Task 1 stamping `turn_id` on the inline `UserMessage` `json!` emit** (else the row is `turn_id = NULL` and the anchored fetch skips it). The in-process fallback in Task 7 step 2 is retained for the genuinely-not-yet-committed race and for legacy `turn_id = NULL` rows. (Code today documents the prior race at `message_build_phase.rs:280-315`.)
+2. **`terminal_state` is folded into the fetch (Tasks 3 + 7).** The Task 3 conversation query excludes `task_end`, so terminal state cannot be read from its rows. `get_turns_from_anchor` LEFT-JOINs each turn's latest `TaskEnd` status and returns it per `FetchedTurn` — one query, no N+1, latest-wins on duplicate/watchdog `TaskEnd`.
+3. **Cold-start anchor init is bounded/paged (Tasks 3 + 7).** `get_turns_from_anchor(session_id, 0)` as a full-session scan is forbidden in the init path. A reverse-paged walk (`get_recent_turns_page`) capped by the budget initializes the anchor; it targets **`low_water`**, not full `archived_budget`, to match steady state.
+4. **`turn_seq` stability is asserted (Task 3).** The in-memory anchor is correct only because `turn_seq = MIN(id)` per turn is immutable across late writes; add a test. Requires `turn_id` globally unique (UUID) — stated.
+5. **`render_archived` output ordering is locked + tested (Task 4).** Chronological with in-place transforms. Identity-verbatim composition precedence specified to avoid duplicate emission.
+6. **Learned-helplessness failure filter fate is explicit (Tasks 4 + 7).** The failure-pattern predicate at `message_build_phase.rs:862-885` becomes a shared pure helper: Current drops the boilerplate; Archived excludes it from winning-assistant selection and emits the fixed terminal-state placeholder when no substantive assistant remains.
+7. **Render-cache pruning on eviction (Tasks 5 + 7).** Drop `turn_renders[session_id][turn_id]` for evicted turns when the anchor advances.
+8. **Non-user-first turns covered (Tasks 3 + 4).** Scheduled/background turns may have no `user_message`; render + fetch-grouping + `tool_steps` counting must not assume one exists.
+9. **Migration pointer verified against callers (Task 1).** The live entry point is `crate::db::migrations::migrate_events` in `src/db/migrations.rs`; it is called by `EventStore::migrate` and `src/state/sqlite/migrations.rs`. Add the column/index there so both initialization paths receive it.
+10. **`content_fp` uses a stable enum tag, not `Debug` (Task 5).**
+11. **Budget component estimation sources spelled out (Task 7).**
+12. **Cold-start paging selects whole turns before message expansion (Task 3).** `LIMIT` applies to a `selected_turns` CTE (`turn_id`, `turn_seq`), then the query joins every conversation row for those turns. It never limits message rows, so a large turn cannot be split and skipped by the next `before_turn_seq` page.
+13. **Pinned-history duplication is removed explicitly (Task 7).** `pinned_memories` is the older slice of the same canonical conversation history loaded during bootstrap, not a separate semantic-memory channel. The anchored fetch supersedes it. Remove the bootstrap split and the `MessageBuildCtx` field rather than silently dropping or double-emitting those messages; the anchor budget is the sole historical-retention policy.
+14. **Recovery-safe `TaskEnd.turn_id` attribution (Task 1).** `TaskStart` is stamped with the active turn and `ResumeCheckpoint` carries the interrupted task's original `turn_id`. Recovery closure MUST use the checkpoint value and MUST NOT consult `current_turn_ids`, which points at the new resume turn.
+15. **Archived failure boilerplate has one deterministic rendering (Task 4).** Learned-helplessness boilerplate is non-substantive for Archived assistant selection; a failed/cancelled/interrupted turn renders the fixed terminal-state placeholder and never retains that boilerplate as its winning assistant text.
 
 ---
 
@@ -27,13 +49,17 @@
 ### Task 1: Turn identity on the write path — `turn_id` column, payloads, emission
 
 **Files:**
-- Modify: `src/db/migrations.rs` (add `turn_id TEXT` column to the `events` table; add index `(session_id, turn_id, id)`)
+- Modify: `src/db/migrations.rs` — inside the live `migrate_events()`, add `turn_id TEXT` to the `CREATE TABLE` definition for fresh databases, then add a best-effort idempotent `ALTER TABLE events ADD COLUMN turn_id TEXT` for existing databases, followed by `CREATE INDEX IF NOT EXISTS idx_events_turn ON events(session_id, turn_id, id)`. `turn_id` is a globally-unique UUID, so the index/join need not disambiguate across sessions. Note: on a large existing `events` table the one-time index build is a startup stall on first run after upgrade — acceptable, but call it out in the migration log.
 - Modify: `src/events/mod.rs` (`Event` struct gains `turn_id: Option<String>`; `Event::new` extracts `data["turn_id"]` exactly as it extracts `task_id`)
 - Modify: `src/events/store.rs` (`append` INSERT binds the new column; the SELECT lists it; `Event` row mapping reads it)
-- Modify: `src/events/payloads.rs` (`UserMessageData`, `AssistantResponseData`, `ToolResultData`, `ToolCallData`, `TaskEndData` each gain `turn_id: Option<String>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`; update the round-trip serde tests)
-- Modify: the emission sites that write these events (re-locate via `rg -n 'UserMessageData\s*{|AssistantResponseData\s*{|ToolResultData\s*{|ToolCallData\s*{|TaskEndData\s*{' src/`) so each sets `turn_id` from the in-process `current_turn_ids` map / the turn's user-message UUID. The agent already stamps `Message.turn_id` via `append_message_canonical` (`src/agent/runtime/turn_context.rs`); mirror that source.
+- Modify: `src/events/payloads.rs` (`UserMessageData`, `AssistantResponseData`, `ToolResultData`, `ToolCallData`, `TaskStartData`, `TaskEndData` each gain `turn_id: Option<String>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`; update the round-trip serde tests). **Note:** the Task 3 conversation fetch selects only `user_message`/`assistant_response`/`tool_result` (tool calls are assistant-embedded via `tool_calls_json`, so `tool_call` events are NOT in the reconstruction path). `ToolCallData.turn_id` is attribution completeness, while `TaskStartData.turn_id` is required for recovery correctness.
+- Modify: `src/agent/agent_helpers.rs` (`ResumeCheckpoint` gains `turn_id: Option<String>`)
+- Modify: `src/agent/runtime/resume.rs` (`build_resume_checkpoint` copies `active_task_event.turn_id`; recovery `TaskEndData` uses `checkpoint.turn_id`)
+- Modify: `src/agent/loop/bootstrap/run.rs` (`TaskStartData` is stamped from the active `current_turn_ids[session_id]`)
+- Modify: the emission sites that write these events so each sets `turn_id` from the correct source: `normalized_msg.turn_id` for conversation events, `current_turn_ids` for active `TaskStart`/normal `TaskEnd`, and `ResumeCheckpoint.turn_id` for recovery `TaskEnd`.
+  - **⚠️ The `UserMessage` emit is NOT a struct literal — the relocation regex misses it.** The assistant/tool/task-end emits use typed struct literals (`AssistantResponseData {…}` in `append_assistant_message_with_event`, `ToolResultData {…}` in `append_tool_message_with_result_event`, `TaskEndData {…}`), which `rg -n 'AssistantResponseData\s*\{|ToolResultData\s*\{|TaskEndData\s*\{' src/` finds. But `UserMessage` is emitted via an **inline `json!({...})`** in `append_user_message_with_event` (`turn_context.rs:~385`) — the `UserMessageData` struct exists only on the *parse* side (`dialogue_state.rs:597`). You MUST add `"turn_id": normalized_msg.turn_id` to that inline `json!` block directly; adding the field to the `UserMessageData` struct alone does nothing for the emitted event. This is the single most important emission edit — if it is missed, the current user message is written with `turn_id = NULL`, the anchored fetch (which filters `turn_id IS NOT NULL`) never returns it, and Task 7's fallback fires on every single turn.
 
-**Context.** `turn_id` exists on `Message` (`src/traits/conversation.rs:235`, `Option<String>` = the turn's opening user-message UUID) and is stamped in-process today, but is NEVER persisted to events — so hydrated messages always get `turn_id: None` (`conversation_turn.rs:194`). `task_id` is the existing template: it is a first-class indexed column on `events`, extracted from `data["task_id"]` in `Event::new` (`events/mod.rs:60-63`) and bound in `append`. Replicate that exact pattern for `turn_id`. `TaskEnd` must carry `turn_id` too (spec §prerequisite): the archived render's terminal-state placeholder is derived from it (Task 2/4), so the completion record must be turn-attributable.
+**Context.** `turn_id` exists on `Message` (`src/traits/conversation.rs:235`, `Option<String>` = the turn's opening user-message UUID) and is stamped in-process today, but is NEVER persisted to events — so hydrated messages always get `turn_id: None` (`conversation_turn.rs:194`). `task_id` is the existing template: it is a first-class indexed column on `events`, extracted from `data["task_id"]` in `Event::new` (`events/mod.rs:60-63`) and bound in `append`. Replicate that exact pattern for `turn_id`. `TaskStart` and `TaskEnd` must both carry `turn_id`: normal completion can use the active turn, while restart recovery must close the old task using the original `TaskStart` event's `turn_id`, not the newly active resume turn.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -64,28 +90,53 @@ async fn append_turn_id_null_when_absent() {
 }
 ```
 
-In `src/events/payloads.rs` tests, extend the existing round-trip tests for `UserMessageData`/`AssistantResponseData`/`ToolResultData`/`TaskEndData`: construct with `turn_id: Some("t1".into())`, serialize→deserialize, assert the field survives; and a minimal-JSON (no `turn_id` key) deserialize → `turn_id == None` (back-compat).
+In `src/events/payloads.rs` tests, extend the existing round-trip tests for `UserMessageData`/`AssistantResponseData`/`ToolCallData`/`ToolResultData`/`TaskStartData`/`TaskEndData`: construct with `turn_id: Some("t1".into())`, serialize→deserialize, assert the field survives; and a minimal-JSON (no `turn_id` key) deserialize → `turn_id == None` (back-compat).
+
+**Emission-site tests (do not skip — silent failure modes).** The struct round-trip above does NOT prove the emission sites populate the right `turn_id`.
+- Drive a normal task to completion through the loop and assert `UserMessage`, `AssistantResponse`, `TaskStart`, and `TaskEnd` all carry the active turn UUID.
+- Build a `ResumeCheckpoint` for an interrupted task whose original turn is `turn-old`, start a new resume turn `turn-new`, call `mark_task_interrupted_for_resume`, and assert the recovery `TaskEnd.turn_id == Some("turn-old")`, never `"turn-new"`.
+- Add a legacy case where the original `TaskStart.turn_id` is `None`; recovery must emit `TaskEnd.turn_id = None`, not borrow the current turn.
 
 - [ ] **Step 2: RED** — `cargo test --lib events 2>&1 | tail -5`. Expected: compile errors (`turn_id` field/extraction missing), then assertion failures.
 
 - [ ] **Step 3: Implement**
 
-Migration (`src/db/migrations.rs`, follow the existing migration-registration pattern — find how columns were added before, e.g. a prior `ALTER TABLE events ADD COLUMN`): add `turn_id TEXT` (nullable, no default needed; NULL = legacy) and `CREATE INDEX IF NOT EXISTS idx_events_turn ON events(session_id, turn_id, id)`. Make it idempotent (guard with the framework's "already applied" check or `ADD COLUMN` wrapped so a re-run is a no-op).
+Migration (`src/db/migrations.rs`, in `migrate_events()`):
+
+```rust
+// Fresh databases receive the column in CREATE TABLE.
+// Existing databases receive it through the best-effort ALTER.
+let _ = sqlx::query("ALTER TABLE events ADD COLUMN turn_id TEXT")
+    .execute(pool)
+    .await;
+sqlx::query(
+    "CREATE INDEX IF NOT EXISTS idx_events_turn
+     ON events(session_id, turn_id, id)",
+)
+.execute(pool)
+.await?;
+```
+
+The column is nullable with no default (`NULL` = legacy). Keep the `ALTER` after `CREATE TABLE`; on a fresh DB it harmlessly reports duplicate column and is discarded, while an existing DB is upgraded before index creation.
 
 `events/mod.rs`: add `pub turn_id: Option<String>` to `Event` (next to `task_id`); in `Event::new`, after the `task_id` extraction, add `let turn_id = data.get("turn_id").and_then(|v| v.as_str()).map(String::from);` and set the field.
 
 `events/store.rs`: in `append`, add `turn_id` to the column list and the bind (`.bind(&event.turn_id)`); in every `SELECT` that maps rows to `Event` for the conversation path, add `turn_id` to the projection and the row read (`row.get("turn_id")`). The general `query_events` used by the test must read it.
 
-`events/payloads.rs`: add `#[serde(default, skip_serializing_if = "Option::is_none")] pub turn_id: Option<String>` to the five structs.
+`events/payloads.rs`: add `#[serde(default, skip_serializing_if = "Option::is_none")] pub turn_id: Option<String>` to the six structs. Update every existing struct literal: active conversation/task events use the resolved turn; fixtures and genuinely unscoped background events use `None`.
 
-Emission sites: set `turn_id` from the same source `Message.turn_id` uses (the per-turn UUID in `agent.current_turn_ids` / passed through `append_message_canonical`). For `TaskEndData`, thread the current turn's id from the loop context where `TaskEnd` is emitted (re-locate via `rg -n 'TaskEnd' src/agent/`).
+Emission sites:
+- User/assistant/tool events use `normalized_msg.turn_id`, falling back to `current_turn_ids[session_id]` only where the message was constructed without the field.
+- Bootstrap reads `current_turn_ids[session_id]` once and sets `TaskStartData.turn_id`.
+- Normal `emit_task_end` resolves the active turn for `emitter.session_id()`.
+- `build_resume_checkpoint` sets `ResumeCheckpoint.turn_id = active_task_event.turn_id.clone()`. `mark_task_interrupted_for_resume` writes exactly `checkpoint.turn_id.clone()` into the old task's recovery `TaskEndData`. It MUST NOT read `current_turn_ids`.
 
 - [ ] **Step 4: GREEN + sweep** — `cargo test --lib events 2>&1 | tail -3`; then a focused run of any agent-loop test that asserts on persisted events. Confirm migration applies cleanly against a fresh temp DB (the test harness creates one).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/db/migrations.rs src/events/mod.rs src/events/store.rs src/events/payloads.rs <emission-site files>
+git add src/db/migrations.rs src/events/mod.rs src/events/store.rs src/events/payloads.rs src/agent/agent_helpers.rs src/agent/runtime/resume.rs src/agent/loop/bootstrap/run.rs <emission-site files>
 git commit -m "feat(pillar-b): persist turn_id on conversation events + TaskEnd; events(session_id,turn_id,id) index"
 ```
 
@@ -179,6 +230,16 @@ impl TerminalState {
             Self::Interrupted => "[task interrupted]".to_string(),
         }
     }
+    /// Stable string tag for fingerprinting/cache keys — decoupled from `Debug`
+    /// so variant renames/reorders never silently invalidate `content_fp`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 ```
 
@@ -200,10 +261,18 @@ git commit -m "feat(pillar-b): hydrate turn_id into Message; TerminalState deriv
 ### Task 3: Monotonic turn-anchored fetch query
 
 **Files:**
-- Modify: `src/events/store.rs` (new `get_turns_from_anchor` query + a `turn_seq`-aware row type)
+- Modify: `src/events/store.rs` (new `get_turns_from_anchor` query + `get_recent_turns_page` for cold-start init + a `turn_seq`/`terminal_state`-aware row type)
 - Modify: `src/events/conversation_turn.rs` (or a small new helper) to group hydrated messages into whole turns
 
 **Context.** Today the fetch is a message-count window (`message_build_phase.rs`: `history_limit = max(40, iter*3).min(120)` → `load_recent_history`), ordered by `created_at`. Pillar B replaces it with: fetch all messages whose turn-start sequence is `>= anchor_turn_seq`, ordered by `(turn_seq, msg_seq)`. `turn_seq = MIN(events.id)` per `turn_id` (cross-row value, joined at fetch — see Execution caveats), `msg_seq = events.id`. This task builds ONLY the query + grouping primitive; wiring into the build path is Task 7.
+
+**Two load-bearing invariants (assert by test):**
+- **`turn_seq` is immutable.** `turn_seq = MIN(id)` per turn never changes once the turn's opening event is written, because ids are monotonic-increasing and never reused, so a late write (higher id) cannot lower the MIN. The in-memory anchor's correctness depends entirely on this. Pin it with a test.
+- **`turn_id` is globally unique** (UUID). The fetch join `e.turn_id = t.turn_id` is therefore unambiguous without a session predicate inside the join; both sides are still session-filtered for index use.
+
+**Terminal state is part of the fetch, not a follow-up query.** The conversation projection below filters out `task_end`, so terminal state cannot come from those rows. `FetchedTurn` carries a `terminal_status: Option<TaskStatus>` populated by a LEFT JOIN to each turn's **latest** `TaskEnd` (`MAX(id)` among that turn's `task_end` rows — latest-wins covers duplicate/watchdog completions). `None` → the renderer derives `Interrupted` (Task 2). This avoids an N+1 lookup per archived turn in Task 7.
+
+**Cold-start init must be bounded.** `get_turns_from_anchor(session_id, 0)` is a full-session scan and is FORBIDDEN as an init path for long-lived sessions. Add `get_recent_turns_page(session_id, before_turn_seq: Option<i64>, limit: usize)` — a reverse walk (turns ordered `turn_seq DESC`, `LIMIT`) that Task 7 calls newest→oldest, accumulating Archived est_tokens until it reaches the cold-start target, never loading the whole history.
 
 - [ ] **Step 1: Write the failing tests** (`src/events/store.rs` tests)
 
@@ -257,7 +326,69 @@ async fn turn_anchored_fetch_respects_anchor_floor_and_excludes_legacy_null() {
 }
 ```
 
-Add the small test helpers (`append_user`/`append_assistant`/`append_tool`/`append_legacy_user`) near the tests if not already present; each appends the corresponding event with `turn_id` in `data` (legacy variant omits it).
+```rust
+#[tokio::test]
+async fn turn_seq_is_immutable_across_late_writes() {
+    let store = test_event_store().await;
+    append_user(&store, "sess", "turn-A", "a-user").await;       // id1, turn_seq = 1
+    append_assistant(&store, "sess", "turn-A", "a-asst").await;
+    let before = store.get_turns_from_anchor("sess", 0).await.unwrap();
+    let a_seq = before.iter().find(|t| t.turn_id.as_deref()==Some("turn-A")).unwrap().turn_seq;
+    append_tool(&store, "sess", "turn-A", "late-tool").await;    // higher id, must not lower MIN
+    let after = store.get_turns_from_anchor("sess", 0).await.unwrap();
+    let a_seq2 = after.iter().find(|t| t.turn_id.as_deref()==Some("turn-A")).unwrap().turn_seq;
+    assert_eq!(a_seq, a_seq2, "turn_seq = MIN(id) is immutable; the anchor relies on this");
+}
+
+#[tokio::test]
+async fn fetch_groups_turn_with_no_user_message() {
+    // Scheduled/background turn: starts with a tool/assistant, no user_message.
+    let store = test_event_store().await;
+    append_assistant(&store, "sess", "turn-bg", "bg-asst").await;
+    append_tool(&store, "sess", "turn-bg", "bg-tool").await;
+    let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_id.as_deref(), Some("turn-bg"));
+    assert!(turns[0].messages.iter().all(|m| m.role != "user"), "no synthesized user message");
+}
+
+#[tokio::test]
+async fn fetch_carries_latest_terminal_status() {
+    let store = test_event_store().await;
+    append_user(&store, "sess", "turn-A", "a-user").await;
+    append_task_end(&store, "sess", "turn-A", "failed").await;     // earlier
+    append_task_end(&store, "sess", "turn-A", "completed").await;  // latest wins
+    let turns = store.get_turns_from_anchor("sess", 0).await.unwrap();
+    let a = turns.iter().find(|t| t.turn_id.as_deref()==Some("turn-A")).unwrap();
+    assert_eq!(a.terminal_status, Some(TaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn recent_turn_page_limits_turns_not_message_rows() {
+    let store = test_event_store().await;
+    // Newest turn has more messages than the page's turn limit. The page must
+    // still return every row in that selected turn.
+    append_user(&store, "sess", "turn-A", "a-user").await;
+    append_user(&store, "sess", "turn-B", "b-user").await;
+    append_assistant(&store, "sess", "turn-B", "b-a1").await;
+    append_tool(&store, "sess", "turn-B", "b-t1").await;
+    append_assistant(&store, "sess", "turn-B", "b-a2").await;
+
+    let page1 = store.get_recent_turns_page("sess", None, 1).await.unwrap();
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1[0].turn_id.as_deref(), Some("turn-B"));
+    assert_eq!(page1[0].messages.len(), 4, "LIMIT applies to turns, not rows");
+
+    let page2 = store
+        .get_recent_turns_page("sess", Some(page1[0].turn_seq), 1)
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].turn_id.as_deref(), Some("turn-A"));
+}
+```
+
+Add the small test helpers (`append_user`/`append_assistant`/`append_tool`/`append_legacy_user`/`append_task_end`) near the tests if not already present; each appends the corresponding event with `turn_id` in `data` (legacy variant omits it; `append_task_end` writes a `task_end` event with `{"status": ..., "turn_id": ...}`).
 
 - [ ] **Step 2: RED** — `cargo test --lib store 2>&1 | tail -5` (compile error: `get_turns_from_anchor`, `FetchedTurn` missing).
 
@@ -268,15 +399,18 @@ Define a grouped-turn type (in `store.rs` or `conversation_turn.rs`):
 ```rust
 pub struct FetchedTurn {
     pub turn_id: Option<String>,
-    pub turn_seq: i64,            // MIN(events.id) over the turn
-    pub messages: Vec<Message>,   // ordered by msg_seq (events.id) within the turn
+    pub turn_seq: i64,                       // MIN(events.id) over the turn (immutable)
+    pub messages: Vec<Message>,              // ordered by msg_seq (events.id) within the turn
+    pub terminal_status: Option<TaskStatus>, // latest TaskEnd status; None => Interrupted
 }
 ```
 
 `get_turns_from_anchor(&self, session_id: &str, anchor_turn_seq: i64) -> anyhow::Result<Vec<FetchedTurn>>`:
 
 ```sql
-SELECT e.id, e.event_type, e.data, e.created_at, e.turn_id, t.turn_seq
+-- t: per-turn start sequence (immutable MIN(id))
+-- s: per-turn LATEST terminal status (MAX(id) among that turn's task_end rows)
+SELECT e.id, e.event_type, e.data, e.created_at, e.turn_id, t.turn_seq, s.status
 FROM events e
 JOIN (
     SELECT turn_id, MIN(id) AS turn_seq
@@ -284,6 +418,18 @@ JOIN (
     WHERE session_id = ?1 AND turn_id IS NOT NULL
     GROUP BY turn_id
 ) t ON e.turn_id = t.turn_id
+LEFT JOIN (
+    SELECT te.turn_id,
+           json_extract(te.data, '$.status') AS status,
+           te.id
+    FROM events te
+    WHERE te.session_id = ?1 AND te.turn_id IS NOT NULL
+      AND te.event_type = 'task_end'
+      AND te.id = (SELECT MAX(te2.id) FROM events te2
+                   WHERE te2.session_id = ?1
+                     AND te2.turn_id = te.turn_id
+                     AND te2.event_type = 'task_end')
+) s ON e.turn_id = s.turn_id
 WHERE e.session_id = ?1
   AND e.turn_id IS NOT NULL
   AND t.turn_seq >= ?2
@@ -291,7 +437,50 @@ WHERE e.session_id = ?1
 ORDER BY t.turn_seq ASC, e.id ASC
 ```
 
-Map each row through `turn_from_event(id, session_id, event_type, &data, created_at).map(|t| t.into_message())` (same hydration as the legacy path — `turn_id` now flows), then GROUP consecutive rows by `turn_id` into `FetchedTurn { turn_id, turn_seq, messages }` (rows are already ordered, so a single linear pass groups them). No `created_at` ordering anywhere. The `(session_id, turn_id, id)` index from Task 1 supports both the subquery MIN and the outer scan.
+Map each conversation row through `turn_from_event(id, session_id, event_type, &data, created_at).map(|t| t.into_message())` (same hydration as the legacy path — `turn_id` now flows), then GROUP consecutive rows by `turn_id` into `FetchedTurn { turn_id, turn_seq, messages, terminal_status }` (rows are already ordered, so a single linear pass groups them; `status`/`turn_seq` are constant within a group). Parse `s.status` into `TaskStatus`; absent (NULL) → `None`. No `created_at` ordering anywhere. The `(session_id, turn_id, id)` index from Task 1 supports the subquery MIN, the terminal-status subquery, and the outer scan.
+
+`get_recent_turns_page(&self, session_id, before_turn_seq: Option<i64>, limit) -> anyhow::Result<Vec<FetchedTurn>>` MUST limit a turn-key CTE before expanding messages:
+
+```sql
+WITH turn_starts AS (
+    SELECT turn_id, MIN(id) AS turn_seq
+    FROM events
+    WHERE session_id = ?1 AND turn_id IS NOT NULL
+    GROUP BY turn_id
+),
+selected_turns AS (
+    SELECT turn_id, turn_seq
+    FROM turn_starts
+    WHERE (?2 IS NULL OR turn_seq < ?2)
+    ORDER BY turn_seq DESC
+    LIMIT ?3
+)
+SELECT e.id, e.event_type, e.data, e.created_at, e.turn_id,
+       selected_turns.turn_seq, s.status
+FROM selected_turns
+JOIN events e
+  ON e.session_id = ?1 AND e.turn_id = selected_turns.turn_id
+LEFT JOIN (
+    SELECT te.turn_id,
+           json_extract(te.data, '$.status') AS status
+    FROM events te
+    WHERE te.session_id = ?1
+      AND te.turn_id IS NOT NULL
+      AND te.event_type = 'task_end'
+      AND te.id = (
+          SELECT MAX(te2.id)
+          FROM events te2
+          WHERE te2.session_id = ?1
+            AND te2.turn_id = te.turn_id
+            AND te2.event_type = 'task_end'
+      )
+) s
+  ON s.turn_id = selected_turns.turn_id
+WHERE e.event_type IN ('user_message','assistant_response','tool_result')
+ORDER BY selected_turns.turn_seq ASC, e.id ASC
+```
+
+`LIMIT ?3` therefore counts whole turns, never message rows. The result is already oldest→newest for the selected page. For the next reverse page, pass `before_turn_seq = page.first().turn_seq`. Do not apply a second `LIMIT` after joining `events`; that would split a turn and permanently skip its remaining messages on the next page.
 
 Edge cases (assert by test where listed): legacy `turn_id IS NULL` excluded (WHERE clause); late writes group with their turn via `turn_id` and sort last by `id` (covered); anchor floor via `turn_seq >= ?2`.
 
@@ -383,6 +572,52 @@ fn current_mode_is_append_only_full() {
     assert_eq!(out[0]["content"], "hi");
     assert_eq!(out[1]["content"], "there");
 }
+
+#[test]
+fn archived_output_order_is_chronological() {
+    let turn = vec![
+        user("u"), assistant_empty_with_tool_call(), tool("terminal","c1","exit 0"), assistant("final"),
+    ];
+    let out = render_turn(&turn, RenderMode::Archived { terminal_state: TerminalState::Completed }, RENDERER_VERSION);
+    let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    // user → assistant(tool_calls) → tool → assistant(final): order preserved, NOT regrouped.
+    assert_eq!(roles, vec!["user","assistant","tool","assistant"]);
+}
+
+#[test]
+fn archived_no_user_message_turn_renders_without_synthesizing_user() {
+    // Scheduled/background turn with no user_message.
+    let turn = vec![ assistant_empty_with_tool_call(), tool("terminal","c1","exit 0") ];
+    let out = render_turn(&turn, RenderMode::Archived { terminal_state: TerminalState::Completed }, RENDERER_VERSION);
+    assert!(out.iter().all(|m| m["role"] != "user"), "no synthetic user message");
+    // tool_step_count = 1 feeds the placeholder if no assistant text exists.
+    assert!(serde_json::to_string(&out).unwrap().contains("1 tool steps") ||
+            out.iter().any(|m| m["role"] == "assistant"));
+}
+
+#[test]
+fn archived_identity_message_emitted_once_not_duplicated() {
+    // Identity-critical assistant that is NOT the last non-empty assistant.
+    let turn = vec![ user("hi"), assistant("my name is David Loor"), assistant("ok done") ];
+    let out = render_turn(&turn, RenderMode::Archived { terminal_state: TerminalState::Completed }, RENDERER_VERSION);
+    let joined = serde_json::to_string(&out).unwrap();
+    assert!(joined.contains("my name is David Loor"), "identity survives verbatim");
+    assert_eq!(joined.matches("my name is David Loor").count(), 1, "emitted once, not duplicated");
+}
+
+#[test]
+fn current_mode_drops_learned_helplessness_but_archived_uses_placeholder() {
+    let turn = vec![ user("do it"), assistant_empty_with_tool_call(), tool("terminal","c1","exit 1"),
+                     assistant("I wasn't able to complete this task.") ];
+    let cur = render_turn(&turn, RenderMode::Current, RENDERER_VERSION);
+    assert!(!serde_json::to_string(&cur).unwrap().contains("I wasn't able to complete"),
+            "learned-helplessness dropped in Current");
+    let arch = render_turn(&turn, RenderMode::Archived { terminal_state: TerminalState::Failed }, RENDERER_VERSION);
+    let aj = serde_json::to_string(&arch).unwrap();
+    assert!(aj.contains("[failed: 1 tool steps, no text reply]"));
+    assert!(!aj.contains("I wasn't able to complete"),
+            "Archived failure boilerplate is replaced by the deterministic terminal placeholder");
+}
 ```
 
 - [ ] **Step 2: RED** — `cargo test --lib turn_render 2>&1 | tail -5`.
@@ -414,11 +649,21 @@ pub(crate) fn render_turn(turn_messages: &[Message], mode: RenderMode, _version:
 
 `render_current`: lift the existing `&Message → Value` conversion (role/content/`tool_calls` with orphan filter against the turn's own tool-result ids/`tool_call_id`/`name`) out of `message_build_phase.rs` into a shared helper so both Current-mode and the legacy path can call it (avoid divergence; Task 7 deletes the inline copy). Append-only, full content.
 
-`render_archived`: single pass over `turn_messages`:
-1. emit the user message verbatim (full content);
-2. select the last assistant record with non-empty trimmed content; if found, emit it truncated to `MAX_OLD_ASSISTANT_CONTENT_CHARS` (char-safe truncation — use the existing `floor_char_boundary`/`truncate_str` helper in `utils.rs`, not byte slicing); if none, emit one assistant message whose content is `terminal_state.placeholder(tool_step_count)`;
-3. for each tool result, emit a `tool`-role message whose content is `summarize_tool_result(tool_name, args_json, result)` (preserve `tool_call_id`/`name` so ordering fixup stays valid);
-4. any message matching `text_relates_to_critical_identity(content)` is emitted verbatim regardless of the above (identity safety cannot rest on summaries).
+**Output ordering invariant (LOCKED): chronological with in-place transforms.** The Archived render preserves the turn's message order and transforms each message *where it sits* — it does NOT reorder into (user, winning-assistant, tools). This keeps provider semantics intact (assistant `tool_calls` immediately precede their `tool` results, so the orphan-`tool_calls` fixup stays valid) and makes the rendered byte sequence trivially comparable to the source order. Add a golden test asserting the *order* of output roles, not just their presence.
+
+`render_archived`: single pass over `turn_messages`, **in order**, applying these per-message transforms; first, pre-scan to find the index of the last **substantive** assistant record with non-empty trimmed content. “Substantive” excludes the same learned-helplessness/budget-exhaustion boilerplate recognized by `render_current`; share one pure `is_failure_boilerplate(&str)` predicate so the lists cannot drift:
+1. **user** message → emit verbatim (full content). (A turn may have NO user message — scheduled/background turns; do not synthesize one.)
+2. **assistant** message:
+   - if it is the pre-scanned last-substantive assistant → emit truncated to `MAX_OLD_ASSISTANT_CONTENT_CHARS` (char-safe — use `floor_char_boundary`/`truncate_str` in `utils.rs`, not byte slicing), preserving any `tool_calls`;
+   - if its content matches `is_failure_boilerplate` → do not emit that text and do not treat it as a winning assistant response;
+   - else if it has `tool_calls` → emit with its `tool_calls` retained but its (losing) text content dropped, so the call/result pairing the next step relies on survives;
+   - else (empty or superseded plain assistant) → drop.
+   - if NO substantive assistant record remains, emit exactly one synthetic assistant message `terminal_state.placeholder(tool_step_count)` **at the position of the turn's last assistant/tool record** (end of turn) so order stays chronological. This includes turns whose only text reply is failure boilerplate.
+3. **tool** result → emit a `tool`-role message with content `summarize_tool_result(tool_name, args_json, result)`, preserving `tool_call_id`/`name`.
+4. **identity override (precedence):** any message whose content matches `text_relates_to_critical_identity(content)` is emitted **verbatim in its original position** and is exempt from truncation/drop/summarization above — but is emitted **once** (the identity rule replaces, not adds to, that message's normal transform; no message is emitted twice).
+
+**Learned-helplessness filter (carryover decision, LOCKED):** extract the failure-pattern list currently in the inline conversion (`message_build_phase.rs:862-885` — "I wasn't able to…", "I've reached my processing limit", budget-exhaustion strings) into pure `is_failure_boilerplate`. `render_current` drops matching assistant messages. `render_archived` excludes them from the winning-assistant selection and emits the fixed terminal-state placeholder when no substantive assistant remains. Add exact tests asserting the boilerplate is absent and the placeholder is present; do not use an either/or assertion.
+
 Reuse `MAX_OLD_ASSISTANT_CONTENT_CHARS`, `summarize_tool_result`, `text_relates_to_critical_identity` (make them `pub(crate)` if not already; that is the only change to their home files — note it in staging).
 
 - [ ] **Step 4: GREEN + commit**
@@ -522,7 +767,9 @@ pub(crate) fn content_fp(turn_messages: &[Message], terminal_state: TerminalStat
         "annotations": m.annotations,
         // EXCLUDED (denylist): embedding, importance, created_at.
     })).collect();
-    hash_canonical(&json!({ "messages": items, "terminal_state": format!("{terminal_state:?}") }))
+    // Stable string tag, NOT `format!("{terminal_state:?}")`: Debug output is not a
+    // stability contract, so a variant rename/reorder would silently flip every fp.
+    hash_canonical(&json!({ "messages": items, "terminal_state": terminal_state.tag() }))
 }
 
 pub(crate) fn render_cache_decision(
@@ -652,18 +899,24 @@ pub(crate) fn plan_eviction(turns: &[RenderedTurn], archived_budget: usize) -> E
     }
     // Over budget: evict oldest whole turns until kept estimate <= low_water.
     let lw = low_water(archived_budget);
-    let mut kept: usize = total; let mut evicted = 0; let mut anchor = turns.first().map(|t| t.turn_seq).unwrap_or(0);
+    let mut kept: usize = total;
+    let mut evicted = 0;
     for t in turns {
         if kept <= lw { break; }
-        kept -= t.est_tokens; evicted += 1;
-        anchor = t.turn_seq + 1; // tentative; corrected below to the next kept turn's seq
+        kept -= t.est_tokens;
+        evicted += 1;
     }
-    if let Some(first_kept) = turns.get(evicted) { anchor = first_kept.turn_seq; }
+    // Anchor = the oldest KEPT turn's turn_seq (the first turn not evicted).
+    let anchor = turns.get(evicted).map(|t| t.turn_seq).unwrap_or(0);
     EvictionPlan { new_anchor_turn_seq: anchor, kept_est_tokens: kept, evicted_count: evicted, degenerate: false }
 }
 ```
 
-`agent/mod.rs`: `type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;` + field `turn_anchors: TurnAnchorMemory` (session_id → anchor turn_seq). `construct.rs`: init both paths. Anchor **initialization** (cold start / restart) is a Task-7 concern that consumes `plan_eviction`: walk turns newest→oldest accumulating est_tokens, stop at the last whole turn fitting the archived budget — implement that walk in Task 7 against `get_turns_from_anchor("…", 0)` (bounded by the budget). State the accepted "one re-prefill per restart" in the Task-7 log.
+`agent/mod.rs`: `type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;` + field `turn_anchors: TurnAnchorMemory` (session_id → anchor turn_seq). `construct.rs`: init both paths.
+
+**Render-cache pruning (consumed by Task 7).** When `plan_eviction` advances the anchor, the first `evicted_count` turns (oldest) drop out of every future payload. Task 7 must prune their entries from `turn_renders[session_id]` at the same moment it updates `turn_anchors`, else the per-session render map grows unbounded across a long session. The evicted turns are exactly `turns[..plan.evicted_count]`; map them back to `turn_id` and remove each. Add a Task-7 test asserting the render map shrinks after an eviction.
+
+**Cold-start target = `low_water`, not full budget.** Anchor **initialization** (cold start / restart) is a Task-7 concern that uses the bounded `get_recent_turns_page` (Task 3) — NOT `get_turns_from_anchor("…", 0)` (a full-session scan, forbidden). Walk turns newest→oldest in pages, accumulating each turn's Archived est_tokens, and stop at the last whole turn that keeps the total `<= low_water(archived_budget)`. Targeting `low_water` (not `archived_budget`) matches the steady state a running session sits at right after an eviction, so a restart re-prefills no more than a live session would carry. Set the anchor to that turn's `turn_seq` and `info!` "anchor initialized (cold start)" noting the accepted one-re-prefill-per-restart.
 
 - [ ] **Step 4: GREEN + commit**
 
@@ -679,20 +932,40 @@ git commit -m "feat(pillar-b): whole-turn eviction plan + archived-region budget
 
 > ⚠️ **HIGHEST-RISK TASK.** This deletes the age ladder and rewires payload assembly atomically. It consumes Tasks 1–6. The Pillar A regions (core at index 0, `[Task Context]` tail at boundary−1, final tool sort) MUST be preserved exactly.
 
+**Pillar A precondition checklist (verify ALL before starting — if any is false, stop and reconcile):**
+- [ ] `render_core_prompt` + `core_prompts` cache present; message zero is the cached core bytes.
+- [ ] `[Task Context]` tail (`TASK_CONTEXT_TAIL_MARKER`) inserted at boundary−1.
+- [ ] `prefix_hash_archived` / `tail_hash` regions exist in `prefix_fingerprint.rs` (the measurement harness this task is graded by).
+- [ ] `sort_tool_definitions_by_name` runs immediately before `MessageBuildData`, and force-text retains the tool-def array (`tool_choice=none`).
+- [ ] Tasks 1–6 are merged and green (turn_id persisted, fetch carries `terminal_status`, `render_turn`/`content_fp`/`plan_eviction` unit-proven).
+
 **Files:**
 - Modify: `src/agent/loop/message_build_phase.rs`
+- Modify: `src/agent/loop/main_loop.rs` (`MessageBuildCtx` no longer receives `pinned_memories`)
+- Modify: `src/agent/loop/bootstrap/run.rs` (remove `load_initial_history` and the old/recent split; anchored fetch owns historical retention)
+- Modify: `src/agent/loop/bootstrap/types.rs` (remove `BootstrapData.pinned_memories`)
 - Modify: `src/agent/loop/sliding_window.rs` (delete `calculate_window_size`; keep `summarize_tool_result` — now called by `turn_render`)
 - Modify: `src/memory/context_window.rs` (scope `fit_messages_with_source_quotas` to the current-turn region; delete dead `fit_messages_to_budget`)
 - Modify: `src/agent/loop/turn_context.rs` if `load_recent_history` is replaced/removed there
 
 **The new build flow (replaces the fetch → age-collapse → sliding-window → JSON-conversion stages, `message_build_phase.rs` ~:262–648 and ~:817–938):**
 
-1. **Anchor resolve.** Read `agent.turn_anchors[session_id]`; if absent (cold start/restart), initialize by walking `get_turns_from_anchor(session_id, 0)` newest→oldest, accumulating each turn's Archived est_tokens, stopping at the last turn that fits `archived_budget(...)`; set the anchor to that turn's `turn_seq` and `info!` "anchor initialized (cold start)" noting the accepted one-re-prefill.
-2. **Fetch** `let turns = agent.event_store.get_turns_from_anchor(session_id, anchor).await?;` (Task 3). The current turn is the last `FetchedTurn` whose `turn_id == current_turn_id`.
-3. **Evict.** Render each archived turn (step 4), estimate tokens, `plan_eviction(...)` (Task 6). If it advances the anchor, update `agent.turn_anchors`, drop the evicted turns, and `info!(… , "Window decision")` with the new fields (below). Degenerate → `warn!` naming overflowing components, zero archived turns.
-4. **Render archived turns** (all but the current): for each, derive `terminal_state` (look up the turn's `TaskEnd` status by `turn_id` — add an event-store helper `terminal_state_for_turn(session_id, turn_id)` or fold it into `get_turns_from_anchor`'s return; `None` → `Interrupted`), compute `content_fp`, consult `agent.turn_renders[session_id][turn_id]` via `render_cache_decision` (Task 5), render on miss with `render_turn(.., Archived{terminal_state}, RENDERER_VERSION)`, store, and emit hit `debug!` / miss·`fp_mismatch` `info!`. In `cfg(debug_assertions)`/tests, always re-render and `assert_eq!` against the cached bytes (nondeterminism = panic).
+0. **Budget components (estimation sources — wire these, do not invent numbers).** Compute `archived_budget(...)` (Task 6) from the SAME sources the existing budget code uses; re-locate via `rg -n 'compute_available_budget_precomputed|model_context_budget|CONTEXT_RESPONSE_RESERVE_TOKENS' src/`:
+   - `context_budget` ← `model_context_budget(model)` (`memory/context_window.rs`).
+   - `core` ← token estimate over the **cached core bytes** (Pillar A `core_prompts[session_id]`); reuse the already-computed core, do not re-render it here.
+   - `tools` ← `estimate_tokens` over the serialized (name-sorted) tool-def array that this build will send.
+   - `tail` ← `estimate_tokens` over the `[Task Context]` tail string (built before budgeting, or estimated from the same inputs — note the ordering dependency: the tail is assembled at step 6, so compute its estimate from its source inputs, not from the not-yet-built array).
+   - `current_turn_reserve` ← a fixed constant for the in-flight user message + expected tool chain headroom (define `CURRENT_TURN_RESERVE_TOKENS` next to the other reserves; do not derive per-turn — it must be stable across turns or it churns the budget).
+   - `output_reserve` ← `CONTEXT_RESPONSE_RESERVE_TOKENS`.
+   - `safety_margin` ← `0.10`.
+   - There is no separate `pinned_memories` component. Those messages came from the same canonical conversation stream and are now either inside the anchored Archived region or intentionally evicted by its budget.
+1. **Anchor resolve.** Read `agent.turn_anchors[session_id]`; if absent (cold start/restart), initialize via the bounded `get_recent_turns_page` walk (Task 3/6): page newest→oldest, accumulate each turn's Archived est_tokens, stop at the last turn keeping the total `<= low_water(archived_budget)`; set the anchor to that turn's `turn_seq` and `info!` "anchor initialized (cold start)" noting the accepted one-re-prefill. **Never** `get_turns_from_anchor(session_id, 0)` here.
+2. **Fetch** `let turns = agent.event_store.get_turns_from_anchor(session_id, anchor).await?;` (Task 3). Identify the current turn as the last `FetchedTurn` whose `turn_id == current_turn_id`.
+   **Current-turn fallback (replaces `current_user_injected` — verified precondition + safety net).** Ordering is VERIFIED (see Revision log #1): bootstrap persists the `UserMessage` event (awaited) before this build runs, so once Task 1 stamps `turn_id` on the inline `UserMessage` `json!` emit, the fetch ends in the current turn — assert it in the happy path. The fallback remains for two residual cases: (a) the documented not-yet-committed race, and (b) legacy `turn_id = NULL` rows that the anchored fetch excludes. If the last `FetchedTurn` is NOT `current_turn_id`, synthesize a current turn from the in-process `user_text` + `current_turn_ids[session_id]` and append it as the current (full/append-only) turn — never emit a payload with no current user message. Log `warn!(session_id, "current turn absent from fetch; injected in-process")` so the case is visible, not silent. (If this `warn!` fires every turn in practice, the Task 1 inline-`json!` stamp was missed — see Task 1.)
+3. **Evict.** Estimate each archived turn's tokens from its Archived rendering (step 4 — render first, then estimate over the final bytes), `plan_eviction(...)` (Task 6). If it advances the anchor: update `agent.turn_anchors[session_id]`, drop the evicted turns from the payload, **prune `turn_renders[session_id]` for each evicted `turn_id`** (`turns[..plan.evicted_count]`), and `info!(… , "Window decision")` with the new fields (below). Degenerate → `warn!` naming overflowing components, zero archived turns.
+4. **Render archived turns** (all but the current): for each, take `terminal_state = TerminalState::from_task_status(turn.terminal_status)` (already on the `FetchedTurn` from the Task 3 fetch — no extra query, no N+1; `None` → `Interrupted`), compute `content_fp(messages, terminal_state)`, consult `agent.turn_renders[session_id][turn_id]` via `render_cache_decision` (Task 5), render on miss with `render_turn(.., Archived{terminal_state}, RENDERER_VERSION)`, store, and emit hit `debug!` / miss·`fp_mismatch` `info!`. In `cfg(debug_assertions)`/tests, always re-render and `assert_eq!` against the cached bytes (nondeterminism = panic).
 5. **Render the current turn** with `render_turn(.., Current, RENDERER_VERSION)` (append-only, full).
-6. **Assemble** `messages = [archived_turn_0 .., archived_turn_k .., current_turn ..]` then keep the existing Pillar A tail insertion (tail at boundary−1, before the current user message) and core insertion (index 0). The current turn's tool chain + transient suffix (execution checkpoints `:1248`, one-shot directives `:1293`) stay as today.
+6. **Assemble** `messages = [archived_turn_0 .., archived_turn_k .., current_turn ..]` then keep the existing Pillar A tail insertion (tail at boundary−1, before the current user message) and core insertion (index 0). The current turn's tool chain + transient suffix (execution checkpoints `:1248`, one-shot directives `:1293`) stay as today. Do not append `pinned_memories`: they are duplicate canonical history and would bypass the anchor.
 7. **Current-region fitting only.** `fit_messages_with_source_quotas` now receives ONLY the current-turn slice (everything after the last archived turn) and a current-turn budget; it must never touch archived turns (they are whole-turn-evicted, never trimmed — spec invariant 3). Emit `Prefix mutation reason=history_fitting` when it actually drops anything (Task 8 finalizes the line).
 8. **Keep** `collapse_repeated_tool_errors` and the empty-response retry rebuild (current-turn only; Task 8 adds their `Prefix mutation` lines). **Keep** the final `sort_tool_definitions_by_name` before `MessageBuildData`.
 
@@ -703,6 +976,8 @@ git commit -m "feat(pillar-b): whole-turn eviction plan + archived-region budget
 - Index-based identity-preserve bypass (`identity_preserve_indices`, ~:336–352 + its uses at ~:424/:628) — identity is now handled at turn granularity inside `render_turn` (verbatim survival).
 - The message-count trim safe-collapse fallback (~:429–463) — the `last_user_pos == None` case cannot occur with turn-anchored fetch.
 - `history_limit` (~:262) and the `load_recent_history` call (replace with the anchored fetch).
+- Bootstrap's `load_initial_history`, old/recent split, and the `pinned_memories` plumbing through `BootstrapData`, `main_loop`, and `MessageBuildCtx`. This is an intentional replacement, not an accidental context drop: the whole-turn anchor is now the only conversation-history retention mechanism.
+- The inline `&Message → Value` conversion (~:817–938) is LIFTED, not duplicated — into `render_current`/`render_turn` (Task 4). Its failure-pattern list moves into shared `is_failure_boilerplate`: Current drops matching text; Archived excludes it from winning-assistant selection and uses the terminal placeholder when no substantive reply remains. No second inline copy may survive here.
 
 **`window_keep_from_tracker`** can be retired or repurposed; the new boundary signal is the anchor (`turn_anchors`). If removing the tracker is invasive, leave the field unused with a deprecation comment and remove its writes — note the choice.
 
@@ -713,7 +988,10 @@ git commit -m "feat(pillar-b): whole-turn eviction plan + archived-region budget
   4. **Tail + core position preserved:** exactly one system message starts with `TASK_CONTEXT_TAIL_MARKER` at boundary−1; message zero equals the core bytes.
   5. **Eviction advances the anchor:** with a tiny archived budget (inject a small `context_window_config` budget), building after several turns evicts the oldest whole turns and emits `Window decision` with `turns_evicted > 0`; no archived turn is partially trimmed.
   6. **Late write re-renders one turn:** appending a tool message under an already-archived `turn_id` between builds flips that turn's `content_fp` → exactly one `fp_mismatch`/re-render, localized to that turn; the other archived turn stays byte-identical.
-  7. **No synthetic user / no age_collapse:** assert the build no longer produces a `synthetic-user-*` id and no `stage="age_collapse"` fingerprint is emitted.
+  7. **No synthetic user / no age_collapse:** assert the build no longer produces a `synthetic-user-*` id and no `stage="age_collapse"` fingerprint is emitted (the in-process fallback in step 2 is the ONLY remaining current-turn injection, and only fires when the fetch genuinely lacks the current turn).
+  8. **Current-turn fallback fires when the row is absent:** simulate the documented race (current user message not yet in events) and assert the built payload still ends in the current user turn (full/append-only) and a `warn!("current turn absent from fetch; injected in-process")` is emitted — never a payload missing the current user message.
+  9. **Render cache prunes on eviction:** after an eviction advances the anchor, assert `turn_renders[session_id]` no longer holds entries for the evicted `turn_id`s (map does not grow unbounded across turns).
+  10. **No duplicate pinned-history path:** create more than the former 20-message recency window using unique content markers, build a turn, and assert each marker present in the rendered payload occurs at most once. Query the selected `FetchedTurn`s separately and assert every historical marker emitted belongs to a turn with `turn_seq >= anchor`. Confirm at compile time that `BootstrapData`/`MessageBuildCtx` no longer exposes `pinned_memories`.
 
 - [ ] **Step 2: Implement** the new flow and perform the deletions. Re-locate every span by symbol before editing. Keep the diff reviewable: do the deletions and the new assembly in one coherent pass (an intermediate half-deleted state won't compile).
 
@@ -722,7 +1000,7 @@ git commit -m "feat(pillar-b): whole-turn eviction plan + archived-region budget
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/agent/loop/message_build_phase.rs src/agent/loop/sliding_window.rs src/memory/context_window.rs src/agent/loop/turn_context.rs <updated test files>
+git add src/agent/loop/message_build_phase.rs src/agent/loop/main_loop.rs src/agent/loop/bootstrap/run.rs src/agent/loop/bootstrap/types.rs src/agent/loop/sliding_window.rs src/memory/context_window.rs src/agent/loop/turn_context.rs <updated test files>
 git commit -m "feat(pillar-b): turn-anchored fetch+render+evict replaces the age ladder in message build"
 ```
 
@@ -788,7 +1066,7 @@ git commit -m "test(pillar-b): cross-turn prefix invariants + identity regressio
 - [ ] **Step 1:** `cargo test --lib 2>&1 | tail -3` — green except the known-exempt `base_tool_registry_names_match_built_schema_names`. List any other failure explicitly; do not wave it through.
 - [ ] **Step 2:** `cargo fmt --check && cargo clippy --all-features -- -D warnings 2>&1 | tail -3` — clean (the 3 db_probe bin clippy errors are the known exception; if the gate must be all-green, scope with `--lib`).
 - [ ] **Step 3:** Spec §Testing sweep — confirm each maps to a passing test: render golden bytes per mode incl. crashed-turn + identity (Task 4); cache fp/version/mode mismatch (Task 5); the 4 cross-turn invariants (Task 9); identity regression (Task 9); per-adapter determinism (Pillar A Task 8, still green).
-- [ ] **Step 4:** Deletion sweep — `rg -n 'calculate_window_size|skeleton_pairs|current_user_injected|identity_preserve_indices|age_collapse|Prior 1|Prior 2|history_limit|fit_messages_to_budget' src/` returns only historical comments / the renamed call sites, no live age-ladder code.
+- [ ] **Step 4:** Deletion sweep — `rg -n 'calculate_window_size|skeleton_pairs|current_user_injected|identity_preserve_indices|age_collapse|Prior 1|Prior 2|history_limit|fit_messages_to_budget|prior_1_tool_ids|collapse_boundary|keep_from|pinned_memories' src/` returns only historical comments / unrelated uses, no live age-ladder or pinned-history plumbing. (`prior_1_tool_ids`/`collapse_boundary`/`keep_from` are easy to miss during the Task 7 deletion pass.)
 - [ ] **Step 5:** Migration check — on a fresh temp DB the `turn_id` migration applies cleanly; on a copy of a pre-migration DB (or a test simulating legacy rows) the NULL-turn rows hydrate and are excluded from reconstruction without panicking.
 
 ---

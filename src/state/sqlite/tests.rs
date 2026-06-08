@@ -1729,10 +1729,12 @@ async fn test_record_and_get_token_usage() {
         model: "gpt-4".to_string(),
         input_tokens: 100,
         output_tokens: 50,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
     };
 
     store
-        .record_token_usage("token-sess", &usage)
+        .record_token_usage("token-sess", &usage, None)
         .await
         .unwrap();
 
@@ -1755,15 +1757,25 @@ async fn test_token_usage_since_filter() {
         model: "gpt-4".to_string(),
         input_tokens: 100,
         output_tokens: 50,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
     };
     let usage2 = TokenUsage {
         model: "gpt-3.5".to_string(),
         input_tokens: 200,
         output_tokens: 80,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
     };
 
-    store.record_token_usage("sess-1", &usage1).await.unwrap();
-    store.record_token_usage("sess-2", &usage2).await.unwrap();
+    store
+        .record_token_usage("sess-1", &usage1, None)
+        .await
+        .unwrap();
+    store
+        .record_token_usage("sess-2", &usage2, None)
+        .await
+        .unwrap();
 
     // A far-past date should return all records
     let all = store

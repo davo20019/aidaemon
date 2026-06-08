@@ -17,7 +17,7 @@ use super::formatting::{
 };
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{QueueOutcome, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
@@ -1014,12 +1014,15 @@ impl SlackChannel {
                     .await;
                 return;
             }
-            let queue_result = self
+            // Atomic check-and-queue: if the task finished between the
+            // has_running_task() check above and this call, fall through to
+            // direct processing instead of stranding the message.
+            match self
                 .task_registry
-                .queue_message(&session_id, &agent_text)
-                .await;
-            match queue_result {
-                Some(queue_pos) => {
+                .queue_message_if_running(&session_id, &agent_text)
+                .await
+            {
+                QueueOutcome::Queued(queue_pos) => {
                     // Only notify for the first 3 queued messages to avoid spam.
                     if queue_pos <= 3 {
                         let current_task = self
@@ -1040,12 +1043,19 @@ impl SlackChannel {
                             )
                             .await;
                     }
+                    return;
                 }
-                None => {
+                QueueOutcome::Duplicate => {
                     debug!(session_id, "Dropped duplicate queued message");
+                    return;
+                }
+                QueueOutcome::NoRunningTask => {
+                    info!(
+                        session_id,
+                        "Task finished during queue attempt — processing message directly"
+                    );
                 }
             }
-            return;
         }
 
         // Dedup gate: atomically mark this message as "seen" so concurrent
@@ -1392,16 +1402,13 @@ impl SlackChannel {
                     }
                 }
 
-                // Finalize the current task AFTER sending the response/error.
-                if let Some(ref err) = task_error {
-                    registry.fail(current_task_id, err).await;
-                } else {
-                    registry.complete(current_task_id).await;
-                }
-
-                // Drain and coalesce ALL queued messages so fragmented long
-                // messages are reassembled into one prompt.
-                if let Some(queued) = registry.pop_all_queued_messages(&session_id).await {
+                // Finalize the current task AFTER sending the response/error,
+                // draining the queue in the same critical section so no
+                // concurrent message can be stranded between the two steps.
+                if let Some(queued) = registry
+                    .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
+                    .await
+                {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
 

@@ -54,6 +54,13 @@ static INTERNAL_CONTROL_MARKERS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"(?i)\[(?:SYSTEM|DIAGNOSTIC|TOOL STATS|UNTRUSTED)(?::[^\]]*)?\]").unwrap(),
         Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
         Regex::new(r"(?i)\[END UNTRUSTED EXTERNAL DATA[^\n]*").unwrap(),
+        // Internal sliding-window placeholder for orphaned tool-call-only
+        // assistant turns (see agent/loop/message_build_phase.rs and
+        // sliding_window.rs). It lives only inside the model's context and must
+        // never reach the user; models occasionally regurgitate it verbatim,
+        // especially when many identical placeholders accumulate in context.
+        Regex::new(r"(?im)^[^\S\n]*\[Action completed\][^\S\n]*$").unwrap(),
+        Regex::new(r"\[Action completed\]").unwrap(),
     ]
 });
 
@@ -280,6 +287,141 @@ fn strip_meta_instructions(content: &str) -> String {
     result
 }
 
+/// Minimum number of consecutive identical units required before the
+/// degeneration guard collapses them. Set conservatively high so ordinary
+/// repetition (a list with repeated prefixes, a refrain) is left untouched and
+/// only runaway model loops are caught.
+const DEGENERATION_MIN_RUN: usize = 4;
+
+/// Minimum normalized length of a repeating sentence cycle before it is
+/// collapsed. Prevents collapsing short repeated tokens like "Yes. Yes. ...".
+const DEGENERATION_MIN_UNIT_LEN: usize = 8;
+
+/// Collapse runaway model degeneration (repetition loops) in a user-facing
+/// reply. Models — especially local ones — sometimes collapse into emitting the
+/// same line or sentence over and over (often after their context fills with
+/// repetitive placeholders). This keeps the first occurrence of the looped unit
+/// and drops the runaway tail so the user sees a coherent reply instead of a
+/// wall of duplicated text.
+///
+/// Conservative by design: only collapses runs of [`DEGENERATION_MIN_RUN`] or
+/// more consecutive identical units. Returns `(collapsed_text, did_collapse)`.
+pub fn collapse_degenerate_repetition(text: &str) -> (String, bool) {
+    // Pass 1: collapse runs of identical consecutive lines into a single copy.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut collapsed_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut did_collapse = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let mut run = 1;
+        while i + run < lines.len() && lines[i + run] == line {
+            run += 1;
+        }
+        if !line.trim().is_empty() && run >= DEGENERATION_MIN_RUN {
+            did_collapse = true;
+            collapsed_lines.push(line);
+        } else {
+            for l in lines.iter().skip(i).take(run) {
+                collapsed_lines.push(l);
+            }
+        }
+        i += run;
+    }
+    let line_collapsed = collapsed_lines.join("\n");
+
+    // Pass 2: collapse consecutive repeated sentence cycles within the text.
+    let (sentence_collapsed, sentence_did) = collapse_repeated_sentence_cycles(&line_collapsed);
+    (sentence_collapsed, did_collapse || sentence_did)
+}
+
+/// Split text into sentence-ish tokens such that concatenating the tokens
+/// reproduces the input exactly. Boundaries occur after sentence-ending
+/// punctuation (`.`, `!`, `?`, including any trailing inline whitespace) and
+/// after newlines.
+fn split_into_sentence_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?') {
+            while let Some(&next) = chars.peek() {
+                if next == ' ' || next == '\t' {
+                    current.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(std::mem::take(&mut current));
+        } else if ch == '\n' {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Detect and collapse consecutive repetitions of a cycle of sentence tokens.
+/// A "cycle" of length `c` is a run of `c` tokens repeated back-to-back; this
+/// catches both single-sentence loops and multi-sentence loops.
+fn collapse_repeated_sentence_cycles(text: &str) -> (String, bool) {
+    let tokens = split_into_sentence_tokens(text);
+    let n = tokens.len();
+    if n < DEGENERATION_MIN_RUN {
+        return (text.to_string(), false);
+    }
+    let norm: Vec<String> = tokens.iter().map(|t| t.trim().to_lowercase()).collect();
+
+    let mut out: Vec<&str> = Vec::with_capacity(n);
+    let mut did = false;
+    let mut i = 0;
+    while i < n {
+        let max_c = (n - i) / DEGENERATION_MIN_RUN;
+        let mut chosen_c = 0;
+        let mut chosen_reps = 0;
+        for c in 1..=max_c {
+            // Skip cycles whose normalized content is too short to be a
+            // meaningful loop (avoids collapsing short repeated tokens).
+            let unit_len: usize = norm[i..i + c].iter().map(String::len).sum();
+            if unit_len < DEGENERATION_MIN_UNIT_LEN {
+                continue;
+            }
+            let mut reps = 1;
+            loop {
+                let start = i + reps * c;
+                if start + c > n {
+                    break;
+                }
+                if (0..c).all(|k| norm[i + k] == norm[start + k]) {
+                    reps += 1;
+                } else {
+                    break;
+                }
+            }
+            if reps >= DEGENERATION_MIN_RUN {
+                chosen_c = c;
+                chosen_reps = reps;
+                break;
+            }
+        }
+        if chosen_c > 0 {
+            did = true;
+            for t in tokens.iter().skip(i).take(chosen_c) {
+                out.push(t);
+            }
+            i += chosen_c * chosen_reps;
+        } else {
+            out.push(&tokens[i]);
+            i += 1;
+        }
+    }
+    (out.join(""), did)
+}
+
 /// Sanitize text before it is shown to end users.
 pub fn sanitize_user_facing_reply(reply: &str) -> String {
     let prior_turn_cleaned = reply
@@ -493,7 +635,67 @@ const INTERNAL_TOOL_NAMES: &[&str] = &[
 /// entire mention.  For bare names we only match when accompanied by
 /// contextual keywords to avoid false-positives on words like "terminal" or
 /// "browser" used in their normal English sense.
-static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+static TOOL_ONLY_PARENTHETICAL: Lazy<Regex> = Lazy::new(|| {
+    let names = INTERNAL_TOOL_NAMES
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    let wrapped_name = format!(r#"(?:`(?:{names})`|"(?:{names})")"#);
+    Regex::new(&format!(
+        r"\s*\(\s*{wrapped_name}(?:\s*(?:,|and|or|/)\s*{wrapped_name})*\s*\)"
+    ))
+    .unwrap()
+});
+
+static STANDALONE_WRAPPED_TOOL_NAME: Lazy<Regex> = Lazy::new(|| {
+    let names = INTERNAL_TOOL_NAMES
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!(
+        r#"(?:`(?P<backtick>{names})`|"(?P<quoted>{names})")"#
+    ))
+    .unwrap()
+});
+
+fn tool_capability_label(name: &str) -> &'static str {
+    match name {
+        "goal_trace" | "tool_trace" => "execution history",
+        "system_info" => "system information",
+        "check_environment" => "environment checks",
+        "manage_config" | "config_manager" => "configuration management",
+        "manage_memories" | "remember_fact" | "share_memory" => "memory management",
+        "manage_oauth" | "manage_http_auth" => "connection management",
+        "http_request" => "API request checks",
+        "web_search" | "web_fetch" => "web research",
+        "terminal" | "run_command" => "command execution",
+        "read_file" | "write_file" | "edit_file" | "search_files" => "file operations",
+        "browser" => "browser automation",
+        "spawn_agent" | "cli_agent" | "manage_cli_agents" => "agent delegation",
+        "health_probe" | "service_status" | "self_diagnose" => "health diagnostics",
+        "manage_skills" | "use_skill" | "skill_resources" => "skill management",
+        "manage_goals"
+        | "manage_goal_tasks"
+        | "scheduled_goal_runs"
+        | "scheduler"
+        | "plan_manager" => "goal and schedule management",
+        "manage_people" => "people management",
+        "manage_mcp" => "integration management",
+        "manage_api" => "API integration management",
+        "send_file" | "send_resume" => "file delivery",
+        "read_channel_history" => "channel history",
+        "token_usage" => "token usage reporting",
+        "policy_metrics" => "policy diagnostics",
+        "project_inspect" => "project inspection",
+        "git_info" | "git_commit" => "version control",
+        "report_blocker" => "blocker reporting",
+        _ => "the relevant capability",
+    }
+}
+
+static TOOL_NAME_PATTERNS: Lazy<Vec<SanitizePattern>> = Lazy::new(|| {
     let names = INTERNAL_TOOL_NAMES
         .iter()
         .map(|n| regex::escape(n))
@@ -503,57 +705,89 @@ static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         // ── slash-prefixed command forms ────────────────────────────────
         // "`/manage_oauth list`"
-        Regex::new(&format!(r"`/(?:{names})(?:\s+[^`\n]+)?`")).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(r"`/(?:{names})(?:\s+[^`\n]+)?`")).unwrap(),
+            replacement: "",
+        },
         // A standalone command line like "/manage_oauth connect twitter"
-        Regex::new(&format!(
-            r"(?im)^\s*/(?:{names})(?:[ \t]+[^\n\r`]+)?\s*$"
-        ))
-        .unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?im)^\s*/(?:{names})(?:[ \t]+[^\n\r`]+)?\s*$"
+            ))
+            .unwrap(),
+            replacement: "",
+        },
         // "type /manage_oauth list" / "run /manage_oauth connect twitter"
-        Regex::new(&format!(
-            r"(?i)(?:type|enter|use|using|run|running|try|call|calling|invoke|invoking)\s+/(?:{names})(?:\s+[A-Za-z0-9_.:-]+)*"
-        ))
-        .unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?i)(?:type|enter|use|using|run|running|try|call|calling|invoke|invoking)\s+/(?:{names})(?:\s+[A-Za-z0-9_.:-]+)*"
+            ))
+            .unwrap(),
+            replacement: "that",
+        },
 
         // ── backtick-wrapped with surrounding phrasing ──────────────────
         // "I couldn't find a `tool` tool"  /  "find a `tool`"  /  "find the `tool` tool"
-        Regex::new(&format!(
-            r"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?`(?:{names})`(?:\s+tool)?"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?`(?:{names})`(?:\s+tool)?"
+            )).unwrap(),
+            replacement: "that",
+        },
         // "the `tool` tool"  /  "the `tool`"
-        Regex::new(&format!(
-            r"(?i)the\s+`(?:{names})`(?:\s+tool)?"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?i)the\s+`(?:{names})`(?:\s+tool)?"
+            )).unwrap(),
+            replacement: "that",
+        },
         // "using the `tool` tool"  (already partially covered above, but catch leftovers)
         // Standalone backtick-wrapped tool name (e.g. "I can try `search_files` if…")
-        Regex::new(&format!(
-            r"`(?:{names})`(?:\s+tool)?"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(r"`(?:{names})`(?:\s+tool)?")).unwrap(),
+            replacement: "",
+        },
 
         // ── double-quote-wrapped with surrounding phrasing ──────────────
-        Regex::new(&format!(
-            r#"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?"(?:{names})"(?:\s+tool)?"#
-        )).unwrap(),
-        Regex::new(&format!(
-            r#"(?i)the\s+"(?:{names})"(?:\s+tool)?"#
-        )).unwrap(),
-        Regex::new(&format!(
-            r#""(?:{names})"(?:\s+tool)?"#
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r#"(?i)(?:find|found|locate|use|using|call|called|invoke|run|try|via|with)\s+(?:a\s+|an\s+|the\s+)?"(?:{names})"(?:\s+tool)?"#
+            )).unwrap(),
+            replacement: "that",
+        },
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r#"(?i)the\s+"(?:{names})"(?:\s+tool)?"#
+            )).unwrap(),
+            replacement: "that",
+        },
+        SanitizePattern {
+            regex: Regex::new(&format!(r#""(?:{names})"(?:\s+tool)?"#)).unwrap(),
+            replacement: "",
+        },
 
         // ── bare (no backtick/quote) with required context keywords ─────
         // "the tool_name tool"  /  "a tool_name tool"
-        Regex::new(&format!(
-            r"(?i)(?:the|a|an)\s+(?:{names})\s+tool"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?i)(?:the|a|an)\s+(?:{names})\s+tool"
+            )).unwrap(),
+            replacement: "that",
+        },
         // "use tool_name"  /  "using tool_name"  /  "call tool_name"  /  "via tool_name"
-        Regex::new(&format!(
-            r"(?i)(?:use|using|call|calling|invoke|invoking|run|running|via)\s+(?:the\s+)?(?:{names})(?:\s+tool)?"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?i)(?:use|using|call|calling|invoke|invoking|run|running|via)\s+(?:the\s+)?(?:{names})(?:\s+tool)?"
+            )).unwrap(),
+            replacement: "that",
+        },
         // Raw call-form leaks: "http_request(GET https://...)" / "web_fetch(https://...)"
-        Regex::new(&format!(
-            r"(?:{names})\([^()\n]{{0,240}}\)"
-        )).unwrap(),
+        SanitizePattern {
+            regex: Regex::new(&format!(
+                r"(?:{names})\([^()\n]{{0,240}}\)"
+            )).unwrap(),
+            replacement: "that",
+        },
     ]
 });
 
@@ -566,9 +800,22 @@ static TOOL_NAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 /// Only call this on **final user-facing replies** — not on internal tool
 /// outputs, logs, or agent-to-agent messages.
 pub fn strip_tool_name_references(content: &str) -> String {
-    let mut result = content.to_string();
+    let mut result = TOOL_ONLY_PARENTHETICAL.replace_all(content, "").to_string();
+    result = STANDALONE_WRAPPED_TOOL_NAME
+        .replace_all(&result, |captures: &regex::Captures<'_>| {
+            let name = captures
+                .name("backtick")
+                .or_else(|| captures.name("quoted"))
+                .map(|capture| capture.as_str())
+                .unwrap_or_default();
+            tool_capability_label(name)
+        })
+        .to_string();
     for pattern in TOOL_NAME_PATTERNS.iter() {
-        result = pattern.replace_all(&result, "that").to_string();
+        result = pattern
+            .regex
+            .replace_all(&result, pattern.replacement)
+            .to_string();
     }
     // Clean up artefacts left by replacements:
     //  - double/triple "that" from overlapping patterns
@@ -578,6 +825,8 @@ pub fn strip_tool_name_references(content: &str) -> String {
     static ARTICLE_THAT: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\b(?:a|an|the)\s+that\b").unwrap());
     static MULTI_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"  +").unwrap());
+    static SPACE_BEFORE_PUNCTUATION: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\s+([.,;:!?])").unwrap());
 
     // Collapse repeated "that that" → "that" (may need two passes)
     for _ in 0..2 {
@@ -585,6 +834,9 @@ pub fn strip_tool_name_references(content: &str) -> String {
     }
     result = ARTICLE_THAT.replace_all(&result, "that").to_string();
     result = MULTI_SPACE.replace_all(&result, " ").to_string();
+    result = SPACE_BEFORE_PUNCTUATION
+        .replace_all(&result, "$1")
+        .to_string();
     result
 }
 
@@ -727,6 +979,64 @@ mod tests {
     fn test_strip_internal_control_markers_preserves_normal_brackets() {
         let input = "[INFO] regular bracket tag";
         let result = strip_internal_control_markers(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_action_completed_placeholder() {
+        // The sliding-window orphaned-turn placeholder must never reach the
+        // user, even when the model regurgitates many of them in a row.
+        let input =
+            "Here is your file.\n[Action completed]\n[Action completed]\n[Action completed]";
+        let result = sanitize_user_facing_reply(input);
+        assert!(!result.contains("[Action completed]"));
+        assert!(result.contains("Here is your file."));
+    }
+
+    #[test]
+    fn test_strip_action_completed_only_collapses_to_empty() {
+        // A reply consisting solely of placeholders sanitizes to empty so the
+        // completion-phase safety net falls back to an activity summary.
+        let input = "[Action completed][Action completed][Action completed]";
+        let result = sanitize_user_facing_reply(input);
+        assert!(result.trim().is_empty());
+    }
+
+    #[test]
+    fn test_collapse_degenerate_repeated_lines() {
+        let input =
+            "Here is the result.\nLoop line.\nLoop line.\nLoop line.\nLoop line.\nLoop line.";
+        let (result, collapsed) = collapse_degenerate_repetition(input);
+        assert!(collapsed);
+        assert_eq!(result.matches("Loop line.").count(), 1);
+        assert!(result.contains("Here is the result."));
+    }
+
+    #[test]
+    fn test_collapse_degenerate_repeated_sentence_cycle() {
+        let unit = "of course! I'll send another one. Which specific one were you interested in? ";
+        let input = format!("Which one would you like? {}", unit.repeat(6));
+        let (result, collapsed) = collapse_degenerate_repetition(&input);
+        assert!(collapsed);
+        // The looped unit is kept exactly once.
+        assert_eq!(result.matches("I'll send another one.").count(), 1);
+        assert!(result.contains("Which one would you like?"));
+    }
+
+    #[test]
+    fn test_collapse_leaves_normal_text_untouched() {
+        let input = "First point here. Second different point. A third unique sentence. Done.";
+        let (result, collapsed) = collapse_degenerate_repetition(input);
+        assert!(!collapsed);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_collapse_ignores_short_repetition() {
+        // Only three repeats — below the conservative threshold — stays as-is.
+        let input = "Yes. Yes. Yes.";
+        let (result, collapsed) = collapse_degenerate_repetition(input);
+        assert!(!collapsed);
         assert_eq!(result, input);
     }
 
@@ -952,6 +1262,46 @@ mod tests {
         assert!(
             !result.contains("`terminal`"),
             "backtick terminal leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_strip_tool_only_parentheticals_without_that_placeholders() {
+        let input = "1. **Execution Forensics (`goal_trace` and `tool_trace`)**: I can inspect an exact timeline.\n\
+2. **System Checks (`system_info` and `check_environment`)**: I can inspect system health.\n\
+3. **Configuration Inspection (`manage_config`)**: I can inspect my settings.\n\
+4. **Memory Audits (`manage_memories`)**: I can inspect stored facts.";
+        let result = strip_tool_name_references(input);
+
+        assert_eq!(
+            result,
+            "1. **Execution Forensics**: I can inspect an exact timeline.\n\
+2. **System Checks**: I can inspect system health.\n\
+3. **Configuration Inspection**: I can inspect my settings.\n\
+4. **Memory Audits**: I can inspect stored facts."
+        );
+        assert!(!result.contains("(that"));
+    }
+
+    #[test]
+    fn test_strip_standalone_wrapped_tool_name_without_inserting_that() {
+        let input = "The available option is `manage_config`.";
+        let result = strip_tool_name_references(input);
+
+        assert_eq!(result, "The available option is configuration management.");
+        assert!(!result.contains("that"));
+    }
+
+    #[test]
+    fn test_standalone_diagnostic_tool_list_keeps_readable_labels() {
+        let input = "• `manage_oauth` / `http_request`: Verify an external connection.\n\
+• `goal_trace`: Inspect a previous execution.";
+        let result = strip_tool_name_references(input);
+
+        assert_eq!(
+            result,
+            "• connection management / API request checks: Verify an external connection.\n\
+• execution history: Inspect a previous execution."
         );
     }
 

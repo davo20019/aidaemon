@@ -18,31 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Stable core / task-context tail split (Pillar A of the cross-turn prefix
-  stability design)**: message zero is now a byte-stable *core* prompt
-  (identity, persona, behavioral rules, tool-selection guide, specialists,
-  channel rules, skills availability catalog) rendered from canonicalized,
-  component-hashed inputs and cached per session — recompiled only on a
-  logged, component-attributed input change (`Core prompt invalidated
-  component=…`). All volatile per-task context (timestamp, session activity,
-  conversation summary, query-ranked memory recall, matched-skill content,
-  people/speaker context, resume checkpoint) moved into a single `[Task
-  Context]` system message inserted immediately before the current user turn.
-  The conversation summary leaves message index 1 — both prior summary
-  insertion paths (build-stage `[Session Summary]` and the fit-stage
-  `[Conversation summary:]` in `fit_messages_*`) were retired so the summary
-  lives only in the tail. The session-static tool roster feeding the core is
-  query-independent (no per-turn MCP-trigger gating or personal-memory/
-  untrusted-reference restrictions); the emitted provider tool array is
-  name-sorted upstream so `tool_defs_hash` flips only on membership change,
-  never on ordering. Phase-0 observability gained `tail_hash` and
-  `prefix_hash_archived` fingerprint regions (logged and persisted on
-  `LlmCallData`); `session_summary_hash` is retired (reports empty);
-  `cache-attribution.py` classifies tail-only flips as expected. Makes
-  `prefix_hash_system` a cross-turn core-stability metric and every remaining
-  prefix flip attributable. Live A-gate measurement (turn-start token
-  reduction vs the 15.6k post-C baseline) pending.
-
 - **Per-call LLM payload reduced 27%** (median 22.3k → 16.2k tokens; Pillar C
   of the cross-turn prefix stability design): the duplicative `## Tools`
   catalog in the system prompt (−16.9k bytes) was replaced by compact

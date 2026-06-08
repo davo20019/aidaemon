@@ -78,6 +78,10 @@ tr:last-child td { border-bottom: none; }
       <h2>Queue Health</h2>
       <div id="queues-body"></div>
     </div>
+    <div class="card wide" id="llm-latency-card">
+      <h2>LLM Latency (last 24h)</h2>
+      <div id="llm-latency-body"></div>
+    </div>
     <div class="card wide" id="policy-card">
       <h2>Policy Metrics</h2>
       <div id="policy-body"></div>
@@ -270,6 +274,32 @@ async function fetchPolicyMetrics() {
   }
 }
 
+async function fetchLlmLatency() {
+  try {
+    const d = await api('/api/llm/latency?hours=24');
+    if (d.error || !d.total_calls) {
+      document.getElementById('llm-latency-body').innerHTML = '<p class="empty">No LLM calls recorded yet</p>';
+      return;
+    }
+    const rows = [
+      ['Total calls', fmtNum(d.total_calls)],
+      ['Avg latency', fmtNum(d.avg_latency_ms) + ' ms'],
+      ['p50 latency', fmtNum(d.p50_latency_ms) + ' ms'],
+      ['p95 latency', fmtNum(d.p95_latency_ms) + ' ms'],
+      ['Max latency', fmtNum(d.max_latency_ms) + ' ms'],
+      ['Calls with fallback', fmtNum(d.fell_back_count)],
+      ['Avg input tokens', fmtNum(d.avg_input_tokens)],
+      ['Avg output tokens', fmtNum(d.avg_output_tokens)],
+    ];
+    let html = '<table><tr><th>Metric</th><th>Value</th></tr>';
+    for (const [k, v] of rows) html += '<tr><td>' + esc(k) + '</td><td class="mono">' + esc(String(v)) + '</td></tr>';
+    html += '</table>';
+    document.getElementById('llm-latency-body').innerHTML = html;
+  } catch {
+    document.getElementById('llm-latency-body').innerHTML = '<p class="empty">LLM latency unavailable</p>';
+  }
+}
+
 async function fetchQueues() {
   try {
     const payload = await api('/api/queues');
@@ -359,7 +389,7 @@ async function fetchWriteConsistency() {
   }
 }
 
-function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchQueues(); fetchPolicyMetrics(); fetchWriteConsistency(); }
+function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchQueues(); fetchLlmLatency(); fetchPolicyMetrics(); fetchWriteConsistency(); }
 
 // Startup
 if (TOKEN) { tryConnect(); } else { showAuth(); }

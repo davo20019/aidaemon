@@ -22,6 +22,7 @@ const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 /// facts, procedures, and error solutions, then stores them in the state store.
 pub async fn extract_task_knowledge(
     state: Arc<dyn StateStore>,
+    event_store: Arc<crate::events::EventStore>,
     provider: Arc<dyn ModelProvider>,
     model: String,
     task: Task,
@@ -113,14 +114,19 @@ pub async fn extract_task_knowledge(
         json!({"role": "user", "content": user_prompt}),
     ];
 
+    let call_start = std::time::Instant::now();
     let response = provider.chat(&model, &messages, &[]).await?;
 
-    // Track token usage for task learning LLM calls
-    if let Some(usage) = &response.usage {
-        let _ = state
-            .record_token_usage("background:task_learning", usage)
-            .await;
-    }
+    crate::events::record_background_model_call_telemetry(
+        event_store,
+        state.as_ref(),
+        "background:task_learning",
+        "task_learning",
+        &model,
+        &response,
+        call_start.elapsed(),
+    )
+    .await;
 
     let response_text = response
         .content

@@ -388,6 +388,13 @@ pub async fn build_base_tools(
     let mut terminal_tool: Option<Arc<TerminalTool>> = None;
 
     for spec in BASE_TOOL_REGISTRY {
+        if !config.tools.is_enabled(spec.name) {
+            info!(
+                tool = spec.name,
+                "Skipped base tool from startup manifest (disabled in [tools].disabled)"
+            );
+            continue;
+        }
         let built = build_base_tool(
             spec.id,
             config,
@@ -445,6 +452,9 @@ pub async fn register_optional_tools(
         let tools_before = tools.len();
         match spec.id {
             OptionalToolId::Diagnose => {
+                if !config.tools.is_enabled("self_diagnose") {
+                    continue;
+                }
                 tools.push(Arc::new(DiagnoseTool::new(
                     event_store.clone(),
                     state.clone(),
@@ -455,12 +465,18 @@ pub async fn register_optional_tools(
             }
             #[cfg(feature = "browser")]
             OptionalToolId::Browser => {
+                if !config.tools.is_enabled("browser") {
+                    continue;
+                }
                 tools.push(Arc::new(BrowserTool::new(
                     config.browser.clone(),
                     media_tx.clone(),
                 )));
             }
             OptionalToolId::SendFile => {
+                if !config.tools.is_enabled("send_file") {
+                    continue;
+                }
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(SendFileTool::new(
                     media_tx.clone(),
@@ -469,6 +485,11 @@ pub async fn register_optional_tools(
                 )));
             }
             OptionalToolId::CliAgents => {
+                let register_cli = config.tools.is_enabled("cli_agent");
+                let register_manage_cli = config.tools.is_enabled("manage_cli_agents");
+                if !register_cli && !register_manage_cli {
+                    continue;
+                }
                 let cli_tool = CliAgentTool::discover(
                     config.cli_agents.clone(),
                     state.clone(),
@@ -481,16 +502,24 @@ pub async fn register_optional_tools(
                 cli_agent_tool = Some(arc.clone());
                 // Always register cli_agent so runtime-added agents become
                 // immediately usable without restart.
-                tools.push(arc.clone());
-                if !has_cli_agents {
-                    info!(
-                        "CLI agents enabled but no tools found on system (cli_agent registered for runtime discovery)"
-                    );
+                if register_cli {
+                    tools.push(arc.clone());
+                    if !has_cli_agents {
+                        info!(
+                            "CLI agents enabled but no tools found on system (cli_agent registered for runtime discovery)"
+                        );
+                    }
                 }
-                let manage_cli = ManageCliAgentsTool::new(arc, state.clone(), approval_tx.clone());
-                tools.push(Arc::new(manage_cli));
+                if register_manage_cli {
+                    let manage_cli =
+                        ManageCliAgentsTool::new(arc, state.clone(), approval_tx.clone());
+                    tools.push(Arc::new(manage_cli));
+                }
             }
             OptionalToolId::HealthProbe => {
+                if !config.tools.is_enabled("health_probe") {
+                    continue;
+                }
                 let Some(store) = &health_store else {
                     continue;
                 };
@@ -498,6 +527,9 @@ pub async fn register_optional_tools(
             }
             #[cfg(feature = "slack")]
             OptionalToolId::SlackChannelHistory => {
+                if !config.tools.is_enabled("read_channel_history") {
+                    continue;
+                }
                 let mut slack_tokens: Vec<String> = config
                     .all_slack_bots()
                     .iter()
@@ -575,6 +607,14 @@ pub async fn register_runtime_tools(
                 tool = spec.name,
                 missing_dependencies = ?missing_dependencies,
                 "Skipped runtime tool from startup manifest (dependencies not satisfied)"
+            );
+            continue;
+        }
+
+        if !config.tools.is_enabled(spec.name) {
+            info!(
+                tool = spec.name,
+                "Skipped runtime tool from startup manifest (disabled in [tools].disabled)"
             );
             continue;
         }
@@ -1172,6 +1212,52 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_tools_are_omitted_from_base_registry() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test-key"
+            [tools]
+            disabled = ["policy_metrics", "goal_trace", "check_environment"]
+            "#,
+        )
+        .unwrap();
+        config.provider.models.apply_defaults(&config.provider.kind);
+
+        let db_file = NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(
+                &db_file.path().display().to_string(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let event_store = Arc::new(EventStore::new(state.pool()).await.unwrap());
+        let config_file = NamedTempFile::new().unwrap();
+
+        let bundle = build_base_tools(
+            &config,
+            config_file.path().to_path_buf(),
+            state,
+            event_store,
+            8,
+            8,
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<&str> = bundle.tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"policy_metrics"));
+        assert!(!names.contains(&"goal_trace"));
+        assert!(!names.contains(&"check_environment"));
+        assert!(names.contains(&"terminal"));
     }
 
     #[tokio::test]

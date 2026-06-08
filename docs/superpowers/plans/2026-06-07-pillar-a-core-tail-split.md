@@ -577,24 +577,6 @@ PASS requires:
 
 ---
 
-## Implementation status (2026-06-07)
-
-Tasks 1–9 implemented via subagent-driven development (fresh implementer + two-stage spec/quality review per task), each committed after the per-commit gate (`cargo fmt`, `cargo clippy --all-features -- -D warnings`, tests). Commit chain:
-
-| Task | Commit(s) | Notes |
-|---|---|---|
-| 1 | `469f0b8`, `0096766` | `tail_hash`/`prefix_hash_archived` fingerprint regions + `LlmCallData`; `session_summary_hash` retired; tail location requires `role == "system"` |
-| 2 | `4b33559`, `2313d1e` | `cache-attribution.py` parses new regions; tail-only flips classified expected; `session_summary` dropped from `STAGE_ORDER` |
-| 3 | `279597b`, `1ccce3c` | `CoreInputs`/`ComponentHashes` canonicalization + component hashing; session-static `core_tool_roster` accessor + `sort_tool_definitions_by_name` (query-independent roster — NOT `base_tool_defs`) |
-| 4 | `047bb9f`, `253a86b` | `render_core_prompt` extracted (pure/sync) + `assemble_core_inputs` (explicit stable inputs); disabled skills filtered |
-| 5+6 | `092ee7c`, `a9f0522` | `build_context_tail` at boundary−1; `BootstrapData` core/tail split; both summary insertion paths retired (summary lives only in tail); budget reserves core+tail; emitted roster name-sorted at both boundaries; channel-rules + skills-catalog routed through the renderer (no double emission) |
-| 7 | `3083f0c`, `4f5de17` | Per-session core cache (`core_prompts`) with `Core prompt invalidated component=…` logging; HIT reuses bytes without re-render |
-| 8 | `04aeea7` | Provider conversion assertions: openai order-preservation + prefix property; anthropic/google determinism; tool-array passthrough (adapters do not sort) |
-
-**Gate (Task 9):** `cargo fmt --check` clean; `cargo clippy --all-features -- -D warnings` clean; `cargo test --lib` 2468 passed / 1 failed — the single failure `startup::tools::tests::base_tool_registry_names_match_built_schema_names` is **pre-existing** (fails identically on the baseline before any Pillar A work) and unrelated to this plan. Integration tests (flattened into the `integration_tests::` module, run within the `--lib` sweep) pass, including the updated `part_10` summary-position assertion. Single-summary-insertion check: the only summary in the LLM message payload is inside the tail (the `main_loop.rs` `[Session Summary]` reference is the separate task-planner's ephemeral context, not the payload).
-
-**Task 10 (live A-gate) — daemon prepped, awaiting operator turns.** The launchd agent (`ai.aidaemon`) was booted out and the daemon restarted manually under `caffeinate -i` with `RUST_LOG="info,aidaemon::agent::loop::message_build_phase=debug"`, stdout → `/tmp/aidaemon-attribution-run.log`. `tool_filter_enforce = false` is already set in `config.toml`. Remaining operator steps: record llama/daemon line offsets at idle; drive 10 fresh distinct turns (new scratch-dir name) in a single session; then `python3 scripts/cache-attribution.py --daemon-log <segment> --session "<session>" --llama-from-line <N>`. PASS = 0 within-task system flips; every cross-turn `prefix_hash_system` flip pairs with a `Core prompt invalidated` line (expected: zero in a quiet run); archived flips attributed to Window decision / Prefix mutation / fp_mismatch; tail-only flips reported expected; `tool_defs_hash` stable (or MCP-membership flips reported separately). Record median turn-start evaluated tokens vs the 15,565 baseline. After the run: results table here, spec §Pillar A "Measured post-A" note, CHANGELOG numbers (the [Unreleased] entry currently marks measurement pending).
-
 ## Out of scope (Pillar B's plan)
 Turn-anchored fetch, `turn_id` in event payloads/hydration, archived turn renders + cache, whole-turn eviction/anchor, the age_collapse ladder removal. After this plan lands, archived-region churn remains — visible and attributed via `prefix_hash_archived`, which is exactly the instrumentation Pillar B builds against.
 

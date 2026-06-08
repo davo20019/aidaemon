@@ -196,6 +196,71 @@ struct WorkingDirClaim {
     dedup_prompt: String,
 }
 
+/// The claims map uses a std (not tokio) Mutex so that WorkingDirClaimGuard
+/// can release a claim in Drop (Drop cannot await). Never hold this lock
+/// across an await point; the compiler enforces it for Send futures.
+type WorkingDirClaims = std::sync::Mutex<HashMap<String, WorkingDirClaim>>;
+
+/// Lock the claims map, recovering from poisoning (a panic while holding the
+/// lock must not permanently wedge working-dir dispatch).
+fn lock_claims(
+    claims: &WorkingDirClaims,
+) -> std::sync::MutexGuard<'_, HashMap<String, WorkingDirClaim>> {
+    claims
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII guard that releases a working-dir claim on drop unless disarmed.
+///
+/// Dispatch futures can be dropped at any await point when the calling
+/// session is cancelled or times out. Before this guard existed, an abort
+/// between claim insertion and the explicit post-await release leaked the
+/// claim permanently, blocking all future dispatches to that directory
+/// until a daemon restart. The guard makes release abort-safe.
+///
+/// Disarm when handing the task off to the background `running` map: from
+/// that point the reaper / cancel paths own the release.
+struct WorkingDirClaimGuard {
+    claims: Arc<WorkingDirClaims>,
+    dir: String,
+    task_id: String,
+    armed: bool,
+}
+
+impl WorkingDirClaimGuard {
+    fn new(claims: Arc<WorkingDirClaims>, dir: String, task_id: String) -> Self {
+        Self {
+            claims,
+            dir,
+            task_id,
+            armed: true,
+        }
+    }
+
+    /// Stop the guard from releasing on drop (ownership of the claim has
+    /// been transferred to the background `running` map).
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkingDirClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut claims = lock_claims(&self.claims);
+        let owned = claims
+            .get(&self.dir)
+            .map(|claim| claim.task_id == self.task_id)
+            .unwrap_or(false);
+        if owned {
+            claims.remove(&self.dir);
+        }
+    }
+}
+
 /// Jaccard similarity between two strings based on word-level bigrams.
 /// Returns a value in [0.0, 1.0].
 fn prompt_similarity(a: &str, b: &str) -> f64 {
@@ -245,7 +310,7 @@ pub struct CliAgentTool {
     tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     running: Arc<Mutex<HashMap<String, RunningCliAgent>>>, // task_id -> RunningCliAgent
     completed: Arc<Mutex<HashMap<String, CompletedCliAgent>>>, // task_id -> finalized output
-    working_dir_claims: Arc<Mutex<HashMap<String, WorkingDirClaim>>>, // normalized dir -> claim
+    working_dir_claims: Arc<WorkingDirClaims>, // normalized dir -> claim (std Mutex: see WorkingDirClaimGuard)
     state: Arc<dyn StateStore>,
     #[allow(dead_code)] // Reserved for future interactive feedback
     llm_runtime: SharedLlmRuntime,
@@ -466,8 +531,8 @@ impl CliAgentTool {
     }
 
     /// Release a working-directory claim if it belongs to the given task.
-    async fn release_working_dir_claim(&self, dir: &str, task_id: &str) {
-        let mut claims = self.working_dir_claims.lock().await;
+    fn release_working_dir_claim(&self, dir: &str, task_id: &str) {
+        let mut claims = lock_claims(&self.working_dir_claims);
         let should_remove = claims
             .get(dir)
             .map(|claim| claim.task_id == task_id)
@@ -601,7 +666,7 @@ impl CliAgentTool {
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state,
             llm_runtime,
             default_timeout,
@@ -836,7 +901,7 @@ impl CliAgentTool {
 
             // Also release working-dir claims for finished tasks.
             // Lock ordering: running -> working_dir_claims.
-            let mut claims = self.working_dir_claims.lock().await;
+            let mut claims = lock_claims(&self.working_dir_claims);
             let mut removed: Vec<(String, RunningCliAgent)> = Vec::new();
             for task_id in finished_ids {
                 if let Some(agent) = running.remove(&task_id) {
@@ -1439,40 +1504,50 @@ impl CliAgentTool {
 
         // Claim the working directory and perform conflict checks.
         // Lock ordering when both locks are needed: running -> working_dir_claims.
+        // The claims (std) lock must not be held across an await, so the
+        // conflict message is computed inside the block and persisted after.
+        let mut claim_guard: Option<WorkingDirClaimGuard> = None;
         if let Some(ref dir) = canonical_working_dir {
-            let _running_guard = self.running.lock().await;
-            let mut claims = self.working_dir_claims.lock().await;
+            let blocked_message: Option<String> = {
+                let _running_guard = self.running.lock().await;
+                let mut claims = lock_claims(&self.working_dir_claims);
 
-            if let Some(claim) = claims.get(dir) {
-                let sim = prompt_similarity(&dedup_prompt, &claim.dedup_prompt);
-                if sim > 0.5 {
-                    let message = format!(
-                        "BLOCKED: A very similar task is already running in {} \
-                         (task_id={}, agent={}, similarity={:.0}%). \
-                         You MUST wait for it to finish or cancel it.",
-                        dir,
-                        claim.task_id,
-                        claim.tool_name,
-                        sim * 100.0
-                    );
-                    if let Some(task_id) = delegated_task_id {
-                        Self::persist_delegated_cli_result_with_state(
-                            self.state.clone(),
-                            task_id,
-                            Some(&message),
-                            None,
-                        )
-                        .await;
+                if let Some(claim) = claims.get(dir) {
+                    let sim = prompt_similarity(&dedup_prompt, &claim.dedup_prompt);
+                    if sim > 0.5 {
+                        Some(format!(
+                            "BLOCKED: A very similar task is already running in {} \
+                             (task_id={}, agent={}, similarity={:.0}%). \
+                             You MUST wait for it to finish or cancel it.",
+                            dir,
+                            claim.task_id,
+                            claim.tool_name,
+                            sim * 100.0
+                        ))
+                    } else {
+                        Some(format!(
+                            "BLOCKED: Another CLI agent is already working in {} \
+                             (task_id={}, agent={}, prompt=\"{}\"). \
+                             You MUST wait for it to finish or cancel it before dispatching \
+                             another task to the same directory.",
+                            dir, claim.task_id, claim.tool_name, claim.prompt_summary
+                        ))
                     }
-                    return Ok(message);
+                } else {
+                    claims.insert(
+                        dir.clone(),
+                        WorkingDirClaim {
+                            task_id: task_id.clone(),
+                            tool_name: tool_name.to_string(),
+                            prompt_summary: short_summary.clone(),
+                            dedup_prompt: dedup_prompt.clone(),
+                        },
+                    );
+                    None
                 }
-                let message = format!(
-                    "BLOCKED: Another CLI agent is already working in {} \
-                     (task_id={}, agent={}, prompt=\"{}\"). \
-                     You MUST wait for it to finish or cancel it before dispatching \
-                     another task to the same directory.",
-                    dir, claim.task_id, claim.tool_name, claim.prompt_summary
-                );
+            };
+
+            if let Some(message) = blocked_message {
                 if let Some(task_id) = delegated_task_id {
                     Self::persist_delegated_cli_result_with_state(
                         self.state.clone(),
@@ -1485,15 +1560,14 @@ impl CliAgentTool {
                 return Ok(message);
             }
 
-            claims.insert(
+            // From here on the claim is released by the guard's Drop on any
+            // early return or future cancellation, unless it is disarmed when
+            // the task hands off to the background `running` map.
+            claim_guard = Some(WorkingDirClaimGuard::new(
+                self.working_dir_claims.clone(),
                 dir.clone(),
-                WorkingDirClaim {
-                    task_id: task_id.clone(),
-                    tool_name: tool_name.to_string(),
-                    prompt_summary: short_summary.clone(),
-                    dedup_prompt: dedup_prompt.clone(),
-                },
-            );
+                task_id.clone(),
+            ));
         }
 
         // Build the enriched prompt if system_instruction is provided
@@ -1512,9 +1586,7 @@ impl CliAgentTool {
         let slot_permit = match self.concurrency_limiter.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                if let Some(ref dir) = canonical_working_dir {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                // claim_guard drops on return and releases the claim.
                 let message = format!(
                     "Maximum {} CLI agents already running. Use action='list' to see running tasks, or action='cancel' to stop one.",
                     self.max_concurrent
@@ -1608,9 +1680,7 @@ impl CliAgentTool {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                if let Some(ref dir) = canonical_working_dir {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                // claim_guard drops on return and releases the claim.
                 // Ensure invocations don't stay "running" forever when spawn fails.
                 if invocation_id != 0 {
                     let duration = started_at_instant.elapsed().as_secs_f64();
@@ -1639,9 +1709,7 @@ impl CliAgentTool {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                if let Some(ref dir) = canonical_working_dir {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                // claim_guard drops on return and releases the claim.
                 let error = "Failed to capture stdout".to_string();
                 if let Some(ref delegated_task_id) = delegated_task_id_owned {
                     Self::persist_delegated_cli_result_with_state(
@@ -1658,9 +1726,7 @@ impl CliAgentTool {
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                if let Some(ref dir) = canonical_working_dir {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                // claim_guard drops on return and releases the claim.
                 let error = "Failed to capture stderr".to_string();
                 if let Some(ref delegated_task_id) = delegated_task_id_owned {
                     Self::persist_delegated_cli_result_with_state(
@@ -2070,6 +2136,11 @@ impl CliAgentTool {
                 working_dir: working_dir_owned,
             };
             self.running.lock().await.insert(task_id.clone(), agent);
+            // The reaper / cancel paths own the claim now (no await between
+            // the insert above and this disarm, so no cancellation window).
+            if let Some(guard) = claim_guard.as_mut() {
+                guard.disarm();
+            }
 
             return Ok(format!(
                 "CLI agent '{}' started in background (task_id={}). \
@@ -2084,10 +2155,9 @@ impl CliAgentTool {
 
         match result {
             Ok(Ok((exit_code, was_loop_killed, loop_count))) => {
-                // Sync completion path: release the claim.
-                if let Some(ref dir) = working_dir_owned {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                // Sync completion path: release the claim eagerly (the rest
+                // of this arm still awaits diff capture and persistence).
+                drop(claim_guard.take());
 
                 // Check if killed due to infinite loop
                 if was_loop_killed {
@@ -2209,9 +2279,7 @@ impl CliAgentTool {
                 Ok(final_result)
             }
             Ok(Err(_)) => {
-                if let Some(ref dir) = working_dir_owned {
-                    self.release_working_dir_claim(dir, &task_id).await;
-                }
+                drop(claim_guard.take());
                 // Channel closed unexpectedly
                 let error_msg =
                     format!("ERROR: CLI agent '{}' task failed unexpectedly", tool_name);
@@ -2246,6 +2314,11 @@ impl CliAgentTool {
                     working_dir: working_dir_owned,
                 };
                 self.running.lock().await.insert(task_id.clone(), agent);
+                // The reaper / cancel paths own the claim now (no await
+                // between the insert above and this disarm).
+                if let Some(guard) = claim_guard.as_mut() {
+                    guard.disarm();
+                }
 
                 Ok(format!(
                     "CLI agent '{}' still running after {}s. Moved to background (task_id={}).\n\
@@ -2360,7 +2433,7 @@ impl CliAgentTool {
 
         // Release working-dir claim owned by this task.
         if let Some(ref dir) = agent.working_dir {
-            self.release_working_dir_claim(dir, task_id).await;
+            self.release_working_dir_claim(dir, task_id);
         }
 
         // Try to kill the process
@@ -2412,7 +2485,7 @@ impl CliAgentTool {
         for (task_id, agent) in to_cancel {
             self.completed.lock().await.remove(&task_id);
             if let Some(ref dir) = agent.working_dir {
-                self.release_working_dir_claim(dir, &task_id).await;
+                self.release_working_dir_claim(dir, &task_id);
             }
             kill_process(agent.child_id).await;
             if let Some(ref delegated_task_id) = agent.delegated_task_id {
@@ -3214,7 +3287,7 @@ mod tests {
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
                 provider as Arc<dyn crate::traits::ModelProvider>,
@@ -3269,7 +3342,7 @@ mod tests {
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
                 provider as Arc<dyn crate::traits::ModelProvider>,
@@ -3483,7 +3556,7 @@ mod tests {
         let (tool, _db) = setup_bash_tool().await;
 
         // Seed a claim as if another task already owns this directory.
-        tool.working_dir_claims.lock().await.insert(
+        lock_claims(&tool.working_dir_claims).insert(
             "/tmp/project".to_string(),
             WorkingDirClaim {
                 task_id: "abc12345".to_string(),
@@ -3520,7 +3593,7 @@ mod tests {
         assert!(result.contains("done"));
 
         // Working-dir claim should be released after completion.
-        let claims = tool.working_dir_claims.lock().await;
+        let claims = lock_claims(&tool.working_dir_claims);
         assert!(
             !claims.contains_key(dir_path),
             "Working-dir claim not released after completion"
@@ -3577,7 +3650,7 @@ mod tests {
             result
         );
 
-        let claims = tool.working_dir_claims.lock().await;
+        let claims = lock_claims(&tool.working_dir_claims);
         assert!(
             !claims.contains_key(&normalized),
             "Working-dir claim should be released after spawn failure"
@@ -3705,10 +3778,103 @@ mod tests {
             result
         );
 
-        let claims = tool.working_dir_claims.lock().await;
+        let claims = lock_claims(&tool.working_dir_claims);
         assert!(
             !claims.contains_key(&normalized),
             "Working-dir claim should be released after semaphore rejection"
+        );
+    }
+
+    /// Regression test: a sync-mode dispatch future dropped mid-await (the
+    /// calling session was cancelled or timed out) must release its
+    /// working-dir claim. Before WorkingDirClaimGuard, this leaked the claim
+    /// permanently and blocked all future dispatches to the directory.
+    #[tokio::test]
+    async fn test_working_dir_claim_released_when_dispatch_future_dropped() {
+        let (tool, _db) = setup_bash_tool().await;
+        let tool = Arc::new(tool);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_string_lossy().to_string();
+        let normalized = CliAgentTool::normalize_working_dir(&dir);
+
+        let args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 15","working_dir":"{}"}}"#,
+            dir
+        );
+        let tool_for_task = Arc::clone(&tool);
+        let handle = tokio::spawn(async move { tool_for_task.call(&args).await });
+
+        // Wait until the dispatch has registered its claim.
+        let mut claimed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if lock_claims(&tool.working_dir_claims).contains_key(&normalized) {
+                claimed = true;
+                break;
+            }
+        }
+        assert!(claimed, "Working-dir claim was never registered");
+
+        // Abort the dispatching future mid-await (simulates the calling
+        // agent session being cancelled while waiting for completion).
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !lock_claims(&tool.working_dir_claims).contains_key(&normalized),
+            "Working-dir claim should be released when the dispatch future is dropped"
+        );
+    }
+
+    /// The guard must NOT release the claim once disarmed (background
+    /// handoff transfers ownership to the reaper / cancel paths).
+    #[tokio::test]
+    async fn test_claim_guard_disarm_keeps_claim() {
+        let claims: Arc<WorkingDirClaims> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        lock_claims(&claims).insert(
+            "/tmp/project".to_string(),
+            WorkingDirClaim {
+                task_id: "abc12345".to_string(),
+                tool_name: "bash-agent".to_string(),
+                prompt_summary: "sleep 60".to_string(),
+                dedup_prompt: make_dedup_prompt("sleep 60"),
+            },
+        );
+
+        let mut guard = WorkingDirClaimGuard::new(
+            Arc::clone(&claims),
+            "/tmp/project".to_string(),
+            "abc12345".to_string(),
+        );
+        guard.disarm();
+        drop(guard);
+        assert!(
+            lock_claims(&claims).contains_key("/tmp/project"),
+            "Disarmed guard must not release the claim"
+        );
+
+        // An armed guard owned by a DIFFERENT task must not steal the claim.
+        let other_guard = WorkingDirClaimGuard::new(
+            Arc::clone(&claims),
+            "/tmp/project".to_string(),
+            "other999".to_string(),
+        );
+        drop(other_guard);
+        assert!(
+            lock_claims(&claims).contains_key("/tmp/project"),
+            "Guard for a different task must not release someone else's claim"
+        );
+
+        // The owning guard releases it.
+        let owner_guard = WorkingDirClaimGuard::new(
+            Arc::clone(&claims),
+            "/tmp/project".to_string(),
+            "abc12345".to_string(),
+        );
+        drop(owner_guard);
+        assert!(
+            !lock_claims(&claims).contains_key("/tmp/project"),
+            "Owning guard must release the claim on drop"
         );
     }
 
@@ -4361,7 +4527,7 @@ mod tests {
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
                 provider as Arc<dyn crate::traits::ModelProvider>,
@@ -4431,7 +4597,7 @@ mod tests {
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
                 provider as Arc<dyn crate::traits::ModelProvider>,
@@ -4586,7 +4752,7 @@ mod tests {
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
-            working_dir_claims: Arc::new(Mutex::new(HashMap::new())),
+            working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
             state: state as Arc<dyn StateStore>,
             llm_runtime: SharedLlmRuntime::new(
                 provider as Arc<dyn crate::traits::ModelProvider>,

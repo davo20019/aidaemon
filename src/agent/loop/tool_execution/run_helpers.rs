@@ -6,7 +6,9 @@
 
 use super::project_dir::{is_recognized_project_root, scope_allows_project_dir};
 use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExecutionPlan};
+use crate::agent::prefix_fingerprint;
 use crate::agent::*;
+use crate::events::{Event, EventType, ToolCallData, ToolResultData};
 use crate::traits::{ToolCallSemantics, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind};
 use crate::utils::{truncate_str, truncate_with_note};
 
@@ -79,6 +81,62 @@ pub(super) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemant
         "system_info" => Some(ToolSemanticScope::HostLocal),
         _ => None,
     }
+}
+
+pub(super) fn duplicate_successful_tool_result_count(
+    events: &[Event],
+    tool_name: &str,
+    arguments_json: &str,
+    result_text: &str,
+) -> usize {
+    let argument_hash = canonical_tool_arguments_hash(arguments_json);
+    let current_result = normalized_tool_result_for_duplicate_detection(result_text);
+    let mut matching_call_ids = HashSet::new();
+    let mut duplicate_count = 0usize;
+
+    for event in events {
+        match event.event_type {
+            EventType::ToolCall => {
+                let Ok(call) = event.parse_data::<ToolCallData>() else {
+                    continue;
+                };
+                if call.name == tool_name
+                    && prefix_fingerprint::hash_canonical(&call.arguments) == argument_hash
+                {
+                    matching_call_ids.insert(call.tool_call_id);
+                }
+            }
+            EventType::ToolResult => {
+                let Ok(result) = event.parse_data::<ToolResultData>() else {
+                    continue;
+                };
+                if result.success
+                    && result.name == tool_name
+                    && matching_call_ids.contains(&result.tool_call_id)
+                    && normalized_tool_result_for_duplicate_detection(&result.result)
+                        == current_result
+                {
+                    duplicate_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    duplicate_count
+}
+
+pub(super) fn canonical_tool_arguments_hash(arguments_json: &str) -> String {
+    let value = serde_json::from_str::<Value>(arguments_json)
+        .unwrap_or_else(|_| Value::String(arguments_json.to_string()));
+    prefix_fingerprint::hash_canonical(&value)
+}
+
+fn normalized_tool_result_for_duplicate_detection(result_text: &str) -> String {
+    crate::traits::extract_primary_message_content(result_text, &[])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(super) fn semantic_scope_blocks_tool(
@@ -424,7 +482,12 @@ pub(super) fn build_terminal_fallback_arguments_from_run_command(
         .map(str::trim)
         .filter(|v| !v.is_empty());
     let terminal_command = if let Some(dir) = working_dir {
-        format!("cd {} && {}", shell_single_quote(dir), command)
+        // Create the working dir before cd-ing: the declared working_dir may
+        // not exist yet (the command itself may be about to create it), and
+        // a failing `cd` wastes whole agent iterations on EnvironmentFailure.
+        // `mkdir -p` is idempotent, so this is a no-op for existing dirs.
+        let quoted = shell_single_quote(dir);
+        format!("mkdir -p {quoted} && cd {quoted} && {command}")
     } else {
         command.to_string()
     };
@@ -817,6 +880,10 @@ mod tests {
 
     #[test]
     fn build_terminal_fallback_arguments_preserves_working_dir() {
+        // `mkdir -p` precedes the cd: the declared working_dir may not exist
+        // yet (e.g. the command itself was going to create it — observed
+        // 2026-06-06: `cd '~/tmp/attrib-run' && mkdir -p ~/tmp/attrib-run`
+        // failed twice because cd ran before the directory existed).
         let args = r#"{"command":"npm create vite@latest whatsapp-site -- --template react","working_dir":"/tmp/my folder"}"#;
         let terminal_args = build_terminal_fallback_arguments_from_run_command(args)
             .expect("fallback args expected");
@@ -824,7 +891,7 @@ mod tests {
         assert_eq!(parsed["action"], "run");
         assert_eq!(
             parsed["command"],
-            "cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
+            "mkdir -p '/tmp/my folder' && cd '/tmp/my folder' && npm create vite@latest whatsapp-site -- --template react"
         );
     }
 
@@ -836,7 +903,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&terminal_args).expect("valid json");
         assert_eq!(
             parsed["command"],
-            "cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
+            "mkdir -p '/tmp/david'\"'\"'s projects' && cd '/tmp/david'\"'\"'s projects' && npm create vite@latest whatsapp-site -- --template react"
         );
     }
 
@@ -1066,6 +1133,75 @@ mod tests {
                 .expect("step should remain active")
                 .step_index,
             1
+        );
+    }
+
+    #[test]
+    fn duplicate_successful_tool_result_requires_same_tool_args_and_result() {
+        let events = vec![
+            crate::events::Event::new(
+                "s1",
+                crate::events::EventType::ToolCall,
+                serde_json::json!({
+                    "tool_call_id": "call-1",
+                    "name": "terminal",
+                    "arguments": {"command": "wc -w file.txt"},
+                    "task_id": "task-1"
+                }),
+            ),
+            crate::events::Event::new(
+                "s1",
+                crate::events::EventType::ToolResult,
+                serde_json::json!({
+                    "tool_call_id": "call-1",
+                    "name": "terminal",
+                    "result": "64 file.txt\n",
+                    "success": true,
+                    "duration_ms": 10,
+                    "task_id": "task-1"
+                }),
+            ),
+            crate::events::Event::new(
+                "s1",
+                crate::events::EventType::ToolCall,
+                serde_json::json!({
+                    "tool_call_id": "call-2",
+                    "name": "terminal",
+                    "arguments": {"command": "wc -w other.txt"},
+                    "task_id": "task-1"
+                }),
+            ),
+            crate::events::Event::new(
+                "s1",
+                crate::events::EventType::ToolResult,
+                serde_json::json!({
+                    "tool_call_id": "call-2",
+                    "name": "terminal",
+                    "result": "12 other.txt\n",
+                    "success": true,
+                    "duration_ms": 10,
+                    "task_id": "task-1"
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            duplicate_successful_tool_result_count(
+                &events,
+                "terminal",
+                r#"{"command": "wc -w file.txt"}"#,
+                "  64   file.txt\n",
+            ),
+            1
+        );
+        assert_eq!(
+            duplicate_successful_tool_result_count(
+                &events,
+                "terminal",
+                r#"{"command": "wc -w file.txt"}"#,
+                "65 file.txt\n",
+            ),
+            0
         );
     }
 }

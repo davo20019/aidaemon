@@ -1,5 +1,18 @@
 use super::*;
 
+/// Telemetry captured during an LLM call with recovery, surfaced to the agent
+/// loop so it can be persisted as an `LlmCall` event. Populated via an out-param
+/// so the many return points in `call_llm_with_recovery` stay untouched.
+#[derive(Debug, Clone, Default)]
+pub(in crate::agent) struct LlmCallTelemetry {
+    /// Model that actually produced the successful response.
+    pub final_model: String,
+    /// Whether recovery cascaded to a different model/provider.
+    pub fell_back: bool,
+    /// Total provider calls attempted (1 = succeeded on the first try).
+    pub attempts: u32,
+}
+
 fn malformed_reason_label(
     reason: Option<crate::providers::MalformedResponseReason>,
 ) -> &'static str {
@@ -61,7 +74,10 @@ impl Agent {
         tool_defs: &[Value],
         options: &ChatOptions,
         last_err: &ProviderError,
+        telemetry: &mut LlmCallTelemetry,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        // Entering the cascade means the original call already failed.
+        telemetry.fell_back = true;
         let mut tried: Vec<String> = vec![failed_model.to_string()];
         let mut final_err = last_err.clone();
         let mut attempt = 1;
@@ -86,6 +102,7 @@ impl Agent {
                 "Primary-provider fallback attempt"
             );
 
+            telemetry.attempts += 1;
             match tokio::time::timeout(
                 Self::CASCADE_ATTEMPT_TIMEOUT,
                 provider.chat_with_options(&fallback, messages, tool_defs, options),
@@ -94,6 +111,7 @@ impl Agent {
             {
                 Ok(Ok(resp)) => {
                     self.stamp_lastgood().await;
+                    telemetry.final_model = fallback;
                     return Ok(resp);
                 }
                 Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
@@ -126,6 +144,7 @@ impl Agent {
                     "Provider failover attempt"
                 );
 
+                telemetry.attempts += 1;
                 match tokio::time::timeout(
                     Self::CASCADE_ATTEMPT_TIMEOUT,
                     target
@@ -136,6 +155,7 @@ impl Agent {
                 {
                     Ok(Ok(resp)) => {
                         self.stamp_lastgood().await;
+                        telemetry.final_model = model;
                         return Ok(resp);
                     }
                     Ok(Err(retry_err)) => match retry_err.downcast::<ProviderError>() {
@@ -233,6 +253,7 @@ impl Agent {
     /// Cascade fallback now means:
     /// 1. Other models on the current provider
     /// 2. Configured failover providers and their model chains
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_llm_with_recovery(
         &self,
         provider: Arc<dyn ModelProvider>,
@@ -241,7 +262,14 @@ impl Agent {
         messages: &[Value],
         tool_defs: &[Value],
         options: &ChatOptions,
+        telemetry: &mut LlmCallTelemetry,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        // Default telemetry: first attempt, no fallback, on the requested model.
+        // Recovery paths below mutate this as they retry/cascade.
+        telemetry.final_model = model.to_string();
+        telemetry.fell_back = false;
+        telemetry.attempts = 1;
+
         // --- Billing failure cache: skip models that recently 402'd ---
         {
             let cache = self.billing_failed_models.read().await;
@@ -270,6 +298,7 @@ impl Agent {
                             tool_defs,
                             options,
                             &billing_err,
+                            telemetry,
                         )
                         .await;
                 }
@@ -380,6 +409,7 @@ impl Agent {
                             tool_defs,
                             options,
                             &provider_err,
+                            telemetry,
                         )
                         .await
                     }
@@ -420,6 +450,7 @@ impl Agent {
                                 "Rate limited, waiting before retry"
                             );
                             tokio::time::sleep(Duration::from_secs(wait)).await;
+                            telemetry.attempts += 1;
                             match provider
                                 .chat_with_options(model, messages, tool_defs, options)
                                 .await
@@ -441,6 +472,7 @@ impl Agent {
                             tool_defs,
                             options,
                             &provider_err,
+                            telemetry,
                         )
                         .await
                     }
@@ -458,6 +490,7 @@ impl Agent {
                                 "Retrying after transient error"
                             );
                             tokio::time::sleep(Duration::from_secs(wait)).await;
+                            telemetry.attempts += 1;
                             match provider
                                 .chat_with_options(model, messages, tool_defs, options)
                                 .await
@@ -479,6 +512,7 @@ impl Agent {
                             tool_defs,
                             options,
                             &provider_err,
+                            telemetry,
                         )
                         .await
                     }
@@ -519,6 +553,7 @@ impl Agent {
                                     tool_defs,
                                     options,
                                     &provider_err,
+                                    telemetry,
                                 )
                                 .await;
                         }
@@ -559,6 +594,7 @@ impl Agent {
                             tool_defs,
                             options,
                             &provider_err,
+                            telemetry,
                         )
                         .await
                     }
@@ -665,6 +701,7 @@ mod tests {
             )],
         );
 
+        let mut telemetry = super::LlmCallTelemetry::default();
         let resp = harness
             .agent
             .call_llm_with_recovery(
@@ -674,6 +711,7 @@ mod tests {
                 &[],
                 &[],
                 &ChatOptions::default(),
+                &mut telemetry,
             )
             .await
             .expect("recover via alternate provider");
@@ -685,6 +723,13 @@ mod tests {
         assert_eq!(
             alternate_provider.models_called().await,
             vec!["secondary-model".to_string()]
+        );
+        assert!(telemetry.fell_back, "expected fallback to be recorded");
+        assert_eq!(telemetry.final_model, "secondary-model");
+        assert!(
+            telemetry.attempts >= 2,
+            "expected multiple attempts, got {}",
+            telemetry.attempts
         );
     }
 }

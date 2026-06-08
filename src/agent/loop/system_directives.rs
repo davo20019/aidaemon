@@ -164,6 +164,12 @@ pub(in crate::agent) enum SystemDirective {
     PlanSuggestion {
         hint: String,
     },
+    /// User challenged the immediately previous answer ("Are you sure?").
+    /// Anchor the model to that exchange only.
+    ReaffirmationChallengeAnchor {
+        prior_user_request: Option<String>,
+        prior_assistant_reply: String,
+    },
 }
 
 impl SystemDirective {
@@ -287,19 +293,17 @@ impl SystemDirective {
             Self::ReadSaturationCritical { read_desc } => format!(
                 "[SYSTEM] CRITICAL: {} \
                  without making meaningful changes. Read tools have been REMOVED.\n\n\
-                 You MUST act NOW with one of these tools:\n\
-                 - `write_file` to rewrite the file with all your fixes applied\n\
-                 - `edit_file` to apply a specific fix to the code\n\
-                 - `terminal` to run tests or commands\n\n\
                  You already have enough information from your previous reads. \
-                 Write the corrected code NOW.",
+                 Answer the user now, or use the appropriate non-read action tool if the request \
+                 requires an action. Do not claim information is unavailable merely because read \
+                 tools were removed.",
                 read_desc
             ),
             Self::ReadSaturationWarning { consecutive_reads } => format!(
                 "[SYSTEM] WARNING: You have called read-only tools {} times in a row. \
-                 STOP reading and ACT NOW.\n\n\
-                 You MUST use `edit_file`, `write_file`, or `terminal` as your NEXT tool call. \
-                 Do NOT call read_file again — you already have the information you need. \
+                 STOP reading and use the information already available. \
+                 Answer the user now, or use an appropriate action tool only if the request \
+                 requires one. Do NOT call read_file again. \
                  If you read again, your read tools will be removed.",
                 consecutive_reads
             ),
@@ -469,10 +473,35 @@ impl SystemDirective {
                  2. Explains WHY you made each choice\n\
                  3. Shows relevant results (test output, file paths, etc.)\n\
                  4. Answers any specific questions the user asked\n\n\
-                 Do NOT just dump raw tool output. Write a clear, structured response.",
+                 Do NOT print raw tool-call syntax like call:terminal or <|tool_call>. \
+                 If you still need a tool, call it using the structured tool interface. \
+                 Otherwise, write a clear, structured response.",
                 user_text_hint
             ),
             Self::PlanSuggestion { hint } => hint.clone(),
+            Self::ReaffirmationChallengeAnchor {
+                prior_user_request,
+                prior_assistant_reply,
+            } => {
+                let mut lines = vec![
+                    "[SYSTEM] REAFFIRMATION CHALLENGE: The user is challenging your immediately previous answer, not an earlier topic.".to_string(),
+                    "Reply ONLY about the exchange below. Do NOT mention unrelated earlier topics, tools, goals, or session activity.".to_string(),
+                ];
+                if let Some(request) = prior_user_request {
+                    lines.push(format!(
+                        "Prior user request: \"{}\"",
+                        crate::utils::truncate_str(request, 240)
+                    ));
+                }
+                lines.push(format!(
+                    "Your prior answer: \"{}\"",
+                    crate::utils::truncate_str(prior_assistant_reply, 400)
+                ));
+                lines.push(
+                    "Either reaffirm that answer with brief justification, or correct it if you were wrong. Keep the reply focused on this exchange only.".to_string(),
+                );
+                lines.join("\n")
+            }
         }
     }
 }
@@ -629,5 +658,37 @@ mod tests {
             SystemDirective::OutcomeReconciliation("[SYSTEM] 1 of 2 attempts failed.".to_string());
         let rendered = directive.render();
         assert!(rendered.contains("1 of 2 attempts failed"));
+    }
+
+    #[test]
+    fn reaffirmation_challenge_anchor_render_focuses_prior_exchange() {
+        let rendered = SystemDirective::ReaffirmationChallengeAnchor {
+            prior_user_request: Some("How many R's in strawberry?".to_string()),
+            prior_assistant_reply: "There are 3 R's in strawberry.".to_string(),
+        }
+        .render();
+
+        assert!(rendered.contains("REAFFIRMATION CHALLENGE"));
+        assert!(rendered.contains("How many R's in strawberry?"));
+        assert!(rendered.contains("There are 3 R's in strawberry."));
+        assert!(rendered.contains("Do NOT mention unrelated earlier topics"));
+    }
+
+    #[test]
+    fn read_saturation_directives_are_task_neutral() {
+        for rendered in [
+            SystemDirective::ReadSaturationWarning {
+                consecutive_reads: 5,
+            }
+            .render(),
+            SystemDirective::ReadSaturationCritical {
+                read_desc: "Repeated reads".to_string(),
+            }
+            .render(),
+        ] {
+            assert!(rendered.contains("Answer the user"));
+            assert!(!rendered.contains("MUST use `write_file`"));
+            assert!(!rendered.contains("Write the corrected code"));
+        }
     }
 }

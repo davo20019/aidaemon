@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::warn;
 
+use crate::events::TaskOutcome;
 use crate::traits::StateStore;
 
 use super::{extract_key_error_line, semantic_failure_limit, MAX_CONSECUTIVE_SAME_TOOL};
@@ -52,6 +53,8 @@ pub(super) struct LearningContext {
     pub(super) completed_naturally: bool,
     pub(super) explicit_positive_signals: u32,
     pub(super) explicit_negative_signals: u32,
+    /// Semantic outcome emitted at task end; authoritative for learning when set.
+    pub(super) task_outcome: Option<TaskOutcome>,
     pub(super) replay_notes: Vec<ReplayNote>,
 }
 
@@ -94,17 +97,18 @@ pub(super) async fn process_learning(
 ) -> anyhow::Result<()> {
     use crate::memory::{expertise, procedures};
 
-    // Determine if task was successful
-    let unrecovered_errors = ctx
-        .errors
-        .iter()
-        .filter(|(_, recovered)| !recovered)
-        .count();
-    let task_success = if ctx.explicit_negative_signals > 0 {
+    let task_success = if let Some(outcome) = ctx.task_outcome {
+        outcome.task_success()
+    } else if ctx.explicit_negative_signals > 0 {
         false
     } else if ctx.explicit_positive_signals > 0 {
         true
     } else {
+        let unrecovered_errors = ctx
+            .errors
+            .iter()
+            .filter(|(_, recovered)| !recovered)
+            .count();
         ctx.completed_naturally && unrecovered_errors == 0
     };
 
@@ -1088,6 +1092,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
         let result = graceful_budget_response(&ctx, 500_000);
@@ -1122,6 +1127,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
         let result = graceful_budget_response(&ctx, 500_000);
@@ -1144,6 +1150,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
 
@@ -1172,6 +1179,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
         let result = graceful_partial_stall_response(&ctx, false, "deferred", &HashMap::new());
@@ -1214,6 +1222,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         }
     }
@@ -1301,6 +1310,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         }
     }
@@ -1420,6 +1430,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 1,
+            task_outcome: None,
             replay_notes: vec![ReplayNote {
                 category: ReplayNoteCategory::ValidationFailure,
                 code: "verification_pending".to_string(),
@@ -1570,5 +1581,38 @@ mod tests {
         let ctx = make_learning_ctx(); // no errors
         let result = graceful_stall_response(&ctx, false, "deferred-no-tool", &HashMap::new());
         assert!(!result.contains("Issues encountered:"));
+    }
+
+    #[test]
+    fn process_learning_uses_task_outcome_for_partial_and_failed() {
+        let partial_ctx = LearningContext {
+            user_text: "inspect homepage".to_string(),
+            intent_domains: vec!["web".to_string()],
+            tool_calls: vec!["browser(navigate)".to_string()],
+            errors: vec![],
+            first_error: None,
+            recovery_actions: vec![],
+            start_time: Utc::now(),
+            completed_naturally: true,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+            task_outcome: Some(crate::events::TaskOutcome::Partial),
+            replay_notes: Vec::new(),
+        };
+        assert!(!crate::events::TaskOutcome::Partial.task_success());
+
+        let failed_ctx = LearningContext {
+            task_outcome: Some(crate::events::TaskOutcome::Failed),
+            ..partial_ctx.clone()
+        };
+        assert!(!crate::events::TaskOutcome::Failed.task_success());
+        assert!(!failed_ctx.task_outcome.unwrap().task_success());
+
+        let succeeded_ctx = LearningContext {
+            task_outcome: Some(crate::events::TaskOutcome::Succeeded),
+            ..partial_ctx
+        };
+        assert!(crate::events::TaskOutcome::Succeeded.task_success());
+        assert!(succeeded_ctx.task_outcome.unwrap().task_success());
     }
 }

@@ -357,6 +357,115 @@ async fn test_personal_recall_challenge_inherits_previous_turn_context() {
 }
 
 #[tokio::test]
+async fn test_general_reaffirmation_challenge_injects_prior_answer_anchor() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("There are 3 R's in strawberry."),
+        MockProvider::text_response("Yes — strawberry has 3 R's."),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let first = harness
+        .agent
+        .handle_message(
+            "reaffirm_anchor_test",
+            "How many R's in strawberry?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        first.contains("3 R"),
+        "Expected strawberry answer, got: {}",
+        first
+    );
+
+    let _second = harness
+        .agent
+        .handle_message(
+            "reaffirm_anchor_test",
+            "Are you sure?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let challenge_call = call_log.last().expect("challenge turn LLM call");
+    let has_anchor = challenge_call.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(|content| content.as_str())
+            .is_some_and(|text| {
+                text.contains("REAFFIRMATION CHALLENGE")
+                    && text.contains("How many R's in strawberry?")
+                    && text.contains("There are 3 R's in strawberry.")
+            })
+    });
+    assert!(
+        has_anchor,
+        "Challenge turn should inject reaffirmation anchor for the immediately previous exchange: {:?}",
+        challenge_call.messages
+    );
+}
+
+#[tokio::test]
+async fn test_compound_message_with_challenge_keyword_skips_reaffirmation_anchor() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("There are 3 R's in strawberry."),
+        MockProvider::text_response("Here is the blog post about Ecuador."),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "reaffirm_anchor_negative_test",
+            "How many R's in strawberry?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Contains the word "really" but is a new task, not a vague challenge of
+    // the previous answer — the anchor directive must NOT be injected.
+    harness
+        .agent
+        .handle_message(
+            "reaffirm_anchor_negative_test",
+            "I really need you to write a blog post about Ecuador",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let second_call = call_log.last().expect("second turn LLM call");
+    let has_anchor = second_call.messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(|content| content.as_str())
+            .is_some_and(|text| text.contains("REAFFIRMATION CHALLENGE"))
+    });
+    assert!(
+        !has_anchor,
+        "Compound new-task message must not be pinned to the previous exchange: {:?}",
+        second_call.messages
+    );
+}
+
+#[tokio::test]
 async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
     let provider = MockProvider::with_responses(vec![MockProvider::text_response(
         "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
@@ -1058,4 +1167,140 @@ async fn test_orchestration_schedule_new_message_cancels_pending() {
         .unwrap();
     assert_eq!(goals.len(), 1);
     assert_eq!(goals[0].status, "cancelled");
+}
+
+#[tokio::test]
+async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
+    // Reproduces the 2026-06-06 attribution-run turn-10 bug: the model
+    // claimed "I have deleted the folder" without making a single tool
+    // call, and the completion phase accepted it. A past-tense side-effect
+    // claim in a zero-tool task with a mutation contract must be treated
+    // like a deferred action: nudged with a hard tool requirement, never
+    // accepted as the final answer.
+    let fabrication = "I have deleted the folder /tmp/fab-test entirely.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(fabrication),
+        MockProvider::text_response(fabrication),
+        MockProvider::text_response(
+            "I could not verify the deletion because no command was run.",
+        ),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "test_session",
+            "Delete the folder /tmp/fab-test entirely.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The fabricated claim must not survive as the final answer.
+    assert!(
+        !response.contains("I have deleted"),
+        "fabricated zero-tool mutation claim was accepted as completion: {response}"
+    );
+
+    // The loop must have continued past the first reply, and the hard
+    // tool-call requirement directive must have been injected.
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls.len() >= 2,
+        "completion was accepted on the first iteration (calls={})",
+        calls.len()
+    );
+    let nudged = calls.iter().skip(1).any(|c| {
+        c.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|t| t.contains("MUST include at least one tool call"))
+        })
+    });
+    assert!(
+        nudged,
+        "DeferredToolCallRequired directive was not injected after the fabricated claim"
+    );
+
+    let event_store = crate::events::EventStore::new(harness.state.pool())
+        .await
+        .expect("event store from harness pool");
+    let events = event_store
+        .query_recent_events("test_session", 200)
+        .await
+        .expect("recent events");
+    let saw_mutation_gate_warning = events.iter().any(|event| {
+        let Ok(data) = event.parse_data::<crate::events::DecisionPointData>() else {
+            return false;
+        };
+        data.decision_type == crate::events::DecisionType::PostExecutionValidation
+            && data
+                .metadata
+                .get("condition")
+                .and_then(serde_json::Value::as_str)
+                == Some("expects_mutation_gate_evaluated")
+            && data
+                .metadata
+                .get("assistant_claimed_mutation")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && data
+                .metadata
+                .get("mutation_tool_calls_count")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+            && data
+                .metadata
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                == Some("blocked_claimed_mutation_without_tool")
+    });
+    assert!(
+        saw_mutation_gate_warning,
+        "mutation gate did not emit explicit warning telemetry for fabricated zero-tool mutation claim"
+    );
+}
+
+#[tokio::test]
+async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
+    let fabrication =
+        "I've initiated a deep analysis using a specialized review agent. I'll return shortly.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(fabrication),
+        MockProvider::text_response(
+            "I could not start a specialist agent, so no delegated review is running.",
+        ),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "fabricated_delegation",
+            "Analyze that resume. Any flaws?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response.contains("I've initiated"),
+        "fabricated zero-tool delegation claim was accepted: {response}"
+    );
+    let calls = harness.provider.call_log.lock().await;
+    assert!(calls.len() >= 2);
+    assert!(calls.iter().skip(1).any(|call| {
+        call.messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("MUST include at least one tool call"))
+        })
+    }));
 }

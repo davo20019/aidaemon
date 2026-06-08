@@ -5,8 +5,10 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+    ReadFileResultMetadata, ReadFileSelectionMetadata, Tool, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
+use crate::types::StatusUpdate;
 
 use super::fs_utils;
 
@@ -21,13 +23,13 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers and basic metadata. Supports line ranges and tail selection."
+        "Read file contents with line numbers and metadata. Read a fitting file in full once; for large files, search first and then read one exact non-overlapping range."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "read_file",
-            "description": "Read file contents with line numbers and basic metadata like size and modified time. Use this instead of terminal cat/head/tail. Supports reading specific line ranges or the last N lines for large files.",
+            "description": "Read file contents with line numbers and metadata. Use this instead of terminal cat/head/tail. Read a file in full once when it fits the limit. For a large file with an unknown target location, use search_files first, then read one exact surrounding range. Sequential ranges must not overlap; previously covered content is replayed from the task-local artifact.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,6 +89,20 @@ impl Tool for ReadFileTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.read_outcome(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.read_outcome(arguments).await
+    }
+}
+
+impl ReadFileTool {
+    async fn read_outcome(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         // Parameter aliasing: models often use "file_path" or "file" instead of "path"
         let path_str = args["path"]
@@ -118,7 +134,7 @@ impl Tool for ReadFileTool {
                 out.push_str(&format!("Modified: {}\n", modified));
             }
             out.push_str("Type: binary (cannot display contents)");
-            return Ok(out);
+            return Ok(ToolCallOutcome::from_output(out));
         }
 
         let start = args["start_line"]
@@ -163,11 +179,52 @@ impl Tool for ReadFileTool {
 
         let selected = read_selected_lines(&path, selection).await?;
         let total_lines = selected.total_lines;
+        let selection_metadata = match selection {
+            ReadSelection::Full => ReadFileSelectionMetadata::Full,
+            ReadSelection::Range {
+                start,
+                end_exclusive: Some(end),
+            } => ReadFileSelectionMetadata::BoundedRange {
+                start_line: start + 1,
+                end_line: end,
+            },
+            ReadSelection::Range {
+                start,
+                end_exclusive: None,
+            } => ReadFileSelectionMetadata::OpenEndedRange {
+                start_line: start + 1,
+            },
+            ReadSelection::Tail { count } => ReadFileSelectionMetadata::Tail {
+                requested_lines: count,
+            },
+        };
+        let canonical_path = tokio::fs::canonicalize(&path)
+            .await
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .into_owned();
+        let read_metadata = ReadFileResultMetadata {
+            display_path: path_str.to_string(),
+            canonical_path,
+            selection: selection_metadata,
+            returned_start_line: (!selected.lines.is_empty()).then_some(selected.start_index + 1),
+            returned_end_line: (!selected.lines.is_empty()).then_some(selected.end_display),
+            total_lines,
+            file_size,
+            modified: modified.clone(),
+            selected_lines: selected.lines.clone(),
+        };
 
         if total_lines == 0 {
             let header =
                 format_text_file_header(path_str, "0 lines, empty", file_size, modified.as_deref());
-            return Ok(header.trim_end().to_string());
+            return Ok(ToolCallOutcome {
+                output: header.trim_end().to_string(),
+                metadata: ToolCallMetadata {
+                    read_file: Some(read_metadata),
+                    ..ToolCallMetadata::default()
+                },
+            });
         }
 
         if selected.start_index >= total_lines {
@@ -178,26 +235,54 @@ impl Tool for ReadFileTool {
             );
         }
 
-        let selected_content = selected.lines.join("\n");
-        let formatted = fs_utils::format_with_line_numbers(&selected_content, selected.start_index);
-
-        let header_summary = match selection {
-            ReadSelection::Full => format!("{} lines", total_lines),
-            ReadSelection::Range { .. } => format!(
-                "lines {}-{} of {}",
-                selected.start_index + 1,
-                selected.end_display,
-                total_lines
-            ),
-            ReadSelection::Tail { .. } => {
-                format!("last {} lines of {}", selected.lines.len(), total_lines)
-            }
-        };
-        let header =
-            format_text_file_header(path_str, &header_summary, file_size, modified.as_deref());
-
-        Ok(format!("{}{}", header, formatted))
+        Ok(ToolCallOutcome {
+            output: render_read_file_output(&read_metadata),
+            metadata: ToolCallMetadata {
+                read_file: Some(read_metadata),
+                ..ToolCallMetadata::default()
+            },
+        })
     }
+}
+
+pub(crate) fn render_read_file_output(metadata: &ReadFileResultMetadata) -> String {
+    if metadata.total_lines == 0 {
+        return format_text_file_header(
+            &metadata.display_path,
+            "0 lines, empty",
+            metadata.file_size,
+            metadata.modified.as_deref(),
+        )
+        .trim_end()
+        .to_string();
+    }
+
+    let start_line = metadata.returned_start_line.unwrap_or(1);
+    let end_line = metadata.returned_end_line.unwrap_or(start_line);
+    let header_summary = match metadata.selection {
+        ReadFileSelectionMetadata::Full => format!("{} lines", metadata.total_lines),
+        ReadFileSelectionMetadata::BoundedRange { .. }
+        | ReadFileSelectionMetadata::OpenEndedRange { .. } => {
+            format!(
+                "lines {}-{} of {}",
+                start_line, end_line, metadata.total_lines
+            )
+        }
+        ReadFileSelectionMetadata::Tail { .. } => format!(
+            "last {} lines of {}",
+            metadata.selected_lines.len(),
+            metadata.total_lines
+        ),
+    };
+    let header = format_text_file_header(
+        &metadata.display_path,
+        &header_summary,
+        metadata.file_size,
+        metadata.modified.as_deref(),
+    );
+    let selected_content = metadata.selected_lines.join("\n");
+    let formatted = fs_utils::format_with_line_numbers(&selected_content, start_line - 1);
+    format!("{}{}", header, formatted)
 }
 
 #[derive(Clone, Copy)]
@@ -336,6 +421,92 @@ mod tests {
         assert!(result.contains("3 lines"));
         assert!(result.contains("bytes"));
         assert!(result.contains("modified"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_outcome_includes_complete_typed_metadata() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "line one\nline two\nline three\n").unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome
+            .metadata
+            .read_file
+            .expect("text reads should expose typed metadata");
+
+        assert_eq!(metadata.display_path, f.path().to_str().unwrap());
+        assert_eq!(metadata.returned_start_line, Some(1));
+        assert_eq!(metadata.returned_end_line, Some(3));
+        assert_eq!(metadata.total_lines, 3);
+        assert_eq!(
+            metadata.selected_lines,
+            vec!["line one", "line two", "line three"]
+        );
+        assert!(matches!(
+            metadata.selection,
+            ReadFileSelectionMetadata::Full
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_range_outcome_metadata_preserves_raw_lines() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc\nd\ne\n").unwrap();
+        let args =
+            json!({"path": f.path().to_str().unwrap(), "start_line": 2, "end_line": 4}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome.metadata.read_file.unwrap();
+
+        assert_eq!(metadata.returned_start_line, Some(2));
+        assert_eq!(metadata.returned_end_line, Some(4));
+        assert_eq!(metadata.selected_lines, vec!["b", "c", "d"]);
+        assert!(matches!(
+            metadata.selection,
+            ReadFileSelectionMetadata::BoundedRange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_empty_file_is_a_typed_full_artifact() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome.metadata.read_file.unwrap();
+
+        assert!(matches!(
+            metadata.selection,
+            ReadFileSelectionMetadata::Full
+        ));
+        assert_eq!(metadata.total_lines, 0);
+        assert_eq!(metadata.returned_start_line, None);
+        assert_eq!(metadata.returned_end_line, None);
+        assert!(metadata.selected_lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_binary_file_has_no_typed_read_artifact() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0xFF, 0xD8, 0xFF, 0x00, 0x10, 0x00]).unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.metadata.read_file.is_none());
     }
 
     #[tokio::test]

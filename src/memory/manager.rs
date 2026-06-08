@@ -1,5 +1,5 @@
 use crate::config::PeopleConfig;
-use crate::events::Consolidator;
+use crate::events::{Consolidator, EventStore};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
 use crate::memory::embeddings::EmbeddingService;
@@ -21,6 +21,7 @@ pub struct MemoryManager {
     llm_runtime: SharedLlmRuntime,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
+    event_store: Option<Arc<EventStore>>,
     state: Option<Arc<dyn StateStore>>,
     people_config: PeopleConfig,
 }
@@ -39,9 +40,15 @@ impl MemoryManager {
             llm_runtime,
             consolidation_interval,
             consolidator,
+            event_store: None,
             state: None,
             people_config: PeopleConfig::default(),
         }
+    }
+
+    pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
+        self.event_store = Some(event_store);
+        self
     }
 
     /// Set the state store for people fact routing.
@@ -639,17 +646,24 @@ impl MemoryManager {
             // Call LLM with fast model, no tools
             let runtime_snapshot = self.llm_runtime.snapshot();
             let fast_model = runtime_snapshot.fast_model();
+            let call_start = std::time::Instant::now();
             match runtime_snapshot
                 .provider()
                 .chat(&fast_model, &llm_messages, &[])
                 .await
             {
                 Ok(response) => {
-                    // Track token usage for background LLM calls
-                    if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
-                        let _ = state
-                            .record_token_usage("background:memory_consolidation", usage)
-                            .await;
+                    if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
+                        crate::events::record_background_model_call_telemetry(
+                            event_store.clone(),
+                            state.as_ref(),
+                            "background:memory_consolidation",
+                            "memory_consolidation",
+                            &fast_model,
+                            &response,
+                            call_start.elapsed(),
+                        )
+                        .await;
                     }
                     if let Some(text) = &response.content {
                         match parse_consolidation_response(text) {
@@ -1261,16 +1275,23 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
         let runtime_snapshot = self.llm_runtime.snapshot();
         let fast_model = runtime_snapshot.fast_model();
+        let call_start = std::time::Instant::now();
         let response = runtime_snapshot
             .provider()
             .chat(&fast_model, &llm_messages, &[])
             .await?;
 
-        // Track token usage for background LLM calls
-        if let (Some(state), Some(usage)) = (&self.state, &response.usage) {
-            let _ = state
-                .record_token_usage("background:episode_creation", usage)
-                .await;
+        if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
+            crate::events::record_background_model_call_telemetry(
+                event_store.clone(),
+                state.as_ref(),
+                "background:episode_creation",
+                "episode_creation",
+                &fast_model,
+                &response,
+                call_start.elapsed(),
+            )
+            .await;
         }
 
         let text = response

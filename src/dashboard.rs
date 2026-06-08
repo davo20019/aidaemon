@@ -98,6 +98,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/queues", get(api_queues))
         .route("/api/writes/consistency", get(api_writes_consistency))
         .route("/api/policy/metrics", get(api_policy_metrics))
+        .route("/api/llm/latency", get(api_llm_latency))
         .route("/api/health/probes", get(api_health_probes))
         .route("/api/health/history", get(api_health_history))
         .route("/api/health/summary", get(api_health_summary))
@@ -558,6 +559,46 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "llm_payload_invalid_total": metrics.llm_payload_invalid_total,
         "llm_payload_invalid_breakdown": metrics.llm_payload_invalid_breakdown
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct LlmLatencyQuery {
+    #[serde(default = "default_llm_latency_hours")]
+    hours: i64,
+}
+
+fn default_llm_latency_hours() -> i64 {
+    24
+}
+
+/// Aggregated LLM call latency + token telemetry over a lookback window,
+/// sourced from `llm_call` events.
+async fn api_llm_latency(
+    State(state): State<DashboardState>,
+    Query(q): Query<LlmLatencyQuery>,
+) -> Json<serde_json::Value> {
+    let Some(store) = &state.event_store else {
+        return Json(json!({ "error": "Event store not available" }));
+    };
+    let hours = q.hours.clamp(1, 720);
+    let since = chrono::Utc::now() - chrono::Duration::hours(hours);
+    match store.get_llm_stats(since).await {
+        Ok(stats) => Json(json!({
+            "window_hours": hours,
+            "total_calls": stats.total_calls,
+            "avg_latency_ms": stats.avg_latency_ms,
+            "p50_latency_ms": stats.p50_latency_ms,
+            "p95_latency_ms": stats.p95_latency_ms,
+            "max_latency_ms": stats.max_latency_ms,
+            "fell_back_count": stats.fell_back_count,
+            "avg_input_tokens": stats.avg_input_tokens,
+            "avg_output_tokens": stats.avg_output_tokens,
+        })),
+        Err(e) => {
+            warn!(error = %e, "Failed to compute LLM latency stats");
+            Json(json!({ "error": format!("failed to compute llm stats: {}", e) }))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

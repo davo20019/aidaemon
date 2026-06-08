@@ -108,6 +108,8 @@ impl MockProvider {
             usage: Some(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -128,6 +130,8 @@ impl MockProvider {
             usage: Some(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -448,6 +452,7 @@ async fn setup_test_agent_internal(
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        None, // interactive_slot — slot routing not exercised in tests
     );
 
     if use_test_executor_mode {
@@ -549,6 +554,7 @@ pub async fn setup_test_agent_with_models(
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        None, // interactive_slot — slot routing not exercised in tests
     );
     // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
 
@@ -635,6 +641,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        None, // interactive_slot — slot routing not exercised in tests
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -868,6 +875,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
+        None, // interactive_slot — slot routing not exercised in tests
     );
 
     // Set executor mode so tests exercise the execution loop directly

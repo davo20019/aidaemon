@@ -7,6 +7,7 @@ use super::types::ToolExecutionOutcome;
 use crate::agent::loop_utils;
 use crate::agent::recall_guardrails::tool_result_indicates_no_evidence;
 use crate::agent::*;
+use crate::events::TaskOutcome;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -167,6 +168,20 @@ fn should_skip_transient_cooldown(tool_name: &str, error_text: &str) -> bool {
     loop_utils::is_file_lookup_miss_for_tool(tool_name, &lower)
 }
 
+fn is_browser_launch_failure(tool_name: &str, error_text: &str) -> bool {
+    if tool_name != "browser" {
+        return false;
+    }
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("failed to launch browser")
+        || lower.contains("singletonlock")
+        || lower.contains("before websocket url could be resolved")
+        || lower.contains("browser process exited")
+        || lower.contains("user data directory is already in use")
+        || lower.contains("devtoolsactiveport")
+        || lower.contains("failed to connect to browser websocket")
+}
+
 fn derive_failure_signature(error_text: &str) -> String {
     let key_line = extract_key_error_line(error_text);
     let normalized = normalize_error_line_for_signature(&key_line);
@@ -274,6 +289,9 @@ pub(super) async fn apply_result_learning(
                         cooldown_iters,
                     },
                 );
+            }
+            if is_browser_launch_failure(&tc.name, &base_error) {
+                append_tool_result_notice(result_text, &ToolResultNotice::BrowserLaunchFallback);
             }
         } else {
             let failure = record_semantic_failure_signature(
@@ -612,6 +630,7 @@ pub(super) async fn apply_result_learning(
                 env.emitter,
                 env.task_id,
                 TaskStatus::Completed,
+                TaskOutcome::Succeeded,
                 env.task_start,
                 env.iteration,
                 state.learning_ctx.tool_calls.len(),
@@ -891,6 +910,30 @@ mod tests {
         ));
         assert!(!user_looks_like_fact_storage_request(
             "run scheduled goals now"
+        ));
+    }
+
+    #[test]
+    fn browser_launch_failure_detection_matches_singleton_lock() {
+        let error = "Failed to launch browser: Browser process exited before websocket URL could be resolved, stderr: BrowserStderr(\"SingletonLock: File exists\")";
+        assert!(is_browser_launch_failure("browser", error));
+        assert!(!is_browser_launch_failure("web_fetch", error));
+        assert!(!is_browser_launch_failure("browser", "HTTP 404 Not Found"));
+    }
+
+    #[test]
+    fn browser_launch_failure_detection_handles_profile_and_devtools_failures() {
+        assert!(is_browser_launch_failure(
+            "browser",
+            "Chrome failed to start: user data directory is already in use"
+        ));
+        assert!(is_browser_launch_failure(
+            "browser",
+            "DevToolsActivePort file doesn't exist; browser process crashed"
+        ));
+        assert!(is_browser_launch_failure(
+            "browser",
+            "failed to connect to browser websocket endpoint"
         ));
     }
 

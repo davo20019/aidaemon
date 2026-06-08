@@ -429,6 +429,12 @@ pub struct Agent {
     /// the payload. Eviction advances it. Consumed by the message-build
     /// integration (Pillar B Task 7).
     turn_anchors: TurnAnchorMemory,
+    /// llama.cpp interactive KV-cache slot for the main generation loop.
+    /// `Some(interactive_slot)` only when slot routing is enabled on the primary
+    /// provider; `None` otherwise (and for all sub-agents). When set, it is
+    /// applied to the main-loop `ChatOptions.id_slot` so the interactive
+    /// conversation pins a dedicated slot that background tasks cannot evict.
+    interactive_slot: Option<u32>,
 }
 
 struct AgentLimits {

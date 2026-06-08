@@ -45,6 +45,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
+use crate::events::EventStore;
 use crate::traits::{ChatOptions, ModelProvider, StateStore};
 use std::sync::Arc;
 
@@ -149,6 +150,7 @@ pub async fn classify_intent(
     fast_model: &str,
     user_text: &str,
     state: Option<&Arc<dyn StateStore>>,
+    event_store: Option<Arc<EventStore>>,
 ) -> LlmIntentClass {
     let trimmed = user_text.trim();
     if trimmed.is_empty() {
@@ -161,6 +163,7 @@ pub async fn classify_intent(
         max_tokens_override: Some(CLASSIFIER_MAX_OUTPUT_TOKENS),
         ..ChatOptions::default()
     };
+    let call_start = std::time::Instant::now();
     let call = provider.chat_with_options(fast_model, &messages, &[], &options);
     let response = match tokio::time::timeout(CLASSIFIER_TIMEOUT, call).await {
         Ok(Ok(r)) => r,
@@ -177,10 +180,17 @@ pub async fn classify_intent(
         }
     };
 
-    if let (Some(state), Some(usage)) = (state, &response.usage) {
-        let _ = state
-            .record_token_usage("background:intent_classifier", usage)
-            .await;
+    if let (Some(state), Some(event_store)) = (state, event_store) {
+        crate::events::record_background_model_call_telemetry(
+            event_store,
+            state.as_ref(),
+            "background:intent_classifier",
+            "intent_classifier",
+            fast_model,
+            &response,
+            call_start.elapsed(),
+        )
+        .await;
     }
 
     match response.content.as_deref() {
@@ -309,7 +319,8 @@ mod tests {
     async fn classify_returns_parsed_label_on_success() {
         let provider =
             MockProvider::with_responses(vec![MockProvider::text_response("memory_storage")]);
-        let result = classify_intent(&provider, "fast-model", "remember my birthday", None).await;
+        let result =
+            classify_intent(&provider, "fast-model", "remember my birthday", None, None).await;
         assert_eq!(result, LlmIntentClass::MemoryStorage);
     }
 
@@ -317,7 +328,8 @@ mod tests {
     async fn classify_fails_open_on_unparseable_response() {
         let provider =
             MockProvider::with_responses(vec![MockProvider::text_response("not a label")]);
-        let result = classify_intent(&provider, "fast-model", "do something weird", None).await;
+        let result =
+            classify_intent(&provider, "fast-model", "do something weird", None, None).await;
         assert_eq!(result, LlmIntentClass::Unknown);
     }
 
@@ -325,7 +337,7 @@ mod tests {
     async fn classify_short_circuits_on_empty_input() {
         // Mock will record a call if invoked; verify it isn't.
         let provider = MockProvider::with_responses(vec![]);
-        let result = classify_intent(&provider, "fast-model", "   ", None).await;
+        let result = classify_intent(&provider, "fast-model", "   ", None, None).await;
         assert_eq!(result, LlmIntentClass::Other);
         assert_eq!(provider.call_count().await, 0);
     }
@@ -335,7 +347,7 @@ mod tests {
         // Empty response queue → provider returns default "Mock response",
         // which doesn't parse as any label.
         let provider = MockProvider::new();
-        let result = classify_intent(&provider, "fast-model", "anything", None).await;
+        let result = classify_intent(&provider, "fast-model", "anything", None, None).await;
         assert_eq!(result, LlmIntentClass::Unknown);
     }
 

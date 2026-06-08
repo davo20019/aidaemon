@@ -445,8 +445,27 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             model TEXT NOT NULL,
             input_tokens INTEGER NOT NULL,
             output_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER,
+            cache_creation_input_tokens INTEGER,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN cached_input_tokens INTEGER")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN cache_creation_input_tokens INTEGER")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN call_id TEXT")
+        .execute(pool)
+        .await;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_token_usage_call_id
+         ON token_usage(call_id)",
     )
     .execute(pool)
     .await?;

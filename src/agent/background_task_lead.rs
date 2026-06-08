@@ -18,8 +18,8 @@ use super::{
     build_goal_task_results_summary, effective_goal_daily_budget, extract_file_paths_from_text,
     goal_completion_response_indicates_incomplete_work, goal_has_scheduled_provenance,
     is_group_session, is_low_signal_task_lead_reply, parse_goal_leading_wait,
-    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
-    truncate_goal_result_text, user_facing_task_description, Agent,
+    parse_wait_task_seconds, persist_scheduled_run_state, salvageable_task_lead_result,
+    strip_leading_wait, truncate_goal_result_text, user_facing_task_description, Agent,
 };
 
 /// Spawn a task lead in the background (free function to satisfy Send requirements).
@@ -958,90 +958,117 @@ pub fn spawn_background_task_lead(
                 .map(|g| g.goal_type == "finite")
                 .unwrap_or(false)
         {
-            info!(goal_id = %goal_id, "Finite goal failed — attempting direct fallback");
+            // Salvage path: if the task lead already produced a substantive,
+            // finished answer, surface it instead of discarding the work and
+            // re-running a fresh, context-free direct fallback (which wastes
+            // tokens and — as observed — can lose a perfectly good result).
+            if let Some(salvaged) = salvageable_task_lead_result(task_lead_response.as_deref()) {
+                let _ = state.mark_goal_notified(&goal_id).await;
+                if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                    g.status = "completed".to_string();
+                    g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    g.updated_at = chrono::Utc::now().to_rfc3339();
+                    let _ = state.update_goal(&g).await;
+                }
+                info!(
+                    goal_id = %goal_id,
+                    "Salvaged substantive task-lead result for failed/stalled finite goal"
+                );
+                if let Some(ref registry) = goal_token_registry {
+                    registry.remove(&goal_id).await;
+                }
+                (
+                    "completed",
+                    format!(
+                        "Goal completed: {}",
+                        truncate_goal_result_text(&salvaged, 4000)
+                    ),
+                )
+            } else {
+                info!(goal_id = %goal_id, "Finite goal failed — attempting direct fallback");
 
-            // Mark as notified immediately to prevent the heartbeat from
-            // sending a duplicate "Goal failed" notification while the
-            // fallback is in progress.
-            let _ = state.mark_goal_notified(&goal_id).await;
+                // Mark as notified immediately to prevent the heartbeat from
+                // sending a duplicate "Goal failed" notification while the
+                // fallback is in progress.
+                let _ = state.mark_goal_notified(&goal_id).await;
 
-            // Notify user we're retrying with a different approach
-            if let Some(hub_weak) = &hub {
-                if let Some(hub_arc) = hub_weak.upgrade() {
-                    let _ = hub_arc
+                // Notify user we're retrying with a different approach
+                if let Some(hub_weak) = &hub {
+                    if let Some(hub_arc) = hub_weak.upgrade() {
+                        let _ = hub_arc
                         .send_text(
                             &session_id,
                             "The task planner couldn't complete this. Let me try handling it directly...",
                         )
                         .await;
-                }
-            }
-
-            // Spawn a direct executor to handle the original request
-            // without goal/task decomposition
-            let fallback_result = agent
-                .spawn_child(
-                    &user_text,
-                    &user_text,
-                    None,
-                    fallback_channel_ctx,
-                    fallback_user_role,
-                    None, // no specific role — gets full tool access
-                    None, // no goal_id — prevents goal re-entry
-                    None,
-                    None,
-                    None, // arg_specialist (direct executor fallback — no LLM tool selection)
-                )
-                .await;
-
-            match fallback_result {
-                Ok(response)
-                    if !response.trim().is_empty()
-                        && !goal_completion_response_indicates_incomplete_work(&response) =>
-                {
-                    // Direct handling succeeded — update goal to completed
-                    if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                        g.status = "completed".to_string();
-                        g.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        g.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = state.update_goal(&g).await;
                     }
-                    info!(goal_id = %goal_id, "Direct fallback succeeded");
-                    (
-                        "completed",
-                        format!(
-                            "Goal completed: {}",
-                            truncate_goal_result_text(&response, 4000)
-                        ),
-                    )
                 }
-                Ok(response) if !response.trim().is_empty() => {
-                    info!(
-                        goal_id = %goal_id,
-                        "Direct fallback returned an incomplete/unverified response"
-                    );
-                    (
-                        "failed",
-                        format!(
+
+                // Spawn a direct executor to handle the original request
+                // without goal/task decomposition
+                let fallback_result = agent
+                    .spawn_child(
+                        &user_text,
+                        &user_text,
+                        None,
+                        fallback_channel_ctx,
+                        fallback_user_role,
+                        None, // no specific role — gets full tool access
+                        None, // no goal_id — prevents goal re-entry
+                        None,
+                        None,
+                        None, // arg_specialist (direct executor fallback — no LLM tool selection)
+                    )
+                    .await;
+
+                match fallback_result {
+                    Ok(response)
+                        if !response.trim().is_empty()
+                            && !goal_completion_response_indicates_incomplete_work(&response) =>
+                    {
+                        // Direct handling succeeded — update goal to completed
+                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                            g.status = "completed".to_string();
+                            g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            g.updated_at = chrono::Utc::now().to_rfc3339();
+                            let _ = state.update_goal(&g).await;
+                        }
+                        info!(goal_id = %goal_id, "Direct fallback succeeded");
+                        (
+                            "completed",
+                            format!(
+                                "Goal completed: {}",
+                                truncate_goal_result_text(&response, 4000)
+                            ),
+                        )
+                    }
+                    Ok(response) if !response.trim().is_empty() => {
+                        info!(
+                            goal_id = %goal_id,
+                            "Direct fallback returned an incomplete/unverified response"
+                        );
+                        (
+                            "failed",
+                            format!(
                             "I made some progress, but I couldn't verify the final outcome:\n\n{}",
                             truncate_goal_result_text(&response, 3500)
                         ),
-                    )
-                }
-                _ => {
-                    // Direct handling also failed — give detailed info
-                    let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
-                    let task_summary: String = tasks
-                        .iter()
-                        .take(5)
-                        .map(|t| {
-                            let err = t.error.as_deref().unwrap_or("no details");
-                            format!("• {} ({})", t.description, err)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    info!(goal_id = %goal_id, "Direct fallback also failed");
-                    (
+                        )
+                    }
+                    _ => {
+                        // Direct handling also failed — give detailed info
+                        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+                        let task_summary: String = tasks
+                            .iter()
+                            .take(5)
+                            .map(|t| {
+                                let err = t.error.as_deref().unwrap_or("no details");
+                                format!("• {} ({})", t.description, err)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        info!(goal_id = %goal_id, "Direct fallback also failed");
+                        (
                         "failed",
                         format!(
                             "I wasn't able to complete your request. Here's what I tried:\n{}\n\nYou could try rephrasing or breaking it into smaller steps.",
@@ -1052,6 +1079,7 @@ pub fn spawn_background_task_lead(
                             }
                         ),
                     )
+                    }
                 }
             }
         } else {

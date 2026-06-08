@@ -1,0 +1,58 @@
+# Minimal aidaemon tool surface — personal assistant without admin/delegation overhead.
+#
+# Compared to a fully loaded config, this disables optional tool groups and turns
+# policy tool filtering back on so the LLM sees ~29 built-ins instead of ~37+.
+#
+# Copy sections into your config.toml or use as a starting point:
+#   cp config.toml.minimal.example config.toml
+# then fill in provider secrets and channel tokens.
+#
+# Built-in tools still registered (~16 base with default [tools].disabled):
+#   16 base + 6 runtime (spawn_agent off) = 22  (health_probe/cli_agent/self_diagnose off unless enabled)
+# git_info, git_commit, read_channel_history (Slack), etc. disabled by default.
+#
+# Disabled vs default:
+#   browser, cli_agents, diagnostics, files, skills, subagents, MCP servers
+#   policy.tool_filter_enforce = true (caps exposed tools per turn to 16–28)
+
+[provider]
+api_key = "keychain"
+base_url = "https://openrouter.ai/api/v1"
+
+[provider.models]
+default = "openai/gpt-4o-mini"
+fallback = []
+
+[state]
+db_path = "aidaemon.db"
+
+[terminal]
+allowed_prefixes = ["ls", "cat", "head", "grep", "find", "git", "cargo", "npm", "python3"]
+
+[browser]
+enabled = false
+
+[cli_agents]
+enabled = false
+
+[skills]
+enabled = false
+
+[subagents]
+enabled = false
+
+[files]
+enabled = false
+
+[diagnostics]
+enabled = false
+
+[policy]
+# Re-enable risk-based tool filtering (open-source default is true).
+tool_filter_enforce = true
+policy_enforce = true
+
+# No MCP servers — add only what you need, e.g.:
+# [mcp.my_server]
+# command = "npx"
+# args = ["-y", "some-mcp-package"]

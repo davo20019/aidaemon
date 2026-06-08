@@ -1,34 +1,6 @@
 use super::*;
 
 #[test]
-fn test_strip_markdown_section_removes_target_heading() {
-    let prompt =
-        "## Identity\nKeep this\n## Tools\nDrop this\nline2\n## Built-in Channels\nKeep channels";
-    let stripped = strip_markdown_section(prompt, "## Tools");
-    assert!(stripped.contains("## Identity"));
-    assert!(stripped.contains("## Built-in Channels"));
-    assert!(!stripped.contains("Drop this"));
-    assert!(!stripped.contains("line2"));
-}
-
-#[test]
-fn test_build_tool_loop_system_prompt_strips_heavy_sections() {
-    let prompt = "## Identity\nA\n## Tool Selection Guide\nB\n## Tools\nC\n## Behavior\nD";
-
-    let standard = build_tool_loop_system_prompt(prompt, ToolLoopPromptStyle::Standard);
-    assert!(standard.contains("## Identity"));
-    assert!(standard.contains("## Tool Selection Guide"));
-    assert!(standard.contains("## Behavior"));
-    assert!(!standard.contains("## Tools"));
-
-    let lite = build_tool_loop_system_prompt(prompt, ToolLoopPromptStyle::Lite);
-    assert!(lite.contains("## Identity"));
-    assert!(lite.contains("## Behavior"));
-    assert!(!lite.contains("## Tool Selection Guide"));
-    assert!(!lite.contains("## Tools"));
-}
-
-#[test]
 fn test_extract_intent_gate_single_line_json() {
     let input = "Answer first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[\"deployment_url\"]}";
     let (cleaned, gate) = extract_intent_gate(input);
@@ -295,6 +267,7 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
         completed_naturally: false,
         explicit_positive_signals: 0,
         explicit_negative_signals: 0,
+        task_outcome: None,
         replay_notes: Vec::new(),
     };
 
@@ -426,5 +399,74 @@ fn test_is_substantive_text_response_accepts_mixed_content() {
          The capital of France is Paris. It is the largest city in France \
          and serves as the country's political, economic, and cultural center.",
         50
+    ));
+}
+
+#[test]
+fn test_claims_completed_side_effect_detects_past_tense_action_claims() {
+    // The exact fabrication from the 2026-06-06 attribution run, turn 10:
+    // zero tool calls were made, yet the model claimed the deletion happened.
+    assert!(claims_completed_side_effect(
+        "I have deleted the cachetest2 folder entirely."
+    ));
+    assert!(claims_completed_side_effect(
+        "I've removed west.txt and cleaned up the directory."
+    ));
+    assert!(claims_completed_side_effect("I deleted the folder."));
+    assert!(claims_completed_side_effect(
+        "Done — I created the directory and wrote all four files for you."
+    ));
+    assert!(claims_completed_side_effect(
+        "I have successfully executed the script."
+    ));
+    // Unicode apostrophe, same as has_action_promise handling.
+    assert!(claims_completed_side_effect(
+        "I\u{2019}ve updated north.txt."
+    ));
+}
+
+#[test]
+fn test_claims_completed_side_effect_ignores_non_claims() {
+    // Future-tense promises are deferred actions, not completion claims.
+    assert!(!claims_completed_side_effect("I'll delete the folder."));
+    assert!(!claims_completed_side_effect(
+        "Let me remove that file for you."
+    ));
+    // Plain informational replies.
+    assert!(!claims_completed_side_effect(
+        "Here are the contents of the three files."
+    ));
+    assert!(!claims_completed_side_effect(
+        "The folder was already empty, nothing to do."
+    ));
+    // "I have" followed by a non-action word is not a claim.
+    assert!(!claims_completed_side_effect(
+        "I have a summary of the files for you."
+    ));
+    assert!(!claims_completed_side_effect(
+        "I have to check the file before answering."
+    ));
+    // Knowledge verbs in past tense are not side effects.
+    assert!(!claims_completed_side_effect(
+        "I have explained the differences between the files above."
+    ));
+}
+
+#[test]
+fn test_claims_delegation_started_detects_unverified_agent_claims() {
+    assert!(claims_delegation_started(
+        "I've initiated a deep analysis using a specialized review agent."
+    ));
+    assert!(claims_delegation_started(
+        "I started a research sub-agent to investigate this."
+    ));
+    assert!(claims_delegation_started(
+        "A specialist agent is now running in the background."
+    ));
+    assert!(!claims_delegation_started(
+        "I can analyze the resume directly."
+    ));
+    assert!(!claims_delegation_started(
+        "The review agent pattern is useful for complex tasks."
     ));
 }

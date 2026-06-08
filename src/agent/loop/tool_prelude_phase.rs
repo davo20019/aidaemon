@@ -1,5 +1,6 @@
 use super::execution_state::LinearIntentStep;
 use super::*;
+use crate::events::TaskOutcome;
 use crate::execution_policy::{PolicyBundle, VerifyLevel};
 use crate::traits::ProviderResponse;
 use serde::{Deserialize, Serialize};
@@ -210,6 +211,31 @@ fn first_side_effecting_tool_call<'a>(
     resp.tool_calls
         .iter()
         .find(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
+}
+
+fn plain_text_guard_blocks_tool(tool_name: &str, is_side_effecting: bool) -> bool {
+    user_visible_side_effect_guard_blocks_tool(tool_name, is_side_effecting)
+}
+
+fn uncertainty_guard_blocks_tool(tool_name: &str, is_side_effecting: bool) -> bool {
+    user_visible_side_effect_guard_blocks_tool(tool_name, is_side_effecting)
+}
+
+fn user_visible_side_effect_guard_blocks_tool(tool_name: &str, is_side_effecting: bool) -> bool {
+    is_side_effecting && tool_name != "spawn_agent"
+}
+
+fn first_plain_text_blocked_tool_call<'a>(
+    agent: &Agent,
+    resp: &'a ProviderResponse,
+    available_capabilities: &HashMap<String, ToolCapabilities>,
+) -> Option<&'a ToolCall> {
+    resp.tool_calls.iter().find(|tc| {
+        plain_text_guard_blocks_tool(
+            &tc.name,
+            tool_call_is_side_effecting(agent, tc, available_capabilities),
+        )
+    })
 }
 
 fn extract_target_preview(arguments: &str) -> Option<String> {
@@ -616,7 +642,7 @@ pub(super) async fn run_tool_prelude_phase(
     }
 
     if let Some(side_effecting_tool_call) =
-        first_side_effecting_tool_call(agent, resp, available_capabilities)
+        first_plain_text_blocked_tool_call(agent, resp, available_capabilities)
     {
         // Memory tools (remember_fact, manage_memories, manage_people) should
         // never be redirected to plain-text completion — the agent legitimately
@@ -701,10 +727,12 @@ pub(super) async fn run_tool_prelude_phase(
     if agent.policy_config.uncertainty_clarify_enforce
         && policy_bundle.uncertainty_score >= uncertainty_threshold
     {
-        let has_side_effecting_call = resp
-            .tool_calls
-            .iter()
-            .any(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities));
+        let has_side_effecting_call = resp.tool_calls.iter().any(|tc| {
+            uncertainty_guard_blocks_tool(
+                &tc.name,
+                tool_call_is_side_effecting(agent, tc, available_capabilities),
+            )
+        });
         if has_side_effecting_call {
             let clarify = default_clarifying_question(user_text, &[]);
             POLICY_METRICS
@@ -738,6 +766,7 @@ pub(super) async fn run_tool_prelude_phase(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
+                    TaskOutcome::Partial,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1268,5 +1297,14 @@ mod tests {
         let plan = base_plan();
         let tc = base_tool_call();
         assert!(validate_pre_execution_plan(&plan, &tc, Some(&plan.first_action.target)).is_ok());
+    }
+
+    #[test]
+    fn plain_text_guard_allows_internal_delegation() {
+        assert!(!plain_text_guard_blocks_tool("spawn_agent", true));
+        assert!(plain_text_guard_blocks_tool("terminal", true));
+        assert!(!plain_text_guard_blocks_tool("read_file", false));
+        assert!(!uncertainty_guard_blocks_tool("spawn_agent", true));
+        assert!(uncertainty_guard_blocks_tool("terminal", true));
     }
 }

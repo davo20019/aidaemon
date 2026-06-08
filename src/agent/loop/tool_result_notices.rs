@@ -29,6 +29,7 @@ pub(in crate::agent) enum ToolResultNotice {
         cooldown_until: usize,
         cooldown_iters: usize,
     },
+    BrowserLaunchFallback,
     OffTargetFactStorageRequest,
     MissingGoalIdManageMemories,
     MissingGoalIdGeneric,
@@ -71,6 +72,13 @@ pub(in crate::agent) enum ToolResultNotice {
     RepeatedReadBlocked {
         tool_name: String,
         repetitive_count: usize,
+    },
+    SemanticReadReplay {
+        rendered_output: String,
+    },
+    SemanticReadPartialOverlap {
+        covered_intervals: String,
+        uncovered_intervals: String,
     },
     RepeatedApiCallBlocked {
         tool_name: String,
@@ -189,6 +197,12 @@ Avoid retrying this tool until iteration {} (cooldown {} iterations). Use anothe
 Only report attempts that were actually executed; do not describe retries that were blocked or skipped.",
                 tool_name, cooldown_until, cooldown_iters
             ),
+            Self::BrowserLaunchFallback => {
+                "[SYSTEM] browser launch failed. Do NOT retry browser for this verification step. \
+Use another available approach now: `terminal` with curl/wrangler/HTTP status checks, \
+or an HTTP-capable fetch tool if available. Verify the URL or deployment with concrete HTTP evidence."
+                    .to_string()
+            }
             Self::OffTargetFactStorageRequest => {
                 "[SYSTEM] The previous tool call was off-target for this request. \
 The user appears to be asking you to learn/remember/save facts. Use `remember_fact` (batch with `facts` when needed) and do NOT call scheduled-goal tools."
@@ -294,10 +308,10 @@ Do NOT repeat the same call. Change approach, reduce scope, or tell the user wha
                 tool_name,
             } => format!(
                 "[SYSTEM] You already read this content {} times. Here it is again — \
-                         do NOT read it again. Use `write_file` to apply your fixes NOW.\n\n\
+                         do NOT read it again.\n\n\
                          --- CACHED CONTENT ---\n{}\n--- END CACHED CONTENT ---\n\n\
-                         IMPORTANT: You have the file content above. Analyze the bugs and \
-                         write the corrected version using `write_file`. Do not call `{}` again.",
+                         IMPORTANT: Use the content above to answer the user or continue the \
+                         requested work. Do not call `{}` again.",
                 repetitive_count, cached_content, tool_name
             ),
             Self::RepeatedReadBlocked {
@@ -306,9 +320,26 @@ Do NOT repeat the same call. Change approach, reduce scope, or tell the user wha
             } => format!(
                 "[SYSTEM] BLOCKED: You already called `{}` with these exact same arguments {} times. \
                          The file content should be in your conversation history. \
-                         Use `write_file` to apply your fixes based on what you already know.\n\n\
-                         You MUST use `write_file` now — do not try to read the file again.",
+                         Use the retained content to answer the user or continue the requested work. \
+                         Do not try to read the same content again.",
                 tool_name, repetitive_count
+            ),
+            Self::SemanticReadReplay { rendered_output } => format!(
+                "{}\n\n[SYSTEM] This content came from the complete task-local file artifact. \
+                 Do not read the same file or range again. Use it to answer the user or continue \
+                 the requested work.",
+                rendered_output
+            ),
+            Self::SemanticReadPartialOverlap {
+                covered_intervals,
+                uncovered_intervals,
+            } => format!(
+                "[SYSTEM] This read overlaps content already retained for the file. \
+                 Covered intervals: {}. Uncovered intervals: {}. \
+                 For sequential inspection, request only each uncovered non-overlapping interval. \
+                 If you are looking for specific text, use `search_files` first and then make one \
+                 exact surrounding `read_file` call. Do not scan with overlapping ranges.",
+                covered_intervals, uncovered_intervals
             ),
             Self::RepeatedApiCallBlocked {
                 tool_name,
@@ -477,6 +508,16 @@ mod tests {
     }
 
     #[test]
+    fn browser_launch_fallback_render_points_to_http_verification() {
+        let rendered = ToolResultNotice::BrowserLaunchFallback.render();
+        assert!(rendered.contains("browser launch failed"));
+        assert!(rendered.contains("terminal"));
+        assert!(rendered.contains("curl"));
+        assert!(rendered.contains("HTTP"));
+        assert!(rendered.contains("Do NOT retry browser"));
+    }
+
+    #[test]
     fn hard_policy_tool_budget_blocked_render_matches_previous_text() {
         assert_eq!(
             ToolResultNotice::HardPolicyToolBudgetBlocked {
@@ -497,5 +538,25 @@ mod tests {
         assert!(rendered.contains("'cli_agent' exists"));
         assert!(rendered.contains("current tool list"));
         assert!(rendered.contains("Do NOT guess or force hidden tool names"));
+    }
+
+    #[test]
+    fn semantic_read_notices_are_task_neutral_and_precise() {
+        let replay = ToolResultNotice::SemanticReadReplay {
+            rendered_output: "File: resume.md\n1 | experience".to_string(),
+        }
+        .render();
+        assert!(replay.contains("complete task-local file artifact"));
+        assert!(replay.contains("answer the user"));
+        assert!(!replay.contains("write_file"));
+
+        let overlap = ToolResultNotice::SemanticReadPartialOverlap {
+            covered_intervals: "10-20".to_string(),
+            uncovered_intervals: "1-9, 21-30".to_string(),
+        }
+        .render();
+        assert!(overlap.contains("1-9, 21-30"));
+        assert!(overlap.contains("search_files"));
+        assert!(overlap.contains("non-overlapping"));
     }
 }

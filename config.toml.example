@@ -31,6 +31,16 @@ base_url = "https://openrouter.ai/api/v1"
 # Cloudflare AI Gateway base URL format:
 # base_url = "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat"
 
+# Optional: llama.cpp slot routing (local OpenAI-compatible servers only).
+# Pins the interactive conversation to a dedicated KV-cache slot so always-on
+# background tasks (memory consolidation, summarization, etc.) can't evict it
+# between turns — keeping prompt-cache hits warm. Requires llama-server started
+# with --parallel >= 2. Leave disabled for cloud APIs (they reject unknown params).
+# [provider.slot_routing]
+# enabled = false          # opt-in; no id_slot is sent when false
+# interactive_slot = 0     # slot the interactive conversation pins to
+# background_slot = 1      # slot all background:* calls are routed to
+
 [provider.models]
 primary = "openai/gpt-4o"
 fast = "openai/gpt-4o-mini"
@@ -92,6 +102,11 @@ working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
 # encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
+
+# Optional per-model total context windows (input plus output tokens).
+# Use the exact model identifier configured under [provider.models].
+# [state.context_window.model_budgets]
+# local-model-name = 16384
 
 [terminal]
 # Set to ["*"] to allow all commands (only if you trust the LLM fully)
@@ -200,6 +215,7 @@ health_port = 8080
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
 # [cli_agents]
+# Delegate to external CLI coding agents (claude, codex, gemini, …). Off by default.
 # enabled = true
 # timeout_secs = 600           # default timeout per invocation
 # max_output_chars = 16000     # max output before truncation
@@ -223,6 +239,31 @@ health_port = 8080
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# Prefer built-in read_file/write_file/search_files instead of MCP filesystem.
+
+# [health]
+# Scheduled uptime probes (http/port/command/file) with channel alerts. Off by default.
+# enabled = true
+# probes = [
+#   { name = "my-site", type = "http", target = "https://example.com", schedule = "every 5 minutes" },
+# ]
+
+# [tools]
+# Omit built-in tools at startup by machine name (requires /restart).
+# Off by default: git_info, git_commit, policy_metrics, check_environment, service_status,
+# project_inspect, read_channel_history (Slack builds only), tool_trace (use goal_trace action=tool_trace).
+# Re-enable any with: disabled = []  (or remove names from the list below)
+# disabled = [
+#   "git_info",
+#   "git_commit",
+#   "policy_metrics",
+#   "check_environment",
+#   "service_status",
+#   "project_inspect",
+#   "read_channel_history",
+#   "tool_trace",
+#   "goal_trace",
+# ]
 
 # [policy]
 # All policy features are enabled by default. Uncomment to override.
@@ -247,7 +288,9 @@ health_port = 8080
 # max_missing_message_id_events = 0
 
 [diagnostics]
-enabled = true
+# Off by default: self_diagnose tool (~560 schema tokens). Event/decision recording stays on.
+# Set enabled = true when you want in-chat task failure forensics from Telegram/Slack.
+enabled = false
 record_decision_points = true
 max_events = 200
 include_raw_tool_args = false

@@ -280,6 +280,29 @@ impl ToolCallSemantics {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFileSelectionMetadata {
+    Full,
+    BoundedRange { start_line: usize, end_line: usize },
+    OpenEndedRange { start_line: usize },
+    Tail { requested_lines: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadFileResultMetadata {
+    pub display_path: String,
+    pub canonical_path: String,
+    pub selection: ReadFileSelectionMetadata,
+    pub returned_start_line: Option<usize>,
+    pub returned_end_line: Option<usize>,
+    pub total_lines: usize,
+    pub file_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    pub selected_lines: Vec<String>,
+}
+
 /// Structured execution metadata returned by tools.
 ///
 /// This is intentionally minimal and backward-compatible: tools can continue
@@ -316,6 +339,9 @@ pub struct ToolCallMetadata {
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
+    /// Complete typed result for successful text-file reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_file: Option<ReadFileResultMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

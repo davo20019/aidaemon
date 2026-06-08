@@ -127,6 +127,7 @@ fn skill_is_valuable(skill: &Skill) -> bool {
 
 pub struct SkillPromoter {
     state: Arc<dyn StateStore>,
+    event_store: Arc<crate::events::EventStore>,
     llm_runtime: SharedLlmRuntime,
     skills_dir: PathBuf,
     evidence_gate_enforce: bool,
@@ -135,12 +136,14 @@ pub struct SkillPromoter {
 impl SkillPromoter {
     pub fn new(
         state: Arc<dyn StateStore>,
+        event_store: Arc<crate::events::EventStore>,
         llm_runtime: SharedLlmRuntime,
         skills_dir: PathBuf,
         evidence_gate_enforce: bool,
     ) -> Self {
         Self {
             state,
+            event_store,
             llm_runtime,
             skills_dir,
             evidence_gate_enforce,
@@ -317,18 +320,22 @@ impl SkillPromoter {
 
         let runtime_snapshot = self.llm_runtime.snapshot();
         let fast_model = runtime_snapshot.fast_model();
+        let call_start = std::time::Instant::now();
         let response = runtime_snapshot
             .provider()
             .chat(&fast_model, &messages, &[])
             .await?;
 
-        // Track token usage for background LLM calls
-        if let Some(usage) = &response.usage {
-            let _ = self
-                .state
-                .record_token_usage("background:skill_promotion", usage)
-                .await;
-        }
+        crate::events::record_background_model_call_telemetry(
+            self.event_store.clone(),
+            self.state.as_ref(),
+            "background:skill_promotion",
+            "skill_promotion",
+            &fast_model,
+            &response,
+            call_start.elapsed(),
+        )
+        .await;
 
         let text = response
             .content

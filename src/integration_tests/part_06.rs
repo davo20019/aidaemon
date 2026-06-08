@@ -450,6 +450,8 @@ async fn test_empty_first_pass_response_not_intercepted() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -493,6 +495,8 @@ async fn test_empty_execution_response_persists_fallback_message() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -505,6 +509,8 @@ async fn test_empty_execution_response_persists_fallback_message() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 20,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -553,6 +559,8 @@ async fn test_empty_execution_response_surfaces_provider_note() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 20,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -568,6 +576,8 @@ async fn test_empty_execution_response_surfaces_provider_note() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 20,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -617,6 +627,8 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 0,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,
@@ -678,6 +690,8 @@ async fn test_initial_routing_call_drops_hallucinated_tool_calls() {
             usage: Some(crate::traits::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,

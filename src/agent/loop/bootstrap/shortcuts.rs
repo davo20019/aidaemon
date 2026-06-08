@@ -1,4 +1,5 @@
 use crate::agent::*;
+use crate::events::TaskOutcome;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_handle_stop_command(
@@ -537,6 +538,7 @@ pub(super) async fn emit_bootstrap_direct_reply(
             emitter,
             task_id,
             TaskStatus::Completed,
+            TaskOutcome::Succeeded,
             task_start,
             0,
             0,

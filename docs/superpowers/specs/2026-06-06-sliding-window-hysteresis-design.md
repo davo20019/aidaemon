@@ -244,8 +244,13 @@ Anchor-map writes opportunistically prune entries whose `last_used_at` is
 older than two hours. Anchors are lost on daemon restart; a daemon-only
 restart against a still-warm llama-server therefore causes one accepted
 re-establishment break. Spawned sub-agents run under distinct session ids
-and get independent anchors. The build phase reaches the map through
-`AgentServices`; `MessageBuildCtx` is unchanged.
+and get independent anchors. The build phase already takes
+`services: &AgentServices` (`message_build_phase.rs:171`, binding
+`let agent = services.agent`) and already reads an
+`Arc<RwLock<HashMap<String, _>>>` field on `Agent` the same way the anchor
+map will be read — `agent.current_turn_ids.read().await.get(session_id)`
+(`message_build_phase.rs:243`) is the direct precedent — so `window_anchors`
+is reachable with no new plumbing and `MessageBuildCtx` is unchanged.
 
 Build-phase flow changes the `keep_from` computation and adds an
 anchor-preservation contract to history fitting. Age-based collapse,

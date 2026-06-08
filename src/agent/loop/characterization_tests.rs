@@ -477,9 +477,11 @@ async fn force_text_characterization_strips_tools_after_duplicate_send_file() {
 
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
-        call_log.last().is_some_and(|call| call.tools.is_empty()),
-        "force-text closeout should strip tools on the final LLM call: {:?}",
-        call_log.last().map(|call| &call.tools)
+        call_log.last().is_some_and(|call| !call.tools.is_empty()
+            && call.options.tool_choice == crate::traits::ToolChoiceMode::None),
+        "force-text closeout retains tool defs (prompt-prefix stability) and \
+         disables calling via tool_choice=none: {:?}",
+        call_log.last().map(|call| &call.options.tool_choice)
     );
 }
 
@@ -633,6 +635,37 @@ async fn truncation_characterization_reassembles_mid_sentence_text_continuation(
 }
 
 #[tokio::test]
+async fn truncation_characterization_keeps_prefix_when_short_tail_repeats_earlier_phrase() {
+    let prefix = format!(
+        "Which company or role are you targeting? {} The AI Expert resume is the ch",
+        std::iter::repeat_n("detail", 205)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let continuation = "osen one even stronger. Which company or role?";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(&prefix),
+        MockProvider::text_response(continuation),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "truncation_short_overlapping_tail",
+            "Which resume should I send?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, format!("{}{}", prefix, continuation));
+}
+
+#[tokio::test]
 async fn background_ack_characterization_forces_text_with_handoff_directive() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
@@ -668,8 +701,10 @@ async fn background_ack_characterization_forces_text_with_handoff_directive() {
         "background detach currently runs one forced text summary pass after the tool call"
     );
     assert!(
-        call_log.last().is_some_and(|call| call.tools.is_empty()),
-        "background detach should strip tools on the forced text pass"
+        call_log.last().is_some_and(|call| !call.tools.is_empty()
+            && call.options.tool_choice == crate::traits::ToolChoiceMode::None),
+        "background detach retains tool defs (prompt-prefix stability) and \
+         disables calling via tool_choice=none on the forced text pass"
     );
     assert!(
         call_log.last().is_some_and(|call| {
@@ -782,6 +817,8 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
             usage: Some(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 10,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
                 model: "mock".to_string(),
             }),
             thinking: None,

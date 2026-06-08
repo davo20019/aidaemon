@@ -80,6 +80,46 @@ impl EvidenceState {
                     .any(|target| target_matches_expected(target, expected))
         })
     }
+
+    pub fn invalidate_file_read_path(&mut self, path: &str) {
+        let expected = normalized_path_key(path);
+        self.records.retain(|record| {
+            if record.kind != EvidenceKind::FileRead {
+                return true;
+            }
+            !record.targets.iter().any(|target| {
+                target.kind == ToolTargetHintKind::Path
+                    && normalized_path_key(&target.value) == expected
+            })
+        });
+        if self.target.as_ref().is_some_and(|target| {
+            target.kind == ToolTargetHintKind::Path
+                && normalized_path_key(&target.value) == expected
+        }) {
+            self.target = None;
+        }
+    }
+
+    pub fn clear_file_read_evidence(&mut self) {
+        self.records
+            .retain(|record| record.kind != EvidenceKind::FileRead);
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.kind == ToolTargetHintKind::Path)
+        {
+            self.target = None;
+        }
+    }
+}
+
+fn normalized_path_key(path: &str) -> String {
+    let normalized = fs_utils::validate_path(path)
+        .ok()
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
+    normalized
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 pub fn has_completed_side_effecting_tool_call(
@@ -337,5 +377,44 @@ mod tests {
             &evidence,
         );
         assert!(violation.is_none());
+    }
+
+    #[test]
+    fn invalidating_file_read_evidence_removes_only_matching_path() {
+        let mut evidence = EvidenceState::default();
+        for path in ["/tmp/a.md", "/tmp/b.md"] {
+            evidence.record_direct(
+                EvidenceKind::FileRead,
+                "read_file",
+                vec![ToolTargetHint::new(ToolTargetHintKind::Path, path).unwrap()],
+            );
+        }
+
+        evidence.invalidate_file_read_path("/tmp/a.md");
+
+        assert!(!evidence.has_direct_targeted_evidence(
+            EvidenceKind::FileRead,
+            &ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/a.md").unwrap()
+        ));
+        assert!(evidence.has_direct_targeted_evidence(
+            EvidenceKind::FileRead,
+            &ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/b.md").unwrap()
+        ));
+    }
+
+    #[test]
+    fn clearing_file_read_evidence_preserves_other_evidence_kinds() {
+        let mut evidence = EvidenceState::default();
+        evidence.record_direct(
+            EvidenceKind::FileRead,
+            "read_file",
+            vec![ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/a.md").unwrap()],
+        );
+        evidence.record_direct(EvidenceKind::CommandOutput, "terminal", Vec::new());
+
+        evidence.clear_file_read_evidence();
+
+        assert_eq!(evidence.records.len(), 1);
+        assert_eq!(evidence.records[0].kind, EvidenceKind::CommandOutput);
     }
 }

@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
+use crate::config::SlotRoutingConfig;
 use crate::providers::ProviderError;
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
@@ -25,6 +26,10 @@ pub struct OpenAiCompatibleProvider {
     /// thinking/reasoning tokens (supported by OpenRouter, Anthropic, etc.).
     /// Values: "low", "medium", "high", "xhigh"
     pub reasoning_effort: Option<String>,
+    /// Opt-in llama.cpp slot routing. When `enabled`, every request carries an
+    /// `id_slot` field: the per-call override when present, else `background_slot`.
+    /// When disabled, `id_slot` is never emitted (cloud-API safe).
+    slot_routing: SlotRoutingConfig,
 }
 
 impl Drop for OpenAiCompatibleProvider {
@@ -136,12 +141,20 @@ impl OpenAiCompatibleProvider {
             extra_headers: extra_headers.unwrap_or_default(),
             max_tokens,
             reasoning_effort: None,
+            slot_routing: SlotRoutingConfig::default(),
         })
     }
 
     /// Enable reasoning/thinking tokens with the given effort level.
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Configure llama.cpp slot routing for this provider. When disabled (the
+    /// default), no `id_slot` field is ever emitted.
+    pub fn with_slot_routing(mut self, slot_routing: SlotRoutingConfig) -> Self {
+        self.slot_routing = slot_routing;
         self
     }
 
@@ -280,6 +293,14 @@ impl OpenAiCompatibleProvider {
                 });
             }
             // else: "off" → omit reasoning param to disable thinking entirely
+        }
+
+        // llama.cpp KV-cache slot pinning. Only emitted when explicitly enabled
+        // — cloud APIs reject unknown params, so disabled is the safe default.
+        // The interactive loop passes `Some(interactive_slot)`; every other call
+        // leaves `id_slot` as `None` and is mapped to the background slot.
+        if self.slot_routing.enabled {
+            body["id_slot"] = json!(options.id_slot.unwrap_or(self.slot_routing.background_slot));
         }
 
         match &options.response_mode {
@@ -699,6 +720,64 @@ mod tests {
             "intent_gate_v1"
         );
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn test_build_request_body_slot_routing_enabled_defaults_to_background_slot() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080/v1", "test-key")
+            .expect("provider should initialize")
+            .with_slot_routing(SlotRoutingConfig {
+                enabled: true,
+                interactive_slot: 0,
+                background_slot: 1,
+            });
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        // id_slot: None → provider maps to background_slot (1).
+        let options = ChatOptions::default();
+        let body = provider.build_request_body("local-model", &messages, &[], &options);
+        assert_eq!(
+            body["id_slot"], 1,
+            "id_slot:None should map to background_slot when routing enabled"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_slot_routing_enabled_honors_explicit_id_slot() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080/v1", "test-key")
+            .expect("provider should initialize")
+            .with_slot_routing(SlotRoutingConfig {
+                enabled: true,
+                interactive_slot: 0,
+                background_slot: 1,
+            });
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let options = ChatOptions {
+            id_slot: Some(0),
+            ..ChatOptions::default()
+        };
+        let body = provider.build_request_body("local-model", &messages, &[], &options);
+        assert_eq!(
+            body["id_slot"], 0,
+            "explicit id_slot:Some(0) (interactive) should be used verbatim"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_slot_routing_disabled_omits_id_slot() {
+        // Disabled (the default) — no id_slot key at all (cloud-API safe).
+        let provider = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        // Even an explicit id_slot must NOT leak when routing is disabled.
+        let options = ChatOptions {
+            id_slot: Some(0),
+            ..ChatOptions::default()
+        };
+        let body = provider.build_request_body("gpt-4o-mini", &messages, &[], &options);
+        assert!(
+            body.get("id_slot").is_none(),
+            "id_slot must be omitted entirely when slot routing is disabled"
+        );
     }
 
     #[test]

@@ -51,6 +51,13 @@ pub struct ChatOptions {
     /// Used for truncation recovery: when a thinking model spends all tokens on
     /// reasoning with no usable output, the retry reduces effort to "low".
     pub reasoning_effort_override: Option<String>,
+    /// llama.cpp KV-cache slot pin (`id_slot`) for this call only.
+    ///
+    /// `None` (the default) means "use the provider's background slot" when slot
+    /// routing is enabled, and "omit the field entirely" when it is disabled.
+    /// The interactive generation loop sets `Some(interactive_slot)` to keep the
+    /// conversation's KV cache warm against background-task eviction.
+    pub id_slot: Option<u32>,
 }
 
 /// Model provider — sends messages + tool defs to an LLM, gets back response.
@@ -86,7 +93,18 @@ pub trait ModelProvider: Send + Sync {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Input tokens served from a provider-side cache, when reported.
+    pub cached_input_tokens: Option<u32>,
+    /// Input tokens newly written into a provider-side cache, when reported.
+    pub cache_creation_input_tokens: Option<u32>,
     pub model: String,
+}
+
+impl TokenUsage {
+    pub fn fresh_input_tokens(&self) -> Option<u32> {
+        self.cached_input_tokens
+            .map(|cached| self.input_tokens.saturating_sub(cached))
+    }
 }
 
 /// The LLM's response: either content text, tool calls, or both.
@@ -109,6 +127,12 @@ pub struct TokenUsageRecord {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    #[allow(dead_code)] // Used for diagnostics and future cost reports
+    pub cached_input_tokens: Option<i64>,
+    #[allow(dead_code)] // Used for diagnostics and future cost reports
+    pub cache_creation_input_tokens: Option<i64>,
+    #[allow(dead_code)] // Used by reconciliation/reporting paths that need correlation IDs.
+    pub call_id: Option<String>,
     #[allow(dead_code)] // Used for database queries
     pub created_at: String,
 }

@@ -198,7 +198,7 @@ async fn intent_classifier_bench_run_corpus() {
 
     for (idx, case) in cases.iter().enumerate() {
         let start = Instant::now();
-        let llm = classify_intent(&provider, &model, case.user_text, None).await;
+        let llm = classify_intent(&provider, &model, case.user_text, None, None).await;
         let elapsed_ms = start.elapsed().as_millis();
         total_latency_ms += elapsed_ms;
 

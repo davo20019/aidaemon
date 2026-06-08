@@ -29,7 +29,115 @@ fn strip_leading_cd(cmd: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(cmd)
 }
 
+#[derive(Debug)]
+struct ShellStructure {
+    segments: Vec<String>,
+    has_output_redirection: bool,
+}
+
+fn parse_shell_structure(command: &str) -> Option<ShellStructure> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut has_output_redirection = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            current.push(ch);
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            current.push(ch);
+            continue;
+        }
+
+        let is_separator = match ch {
+            ';' => true,
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                true
+            }
+            '|' => {
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+                true
+            }
+            '>' => {
+                has_output_redirection = true;
+                if matches!(chars.peek(), Some('>') | Some('|')) {
+                    chars.next();
+                }
+                false
+            }
+            _ => false,
+        };
+        if is_separator {
+            let segment = current.trim();
+            if segment.is_empty() {
+                return None;
+            }
+            segments.push(segment.to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if escaped || quote.is_some() {
+        return None;
+    }
+    let tail = current.trim();
+    if !tail.is_empty() {
+        segments.push(tail.to_string());
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(ShellStructure {
+        segments,
+        has_output_redirection,
+    })
+}
+
 pub(crate) fn classify_shell_command(command: &str) -> ToolCallSemantics {
+    let Some(structure) = parse_shell_structure(command) else {
+        return ToolCallSemantics::mutation();
+    };
+    let mut observes = false;
+    let mut mutates = structure.has_output_redirection;
+    for segment in structure.segments {
+        let semantics = classify_simple_shell_command(&segment);
+        observes |= semantics.observes_state();
+        mutates |= semantics.mutates_state();
+    }
+    match (observes, mutates) {
+        (true, true) => ToolCallSemantics::observation_and_mutation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        (true, false) => ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        (false, true) => ToolCallSemantics::mutation(),
+        (false, false) => ToolCallSemantics::administrative(),
+    }
+}
+
+fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
     let lower = command.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return ToolCallSemantics::administrative();
@@ -41,6 +149,41 @@ pub(crate) fn classify_shell_command(command: &str) -> ToolCallSemantics {
     // would otherwise cause every injected command to fall through to the
     // default mutation classification.
     let lower = strip_leading_cd(&lower);
+
+    if lower == "cd" || lower.starts_with("cd ") {
+        return ToolCallSemantics::administrative();
+    }
+
+    if matches!(
+        lower.as_ref(),
+        "ls" | "pwd"
+            | "cat"
+            | "head"
+            | "tail"
+            | "find"
+            | "rg"
+            | "grep"
+            | "stat"
+            | "wc"
+            | "date"
+            | "uname"
+            | "whoami"
+            | "hostname"
+            | "uptime"
+            | "env"
+            | "printenv"
+            | "echo"
+            | "tree"
+            | "du"
+            | "df"
+            | "file"
+            | "diff"
+            | "sort"
+            | "uniq"
+    ) {
+        return ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent);
+    }
 
     if lower.starts_with("curl ") || lower.starts_with("wget ") {
         let mutating_request = contains_any(
@@ -246,5 +389,59 @@ mod tests {
             sem.mutates_state(),
             "cd-prefixed cargo build should be mutation"
         );
+    }
+
+    #[test]
+    fn output_redirection_is_state_mutating() {
+        for command in [
+            "echo value > file",
+            "cat > file",
+            "echo value >> file",
+            "echo value 2> errors.log",
+            "echo value &> all.log",
+        ] {
+            assert!(
+                classify_shell_command(command).mutates_state(),
+                "{command} must be mutating"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_and_pipeline_semantics_include_every_segment() {
+        let mixed = classify_shell_command("ls && rm file");
+        assert!(mixed.observes_state());
+        assert!(mixed.mutates_state());
+
+        let observation = classify_shell_command("rg pattern file | head");
+        assert!(observation.observes_state());
+        assert!(!observation.mutates_state());
+
+        let tee = classify_shell_command("rg pattern file | tee output.txt");
+        assert!(tee.observes_state());
+        assert!(tee.mutates_state());
+    }
+
+    #[test]
+    fn quoted_and_escaped_operators_are_not_shell_structure() {
+        for command in [
+            "echo 'value > file'",
+            "echo \"a | b && c; d\"",
+            r"echo value \> file",
+        ] {
+            let semantics = classify_shell_command(command);
+            assert!(semantics.observes_state(), "{command} should observe");
+            assert!(
+                !semantics.mutates_state(),
+                "{command} should not be classified as a mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_shell_expression_is_conservatively_mutating() {
+        let semantics = classify_shell_command("echo 'unterminated");
+        assert!(semantics.mutates_state());
+        assert!(!semantics.observes_state());
     }
 }

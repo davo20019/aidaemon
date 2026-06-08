@@ -23,6 +23,159 @@ fn resolve_runtime_env_file_path(working_dir: &Path) -> PathBuf {
     working_dir.join(".env")
 }
 
+fn canonical_task_outcome(value: &serde_json::Value) -> Option<&str> {
+    let status = match value.get("status").and_then(|status| status.as_str()) {
+        Some(status @ ("completed" | "failed" | "cancelled")) => status,
+        _ => return None,
+    };
+    if let Some(outcome) = value.get("outcome") {
+        return match outcome.as_str() {
+            Some("succeeded") => Some("succeeded"),
+            Some("partial") => Some("partial"),
+            Some("failed") => Some("failed"),
+            _ => None,
+        };
+    }
+    match status {
+        "completed" => Some("succeeded"),
+        "failed" | "cancelled" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn canonical_error_type(value: &serde_json::Value) -> &str {
+    match value
+        .get("error_type")
+        .and_then(|error_type| error_type.as_str())
+    {
+        Some(
+            error_type @ ("tool_error" | "llm_error" | "timeout" | "rate_limit"
+            | "permission_denied" | "internal" | "cancelled"),
+        ) => error_type,
+        _ => "unknown",
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TelemetryReconciliationCounts {
+    correlated: usize,
+    token_only: usize,
+    event_only: usize,
+    duplicate_token_rows: usize,
+    duplicate_event_rows: usize,
+    legacy_token_rows: usize,
+    legacy_event_rows: usize,
+}
+
+fn telemetry_reconciliation_counts(
+    token_call_ids: &[Option<String>],
+    event_rows: &[(Option<String>, bool)],
+) -> TelemetryReconciliationCounts {
+    let mut token_frequencies = std::collections::HashMap::<String, usize>::new();
+    let mut legacy_token_rows = 0usize;
+    for call_id in token_call_ids {
+        match call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
+            Some(call_id) => *token_frequencies.entry(call_id.to_string()).or_insert(0) += 1,
+            None => legacy_token_rows += 1,
+        }
+    }
+
+    let mut event_frequencies = std::collections::HashMap::<String, usize>::new();
+    let mut legacy_event_rows = 0usize;
+    for (call_id, usage_present) in event_rows {
+        if call_id.as_deref().map_or(true, str::is_empty) {
+            legacy_event_rows += 1;
+        }
+        if !usage_present {
+            continue;
+        }
+        match call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
+            Some(call_id) => *event_frequencies.entry(call_id.to_string()).or_insert(0) += 1,
+            None => {}
+        }
+    }
+
+    let token_ids: std::collections::HashSet<&String> = token_frequencies.keys().collect();
+    let event_ids: std::collections::HashSet<&String> = event_frequencies.keys().collect();
+    TelemetryReconciliationCounts {
+        correlated: token_ids.intersection(&event_ids).count(),
+        token_only: token_ids.difference(&event_ids).count(),
+        event_only: event_ids.difference(&token_ids).count(),
+        duplicate_token_rows: token_frequencies
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum(),
+        duplicate_event_rows: event_frequencies
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum(),
+        legacy_token_rows,
+        legacy_event_rows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_task_outcome_rejects_unrecognized_values() {
+        assert_eq!(
+            canonical_task_outcome(&json!({"status": "completed", "outcome": "mostly_done"})),
+            None
+        );
+        assert_eq!(
+            canonical_task_outcome(&json!({"status": "completed"})),
+            Some("succeeded")
+        );
+        assert_eq!(
+            canonical_task_outcome(&json!({"outcome": "succeeded"})),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_error_type_rejects_unrecognized_values() {
+        assert_eq!(
+            canonical_error_type(&json!({"error_type": "networkish"})),
+            "unknown"
+        );
+        assert_eq!(
+            canonical_error_type(&json!({"error_type": "tool_error"})),
+            "tool_error"
+        );
+    }
+
+    #[test]
+    fn reconciliation_counts_duplicate_and_legacy_rows() {
+        let counts = telemetry_reconciliation_counts(
+            &[
+                Some("call-a".to_string()),
+                Some("call-a".to_string()),
+                Some("call-b".to_string()),
+                None,
+            ],
+            &[
+                (Some("call-a".to_string()), true),
+                (Some("call-c".to_string()), true),
+                (Some("call-c".to_string()), true),
+                (None, true),
+                (None, false),
+                (Some("call-d".to_string()), false),
+            ],
+        );
+
+        assert_eq!(counts.correlated, 1);
+        assert_eq!(counts.token_only, 1);
+        assert_eq!(counts.event_only, 1);
+        assert_eq!(counts.duplicate_token_rows, 1);
+        assert_eq!(counts.duplicate_event_rows, 1);
+        assert_eq!(counts.legacy_token_rows, 1);
+        assert_eq!(counts.legacy_event_rows, 2);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -363,7 +516,9 @@ async fn main() -> anyhow::Result<()> {
         SELECT
           COUNT(*) AS request_count,
           COALESCE(SUM(input_tokens), 0) AS input_tokens,
-          COALESCE(SUM(output_tokens), 0) AS output_tokens
+          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+          COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens
         FROM token_usage
         WHERE created_at >= datetime('now', '-' || ? || ' hours')
         "#,
@@ -376,10 +531,16 @@ async fn main() -> anyhow::Result<()> {
             let reqs: i64 = row.get("request_count");
             let input: i64 = row.get("input_tokens");
             let output: i64 = row.get("output_tokens");
+            let cached: i64 = row.get("cached_input_tokens");
+            let cache_created: i64 = row.get("cache_creation_input_tokens");
+            let fresh = input.saturating_sub(cached);
             println!(
-                "- requests={} input_tokens={} output_tokens={} total_tokens={}",
+                "- requests={} input_tokens={} cached_input_tokens={} fresh_input_tokens={} cache_creation_input_tokens={} output_tokens={} total_tokens={}",
                 reqs,
                 input,
+                cached,
+                fresh,
+                cache_created,
                 output,
                 input + output
             );
@@ -395,6 +556,7 @@ async fn main() -> anyhow::Result<()> {
           session_id,
           COUNT(*) AS request_count,
           COALESCE(SUM(input_tokens + output_tokens), 0) AS total_tokens,
+          COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
           MIN(created_at) AS first_at,
           MAX(created_at) AS last_at
         FROM token_usage
@@ -415,9 +577,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("Top sessions (by tokens):");
                 for row in rows {
                     println!(
-                        "- session={} tokens={} requests={} first_at={:?} last_at={:?}",
+                        "- session={} tokens={} cached_input_tokens={} requests={} first_at={:?} last_at={:?}",
                         row.get::<String, _>("session_id"),
                         row.get::<i64, _>("total_tokens"),
+                        row.get::<i64, _>("cached_input_tokens"),
                         row.get::<i64, _>("request_count"),
                         row.try_get::<Option<String>, _>("first_at").unwrap_or(None),
                         row.try_get::<Option<String>, _>("last_at").unwrap_or(None),
@@ -463,6 +626,127 @@ async fn main() -> anyhow::Result<()> {
             println!("(failed to query token_usage hourly: {})", e);
         }
     }
+
+    println!(
+        "\n== Telemetry Reconciliation (Last {} Hours) ==",
+        token_hours
+    );
+    let token_call_ids: Vec<Option<String>> = sqlx::query_scalar(
+        r#"
+        SELECT call_id FROM token_usage
+        WHERE created_at >= datetime('now', '-' || ? || ' hours')
+        "#,
+    )
+    .bind(token_hours)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let llm_rows = sqlx::query(
+        r#"
+        SELECT
+          json_extract(data, '$.call_id') AS call_id,
+          json_extract(data, '$.token_usage_present') AS token_usage_present
+        FROM events
+        WHERE event_type = 'llm_call'
+          AND created_at >= datetime('now', '-' || ? || ' hours')
+        "#,
+    )
+    .bind(token_hours)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let mut events_with_usage = 0i64;
+    let mut event_rows = Vec::with_capacity(llm_rows.len());
+    for row in &llm_rows {
+        let call_id = row.try_get::<Option<String>, _>("call_id").unwrap_or(None);
+        let token_usage_present = row
+            .try_get::<Option<i64>, _>("token_usage_present")
+            .unwrap_or(None)
+            == Some(1);
+        if token_usage_present {
+            events_with_usage += 1;
+        }
+        event_rows.push((call_id, token_usage_present));
+    }
+    let reconciliation = telemetry_reconciliation_counts(&token_call_ids, &event_rows);
+    println!(
+        "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} legacy_token_rows={} legacy_event_rows={}",
+        token_call_ids.len(),
+        llm_rows.len(),
+        events_with_usage,
+        reconciliation.correlated,
+        reconciliation.token_only,
+        reconciliation.event_only,
+        reconciliation.duplicate_token_rows,
+        reconciliation.duplicate_event_rows,
+        reconciliation.legacy_token_rows,
+        reconciliation.legacy_event_rows,
+    );
+
+    println!("\n== Task Outcomes (Last {} Hours) ==", token_hours);
+    let task_end_rows = sqlx::query(
+        r#"
+        SELECT data
+        FROM events
+        WHERE event_type = 'task_end'
+          AND created_at >= datetime('now', '-' || ? || ' hours')
+        "#,
+    )
+    .bind(token_hours)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let mut by_status: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut by_outcome: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut unknown = 0u64;
+    for row in task_end_rows {
+        let data_str: String = row.get("data");
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+            unknown += 1;
+            continue;
+        };
+        let status = match value.get("status").and_then(|v| v.as_str()) {
+            Some(status @ ("completed" | "failed" | "cancelled")) => status,
+            _ => "unknown",
+        };
+        *by_status.entry(status.to_string()).or_insert(0) += 1;
+        let outcome = canonical_task_outcome(&value).unwrap_or_else(|| {
+            unknown += 1;
+            "unknown"
+        });
+        *by_outcome.entry(outcome.to_string()).or_insert(0) += 1;
+    }
+    println!("- by_status: {:?}", by_status);
+    println!("- by_outcome: {:?}", by_outcome);
+    if unknown > 0 {
+        println!("- malformed_or_unknown={}", unknown);
+    }
+
+    println!("\n== Errors by Type (Last {} Hours) ==", token_hours);
+    let error_rows = sqlx::query(
+        r#"
+        SELECT data
+        FROM events
+        WHERE event_type = 'error'
+          AND created_at >= datetime('now', '-' || ? || ' hours')
+        "#,
+    )
+    .bind(token_hours)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let mut by_error_type: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for row in error_rows {
+        let data_str: String = row.get("data");
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+            *by_error_type.entry("unknown".to_string()).or_insert(0) += 1;
+            continue;
+        };
+        let error_type = canonical_error_type(&value);
+        *by_error_type.entry(error_type.to_string()).or_insert(0) += 1;
+    }
+    println!("- by_error_type: {:?}", by_error_type);
 
     if let Some(inv_id) = inv_filter {
         println!("\n== Invocation {} Details ==", inv_id);
@@ -521,6 +805,51 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    println!("\n== Recent LLM Calls ==");
+    let llm_events = sqlx::query(
+        r#"
+        SELECT
+            task_id,
+            created_at,
+            json_extract(data, '$.iteration') AS iteration,
+            json_extract(data, '$.model') AS model,
+            json_extract(data, '$.fell_back') AS fell_back,
+            json_extract(data, '$.latency_ms') AS latency_ms,
+            json_extract(data, '$.input_tokens') AS input_tokens,
+            json_extract(data, '$.output_tokens') AS output_tokens,
+            json_extract(data, '$.cached_input_tokens') AS cached_input_tokens,
+            json_extract(data, '$.fresh_input_tokens') AS fresh_input_tokens,
+            json_extract(data, '$.cache_creation_input_tokens') AS cache_creation_input_tokens
+        FROM events
+        WHERE event_type = 'llm_call'
+        ORDER BY id DESC
+        LIMIT 30
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?;
+    if llm_events.is_empty() {
+        println!("(none)");
+    } else {
+        for row in llm_events {
+            println!(
+                "- task_id={:?} iter={} model={} fell_back={} latency_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} at={}",
+                row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
+                row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
+                row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1),
+                row.try_get::<Option<i64>, _>("latency_ms").unwrap_or(None).unwrap_or(0),
+                row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
+                row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
+                row.get::<String, _>("created_at"),
+            );
+        }
+    }
+
     println!("\n== Recent cli_agent Tool Events ==");
     let cli_events = sqlx::query(
         r#"
@@ -563,7 +892,7 @@ async fn main() -> anyhow::Result<()> {
             ORDER BY id ASC
             "#,
         )
-        .bind(task_id)
+        .bind(&task_id)
         .fetch_all(&pool)
         .await?;
         for row in rows {
@@ -579,6 +908,66 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .replace('\n', " ")
             );
+        }
+
+        println!("\n== Task {} LLM Calls ==", task_id);
+        let llm_rows = sqlx::query(
+            r#"
+            SELECT
+                json_extract(data, '$.iteration') AS iteration,
+                json_extract(data, '$.model') AS model,
+                json_extract(data, '$.final_model') AS final_model,
+                json_extract(data, '$.fell_back') AS fell_back,
+                json_extract(data, '$.attempts') AS attempts,
+                json_extract(data, '$.latency_ms') AS latency_ms,
+                json_extract(data, '$.build_ms') AS build_ms,
+                json_extract(data, '$.input_tokens') AS input_tokens,
+                json_extract(data, '$.output_tokens') AS output_tokens,
+                json_extract(data, '$.cached_input_tokens') AS cached_input_tokens,
+                json_extract(data, '$.fresh_input_tokens') AS fresh_input_tokens,
+                json_extract(data, '$.cache_creation_input_tokens') AS cache_creation_input_tokens,
+                json_extract(data, '$.est_input_tokens') AS est_input_tokens
+            FROM events
+            WHERE event_type = 'llm_call' AND task_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(&task_id)
+        .fetch_all(&pool)
+        .await?;
+        if llm_rows.is_empty() {
+            println!("(none)");
+        } else {
+            for row in llm_rows {
+                let model = row.try_get::<Option<String>, _>("model").unwrap_or(None);
+                let final_model = row
+                    .try_get::<Option<String>, _>("final_model")
+                    .unwrap_or(None);
+                let fell_back =
+                    row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1);
+                let model_label = match final_model {
+                    Some(fm) if Some(&fm) != model.as_ref() => {
+                        format!("{} -> {}", model.unwrap_or_default(), fm)
+                    }
+                    _ => model.unwrap_or_default(),
+                };
+                println!(
+                    "- iter={} model={} fell_back={} attempts={} latency_ms={} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
+                    row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
+                    model_label,
+                    fell_back,
+                    row.try_get::<Option<i64>, _>("attempts").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("latency_ms").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("build_ms").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
+                        .unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None).unwrap_or(0),
+                );
+            }
         }
     }
 

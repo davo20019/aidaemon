@@ -304,6 +304,79 @@ pub(super) async fn run_completion_phase(
             }
         }
 
+        let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
+        let assistant_claimed_mutation = claims_completed_side_effect(&reply);
+        let assistant_claimed_delegation = claims_delegation_started(&reply);
+        let mutation_gate_relevant =
+            turn_context.completion_contract.expects_mutation || assistant_claimed_mutation;
+        if mutation_gate_relevant {
+            let mutation_gate_block_condition = !force_text_fast_path_accepted
+                && !force_text_response
+                && agent.depth == 0
+                && turn_context.completion_contract.expects_mutation
+                && completion_progress.mutation_count == 0
+                && has_tool_attempts
+                && stall_count < 2;
+            let zero_tool_claim_condition = !has_tool_attempts
+                && turn_context.completion_contract.expects_mutation
+                && assistant_claimed_mutation;
+            let (outcome, skip_reason) = if force_text_fast_path_accepted {
+                ("skipped_force_text_fast_path", Some("force_text_fast_path"))
+            } else if force_text_response {
+                ("skipped_force_text_response", Some("force_text_response"))
+            } else if zero_tool_claim_condition {
+                ("blocked_claimed_mutation_without_tool", None)
+            } else if agent.depth != 0 {
+                ("skipped_non_root_agent", Some("non_root_agent"))
+            } else if !turn_context.completion_contract.expects_mutation {
+                ("not_expected", Some("completion_contract_no_mutation"))
+            } else if completion_progress.mutation_count > 0 {
+                ("passed", None)
+            } else if mutation_gate_block_condition {
+                ("blocked_unsatisfied_after_tools", None)
+            } else {
+                ("pending_no_mutation_tool", None)
+            };
+            let metadata = json!({
+                "condition": "expects_mutation_gate_evaluated",
+                "expects_mutation": turn_context.completion_contract.expects_mutation,
+                "assistant_claimed_mutation": assistant_claimed_mutation,
+                "tool_calls_count": resp.tool_calls.len(),
+                "mutation_tool_calls_count": completion_progress.mutation_count,
+                "total_successful_tool_calls": total_successful_tool_calls,
+                "has_tool_attempts": has_tool_attempts,
+                "outcome": outcome,
+                "skip_reason": skip_reason,
+                "stall_count": stall_count,
+            });
+            if matches!(
+                outcome,
+                "blocked_claimed_mutation_without_tool" | "blocked_unsatisfied_after_tools"
+            ) {
+                agent
+                    .emit_warning_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::PostExecutionValidation,
+                        "Mutation expectation gate flagged an unsafe completion".to_string(),
+                        metadata,
+                    )
+                    .await;
+            } else {
+                agent
+                    .emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::PostExecutionValidation,
+                        "Mutation expectation gate evaluated".to_string(),
+                        metadata,
+                    )
+                    .await;
+            }
+        }
+
         if agent.depth == 0
             && total_successful_tool_calls == 0
             && needs_tools_for_turn
@@ -368,7 +441,6 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
         let false_capability_denial = looks_like_false_capability_denial_after_tool_success(&reply);
 
         if false_capability_denial {
@@ -721,11 +793,24 @@ pub(super) async fn run_completion_phase(
                     )
                     .await?;
 
+                let has_unrecovered_errors =
+                    learning_ctx.errors.iter().any(|(_, recovered)| !*recovered);
+                let outcome = TaskOutcomeDerivation::from_completion_state(
+                    &validation_state,
+                    execution_state,
+                    ctx.completion_progress,
+                    true,
+                    response_has_user_value(&fallback, total_successful_tool_calls),
+                    has_unrecovered_errors,
+                    None,
+                )
+                .derive_outcome();
                 agent
                     .emit_task_end(
                         emitter,
                         task_id,
                         TaskStatus::Completed,
+                        outcome,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -733,6 +818,16 @@ pub(super) async fn run_completion_phase(
                         Some(fallback.chars().take(200).collect()),
                     )
                     .await;
+                learning_ctx.completed_naturally = true;
+                learning_ctx.task_outcome = Some(outcome);
+                let learning_ctx_for_task = learning_ctx.clone();
+                let state = agent.state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await
+                    {
+                        warn!("Learning failed: {}", e);
+                    }
+                });
 
                 commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::Return(Ok(fallback))));
@@ -1163,10 +1258,28 @@ pub(super) async fn run_completion_phase(
         let reply_is_substantive =
             !has_structural_markers && is_substantive_text_response(&reply, 200);
         let incomplete_live_work_summary = looks_like_incomplete_live_work_summary(&reply);
+        // Fabricated-action guard: a reply that claims a completed side
+        // effect ("I have deleted the folder") in a task that made ZERO
+        // tool calls cannot be truthful when the completion contract
+        // expects a mutation. Treat it like a deferred action so the
+        // no-tool recovery machinery (hard tool-call nudge, fallback
+        // expansion, model switch) gets a chance to make it real. The
+        // substantive-text bypass must not rescue such replies either —
+        // length is no evidence of truth.
+        let claims_unfulfilled_mutation = !has_tool_attempts
+            && turn_context.completion_contract.expects_mutation
+            && assistant_claimed_mutation;
+        let claims_unfulfilled_delegation = !has_tool_attempts && assistant_claimed_delegation;
         if !used_identity_prefill
             && !force_text_fast_path_accepted
-            && (looks_like_deferred_action_response(&reply) || incomplete_live_work_summary)
-            && (!reply_is_substantive || incomplete_live_work_summary)
+            && (looks_like_deferred_action_response(&reply)
+                || incomplete_live_work_summary
+                || claims_unfulfilled_mutation
+                || claims_unfulfilled_delegation)
+            && (!reply_is_substantive
+                || incomplete_live_work_summary
+                || claims_unfulfilled_mutation
+                || claims_unfulfilled_delegation)
         {
             // Post-tool-success: if we've already caught one deferral after tools
             // succeeded, accept this reply instead of stalling further.
@@ -1259,6 +1372,7 @@ pub(super) async fn run_completion_phase(
             } else if !has_tool_attempts
                 && deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
                 && is_substantive_text_response(&reply, 50)
+                && !claims_unfulfilled_mutation
             {
                 // Early acceptance: the model keeps producing deferred-action text
                 // but the underlying content is substantive (e.g., a greeting,
@@ -1333,7 +1447,14 @@ pub(super) async fn run_completion_phase(
                             && lower_reply.contains("\"needs_tools\":true")
                     };
                     let deferred_nudge = if !has_tool_attempts {
-                        if needs_tools_for_turn || response_claims_needs_tools {
+                        // A claimed-but-unexecuted mutation always needs a
+                        // tool call — never downgrade it to plain-text mode,
+                        // which would accept the fabrication next iteration.
+                        if needs_tools_for_turn
+                            || response_claims_needs_tools
+                            || claims_unfulfilled_mutation
+                            || claims_unfulfilled_delegation
+                        {
                             SystemDirective::DeferredToolCallRequired
                         } else {
                             force_text_response = true;
@@ -1473,30 +1594,6 @@ pub(super) async fn run_completion_phase(
             )
             .await?;
 
-        // Emit TaskEnd event
-        agent
-            .emit_task_end(
-                emitter,
-                task_id,
-                TaskStatus::Completed,
-                task_start,
-                iteration,
-                learning_ctx.tool_calls.len(),
-                None,
-                Some(reply.chars().take(200).collect()),
-            )
-            .await;
-
-        // Process learning in background
-        learning_ctx.completed_naturally = true;
-        let learning_ctx_for_task = learning_ctx.clone();
-        let state = agent.state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                warn!("Learning failed: {}", e);
-            }
-        });
-
         // Progressive fact extraction: extract durable facts immediately
         if agent.context_window_config.progressive_facts
             && crate::memory::context_window::should_extract_facts(user_text)
@@ -1509,6 +1606,7 @@ pub(super) async fn run_completion_phase(
                 llm_provider.clone(),
                 fast_model.clone(),
                 agent.state.clone(),
+                agent.event_store.clone(),
                 user_text.to_string(),
                 reply.clone(),
                 channel_ctx.channel_id.clone(),
@@ -1522,6 +1620,7 @@ pub(super) async fn run_completion_phase(
                     llm_provider.clone(),
                     fast_model,
                     agent.state.clone(),
+                    agent.event_store.clone(),
                     session_id.to_string(),
                     agent.context_window_config.summarize_threshold,
                     agent.context_window_config.summary_window,
@@ -1529,6 +1628,26 @@ pub(super) async fn run_completion_phase(
                 );
             }
         }
+
+        // Degeneration guard: collapse runaway repetition loops before anything
+        // else. Models (especially local ones) sometimes collapse into emitting
+        // the same sentence or line many times in a row once their context fills
+        // with repetitive content; without this the user sees a wall of
+        // duplicated text split across many chunked messages.
+        let reply = {
+            let (collapsed, did_collapse) =
+                crate::tools::sanitize::collapse_degenerate_repetition(&reply);
+            if did_collapse {
+                warn!(
+                    session_id,
+                    iteration,
+                    original_len = reply.len(),
+                    collapsed_len = collapsed.len(),
+                    "Collapsed degenerate repetition loop in final reply"
+                );
+            }
+            collapsed
+        };
 
         // Sanitize user-facing output before any channel-specific redaction.
         let pre_sanitize_non_empty = !reply.trim().is_empty();
@@ -1594,7 +1713,8 @@ pub(super) async fn run_completion_phase(
             && looks_like_multi_part_request(user_text);
         // Canned ack is always low quality when there was significant tool work
         let is_canned_with_work = is_canned_ack_reply && total_successful_tool_calls >= 3;
-        if (is_canned_with_work || is_low_quality_multipart)
+        let is_plain_text_tool_call = response_looks_like_plain_text_tool_call(&reply);
+        if (is_canned_with_work || is_low_quality_multipart || is_plain_text_tool_call)
             && ctx.completion_progress.quality_nudge_count == 0
         {
             ctx.completion_progress.quality_nudge_count += 1;
@@ -1607,11 +1727,48 @@ pub(super) async fn run_completion_phase(
                 iteration,
                 reply_len = reply.len(),
                 total_successful_tool_calls,
+                is_plain_text_tool_call,
                 "Response quality too low for multi-part request — nudging for better response"
             );
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
+
+        let has_unrecovered_errors = learning_ctx.errors.iter().any(|(_, recovered)| !*recovered);
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation_state,
+            execution_state,
+            ctx.completion_progress,
+            true,
+            response_has_user_value(&reply, total_successful_tool_calls),
+            has_unrecovered_errors,
+            None,
+        )
+        .derive_outcome();
+
+        agent
+            .emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Completed,
+                outcome,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                None,
+                Some(reply.chars().take(200).collect()),
+            )
+            .await;
+
+        learning_ctx.completed_naturally = true;
+        learning_ctx.task_outcome = Some(outcome);
+        let learning_ctx_for_task = learning_ctx.clone();
+        let state = agent.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                warn!("Learning failed: {}", e);
+            }
+        });
 
         info!(
             session_id,
@@ -1619,6 +1776,7 @@ pub(super) async fn run_completion_phase(
             reply_len = reply.len(),
             reply_empty = reply.trim().is_empty(),
             reply_preview = &reply.chars().take(120).collect::<String>() as &str,
+            outcome = outcome.as_str(),
             "Agent completed naturally"
         );
         commit_state!();

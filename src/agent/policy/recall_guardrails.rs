@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use super::intent_routing::contains_keyword_as_words;
-use crate::traits::Fact;
+use crate::traits::{Fact, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CriticalFactQuery {
@@ -479,6 +479,101 @@ pub(super) fn user_is_reaffirmation_challenge(user_text: &str) -> bool {
         || contains_keyword_as_words(&lower, "certain")
 }
 
+/// A reaffirmation challenge is only "vague" — and safe to anchor hard to the
+/// immediately previous exchange — when the message is short and carries no
+/// new task of its own. Long or statement-shaped messages that merely contain
+/// "really"/"certain" must NOT be pinned to the prior exchange.
+pub(super) fn is_vague_reaffirmation_challenge(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    // Long messages carry their own topic/task — anchoring them to the prior
+    // exchange would fight the user's actual request (same length heuristic
+    // as cancel-intent detection in main_loop.rs).
+    if lower.len() >= 80 {
+        return false;
+    }
+    if contains_keyword_as_words(&lower, "are you sure")
+        || contains_keyword_as_words(&lower, "you sure")
+        || contains_keyword_as_words(&lower, "are you certain")
+    {
+        return true;
+    }
+    // Bare "really"/"certain" are too ambiguous on their own: require a short,
+    // question-shaped message so statements like "I really need you to
+    // refactor X" don't get pinned to the previous exchange.
+    (contains_keyword_as_words(&lower, "really") || contains_keyword_as_words(&lower, "certain"))
+        && lower.contains('?')
+        && lower.len() <= 40
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReaffirmationAnchorContext {
+    pub prior_user_request: Option<String>,
+    pub prior_assistant_reply: String,
+}
+
+/// Resolve the immediately previous user/assistant exchange that a vague
+/// reaffirmation challenge ("Are you sure?") should address.
+pub(super) fn resolve_reaffirmation_anchor(
+    history: &[Message],
+    challenge_text: &str,
+) -> Option<ReaffirmationAnchorContext> {
+    let challenge = challenge_text.trim();
+    if challenge.is_empty() {
+        return None;
+    }
+
+    let mut skipped_challenge = false;
+    let mut prior_assistant: Option<&Message> = None;
+
+    for msg in history.iter().rev() {
+        match msg.role.as_str() {
+            "user" => {
+                // None-content rows (synthetic/tool-related) are skipped, not
+                // treated as a resolution failure.
+                let Some(content) = msg.content.as_deref() else {
+                    continue;
+                };
+                let content = content.trim();
+                if content.is_empty() {
+                    continue;
+                }
+                if !skipped_challenge && content.eq_ignore_ascii_case(challenge) {
+                    skipped_challenge = true;
+                    continue;
+                }
+                if let Some(assistant) = prior_assistant {
+                    return Some(ReaffirmationAnchorContext {
+                        prior_user_request: Some(content.to_string()),
+                        prior_assistant_reply: assistant.content.clone()?,
+                    });
+                }
+            }
+            "assistant" if prior_assistant.is_none() => {
+                // Tool-call-only assistant rows can have None content — skip
+                // them rather than aborting the whole resolution.
+                let Some(content) = msg.content.as_deref() else {
+                    continue;
+                };
+                if !content.trim().is_empty() {
+                    prior_assistant = Some(msg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    prior_assistant.and_then(|assistant| {
+        let reply = assistant.content.as_deref()?.trim();
+        if reply.is_empty() {
+            return None;
+        }
+        Some(ReaffirmationAnchorContext {
+            prior_user_request: None,
+            prior_assistant_reply: reply.to_string(),
+        })
+    })
+}
+
 pub(super) fn user_requests_external_verification(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     contains_keyword_as_words(&lower, "actually check")
@@ -629,6 +724,113 @@ mod tests {
         assert!(user_requests_external_verification(
             "Please check online and verify this."
         ));
+    }
+
+    fn history_msg(role: &str, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: "test".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls_json: None,
+            created_at: chrono::Utc::now(),
+            importance: 1.0,
+            ..Message::runtime_defaults()
+        }
+    }
+
+    #[test]
+    fn resolve_reaffirmation_anchor_targets_immediately_previous_exchange() {
+        let history = vec![
+            history_msg("user", "Whats ecuador?"),
+            history_msg(
+                "assistant",
+                "Ecuador is a country in northwestern South America.",
+            ),
+            history_msg("user", "How many R's in strawberry?"),
+            history_msg("assistant", "There are 3 R's in strawberry."),
+            history_msg("user", "Are you sure?"),
+        ];
+
+        let anchor =
+            resolve_reaffirmation_anchor(&history, "Are you sure?").expect("anchor should resolve");
+
+        assert_eq!(
+            anchor.prior_user_request.as_deref(),
+            Some("How many R's in strawberry?")
+        );
+        assert_eq!(
+            anchor.prior_assistant_reply,
+            "There are 3 R's in strawberry."
+        );
+    }
+
+    #[test]
+    fn resolve_reaffirmation_anchor_skips_empty_assistant_messages() {
+        let history = vec![
+            history_msg("user", "2 + 2 ?"),
+            history_msg("assistant", ""),
+            history_msg("assistant", "2 + 2 = 4"),
+            history_msg("user", "Are you sure?"),
+        ];
+
+        let anchor =
+            resolve_reaffirmation_anchor(&history, "Are you sure?").expect("anchor should resolve");
+
+        assert_eq!(anchor.prior_user_request.as_deref(), Some("2 + 2 ?"));
+        assert_eq!(anchor.prior_assistant_reply, "2 + 2 = 4");
+    }
+
+    #[test]
+    fn resolve_reaffirmation_anchor_skips_none_content_messages() {
+        // Tool-call-only assistant rows and synthetic user rows can have
+        // content: None — they must be skipped, not abort the resolution.
+        let mut none_user = history_msg("user", "");
+        none_user.content = None;
+        let mut none_assistant = history_msg("assistant", "");
+        none_assistant.content = None;
+        let history = vec![
+            history_msg("user", "2 + 2 ?"),
+            none_user,
+            history_msg("assistant", "2 + 2 = 4"),
+            none_assistant,
+            history_msg("user", "Are you sure?"),
+        ];
+
+        let anchor = resolve_reaffirmation_anchor(&history, "Are you sure?")
+            .expect("None-content messages should be skipped, not abort resolution");
+
+        assert_eq!(anchor.prior_user_request.as_deref(), Some("2 + 2 ?"));
+        assert_eq!(anchor.prior_assistant_reply, "2 + 2 = 4");
+    }
+
+    #[test]
+    fn vague_reaffirmation_challenge_accepts_short_challenges() {
+        assert!(is_vague_reaffirmation_challenge("Are you sure?"));
+        assert!(is_vague_reaffirmation_challenge("really?"));
+        assert!(is_vague_reaffirmation_challenge("you sure?"));
+        assert!(is_vague_reaffirmation_challenge(
+            "Are you certain about that?"
+        ));
+    }
+
+    #[test]
+    fn vague_reaffirmation_challenge_rejects_compound_or_statement_messages() {
+        // Statements that merely contain a challenge keyword.
+        assert!(!is_vague_reaffirmation_challenge(
+            "I really need you to refactor the auth module"
+        ));
+        assert!(!is_vague_reaffirmation_challenge(
+            "I'm certain the config is in the projects folder"
+        ));
+        // Long compound message carries its own new task.
+        assert!(!is_vague_reaffirmation_challenge(
+            "Are you sure? Anyway, now please write a long and detailed blog post about Ecuador for me"
+        ));
+        // Not a challenge at all.
+        assert!(!is_vague_reaffirmation_challenge("Please deploy the app"));
     }
 
     #[test]

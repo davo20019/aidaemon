@@ -7,6 +7,7 @@ use crate::agent::recall_guardrails::{
 };
 use crate::agent::response_phase::ResponsePhaseOutcome;
 use crate::agent::*;
+use crate::events::TaskOutcome;
 
 const MAX_SCHEDULE_SEGMENTS_PER_MESSAGE: usize = 10;
 
@@ -115,6 +116,7 @@ async fn emit_direct_reply(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
+            TaskOutcome::Succeeded,
             ctx.task_start,
             ctx.iteration,
             0,
@@ -179,6 +181,7 @@ async fn confirm_scheduled_goal_activation(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
+            TaskOutcome::Succeeded,
             ctx.task_start,
             ctx.iteration,
             0,
@@ -264,11 +267,17 @@ async fn confirm_scheduled_goal_activation_batch(
     agent
         .append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
         .await?;
+    let outcome = if !activated.is_empty() {
+        TaskOutcome::Succeeded
+    } else {
+        TaskOutcome::Failed
+    };
     agent
         .emit_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
+            outcome,
             ctx.task_start,
             ctx.iteration,
             0,
@@ -429,6 +438,7 @@ pub(super) async fn maybe_handle_generic_cancel_request(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
+            TaskOutcome::Succeeded,
             ctx.task_start,
             ctx.iteration,
             0,
@@ -493,6 +503,7 @@ async fn handle_scheduled_intent(
                 ctx.emitter,
                 ctx.task_id,
                 TaskStatus::Completed,
+                TaskOutcome::Succeeded,
                 ctx.task_start,
                 ctx.iteration,
                 0,
@@ -1212,6 +1223,7 @@ async fn handle_complex_intent(
                 ctx.emitter,
                 ctx.task_id,
                 TaskStatus::Completed,
+                TaskOutcome::Succeeded,
                 ctx.task_start,
                 ctx.iteration,
                 0,
@@ -1352,6 +1364,11 @@ async fn handle_complex_intent(
                         ctx.emitter,
                         ctx.task_id,
                         TaskStatus::Completed,
+                        if response_has_user_value(&response, 0) {
+                            TaskOutcome::Succeeded
+                        } else {
+                            TaskOutcome::Failed
+                        },
                         ctx.task_start,
                         ctx.iteration,
                         0,
@@ -1398,6 +1415,7 @@ async fn handle_complex_intent(
                         ctx.emitter,
                         ctx.task_id,
                         TaskStatus::Failed,
+                        TaskOutcome::Failed,
                         ctx.task_start,
                         ctx.iteration,
                         0,
@@ -1435,6 +1453,7 @@ async fn handle_complex_intent(
             ctx.llm_provider.clone(),
             fast_model.clone(),
             agent.state.clone(),
+            agent.event_store.clone(),
             ctx.user_text.to_string(),
             goal_response.clone(),
             ctx.channel_ctx.channel_id.clone(),
@@ -1447,6 +1466,7 @@ async fn handle_complex_intent(
                 ctx.llm_provider.clone(),
                 fast_model,
                 agent.state.clone(),
+                agent.event_store.clone(),
                 ctx.session_id.to_string(),
                 agent.context_window_config.summarize_threshold,
                 agent.context_window_config.summary_window,
@@ -1478,6 +1498,7 @@ async fn handle_complex_intent(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
+            TaskOutcome::Succeeded,
             ctx.task_start,
             ctx.iteration,
             0,

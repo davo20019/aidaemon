@@ -332,6 +332,7 @@ pub(super) async fn maybe_trigger_reflection(
         }),
     ];
 
+    let call_start = std::time::Instant::now();
     let response =
         match tokio::time::timeout(REFLECTION_TIMEOUT, provider.chat(&model, &messages, &[])).await
         {
@@ -355,9 +356,16 @@ pub(super) async fn maybe_trigger_reflection(
             }
         };
 
-    if let Some(usage) = &response.usage {
-        let _ = agent.state.record_token_usage(session_id, usage).await;
-    }
+    crate::events::record_background_model_call_telemetry(
+        agent.event_store.clone(),
+        agent.state.as_ref(),
+        session_id,
+        "tool_reflection",
+        &model,
+        &response,
+        call_start.elapsed(),
+    )
+    .await;
 
     let response_text = response
         .content

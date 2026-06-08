@@ -317,7 +317,14 @@ pub(super) async fn run_llm_phase(
             "Force-text mode: requiring plain text via tool_choice=none (tool defs retained for prefix stability)"
         );
     }
-    let mut llm_options = ChatOptions::default();
+    // llama.cpp slot pinning (opt-in). The root interactive agent carries
+    // `Some(interactive_slot)`; sub-agents carry `None` and fall through to the
+    // provider's background slot. When routing is disabled this is `None` and
+    // the provider omits `id_slot` entirely.
+    let mut llm_options = ChatOptions {
+        id_slot: services.agent.interactive_slot,
+        ..ChatOptions::default()
+    };
     // Escalating recovery for thinking-model truncation.
     // Count tracks how many consecutive iterations were truncated with all
     // tokens spent on thinking and no usable output.

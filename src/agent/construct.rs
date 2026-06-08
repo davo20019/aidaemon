@@ -57,6 +57,7 @@ impl Agent {
         path_aliases: PathAliasConfig,
         inherited_project_scope: Option<String>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
+        interactive_slot: Option<u32>,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
@@ -142,6 +143,7 @@ impl Agent {
             core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            interactive_slot,
         }
     }
 
@@ -309,6 +311,9 @@ impl Agent {
             core_prompts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_renders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            // Sub-agents never pin the interactive slot — only the root agent's
+            // main generation loop does. They default to the background slot.
+            interactive_slot: None,
         }
     }
 }

@@ -10,8 +10,26 @@ use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::run_helpers::*;
 use super::types::{ToolExecutionCtx, ToolExecutionOutcome};
 use crate::agent::execution_state::OutcomeEntry;
+use crate::agent::loop_state::{
+    canonical_path_from_arguments, LineInterval, ReadDecision, ReadRequest,
+};
 use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::*;
+use crate::events::TaskOutcome;
+
+fn format_line_intervals(intervals: &[LineInterval]) -> String {
+    intervals
+        .iter()
+        .map(|interval| {
+            if interval.start == interval.end {
+                interval.start.to_string()
+            } else {
+                format!("{}-{}", interval.start, interval.end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 pub(in crate::agent) async fn run_tool_execution_phase(
     services: &crate::agent::services::AgentServices<'_>,
@@ -45,6 +63,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let resolved_goal_id = ctx.resolved_goal_id;
     let evidence_state = &mut *ctx.evidence_state;
     let validation_state = &mut *ctx.validation_state;
+    let read_file_tracker = &mut *ctx.read_file_tracker;
 
     let mut tool_defs = std::mem::take(ctx.tool_defs);
     let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
@@ -755,6 +774,100 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // They must run BEFORE loop-pattern guards so blocked calls
         // do not inflate repetitive/same-tool counters and trigger
         // false "agent is looping" failures.
+        if tc.name == "read_file" {
+            if let Some(request) = ReadRequest::from_arguments(&effective_arguments).await {
+                let decision = read_file_tracker.decide(&request);
+                match &decision {
+                    ReadDecision::Replay {
+                        covered_intervals, ..
+                    } => {
+                        agent
+                            .emit_warning_decision_point(
+                                emitter,
+                                task_id,
+                                iteration,
+                                DecisionType::SemanticReadDecision,
+                                "Replayed complete task-local file artifact".to_string(),
+                                json!({
+                                    "condition": "semantic_read_replay",
+                                    "path": &request.canonical_path,
+                                    "covered_intervals": covered_intervals,
+                                    "uncovered_intervals": [],
+                                }),
+                            )
+                            .await;
+                    }
+                    ReadDecision::PartialOverlap {
+                        covered_intervals,
+                        uncovered_intervals,
+                    } => {
+                        agent
+                            .emit_warning_decision_point(
+                                emitter,
+                                task_id,
+                                iteration,
+                                DecisionType::SemanticReadDecision,
+                                "Blocked overlapping file range read".to_string(),
+                                json!({
+                                    "condition": "semantic_read_partial_overlap",
+                                    "path": &request.canonical_path,
+                                    "covered_intervals": covered_intervals,
+                                    "uncovered_intervals": uncovered_intervals,
+                                }),
+                            )
+                            .await;
+                    }
+                    ReadDecision::Execute | ReadDecision::Unknown => {}
+                }
+                let synthetic = match &decision {
+                    ReadDecision::Replay { metadata, .. } => Some(
+                        ToolResultNotice::SemanticReadReplay {
+                            rendered_output: crate::tools::render_read_file_output(metadata),
+                        }
+                        .render(),
+                    ),
+                    ReadDecision::PartialOverlap {
+                        covered_intervals,
+                        uncovered_intervals,
+                    } => Some(
+                        ToolResultNotice::SemanticReadPartialOverlap {
+                            covered_intervals: format_line_intervals(covered_intervals),
+                            uncovered_intervals: format_line_intervals(uncovered_intervals),
+                        }
+                        .render(),
+                    ),
+                    ReadDecision::Execute | ReadDecision::Unknown => None,
+                };
+                if let Some(result_text) = synthetic {
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        ..Message::runtime_defaults()
+                    };
+                    agent
+                        .append_tool_message_with_result_event(
+                            emitter,
+                            &tool_msg,
+                            true,
+                            0,
+                            None,
+                            Some(task_id),
+                        )
+                        .await?;
+                    execution_state.record_tool_call();
+                    execution_state.complete_current_step(StepExecutionOutcome::Progress);
+                    execution_state.mark_persisted_now();
+                    continue;
+                }
+            }
+        }
         if let Some(guard_outcome) = super::guards::maybe_handle_loop_pattern_guards(
             agent,
             tc,
@@ -828,6 +941,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         .await?
         {
             continue;
+        }
+
+        let path_specific_mutation = matches!(tc.name.as_str(), "write_file" | "edit_file");
+        let unknown_may_mutate =
+            call_semantics.is_empty() && (!tool_caps.read_only || tool_caps.external_side_effect);
+        if !path_specific_mutation && (call_semantics.mutates_state() || unknown_may_mutate) {
+            read_file_tracker.clear();
+            evidence_state.clear_file_read_evidence();
         }
 
         let io = super::execution_io::execute_tool_call_io(
@@ -922,13 +1043,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // Track total calls per tool
         *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
 
-        // Cache successful read_file/search_files results so the repetitive
+        // Cache successful search_files results so the repetitive
         // redirect can replay them instead of sending a generic "BLOCKED"
         // message.  This solves the lost-context problem: when context
         // truncation drops earlier read results, the model re-reads the same
         // file, gets redirected, and receives the cached content + coaching
         // to write fixes instead of reading again.
-        if matches!(tc.name.as_str(), "read_file" | "search_files") {
+        if tc.name == "search_files" {
             let cache_hash = hash_tool_call(&tc.name, &tc.arguments);
             // Cap cached content at 8KB to avoid bloating the redirect msg
             let max_cache_chars = 8000;
@@ -980,6 +1101,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             false,
         );
         let is_error = failure_class.is_some();
+        if path_specific_mutation && !is_error {
+            if let Some(path) = canonical_path_from_arguments(&effective_arguments).await {
+                read_file_tracker.invalidate_path(&path);
+                evidence_state.invalidate_file_read_path(&path);
+            }
+        }
+        if tc.name == "read_file" && !is_error {
+            if let Some(read_metadata) = result_metadata.read_file.clone() {
+                read_file_tracker.insert(read_metadata);
+            }
+        }
 
         // Track tool call for learning — mark failures so activity summaries
         // don't claim files were written when writes actually failed.
@@ -1336,6 +1468,42 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
+        if !is_error {
+            if let Ok(events) = agent
+                .event_store
+                .query_task_events_for_session(session_id, task_id)
+                .await
+            {
+                let duplicate_count = duplicate_successful_tool_result_count(
+                    &events,
+                    &tc.name,
+                    &effective_arguments,
+                    &result_text,
+                );
+                if duplicate_count > 0 {
+                    agent
+                        .emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::RepetitiveCallDetection,
+                            format!(
+                                "Repeated successful tool call for {} with the same arguments and result",
+                                tc.name
+                            ),
+                            json!({
+                                "condition": "duplicate_successful_tool_call",
+                                "tool": tc.name,
+                                "duplicate_count": duplicate_count,
+                                "arguments_hash": canonical_tool_arguments_hash(&effective_arguments),
+                                "result_len": result_text.len(),
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+
         let tool_msg = Message {
             content: Some(result_text.clone()),
             tool_call_id: Some(tc.id.clone()),
@@ -1388,6 +1556,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
+                    TaskOutcome::Succeeded,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1397,6 +1566,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .await;
 
             learning_ctx.completed_naturally = true;
+            learning_ctx.task_outcome = Some(crate::events::TaskOutcome::Succeeded);
             let learning_ctx_for_task = learning_ctx.clone();
             let state = agent.state.clone();
             tokio::spawn(async move {

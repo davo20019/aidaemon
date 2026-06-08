@@ -1181,6 +1181,7 @@ mod tests {
             completed_naturally: false,
             explicit_positive_signals: 0,
             explicit_negative_signals: 0,
+            task_outcome: None,
             replay_notes: Vec::new(),
         };
 

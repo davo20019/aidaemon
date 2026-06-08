@@ -43,9 +43,10 @@ pub use provider::{
 };
 #[allow(unused_imports)]
 pub use tools::{
-    AgentRole, SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolRole, ToolSemanticAffordances, ToolSemanticFacet,
-    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
+    ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 pub use trigger_event::TriggerEvent;
 

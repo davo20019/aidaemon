@@ -85,6 +85,38 @@ struct CompletedProcess {
     completed_at: Instant,
 }
 
+/// Max agent re-engagements from background-command completions per session
+/// within [`REENGAGE_WINDOW`]. Beyond the cap the raw output is delivered
+/// instead of re-entering the agent loop. Guards against runaway cycles where
+/// a re-engaged task stalls, spawns another background command, and its
+/// completion re-engages again (observed 2026-06-06: a stalled task re-spawned
+/// whole-home `find` scans, burning ~24k-token LLM calls for ~30 minutes).
+const MAX_REENGAGEMENTS_PER_WINDOW: usize = 3;
+/// Sliding window for the re-engagement cap.
+const REENGAGE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Sliding-window limiter for background-completion agent re-engagements.
+/// Records `now` and returns `true` when the session still has budget;
+/// returns `false` (recording nothing) once the cap is reached.
+fn reengagement_allowed(
+    log: &mut HashMap<String, std::collections::VecDeque<Instant>>,
+    session_id: &str,
+    now: Instant,
+) -> bool {
+    let entries = log.entry(session_id.to_string()).or_default();
+    while entries
+        .front()
+        .is_some_and(|t| now.duration_since(*t) >= REENGAGE_WINDOW)
+    {
+        entries.pop_front();
+    }
+    if entries.len() >= MAX_REENGAGEMENTS_PER_WINDOW {
+        return false;
+    }
+    entries.push_back(now);
+    true
+}
+
 pub struct TerminalTool {
     /// Permanently allowed prefixes (from config + DB)
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
@@ -107,6 +139,9 @@ pub struct TerminalTool {
     /// a background terminal command completes so the agent can process the
     /// output and continue working on the original task.
     agent: OnceLock<Weak<crate::agent::Agent>>,
+    /// Per-session timestamps of recent background-completion re-engagements,
+    /// used by [`reengagement_allowed`] to cap runaway re-engagement loops.
+    reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
 }
 
 /// Check if a command string contains shell operators.
@@ -517,6 +552,7 @@ impl TerminalTool {
             state: None,
             hub: OnceLock::new(),
             agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1340,6 +1376,7 @@ impl TerminalTool {
                 let state_for_notify = self.state.clone();
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
+                let reengagements_for_notify = self.reengagements.clone();
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -1425,9 +1462,15 @@ impl TerminalTool {
                                         } else {
                                             "finished with errors"
                                         };
+                                        // Short status ping only — the raw command output is NOT
+                                        // dumped here. The agent re-engagement below feeds the output
+                                        // back through the LLM so the user gets a properly formatted,
+                                        // summarized reply instead of a wall of raw stdout. The output
+                                        // is only delivered verbatim as a fallback (see below) when
+                                        // re-engagement can't run or produces nothing.
                                         let mut message = format!(
-                                            "Background terminal command {} after {}s.\nCommand: `{}`\n\nOutput:\n{}",
-                                            status, elapsed_secs, command_summary, output
+                                            "Background terminal command {} after {}s.\nCommand: `{}`",
+                                            status, elapsed_secs, command_summary
                                         );
                                         if let Some(code) = exit_code {
                                             if code != 0 {
@@ -1612,57 +1655,135 @@ impl TerminalTool {
                                         pid,
                                         "Skipping agent re-engagement: trivial background command output"
                                     );
-                                } else if let Some(ref agent) = agent_for_notify {
-                                    let followup = format!(
-                                        "[Background command completed]\n\
-                                         Command: `{}`\n\
-                                         Output:\n{}\n\n\
-                                         This command was part of your previous task. \
-                                         Check your session history for the original user request \
-                                         and continue where you left off. Use the output above \
-                                         to proceed with the remaining steps of the task.",
-                                        command_summary, output
-                                    );
-                                    info!(
-                                        pid,
-                                        session_id = %session_for_notify,
-                                        command = %command_for_notify,
-                                        "Re-engaging agent loop to process background command output"
-                                    );
-                                    match agent
-                                        .handle_message(
+                                } else {
+                                    // Preferred path: feed the output back through the agent so the
+                                    // user gets a formatted, summarized reply instead of raw stdout.
+                                    // Only if that path is unavailable or yields nothing do we fall
+                                    // back to delivering the output verbatim (so content is never lost).
+                                    //
+                                    // Re-engagement budget: a re-engaged loop that stalls can spawn
+                                    // another background command whose completion re-engages again,
+                                    // looping indefinitely. Past the per-session cap, skip the agent
+                                    // and deliver the raw output via the fallback below.
+                                    let reengage_budget_ok = {
+                                        let mut log = reengagements_for_notify.lock().await;
+                                        reengagement_allowed(
+                                            &mut log,
                                             &session_for_notify,
-                                            &followup,
-                                            None,
-                                            crate::types::UserRole::Owner,
-                                            crate::types::ChannelContext::internal(),
-                                            None,
+                                            Instant::now(),
                                         )
-                                        .await
-                                    {
-                                        Ok(reply) => {
-                                            // Send the agent's analysis to the user
-                                            if !reply.trim().is_empty() {
-                                                if let Some(ref hub) = hub_for_notify {
-                                                    if let Err(e) = hub
-                                                        .send_text(&session_for_notify, &reply)
-                                                        .await
-                                                    {
-                                                        warn!(
-                                                            pid,
-                                                            error = %e,
-                                                            "Failed to deliver agent follow-up for background command"
-                                                        );
+                                    };
+                                    if !reengage_budget_ok {
+                                        warn!(
+                                            pid,
+                                            session_id = %session_for_notify,
+                                            command = %command_for_notify,
+                                            "Background re-engagement budget exhausted; delivering raw output instead of re-entering agent loop"
+                                        );
+                                    }
+                                    let mut formatted_delivered = false;
+                                    if !reengage_budget_ok {
+                                        // Skip the agent path entirely — fall through to the
+                                        // raw-output fallback delivery below.
+                                    } else if let Some(ref agent) = agent_for_notify {
+                                        let followup = format!(
+                                            "[Background command completed]\n\
+                                             Command: `{}`\n\
+                                             Output:\n{}\n\n\
+                                             This command was part of your previous task. \
+                                             Check your session history for the original user request \
+                                             and continue where you left off. Use the output above \
+                                             to proceed with the remaining steps of the task.",
+                                            command_summary, output
+                                        );
+                                        info!(
+                                            pid,
+                                            session_id = %session_for_notify,
+                                            command = %command_for_notify,
+                                            "Re-engaging agent loop to process background command output"
+                                        );
+                                        match agent
+                                            .handle_message(
+                                                &session_for_notify,
+                                                &followup,
+                                                None,
+                                                crate::types::UserRole::Owner,
+                                                crate::types::ChannelContext::internal(),
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            Ok(reply) => {
+                                                // Send the agent's analysis to the user
+                                                if !reply.trim().is_empty() {
+                                                    if let Some(ref hub) = hub_for_notify {
+                                                        match hub
+                                                            .send_text(&session_for_notify, &reply)
+                                                            .await
+                                                        {
+                                                            Ok(()) => formatted_delivered = true,
+                                                            Err(e) => warn!(
+                                                                pid,
+                                                                error = %e,
+                                                                "Failed to deliver agent follow-up for background command"
+                                                            ),
+                                                        }
                                                     }
                                                 }
                                             }
+                                            Err(e) => {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    "Agent re-engagement failed for background command"
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                pid,
-                                                error = %e,
-                                                "Agent re-engagement failed for background command"
-                                            );
+                                    }
+
+                                    // Fallback: the agent couldn't deliver a formatted reply, so
+                                    // send the raw output (wrapped in a code block) rather than
+                                    // leaving the user with only a "completed" ping and no content.
+                                    if !formatted_delivered {
+                                        let fallback = format!(
+                                            "Output from `{}`:\n\n```\n{}\n```",
+                                            command_summary, output
+                                        );
+                                        let mut delivered = false;
+                                        if let Some(ref hub) = hub_for_notify {
+                                            if let Err(e) =
+                                                hub.send_text(&session_for_notify, &fallback).await
+                                            {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    session_id = %session_for_notify,
+                                                    "Failed to deliver fallback background command output"
+                                                );
+                                            } else {
+                                                delivered = true;
+                                            }
+                                        }
+                                        if !delivered {
+                                            if let Some(ref state) = state_for_notify {
+                                                let entry = crate::traits::NotificationEntry::new(
+                                                    &goal_id_for_notify,
+                                                    &session_for_notify,
+                                                    "progress",
+                                                    &fallback,
+                                                );
+                                                if let Err(e) =
+                                                    state.enqueue_notification(&entry).await
+                                                {
+                                                    warn!(
+                                                        pid,
+                                                        error = %e,
+                                                        session_id = %session_for_notify,
+                                                        goal_id = %goal_id_for_notify,
+                                                        "Failed to enqueue fallback background command output"
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1911,6 +2032,7 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
         http_status: None,
         direct_response: None,
         semantics: ToolCallSemantics::default(),
+        read_file: None,
     }
 }
 
@@ -1929,6 +2051,7 @@ fn tracked_background_metadata(
         http_status: None,
         direct_response: None,
         semantics: ToolCallSemantics::default(),
+        read_file: None,
     }
 }
 
@@ -2358,6 +2481,48 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn test_reengagement_allowed_caps_per_session_window() {
+        let mut log = HashMap::new();
+        let t0 = Instant::now();
+
+        // First MAX_REENGAGEMENTS_PER_WINDOW re-engagements pass.
+        for i in 0..MAX_REENGAGEMENTS_PER_WINDOW {
+            assert!(
+                reengagement_allowed(&mut log, "session-a", t0),
+                "re-engagement {} should be allowed",
+                i
+            );
+        }
+        // The next one within the window is blocked.
+        assert!(!reengagement_allowed(&mut log, "session-a", t0));
+
+        // A different session has its own budget.
+        assert!(reengagement_allowed(&mut log, "session-b", t0));
+
+        // After the window elapses, the budget refills.
+        let later = t0 + REENGAGE_WINDOW + Duration::from_secs(1);
+        assert!(reengagement_allowed(&mut log, "session-a", later));
+    }
+
+    #[test]
+    fn test_reengagement_allowed_sliding_window_partial_expiry() {
+        let mut log = HashMap::new();
+        let t0 = Instant::now();
+
+        assert!(reengagement_allowed(&mut log, "s", t0));
+        let mid = t0 + REENGAGE_WINDOW / 2;
+        assert!(reengagement_allowed(&mut log, "s", mid));
+        assert!(reengagement_allowed(&mut log, "s", mid));
+        // Budget exhausted at mid-window.
+        assert!(!reengagement_allowed(&mut log, "s", mid));
+
+        // Just past the first entry's expiry, exactly one slot frees up.
+        let after_first = t0 + REENGAGE_WINDOW + Duration::from_secs(1);
+        assert!(reengagement_allowed(&mut log, "s", after_first));
+        assert!(!reengagement_allowed(&mut log, "s", after_first));
+    }
 
     fn extract_pid_from_background_message(msg: &str) -> u32 {
         let marker = "pid=";

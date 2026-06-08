@@ -235,6 +235,14 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         config.path_aliases.clone(),
         None,
         specialists,
+        // Pin the interactive generation loop to the configured slot only when
+        // slot routing is enabled on the primary provider; otherwise None (no
+        // id_slot is ever sent — zero behavior change for cloud-API users).
+        if config.provider.slot_routing.enabled {
+            Some(config.provider.slot_routing.interactive_slot)
+        } else {
+            None
+        },
     ));
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
@@ -583,7 +591,7 @@ async fn init_heartbeat_coordinator(
         // Uses a conservative timeout (2x watchdog stale threshold, minimum 5 min)
         // to avoid false positives on legitimately long-running tasks.
         if watchdog_stale_threshold_secs > 0 {
-            let event_store_for_reconcile = event_store;
+            let event_store_for_reconcile = event_store.clone();
             let stale_secs = watchdog_stale_threshold_secs.saturating_mul(2).max(300);
             heartbeat.register_job(
                 "event_task_reconciliation",
@@ -651,6 +659,7 @@ async fn init_heartbeat_coordinator(
         if let Some(sd) = skills_dir {
             let promoter = Arc::new(crate::memory::skill_promotion::SkillPromoter::new(
                 state.clone(),
+                event_store.clone(),
                 llm_runtime.clone(),
                 sd,
                 config.policy.learning_evidence_gate_enforce,
@@ -1460,6 +1469,7 @@ Each retry must build on what you learned — never repeat an approach that alre
 **Coding tasks are exempt from the 3-tool completion rule.**
 **Never skip testing.** Verify your changes work before responding.
 **Never claim a fix is done without testing it.**
+**File reading:** Read a fitting file in full once. For large files, use `search_files` to locate the target, then make one exact surrounding `read_file` call. When scanning sequentially, request only new non-overlapping ranges. Never re-read a file or range already returned.
 **NEVER use `terminal` with `python3 -c` to read or write files.** Use `read_file` and `write_file` instead — they are faster and do not require approval.
 **NEVER use `terminal` with `cat`, `head`, or `tail` to read files.** Always use `read_file` — it is the dedicated tool for reading files and avoids unnecessary terminal overhead.
 

@@ -73,6 +73,152 @@ pub(super) fn looks_like_deferred_action_response(text: &str) -> bool {
         || lower.contains("[tool_call:")
 }
 
+/// Detect first-person past-tense side-effect claims like "I have deleted…",
+/// "I've removed…", "I created…". Used by the completion phase to catch
+/// fabricated action claims: a reply asserting a completed side effect in a
+/// task that made zero tool calls cannot be truthful.
+pub(super) fn claims_completed_side_effect(text: &str) -> bool {
+    // Same normalization as has_action_promise: unify Unicode apostrophes
+    // so "I’ve" matches "I've".
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'");
+
+    // Past-tense verbs that imply a tool-mediated side effect. Knowledge
+    // verbs ("explained", "summarized") are intentionally absent — those
+    // can be fulfilled without tools.
+    const PAST_ACTION_VERBS: &[&str] = &[
+        "deleted",
+        "removed",
+        "created",
+        "wrote",
+        "written",
+        "updated",
+        "edited",
+        "modified",
+        "replaced",
+        "moved",
+        "renamed",
+        "executed",
+        "ran",
+        "installed",
+        "saved",
+        "stored",
+        "copied",
+        "combined",
+        "merged",
+        "deployed",
+        "restarted",
+        "stopped",
+        "killed",
+        "downloaded",
+        "cloned",
+        "pushed",
+        "pulled",
+        "committed",
+        "cleaned",
+        "cleared",
+        "built",
+        "generated",
+        "appended",
+        "uploaded",
+        "sent",
+        "added",
+    ];
+    // Adverbs allowed between the subject and the verb:
+    // "I have successfully executed", "I've just removed".
+    const FILLER_ADVERBS: &[&str] = &["now", "just", "successfully", "already", "also"];
+
+    let words: Vec<String> = normalized
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    let is_action_verb = |w: &str| PAST_ACTION_VERBS.contains(&w);
+    let verb_after = |start: usize| -> bool {
+        let mut idx = start;
+        while words
+            .get(idx)
+            .is_some_and(|w| FILLER_ADVERBS.contains(&w.as_str()))
+        {
+            idx += 1;
+        }
+        words.get(idx).is_some_and(|w| is_action_verb(w))
+    };
+
+    for i in 0..words.len() {
+        let claim = if words[i] == "i've" {
+            // "I've removed …"
+            verb_after(i + 1)
+        } else if words[i] == "i" && words.get(i + 1).is_some_and(|w| w == "have") {
+            // "I have deleted …"
+            verb_after(i + 2)
+        } else if words[i] == "i" {
+            // Simple past: "I deleted …"
+            verb_after(i + 1)
+        } else {
+            false
+        };
+        if claim {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect claims that a delegated agent has already been started. Without a
+/// corresponding tool call, these statements fabricate asynchronous work that
+/// will never produce a result.
+pub(super) fn claims_delegation_started(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'");
+
+    let mentions_delegated_agent = [
+        "specialist agent",
+        "specialized review agent",
+        "review agent",
+        "research agent",
+        "sub-agent",
+        "subagent",
+        "background agent",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+    if !mentions_delegated_agent {
+        return false;
+    }
+
+    [
+        "i've initiated",
+        "i have initiated",
+        "i initiated",
+        "i've started",
+        "i have started",
+        "i started",
+        "i've launched",
+        "i have launched",
+        "i launched",
+        "i've spawned",
+        "i have spawned",
+        "i spawned",
+        "i've delegated",
+        "i have delegated",
+        "i delegated",
+        "is now running",
+        "is running in the background",
+        "has been started",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
 /// Detect action-promise patterns like "I'll create", "I will run", "Let me check".
 /// Returns true when the verb following the prefix is NOT a knowledge-only verb
 /// (e.g., "explain", "describe", "summarize"), meaning the LLM needs tools to fulfill it.

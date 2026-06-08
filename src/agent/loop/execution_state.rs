@@ -441,17 +441,26 @@ impl ExecutionState {
     ///
     /// Also filters out failures with no error summary (unknown errors / false positives).
     pub fn uncorrected_failed_mutations(&self) -> Vec<&OutcomeEntry> {
+        self.uncorrected_failed_entries(true)
+    }
+
+    /// True if there are external mutation failures that were NOT corrected
+    /// by later successes.
+    pub fn has_uncorrected_failed_external_mutations(&self) -> bool {
+        !self.uncorrected_failed_mutations().is_empty()
+    }
+
+    fn uncorrected_failed_entries(&self, external_mutation: bool) -> Vec<&OutcomeEntry> {
         let failures: Vec<&OutcomeEntry> = self
             .outcome_ledger
             .iter()
-            .filter(|e| e.is_external_mutation && !e.success)
+            .filter(|e| e.is_external_mutation == external_mutation && !e.success)
             .collect();
 
         if failures.is_empty() {
             return Vec::new();
         }
 
-        // Filter out failures with no error summary (unknown errors / false positives)
         let failures_with_summary: Vec<&OutcomeEntry> = failures
             .into_iter()
             .filter(|e| e.error_summary.is_some())
@@ -461,12 +470,11 @@ impl ExecutionState {
             return Vec::new();
         }
 
-        // Step 1: Remove failures corrected by a later success of the same tool
         let uncorrected: Vec<&OutcomeEntry> = failures_with_summary
             .into_iter()
             .filter(|fail| {
                 !self.outcome_ledger.iter().any(|e| {
-                    e.is_external_mutation
+                    e.is_external_mutation == external_mutation
                         && e.success
                         && e.tool_name == fail.tool_name
                         && e.iteration > fail.iteration
@@ -478,31 +486,45 @@ impl ExecutionState {
             return Vec::new();
         }
 
-        // Step 2: If ALL remaining failures occurred before the latest success
-        // (any tool), the agent recovered overall. This handles tool switching
-        // (e.g., run_command fails, bot switches to terminal and succeeds).
         let max_success_iter = self
             .outcome_ledger
             .iter()
-            .filter(|e| e.is_external_mutation && e.success)
+            .filter(|e| e.is_external_mutation == external_mutation && e.success)
             .map(|e| e.iteration)
             .max();
 
         if let Some(max_success) = max_success_iter {
-            let still_uncorrected: Vec<&OutcomeEntry> = uncorrected
+            return uncorrected
                 .into_iter()
                 .filter(|e| e.iteration > max_success)
                 .collect();
-            return still_uncorrected;
         }
 
         uncorrected
     }
 
-    /// True if there are external mutation failures that were NOT corrected
-    /// by later successes.
-    pub fn has_uncorrected_failed_external_mutations(&self) -> bool {
-        !self.uncorrected_failed_mutations().is_empty()
+    /// Failed non-mutation observation attempts (navigation, read, search) that
+    /// were not corrected by a later success of the same tool.
+    pub fn uncorrected_failed_observations(&self) -> Vec<&OutcomeEntry> {
+        self.uncorrected_failed_entries(false)
+    }
+
+    /// Uncorrected failed observations that remain required because planned
+    /// steps are still incomplete or the entry is linked to a planned step.
+    pub fn uncorrected_failed_required_observations(&self) -> Vec<&OutcomeEntry> {
+        let has_incomplete_steps = self
+            .active_linear_intent_plan
+            .as_ref()
+            .is_some_and(|plan| plan.steps.iter().any(|step| !step.completed));
+
+        self.uncorrected_failed_observations()
+            .into_iter()
+            .filter(|entry| {
+                has_incomplete_steps
+                    || entry.planned_step_id.is_some()
+                    || entry.planned_step_index.is_some()
+            })
+            .collect()
     }
 
     pub(crate) fn build_attempt_reconciliation_overview(&self) -> Option<ReconciliationOverview> {

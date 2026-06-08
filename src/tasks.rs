@@ -17,6 +17,18 @@ pub struct QueuedMessage {
     pub queued_at: DateTime<Utc>,
 }
 
+/// Outcome of an atomic check-and-queue attempt.
+#[derive(Debug)]
+pub enum QueueOutcome {
+    /// Message queued at this 1-based position.
+    Queued(usize),
+    /// Identical message recently seen — silently dropped.
+    Duplicate,
+    /// No running task for the session: queueing would strand the message
+    /// (nothing will drain it). The caller must process it directly.
+    NoRunningTask,
+}
+
 #[derive(Clone, Debug)]
 pub enum TaskStatus {
     Running,
@@ -107,6 +119,9 @@ impl TaskRegistry {
     }
 
     /// Mark a task as completed.
+    /// Channel loops now use [`Self::finalize_and_drain`]; retained for
+    /// callers that finalize without a session queue (and for tests).
+    #[allow(dead_code)]
     pub async fn complete(&self, task_id: u64) {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
@@ -249,6 +264,9 @@ impl TaskRegistry {
     /// Queue a message for later processing.
     /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
     /// already exists in the queue or was recently processed).
+    /// Channel loops now use [`Self::queue_message_if_running`]; retained
+    /// for queue-only callers and tests.
+    #[allow(dead_code)]
     pub async fn queue_message(&self, session_id: &str, text: &str) -> Option<usize> {
         let now = Utc::now();
         let hash = Self::text_hash(text);
@@ -286,22 +304,15 @@ impl TaskRegistry {
         queues.get_mut(session_id).and_then(|q| q.pop_front())
     }
 
-    /// Drain all queued messages for a session and coalesce into one.
-    /// When a long message is fragmented by the client (e.g. Telegram Web),
-    /// each fragment lands as a separate queued message. This method pops
-    /// them all and concatenates their text with newlines so the agent
+    /// Drain a queue and coalesce its messages into one. When a long message
+    /// is fragmented by the client (e.g. Telegram Web), each fragment lands
+    /// as a separate queued message — concatenate with newlines so the agent
     /// sees the full message as a single prompt.
-    pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
-        let mut queues = self.queues.write().await;
-        let queue = queues.get_mut(session_id)?;
-        if queue.is_empty() {
-            return None;
-        }
-        let first = queue.pop_front().unwrap();
+    fn drain_and_coalesce(queue: &mut VecDeque<QueuedMessage>) -> Option<QueuedMessage> {
+        let first = queue.pop_front()?;
         if queue.is_empty() {
             return Some(first);
         }
-        // Coalesce remaining messages into the first
         let mut combined = first.text;
         while let Some(msg) = queue.pop_front() {
             combined.push('\n');
@@ -311,6 +322,91 @@ impl TaskRegistry {
             text: combined,
             queued_at: first.queued_at,
         })
+    }
+
+    /// Drain all queued messages for a session and coalesce into one.
+    /// Channel loops now use [`Self::finalize_and_drain`]; retained for
+    /// drain-only callers and tests.
+    #[allow(dead_code)]
+    pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(session_id)?;
+        Self::drain_and_coalesce(queue)
+    }
+
+    /// Atomically check for a running task and queue the message behind it.
+    ///
+    /// Closes the race where a session task finishes between the caller's
+    /// `has_running_task()` check and `queue_message()`: a message queued
+    /// after the drain in [`finalize_and_drain`] would otherwise sit in the
+    /// queue with nothing left to drain it (observed in the 2026-06-06
+    /// attribution run, where a queued message was silently stranded).
+    ///
+    /// Lock order: `tasks` → `recently_seen` → `queues` (same as
+    /// [`finalize_and_drain`]), so the two operations serialize and the
+    /// caller can trust the [`QueueOutcome`].
+    pub async fn queue_message_if_running(&self, session_id: &str, text: &str) -> QueueOutcome {
+        let tasks = self.tasks.read().await;
+        let running = tasks.values().any(|h| {
+            h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
+        });
+        if !running {
+            return QueueOutcome::NoRunningTask;
+        }
+
+        // Keep holding the task-map read lock while queueing so
+        // finalize_and_drain (which takes the write lock first) cannot
+        // finalize-and-drain between our check and our push.
+        let now = Utc::now();
+        let hash = Self::text_hash(text);
+        let key = (session_id.to_string(), hash);
+        {
+            let mut seen = self.recently_seen.write().await;
+            seen.retain(|_, ts| (now - *ts).num_seconds() < DEDUP_WINDOW_SECS);
+            if let Some(first_seen) = seen.get(&key) {
+                if (now - *first_seen).num_seconds() < DEDUP_WINDOW_SECS {
+                    return QueueOutcome::Duplicate;
+                }
+            }
+            seen.insert(key, now);
+        }
+        let mut queues = self.queues.write().await;
+        let queue = queues.entry(session_id.to_string()).or_default();
+        queue.push_back(QueuedMessage {
+            text: text.to_string(),
+            queued_at: now,
+        });
+        QueueOutcome::Queued(queue.len())
+    }
+
+    /// Atomically finalize a task (complete, or fail with `error`) and drain
+    /// the session's message queue in one critical section.
+    ///
+    /// Holding the task-map write lock across both steps means no concurrent
+    /// [`queue_message_if_running`] can observe the task as running after the
+    /// drain — so a message is either drained here or rejected with
+    /// `NoRunningTask` (and processed directly by its own handler). Replaces
+    /// the racy `complete()`/`fail()` → gap → `pop_all_queued_messages()`
+    /// sequence in the channel loops.
+    pub async fn finalize_and_drain(
+        &self,
+        task_id: u64,
+        session_id: &str,
+        error: Option<&str>,
+    ) -> Option<QueuedMessage> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.get_mut(&task_id) {
+            handle.entry.status = match error {
+                Some(e) => TaskStatus::Failed(e.to_string()),
+                None => TaskStatus::Completed,
+            };
+            handle.entry.finished_at = Some(Utc::now());
+        }
+        Self::cleanup_locked(&mut tasks, self.max_completed);
+
+        let mut queues = self.queues.write().await;
+        let queue = queues.get_mut(session_id)?;
+        Self::drain_and_coalesce(queue)
     }
 
     /// Get the number of queued messages for a session.
@@ -450,5 +546,110 @@ mod tests {
         let result = registry.pop_all_queued_messages(session).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().text, "only one");
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_queues_while_task_runs() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "long task").await;
+
+        match registry
+            .queue_message_if_running(session, "follow-up")
+            .await
+        {
+            QueueOutcome::Queued(pos) => assert_eq!(pos, 1),
+            other => panic!("expected Queued(1), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_rejects_when_no_task() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+
+        // No running task: the caller must process directly instead of
+        // queueing into a queue nobody will ever drain.
+        assert!(matches!(
+            registry.queue_message_if_running(session, "orphan").await,
+            QueueOutcome::NoRunningTask
+        ));
+        assert_eq!(registry.queue_len(session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_detects_finished_task_race() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        // Task finishes between the caller's has_running_task check and the
+        // queue attempt — the registry must report NoRunningTask instead of
+        // stranding the message.
+        registry.complete(task_id).await;
+
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "late message")
+                .await,
+            QueueOutcome::NoRunningTask
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_queue_message_if_running_deduplicates() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "task").await;
+
+        assert!(matches!(
+            registry.queue_message_if_running(session, "hello").await,
+            QueueOutcome::Queued(1)
+        ));
+        assert!(matches!(
+            registry.queue_message_if_running(session, "hello").await,
+            QueueOutcome::Duplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_completes_and_returns_queued_work() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+        registry.queue_message_if_running(session, "queued A").await;
+        registry.queue_message_if_running(session, "queued B").await;
+
+        let drained = registry.finalize_and_drain(task_id, session, None).await;
+        assert_eq!(drained.unwrap().text, "queued A\nqueued B");
+        assert!(!registry.has_running_task(session).await);
+        assert_eq!(registry.queue_len(session).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_with_error_marks_failed() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+
+        let drained = registry
+            .finalize_and_drain(task_id, session, Some("boom"))
+            .await;
+        assert!(drained.is_none());
+        assert!(!registry.has_running_task(session).await);
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_and_drain_empty_queue_returns_none() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "task").await;
+
+        assert!(registry
+            .finalize_and_drain(task_id, session, None)
+            .await
+            .is_none());
+        assert!(!registry.has_running_task(session).await);
     }
 }

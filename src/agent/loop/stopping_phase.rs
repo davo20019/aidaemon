@@ -6,6 +6,7 @@ use super::stopping_progress::{
     turn_contract_is_text_only,
 };
 use super::*;
+use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ConversationSummary;
 
@@ -393,6 +394,7 @@ pub(super) async fn run_stopping_phase(
                 emitter,
                 task_id,
                 TaskStatus::Completed,
+                TaskOutcome::Failed,
                 task_start,
                 iteration,
                 learning_ctx.tool_calls.len(),
@@ -587,11 +589,24 @@ pub(super) async fn run_stopping_phase(
                         None,
                     )
                     .await?;
+                let has_unrecovered_errors =
+                    learning_ctx.errors.iter().any(|(_, recovered)| !recovered);
+                let outcome = TaskOutcomeDerivation::from_completion_state(
+                    &validation_state,
+                    execution_state,
+                    completion_progress,
+                    true,
+                    response_has_user_value(&reply, total_successful_tool_calls),
+                    has_unrecovered_errors,
+                    None,
+                )
+                .derive_outcome();
                 agent
                     .emit_task_end(
                         emitter,
                         task_id,
                         TaskStatus::Completed,
+                        outcome,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -653,6 +668,7 @@ pub(super) async fn run_stopping_phase(
                         emitter,
                         task_id,
                         status,
+                        TaskOutcome::Failed,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -702,6 +718,7 @@ pub(super) async fn run_stopping_phase(
                         emitter,
                         task_id,
                         status,
+                        TaskOutcome::Failed,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -941,6 +958,7 @@ pub(super) async fn run_stopping_phase(
                     emitter,
                     task_id,
                     status,
+                    TaskOutcome::Failed,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1055,6 +1073,7 @@ pub(super) async fn run_stopping_phase(
                             emitter,
                             task_id,
                             status,
+                            TaskOutcome::Failed,
                             task_start,
                             iteration,
                             learning_ctx.tool_calls.len(),
@@ -1167,6 +1186,7 @@ pub(super) async fn run_stopping_phase(
                                     emitter,
                                     task_id,
                                     status,
+                                    TaskOutcome::Failed,
                                     task_start,
                                     iteration,
                                     learning_ctx.tool_calls.len(),
@@ -1337,6 +1357,7 @@ pub(super) async fn run_stopping_phase(
                         emitter,
                         task_id,
                         TaskStatus::Failed,
+                        TaskOutcome::Failed,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -1417,6 +1438,7 @@ pub(super) async fn run_stopping_phase(
                 emitter,
                 task_id,
                 TaskStatus::Failed,
+                TaskOutcome::Failed,
                 task_start,
                 iteration,
                 learning_ctx.tool_calls.len(),
@@ -1478,6 +1500,7 @@ pub(super) async fn run_stopping_phase(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
+                    TaskOutcome::Succeeded,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1559,11 +1582,22 @@ pub(super) async fn run_stopping_phase(
                         )
                         .await?;
 
+                    let outcome = TaskOutcomeDerivation::from_completion_state(
+                        &validation_state,
+                        execution_state,
+                        completion_progress,
+                        true,
+                        response_has_user_value(&reply, total_successful_tool_calls),
+                        false,
+                        None,
+                    )
+                    .derive_outcome();
                     agent
                         .emit_task_end(
                             emitter,
                             task_id,
                             TaskStatus::Completed,
+                            outcome,
                             task_start,
                             iteration,
                             learning_ctx.tool_calls.len(),
@@ -1601,6 +1635,7 @@ pub(super) async fn run_stopping_phase(
                     emitter,
                     task_id,
                     status,
+                    TaskOutcome::Failed,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1660,11 +1695,22 @@ pub(super) async fn run_stopping_phase(
                     )
                     .await?;
 
+                let outcome = TaskOutcomeDerivation::from_completion_state(
+                    &validation_state,
+                    execution_state,
+                    completion_progress,
+                    true,
+                    response_has_user_value(&reply, total_successful_tool_calls),
+                    false,
+                    None,
+                )
+                .derive_outcome();
                 agent
                     .emit_task_end(
                         emitter,
                         task_id,
                         TaskStatus::Completed,
+                        outcome,
                         task_start,
                         iteration,
                         learning_ctx.tool_calls.len(),
@@ -1720,11 +1766,23 @@ pub(super) async fn run_stopping_phase(
             .await
         {
             info!(session_id, "Knowledge fallback succeeded after tool stall");
+            let reply = result.as_ref().ok().cloned().unwrap_or_default();
+            let outcome = TaskOutcomeDerivation::from_completion_state(
+                &validation_state,
+                execution_state,
+                completion_progress,
+                !reply.trim().is_empty(),
+                response_has_user_value(&reply, total_successful_tool_calls),
+                unrecovered_errors > 0,
+                None,
+            )
+            .derive_outcome();
             agent
                 .emit_task_end(
                     emitter,
                     task_id,
                     TaskStatus::Completed,
+                    outcome,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -1764,6 +1822,7 @@ pub(super) async fn run_stopping_phase(
                 emitter,
                 task_id,
                 status,
+                TaskOutcome::Failed,
                 task_start,
                 iteration,
                 learning_ctx.tool_calls.len(),

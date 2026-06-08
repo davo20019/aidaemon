@@ -1,5 +1,6 @@
 use super::types::ToolExecutionOutcome;
 use crate::agent::*;
+use crate::events::TaskOutcome;
 
 pub(super) enum LoopPatternGuardOutcome {
     ContinueLoop,
@@ -219,6 +220,7 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
                 emitter,
                 task_id,
                 status,
+                TaskOutcome::Failed,
                 task_start,
                 iteration,
                 learning_ctx.tool_calls.len(),
@@ -316,6 +318,7 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
                     emitter,
                     task_id,
                     status,
+                    TaskOutcome::Failed,
                     task_start,
                     iteration,
                     learning_ctx.tool_calls.len(),
@@ -434,6 +437,7 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
                             emitter,
                             task_id,
                             status,
+                            TaskOutcome::Failed,
                             task_start,
                             iteration,
                             learning_ctx.tool_calls.len(),

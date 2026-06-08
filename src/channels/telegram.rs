@@ -37,7 +37,7 @@ use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
 use crate::config::{AppConfig, TelegramWebhookConfig};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{QueueOutcome, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{
@@ -4503,9 +4503,16 @@ impl TelegramChannel {
                     .await;
                 return;
             }
-            let queue_result = self.task_registry.queue_message(&session_id, &text).await;
-            match queue_result {
-                Some(queue_pos) => {
+            // Atomic check-and-queue: if the task finished between the
+            // has_running_task() check above and this call, the registry
+            // reports NoRunningTask and we fall through to direct processing
+            // instead of stranding the message in an undrained queue.
+            match self
+                .task_registry
+                .queue_message_if_running(&session_id, &text)
+                .await
+            {
+                QueueOutcome::Queued(queue_pos) => {
                     // Only notify the user for the first 3 queued messages to avoid spam
                     // (long messages fragmented by Telegram Web can produce 10+ fragments).
                     if queue_pos <= 3 {
@@ -4526,13 +4533,21 @@ impl TelegramChannel {
                             )
                             .await;
                     }
+                    return;
                 }
-                None => {
+                QueueOutcome::Duplicate => {
                     // Duplicate message detected — silently ignore
                     debug!(session_id, "Dropped duplicate queued message");
+                    return;
+                }
+                QueueOutcome::NoRunningTask => {
+                    info!(
+                        session_id,
+                        "Task finished during queue attempt — processing message directly"
+                    );
+                    // Fall through to direct processing below.
                 }
             }
-            return;
         }
 
         // Dedup gate: atomically mark this message as "seen" so concurrent
@@ -4601,29 +4616,20 @@ impl TelegramChannel {
         let status_task = tokio::spawn(async move {
             let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
             let min_interval = Duration::from_secs(3);
-            let mut sent_thinking = false;
             let mut dm_status_count: u32 = 0;
-            let mut last_was_thinking = false;
             const MAX_DM_STATUS_MESSAGES: u32 = 6;
             while let Some(update) = status_rx.recv().await {
-                // In non-DM channels: only send one "Thinking..." then suppress
+                if is_indicator_only_status(&update) {
+                    let _ = status_bot
+                        .send_chat_action(status_chat_id, ChatAction::Typing)
+                        .await;
+                    continue;
+                }
+                // In non-DM channels, suppress progress chatter.
                 if !is_dm {
                     if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
                         // Fall through — cost notifications must reach the user
                     } else {
-                        if !sent_thinking
-                            && matches!(
-                                update,
-                                StatusUpdate::Thinking(_) | StatusUpdate::ToolStart { .. }
-                            )
-                        {
-                            let _ = status_bot.send_message(status_chat_id, "Thinking...").await;
-                            let _ = status_bot
-                                .send_chat_action(status_chat_id, ChatAction::Typing)
-                                .await;
-                            sent_thinking = true;
-                            last_sent = tokio::time::Instant::now();
-                        }
                         continue;
                     }
                 }
@@ -4645,16 +4651,8 @@ impl TelegramChannel {
                 if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
                     continue;
                 }
-                // Suppress consecutive "Thinking..." — only send if the last visible
-                // status was a non-Thinking update (tool start, progress, etc.).
-                if matches!(&update, StatusUpdate::Thinking(_)) && last_was_thinking {
-                    let _ = status_bot
-                        .send_chat_action(status_chat_id, ChatAction::Typing)
-                        .await;
-                    continue;
-                }
                 let text = match &update {
-                    StatusUpdate::Thinking(_) => "Thinking...".to_string(),
+                    StatusUpdate::Thinking(_) => continue,
                     StatusUpdate::ToolStart { name, summary } => {
                         if summary.is_empty() {
                             format!("Using {}...", name)
@@ -4784,7 +4782,6 @@ impl TelegramChannel {
                         )
                     }
                 };
-                last_was_thinking = matches!(&update, StatusUpdate::Thinking(_));
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 dm_status_count += 1;
                 // Re-send typing indicator immediately after each status message.
@@ -4914,18 +4911,15 @@ impl TelegramChannel {
                     }
                 }
 
-                // Finalize the current task AFTER sending the response/error.
-                // This closes the race window where incoming messages could see
-                // no running task and spawn concurrent handlers.
-                if let Some(ref err) = task_error {
-                    registry.fail(current_task_id, err).await;
-                } else {
-                    registry.complete(current_task_id).await;
-                }
-
-                // Drain and coalesce ALL queued messages so fragmented long
-                // messages (split by Telegram Web) are reassembled into one prompt.
-                if let Some(queued) = registry.pop_all_queued_messages(&session_id).await {
+                // Finalize the current task AFTER sending the response/error,
+                // and drain the queue in the SAME critical section: a message
+                // arriving concurrently is then either drained here or sees
+                // NoRunningTask and processes directly — never stranded in a
+                // queue nothing will drain.
+                if let Some(queued) = registry
+                    .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
+                    .await
+                {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -4961,27 +4955,19 @@ impl TelegramChannel {
                     current_status_task = tokio::spawn(async move {
                         let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
                         let min_interval = Duration::from_secs(3);
-                        let mut sent_thinking = false;
-                        let mut last_was_thinking = false;
                         while let Some(update) = new_status_rx.recv().await {
-                            // In non-DM channels: only send one "Thinking..." then suppress
-                            // (except BudgetExtended which must always reach the user)
+                            if is_indicator_only_status(&update) {
+                                let _ = status_bot
+                                    .send_chat_action(chat_id, ChatAction::Typing)
+                                    .await;
+                                continue;
+                            }
+                            // In non-DM channels, suppress progress chatter except
+                            // BudgetExtended, which must always reach the user.
                             if !is_dm {
                                 if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
                                     // Fall through — cost notifications must reach the user
                                 } else {
-                                    if !sent_thinking
-                                        && matches!(
-                                            update,
-                                            StatusUpdate::Thinking(_)
-                                                | StatusUpdate::ToolStart { .. }
-                                        )
-                                    {
-                                        let _ =
-                                            status_bot.send_message(chat_id, "Thinking...").await;
-                                        sent_thinking = true;
-                                        last_sent = tokio::time::Instant::now();
-                                    }
                                     continue;
                                 }
                             }
@@ -4991,12 +4977,8 @@ impl TelegramChannel {
                             if !is_budget_ext && now.duration_since(last_sent) < min_interval {
                                 continue;
                             }
-                            // Suppress consecutive "Thinking..." messages
-                            if matches!(&update, StatusUpdate::Thinking(_)) && last_was_thinking {
-                                continue;
-                            }
                             let text = match &update {
-                                StatusUpdate::Thinking(_) => "Thinking...".to_string(),
+                                StatusUpdate::Thinking(_) => continue,
                                 StatusUpdate::ToolStart { name, summary } => {
                                     if summary.is_empty() {
                                         format!("Using {}...", name)
@@ -5017,7 +4999,6 @@ impl TelegramChannel {
                                 }
                                 _ => continue, // Skip other status updates for queued messages
                             };
-                            last_was_thinking = matches!(&update, StatusUpdate::Thinking(_));
                             let _ = status_bot.send_message(chat_id, text).await;
                             last_sent = tokio::time::Instant::now();
                         }
@@ -5521,9 +5502,18 @@ fn format_attachment_delivery_summary(delivered_files: &[(String, String)]) -> O
     ))
 }
 
+fn is_indicator_only_status(update: &StatusUpdate) -> bool {
+    matches!(update, StatusUpdate::Thinking(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_status_uses_native_telegram_indicator_only() {
+        assert!(is_indicator_only_status(&StatusUpdate::Thinking(2)));
+    }
 
     #[test]
     fn normalize_agent_permission_aliases_maps_claude_allow_flag() {

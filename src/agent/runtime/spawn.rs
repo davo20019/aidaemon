@@ -1261,6 +1261,7 @@ impl Agent {
                 if let Ok(Some(completed_task)) = self.state.get_task(task_id).await {
                     if completed_task.status == "completed" {
                         let state = self.state.clone();
+                        let event_store = self.event_store.clone();
                         let provider = self.llm_runtime.provider();
                         let tid = task_id.clone();
                         let model = match tokio::time::timeout(
@@ -1281,6 +1282,7 @@ impl Agent {
                         tokio::spawn(async move {
                             if let Err(e) = crate::memory::task_learning::extract_task_knowledge(
                                 state,
+                                event_store,
                                 provider,
                                 model,
                                 completed_task,
