@@ -406,11 +406,29 @@ impl BrowserSessionRegistry {
     /// approval across a teardown the user never saw). The session entry itself
     /// is removed entirely (unlike `invalidate_all_pages`, which keeps the entry
     /// after a reconnect), since idle eviction reclaims the session wholesale.
+    ///
+    /// INVARIANT: a session with a HELD action lock is never evicted. A session
+    /// whose action runs longer than `max_idle` (unreachable today — the 30-min
+    /// threshold dwarfs any single action — but enforced structurally) is in
+    /// active use: its page handle is live under that action, so disposing its
+    /// tab targets / browser context would be a use-after-dispose. Before
+    /// evicting an idle session we `try_lock()` its per-session `action_lock`; if
+    /// that would block (lock held), the session is mid-action and we SKIP it,
+    /// leaving it for the next sweep. The `try_lock` is non-blocking, so holding
+    /// the registry `sessions` mutex across it cannot deadlock (we never `.await`
+    /// on the per-session lock here); the temporary guard is dropped immediately.
     pub async fn evict_idle(&self, now: Instant, max_idle: Duration) -> Vec<EvictedSession> {
         let mut sessions = self.sessions.lock().await;
         let idle_ids: Vec<String> = sessions
             .iter()
             .filter(|(_, state)| now.duration_since(state.last_used_at) >= max_idle)
+            // Skip any idle session whose action lock is currently held: it is
+            // mid-action and must NOT be torn down under the running action.
+            // `try_lock` is non-blocking (no `.await`), so this is safe to do
+            // while holding the `sessions` mutex — no deadlock with the
+            // per-session lock. The temporary guard drops at the end of the
+            // closure.
+            .filter(|(_, state)| state.action_lock.try_lock().is_ok())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -497,6 +515,18 @@ impl BrowserSessionRegistry {
     #[cfg(test)]
     pub async fn has_session_for_test(&self, session_id: &str) -> bool {
         self.sessions.lock().await.contains_key(session_id)
+    }
+
+    /// Test-only: clone the per-session `action_lock` `Arc`, so a test can
+    /// acquire an OWNED guard on it and model a session that is mid-action while
+    /// `evict_idle` runs. Returns `None` if the session does not exist.
+    #[cfg(test)]
+    pub async fn action_lock_for_test(&self, session_id: &str) -> Option<Arc<Mutex<()>>> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|state| Arc::clone(&state.action_lock))
     }
 
     /// Snapshot of this session's tabs for `list_tabs`. Empty if the session is

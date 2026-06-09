@@ -2598,15 +2598,19 @@ async fn close_on_launched_browser_records_graceful_shutdown() {
 }
 
 /// `set_mode` that actually changes the mode must reuse the graceful shutdown
-/// path to tear the old browser down (launched → graceful).
+/// path to tear the old browser down (launched → graceful) so the next action
+/// relaunches in the new mode. The mock models this teardown
+/// (`set_headless_mode` records a `Shutdown` on a real change while a browser is
+/// live, mirroring `ChromiumoxideBackend::set_headless_mode` →
+/// `graceful_teardown`), so the test can verify the REUSE — not merely that the
+/// switch was routed. True teardown against real Chrome is exercised in Task 18.
 #[tokio::test]
 async fn set_mode_change_reuses_graceful_shutdown() {
     let (tool, backend, _rx) = mock_tool();
 
-    // Bring a browser up (default headless=… in mock is irrelevant; the mock's
-    // set_headless_mode just records). To force a real teardown we drive the
-    // REAL backend path via the tool's mock which records Shutdown only when a
-    // browser is live — so first navigate, then switch mode.
+    // Bring a browser up (the mock defaults to headless), then switch to visible
+    // — a REAL mode change while a browser is live, which must reuse the graceful
+    // teardown path.
     tool.call(
         &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
             .to_string(),
@@ -2621,14 +2625,48 @@ async fn set_mode_change_reuses_graceful_shutdown() {
         out.to_lowercase().contains("visible"),
         "set_mode should confirm the new mode: {out}"
     );
-    // The mock's set_headless_mode records SetHeadlessMode (it does not itself
-    // call shutdown — that wiring lives in the real backend). We assert the mode
-    // switch was routed to the backend, which is the tool-level contract here.
+    {
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            calls.contains(&MockCall::SetHeadlessMode(false)),
+            "set_mode must route the mode switch to the backend: {calls:?}"
+        );
+        // The real mode change reused the graceful teardown path.
+        assert!(
+            calls.contains(&MockCall::Shutdown { graceful: true }),
+            "a real set_mode change must reuse the graceful shutdown path: {calls:?}"
+        );
+    }
+
+    // A no-op same-mode call (switch to visible again) must NOT tear the browser
+    // down again — bring a browser back up first, then re-issue the SAME mode.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let shutdowns_before = {
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        calls
+            .iter()
+            .filter(|c| matches!(c, MockCall::Shutdown { .. }))
+            .count()
+    };
+    tool.call(&json!({ "action": "set_mode", "value": "visible" }).to_string())
+        .await
+        .unwrap();
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert!(
-        calls.contains(&MockCall::SetHeadlessMode(false)),
-        "set_mode must route the mode switch to the backend: {calls:?}"
+    let shutdowns_after = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::Shutdown { .. }))
+        .count();
+    assert_eq!(
+        shutdowns_before, shutdowns_after,
+        "a no-op same-mode set_mode must NOT record a teardown: {calls:?}"
     );
 }
 
@@ -2820,6 +2858,90 @@ async fn evict_idle_keeps_all_fresh_sessions() {
     let evicted = registry.evict_idle(now, Duration::from_secs(30 * 60)).await;
     assert!(evicted.is_empty(), "no fresh session should be evicted");
     assert!(registry.has_session_for_test("fresh").await);
+}
+
+/// INVARIANT: a session with a HELD action lock is never evicted, even when it
+/// is past the idle threshold. An action that outruns the idle window must not
+/// have its tab targets / browser context disposed out from under the live page
+/// handle (use-after-dispose). The unheld idle sibling IS evicted in the same
+/// sweep, proving the skip is targeted, not a blanket bail-out.
+#[tokio::test]
+async fn evict_idle_skips_session_with_held_action_lock() {
+    let registry = BrowserSessionRegistry::new();
+    let backend = Arc::new(MockBackend::new().with_isolated_contexts());
+    let (_id, _ctx, page) = backend.create_page().await.unwrap();
+
+    let now = Instant::now();
+    let old = now - Duration::from_secs(60 * 60); // 1h ago — both idle.
+
+    // One idle session that is MID-ACTION (its action lock is held), and one
+    // idle session that is not.
+    registry
+        .seed_session_for_test(
+            "busy",
+            old,
+            vec![("t-busy".into(), Some("ctx-busy".into()))],
+            Arc::clone(&page),
+            true,
+        )
+        .await;
+    registry
+        .seed_session_for_test(
+            "free",
+            old,
+            vec![("t-free".into(), Some("ctx-free".into()))],
+            Arc::clone(&page),
+            true,
+        )
+        .await;
+
+    // Model "busy" running an action: hold an owned guard on its action lock for
+    // the duration of the eviction sweep.
+    let busy_lock = registry
+        .action_lock_for_test("busy")
+        .await
+        .expect("busy session seeded");
+    let _held = busy_lock.lock_owned().await;
+
+    let evicted = registry.evict_idle(now, Duration::from_secs(30 * 60)).await;
+
+    // Only the unheld idle session is evicted; the busy one survives untouched.
+    assert_eq!(
+        evicted,
+        vec![EvictedSession {
+            session_id: "free".into(),
+            tab_target_ids: vec!["t-free".into()],
+            context_ids: vec!["ctx-free".into()],
+        }],
+        "only the unheld idle session is evicted: {evicted:?}"
+    );
+    assert!(
+        registry.has_session_for_test("busy").await,
+        "a session with a held action lock must survive eviction"
+    );
+    assert!(!registry.has_session_for_test("free").await);
+
+    // The busy session's resources are NOT returned for disposal, so disposing
+    // the evicted set never touches them.
+    for ev in &evicted {
+        backend
+            .dispose_session(&ev.tab_target_ids, &ev.context_ids)
+            .await;
+    }
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.contains(&MockCall::CloseTarget("t-busy".into())),
+        "the busy session's tab target must NOT be closed: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&MockCall::DisposeContext("ctx-busy".into())),
+        "the busy session's context must NOT be disposed: {calls:?}"
+    );
+    assert!(
+        calls.contains(&MockCall::CloseTarget("t-free".into())),
+        "the free session's tab target should be closed: {calls:?}"
+    );
 }
 
 /// Opportunistic eviction: creating a NEW session sweeps an already-idle sibling

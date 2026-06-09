@@ -1016,6 +1016,12 @@ pub struct MockBackend {
     /// `shutdown` still tears down and records `graceful: false`, exercising the
     /// forced-cleanup fallback path.
     graceful_fails: bool,
+    /// Current headless mode, mirroring `ChromiumoxideBackend::headless`. Lets
+    /// `set_headless_mode` detect a REAL mode change (vs. a no-op same-mode call)
+    /// and model the real backend's teardown-on-change (`backend.rs` graceful
+    /// teardown) by recording a `Shutdown` when a browser is live. Defaults to
+    /// `true` (headless), matching the common config default.
+    headless: AtomicBool,
 }
 
 #[cfg(test)]
@@ -1036,6 +1042,7 @@ impl Default for MockBackend {
             isolate_contexts: false,
             attached: false,
             graceful_fails: false,
+            headless: AtomicBool::new(true),
         }
     }
 }
@@ -1356,6 +1363,20 @@ impl BrowserBackend for MockBackend {
 
     async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String> {
         self.record(MockCall::SetHeadlessMode(headless)).await;
+        // Mirror the real backend (`ChromiumoxideBackend::set_headless_mode` →
+        // `graceful_teardown`): a REAL mode change while a browser is live tears
+        // the old browser down through the shared graceful-shutdown path so the
+        // next action relaunches in the new mode; a no-op same-mode call does
+        // NOT. Recording `Shutdown` here lets tests verify that reuse instead of
+        // only asserting the mode switch was routed to the backend.
+        let old = self.headless.swap(headless, Ordering::Relaxed);
+        let changed = old != headless;
+        if changed && self.connected.load(Ordering::Relaxed) {
+            let graceful = !self.attached && !self.graceful_fails;
+            self.record(MockCall::Shutdown { graceful }).await;
+            self.connected.store(false, Ordering::Relaxed);
+            self.handler_alive.store(false, Ordering::SeqCst);
+        }
         Ok(format!("Switched to {} mode.", mode))
     }
 

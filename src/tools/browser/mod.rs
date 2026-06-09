@@ -818,6 +818,15 @@ impl BrowserTool {
         // close()+wait()+timeout+fallback; attached → detach without a
         // browser-close command). All cached session pages are now stale handles
         // into a torn-down connection, so drop them too.
+        //
+        // NOTE (deferred follow-up): DAEMON-EXIT graceful close is NOT wired.
+        // Only `close`, `set_mode` (mode change), and idle eviction reuse the
+        // backend's graceful-teardown path; nothing calls it on process exit.
+        // Wiring a daemon-shutdown hook would require threading a concrete
+        // `Arc<BrowserTool>` into `core.rs`'s shutdown handler — out of scope and
+        // low value here: on process exit a LAUNCHED Chrome is reclaimed by OS
+        // teardown of its temp profile, and an ATTACHED Chrome is unaffected
+        // (we never send it a close command). Left as a documented follow-up.
         let result = self.backend.shutdown().await;
         self.sessions.invalidate_all_pages().await;
         result
