@@ -522,6 +522,7 @@ impl Agent {
                     task_id: task_id.map(str::to_string),
                     annotations: normalized_msg.annotations.clone(),
                     turn_id,
+                    attachments: normalized_msg.attachments.clone(),
                 },
             )
             .await?;

@@ -342,6 +342,9 @@ pub struct ToolCallMetadata {
     /// Complete typed result for successful text-file reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_file: Option<ReadFileResultMetadata>,
+    /// Image (or other) files produced by the tool for agent vision context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::traits::MessageAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

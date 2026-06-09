@@ -472,6 +472,7 @@ pub async fn register_optional_tools(
                     config.browser.clone(),
                     media_tx.clone(),
                     approval_tx.clone(),
+                    inbox_dir.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
                 tools.push(Arc::new(browser_tool));

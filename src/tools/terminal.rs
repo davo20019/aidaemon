@@ -2064,6 +2064,7 @@ fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
         direct_response: None,
         semantics: ToolCallSemantics::default(),
         read_file: None,
+        ..Default::default()
     }
 }
 
@@ -2083,6 +2084,7 @@ fn tracked_background_metadata(
         direct_response: None,
         semantics: ToolCallSemantics::default(),
         read_file: None,
+        ..Default::default()
     }
 }
 

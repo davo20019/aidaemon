@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,8 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+    MessageAttachment, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
@@ -317,19 +319,6 @@ fn screenshot_delivery_kind(
     }
 }
 
-/// RAII guard that deletes a temp file on drop. Guarantees the buffered
-/// screenshot file is removed on EVERY return path (success, delivery failure,
-/// timeout, early error) without scattering manual `remove_file` calls.
-struct TempFileGuard {
-    path: std::path::PathBuf,
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Parse the pixel dimensions of a PNG from its header WITHOUT decoding the
 /// image (no `image` crate dependency). A PNG is the 8-byte signature followed
 /// by the IHDR chunk; width is the big-endian `u32` at bytes `[16..20]` and
@@ -370,9 +359,26 @@ fn screenshot_oversize_reason(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Result of a browser action dispatch — text for the LLM plus optional vision attachments.
+struct DispatchResult {
+    text: String,
+    attachments: Vec<MessageAttachment>,
+}
+
+impl DispatchResult {
+    fn text_only(text: String) -> Self {
+        Self {
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
     media_tx: mpsc::Sender<MediaMessage>,
+    /// Shared inbox for persisting screenshots for agent vision context.
+    inbox_dir: PathBuf,
     /// Per-session page state, keyed by trusted internal `_session_id`.
     sessions: BrowserSessionRegistry,
     /// Transport used to prompt the user Allow/Deny at action time.
@@ -423,6 +429,7 @@ impl BrowserTool {
         config: BrowserConfig,
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
+        inbox_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -443,6 +450,7 @@ impl BrowserTool {
         Ok(Self {
             backend: Arc::new(backend),
             media_tx,
+            inbox_dir: inbox_dir.into(),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
@@ -463,6 +471,7 @@ impl BrowserTool {
         Self {
             backend,
             media_tx,
+            inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
@@ -485,6 +494,7 @@ impl BrowserTool {
         Self {
             backend,
             media_tx,
+            inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout,
@@ -808,7 +818,11 @@ impl BrowserTool {
         Ok(format!("Navigated to {}", url))
     }
 
-    async fn action_screenshot(&self, args: &Value, session_id: &str) -> Result<String, String> {
+    async fn action_screenshot(
+        &self,
+        args: &Value,
+        session_id: &str,
+    ) -> Result<DispatchResult, String> {
         // `page_for` already rejects an empty session id before any capture; we
         // additionally guard the media-delivery path below so an empty id can
         // never reach the channel.
@@ -841,6 +855,15 @@ impl BrowserTool {
             return Err("browser actions require a session id".to_string());
         }
 
+        let saved_attachment = crate::channels::attachments::save_tool_observation_image(
+            &self.inbox_dir,
+            &png_bytes,
+            "screenshot.png",
+            "image/png",
+            "browser",
+        )
+        .map_err(|e| format!("Screenshot captured but failed to save for vision context: {e}"))?;
+
         // Decide HOW to deliver based on size. A viewport capture is always a
         // Photo. A full-page capture of a long page can exceed Telegram's
         // sendPhoto caps (PHOTO_INVALID_DIMENSIONS); rather than refusing it, we
@@ -850,35 +873,16 @@ impl BrowserTool {
         let oversize_reason = screenshot_oversize_reason(&png_bytes);
         let delivery = screenshot_delivery_kind(png_bytes.len(), oversize_reason);
 
-        // `as_file` selects the honest, mode-aware success string below. The
-        // optional temp-file guard owns cleanup of the buffered Document file on
-        // every return path (it removes the file when dropped).
-        let (kind, as_file, _temp_guard) = match delivery {
-            ScreenshotDelivery::Photo => (MediaKind::Photo { data: png_bytes }, false, None),
-            ScreenshotDelivery::Document => {
-                // Buffer the PNG to a unique temp file; the channel's Document
-                // arm sends it via InputFile::file(path).
-                let path = std::env::temp_dir()
-                    .join(format!("aidaemon-screenshot-{}.png", uuid::Uuid::new_v4()));
-                // Arm the cleanup guard BEFORE writing so a partial file left by a
-                // failed write (e.g. ENOSPC) is still removed on the early return.
-                let guard = TempFileGuard { path: path.clone() };
-                if let Err(e) = std::fs::write(&path, &png_bytes) {
-                    return Err(format!(
-                        "Screenshot captured but failed to buffer it for delivery as a file: {}. \
-                         The image was not sent.",
-                        e
-                    ));
-                }
-                (
-                    MediaKind::Document {
-                        file_path: path.to_string_lossy().into_owned(),
-                        filename: "screenshot.png".to_string(),
-                    },
-                    true,
-                    Some(guard),
-                )
-            }
+        // `as_file` selects the honest, mode-aware success string below.
+        let (kind, as_file) = match delivery {
+            ScreenshotDelivery::Photo => (MediaKind::Photo { data: png_bytes }, false),
+            ScreenshotDelivery::Document => (
+                MediaKind::Document {
+                    file_path: saved_attachment.local_path.clone(),
+                    filename: saved_attachment.filename.clone(),
+                },
+                true,
+            ),
             ScreenshotDelivery::TooLarge => {
                 return Err(format!(
                     "Screenshot is too large to deliver even as a file ({} bytes, max {}). \
@@ -890,8 +894,6 @@ impl BrowserTool {
         };
 
         // Honest delivery: ask the media listener to report the ACTUAL outcome.
-        // `_temp_guard` (if any) is held across the await and dropped on every
-        // return path below, guaranteeing the temp file is cleaned up.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         self.media_tx
             .send(MediaMessage {
@@ -905,33 +907,48 @@ impl BrowserTool {
 
         // Wait (bounded) for the listener to confirm delivery, then report
         // HONESTLY — never claim "sent" unless the channel actually accepted it.
-        match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+        let text = match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
             Ok(Ok(Ok(()))) => {
-                if as_file {
-                    Ok(format!(
+                let base = if as_file {
+                    format!(
                         "Screenshot captured and delivered to chat as a file (the full page was \
                          too large for an inline image). {}",
                         caption
-                    ))
+                    )
                 } else {
-                    Ok(format!("Screenshot captured and delivered to chat. {}", caption))
-                }
+                    format!("Screenshot captured and delivered to chat. {}", caption)
+                };
+                format!(
+                    "{base}\nSaved to: {}",
+                    saved_attachment.local_path
+                )
             }
-            Ok(Ok(Err(reason))) => Err(format!(
-                "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
-                reason
-            )),
-            Ok(Err(_)) => Err(
-                "Screenshot captured but delivery could not be confirmed (the delivery channel \
+            Ok(Ok(Err(reason))) => {
+                return Err(format!(
+                    "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
+                    reason
+                ))
+            }
+            Ok(Err(_)) => {
+                return Err(
+                    "Screenshot captured but delivery could not be confirmed (the delivery channel \
                  was dropped). The image may not have been sent."
-                    .to_string(),
-            ),
-            Err(_) => Err(
-                "Screenshot captured but delivery could not be confirmed within the timeout. \
+                        .to_string(),
+                )
+            }
+            Err(_) => {
+                return Err(
+                    "Screenshot captured but delivery could not be confirmed within the timeout. \
                  The image may not have been sent."
-                    .to_string(),
-            ),
-        }
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(DispatchResult {
+            text,
+            attachments: vec![saved_attachment],
+        })
     }
 
     async fn action_click(&self, args: &Value, session_id: &str) -> Result<String, String> {
@@ -1294,21 +1311,54 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
-    ) -> Result<String, String> {
+    ) -> Result<DispatchResult, String> {
         match action {
-            "navigate" => self.action_navigate(args, session_id).await,
+            "navigate" => self
+                .action_navigate(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id).await,
-            "click" => self.action_click(args, session_id).await,
-            "fill" => self.action_fill(args, session_id).await,
-            "get_text" => self.action_get_text(args, session_id).await,
-            "execute_js" => self.action_execute_js(args, session_id).await,
-            "wait" => self.action_wait(args, session_id).await,
-            "list_tabs" => self.action_list_tabs(session_id).await,
-            "new_tab" => self.action_new_tab(args, session_id).await,
-            "switch_tab" => self.action_switch_tab(args, session_id).await,
-            "close_tab" => self.action_close_tab(args, session_id).await,
-            "set_mode" => self.action_set_mode(args).await,
-            "close" => self.action_close().await,
+            "click" => self
+                .action_click(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "fill" => self
+                .action_fill(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "get_text" => self
+                .action_get_text(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "execute_js" => self
+                .action_execute_js(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "wait" => self
+                .action_wait(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "list_tabs" => self
+                .action_list_tabs(session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "new_tab" => self
+                .action_new_tab(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "switch_tab" => self
+                .action_switch_tab(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "close_tab" => self
+                .action_close_tab(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "set_mode" => self
+                .action_set_mode(args)
+                .await
+                .map(DispatchResult::text_only),
+            "close" => self.action_close().await.map(DispatchResult::text_only),
             _ => Err(format!(
                 "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, new_tab, switch_tab, close_tab, set_mode, close",
                 action
@@ -1358,7 +1408,7 @@ impl BrowserTool {
         action: &str,
         args: &Value,
         session_id: &str,
-    ) -> Result<String, String> {
+    ) -> Result<DispatchResult, String> {
         let first = self.dispatch_action(action, args, session_id).await;
         let err = match first {
             Ok(ok) => return Ok(ok),
@@ -1563,6 +1613,56 @@ impl BrowserTool {
             )),
         }
     }
+
+    async fn run_action(&self, arguments: &str) -> anyhow::Result<DispatchResult> {
+        let args: Value = serde_json::from_str(arguments)?;
+
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
+
+        let session_id = args
+            .get("_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let needs_session = !matches!(action, "close" | "set_mode");
+        if needs_session && session_id.is_empty() {
+            return Ok(DispatchResult::text_only(
+                "Error: browser actions require a session id".to_string(),
+            ));
+        }
+
+        if action == "execute_js" {
+            let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(reason) = validate_script_constraints(script) {
+                warn!(action, "execute_js script rejected by constraint check");
+                return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
+            }
+        }
+
+        let action_args = ActionArgs {
+            action,
+            url: args.get("url").and_then(|v| v.as_str()),
+            selector: args.get("selector").and_then(|v| v.as_str()),
+            script: args.get("script").and_then(|v| v.as_str()),
+            tab_id: args.get("tab_id").and_then(|v| v.as_str()),
+            session_id,
+        };
+        if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
+            warn!(action, "Browser action blocked by approval gate");
+            return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
+        }
+
+        match self.dispatch_with_recovery(action, &args, session_id).await {
+            Ok(result) => Ok(result),
+            Err(err_text) => {
+                warn!(action, error = %err_text, "Browser action failed");
+                Ok(DispatchResult::text_only(format!("Error: {}", err_text)))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1632,64 +1732,23 @@ impl Tool for BrowserTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
+        Ok(self.run_action(arguments).await?.text)
+    }
 
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: action"))?;
-
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        // Reject an empty/missing session id BEFORE the approval gate or any
-        // backend launch — a missing session id must never prompt the user or
-        // launch a browser. (Administrative actions like `close` operate on the
-        // global backend and don't need a session id.)
-        let needs_session = !matches!(action, "close" | "set_mode");
-        if needs_session && session_id.is_empty() {
-            return Ok("Error: browser actions require a session id".to_string());
-        }
-
-        // Script constraint validation — runs BEFORE the approval gate so a
-        // doomed script is never sent for user approval and never reaches the
-        // backend. Only applies to execute_js (other actions have no script arg).
-        if action == "execute_js" {
-            let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
-            if let Err(reason) = validate_script_constraints(script) {
-                warn!(action, "execute_js script rejected by constraint check");
-                return Ok(format!("Error: {}", reason));
-            }
-        }
-
-        // Approval gate — runs BEFORE any backend/page method is touched, so a
-        // denied action can never reach the browser. We only invoke the
-        // `action_*` handler when the gate allows.
-        let action_args = ActionArgs {
-            action,
-            url: args.get("url").and_then(|v| v.as_str()),
-            selector: args.get("selector").and_then(|v| v.as_str()),
-            script: args.get("script").and_then(|v| v.as_str()),
-            tab_id: args.get("tab_id").and_then(|v| v.as_str()),
-            session_id,
-        };
-        if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
-            warn!(action, "Browser action blocked by approval gate");
-            return Ok(format!("Error: {}", reason));
-        }
-
-        let result = self.dispatch_with_recovery(action, &args, session_id).await;
-
-        // Return errors as text so the LLM can adjust its approach
-        match result {
-            Ok(text) => Ok(text),
-            Err(err_text) => {
-                warn!(action, error = %err_text, "Browser action failed");
-                Ok(format!("Error: {}", err_text))
-            }
-        }
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let result = self.run_action(arguments).await?;
+        Ok(ToolCallOutcome {
+            output: result.text,
+            metadata: ToolCallMetadata {
+                attachments: result.attachments,
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 
     fn capabilities(&self) -> ToolCapabilities {

@@ -83,6 +83,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 task_id: Some(orphan_task_id.to_string()),
                 annotations: Vec::new(),
                 turn_id: None,
+                attachments: Vec::new(),
             },
         )
         .await

@@ -227,7 +227,7 @@ pub fn turn_from_event(
             tool_calls: None,
             annotations: annotations_from_event_data(data),
             turn_id: turn_id.clone(),
-            attachments: Vec::new(),
+            attachments: attachments_from_event_data(data),
         }),
         _ => None,
     }

@@ -19,8 +19,8 @@ pub use channels::{Channel, ChannelCapabilities};
 #[allow(unused_imports)]
 pub use conversation::{
     extract_primary_message_content, first_primary_message_line, infer_message_annotations,
-    message_content_is_structural_only, ConversationSummary, Message, MessageAnnotation,
-    MessageAttachment, ToolCall,
+    message_content_is_structural_only, AttachmentProvenance, ConversationSummary, Message,
+    MessageAnnotation, MessageAttachment, ToolCall,
 };
 pub use dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,

@@ -237,12 +237,50 @@ impl Agent {
         Ok(None)
     }
 
+    /// When the provider rejects a multimodal payload, strip image blocks and retry once.
+    async fn try_text_only_vision_fallback(
+        &self,
+        provider: &Arc<dyn ModelProvider>,
+        model: &str,
+        messages: &[Value],
+        tool_defs: &[Value],
+        options: &ChatOptions,
+    ) -> Option<crate::traits::ProviderResponse> {
+        if !crate::providers::multimodal::messages_contain_vision_blocks(messages) {
+            return None;
+        }
+        warn!(
+            model,
+            "Provider rejected vision payload; retrying once with text-only content"
+        );
+        let mut text_only = messages.to_vec();
+        crate::providers::multimodal::strip_image_blocks_from_messages(&mut text_only);
+        match provider
+            .chat_with_options(model, &text_only, tool_defs, options)
+            .await
+        {
+            Ok(resp) => {
+                self.stamp_lastgood().await;
+                Some(resp)
+            }
+            Err(retry_err) => {
+                warn!(
+                    model,
+                    error = %retry_err,
+                    "Text-only vision fallback retry also failed"
+                );
+                None
+            }
+        }
+    }
+
     /// How long a billing failure is cached before we re-try that model.
     /// After this window the model is attempted again (credits may have been added).
     const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
     /// Attempt an LLM call with error-classified recovery:
     /// - RateLimit → exponential backoff retries, then cascade fallback
+    /// - BadRequest/ServerError with vision blocks → text-only strip retry once
     /// - Timeout/Network/ServerError → exponential backoff retries, then cascade fallback
     /// - MalformedResponse(Parse) → exponential backoff retries, then cascade fallback
     /// - MalformedResponse(Shape/Unknown) → single retry (no cascade fallback)
@@ -414,31 +452,17 @@ impl Agent {
                         .await
                     }
                     ProviderErrorKind::BadRequest => {
-                        if crate::providers::multimodal::messages_contain_vision_blocks(messages) {
-                            warn!(
+                        if let Some(resp) = self
+                            .try_text_only_vision_fallback(
+                                &provider,
                                 model,
-                                "Provider rejected vision payload; retrying once with text-only content"
-                            );
-                            let mut text_only = messages.to_vec();
-                            crate::providers::multimodal::strip_image_blocks_from_messages(
-                                &mut text_only,
-                            );
-                            match provider
-                                .chat_with_options(model, &text_only, tool_defs, options)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    self.stamp_lastgood().await;
-                                    return Ok(resp);
-                                }
-                                Err(retry_err) => {
-                                    warn!(
-                                        model,
-                                        error = %retry_err,
-                                        "Text-only vision fallback retry also failed"
-                                    );
-                                }
-                            }
+                                messages,
+                                tool_defs,
+                                options,
+                            )
+                            .await
+                        {
+                            return Ok(resp);
                         }
                         if *options != ChatOptions::default() {
                             warn!(
@@ -507,6 +531,20 @@ impl Agent {
                     ProviderErrorKind::Timeout
                     | ProviderErrorKind::Network
                     | ProviderErrorKind::ServerError => {
+                        if provider_err.kind == ProviderErrorKind::ServerError {
+                            if let Some(resp) = self
+                                .try_text_only_vision_fallback(
+                                    &provider,
+                                    model,
+                                    messages,
+                                    tool_defs,
+                                    options,
+                                )
+                                .await
+                            {
+                                return Ok(resp);
+                            }
+                        }
                         for attempt in 0..Self::MAX_LLM_RETRIES {
                             let wait = Self::RETRY_BASE_DELAY_SECS * 2u64.pow(attempt); // 2s, 4s, 8s
                             info!(

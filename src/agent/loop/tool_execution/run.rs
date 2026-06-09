@@ -1513,6 +1513,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             content: Some(result_text.clone()),
             tool_call_id: Some(tc.id.clone()),
             tool_name: Some(tc.name.clone()),
+            attachments: result_metadata.attachments.clone(),
             importance: 0.3, // Tool outputs default to lower importance
             ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
         };

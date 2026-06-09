@@ -177,6 +177,9 @@ pub struct ToolResultData {
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Files saved for agent vision (e.g. browser screenshots).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 // =============================================================================
@@ -1253,6 +1256,7 @@ mod tests {
             task_id: None,
             annotations: vec![],
             turn_id: Some("t1".to_string()),
+            attachments: vec![],
         };
         let back: ToolResultData =
             serde_json::from_value(serde_json::to_value(&tr).unwrap()).unwrap();

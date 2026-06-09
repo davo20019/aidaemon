@@ -38,13 +38,28 @@ pub enum MessageAnnotation {
     },
 }
 
-/// Metadata for a file saved from an inbound channel message.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Where an attachment originated — drives vision retention in archived turns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentProvenance {
+    /// User sent via a channel (Telegram, Slack, Discord).
+    #[default]
+    Inbound,
+    /// Produced by a tool observation (browser screenshot, MCP image, etc.).
+    ToolObservation,
+}
+
+/// Metadata for a file saved from an inbound channel message or tool observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MessageAttachment {
     pub local_path: String,
     pub filename: String,
     pub mime_type: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub provenance: AttachmentProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool: Option<String>,
 }
 
 pub fn infer_message_annotations(content: &str) -> Vec<MessageAnnotation> {

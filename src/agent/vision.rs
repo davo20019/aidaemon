@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::VisionConfig;
-use crate::traits::MessageAttachment;
+use crate::traits::{AttachmentProvenance, MessageAttachment};
 
 use crate::agent::turn_render::RenderMode;
 
@@ -75,9 +75,17 @@ pub fn build_multimodal_content(
     mode: RenderMode,
     vision: &VisionConfig,
 ) -> MultimodalBuildResult {
-    let text = text.trim();
     let encode_vision = matches!(mode, RenderMode::Current) && vision.enabled;
+    build_multimodal_content_force(text, attachments, encode_vision, vision)
+}
 
+fn build_multimodal_content_force(
+    text: &str,
+    attachments: &[MessageAttachment],
+    encode_vision: bool,
+    vision: &VisionConfig,
+) -> MultimodalBuildResult {
+    let text = text.trim();
     if !encode_vision || attachments.is_empty() {
         return MultimodalBuildResult {
             content: Value::String(text.to_string()),
@@ -139,6 +147,33 @@ pub fn build_multimodal_content(
     MultimodalBuildResult {
         content: Value::Array(blocks),
         vision_skipped: skipped_any,
+    }
+}
+
+/// Build multimodal content for tool-produced observation images.
+///
+/// Unlike inbound user photos, tool observations stay vision-eligible even when
+/// rendered from archived turns (follow-up questions about a prior screenshot).
+pub fn build_tool_observation_content(
+    label: &str,
+    attachments: &[MessageAttachment],
+    vision: &VisionConfig,
+) -> MultimodalBuildResult {
+    let tool_images: Vec<MessageAttachment> = attachments
+        .iter()
+        .filter(|a| a.provenance == AttachmentProvenance::ToolObservation)
+        .cloned()
+        .collect();
+    build_multimodal_content_force(label, &tool_images, vision.enabled, vision)
+}
+
+/// Label for a synthetic user message carrying a tool observation image.
+pub fn format_tool_observation_label(tool_name: &str, result_hint: &str) -> String {
+    let hint = result_hint.trim();
+    if hint.is_empty() {
+        format!("[Tool observation image from {tool_name}]")
+    } else {
+        format!("[Tool observation image from {tool_name}: {hint}]")
     }
 }
 
@@ -213,12 +248,14 @@ mod tests {
                 filename: "a.png".to_string(),
                 mime_type: "image/png".to_string(),
                 size_bytes: 8,
+                ..Default::default()
             },
             MessageAttachment {
                 local_path: f2.path().to_string_lossy().into_owned(),
                 filename: "b.png".to_string(),
                 mime_type: "image/png".to_string(),
                 size_bytes: 8,
+                ..Default::default()
             },
         ];
 
@@ -242,6 +279,7 @@ mod tests {
             filename: "missing.png".to_string(),
             mime_type: "image/png".to_string(),
             size_bytes: 1,
+            ..Default::default()
         }];
         let result = build_multimodal_content(
             "stub text",
@@ -262,6 +300,7 @@ mod tests {
             filename: "x.png".to_string(),
             mime_type: "image/png".to_string(),
             size_bytes: 1,
+            ..Default::default()
         }];
         let result =
             build_multimodal_content("hello", &attachments, RenderMode::Current, &vision_config());

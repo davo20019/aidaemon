@@ -23,9 +23,10 @@ use super::sliding_window::summarize_tool_result;
 use super::*;
 use crate::config::VisionConfig;
 use crate::events::TerminalState;
+use crate::traits::AttachmentProvenance;
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-pub(crate) const RENDERER_VERSION: u32 = 2;
+pub(crate) const RENDERER_VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
@@ -154,6 +155,40 @@ fn attach_tool_routing(obj: &mut Value, m: &Message) {
     }
 }
 
+/// Append synthetic user messages carrying tool observation images for the LLM.
+fn append_tool_observation_messages(
+    out: &mut Vec<Value>,
+    m: &Message,
+    options: &RenderOptions,
+    vision_skipped: &mut bool,
+) {
+    if m.role != "tool" {
+        return;
+    }
+    if !m
+        .attachments
+        .iter()
+        .any(|a| a.provenance == AttachmentProvenance::ToolObservation)
+    {
+        return;
+    }
+    let tool_name = m.tool_name.as_deref().unwrap_or("tool");
+    let hint = m.content.as_deref().unwrap_or("");
+    let label = crate::agent::vision::format_tool_observation_label(tool_name, hint);
+    let built = crate::agent::vision::build_tool_observation_content(
+        &label,
+        &m.attachments,
+        &options.vision,
+    );
+    if built.vision_skipped {
+        *vision_skipped = true;
+    }
+    out.push(json!({
+        "role": "user",
+        "content": built.content,
+    }));
+}
+
 /// **Current** mode: append-only, full content. Single source of truth for the
 /// `&Message → Value` conversion (Task 7 deletes the inline copy in
 /// `message_build_phase.rs` and routes through here).
@@ -161,61 +196,63 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
     let result_ids = tool_result_ids(turn_messages);
     let mut vision_skipped = false;
 
-    let mut rendered: Vec<Value> = turn_messages
+    let mut rendered: Vec<Value> = Vec::new();
+
+    for m in turn_messages
         .iter()
         // Skip tool results with empty/missing tool_name.
         .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
-        .filter_map(|m| {
-            // Drop learned-helplessness / budget-exhaustion boilerplate so the
-            // model never reads its own prior "I failed" text and gives up.
-            if m.role == "assistant"
-                && m.tool_calls_json.is_none()
-                && m.content.as_deref().is_some_and(is_failure_boilerplate)
+    {
+        // Drop learned-helplessness / budget-exhaustion boilerplate so the
+        // model never reads its own prior "I failed" text and gives up.
+        if m.role == "assistant"
+            && m.tool_calls_json.is_none()
+            && m.content.as_deref().is_some_and(is_failure_boilerplate)
+        {
+            continue;
+        }
+
+        let content = if m.role == "user" && !m.attachments.is_empty() {
+            let text = m.content.as_deref().unwrap_or("");
+            let built = crate::agent::vision::build_multimodal_content(
+                text,
+                &m.attachments,
+                RenderMode::Current,
+                &options.vision,
+            );
+            if built.vision_skipped {
+                vision_skipped = true;
+            }
+            built.content
+        } else {
+            json!(m.content)
+        };
+
+        let mut obj = json!({
+            "role": m.role,
+            "content": content,
+        });
+
+        if let Some(tc_json) = &m.tool_calls_json {
+            let filtered = wire_tool_calls(tc_json, &result_ids);
+            if !filtered.is_empty() {
+                obj["tool_calls"] = json!(filtered);
+                if m.content.is_none() {
+                    obj["content"] = Value::Null;
+                }
+            } else if m.content.is_none()
+                || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
             {
-                return None;
+                // All tool_calls orphaned and no text content — replace with
+                // a placeholder to avoid a dangling user message.
+                obj["content"] = json!("[Action completed]");
             }
+        }
 
-            let content = if m.role == "user" && !m.attachments.is_empty() {
-                let text = m.content.as_deref().unwrap_or("");
-                let built = crate::agent::vision::build_multimodal_content(
-                    text,
-                    &m.attachments,
-                    RenderMode::Current,
-                    &options.vision,
-                );
-                if built.vision_skipped {
-                    vision_skipped = true;
-                }
-                built.content
-            } else {
-                json!(m.content)
-            };
-
-            let mut obj = json!({
-                "role": m.role,
-                "content": content,
-            });
-
-            if let Some(tc_json) = &m.tool_calls_json {
-                let filtered = wire_tool_calls(tc_json, &result_ids);
-                if !filtered.is_empty() {
-                    obj["tool_calls"] = json!(filtered);
-                    if m.content.is_none() {
-                        obj["content"] = Value::Null;
-                    }
-                } else if m.content.is_none()
-                    || m.content.as_deref().is_some_and(|c| c.trim().is_empty())
-                {
-                    // All tool_calls orphaned and no text content — replace with
-                    // a placeholder to avoid a dangling user message.
-                    obj["content"] = json!("[Action completed]");
-                }
-            }
-
-            attach_tool_routing(&mut obj, m);
-            Some(obj)
-        })
-        .collect();
+        attach_tool_routing(&mut obj, m);
+        rendered.push(obj);
+        append_tool_observation_messages(&mut rendered, m, options, &mut vision_skipped);
+    }
 
     if vision_skipped {
         rendered.insert(
@@ -237,7 +274,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
 fn render_archived(
     turn_messages: &[Message],
     terminal_state: TerminalState,
-    _options: &RenderOptions,
+    options: &RenderOptions,
 ) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
 
@@ -272,6 +309,7 @@ fn render_archived(
         .rposition(|m| m.role == "assistant" || m.role == "tool");
 
     let need_placeholder = last_substantive_assistant.is_none();
+    let mut vision_skipped = false;
 
     let mut out: Vec<Value> = Vec::with_capacity(turn_messages.len());
 
@@ -358,6 +396,7 @@ fn render_archived(
                 let mut obj = json!({ "role": "tool", "content": summary });
                 attach_tool_routing(&mut obj, m);
                 out.push(obj);
+                append_tool_observation_messages(&mut out, m, options, &mut vision_skipped);
             }
 
             _ => {}
@@ -370,6 +409,16 @@ fn render_archived(
             last_assistant_or_tool,
             terminal_state,
             tool_step_count,
+        );
+    }
+
+    if vision_skipped {
+        out.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+            }),
         );
     }
 
@@ -748,6 +797,7 @@ mod tests {
                 filename: "photo.png".to_string(),
                 mime_type: "image/png".to_string(),
                 size_bytes: 8,
+                ..Default::default()
             }],
             ..Message::runtime_defaults()
         }];
@@ -767,6 +817,62 @@ mod tests {
     }
 
     #[test]
+    fn current_mode_emits_synthetic_user_observation_after_tool_screenshot() {
+        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+
+        let turn = vec![
+            assistant_empty_with_tool_call(),
+            Message {
+                role: "tool".to_string(),
+                content: Some("Screenshot captured and delivered to chat.".to_string()),
+                tool_call_id: Some("c1".to_string()),
+                tool_name: Some("browser".to_string()),
+                attachments: vec![MessageAttachment {
+                    local_path: file.path().to_string_lossy().into_owned(),
+                    filename: "screenshot.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    size_bytes: 8,
+                    provenance: AttachmentProvenance::ToolObservation,
+                    source_tool: Some("browser".to_string()),
+                }],
+                ..Message::runtime_defaults()
+            },
+        ];
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let observation = out
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .find(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Tool observation image from browser"))
+                    || m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|text| text.contains("Tool observation image"))
+                        })
+                    })
+            })
+            .expect("synthetic tool observation user message");
+        let blocks = observation["content"]
+            .as_array()
+            .expect("multimodal observation");
+        assert!(blocks.iter().any(|b| b["type"] == "image_url"));
+    }
+
+    #[test]
     fn archived_mode_keeps_image_attachments_as_text_stub() {
         let turn = vec![Message {
             role: "user".to_string(),
@@ -778,6 +884,7 @@ mod tests {
                 filename: "photo.png".to_string(),
                 mime_type: "image/png".to_string(),
                 size_bytes: 1024,
+                ..Default::default()
             }],
             ..Message::runtime_defaults()
         }];

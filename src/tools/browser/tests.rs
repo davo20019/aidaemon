@@ -628,14 +628,29 @@ async fn screenshot_delivery_success_is_reported() {
     assert!(matches!(captured[0].kind, MediaKind::Photo { .. }));
 }
 
-/// OVERSIZED (over photo caps, under doc cap): a capture whose PNG header
-/// encodes over-photo-cap dimensions but whose total byte length is under the
-/// document cap is now delivered AS A DOCUMENT (file attachment), not rejected.
-/// The Document temp file must be cleaned up after delivery.
+#[tokio::test]
+async fn screenshot_call_with_status_outcome_includes_vision_attachment() {
+    use crate::traits::{AttachmentProvenance, ToolCallOutcome};
+
+    let (tool, _backend, rx) = mock_tool();
+    let _media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    let outcome: ToolCallOutcome = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.metadata.attachments.len(), 1);
+    let attachment = &outcome.metadata.attachments[0];
+    assert_eq!(attachment.provenance, AttachmentProvenance::ToolObservation);
+    assert_eq!(attachment.source_tool.as_deref(), Some("browser"));
+    assert!(std::path::Path::new(&attachment.local_path).exists());
+}
+
+/// OVERSIZED (over photo caps, under doc cap): delivered as a DOCUMENT using the
+/// persisted inbox copy (also used for agent vision context).
 #[tokio::test]
 async fn screenshot_oversized_delivered_as_document() {
-    // PNG header encoding 8000x8000 → width+height = 16000 > the 9000 photo cap,
-    // but the buffer is tiny (well under the document cap), so it becomes a Document.
     let oversized = png_header(8000, 8000);
     let backend = MockBackend::new().with_screenshot_bytes(oversized);
     let (tool, _backend, rx) = mock_tool_with(backend);
@@ -646,6 +661,10 @@ async fn screenshot_oversized_delivered_as_document() {
     assert!(
         out.contains("delivered to chat as a file"),
         "oversized capture should report delivery as a file: {out}"
+    );
+    assert!(
+        out.contains("Saved to:"),
+        "screenshot should report inbox path for vision: {out}"
     );
 
     let captured = media.messages.lock().await;
@@ -661,18 +680,15 @@ async fn screenshot_oversized_delivered_as_document() {
         filename, "screenshot.png",
         "filename should be screenshot.png"
     );
-    // Cleanup: the temp file at the Document path must no longer exist after the
-    // call returned (delivery result received → temp file removed).
     assert!(
-        !std::path::Path::new(&path).exists(),
-        "temp screenshot file must be cleaned up after delivery: {path}"
+        std::path::Path::new(&path).exists(),
+        "inbox screenshot file must persist for vision context: {path}"
     );
 }
 
-/// DOCUMENT DELIVERY FAILURE: when the channel rejects a Document delivery, the
-/// tool reports non-delivery honestly AND still cleans up the temp file.
+/// DOCUMENT DELIVERY FAILURE: channel rejects delivery; inbox copy still saved for vision.
 #[tokio::test]
-async fn screenshot_document_delivery_failure_is_reported_and_cleaned_up() {
+async fn screenshot_document_delivery_failure_is_reported_and_inbox_persists() {
     let oversized = png_header(8000, 8000);
     let backend = MockBackend::new().with_screenshot_bytes(oversized);
     let (tool, _backend, rx) = mock_tool_with(backend);
@@ -696,8 +712,8 @@ async fn screenshot_document_delivery_failure_is_reported_and_cleaned_up() {
         _ => panic!("must be a Document"),
     };
     assert!(
-        !std::path::Path::new(&path).exists(),
-        "temp screenshot file must be cleaned up even on delivery failure: {path}"
+        std::path::Path::new(&path).exists(),
+        "inbox screenshot file must persist even when chat delivery fails: {path}"
     );
 }
 

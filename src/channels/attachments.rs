@@ -1,8 +1,11 @@
 //! Shared inbound file attachment helpers for Telegram, Slack, and Discord.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::traits::MessageAttachment;
+use crate::traits::{AttachmentProvenance, MessageAttachment};
+
+use super::formatting::sanitize_filename;
 
 /// Format a single saved file as the legacy text stub (backward compatible).
 pub fn format_file_stub(
@@ -97,7 +100,33 @@ pub fn message_attachment(
         filename,
         mime_type,
         size_bytes,
+        provenance: AttachmentProvenance::Inbound,
+        source_tool: None,
     }
+}
+
+/// Save tool-produced image bytes to the shared inbox for agent vision context.
+pub fn save_tool_observation_image(
+    inbox_dir: &Path,
+    bytes: &[u8],
+    filename_hint: &str,
+    mime_type: &str,
+    source_tool: &str,
+) -> io::Result<MessageAttachment> {
+    std::fs::create_dir_all(inbox_dir)?;
+    let sanitized = sanitize_filename(filename_hint);
+    let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let dest_name = format!("{uuid_prefix}_{sanitized}");
+    let dest_path = inbox_dir.join(&dest_name);
+    std::fs::write(&dest_path, bytes)?;
+    Ok(MessageAttachment {
+        local_path: dest_path.to_string_lossy().into_owned(),
+        filename: sanitized,
+        mime_type: mime_type.to_string(),
+        size_bytes: bytes.len() as u64,
+        provenance: AttachmentProvenance::ToolObservation,
+        source_tool: Some(source_tool.to_string()),
+    })
 }
 
 /// Infer image MIME from magic bytes when the platform metadata is unreliable.
@@ -200,5 +229,22 @@ mod tests {
     fn strip_inbound_file_stubs_leaves_plain_text_untouched() {
         let text = "Please check ~/project/Cargo.toml";
         assert_eq!(strip_inbound_file_stubs(text), text);
+    }
+
+    #[test]
+    fn save_tool_observation_image_writes_inbox_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = save_tool_observation_image(
+            dir.path(),
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "screenshot.png",
+            "image/png",
+            "browser",
+        )
+        .unwrap();
+        assert_eq!(attachment.provenance, AttachmentProvenance::ToolObservation);
+        assert_eq!(attachment.source_tool.as_deref(), Some("browser"));
+        assert_eq!(attachment.mime_type, "image/png");
+        assert!(Path::new(&attachment.local_path).exists());
     }
 }
