@@ -2326,3 +2326,240 @@ async fn denied_execute_js_not_evaluated() {
         "a denied execute_js must not be evaluated: {calls:?}"
     );
 }
+
+// ============================================================================
+// Task 10: handler-health monitoring + disconnect recovery
+// ============================================================================
+
+use super::backend::{is_connection_error, BrowserBackend, FailOp};
+
+/// `is_connection_error` recognizes transport/connection-death patterns but NOT
+/// ordinary page errors. This is the classifier that gates ALL recovery.
+#[test]
+fn connection_error_classifier_only_matches_transport_failures() {
+    // Transport/connection-class failures → true.
+    for e in &[
+        "WebSocket connection closed: Sender was dropped",
+        "connection reset by peer",
+        "Ws(connection aborted)",
+        "the channel closed unexpectedly",
+        "request did not resolve",
+        "no response from the browser",
+        "the browser was closed",
+        "Transport error",
+    ] {
+        assert!(
+            is_connection_error(e),
+            "should be classified as a connection error: {e}"
+        );
+    }
+
+    // Ordinary page-level errors → false (must NOT trigger a reconnect).
+    for e in &[
+        "Element not found '#missing': node not found",
+        "JavaScript execution failed: ReferenceError: x is not defined",
+        "Timeout: element '#foo' not found after 10s",
+        "Failed to navigate to https://x.test: net::ERR_NAME_NOT_RESOLVED",
+        "Navigation blocked: target is a loopback address",
+    ] {
+        assert!(
+            !is_connection_error(e),
+            "ordinary page error must NOT be a connection error: {e}"
+        );
+    }
+}
+
+/// HANDLER-EXIT DETECTION: when the mock reports its handler dead, `ensure_ready`
+/// (driven by the first action) must NOT treat the connection as healthy — it
+/// relaunches/reconnects (a fresh EnsureReady) and the action then works.
+#[tokio::test]
+async fn dead_handler_triggers_relaunch_on_next_action() {
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("alive"));
+
+    // First action establishes the connection.
+    let args = json!({ "action": "get_text", "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "alive");
+    assert!(
+        backend.is_connected().await,
+        "connection should be live after first action"
+    );
+
+    // Connection dies: the CDP handler exits, but a naive is_some() check would
+    // still report healthy. Prove our health gate catches it.
+    backend.mark_handler_dead();
+    assert!(
+        !backend.is_connected().await,
+        "a dead handler must report NOT connected (the core bug)"
+    );
+
+    // Next action must observe the dead handler and relaunch (fresh EnsureReady),
+    // then succeed.
+    let out2 = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out2, "alive", "action after relaunch should succeed");
+    assert!(
+        backend.is_connected().await,
+        "relaunch should have revived the connection"
+    );
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let ensure_count = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::EnsureReady))
+        .count();
+    assert_eq!(
+        ensure_count, 2,
+        "ensure_ready must have run again after the handler died: {calls:?}"
+    );
+}
+
+/// OBSERVATION RETRY: `get_text` hits a one-shot connection error on the first
+/// `body_text`, then after exactly ONE reconnect + a fresh page the retry
+/// succeeds and returns the text.
+#[tokio::test]
+async fn observation_retries_once_after_connection_error() {
+    let (tool, backend, _rx) =
+        mock_tool_with(MockBackend::new().with_text_result("recovered text"));
+    backend
+        .fail_once_with_connection_error_on(FailOp::BodyText)
+        .await;
+
+    let args = json!({ "action": "get_text", "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(
+        out, "recovered text",
+        "observation should retry and return the text after reconnect"
+    );
+
+    assert_eq!(
+        backend.reconnect_count().await,
+        1,
+        "exactly one reconnect for an observation connection error"
+    );
+
+    // The op was attempted twice: once (failed) + once (retry succeeded).
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let body_calls = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::BodyText))
+        .count();
+    assert_eq!(
+        body_calls, 2,
+        "body_text should be attempted once then retried once: {calls:?}"
+    );
+}
+
+/// MUTATION NON-REPLAY: `click` hits a connection error → the action surfaces an
+/// error, the click is attempted only ONCE (no silent second Click), and a
+/// reconnect happens for recovery (so the NEXT action works) — but the mutation
+/// is NOT replayed.
+#[tokio::test]
+async fn mutation_is_not_replayed_after_connection_error() {
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new());
+    backend
+        .fail_once_with_connection_error_on(FailOp::Click)
+        .await;
+
+    let args = json!({ "action": "click", "selector": "#buy-now", "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.to_lowercase().contains("could not be confirmed")
+            || out.to_lowercase().contains("not retried")
+            || out.to_lowercase().contains("connection was lost"),
+        "a mutation disconnect must surface a clear non-replay error: {out}"
+    );
+
+    // Reconnect happened (recovery for subsequent actions)...
+    assert_eq!(
+        backend.reconnect_count().await,
+        1,
+        "the connection should be restored for the next action"
+    );
+
+    // ...but the click was attempted exactly ONCE (NEVER replayed).
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let click_calls = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::Click(_)))
+        .count();
+    assert_eq!(
+        click_calls, 1,
+        "click must NOT be auto-replayed after a disconnect: {calls:?}"
+    );
+}
+
+/// MUTATION NON-REPLAY (fill): same contract as click — a fill that disconnects
+/// is never silently re-typed.
+#[tokio::test]
+async fn fill_is_not_replayed_after_connection_error() {
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new());
+    backend
+        .fail_once_with_connection_error_on(FailOp::ReplaceText)
+        .await;
+
+    let args = json!({
+        "action": "fill",
+        "selector": "#card-number",
+        "value": "4111111111111111",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.to_lowercase().contains("connection was lost")
+            || out.to_lowercase().contains("could not be confirmed"),
+        "a fill disconnect must surface a clear non-replay error: {out}"
+    );
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let fill_calls = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::ReplaceText(..)))
+        .count();
+    assert_eq!(
+        fill_calls, 1,
+        "fill must NOT be auto-replayed after a disconnect: {calls:?}"
+    );
+    // The secret value must never appear in the surfaced error.
+    assert!(
+        !out.contains("4111111111111111"),
+        "the fill value must never leak into the error message: {out}"
+    );
+}
+
+/// NEGATIVE CONTROL: a normal "element not found" error is NOT a connection
+/// error — no reconnect, surfaced verbatim. `wait` on a missing element times
+/// out (an ordinary error).
+#[tokio::test]
+async fn ordinary_error_does_not_trigger_reconnect() {
+    // `screenshot` element-not-found is an ordinary error in real Chrome; the
+    // mock never errors there, so instead drive a clearly-ordinary path: a
+    // `switch_tab` to an unknown id returns a normal (non-connection) error.
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new());
+
+    // Establish the session first.
+    let _ = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    let out = tool
+        .call(
+            &json!({ "action": "switch_tab", "tab_id": "does-not-exist", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.to_lowercase().contains("unknown tab"),
+        "ordinary error should be surfaced verbatim: {out}"
+    );
+    assert_eq!(
+        backend.reconnect_count().await,
+        0,
+        "an ordinary error must NOT trigger a reconnect"
+    );
+}

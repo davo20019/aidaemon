@@ -150,11 +150,74 @@ pub trait BrowserBackend: Send + Sync {
     /// Close the target/tab identified by `target_id` at the browser level.
     async fn close_target(&self, target_id: &str) -> Result<(), String>;
 
-    // --- Connection health (declared for later tasks; thin today) ---
+    // --- Connection health + recovery ---
 
     /// Whether the backend currently holds a live connection.
+    ///
+    /// This reflects REAL handler health: it is `true` only when a browser is
+    /// held AND its CDP event handler task is still running. A browser whose
+    /// handler has exited (the connection died) reports `false`, even though the
+    /// `Option<Browser>` is still `Some`.
+    ///
+    /// Exposed for health introspection; `ensure_ready` consults the same
+    /// underlying handler-alive signal directly.
     #[allow(dead_code)]
     async fn is_connected(&self) -> bool;
+
+    /// Forcibly drop the current browser + handler and re-run the launch/connect
+    /// path, spawning a fresh supervised handler. Respects `connected_to_existing`
+    /// (reconnects to the same remote-debugging port for attached Chrome;
+    /// relaunches for an owned instance).
+    ///
+    /// Returns `Ok(())` on a successful reconnect. After a successful reconnect
+    /// all previously-minted page handles are stale and MUST be re-created
+    /// (the tool layer invalidates the session registry's cached pages).
+    async fn reconnect(&self) -> Result<(), String>;
+}
+
+/// Classify a backend/page error string as a transport/connection-class failure
+/// (the connection to Chrome itself is dead) versus an ordinary page-level error
+/// (element not found, navigation failed, timeout, etc.).
+///
+/// This drives the tool layer's recovery decision: connection-class errors
+/// trigger a single reconnect (+ observation retry / mutation non-replay), while
+/// ordinary errors are surfaced verbatim with no reconnect.
+///
+/// The patterns are deliberately CONSERVATIVE — only true transport failures.
+/// chromiumoxide's `CdpError` surfaces transport death through several shapes:
+/// - websocket teardown (`"websocket"`, `"Ws("`, `"connection closed"`,
+///   `"connection reset"`),
+/// - the internal command channel being torn down when the handler task ends
+///   (`"channel closed"`, `"Sender was dropped"`, `"receiver"`/`"sender"` dropped,
+///   `"request did not resolve"`),
+/// - the launched/attached Chrome process going away
+///   (`"chrome process"`, `"the browser was closed"`, `"no response from"`).
+///
+/// A normal `"Element not found"` / `"JavaScript execution failed"` /
+/// `"Timeout"` is NOT a connection error — it must never trigger a reconnect.
+pub fn is_connection_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    const CONNECTION_PATTERNS: &[&str] = &[
+        "connection closed",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "websocket",
+        "ws(",
+        "channel closed",
+        "sender was dropped",
+        "sender dropped",
+        "receiver dropped",
+        "channel is closed",
+        "request did not resolve",
+        "no response from",
+        "the browser was closed",
+        "chrome process",
+        "browser process",
+        "transport",
+        "broken pipe",
+    ];
+    CONNECTION_PATTERNS.iter().any(|p| e.contains(p))
 }
 
 // =============================================================================
@@ -166,6 +229,12 @@ pub trait BrowserBackend: Send + Sync {
 pub struct ChromiumoxideBackend {
     browser: Arc<Mutex<Option<Browser>>>,
     browser_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Liveness flag for the CDP event-handler task. Set `true` at spawn and set
+    /// `false` by the supervised drain loop when it exits (the connection died or
+    /// the browser closed). `ensure_ready`/`is_connected` consult this so a dead
+    /// handler is treated as a dead connection instead of "healthy because
+    /// `browser.is_some()`".
+    handler_alive: Arc<AtomicBool>,
     /// True when connected to an existing Chrome (don't close it on "close").
     connected_to_existing: Arc<Mutex<bool>>,
     /// Runtime-mutable headless mode (togglable via the tool's set_mode action).
@@ -192,6 +261,7 @@ impl ChromiumoxideBackend {
         Ok(Self {
             browser: Arc::new(Mutex::new(None)),
             browser_handle: Arc::new(Mutex::new(None)),
+            handler_alive: Arc::new(AtomicBool::new(false)),
             connected_to_existing: Arc::new(Mutex::new(false)),
             headless,
             session_isolation,
@@ -264,22 +334,45 @@ impl ChromiumoxideBackend {
         let target_id = page.target_id().as_ref().to_string();
         Ok((target_id, Arc::new(page)))
     }
-}
 
-#[async_trait]
-impl BrowserBackend for ChromiumoxideBackend {
-    async fn ensure_ready(&self) -> Result<(), String> {
-        let mut guard = self.browser.lock().await;
-        if guard.is_some() {
-            return Ok(());
-        }
+    /// Spawn the SUPERVISED CDP event-handler drain task.
+    ///
+    /// Unlike the old fire-and-forget `tokio::spawn(async move { while
+    /// handler.next().await.is_some() {} })`, this records the handler's exit:
+    /// `handler_alive` is set `true` here and flipped to `false` the moment the
+    /// drain loop ends (which happens when `handler.next()` yields `None` — i.e.
+    /// the websocket/connection to Chrome died or the browser was closed). That
+    /// turns "connection died" into an observable signal instead of a silent
+    /// state where `browser` stays `Some` forever.
+    fn spawn_supervised_handler<H>(&self, mut handler: H) -> tokio::task::JoinHandle<()>
+    where
+        H: futures::Stream + Send + Unpin + 'static,
+    {
+        let alive = Arc::clone(&self.handler_alive);
+        alive.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+            // The handler stream ended: the CDP connection is gone. Record it so
+            // ensure_ready/is_connected stop treating this browser as healthy.
+            alive.store(false, Ordering::SeqCst);
+            warn!("browser CDP handler exited — connection is no longer healthy");
+        })
+    }
 
-        // If remote_debugging_port is set, connect to existing Chrome instead of launching
+    /// Launch a new Chrome or connect to an existing one (per config), store the
+    /// browser + a freshly-spawned supervised handler, and update
+    /// `connected_to_existing`. The caller holds the `browser` mutex guard.
+    ///
+    /// This is the single launch/connect path shared by the first `ensure_ready`
+    /// and by `reconnect` — so reconnect re-uses the exact same logic (including
+    /// remote-port reconnect vs. relaunch) rather than duplicating it.
+    async fn launch_or_connect(&self, guard: &mut Option<Browser>) -> Result<(), String> {
+        // Connect to existing Chrome if a remote debugging port is configured.
         if let Some(port) = self.config.remote_debugging_port {
             let url = format!("http://127.0.0.1:{}", port);
             info!(port, "Connecting to existing Chrome instance");
 
-            let (browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
+            let (browser, handler) = Browser::connect(&url).await.map_err(|e| {
                 format!(
                     "Failed to connect to Chrome on port {}. \
                          Make sure Chrome is running with: --remote-debugging-port={}\n\
@@ -288,7 +381,7 @@ impl BrowserBackend for ChromiumoxideBackend {
                 )
             })?;
 
-            let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+            let handle = self.spawn_supervised_handler(handler);
 
             info!(
                 port,
@@ -299,11 +392,10 @@ impl BrowserBackend for ChromiumoxideBackend {
 
             let mut handle_guard = self.browser_handle.lock().await;
             *handle_guard = Some(handle);
-
             return Ok(());
         }
 
-        // Otherwise, launch a new Chrome instance
+        // Otherwise, launch a new Chrome instance.
         let mut builder = ChromeBrowserConfig::builder();
         let want_headless = self.headless.load(Ordering::Relaxed);
         let use_headless = if !want_headless && !Self::has_display() {
@@ -348,22 +440,52 @@ impl BrowserBackend for ChromiumoxideBackend {
             )
         })?;
 
-        let (browser, mut handler) = Browser::launch(browser_config).await.map_err(|e| {
+        let (browser, handler) = Browser::launch(browser_config).await.map_err(|e| {
             format!(
                 "Failed to launch browser: {}. Make sure Chrome or Chromium is installed.",
                 e
             )
         })?;
 
-        let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let handle = self.spawn_supervised_handler(handler);
 
         info!("Browser launched successfully");
         *guard = Some(browser);
+        *self.connected_to_existing.lock().await = false;
 
         let mut handle_guard = self.browser_handle.lock().await;
         *handle_guard = Some(handle);
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl BrowserBackend for ChromiumoxideBackend {
+    async fn ensure_ready(&self) -> Result<(), String> {
+        let mut guard = self.browser.lock().await;
+
+        // Healthy ONLY if we hold a browser AND its handler task is still alive.
+        // The pre-fix check (`guard.is_some()`) treated a dead connection as
+        // healthy forever: when Chrome's websocket dies, the handler drain loop
+        // ends but `browser` stays `Some`. Now we verify the handler is alive.
+        if guard.is_some() && self.handler_alive.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Either we have no browser yet, OR the handler has died (dead
+        // connection). In the dead-handler case, drop the stale browser/handle
+        // first so launch_or_connect starts clean, then (re)launch/connect.
+        if guard.is_some() {
+            warn!("browser handler is dead — dropping stale connection and reconnecting");
+            *guard = None;
+            let mut handle_guard = self.browser_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+
+        self.launch_or_connect(&mut guard).await
     }
 
     async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String> {
@@ -376,7 +498,8 @@ impl BrowserBackend for ChromiumoxideBackend {
         if guard.is_some() {
             let was_connected = *self.connected_to_existing.lock().await;
             *guard = None;
-            // Abort the handler task
+            // Abort the handler task and mark it not alive.
+            self.handler_alive.store(false, Ordering::SeqCst);
             let mut handle_guard = self.browser_handle.lock().await;
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
@@ -416,6 +539,7 @@ impl BrowserBackend for ChromiumoxideBackend {
         let mut guard = self.browser.lock().await;
         if guard.is_some() {
             *guard = None;
+            self.handler_alive.store(false, Ordering::SeqCst);
             let mut handle_guard = self.browser_handle.lock().await;
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
@@ -493,7 +617,23 @@ impl BrowserBackend for ChromiumoxideBackend {
     }
 
     async fn is_connected(&self) -> bool {
-        self.browser.lock().await.is_some()
+        // Real health: a browser is held AND its handler task is still running.
+        self.browser.lock().await.is_some() && self.handler_alive.load(Ordering::SeqCst)
+    }
+
+    async fn reconnect(&self) -> Result<(), String> {
+        let mut guard = self.browser.lock().await;
+        // Forcibly drop the current browser + handler regardless of state.
+        *guard = None;
+        self.handler_alive.store(false, Ordering::SeqCst);
+        {
+            let mut handle_guard = self.browser_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+        info!("reconnecting browser after a connection-class failure");
+        self.launch_or_connect(&mut guard).await
     }
 }
 
@@ -695,6 +835,22 @@ pub enum MockCall {
     BodyText,
     Screenshot(Option<String>),
     Url,
+    /// Recorded by `MockBackend::reconnect`. Asserting on its count proves the
+    /// tool layer reconnected exactly once on a connection-class error.
+    Reconnect,
+}
+
+/// Which page operation a scripted connection-class error should fire on, used
+/// by `MockBackend::fail_once_with_connection_error_on`. Distinct ops let a test
+/// target the body_text/inner_text read for the observation-retry case or the
+/// click/replace_text op for the mutation non-replay case.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailOp {
+    BodyText,
+    InnerText,
+    Click,
+    ReplaceText,
 }
 
 /// In-memory mock backend that records calls and returns scripted results. It
@@ -722,6 +878,14 @@ pub struct MockBackend {
     /// CLICK happens, modeling a `target=_blank`/`window.open` spawn. Shared with
     /// `MockPage` so the reveal is tied to the click, not to `list_targets`.
     pending_popup: Arc<Mutex<Option<TargetInfo>>>,
+    /// Handler liveness, mirroring `ChromiumoxideBackend::handler_alive`. Tests
+    /// flip this to model a dead CDP handler; `ensure_ready` consults it and, on
+    /// a dead handler, relaunches (recorded as a fresh `EnsureReady`/`Reconnect`).
+    handler_alive: Arc<AtomicBool>,
+    /// A scripted one-shot connection-class error: the FIRST time the named op
+    /// runs, it returns the connection error and clears the slot, so the retry
+    /// (against a fresh page after reconnect) succeeds. Shared with `MockPage`.
+    pending_fail: Arc<Mutex<Option<FailOp>>>,
 }
 
 #[cfg(test)]
@@ -737,6 +901,8 @@ impl Default for MockBackend {
             next_page_id: Mutex::new(0),
             targets: Arc::new(Mutex::new(Vec::new())),
             pending_popup: Arc::new(Mutex::new(None)),
+            handler_alive: Arc::new(AtomicBool::new(true)),
+            pending_fail: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -806,10 +972,38 @@ impl MockBackend {
         });
     }
 
+    /// Mark the mock's CDP handler as dead, modeling a browser whose connection
+    /// died. `ensure_ready` sees `is_some && !handler_alive` and relaunches.
+    pub fn mark_handler_dead(&self) {
+        self.handler_alive.store(false, Ordering::SeqCst);
+    }
+
+    /// Script a one-shot connection-class error on the next invocation of `op`.
+    /// The op records its `MockCall` (so we can assert it ran), then returns a
+    /// transport-class error string and clears the slot — so a retry succeeds.
+    pub async fn fail_once_with_connection_error_on(&self, op: FailOp) {
+        *self.pending_fail.lock().await = Some(op);
+    }
+
+    /// Count of `Reconnect` calls recorded so far.
+    pub async fn reconnect_count(&self) -> usize {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter(|c| matches!(c, MockCall::Reconnect))
+            .count()
+    }
+
     async fn record(&self, call: MockCall) {
         self.calls.lock().await.push(call);
     }
 }
+
+/// The connection-class error string a scripted mock op returns. Matches
+/// `is_connection_error` so the tool layer routes it through recovery.
+#[cfg(test)]
+const MOCK_CONNECTION_ERROR: &str = "WebSocket connection closed: Sender was dropped";
 
 #[cfg(test)]
 struct MockPage {
@@ -826,12 +1020,25 @@ struct MockPage {
     /// reveal a popup target (modeling target=_blank/window.open).
     targets: Arc<Mutex<Vec<TargetInfo>>>,
     pending_popup: Arc<Mutex<Option<TargetInfo>>>,
+    /// Shared one-shot connection-error script (see `MockBackend::pending_fail`).
+    pending_fail: Arc<Mutex<Option<FailOp>>>,
 }
 
 #[cfg(test)]
 impl MockPage {
     async fn record(&self, call: MockCall) {
         self.calls.lock().await.push(call);
+    }
+
+    /// If a one-shot connection error is scripted for `op`, consume it and return
+    /// the transport-class error string; otherwise `None` (op proceeds normally).
+    async fn take_scripted_failure(&self, op: FailOp) -> Option<String> {
+        let mut slot = self.pending_fail.lock().await;
+        if *slot == Some(op) {
+            *slot = None;
+            return Some(MOCK_CONNECTION_ERROR.to_string());
+        }
+        None
     }
 }
 
@@ -851,6 +1058,9 @@ impl PageHandle for MockPage {
 
     async fn click(&self, selector: &str) -> Result<(), String> {
         self.record(MockCall::Click(selector.to_string())).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::Click).await {
+            return Err(err);
+        }
         // A click reveals any scripted popup: it appears as a new live target,
         // exactly as a real target=_blank/window.open would after the click.
         if let Some(popup) = self.pending_popup.lock().await.take() {
@@ -871,6 +1081,9 @@ impl PageHandle for MockPage {
             value.to_string(),
         ))
         .await;
+        if let Some(err) = self.take_scripted_failure(FailOp::ReplaceText).await {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -881,11 +1094,17 @@ impl PageHandle for MockPage {
 
     async fn inner_text(&self, selector: &str) -> Result<String, String> {
         self.record(MockCall::InnerText(selector.to_string())).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::InnerText).await {
+            return Err(err);
+        }
         Ok(self.text_result.clone())
     }
 
     async fn body_text(&self) -> Result<String, String> {
         self.record(MockCall::BodyText).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::BodyText).await {
+            return Err(err);
+        }
         Ok(self.text_result.clone())
     }
 
@@ -906,7 +1125,12 @@ impl PageHandle for MockPage {
 impl BrowserBackend for MockBackend {
     async fn ensure_ready(&self) -> Result<(), String> {
         self.record(MockCall::EnsureReady).await;
+        // Model the production health check: a (re)launch revives the handler and
+        // marks the connection live. A test that flipped `mark_handler_dead`
+        // before this call sees the EnsureReady record + a revived handler,
+        // proving a dead handler is no longer treated as healthy.
         self.connected.store(true, Ordering::Relaxed);
+        self.handler_alive.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -936,6 +1160,7 @@ impl BrowserBackend for MockBackend {
                 url: self.url.clone(),
                 targets: Arc::clone(&self.targets),
                 pending_popup: Arc::clone(&self.pending_popup),
+                pending_fail: Arc::clone(&self.pending_fail),
             }),
         ))
     }
@@ -974,6 +1199,7 @@ impl BrowserBackend for MockBackend {
             url: self.url.clone(),
             targets: Arc::clone(&self.targets),
             pending_popup: Arc::clone(&self.pending_popup),
+            pending_fail: Arc::clone(&self.pending_fail),
         }))
     }
 
@@ -986,7 +1212,15 @@ impl BrowserBackend for MockBackend {
     }
 
     async fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.connected.load(Ordering::Relaxed) && self.handler_alive.load(Ordering::SeqCst)
+    }
+
+    async fn reconnect(&self) -> Result<(), String> {
+        self.record(MockCall::Reconnect).await;
+        // A successful reconnect revives the connection + handler.
+        self.connected.store(true, Ordering::Relaxed);
+        self.handler_alive.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 

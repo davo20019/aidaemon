@@ -326,6 +326,26 @@ impl BrowserSessionRegistry {
             .map(|t| t.target_id.clone())
     }
 
+    /// Drop ALL cached tabs for EVERY session. Called after a browser-level
+    /// reconnect: a dead browser kills every session's pages at once (they are
+    /// handles into a CDP connection that no longer exists), so per-session
+    /// invalidation would be wrong — a sibling session reusing its stale handle
+    /// would hit the dead connection. Clearing all sessions forces
+    /// `get_or_create_page` to mint fresh pages against the new connection on the
+    /// next action. Per-session approval flags are preserved (they are not tied
+    /// to the connection), so a recovered session does not re-prompt.
+    ///
+    /// The session entries themselves are kept (so `last_used_at`/`action_lock`
+    /// survive) but emptied of tabs; the next `get_or_create_page` adopts a fresh
+    /// first tab into the existing entry.
+    pub async fn invalidate_all_pages(&self) {
+        let mut sessions = self.sessions.lock().await;
+        for state in sessions.values_mut() {
+            state.tabs.clear();
+            state.active_target_id.clear();
+        }
+    }
+
     /// Snapshot of this session's tabs for `list_tabs`. Empty if the session is
     /// unknown or has no tabs.
     pub async fn list_tabs(&self, session_id: &str) -> Vec<TabView> {

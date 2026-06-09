@@ -811,6 +811,128 @@ impl BrowserTool {
         self.backend.close().await
     }
 
+    /// Dispatch a single action to its handler (no recovery). Pulled out of
+    /// `call()` so the recovery wrapper can re-invoke it for an observation retry.
+    async fn dispatch_action(
+        &self,
+        action: &str,
+        args: &Value,
+        session_id: &str,
+    ) -> Result<String, String> {
+        match action {
+            "navigate" => self.action_navigate(args, session_id).await,
+            "screenshot" => self.action_screenshot(args, session_id).await,
+            "click" => self.action_click(args, session_id).await,
+            "fill" => self.action_fill(args, session_id).await,
+            "get_text" => self.action_get_text(args, session_id).await,
+            "execute_js" => self.action_execute_js(args, session_id).await,
+            "wait" => self.action_wait(args, session_id).await,
+            "list_tabs" => self.action_list_tabs(session_id).await,
+            "new_tab" => self.action_new_tab(args, session_id).await,
+            "switch_tab" => self.action_switch_tab(args, session_id).await,
+            "close_tab" => self.action_close_tab(args, session_id).await,
+            "set_mode" => self.action_set_mode(args).await,
+            "close" => self.action_close().await,
+            _ => Err(format!(
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, new_tab, switch_tab, close_tab, set_mode, close",
+                action
+            )),
+        }
+    }
+
+    /// Whether an action is safe to AUTOMATICALLY replay after a connection-class
+    /// failure + reconnect. Only observation/navigation/administrative actions
+    /// are idempotent enough to re-run blindly. Mutations (`click`, `fill`,
+    /// `execute_js`) may have PARTIALLY executed before the disconnect (the CDP
+    /// command could have reached Chrome and run before the websocket tore down),
+    /// so their state after a disconnect is UNCERTAIN — replaying could double a
+    /// submit/purchase/delete. We never auto-replay them.
+    ///
+    /// Uses the shared `policy::classify` so the observation-vs-mutation boundary
+    /// has a single source of truth.
+    fn action_is_safe_to_replay(action: &str) -> bool {
+        let risk = policy::classify(action, None, None);
+        matches!(
+            risk.class,
+            BrowserRiskClass::Observation
+                | BrowserRiskClass::Navigation
+                | BrowserRiskClass::Administrative
+        )
+    }
+
+    /// Run an action with disconnect recovery layered on top of `dispatch_action`.
+    ///
+    /// On a CONNECTION-CLASS error (per `backend::is_connection_error`) — the
+    /// websocket/CDP connection to Chrome died, distinct from an ordinary page
+    /// error like "element not found" — recovery splits by idempotency, which is
+    /// known HERE (the tool layer) via the action's risk class:
+    ///
+    /// - **Observation / navigation / administrative (idempotent):** invalidate
+    ///   ALL cached session pages (a dead browser kills every session's pages),
+    ///   `reconnect()` ONCE, then retry the action ONE time against a fresh page.
+    ///   If it fails again, surface that error.
+    /// - **Mutation (`click`/`fill`/`execute_js`):** NEVER auto-replay — the
+    ///   action may have partially executed before the disconnect (uncertain
+    ///   state). Still reconnect + invalidate so the NEXT action works, but
+    ///   surface a clear "could not be confirmed; re-issue manually" error.
+    ///
+    /// A non-connection error is returned verbatim with no reconnect.
+    async fn dispatch_with_recovery(
+        &self,
+        action: &str,
+        args: &Value,
+        session_id: &str,
+    ) -> Result<String, String> {
+        let first = self.dispatch_action(action, args, session_id).await;
+        let err = match first {
+            Ok(ok) => return Ok(ok),
+            Err(e) => e,
+        };
+
+        // Only connection-class failures trigger recovery. A normal page error
+        // ("Element not found", "Timeout", ...) is surfaced as-is.
+        if !backend::is_connection_error(&err) {
+            return Err(err);
+        }
+
+        warn!(
+            action,
+            "browser action hit a connection-class error; attempting recovery"
+        );
+
+        // A dead browser invalidates EVERY session's pages — drop them all so
+        // the next page resolution mints fresh handles against the new
+        // connection. Then reconnect exactly once.
+        self.sessions.invalidate_all_pages().await;
+        if let Err(reconnect_err) = self.backend.reconnect().await {
+            return Err(format!(
+                "Browser connection lost and reconnect failed: {}. \
+                 The action did not complete; please retry.",
+                reconnect_err
+            ));
+        }
+
+        if Self::action_is_safe_to_replay(action) {
+            // Idempotent: retry once against a freshly-minted page.
+            info!(action, "retrying idempotent browser action after reconnect");
+            return self.dispatch_action(action, args, session_id).await;
+        }
+
+        // Mutation: NEVER auto-replay. The connection is restored for subsequent
+        // actions, but this action's effect is uncertain.
+        warn!(
+            action,
+            "mutation hit a disconnect; NOT replaying (uncertain state)"
+        );
+        Err(format!(
+            "Browser connection was lost while performing '{}'. The action could NOT be \
+             confirmed and may have partially completed — it was NOT retried automatically to \
+             avoid duplicating it. The connection has been restored; re-issue the action \
+             manually if needed after checking the page state.",
+            action
+        ))
+    }
+
     /// `list_tabs`: render this session's tabs — opaque id, title, REDACTED
     /// origin (never the full URL — paths/queries can carry secrets), and which
     /// is active. Ensures the session has at least one tab first (so a fresh
@@ -1060,25 +1182,7 @@ impl Tool for BrowserTool {
             return Ok(format!("Error: {}", reason));
         }
 
-        let result = match action {
-            "navigate" => self.action_navigate(&args, session_id).await,
-            "screenshot" => self.action_screenshot(&args, session_id).await,
-            "click" => self.action_click(&args, session_id).await,
-            "fill" => self.action_fill(&args, session_id).await,
-            "get_text" => self.action_get_text(&args, session_id).await,
-            "execute_js" => self.action_execute_js(&args, session_id).await,
-            "wait" => self.action_wait(&args, session_id).await,
-            "list_tabs" => self.action_list_tabs(session_id).await,
-            "new_tab" => self.action_new_tab(&args, session_id).await,
-            "switch_tab" => self.action_switch_tab(&args, session_id).await,
-            "close_tab" => self.action_close_tab(&args, session_id).await,
-            "set_mode" => self.action_set_mode(&args).await,
-            "close" => self.action_close().await,
-            _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, new_tab, switch_tab, close_tab, set_mode, close",
-                action
-            )),
-        };
+        let result = self.dispatch_with_recovery(action, &args, session_id).await;
 
         // Return errors as text so the LLM can adjust its approach
         match result {
