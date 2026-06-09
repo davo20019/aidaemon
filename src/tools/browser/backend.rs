@@ -37,7 +37,9 @@ pub trait PageHandle: Send + Sync {
     /// Click the element matching `selector`.
     async fn click(&self, selector: &str) -> Result<(), String>;
 
-    /// Focus the element matching `selector` and type `value` into it.
+    /// Focus the element matching `selector` and type `value` into it
+    /// (append semantics — kept as a seam primitive for future tasks).
+    #[allow(dead_code)]
     async fn type_text(&self, selector: &str, value: &str) -> Result<(), String>;
 
     /// Evaluate a JavaScript `script` and return its result as a JSON value.
@@ -60,6 +62,15 @@ pub trait PageHandle: Send + Sync {
 
     /// Current page URL, if available.
     async fn url(&self) -> Option<String>;
+
+    /// Replace the entire content of the element matching `selector` with
+    /// `value`, firing native `input` and `change` events.
+    ///
+    /// This replaces whatever is already in the field. The `value` is NEVER
+    /// interpolated into a JavaScript source string — it is delivered as real
+    /// key events via `type_str` after the field is cleared through an
+    /// element-bound JS function.
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String>;
 }
 
 /// A browser backend: owns the connection lifecycle and hands out page handles.
@@ -417,6 +428,52 @@ impl PageHandle for ChromiumoxidePage {
         Ok(())
     }
 
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        let element = self
+            .page
+            .find_element(selector)
+            .await
+            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+
+        // Focus the element.
+        element
+            .focus()
+            .await
+            .map_err(|e| format!("Failed to focus '{}': {}", selector, e))?;
+
+        // Clear the field via a bound JS function — the empty-string literal `''`
+        // is a compile-time constant, NOT user data; no interpolation occurs.
+        element
+            .call_js_fn(
+                "function() { \
+                    this.value = ''; \
+                    this.dispatchEvent(new Event('input', {bubbles: true})); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| format!("Failed to clear '{}': {}", selector, e))?;
+
+        // Type the new value with real key events (never enters a JS string).
+        element
+            .type_str(value)
+            .await
+            .map_err(|e| format!("Failed to type into '{}': {}", selector, e))?;
+
+        // Fire a final `change` event (some frameworks rely on it to commit).
+        element
+            .call_js_fn(
+                "function() { \
+                    this.dispatchEvent(new Event('change', {bubbles: true})); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| format!("Failed to dispatch change on '{}': {}", selector, e))?;
+
+        Ok(())
+    }
+
     async fn evaluate(&self, script: &str) -> Result<Option<serde_json::Value>, String> {
         let result = self
             .page
@@ -500,6 +557,8 @@ pub enum MockCall {
     FindElement(String),
     Click(String),
     TypeText(String, String),
+    /// Recorded by `MockPage::replace_text`. Fields: (selector, value).
+    ReplaceText(String, String),
     Evaluate(String),
     InnerText(String),
     BodyText,
@@ -604,6 +663,15 @@ impl PageHandle for MockPage {
     async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
         self.record(MockCall::TypeText(selector.to_string(), value.to_string()))
             .await;
+        Ok(())
+    }
+
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        self.record(MockCall::ReplaceText(
+            selector.to_string(),
+            value.to_string(),
+        ))
+        .await;
         Ok(())
     }
 

@@ -221,6 +221,103 @@ async fn fill_result_contains_selector_but_not_value() {
     );
 }
 
+// =============================================================================
+// Task 2: fill replaces existing content (not appends)
+// =============================================================================
+
+/// Core regression: filling a field that already has "old@example.com" must
+/// produce ONLY "new@example.com". The mock asserts dispatch-level semantics —
+/// `action_fill` must call `replace_text`, not the old `click`+`type_text`
+/// append sequence. True DOM-level replacement (that `this.value = ''` clears
+/// the native input state) is covered by the ignored real-Chrome smoke suite
+/// (Task 18, not in this slice).
+#[tokio::test]
+async fn fill_replaces_existing_value_not_appends() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // The mock "field" conceptually starts with old@example.com; with replace
+    // semantics the recorded call carries exactly the new value.
+    let args = json!({
+        "action": "fill",
+        "selector": "#email",
+        "value": "new@example.com"
+    });
+    let result = tool.call(&args.to_string()).await.unwrap();
+
+    // Action should succeed and report the selector.
+    assert!(
+        result.contains("#email"),
+        "fill result must contain selector: {result}"
+    );
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+
+    // Must have recorded a ReplaceText with exactly the new value (replace
+    // semantics). The old append sequence (Click + TypeText) must NOT appear.
+    assert!(
+        calls.contains(&MockCall::ReplaceText(
+            "#email".to_string(),
+            "new@example.com".to_string()
+        )),
+        "fill must dispatch replace_text with new@example.com: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::TypeText(..))),
+        "fill must NOT use type_text (append path): {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Click(..))),
+        "fill must NOT use click (old append preamble): {calls:?}"
+    );
+}
+
+/// Parametrized value round-trip: each value must appear unchanged in the
+/// recorded ReplaceText call AND must NOT appear in the returned result string
+/// (Task 1 secret-safety invariant holds for all value types).
+#[tokio::test]
+async fn fill_replace_value_cases_round_trip_and_stay_secret() {
+    let cases: &[(&str, &str)] = &[
+        ("#empty", ""),
+        ("#unicode", "héllo wörld 日本語 🚀"),
+        ("#multiline", "line1\nline2"),
+        ("#password", "P@ssw0rd!'\"<script>"),
+    ];
+
+    for (selector, value) in cases {
+        let (tool, backend, _rx) = mock_tool();
+
+        let args = json!({ "action": "fill", "selector": selector, "value": value });
+        let result = tool.call(&args.to_string()).await.unwrap();
+
+        // Result must contain selector (callers know which field was filled).
+        assert!(
+            result.contains(*selector),
+            "fill result must contain selector '{selector}' for value '{value}': {result}"
+        );
+
+        // Result must NOT contain the value (secret-safety, Task 1 invariant).
+        if !value.is_empty() {
+            assert!(
+                !result.contains(*value),
+                "fill result must not echo value for selector '{selector}': {result}"
+            );
+        }
+
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+
+        // The value must round-trip unchanged into the ReplaceText record.
+        assert!(
+            calls.contains(&MockCall::ReplaceText(
+                selector.to_string(),
+                value.to_string()
+            )),
+            "replace_text call must carry exact value for selector '{selector}': {calls:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn screenshot_without_selector_records_full_page_target() {
     let (tool, backend, mut rx) = mock_tool();

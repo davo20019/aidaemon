@@ -117,7 +117,7 @@ impl BrowserTool {
         self.backend.ensure_ready().await?;
         let page = self.backend.current_page().await?;
 
-        page.type_text(selector, value).await?;
+        page.replace_text(selector, value).await?;
 
         tracing::info!(
             action = "fill",
