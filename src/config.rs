@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -1540,6 +1540,29 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
+/// How browser sessions are isolated from one another with respect to cookies,
+/// cache, and other browsing state.
+///
+/// HONESTY CONTRACT: this enum must never claim isolation that isn't actually
+/// delivered. `Page` mode explicitly SHARES cookies across sessions;
+/// `BrowserContext` mode creates a real, per-session incognito browser context
+/// (no shared cookies/cache). The two modes are mutually exclusive with a
+/// shared persistent profile or an attached remote-debugging Chrome — see
+/// [`BrowserConfig::resolve_session_isolation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+pub enum SessionIsolation {
+    /// All sessions share one default browser context: cookies/cache are SHARED.
+    /// This is the only honest option when attached to a persistent profile or a
+    /// remote-debugging Chrome instance.
+    Page,
+    /// Each session gets its own incognito browser context: cookies/cache are
+    /// ISOLATED per session. Requires dedicated ephemeral browsing (no
+    /// `user_data_dir`, no `remote_debugging_port`).
+    BrowserContext,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
 pub struct BrowserConfig {
@@ -1562,6 +1585,16 @@ pub struct BrowserConfig {
     /// Chrome profile directory name within user_data_dir (default: "Default").
     /// Other profiles are typically "Profile 1", "Profile 2", etc.
     pub profile: Option<String>,
+    /// How browser sessions are isolated from one another.
+    ///
+    /// `None` (the default) means "auto": dedicated ephemeral browsing resolves
+    /// to `browser_context` (per-session isolated cookies), while a shared
+    /// persistent profile (`user_data_dir`) or an attached remote-debugging
+    /// Chrome (`remote_debugging_port`) resolves to `page` (shared cookies).
+    /// Set explicitly to fail fast on incompatible combinations rather than
+    /// silently claiming isolation. See [`Self::resolve_session_isolation`].
+    #[serde(default)]
+    pub session_isolation: Option<SessionIsolation>,
 }
 
 impl Default for BrowserConfig {
@@ -1574,6 +1607,42 @@ impl Default for BrowserConfig {
             remote_debugging_port: None,
             user_data_dir: default_browser_user_data_dir(),
             profile: None,
+            session_isolation: None,
+        }
+    }
+}
+
+impl BrowserConfig {
+    /// Resolve the effective session-isolation mode, rejecting configurations
+    /// that would falsely claim per-session cookie isolation.
+    ///
+    /// HONESTY CONTRACT: a shared persistent profile (`user_data_dir`) or an
+    /// attached remote-debugging Chrome (`remote_debugging_port`) cannot give
+    /// per-session isolated cookies — they always share one cookie jar. So:
+    ///
+    /// - `Some(BrowserContext)` + shared/attached → **Err** (don't lie).
+    /// - `Some(Page)` → always `Ok(Page)` (honest: shared cookies).
+    /// - `Some(BrowserContext)` + ephemeral → `Ok(BrowserContext)`.
+    /// - `None` (auto): shared/attached → `Ok(Page)`; ephemeral →
+    ///   `Ok(BrowserContext)`.
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
+        let shared_or_attached =
+            self.user_data_dir.is_some() || self.remote_debugging_port.is_some();
+
+        match self.session_isolation {
+            Some(SessionIsolation::BrowserContext) if shared_or_attached => Err(
+                "browser.session_isolation = \"browser_context\" requires dedicated ephemeral \
+                 browsing, but a shared persistent profile (user_data_dir) or an attached \
+                 remote-debugging Chrome (remote_debugging_port) is configured. These share a \
+                 single cookie jar and CANNOT provide per-session isolated cookies. Either use \
+                 session_isolation = \"page\" (sessions share cookies), or remove user_data_dir \
+                 and remote_debugging_port to enable real per-session isolation."
+                    .to_string(),
+            ),
+            Some(mode) => Ok(mode),
+            None if shared_or_attached => Ok(SessionIsolation::Page),
+            None => Ok(SessionIsolation::BrowserContext),
         }
     }
 }
@@ -3537,5 +3606,142 @@ allowed_user_ids = ["U123"]
         assert_eq!(bots[0].app_token, "xapp-123");
         assert_eq!(bots[0].bot_token, "xoxb-456");
         assert_eq!(bots[0].allowed_user_ids, vec!["U123"]);
+    }
+
+    // === Browser session_isolation parsing + resolution ===
+
+    /// A BrowserConfig with no profile and no remote-debugging port (truly
+    /// ephemeral), letting us isolate the `session_isolation` field's behavior.
+    fn ephemeral_browser_config(isolation: Option<SessionIsolation>) -> BrowserConfig {
+        BrowserConfig {
+            enabled: true,
+            headless: true,
+            screenshot_width: 1280,
+            screenshot_height: 720,
+            remote_debugging_port: None,
+            user_data_dir: None,
+            profile: None,
+            session_isolation: isolation,
+        }
+    }
+
+    #[test]
+    fn parse_session_isolation_page() {
+        let toml = r#"
+enabled = true
+user_data_dir = "/tmp/profile"
+session_isolation = "page"
+"#;
+        let cfg: BrowserConfig = toml::from_str(toml).expect("parse browser config");
+        assert_eq!(cfg.session_isolation, Some(SessionIsolation::Page));
+    }
+
+    #[test]
+    fn parse_session_isolation_browser_context() {
+        let toml = r#"
+enabled = true
+session_isolation = "browser_context"
+"#;
+        let cfg: BrowserConfig = toml::from_str(toml).expect("parse browser config");
+        assert_eq!(
+            cfg.session_isolation,
+            Some(SessionIsolation::BrowserContext)
+        );
+    }
+
+    #[test]
+    fn parse_session_isolation_omitted_is_none() {
+        let toml = r#"
+enabled = true
+"#;
+        let cfg: BrowserConfig = toml::from_str(toml).expect("parse browser config");
+        assert_eq!(cfg.session_isolation, None);
+    }
+
+    #[test]
+    fn parse_session_isolation_invalid_value_rejected() {
+        let toml = r#"
+enabled = true
+session_isolation = "incognito"
+"#;
+        let result: Result<BrowserConfig, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "unknown session_isolation variant should fail to parse"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_ephemeral_is_browser_context() {
+        let cfg = ephemeral_browser_config(None);
+        assert_eq!(
+            cfg.resolve_session_isolation(),
+            Ok(SessionIsolation::BrowserContext)
+        );
+    }
+
+    #[test]
+    fn resolve_auto_with_profile_is_page() {
+        let mut cfg = ephemeral_browser_config(None);
+        cfg.user_data_dir = Some("/tmp/profile".to_string());
+        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+    }
+
+    #[test]
+    fn resolve_auto_with_remote_port_is_page() {
+        let mut cfg = ephemeral_browser_config(None);
+        cfg.remote_debugging_port = Some(9222);
+        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+    }
+
+    #[test]
+    fn resolve_page_with_profile_is_ok_page() {
+        let mut cfg = ephemeral_browser_config(Some(SessionIsolation::Page));
+        cfg.user_data_dir = Some("/tmp/profile".to_string());
+        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+    }
+
+    #[test]
+    fn resolve_browser_context_ephemeral_is_ok() {
+        let cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
+        assert_eq!(
+            cfg.resolve_session_isolation(),
+            Ok(SessionIsolation::BrowserContext)
+        );
+    }
+
+    #[test]
+    fn resolve_browser_context_with_profile_is_err() {
+        let mut cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
+        cfg.user_data_dir = Some("/tmp/profile".to_string());
+        let err = cfg
+            .resolve_session_isolation()
+            .expect_err("browser_context + persistent profile must be rejected");
+        assert!(
+            err.contains("browser_context") && err.contains("user_data_dir"),
+            "error should explain the incompatibility: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_browser_context_with_remote_port_is_err() {
+        let mut cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
+        cfg.remote_debugging_port = Some(9222);
+        let err = cfg
+            .resolve_session_isolation()
+            .expect_err("browser_context + remote-debugging Chrome must be rejected");
+        assert!(
+            err.contains("browser_context") && err.contains("remote_debugging_port"),
+            "error should explain the incompatibility: {err}"
+        );
+    }
+
+    #[test]
+    fn shipped_default_config_resolves_without_error() {
+        // The shipped default uses a persistent profile (user_data_dir set) and
+        // session_isolation = None. It must resolve to Page, not error.
+        let cfg = BrowserConfig::default();
+        assert_eq!(cfg.session_isolation, None);
+        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
     }
 }

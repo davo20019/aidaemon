@@ -15,12 +15,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::BrowserConfig;
+use crate::config::{BrowserConfig, SessionIsolation};
 
 /// A handle to a single browser page/tab. Methods mirror the chromiumoxide
 /// `Page` operations the tool's actions need today. Some methods (e.g. the tab
@@ -139,19 +140,38 @@ pub struct ChromiumoxideBackend {
     connected_to_existing: Arc<Mutex<bool>>,
     /// Runtime-mutable headless mode (togglable via the tool's set_mode action).
     headless: AtomicBool,
+    /// Resolved session-isolation mode (computed once at construction). Controls
+    /// whether each session's page is created in the default shared context
+    /// (`Page` — shared cookies) or its own incognito browser context
+    /// (`BrowserContext` — isolated cookies).
+    session_isolation: SessionIsolation,
     config: BrowserConfig,
 }
 
 impl ChromiumoxideBackend {
-    pub fn new(config: BrowserConfig) -> Self {
+    /// Construct a backend, resolving the session-isolation mode from config.
+    ///
+    /// Returns an `Err` if the configuration is incompatible (e.g. requesting
+    /// per-session `browser_context` isolation while attached to a shared
+    /// persistent profile or remote-debugging Chrome). Callers must surface this
+    /// error at startup rather than silently downgrading — honesty over a
+    /// false claim of cookie isolation.
+    pub fn new(config: BrowserConfig) -> Result<Self, String> {
+        let session_isolation = config.resolve_session_isolation()?;
         let headless = AtomicBool::new(config.headless);
-        Self {
+        Ok(Self {
             browser: Arc::new(Mutex::new(None)),
             browser_handle: Arc::new(Mutex::new(None)),
             connected_to_existing: Arc::new(Mutex::new(false)),
             headless,
+            session_isolation,
             config,
-        }
+        })
+    }
+
+    /// The resolved session-isolation mode this backend will use.
+    pub fn session_isolation(&self) -> SessionIsolation {
+        self.session_isolation
     }
 
     /// Check if a display is available for non-headless Chrome.
@@ -172,16 +192,45 @@ impl ChromiumoxideBackend {
     /// The global browser mutex is held only long enough to issue `new_page`;
     /// the returned handle owns its own `Arc<Page>`, so the action that follows
     /// runs without holding this mutex.
+    ///
+    /// In `Page` isolation mode the page is created in the default (shared)
+    /// browser context — sessions share cookies. In `BrowserContext` mode a new
+    /// incognito browser context is created per session, giving real per-session
+    /// cookie/cache isolation. The created context is NOT disposed here;
+    /// disposal-on-close is deferred (see Task 11). This is a known, bounded
+    /// context leak for the process lifetime.
     async fn new_blank_page(&self) -> Result<(String, Arc<chromiumoxide::Page>), String> {
         let guard = self.browser.lock().await;
         let browser = guard
             .as_ref()
             .ok_or_else(|| "Browser not initialized".to_string())?;
 
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| format!("Failed to create new page: {}", e))?;
+        let page = match self.session_isolation {
+            SessionIsolation::Page => browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| format!("Failed to create new page: {}", e))?,
+            SessionIsolation::BrowserContext => {
+                // Create a fresh incognito browser context so this session's
+                // cookies/cache are isolated from every other session.
+                let context_id = browser
+                    .create_browser_context(Default::default())
+                    .await
+                    .map_err(|e| format!("Failed to create isolated browser context: {}", e))?;
+                // NOTE: context_id is intentionally not disposed here — disposal
+                // on session close is a deferred concern (Task 11).
+                debug!("Created isolated browser context for session");
+                let params = CreateTargetParams::builder()
+                    .url("about:blank")
+                    .browser_context_id(context_id)
+                    .build()
+                    .map_err(|e| format!("Failed to build isolated page parameters: {}", e))?;
+                browser
+                    .new_page(params)
+                    .await
+                    .map_err(|e| format!("Failed to create new isolated page: {}", e))?
+            }
+        };
         let target_id = page.target_id().as_ref().to_string();
         Ok((target_id, Arc::new(page)))
     }
@@ -772,5 +821,65 @@ impl BrowserBackend for MockBackend {
 
     async fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+}
+
+// =============================================================================
+// Backend construction / isolation-resolution tests (no real Chrome needed)
+// =============================================================================
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::config::SessionIsolation;
+
+    fn ephemeral_config() -> BrowserConfig {
+        BrowserConfig {
+            enabled: true,
+            headless: true,
+            screenshot_width: 1280,
+            screenshot_height: 720,
+            remote_debugging_port: None,
+            user_data_dir: None,
+            profile: None,
+            session_isolation: None,
+        }
+    }
+
+    #[test]
+    fn ephemeral_auto_resolves_to_browser_context() {
+        match ChromiumoxideBackend::new(ephemeral_config()) {
+            Ok(backend) => assert_eq!(
+                backend.session_isolation(),
+                SessionIsolation::BrowserContext
+            ),
+            Err(e) => panic!("ephemeral config must construct: {e}"),
+        }
+    }
+
+    #[test]
+    fn profile_auto_resolves_to_page() {
+        let mut config = ephemeral_config();
+        config.user_data_dir = Some("/tmp/profile".to_string());
+        match ChromiumoxideBackend::new(config) {
+            Ok(backend) => assert_eq!(backend.session_isolation(), SessionIsolation::Page),
+            Err(e) => panic!("profile config must construct: {e}"),
+        }
+    }
+
+    #[test]
+    fn incompatible_browser_context_with_profile_is_rejected_at_construction() {
+        let mut config = ephemeral_config();
+        config.session_isolation = Some(SessionIsolation::BrowserContext);
+        config.user_data_dir = Some("/tmp/profile".to_string());
+        match ChromiumoxideBackend::new(config) {
+            Ok(_) => {
+                panic!("browser_context + persistent profile must fail fast at construction")
+            }
+            Err(err) => assert!(
+                err.contains("browser_context"),
+                "construction error should explain the incompatibility: {err}"
+            ),
+        }
     }
 }

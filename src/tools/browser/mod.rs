@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
 use crate::traits::{
@@ -29,12 +29,34 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
-    pub fn new(config: BrowserConfig, media_tx: mpsc::Sender<MediaMessage>) -> Self {
-        Self {
-            backend: Arc::new(ChromiumoxideBackend::new(config)),
+    /// Construct the browser tool, resolving and validating the session
+    /// isolation mode up front.
+    ///
+    /// Returns an `Err` (surfaced at startup) when the configuration would
+    /// falsely claim per-session cookie isolation — e.g. `browser_context`
+    /// mode requested alongside a shared persistent profile or remote-debugging
+    /// Chrome. On success, logs the resolved mode and whether sessions SHARE
+    /// cookies, without logging any profile path contents.
+    pub fn new(
+        config: BrowserConfig,
+        media_tx: mpsc::Sender<MediaMessage>,
+    ) -> Result<Self, String> {
+        let backend = ChromiumoxideBackend::new(config)?;
+        let mode = backend.session_isolation();
+        let (mode_label, shares_cookies) = match mode {
+            crate::config::SessionIsolation::Page => ("page", true),
+            crate::config::SessionIsolation::BrowserContext => ("browser_context", false),
+        };
+        info!(
+            isolation = mode_label,
+            shares_cookies,
+            "browser sessions share cookies: {shares_cookies} (isolation={mode_label})"
+        );
+        Ok(Self {
+            backend: Arc::new(backend),
             media_tx,
             sessions: BrowserSessionRegistry::new(),
-        }
+        })
     }
 
     /// Test-only constructor that injects an arbitrary backend (e.g. the mock).

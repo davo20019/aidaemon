@@ -468,10 +468,9 @@ pub async fn register_optional_tools(
                 if !config.tools.is_enabled("browser") {
                     continue;
                 }
-                tools.push(Arc::new(BrowserTool::new(
-                    config.browser.clone(),
-                    media_tx.clone(),
-                )));
+                let browser_tool = BrowserTool::new(config.browser.clone(), media_tx.clone())
+                    .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
+                tools.push(Arc::new(browser_tool));
             }
             OptionalToolId::SendFile => {
                 if !config.tools.is_enabled("send_file") {

@@ -199,6 +199,18 @@ health_port = 8080
 # # Use an existing Chrome profile to inherit cookies/sessions (e.g. Cloudflare, GitHub, AWS)
 # user_data_dir = "~/Library/Application Support/Google/Chrome"
 # profile = "Default"    # or "Profile 1", "Profile 2", etc.
+# # How browser sessions are isolated from each other (cookies/cache):
+# #   "page"            - all sessions SHARE one browser context (shared cookies).
+# #   "browser_context" - each session gets its own incognito context
+# #                       (per-session isolated cookies). Requires dedicated
+# #                       ephemeral browsing: NO user_data_dir and NO
+# #                       remote_debugging_port (a persistent profile or attached
+# #                       Chrome shares one cookie jar and cannot isolate cookies).
+# # Omit (default = auto): ephemeral browsing -> "browser_context"; a configured
+# # user_data_dir or remote_debugging_port -> "page". An explicit
+# # "browser_context" combined with user_data_dir/remote_debugging_port is
+# # REJECTED at startup rather than silently claiming isolation it can't deliver.
+# session_isolation = "page"
 
 # [triggers.email]
 # host = "imap.gmail.com"
