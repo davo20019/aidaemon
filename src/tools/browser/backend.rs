@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::browser_protocol::target::{
-    CloseTargetParams, CreateTargetParams, TargetId,
+    CloseTargetParams, CreateTargetParams, GetTargetsParams, TargetId,
 };
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
@@ -81,11 +81,19 @@ pub trait PageHandle: Send + Sync {
 /// id string (used as the opaque, stable tab id surfaced to the LLM); `title`
 /// and `url` are best-effort and may be `None`/empty if the page is still
 /// loading or unreachable.
+///
+/// `opener_id` is the target id of the page that SPAWNED this target (the CDP
+/// `openerId`), or `None` for targets opened independently (a user-typed tab,
+/// the initial blank tab, etc.). Popup attribution uses it to bind a net-new
+/// target to the SPECIFIC session whose page opened it, instead of attributing
+/// any net-new global target to whoever clicked — which under concurrent timing
+/// would let one session capture another session's freshly-opened tab.
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
     pub target_id: String,
     pub title: Option<String>,
     pub url: Option<String>,
+    pub opener_id: Option<String>,
 }
 
 /// A browser backend: owns the connection lifecycle and hands out page handles.
@@ -415,23 +423,32 @@ impl BrowserBackend for ChromiumoxideBackend {
         let browser = guard
             .as_ref()
             .ok_or_else(|| "Browser not initialized".to_string())?;
-        let pages = browser
-            .pages()
+        // Use CDP `Target.getTargets` rather than `pages()` because the raw
+        // `TargetInfo` carries `openerId` — the id of the target that spawned
+        // this one. Popup detection needs the opener to attribute a net-new tab
+        // to the SPECIFIC session whose page opened it (cross-session safety),
+        // which `pages()`/`Page` does not surface.
+        let returns = browser
+            .execute(GetTargetsParams::builder().build())
             .await
             .map_err(|e| format!("Failed to list browser tabs: {}", e))?;
-        let mut infos = Vec::with_capacity(pages.len());
-        for page in pages {
-            let target_id = page.target_id().as_ref().to_string();
-            // Title/URL are best-effort: a still-loading or detached page can
-            // error here, which must not abort the whole listing.
-            let title = page.get_title().await.ok().flatten();
-            let url = page.url().await.ok().flatten();
-            infos.push(TargetInfo {
-                target_id,
-                title,
-                url,
-            });
-        }
+        let infos = returns
+            .result
+            .target_infos
+            .into_iter()
+            // Only real page tabs — drop browser/background/service-worker etc.
+            .filter(|t| t.r#type == "page")
+            .map(|t| {
+                let title = (!t.title.is_empty()).then(|| t.title.clone());
+                let url = (!t.url.is_empty()).then(|| t.url.clone());
+                TargetInfo {
+                    target_id: String::from(t.target_id),
+                    title,
+                    url,
+                    opener_id: t.opener_id.map(String::from),
+                }
+            })
+            .collect();
         Ok(infos)
     }
 
@@ -736,15 +753,36 @@ impl MockBackend {
         Arc::clone(&self.calls)
     }
 
-    /// Script a popup target that will appear the next time `list_targets` is
-    /// called, simulating a click that opened a new tab (`target=_blank` /
-    /// `window.open`). The given `url` is used verbatim so tests can assert
-    /// origin redaction (e.g. include a path + query string).
+    /// Script a popup target revealed by the next `MockPage::click` (appended to
+    /// the live target set on click), simulating a click that opened a new tab
+    /// (`target=_blank` / `window.open`). The popup's `opener_id` is left `None`,
+    /// so callers that need it attributed to a clicking session should use
+    /// [`MockBackend::script_popup_with_opener`] with that session's active
+    /// target id. The given `url` is used verbatim so tests can assert origin
+    /// redaction (e.g. include a path + query string).
     pub async fn script_popup(&self, target_id: &str, title: &str, url: &str) {
+        self.script_popup_with_opener(target_id, title, url, None)
+            .await;
+    }
+
+    /// Like [`MockBackend::script_popup`], but sets the popup's `opener_id`.
+    ///
+    /// Pass `Some(active_target_id)` of the clicking session to model a popup
+    /// the session legitimately spawned (it should be attributed to that
+    /// session). Pass a DIFFERENT target id to model a tab opened by another
+    /// session / independently (it must NOT be attributed to the clicker).
+    pub async fn script_popup_with_opener(
+        &self,
+        target_id: &str,
+        title: &str,
+        url: &str,
+        opener_id: Option<&str>,
+    ) {
         *self.pending_popup.lock().await = Some(TargetInfo {
             target_id: target_id.to_string(),
             title: Some(title.to_string()),
             url: Some(url.to_string()),
+            opener_id: opener_id.map(|s| s.to_string()),
         });
     }
 
@@ -864,6 +902,8 @@ impl BrowserBackend for MockBackend {
             target_id: page_id.clone(),
             title: Some("mock tab".to_string()),
             url: self.url.clone(),
+            // A directly-created page has no opener (independent tab).
+            opener_id: None,
         });
         Ok((
             page_id.clone(),

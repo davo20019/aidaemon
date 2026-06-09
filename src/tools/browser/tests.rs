@@ -596,14 +596,20 @@ async fn popup_after_click_is_discoverable() {
     let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
     tool.call(&nav.to_string()).await.unwrap();
 
+    // The session's active tab is the page minted by navigate — it is the
+    // legitimate opener for a popup this session spawns.
+    let opener_id = create_page_ids(&backend).await[0].clone();
+
     // Script a popup that will appear the next time list_targets runs (i.e. the
-    // diff after the click). Give it a URL with a secret path/query to also prove
-    // redaction flows through to list_tabs.
+    // diff after the click). Its opener is the clicking session's active tab, so
+    // it is attributed to this session. Give it a URL with a secret path/query
+    // to also prove redaction flows through to list_tabs.
     backend
-        .script_popup(
+        .script_popup_with_opener(
             "popup-target-xyz",
             "Popup Page",
             "https://popup.example/oauth?code=TOPSECRET",
+            Some(&opener_id),
         )
         .await;
 
@@ -646,6 +652,63 @@ async fn popup_after_click_is_discoverable() {
     assert!(
         !active_line.contains("popup-target-xyz"),
         "popup must NOT be auto-activated: {active_line}"
+    );
+}
+
+/// Cross-session security: a net-new target whose CDP `openerId` is NOT the
+/// clicking session's active tab (it belongs to another session, or was opened
+/// independently) must NOT be attributed to the clicking session. Otherwise,
+/// under concurrent timing, session A's click could capture session B's
+/// freshly-opened tab and then read/switch its page — a cross-session leak.
+#[tokio::test]
+async fn popup_with_foreign_opener_is_not_attributed() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // Session A establishes its first tab.
+    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
+    tool.call(&nav.to_string()).await.unwrap();
+
+    // Script a net-new target whose opener is some OTHER target (not A's active
+    // tab) — modeling a tab spawned by a different session or independently.
+    backend
+        .script_popup_with_opener(
+            "foreign-target-zzz",
+            "Foreign Page",
+            "https://foreign.example/secret",
+            Some("some-other-sessions-target"),
+        )
+        .await;
+
+    // A clicks. The new target appears in the global set, but its opener is not
+    // A's active tab, so the click must NOT report a new tab.
+    let out = tool
+        .call(
+            &json!({ "action": "click", "selector": "#open", "_session_id": "sess-a" }).to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !out.contains("opened new tab") && !out.contains("foreign-target-zzz"),
+        "a foreign-opener target must not be reported as A's popup: {out}"
+    );
+    assert_eq!(
+        out, "Clicked element '#open'",
+        "click should report a plain click when no popup is attributed: {out}"
+    );
+
+    // list_tabs for session A must NOT include the foreign target — only A's
+    // original tab remains.
+    let list = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        list.contains("Open tabs (1)"),
+        "session A must still have exactly one tab: {list}"
+    );
+    assert!(
+        !list.contains("foreign-target-zzz"),
+        "the foreign-opener target must NOT be discoverable in A's session: {list}"
     );
 }
 
@@ -815,6 +878,52 @@ async fn close_tab_removes_and_reports_new_active() {
     assert!(
         !list.contains(second_id.as_str()),
         "the closed tab must be gone: {list}"
+    );
+}
+
+/// `redact_origin` must strip embedded userinfo (credentials), the path, query,
+/// and fragment — leaving only `scheme://host[:port]`. Anything in those parts
+/// can be a secret and must never reach a tab listing.
+#[test]
+fn redact_origin_strips_credentials_path_and_query() {
+    let redacted = super::redact_origin("https://user:s3cr3t@example.com/admin?token=ABC");
+
+    // The credential, query key, query value, and path must all be gone.
+    assert!(
+        !redacted.contains("s3cr3t"),
+        "embedded password must be stripped: {redacted}"
+    );
+    assert!(
+        !redacted.contains("user"),
+        "embedded username must be stripped: {redacted}"
+    );
+    assert!(
+        !redacted.contains("token"),
+        "query key must be stripped: {redacted}"
+    );
+    assert!(
+        !redacted.contains("ABC"),
+        "query value must be stripped: {redacted}"
+    );
+    assert!(
+        !redacted.contains("/admin"),
+        "path must be stripped: {redacted}"
+    );
+    // The host must survive so the listing stays useful.
+    assert!(
+        redacted.contains("example.com"),
+        "host must be preserved: {redacted}"
+    );
+    assert_eq!(
+        redacted, "https://example.com",
+        "exact origin must be scheme://host with nothing else: {redacted}"
+    );
+
+    // Schemeless host/path: the path must still be stripped.
+    let schemeless = super::redact_origin("host.com/path?x=secret");
+    assert_eq!(
+        schemeless, "host.com",
+        "schemeless input must strip path/query: {schemeless}"
     );
 }
 

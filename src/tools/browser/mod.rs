@@ -21,15 +21,18 @@ use session::{BrowserSessionRegistry, TabView};
 
 use tokio::sync::OwnedMutexGuard;
 
-/// Reduce a full URL to its origin (`scheme://host[:port]`), dropping path,
-/// query, and fragment — these can carry secrets (session tokens, reset codes)
-/// and must never be surfaced in a tab listing.
+/// Reduce a full URL to its origin (`scheme://host[:port]`), dropping any
+/// userinfo, path, query, and fragment — all of which can carry secrets
+/// (credentials, session tokens, reset codes) and must never be surfaced in a
+/// tab listing.
 ///
-/// Parsing is deliberately dependency-free string surgery: take everything
-/// before the first `/`, `?`, or `#` that follows the `scheme://` authority.
-/// Inputs that don't look like `scheme://host` (e.g. `about:blank`, an empty
-/// string) are returned trimmed of any path/query/fragment but otherwise
-/// unchanged, since there is no origin to extract.
+/// Parsing is deliberately dependency-free string surgery:
+/// - For a `scheme://...` URL, take the authority (everything before the first
+///   `/`, `?`, or `#`), then drop any `userinfo@` prefix, keeping only the
+///   `host[:port]`. So `https://user:pass@host/p?x=secret` → `https://host`.
+/// - For inputs without a `scheme://authority` form (e.g. `about:blank`,
+///   `data:`, or a schemeless `host.com/path?x=secret`), cut at the first `/`,
+///   `?`, or `#`, stripping any path/query/fragment so none of it can leak.
 fn redact_origin(url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
@@ -43,16 +46,19 @@ fn redact_origin(url: &str) -> String {
         let authority_len = authority_and_rest
             .find(['/', '?', '#'])
             .unwrap_or(authority_and_rest.len());
-        return format!(
-            "{}://{}",
-            &url[..scheme_end],
-            &authority_and_rest[..authority_len]
-        );
+        let authority = &authority_and_rest[..authority_len];
+        // Drop any `userinfo@` prefix so embedded credentials never survive:
+        // keep only the host[:port] after the LAST '@'.
+        let host = match authority.rfind('@') {
+            Some(at) => &authority[at + 1..],
+            None => authority,
+        };
+        return format!("{}://{}", &url[..scheme_end], host);
     }
-    // No scheme://authority form (e.g. about:blank, data:, mailto:). Strip any
-    // path/query/fragment after a scheme that uses a single ':' opaque part by
-    // cutting at the first '?', '#', or '/'.
-    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    // No scheme://authority form (e.g. about:blank, data:, mailto:, or a
+    // schemeless host/path). Strip any path/query/fragment by cutting at the
+    // first '/', '?', or '#' so no path can leak.
+    let cut = url.find(['/', '?', '#']).unwrap_or(url.len());
     url[..cut].to_string()
 }
 
@@ -188,10 +194,12 @@ impl BrowserTool {
         // Resolve the session's (active) page FIRST so that creating a session's
         // first page does not itself look like a popup. Then snapshot the
         // browser's live targets BEFORE the click so we can detect a popup
-        // (target=_blank / window.open) the click may spawn. We diff against the
-        // GLOBAL target set (not just this session's tabs) so a tab another
-        // session happens to own is never misattributed as our popup.
+        // (target=_blank / window.open) the click may spawn.
         let (page, _guard) = self.page_for(session_id).await?;
+
+        // The clicking session's active target id — the ONLY legitimate opener
+        // for a popup we should attribute to this session.
+        let clicker_target_id = self.sessions.active_target_id(session_id).await;
 
         let known_before: Vec<String> = self
             .backend
@@ -206,13 +214,15 @@ impl BrowserTool {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Popup detection: diff the live targets against what the session knew
-        // before. Any brand-new target is registered as a tab in this session so
-        // it is discoverable/switchable — a target=_blank click never silently
-        // leaves later actions stranded on the old implicit page. The new tab is
-        // NOT auto-activated (the plan does not require it); the current tab
-        // stays active unless the caller explicitly switches.
+        // before. A brand-new target is registered as a tab in this session
+        // ONLY when its CDP `openerId` is this session's active page — so a
+        // target=_blank click never silently leaves later actions stranded on
+        // the old implicit page, yet a tab opened by a DIFFERENT session (or
+        // independently) is never misattributed to us. The new tab is NOT
+        // auto-activated; the current tab stays active unless the caller
+        // explicitly switches.
         let new_tab_id = self
-            .detect_and_register_popup(session_id, &known_before)
+            .detect_and_register_popup(session_id, &known_before, clicker_target_id.as_deref())
             .await;
 
         match new_tab_id {
@@ -225,21 +235,39 @@ impl BrowserTool {
     }
 
     /// After an action that may spawn a popup, diff the browser's live targets
-    /// against `known_before`. Register the FIRST new target as a tab in the
-    /// session (not active) and return its opaque tab id. Returns `None` when no
-    /// new target appeared or the diff couldn't be computed.
+    /// against `known_before`. Register the FIRST net-new target whose CDP
+    /// `openerId` equals `clicker_target_id` (the clicking session's active
+    /// page) as a tab in the session (not active) and return its opaque tab id.
+    ///
+    /// A net-new target with a DIFFERENT opener — or no opener — is NOT
+    /// attributed to this session: under concurrent timing it belongs to
+    /// another session or was opened independently, and binding it here would be
+    /// a cross-session info leak (the clicker could then switch/read its page).
+    /// Returns `None` when no eligible new target appeared, when this session
+    /// has no resolvable active target, or when the diff couldn't be computed.
     async fn detect_and_register_popup(
         &self,
         session_id: &str,
         known_before: &[String],
+        clicker_target_id: Option<&str>,
     ) -> Option<String> {
+        // Without a known active target for the clicker, we cannot prove a
+        // popup's opener belongs to this session — refuse to attribute anything.
+        let clicker_target_id = clicker_target_id?;
+
         let targets = self.backend.list_targets().await.ok()?;
         for t in targets {
             if known_before.iter().any(|k| k == &t.target_id) {
                 continue;
             }
-            // A target unknown to this session appeared. Bind a page handle to it
-            // so the session can operate on it later, then register it.
+            // Only attribute a net-new target whose opener is THIS session's
+            // active page. Any other opener (a different session's tab) or no
+            // opener at all is rejected — never bound into this session.
+            if t.opener_id.as_deref() != Some(clicker_target_id) {
+                continue;
+            }
+            // The popup is ours. Bind a page handle to it so the session can
+            // operate on it later, then register it.
             let page = self.backend.page_for_target(&t.target_id).await.ok()?;
             let registered = self
                 .sessions

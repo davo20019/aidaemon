@@ -278,6 +278,25 @@ impl BrowserSessionRegistry {
         Ok((removed.target_id, new_active))
     }
 
+    /// The `target_id` of this session's ACTIVE tab, if the session exists and
+    /// currently has an active tab. Used by popup detection to attribute a
+    /// net-new target only when its CDP `openerId` matches the clicking
+    /// session's active page (cross-session safety).
+    pub async fn active_target_id(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        let state = sessions.get(session_id)?;
+        let active = &state.active_target_id;
+        if active.is_empty() {
+            return None;
+        }
+        // Only report it when it actually references one of the session's tabs.
+        state
+            .tabs
+            .iter()
+            .find(|t| &t.target_id == active)
+            .map(|t| t.target_id.clone())
+    }
+
     /// Snapshot of this session's tabs for `list_tabs`. Empty if the session is
     /// unknown or has no tabs.
     pub async fn list_tabs(&self, session_id: &str) -> Vec<TabView> {
