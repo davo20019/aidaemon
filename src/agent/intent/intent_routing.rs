@@ -359,6 +359,7 @@ pub(super) fn is_internal_maintenance_intent(user_text: &str) -> bool {
 }
 
 pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
+    let user_text = crate::channels::attachments::user_authored_text(user_text);
     // Deterministic tool-need overrides:
     // 1) explicit filesystem paths
     // 2) explicit local-environment execution/inspection requests
@@ -369,10 +370,10 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     //
     // These requests cannot be satisfied by a text-only first-pass response and
     // must run through the tool loop, regardless of model intent-gate output.
-    if super::user_text_references_filesystem_path(user_text)
-        || user_text_requires_local_tool_execution(user_text)
-        || user_text_requests_auth_or_integration_management(user_text)
-        || classify_connected_api_intent(user_text).is_some()
+    if super::user_text_references_filesystem_path(&user_text)
+        || user_text_requires_local_tool_execution(&user_text)
+        || user_text_requests_auth_or_integration_management(&user_text)
+        || classify_connected_api_intent(&user_text).is_some()
     {
         return IntentGateDecision {
             can_answer_now: Some(false),
@@ -1307,6 +1308,42 @@ mod intent_routing_path_override_tests {
     #[test]
     fn infer_intent_gate_forces_tools_for_unix_paths() {
         let d = infer_intent_gate("/Users/alice/project/file.txt", "");
+        assert_eq!(d.needs_tools, Some(true));
+    }
+
+    #[test]
+    fn infer_intent_gate_ignores_paths_in_channel_file_stub() {
+        use crate::channels::attachments::format_file_stub;
+
+        let stub = format_file_stub(
+            "photo.jpg",
+            221 * 1024,
+            "image/jpeg",
+            std::path::Path::new("/Users/alice/.aidaemon/files/inbox/photo.jpg"),
+        );
+        let d = infer_intent_gate(&stub, "");
+        assert_ne!(
+            d.needs_tools,
+            Some(true),
+            "channel file stub paths must not force tools, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn infer_intent_gate_forces_tools_for_user_path_with_attachment_stub() {
+        use std::path::PathBuf;
+
+        use crate::channels::attachments::{build_inbound_text, message_attachment};
+
+        let attachments = vec![message_attachment(
+            PathBuf::from("/tmp/inbox/doc.pdf"),
+            "doc.pdf".to_string(),
+            "application/pdf".to_string(),
+            100,
+        )];
+        let inbound = build_inbound_text("Please read ~/project/Cargo.toml", &attachments);
+        let d = infer_intent_gate(&inbound, "");
         assert_eq!(d.needs_tools, Some(true));
     }
 

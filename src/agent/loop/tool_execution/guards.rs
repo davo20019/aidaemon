@@ -64,6 +64,11 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
             repetitive_count,
             "Redirecting repetitive tool call — coaching agent to adapt"
         );
+        if agent.harness_eval_enabled() {
+            agent
+                .with_harness_eval(|eval| eval.record_repetition_guard())
+                .await;
+        }
         agent
             .emit_warning_decision_point(
                 emitter,
@@ -164,6 +169,14 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
             repetitive_count,
             "Repetitive tool call detected - agent may be stuck"
         );
+        if agent.harness_eval_enabled() {
+            agent
+                .with_harness_eval(|eval| {
+                    eval.record_repetition_guard();
+                    eval.record_stop_reason(StopReason::Stall);
+                })
+                .await;
+        }
         // Wrap the entire graceful shutdown in a timeout to prevent
         // indefinite hangs from SQLite pool exhaustion or deadlocks.
         let graceful_fut = async {

@@ -2100,6 +2100,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t1"),
         )
@@ -2119,6 +2120,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t2"),
         )
@@ -2217,6 +2219,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t1"),
         )
@@ -2327,6 +2330,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t-replay"),
         )
@@ -2430,6 +2434,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t1"),
         )
@@ -2486,6 +2491,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t-ctx"),
         )
@@ -2546,6 +2552,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("t1"),
         )
@@ -2708,6 +2715,7 @@ mod tests {
                 summary: Some("Recovered from checkpoint after interruption".to_string()),
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("parent-1"),
         )
@@ -2743,6 +2751,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                harness_eval: None,
             },
             Some("child-1"),
         )

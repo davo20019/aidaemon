@@ -475,6 +475,7 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
     //
     // This intentionally avoids broad `text.contains('/')` checks which misfire on fractions/dates
     // (e.g. "3/4", "2/14") and common shorthand like "yes/no" or "w/o".
+    let user_text = crate::channels::attachments::user_authored_text(user_text);
     if user_text.trim().is_empty() {
         return false;
     }
@@ -489,7 +490,7 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
         "include", "cmd", "internal", "docs",
     ];
 
-    for raw in user_text.split_whitespace() {
+    for raw in user_text.as_str().split_whitespace() {
         let token = raw.trim_matches(|c: char| c.is_ascii_punctuation());
         if token.is_empty() {
             continue;

@@ -835,8 +835,7 @@ pub(super) async fn run_message_build_phase(
         // Locate the current-turn region: from the current user message (last
         // occurrence matching `user_text`) to the end of `messages`. Archived
         // turns precede it and are left untouched.
-        let current_region_idx =
-            find_current_user_position(&messages, user_text).unwrap_or(0);
+        let current_region_idx = find_current_user_position(&messages, user_text).unwrap_or(0);
         let archived_prefix: Vec<Value> = messages[..current_region_idx].to_vec();
         let current_region: Vec<Value> = messages[current_region_idx..].to_vec();
         // The archived prefix already consumed `archived_budget`; the current
@@ -992,9 +991,8 @@ pub(super) async fn run_message_build_phase(
         if non_system_non_user_count == 0 {
             messages.retain(|m| {
                 m.get("role").and_then(|r| r.as_str()) != Some("user")
-                    || m.get("content").is_some_and(|content| {
-                        user_message_content_matches(content, user_text)
-                    })
+                    || m.get("content")
+                        .is_some_and(|content| user_message_content_matches(content, user_text))
             });
             pending_system_messages.push(SystemDirective::FreshConversationContext);
         }
@@ -2881,9 +2879,8 @@ mod tests {
         assert_eq!(non_system_non_user_count, 0);
         messages.retain(|m| {
             m.get("role").and_then(|r| r.as_str()) != Some("user")
-                || m.get("content").is_some_and(|content| {
-                    user_message_content_matches(content, user_text)
-                })
+                || m.get("content")
+                    .is_some_and(|content| user_message_content_matches(content, user_text))
         });
         assert_eq!(messages.len(), 2);
         assert!(

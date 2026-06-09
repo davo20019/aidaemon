@@ -562,6 +562,9 @@ pub struct TaskEndData {
     /// For recovery TaskEnd this is the interrupted task's ORIGINAL turn_id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Per-task harness effectiveness snapshot (routing, progress, quality, cost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_eval: Option<HarnessEvalSnapshot>,
 }
 
 impl TaskEndData {
@@ -598,6 +601,112 @@ pub struct TaskEfficiencyData {
     pub final_model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
+}
+
+// =============================================================================
+// Harness evaluation (effectiveness snapshot on TaskEnd)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessEvalSnapshot {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    pub completion_task_kind: String,
+    pub orchestration_route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_mode: Option<String>,
+    pub routing: RoutingEvalPayload,
+    pub progress: ProgressEvalPayload,
+    pub quality: QualityEvalPayload,
+    pub cost: CostEvalPayload,
+    pub scores: HarnessScoresPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessScoresPayload {
+    pub routing_accuracy: f32,
+    pub progress_yield: f32,
+    pub contract_fulfillment: f32,
+    pub cost_efficiency: f32,
+    pub overall: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingEvalPayload {
+    pub orchestration_route: String,
+    pub tools_required_predicted: bool,
+    pub tools_actually_used: bool,
+    pub direct_return_attempted: bool,
+    pub route_drift_failsafe: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills_activated: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_profile: Option<String>,
+    #[serde(default)]
+    pub model_escalated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressEvalPayload {
+    pub iterations: u32,
+    pub tool_calls_attempted: u32,
+    pub tool_calls_succeeded: u32,
+    pub evidence_gain_total: u32,
+    pub no_progress_iterations: u32,
+    pub stall_guard_fires: u32,
+    pub repetition_guard_fires: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_steps_completed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_steps_total: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityEvalPayload {
+    pub outcome: String,
+    pub stop_reason: String,
+    pub contract: ContractFulfillmentPayload,
+    pub post_exec_validation_failures: u32,
+    pub unrecovered_errors: u32,
+    #[serde(default)]
+    pub approval_denied: bool,
+    #[serde(default)]
+    pub contract_fulfilled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractFulfillmentPayload {
+    pub expects_mutation: bool,
+    pub mutation_count: u32,
+    pub requires_observation: bool,
+    pub observation_count: u32,
+    pub verification_required: bool,
+    pub verification_count: u32,
+    pub verification_blocks: u32,
+    #[serde(default)]
+    pub fulfilled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostEvalPayload {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub weighted_tokens: u64,
+    pub llm_calls: u32,
+    pub fell_back_count: u32,
+    #[serde(default)]
+    pub sub_agent_weighted_tokens: u64,
+    #[serde(default)]
+    pub sub_agent_spawn_count: u32,
+    #[serde(default)]
+    pub sub_agent_failures: u32,
+    #[serde(default)]
+    pub tokens_failed_waste: bool,
 }
 
 // =============================================================================
@@ -984,6 +1093,7 @@ mod tests {
         .expect("deserialize minimal TaskEndData");
 
         assert!(data.efficiency.is_none());
+        assert!(data.harness_eval.is_none());
         assert!(data.outcome.is_none());
         assert_eq!(data.effective_outcome(), TaskOutcome::Succeeded);
     }
@@ -1062,6 +1172,7 @@ mod tests {
                 reasons: vec!["1 fallback(s)".to_string()],
             }),
             turn_id: None,
+            harness_eval: None,
         };
 
         let json = serde_json::to_value(&data).expect("serialize");
@@ -1171,6 +1282,7 @@ mod tests {
             summary: None,
             efficiency: None,
             turn_id: Some("t1".to_string()),
+            harness_eval: None,
         };
         let back: TaskEndData = serde_json::from_value(serde_json::to_value(&te).unwrap()).unwrap();
         assert_eq!(back.turn_id.as_deref(), Some("t1"));

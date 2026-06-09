@@ -943,6 +943,19 @@ impl Agent {
         summary: Option<String>,
     ) {
         let efficiency = self.task_efficiency_data(task_id).await;
+        let harness_eval_snapshot = if self.harness_eval_config.enabled {
+            let acc = self.harness_eval.write().await.take();
+            acc.map(|accumulator| {
+                accumulator.finalize(
+                    outcome,
+                    iteration as u32,
+                    tool_calls_count as u32,
+                    efficiency.as_ref(),
+                )
+            })
+        } else {
+            None
+        };
         // Stamp the active turn so the normal TaskEnd carries turn identity
         // (recovery TaskEnd uses the checkpoint's original turn_id instead).
         let turn_id = self
@@ -965,6 +978,7 @@ impl Agent {
                     summary,
                     efficiency,
                     turn_id,
+                    harness_eval: harness_eval_snapshot,
                 },
             )
             .await;

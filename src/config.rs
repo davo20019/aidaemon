@@ -2469,6 +2469,90 @@ pub struct DiagnosticsConfig {
     pub max_events: usize,
     #[serde(default)]
     pub include_raw_tool_args: bool,
+    #[serde(default)]
+    pub harness_eval: DiagnosticsHarnessEvalConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // warn_* thresholds used in Phase C diagnose/db_probe
+pub struct DiagnosticsHarnessEvalConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub persist_on_task_end: bool,
+    #[serde(default)]
+    pub emit_separate_event: bool,
+    #[serde(default = "default_harness_weight_routing")]
+    pub weight_routing: f32,
+    #[serde(default = "default_harness_weight_progress")]
+    pub weight_progress: f32,
+    #[serde(default = "default_harness_weight_quality")]
+    pub weight_quality: f32,
+    #[serde(default = "default_harness_weight_cost")]
+    pub weight_cost: f32,
+    #[serde(default = "default_harness_cost_tier_cheap")]
+    pub cost_tier_cheap: f32,
+    #[serde(default = "default_harness_cost_tier_balanced")]
+    pub cost_tier_balanced: f32,
+    #[serde(default = "default_harness_cost_tier_strong")]
+    pub cost_tier_strong: f32,
+    #[serde(default = "default_harness_cost_tier_unknown")]
+    pub cost_tier_unknown: f32,
+    #[serde(default = "default_harness_warn_overall")]
+    pub warn_overall_below: f32,
+    #[serde(default = "default_harness_warn_routing")]
+    pub warn_routing_below: f32,
+}
+
+impl Default for DiagnosticsHarnessEvalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            persist_on_task_end: true,
+            emit_separate_event: false,
+            weight_routing: default_harness_weight_routing(),
+            weight_progress: default_harness_weight_progress(),
+            weight_quality: default_harness_weight_quality(),
+            weight_cost: default_harness_weight_cost(),
+            cost_tier_cheap: default_harness_cost_tier_cheap(),
+            cost_tier_balanced: default_harness_cost_tier_balanced(),
+            cost_tier_strong: default_harness_cost_tier_strong(),
+            cost_tier_unknown: default_harness_cost_tier_unknown(),
+            warn_overall_below: default_harness_warn_overall(),
+            warn_routing_below: default_harness_warn_routing(),
+        }
+    }
+}
+
+fn default_harness_weight_routing() -> f32 {
+    0.30
+}
+fn default_harness_weight_progress() -> f32 {
+    0.25
+}
+fn default_harness_weight_quality() -> f32 {
+    0.30
+}
+fn default_harness_weight_cost() -> f32 {
+    0.15
+}
+fn default_harness_cost_tier_cheap() -> f32 {
+    1.0
+}
+fn default_harness_cost_tier_balanced() -> f32 {
+    2.5
+}
+fn default_harness_cost_tier_strong() -> f32 {
+    5.0
+}
+fn default_harness_cost_tier_unknown() -> f32 {
+    3.0
+}
+fn default_harness_warn_overall() -> f32 {
+    0.6
+}
+fn default_harness_warn_routing() -> f32 {
+    0.7
 }
 
 impl Default for DiagnosticsConfig {
@@ -2478,6 +2562,7 @@ impl Default for DiagnosticsConfig {
             record_decision_points: true,
             max_events: default_diagnostics_max_events(),
             include_raw_tool_args: false,
+            harness_eval: DiagnosticsHarnessEvalConfig::default(),
         }
     }
 }

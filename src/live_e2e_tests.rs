@@ -148,6 +148,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
+        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -340,6 +341,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
+        (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 
     let channel = Arc::new(TestChannel::new());

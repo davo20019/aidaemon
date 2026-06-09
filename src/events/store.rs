@@ -988,6 +988,7 @@ impl EventStore {
                     // Watchdog-synthesized TaskEnd has no in-process turn
                     // context; legacy/unscoped => None.
                     turn_id: None,
+                    harness_eval: None,
                 })?,
             );
             self.append(event).await?;
@@ -1732,6 +1733,7 @@ mod tests {
             summary: summary.map(str::to_string),
             efficiency: None,
             turn_id: None,
+            harness_eval: None,
         };
         append_event_at(
             store,

@@ -83,11 +83,40 @@ pub(in crate::agent) async fn run_orchestration_phase(
 ) -> anyhow::Result<Option<ResponsePhaseOutcome>> {
     let agent = services.agent;
     if let Some(outcome) = super::routes::maybe_handle_generic_cancel_request(agent, ctx).await? {
+        record_orchestration_direct_return(agent, &outcome).await;
         return Ok(Some(outcome));
     }
 
     // Orchestration routing (always-on).
     let (complexity, _) = classify_intent_complexity(ctx.user_text, ctx.intent_gate);
+    let (route, tools_required) = orchestration_route_label(&complexity);
+    if agent.harness_eval_enabled() {
+        agent
+            .with_harness_eval(|eval| eval.record_orchestration_route(route, tools_required))
+            .await;
+    }
     let outcome = super::routes::route_orchestration_complexity(agent, ctx, complexity).await?;
+    record_orchestration_direct_return(agent, &outcome).await;
     Ok(Some(outcome))
+}
+
+fn orchestration_route_label(complexity: &IntentComplexity) -> (&'static str, bool) {
+    match complexity {
+        IntentComplexity::ScheduledMissingTiming => ("clarification_required", false),
+        IntentComplexity::Scheduled { .. } => ("direct_reply", false),
+        IntentComplexity::Knowledge => ("default_continue", false),
+        IntentComplexity::Simple => ("default_continue", false),
+        IntentComplexity::Complex => ("tools_required", true),
+    }
+}
+
+async fn record_orchestration_direct_return(agent: &Agent, outcome: &ResponsePhaseOutcome) {
+    if !agent.harness_eval_enabled() {
+        return;
+    }
+    if let ResponsePhaseOutcome::Return(result) = outcome {
+        agent
+            .with_harness_eval(|eval| eval.record_direct_return(true, result.is_ok()))
+            .await;
+    }
 }

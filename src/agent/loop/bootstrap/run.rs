@@ -113,7 +113,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         importance: 0.5, // Will be updated by score_message below
         turn_id: Some(user_msg_id.clone()),
         attachments: ctx.attachments.to_vec(),
-        ..Message::new_runtime(user_msg_id, session_id, "user")
+        ..Message::new_runtime(user_msg_id.clone(), session_id, "user")
     };
     // Calculate heuristic score immediately
     let score = crate::memory::scoring::score_message(&user_msg);
@@ -615,6 +615,22 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // split is removed — the whole-turn anchor is the single retention
     // mechanism, so this bootstrap no longer pre-loads or pins history.
 
+    let mut harness_eval = HarnessEvalAccumulator::new(HarnessEvalSeed {
+        task_id: task_id.clone(),
+        turn_id: Some(user_msg_id.clone()),
+        depth: agent.depth as u32,
+        parent_task_id: agent.task_id.clone(),
+        completion_task_kind: "conversational".to_string(),
+        followup_mode: None,
+        config: agent.harness_eval_config.clone(),
+    });
+    harness_eval.record_bootstrap(
+        "default_continue",
+        active_skill_names.clone(),
+        Some(policy_bundle.policy.model_profile),
+        route_failsafe_active,
+    );
+
     let data = BootstrapData {
         task_id,
         emitter,
@@ -639,6 +655,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         core_prompt_bytes,
         task_context_tail,
         session_summary,
+        harness_eval,
     };
 
     Ok(BootstrapOutcome::Continue(Box::new(data)))

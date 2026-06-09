@@ -238,6 +238,46 @@ async fn test_llm_call_event_emitted_with_telemetry() {
 }
 
 #[tokio::test]
+async fn test_harness_eval_snapshot_on_task_end() {
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "harness_eval_session",
+            "Hello there",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let event_store = crate::events::EventStore::new(harness.state.pool())
+        .await
+        .expect("event store from harness pool");
+    let events = event_store
+        .query_recent_events("harness_eval_session", 50)
+        .await
+        .expect("recent events");
+    let task_end = events
+        .iter()
+        .find(|event| event.event_type == crate::events::EventType::TaskEnd)
+        .expect("task_end event");
+    let data = task_end
+        .parse_data::<crate::events::TaskEndData>()
+        .expect("task end payload");
+    let eval = data
+        .harness_eval
+        .as_ref()
+        .expect("harness_eval snapshot on TaskEnd");
+    assert_eq!(eval.scores.overall, eval.scores.overall.clamp(0.0, 1.0));
+    assert!(eval.scores.routing_accuracy >= 0.0);
+    assert!(eval.completion_task_kind.contains("conversational"));
+}
+
+#[tokio::test]
 async fn test_memory_persistence() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 

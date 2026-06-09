@@ -46,4 +46,5 @@ pub(in crate::agent) struct BootstrapData {
     /// the boundary − 1 position (immediately before the current user message).
     pub task_context_tail: String,
     pub session_summary: Option<ConversationSummary>,
+    pub harness_eval: HarnessEvalAccumulator,
 }

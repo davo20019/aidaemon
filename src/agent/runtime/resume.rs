@@ -214,6 +214,7 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
                 // current_turn_ids (which points at the new resume turn).
                 // Legacy (TaskStart.turn_id == None) => None here.
                 turn_id: checkpoint.turn_id.clone(),
+                harness_eval: None,
             },
         )
         .await;

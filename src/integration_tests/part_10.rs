@@ -1288,3 +1288,59 @@ async fn test_vision_attachment_still_triggers_compaction() {
         "expected compaction summary in an LLM call"
     );
 }
+
+/// Photo/document uploads without a caption must not inherit tool requirements from
+/// the channel-injected inbox path in the file stub metadata.
+#[tokio::test]
+async fn test_attachment_stub_metadata_does_not_force_tool_required_loop() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+    use crate::traits::ToolChoiceMode;
+
+    let mut png = tempfile::NamedTempFile::new().unwrap();
+    png.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+        .unwrap();
+
+    let attachment = message_attachment(
+        png.path().to_path_buf(),
+        "photo.jpg".to_string(),
+        "image/jpeg".to_string(),
+        9,
+    );
+    let inbound_text = build_inbound_text("", &[attachment.clone()]);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "This image looks like a small PNG file.",
+    )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message_with_attachments(
+            "attachment_stub_intent_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        reply.contains("PNG") || reply.contains("image"),
+        "expected vision/text reply, got: {reply}"
+    );
+
+    let call_log = harness.provider.call_log.lock().await;
+    let forced_tool_calls = call_log
+        .iter()
+        .filter(|call| call.options.tool_choice == ToolChoiceMode::Required)
+        .count();
+    assert_eq!(
+        forced_tool_calls, 0,
+        "stub inbox path must not trigger tool_choice=Required recovery loop"
+    );
+}

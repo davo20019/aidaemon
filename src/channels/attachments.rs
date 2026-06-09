@@ -25,6 +25,43 @@ pub fn format_file_stub(
     )
 }
 
+/// Prefix for channel-injected file metadata blocks (`format_file_stub`).
+pub const INBOUND_FILE_STUB_PREFIX: &str = "[File received:";
+
+/// Remove channel-injected `[File received: ...]` blocks from inbound message text.
+///
+/// Channels prepend these stubs so the LLM knows a file was saved, but paths
+/// inside them must not drive intent heuristics (`needs_tools`, project scope,
+/// completion contract) — the user did not type them.
+pub fn strip_inbound_file_stubs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(rel) = text[cursor..].find(INBOUND_FILE_STUB_PREFIX) else {
+            out.push_str(&text[cursor..]);
+            break;
+        };
+        let start = cursor + rel;
+        out.push_str(&text[cursor..start]);
+        let Some(close_rel) = text[start..].find(']') else {
+            out.push_str(&text[start..]);
+            break;
+        };
+        cursor = start + close_rel + 1;
+        if text[cursor..].starts_with("\r\n") {
+            cursor += 2;
+        } else if text[cursor..].starts_with('\n') {
+            cursor += 1;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// User-typed caption/body only — excludes channel file metadata stubs.
+pub fn user_authored_text(inbound_text: &str) -> String {
+    strip_inbound_file_stubs(inbound_text)
+}
+
 /// Build the user-visible text from optional caption/body plus file stubs.
 pub fn build_inbound_text(user_text: &str, attachments: &[MessageAttachment]) -> String {
     let stubs: Vec<String> = attachments
@@ -118,5 +155,50 @@ mod tests {
         let text = build_inbound_text("what is this?", &attachments);
         assert!(text.contains("[File received: a.png"));
         assert!(text.ends_with("what is this?"));
+    }
+
+    #[test]
+    fn strip_inbound_file_stubs_removes_metadata_paths() {
+        let stub = format_file_stub(
+            "photo.jpg",
+            221 * 1024,
+            "image/jpeg",
+            Path::new("/Users/alice/.aidaemon/files/inbox/photo.jpg"),
+        );
+        assert_eq!(strip_inbound_file_stubs(&stub), "");
+        assert_eq!(user_authored_text(&stub), "");
+    }
+
+    #[test]
+    fn strip_inbound_file_stubs_preserves_user_caption() {
+        let attachments = vec![message_attachment(
+            PathBuf::from("/tmp/a.png"),
+            "a.png".to_string(),
+            "image/png".to_string(),
+            100,
+        )];
+        let inbound = build_inbound_text("what is this?", &attachments);
+        assert_eq!(user_authored_text(&inbound), "what is this?");
+    }
+
+    #[test]
+    fn strip_inbound_file_stubs_preserves_user_paths_in_caption() {
+        let attachments = vec![message_attachment(
+            PathBuf::from("/tmp/inbox/doc.pdf"),
+            "doc.pdf".to_string(),
+            "application/pdf".to_string(),
+            100,
+        )];
+        let inbound = build_inbound_text("Please check ~/project/Cargo.toml", &attachments);
+        assert_eq!(
+            user_authored_text(&inbound),
+            "Please check ~/project/Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn strip_inbound_file_stubs_leaves_plain_text_untouched() {
+        let text = "Please check ~/project/Cargo.toml";
+        assert_eq!(strip_inbound_file_stubs(text), text);
     }
 }

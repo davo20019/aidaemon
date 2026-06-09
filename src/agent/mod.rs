@@ -222,6 +222,7 @@ mod compaction;
 #[path = "runtime/llm.rs"]
 mod llm;
 pub(in crate::agent) use llm::LlmCallTelemetry;
+pub(in crate::agent) mod eval;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
 #[path = "loop/main_loop.rs"]
@@ -268,7 +269,9 @@ pub(crate) mod turn_render;
 pub(crate) mod turn_render_cache;
 pub(crate) mod vision;
 
-pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
+pub(in crate::agent) use eval::{
+    HarnessEvalAccumulator, HarnessEvalConfig, HarnessEvalSeed, StopReason,
+};
 use system_prompt::format_goal_context;
 pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 
@@ -444,7 +447,13 @@ pub struct Agent {
     session_core_profile_ids: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>>,
     /// Vision/image encoding settings for multimodal LLM requests.
     vision_config: VisionConfig,
+    /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
+    harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
+    /// Harness eval scoring configuration.
+    harness_eval_config: HarnessEvalConfig,
 }
+
+pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 
 struct AgentLimits {
     max_depth: usize,
@@ -527,6 +536,21 @@ impl Agent {
         turn_render::RenderOptions {
             vision: self.vision_config.clone(),
         }
+    }
+
+    pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
+        *self.harness_eval.write().await = Some(accumulator);
+    }
+
+    pub(in crate::agent) async fn with_harness_eval<R>(
+        &self,
+        f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
+    ) -> Option<R> {
+        self.harness_eval.write().await.as_mut().map(f)
+    }
+
+    pub(in crate::agent) fn harness_eval_enabled(&self) -> bool {
+        self.harness_eval_config.enabled
     }
 
     /// Maximum recursion depth allowed.

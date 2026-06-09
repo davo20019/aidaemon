@@ -183,6 +183,7 @@ impl Agent {
             core_prompt_bytes,
             task_context_tail,
             mut session_summary,
+            mut harness_eval,
         } = match bootstrap_outcome {
             BootstrapOutcome::Return(result) => return result,
             BootstrapOutcome::Continue(data) => *data,
@@ -222,6 +223,16 @@ impl Agent {
             user_text.to_string()
         };
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
+        harness_eval.set_completion_context(
+            format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
+            turn_context
+                .followup_mode
+                .map(|mode| mode.as_str().to_string()),
+        );
+        harness_eval.record_completion_contract(&turn_context.completion_contract);
+        if self.harness_eval_enabled() {
+            self.install_harness_eval(harness_eval).await;
+        }
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
         #[cfg(test)]
@@ -663,11 +674,24 @@ impl Agent {
         loop {
             let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
+            self.with_harness_eval(|eval| {
+                eval.record_completion_progress(&completion_progress);
+                eval.record_iteration_progress(
+                    iteration as u32,
+                    turn_state.counters.total_tool_calls_attempted() as u32,
+                    turn_state.counters.total_successful_tool_calls() as u32,
+                    turn_state.evidence.evidence_gain_count() as u32,
+                    false,
+                );
+            })
+            .await;
 
             // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {
                 if ct.is_cancelled() {
                     info!(session_id, iteration, "Task cancelled by parent");
+                    self.with_harness_eval(|eval| eval.record_stop_reason(StopReason::Cancelled))
+                        .await;
                     self.emit_decision_point(
                         &emitter,
                         &task_id,

@@ -196,28 +196,33 @@ impl Agent {
         session_id: &str,
         user_text: &str,
     ) -> TurnContext {
-        let current = user_text.trim();
-        if current.is_empty() {
+        let stored_current = user_text.trim();
+        if stored_current.is_empty() {
             return TurnContext::default();
         }
-
+        let authored_current = crate::channels::attachments::user_authored_text(stored_current);
+        // History rows include channel file stubs; match on the full stored text.
         let history = self
             .state
             .get_history(session_id, GOAL_CONTEXT_HINT_HISTORY_LIMIT)
             .await
             .unwrap_or_default();
-        let (prev_assistant, prev_user) = find_previous_turns(&history, current);
+        let (prev_assistant, prev_user) = find_previous_turns(&history, stored_current);
         let (mut followup_mode, mut reasons) =
-            classify_followup_mode(current, prev_assistant.as_deref());
+            classify_followup_mode(stored_current, prev_assistant.as_deref());
 
-        let mut goal_user_text = current.to_string();
+        let mut goal_user_text = if authored_current.is_empty() {
+            String::new()
+        } else {
+            authored_current.clone()
+        };
         // Mismatch preflight: still used for project scope divergence detection
         // (affects scope extraction below), but no longer gates goal_user_text enrichment.
         if followup_mode != FollowupMode::NewTask {
             let mismatch_preflight_drop = prev_user.as_deref().is_some_and(|prev| {
                 has_project_scope_divergence_with_aliases(
                     prev,
-                    current,
+                    &authored_current,
                     &self.path_aliases.projects,
                 )
             });
@@ -240,13 +245,17 @@ impl Agent {
         // are useless for planning.
         if let Some(prev_user_text) = prev_user
             .as_deref()
-            .filter(|prev| !prev.trim().eq_ignore_ascii_case(current))
+            .filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
         {
             let mut combined = String::new();
             combined.push_str("Original request:\n");
             combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
             combined.push_str("\n\nCurrent request:\n");
-            combined.push_str(current);
+            combined.push_str(if authored_current.is_empty() {
+                stored_current
+            } else {
+                &authored_current
+            });
             goal_user_text = combined;
         }
         // Sanitize carryover blocks regardless of mode (they can appear in any message)
@@ -265,7 +274,7 @@ impl Agent {
 
         let project_hints = extract_project_hints_from_history(
             &history,
-            current,
+            &authored_current,
             GOAL_CONTEXT_MAX_PROJECT_HINTS,
             true,
         );
@@ -275,12 +284,12 @@ impl Agent {
         // to existing project directories like modern-plants-site.
         let mut current_project_scopes = Vec::new();
         extract_explicit_path_scopes_from_text(
-            current,
+            &authored_current,
             &mut current_project_scopes,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
             &self.path_aliases.projects,
         );
-        let allow_scope_carryover = if looks_like_scope_carryover_ack(current) {
+        let allow_scope_carryover = if looks_like_scope_carryover_ack(stored_current) {
             let mut prior_user_scopes = Vec::new();
             if let Some(prev_user_text) = prev_user.as_deref() {
                 extract_project_scopes_from_text(
@@ -295,17 +304,17 @@ impl Agent {
                     turn_allows_inherited_project_scope(prev_user_text, &prior_user_scopes)
                 })
         } else {
-            turn_allows_inherited_project_scope(current, &current_project_scopes)
+            turn_allows_inherited_project_scope(&authored_current, &current_project_scopes)
         };
         let project_scopes = extract_project_scopes_from_history(
             &history,
-            current,
+            &authored_current,
             GOAL_CONTEXT_MAX_PROJECT_SCOPES,
             allow_scope_carryover,
             &self.path_aliases.projects,
         );
         let allow_multi_project_scope =
-            looks_like_multi_project_request(&current.to_ascii_lowercase());
+            looks_like_multi_project_request(&authored_current.to_ascii_lowercase());
         // For current-turn scopes, unify all explicitly mentioned paths into a
         // single scope that encompasses them all.  When the user mentions paths
         // in different subdirectories (e.g. ~/projects/blog/posts/file.md and

@@ -23,7 +23,7 @@ use crate::traits::{AgentRole, StateStore, Tool};
 
 #[cfg(test)]
 use super::execution_state::ExecutionBudget;
-use super::{init_policy_tunables_once, Agent, AgentLimits};
+use super::{init_policy_tunables_once, Agent, AgentLimits, HarnessEvalConfig};
 
 // impl-Agent justification: constructor, with_depth, and test setters — the only place Agent fields are wired.
 impl Agent {
@@ -59,6 +59,7 @@ impl Agent {
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         interactive_slot: Option<u32>,
         vision_config: VisionConfig,
+        harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
@@ -147,6 +148,8 @@ impl Agent {
             interactive_slot,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
+            harness_eval: Arc::new(RwLock::new(None)),
+            harness_eval_config,
         }
     }
 
@@ -264,6 +267,7 @@ impl Agent {
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         vision_config: VisionConfig,
+        harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         let fallback = llm_runtime
             .router()
@@ -325,6 +329,8 @@ impl Agent {
             interactive_slot: None,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
+            harness_eval: Arc::new(RwLock::new(None)),
+            harness_eval_config,
         }
     }
 }

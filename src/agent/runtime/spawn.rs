@@ -828,6 +828,7 @@ impl Agent {
             root_tools,
             self.specialists.clone(),
             self.vision_config.clone(),
+            self.harness_eval_config.clone(),
         ));
 
         if let Some(spawn_tool) = spawn_tool {
@@ -1207,6 +1208,7 @@ impl Agent {
                 timeout_secs_override,
             )
             .await;
+        let child_session_for_events = child_session.clone();
         let result = child
             .handle_message(
                 &child_session,
@@ -1217,6 +1219,28 @@ impl Agent {
                 None,
             )
             .await;
+
+        if self.harness_eval_enabled() {
+            if let Ok(events) = self
+                .event_store
+                .query_recent_events(&child_session_for_events, 30)
+                .await
+            {
+                if let Some(child_snapshot) = events.iter().rev().find_map(|event| {
+                    if event.event_type == EventType::TaskEnd {
+                        event
+                            .parse_data::<TaskEndData>()
+                            .ok()
+                            .and_then(|data| data.harness_eval)
+                    } else {
+                        None
+                    }
+                }) {
+                    self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
+                        .await;
+                }
+            }
+        }
 
         if role == AgentRole::Executor {
             if let Some(task_id) = saved_task_id.as_deref() {
@@ -1416,6 +1440,7 @@ impl Agent {
                 )
                 .await;
 
+            let child_session_for_events = child_session.clone();
             let result = child
                 .handle_message(
                     &child_session,
@@ -1426,6 +1451,28 @@ impl Agent {
                     None,
                 )
                 .await;
+
+            if self.harness_eval_enabled() {
+                if let Ok(events) = self
+                    .event_store
+                    .query_recent_events(&child_session_for_events, 30)
+                    .await
+                {
+                    if let Some(child_snapshot) = events.iter().rev().find_map(|event| {
+                        if event.event_type == EventType::TaskEnd {
+                            event
+                                .parse_data::<TaskEndData>()
+                                .ok()
+                                .and_then(|data| data.harness_eval)
+                        } else {
+                            None
+                        }
+                    }) {
+                        self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
+                            .await;
+                    }
+                }
+            }
 
             let duration = start.elapsed();
 

@@ -244,6 +244,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             None
         },
         VisionConfig::from_files(&config.files),
+        (&config.diagnostics.harness_eval).into(),
     ));
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.

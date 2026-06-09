@@ -1797,6 +1797,14 @@ pub(super) async fn run_stopping_phase(
             return Ok(StoppingPhaseOutcome::Return(result));
         }
 
+        if agent.harness_eval_enabled() {
+            agent
+                .with_harness_eval(|eval| {
+                    eval.record_stall_guard();
+                    eval.record_stop_reason(StopReason::Stall);
+                })
+                .await;
+        }
         let result = agent
             .graceful_stall_response(
                 emitter,
@@ -1953,6 +1961,11 @@ pub(super) async fn run_stopping_phase(
                     POLICY_METRICS
                         .escalation_total
                         .fetch_add(1, Ordering::Relaxed);
+                    if agent.harness_eval_enabled() {
+                        agent
+                            .with_harness_eval(|eval| eval.record_model_escalated())
+                            .await;
+                    }
                     last_escalation_iteration = Some(iteration);
                     if let Some(ref router) = llm_router {
                         let next_model = router
