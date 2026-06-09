@@ -606,25 +606,31 @@ impl PageHandle for ChromiumoxidePage {
     }
 
     async fn inner_text(&self, selector: &str) -> Result<String, String> {
-        // Verify the element exists first (preserves original error message).
-        self.page
+        // Use the element handle's own `inner_text()` method instead of building
+        // a JS string from the selector.  The old approach interpolated `selector`
+        // into `document.querySelector('<selector>').innerText`, which broke on
+        // backslashes, newlines, and un-escapable CSS escapes, and could inject
+        // arbitrary JS via a crafted selector.
+        //
+        // `Page::find_element` passes the selector to the CDP DOM query (not to
+        // any JS source string), and `Element::inner_text()` evaluates the
+        // constant function `function() { return this.innerText; }` bound to the
+        // element object — NO selector interpolation occurs anywhere.
+        //
+        // Real-Chrome adversarial-selector coverage is deferred to the Task 18
+        // smoke suite; the mock-level dispatch contract (selector passed through
+        // unchanged, no Evaluate call recorded) is locked down in Task 14 tests.
+        let element = self
+            .page
             .find_element(selector)
             .await
             .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
 
-        let js = format!(
-            "document.querySelector('{}').innerText",
-            selector.replace('\'', "\\'")
-        );
-        let result = self
-            .page
-            .evaluate(js)
+        Ok(element
+            .inner_text()
             .await
-            .map_err(|e| format!("Failed to get text from '{}': {}", selector, e))?;
-
-        Ok(result
-            .into_value::<String>()
-            .unwrap_or_else(|_| "(could not extract text)".to_string()))
+            .map_err(|e| format!("Failed to get text from '{}': {}", selector, e))?
+            .unwrap_or_else(|| "(could not extract text)".to_string()))
     }
 
     async fn body_text(&self) -> Result<String, String> {

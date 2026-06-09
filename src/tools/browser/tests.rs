@@ -142,6 +142,155 @@ async fn get_text_with_selector_routes_through_inner_text() {
     );
 }
 
+/// Task 14 — selector-faithful dispatch contract.
+///
+/// `get_text` must forward the selector to `inner_text` UNCHANGED, regardless
+/// of what characters it contains.  The old implementation built a JS string
+/// `document.querySelector('<selector>').innerText`, which broke on backslashes,
+/// newlines, and un-escapable CSS escapes, and could inject arbitrary JS via a
+/// crafted selector.  The fix moves text extraction to the element handle, so
+/// the selector is only ever passed to `find_element` (a CDP DOM query — no JS
+/// string building) and the text comes from `Element::inner_text()`.
+///
+/// These tests verify the *dispatch contract*: the selector arrives at
+/// `InnerText(selector)` byte-for-byte unchanged.  The absence of any
+/// `Evaluate` call with the selector embedded in it proves the interpolation is
+/// gone.  Real DOM-level extraction with adversarial selectors (actual Chrome,
+/// actual pages) is covered by the deferred real-Chrome smoke suite (Task 18).
+#[tokio::test]
+async fn get_text_selector_with_single_quote_passes_through_unchanged() {
+    // `input[name='x']` — contains a single-quote that the old code escaped to
+    // `\'`, mutating the selector before passing it on.
+    let selector = "input[name='x']";
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("field text"));
+
+    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "field text");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+
+    // The selector must arrive at inner_text byte-for-byte.
+    assert!(
+        calls.contains(&MockCall::InnerText(selector.to_string())),
+        "selector with single-quote must pass through to inner_text unchanged: {calls:?}"
+    );
+    // No Evaluate call may contain the selector (interpolation is gone).
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, MockCall::Evaluate(s) if s.contains(selector))),
+        "selector must not be interpolated into an Evaluate call: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_text_selector_with_backslash_passes_through_unchanged() {
+    // `a\\b` — a raw backslash (CSS escape introducer). The old JS-string
+    // approach mis-handled this; element-handle extraction avoids any JS source.
+    let selector = r"a\b";
+    let (tool, backend, _rx) =
+        mock_tool_with(MockBackend::new().with_text_result("backslash text"));
+
+    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "backslash text");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::InnerText(selector.to_string())),
+        "selector with backslash must pass through to inner_text unchanged: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, MockCall::Evaluate(s) if s.contains(selector))),
+        "backslash selector must not be interpolated into an Evaluate call: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_text_selector_with_newline_passes_through_unchanged() {
+    // A newline inside the selector would break the single-line JS string
+    // built by the old code, causing a syntax error in Chrome's JS engine.
+    let selector = "div[data-x=\"line1\nline2\"]";
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("newline text"));
+
+    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "newline text");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::InnerText(selector.to_string())),
+        "selector with newline must pass through to inner_text unchanged: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, MockCall::Evaluate(s) if s.contains("line1"))),
+        "newline selector must not be interpolated into an Evaluate call: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_text_selector_with_css_escape_passes_through_unchanged() {
+    // `#\31 23` — a CSS-escaped numeric id (ID starting with a digit).
+    // `\31 ` is the CSS escape for `1`, making the selector `#123` after
+    // browser parsing. The backslash-space sequence must survive intact.
+    let selector = r"#\31 23";
+    let (tool, backend, _rx) =
+        mock_tool_with(MockBackend::new().with_text_result("escaped id text"));
+
+    let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "escaped id text");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::InnerText(selector.to_string())),
+        "CSS-escaped selector must pass through to inner_text unchanged: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, MockCall::Evaluate(s) if s.contains(selector))),
+        "CSS-escaped selector must not be interpolated into an Evaluate call: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_text_with_selector_never_calls_evaluate() {
+    // Regardless of the selector, get_text must NEVER call evaluate.
+    // The old code always went through evaluate(format!(...selector...));
+    // the fixed code goes through inner_text only.
+    let selectors = &[
+        "#simple",
+        "input[name='user']",
+        r"div\backslash",
+        "p[data-v=\"a\nb\"]",
+        r"#\31 23",
+    ];
+
+    for selector in selectors {
+        let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("t"));
+
+        let args = json!({ "action": "get_text", "selector": selector, "_session_id": "sess-a" });
+        tool.call(&args.to_string()).await.unwrap();
+
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+            "get_text with selector '{selector}' must NEVER call evaluate: {calls:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn get_text_without_selector_routes_through_body_text() {
     let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_text_result("hello body"));
