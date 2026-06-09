@@ -367,30 +367,36 @@ async fn execute_js_undefined_renders_as_no_return_value() {
 
 #[tokio::test]
 async fn screenshot_with_selector_records_element_target() {
-    let (tool, backend, mut rx) = mock_tool();
+    let (tool, backend, rx) = mock_tool();
+    // Channel ACCEPTS the delivery → the tool reports honest success.
+    let media = spawn_media_responder(rx, Ok(()));
 
     let args = json!({ "action": "screenshot", "selector": "#hero", "_session_id": "sess-a" });
     let out = tool.call(&args.to_string()).await.unwrap();
     assert!(
-        out.starts_with("Screenshot taken and sent to chat."),
-        "screenshot should report success: {out}"
+        out.contains("delivered to chat"),
+        "screenshot should report honest delivery: {out}"
     );
 
     let calls = backend.calls();
     let calls = calls.lock().await;
+    // A selector capture passes full_page through (false), but it is ignored.
     assert!(
-        calls.contains(&MockCall::Screenshot(Some("#hero".to_string()))),
+        calls.contains(&MockCall::Screenshot(Some("#hero".to_string()), false)),
         "with a selector, screenshot must target the element: {calls:?}"
     );
     assert!(
-        !calls.contains(&MockCall::Screenshot(None)),
-        "with a selector, screenshot must NOT capture the full page: {calls:?}"
+        !calls
+            .iter()
+            .any(|c| matches!(c, MockCall::Screenshot(None, _))),
+        "with a selector, screenshot must NOT capture the page: {calls:?}"
     );
 
-    // The screenshot bytes are pushed onto the media channel as a Photo.
-    let media: MediaMessage = rx.try_recv().expect("a media message should be sent");
+    // The screenshot bytes were pushed onto the media channel as a Photo.
+    let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1, "exactly one media message enqueued");
     assert!(
-        matches!(media.kind, MediaKind::Photo { .. }),
+        matches!(captured[0].kind, MediaKind::Photo { .. }),
         "screenshot media must be a Photo"
     );
 }
@@ -523,34 +529,229 @@ async fn fill_replace_value_cases_round_trip_and_stay_secret() {
 }
 
 #[tokio::test]
-async fn screenshot_without_selector_records_full_page_target() {
-    let (tool, backend, mut rx) = mock_tool();
+async fn screenshot_without_selector_defaults_to_viewport() {
+    let (tool, backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
 
     let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
     let out = tool.call(&args.to_string()).await.unwrap();
     assert!(
-        out.starts_with("Screenshot taken and sent to chat."),
-        "screenshot should report success: {out}"
+        out.contains("delivered to chat"),
+        "screenshot should report honest delivery: {out}"
     );
 
     let calls = backend.calls();
     let calls = calls.lock().await;
+    // DEFAULT (no full_page arg) is a VIEWPORT capture: full_page=false.
     assert!(
-        calls.contains(&MockCall::Screenshot(None)),
-        "without a selector, screenshot must capture the full page: {calls:?}"
+        calls.contains(&MockCall::Screenshot(None, false)),
+        "without a selector or full_page, screenshot must capture the viewport: {calls:?}"
     );
     assert!(
         !calls
             .iter()
-            .any(|c| matches!(c, MockCall::Screenshot(Some(_)))),
+            .any(|c| matches!(c, MockCall::Screenshot(Some(_), _))),
         "without a selector, screenshot must NOT target an element: {calls:?}"
     );
 
-    let media: MediaMessage = rx.try_recv().expect("a media message should be sent");
+    let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1, "exactly one media message enqueued");
     assert!(
-        matches!(media.kind, MediaKind::Photo { .. }),
+        matches!(captured[0].kind, MediaKind::Photo { .. }),
         "screenshot media must be a Photo"
     );
+}
+
+/// `full_page: true` must pass `full_page=true` through to the backend.
+#[tokio::test]
+async fn screenshot_full_page_true_passes_through() {
+    let (tool, backend, rx) = mock_tool();
+    let _media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(out.contains("delivered to chat"), "should succeed: {out}");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::Screenshot(None, true)),
+        "full_page:true must reach the backend as true: {calls:?}"
+    );
+}
+
+/// HONEST-FAILURE regression (the confirmed bug): when the channel REJECTS the
+/// delivery (e.g. Telegram PHOTO_INVALID_DIMENSIONS), the tool must NOT claim it
+/// was sent — it returns an error stating the image was not delivered.
+#[tokio::test]
+async fn screenshot_delivery_failure_is_reported_honestly() {
+    let (tool, _backend, rx) = mock_tool();
+    // Channel REJECTS the delivery.
+    let _media = spawn_media_responder(rx, Err("PHOTO_INVALID_DIMENSIONS".to_string()));
+
+    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    // The Tool::call wrapper surfaces an internal Err(String) as Ok("Error: ..").
+    let msg = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        msg.starts_with("Error:"),
+        "a rejected delivery must surface as an error: {msg}"
+    );
+    assert!(
+        msg.contains("could NOT be delivered") || msg.contains("not sent"),
+        "must honestly report non-delivery: {msg}"
+    );
+    assert!(
+        !msg.contains("captured and delivered to chat"),
+        "must NOT make a success claim: {msg}"
+    );
+    assert!(
+        msg.contains("PHOTO_INVALID_DIMENSIONS"),
+        "the channel's reason should be surfaced: {msg}"
+    );
+}
+
+/// HONEST-SUCCESS: when the channel ACCEPTS the delivery, the tool reports a
+/// success string and a Photo was enqueued.
+#[tokio::test]
+async fn screenshot_delivery_success_is_reported() {
+    let (tool, _backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("captured and delivered to chat"),
+        "successful delivery should be reported as delivered: {out}"
+    );
+    let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1, "a Photo must have been enqueued");
+    assert!(matches!(captured[0].kind, MediaKind::Photo { .. }));
+}
+
+/// OVERSIZED: a capture whose PNG header encodes oversized dimensions must be
+/// rejected BEFORE any media is enqueued — the media channel receives nothing.
+#[tokio::test]
+async fn screenshot_oversized_rejected_before_enqueue() {
+    // PNG header encoding 8000x8000 → width+height = 16000 > the 9000 cap.
+    let oversized = png_header(8000, 8000);
+    let backend = MockBackend::new().with_screenshot_bytes(oversized);
+    let (tool, _backend, rx) = mock_tool_with(backend);
+    let media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
+    let msg = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        msg.starts_with("Error:") && msg.contains("too large to deliver"),
+        "oversized must report a clear too-large error: {msg}"
+    );
+
+    // Give the responder a moment; nothing should ever have been enqueued.
+    tokio::task::yield_now().await;
+    let captured = media.messages.lock().await;
+    assert!(
+        captured.is_empty(),
+        "oversized capture must NOT enqueue any media: {} enqueued",
+        captured.len()
+    );
+}
+
+/// MISSING SESSION ID: a screenshot with an empty `_session_id` is refused
+/// before any capture or enqueue.
+#[tokio::test]
+async fn screenshot_empty_session_id_refused() {
+    let (tool, backend, rx) = mock_tool();
+    let media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "_session_id": "" });
+    let msg = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        msg.starts_with("Error:") && msg.contains("session id"),
+        "empty session id must be refused: {msg}"
+    );
+    // No capture and no enqueue happened.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Screenshot(..))),
+        "must refuse before capturing: {calls:?}"
+    );
+    let captured = media.messages.lock().await;
+    assert!(captured.is_empty(), "must enqueue nothing");
+}
+
+/// URL REDACTION: a page URL carrying a query token + fragment must have BOTH
+/// stripped from the caption and the result, while host+path survive.
+#[tokio::test]
+async fn screenshot_caption_redacts_query_and_fragment() {
+    let backend =
+        MockBackend::new().with_url("https://host.example/dash/board?token=SECRET#section");
+    let (tool, _backend, rx) = mock_tool_with(backend);
+    let media = spawn_media_responder(rx, Ok(()));
+
+    let args = json!({ "action": "screenshot", "_session_id": "sess-a" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    // Result string: no token, no fragment; host + path present.
+    assert!(
+        !out.contains("SECRET"),
+        "result must not leak the token: {out}"
+    );
+    assert!(
+        !out.contains("section"),
+        "result must not leak the fragment: {out}"
+    );
+    assert!(
+        out.contains("host.example/dash/board"),
+        "host + path should be present: {out}"
+    );
+
+    // Caption (what reaches the channel) is likewise redacted.
+    let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1);
+    let cap = &captured[0].caption;
+    assert!(
+        !cap.contains("SECRET"),
+        "caption must not leak the token: {cap}"
+    );
+    assert!(
+        !cap.contains("section"),
+        "caption must not leak the fragment: {cap}"
+    );
+    assert!(
+        cap.contains("host.example/dash/board"),
+        "caption keeps host + path: {cap}"
+    );
+}
+
+/// Unit test for the dependency-free PNG dimension parser.
+#[test]
+fn png_dimensions_parses_valid_header_and_rejects_others() {
+    // Valid PNG header encoding 1280x720.
+    let bytes = png_header(1280, 720);
+    assert_eq!(super::png_dimensions(&bytes), Some((1280, 720)));
+
+    // Not a PNG (wrong signature).
+    assert_eq!(super::png_dimensions(&[0x00, 0x01, 0x02, 0x03]), None);
+
+    // Too short to contain an IHDR.
+    assert_eq!(
+        super::png_dimensions(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        None
+    );
+}
+
+/// Build a minimal valid PNG header (8-byte signature + an IHDR whose width and
+/// height fields encode `w`/`h`). Only the first 24 bytes matter for
+/// `png_dimensions`; the rest of a real PNG is irrelevant to the dimension parse.
+fn png_header(w: u32, h: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    // IHDR chunk length (13) + type "IHDR" (bytes [8..16]); contents unimportant
+    // here except width@[16..20] and height@[20..24].
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&w.to_be_bytes());
+    bytes.extend_from_slice(&h.to_be_bytes());
+    bytes
 }
 
 // =============================================================================
@@ -1214,6 +1415,50 @@ fn spawn_silent_responder() -> (ApprovalBroker, ApprovalRecorder) {
         }
     });
     (broker, recorder)
+}
+
+/// Captures the `MediaMessage`s a media responder drained, so a test can assert
+/// what (if anything) was enqueued and how many.
+#[derive(Clone)]
+struct MediaRecorder {
+    messages: Arc<Mutex<Vec<CapturedMedia>>>,
+}
+
+/// A `MediaMessage` with its `result_tx` already consumed (replied to). Carries
+/// only the inspectable fields a test asserts on.
+struct CapturedMedia {
+    #[allow(dead_code)]
+    session_id: String,
+    caption: String,
+    kind: MediaKind,
+}
+
+/// Spawn a media responder that drains `media_rx`, records each `MediaMessage`,
+/// and replies on its `result_tx` with the given outcome — modeling the channel
+/// either accepting (`Ok`) or rejecting (`Err`) the delivery. Mirrors the
+/// approval-responder pattern. Returns a recorder for post-hoc assertions.
+fn spawn_media_responder(
+    mut rx: mpsc::Receiver<MediaMessage>,
+    outcome: Result<(), String>,
+) -> MediaRecorder {
+    let recorder = MediaRecorder {
+        messages: Arc::new(Mutex::new(Vec::new())),
+    };
+    let messages = recorder.messages.clone();
+    tokio::spawn(async move {
+        while let Some(mut msg) = rx.recv().await {
+            let result_tx = msg.result_tx.take();
+            messages.lock().await.push(CapturedMedia {
+                session_id: msg.session_id.clone(),
+                caption: msg.caption.clone(),
+                kind: msg.kind,
+            });
+            if let Some(result_tx) = result_tx {
+                let _ = result_tx.send(outcome.clone());
+            }
+        }
+    });
+    recorder
 }
 
 fn approving_tool(
@@ -1923,7 +2168,7 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         let calls = backend.calls();
         let calls = calls.lock().await;
         assert!(
-            !calls.iter().any(|c| matches!(c, MockCall::Screenshot(_))),
+            !calls.iter().any(|c| matches!(c, MockCall::Screenshot(..))),
             "screenshot must refuse BEFORE capturing: {calls:?}"
         );
     }
@@ -2019,20 +2264,21 @@ async fn observation_actions_allowed_on_public_current_url() {
         );
     }
 
-    // screenshot proceeds. Use mock_tool_with so the media receiver stays alive
-    // (the screenshot is pushed onto the media channel on success).
+    // screenshot proceeds. A media responder drains the channel and confirms
+    // delivery so the tool's bounded delivery-await resolves promptly.
     {
-        let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_url(public));
+        let (tool, backend, rx) = mock_tool_with(MockBackend::new().with_url(public));
+        let _media = spawn_media_responder(rx, Ok(()));
         let out = tool
             .call(&json!({ "action": "screenshot", "_session_id": "sess-a" }).to_string())
             .await
             .unwrap();
         assert!(
-            out.starts_with("Screenshot taken and sent to chat."),
+            out.contains("delivered to chat"),
             "public screenshot must proceed: {out}"
         );
         assert!(
-            calls_contains(&backend, &MockCall::Screenshot(None)).await,
+            calls_contains(&backend, &MockCall::Screenshot(None, false)).await,
             "public screenshot must reach the capture"
         );
     }

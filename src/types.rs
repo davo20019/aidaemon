@@ -298,4 +298,14 @@ pub struct MediaMessage {
     pub session_id: String,
     pub caption: String,
     pub kind: MediaKind,
+    /// Optional one-shot used to report the ACTUAL delivery outcome back to the
+    /// enqueuing tool. `Some(tx)` means the sender wants honest confirmation:
+    /// `media_listener` replies `Ok(())` only when the channel's `send_media`
+    /// succeeded, and `Err(reason)` when delivery failed / no channel was found /
+    /// the message was shed under overload. `None` keeps the legacy
+    /// fire-and-forget behavior (the sender does not care about the outcome).
+    ///
+    /// `oneshot::Sender` is neither `Clone` nor `Default`; `MediaMessage` is moved
+    /// (never cloned) through the media channel, so no derive is affected.
+    pub result_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }

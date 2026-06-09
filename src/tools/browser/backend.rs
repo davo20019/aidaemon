@@ -97,8 +97,12 @@ pub trait PageHandle: Send + Sync {
     async fn body_text(&self) -> Result<String, String>;
 
     /// Capture a screenshot. When `selector` is `Some`, screenshots that
-    /// element; otherwise captures the full page.
-    async fn screenshot(&self, selector: Option<&str>) -> Result<Vec<u8>, String>;
+    /// element (and `full_page` is ignored — the element bounds define the
+    /// capture). When `selector` is `None`, captures the VIEWPORT by default
+    /// (`full_page=false`) and only the entire scrollable page when
+    /// `full_page=true`. Defaulting to the viewport keeps captures within
+    /// downstream channel (e.g. Telegram) dimension/byte limits.
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String>;
 
     /// Current page URL, if available.
     ///
@@ -996,8 +1000,10 @@ impl PageHandle for ChromiumoxidePage {
             .unwrap_or_else(|_| "(could not extract text)".to_string()))
     }
 
-    async fn screenshot(&self, selector: Option<&str>) -> Result<Vec<u8>, String> {
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {
         if let Some(selector) = selector {
+            // Element capture: the element's bounds define the image; full_page
+            // does not apply.
             let element = self
                 .page
                 .find_element(selector)
@@ -1008,8 +1014,11 @@ impl PageHandle for ChromiumoxidePage {
                 .await
                 .map_err(|e| format!("Failed to screenshot element: {}", e))
         } else {
+            // full_page=false (default) captures only the current viewport, which
+            // is inherently bounded by the configured window size; full_page=true
+            // captures the entire scrollable page (may be very tall).
             self.page
-                .screenshot(ScreenshotParams::builder().full_page(true).build())
+                .screenshot(ScreenshotParams::builder().full_page(full_page).build())
                 .await
                 .map_err(|e| format!("Failed to take screenshot: {}", e))
         }
@@ -1053,7 +1062,9 @@ pub enum MockCall {
     Evaluate(String),
     InnerText(String),
     BodyText,
-    Screenshot(Option<String>),
+    /// Recorded by `screenshot`. Fields: (selector, full_page) — lets tests
+    /// assert the viewport default (`full_page=false`) vs. explicit full-page.
+    Screenshot(Option<String>, bool),
     Url,
     /// Recorded by `MockBackend::reconnect`. Asserting on its count proves the
     /// tool layer reconnected exactly once on a connection-class error.
@@ -1227,6 +1238,14 @@ impl MockBackend {
     /// Override the text returned by `inner_text` and `body_text`.
     pub fn with_text_result(mut self, text: impl Into<String>) -> Self {
         self.text_result = text.into();
+        self
+    }
+
+    /// Override the raw bytes returned by `screenshot`. Lets a test feed a PNG
+    /// header that encodes oversized dimensions so the tool's pre-enqueue bounds
+    /// check rejects it.
+    pub fn with_screenshot_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.screenshot_bytes = bytes;
         self
     }
 
@@ -1525,9 +1544,12 @@ impl PageHandle for MockPage {
         Ok(self.text_result.clone())
     }
 
-    async fn screenshot(&self, selector: Option<&str>) -> Result<Vec<u8>, String> {
-        self.record(MockCall::Screenshot(selector.map(|s| s.to_string())))
-            .await;
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {
+        self.record(MockCall::Screenshot(
+            selector.map(|s| s.to_string()),
+            full_page,
+        ))
+        .await;
         Ok(self.screenshot_bytes.clone())
     }
 

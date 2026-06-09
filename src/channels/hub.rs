@@ -349,7 +349,7 @@ impl ChannelHub {
     pub async fn media_listener(self: Arc<Self>, mut rx: mpsc::Receiver<MediaMessage>) {
         let mut fair_session_budget: SessionFairnessBudget = HashMap::new();
         loop {
-            let msg = match rx.recv().await {
+            let mut msg = match rx.recv().await {
                 Some(m) => m,
                 None => break, // channel closed
             };
@@ -417,14 +417,25 @@ impl ChannelHub {
                     }
                     queue_telemetry.mark_media_completed();
                 }
+                // The sender (if it asked) deserves to know the media was NOT
+                // delivered — it was shed under system overload.
+                if let Some(result_tx) = msg.result_tx.take() {
+                    let _ = result_tx.send(Err("system overload".to_string()));
+                }
                 continue;
             }
 
             let mut had_error = false;
+            // The honest delivery outcome reported back to the enqueuing tool via
+            // `result_tx` (if present). `Ok(())` ONLY when the media (or its text
+            // fallback) was actually handed to the channel successfully. Reasons
+            // are concise and free of secrets/URLs.
+            let mut delivery_result: Result<(), String> = Ok(());
             if let Some(channel) = self.channel_for_session(&msg.session_id).await {
                 if channel.capabilities().media {
                     if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
                         had_error = true;
+                        delivery_result = Err(e.to_string());
                         warn!("Failed to send media via {}: {}", channel.name(), e);
                     } else {
                         self.record_media_delivery_note(&msg).await;
@@ -436,12 +447,17 @@ impl ChannelHub {
                         .await
                     {
                         had_error = true;
+                        delivery_result = Err(e.to_string());
                         warn!("Failed to send media caption via {}: {}", channel.name(), e);
                     }
                 }
             } else {
                 had_error = true;
+                delivery_result = Err("no channel found for session".to_string());
                 warn!("No channel found for media session {}", msg.session_id);
+            }
+            if let Some(result_tx) = msg.result_tx.take() {
+                let _ = result_tx.send(delivery_result);
             }
             if let Some(queue_telemetry) = &self.queue_telemetry {
                 if had_error {

@@ -290,6 +290,8 @@ impl Tool for SendFileTool {
                     file_path: canonical.to_string_lossy().to_string(),
                     filename: filename.clone(),
                 },
+                // Fire-and-forget: send_file does not await a delivery receipt.
+                result_tx: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;

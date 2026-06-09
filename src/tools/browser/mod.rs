@@ -209,6 +209,74 @@ fn redact_origin(url: &str) -> String {
     url[..cut].to_string()
 }
 
+/// Redact a URL for DISPLAY in a screenshot caption / action result: keep the
+/// scheme, host, and PATH (useful context for the user) but strip the query
+/// string and fragment, which can carry session tokens, auth codes, or other
+/// secrets. Anything from the first `?` or `#` onward is dropped.
+///
+/// Examples:
+/// - `https://host.com/a/b?token=SECRET#frag` → `https://host.com/a/b`
+/// - `https://host.com/path`                  → `https://host.com/path`
+/// - `about:blank`                            → `about:blank`
+fn redact_url_for_display(url: &str) -> String {
+    let url = url.trim();
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    url[..cut].to_string()
+}
+
+/// Telegram-safe upper bounds for an outbound screenshot, enforced BEFORE the
+/// image is enqueued onto the media channel. A VIEWPORT capture at the default
+/// window size is always within these; a `full_page` capture of a tall page can
+/// exceed them, in which case we return a clear error instead of enqueuing an
+/// image that the channel would silently reject (the production bug:
+/// `PHOTO_INVALID_DIMENSIONS`, dropped with only a `warn!`).
+///
+/// Telegram rejects `sendPhoto` when width+height > 10000, when the aspect ratio
+/// exceeds ~20:1, or when the file is larger than 10MB. We stay safely under each.
+const MAX_SCREENSHOT_DIM_SUM: u32 = 9000;
+const MAX_SCREENSHOT_RATIO: u32 = 18;
+const MAX_SCREENSHOT_BYTES: usize = 9_000_000;
+
+/// Parse the pixel dimensions of a PNG from its header WITHOUT decoding the
+/// image (no `image` crate dependency). A PNG is the 8-byte signature followed
+/// by the IHDR chunk; width is the big-endian `u32` at bytes `[16..20]` and
+/// height at `[20..24]`. Returns `None` if the buffer is too short or does not
+/// begin with the PNG signature.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.len() < 24 || bytes[..8] != PNG_SIGNATURE {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((width, height))
+}
+
+/// Whether a captured screenshot is within the channel-safe caps. Returns the
+/// offending `(width, height)` when the PNG header is parseable AND the image is
+/// too large by dimension-sum, aspect ratio, or encoded byte length. A buffer
+/// whose PNG header is unparseable is judged on byte length alone (we can't know
+/// its dimensions, but a too-large encoding is still rejected).
+fn screenshot_oversize_reason(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_SCREENSHOT_BYTES {
+        return Some(format!(
+            "encoded size {} bytes exceeds the {} byte limit",
+            bytes.len(),
+            MAX_SCREENSHOT_BYTES
+        ));
+    }
+    if let Some((w, h)) = png_dimensions(bytes) {
+        if w.saturating_add(h) > MAX_SCREENSHOT_DIM_SUM {
+            return Some(format!("dimensions {}x{}", w, h));
+        }
+        let (lo, hi) = if w >= h { (h, w) } else { (w, h) };
+        if lo > 0 && hi / lo > MAX_SCREENSHOT_RATIO {
+            return Some(format!("aspect ratio of {}x{}", w, h));
+        }
+    }
+    None
+}
+
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
     media_tx: mpsc::Sender<MediaMessage>,
@@ -672,6 +740,9 @@ impl BrowserTool {
     }
 
     async fn action_screenshot(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        // `page_for` already rejects an empty session id before any capture; we
+        // additionally guard the media-delivery path below so an empty id can
+        // never reach the channel.
         let (page, _guard) = self.page_for(session_id).await?;
 
         // Defense-in-depth: refuse to capture if the live committed URL is a
@@ -679,25 +750,71 @@ impl BrowserTool {
         self.ensure_current_url_allowed(&page).await?;
 
         let selector = args.get("selector").and_then(|v| v.as_str());
-        let png_bytes = page.screenshot(selector).await?;
+        // Default to a VIEWPORT capture; full-page must be opted into explicitly.
+        // A selector capture ignores full_page (the element bounds define it).
+        let full_page = args
+            .get("full_page")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let png_bytes = page.screenshot(selector, full_page).await?;
 
-        let caption = format!(
-            "Screenshot of {}",
-            page.url()
-                .await
-                .unwrap_or_else(|| "current page".to_string())
-        );
+        // Redacted page URL (query + fragment stripped) for the caption AND any
+        // URL echoed back in the result string — neither must leak a token.
+        let display_url = page
+            .url()
+            .await
+            .map(|u| redact_url_for_display(&u))
+            .unwrap_or_else(|| "current page".to_string());
+        let caption = format!("Screenshot of {}", display_url);
 
+        // Bound the image BEFORE enqueueing. An oversized capture (typically a
+        // full-page screenshot of a long page) would be silently dropped by the
+        // channel (Telegram: PHOTO_INVALID_DIMENSIONS), so we reject it here with
+        // an actionable error instead of falsely claiming it was sent.
+        if let Some(reason) = screenshot_oversize_reason(&png_bytes) {
+            return Err(format!(
+                "Screenshot is too large to deliver ({}). Try the default viewport \
+                 capture (omit full_page) or pass a selector to capture a specific element.",
+                reason
+            ));
+        }
+
+        // Guard the delivery path: never enqueue media with an empty session id.
+        if session_id.is_empty() {
+            return Err("browser actions require a session id".to_string());
+        }
+
+        // Honest delivery: ask the media listener to report the ACTUAL outcome.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         self.media_tx
             .send(MediaMessage {
                 session_id: session_id.to_string(),
                 caption: caption.clone(),
                 kind: MediaKind::Photo { data: png_bytes },
+                result_tx: Some(result_tx),
             })
             .await
-            .map_err(|e| format!("Failed to send screenshot to Telegram: {}", e))?;
+            .map_err(|e| format!("Failed to send screenshot to chat: {}", e))?;
 
-        Ok(format!("Screenshot taken and sent to chat. {}", caption))
+        // Wait (bounded) for the listener to confirm delivery, then report
+        // HONESTLY — never claim "sent" unless the channel actually accepted it.
+        match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
+            Ok(Ok(Ok(()))) => Ok(format!("Screenshot captured and delivered to chat. {}", caption)),
+            Ok(Ok(Err(reason))) => Err(format!(
+                "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
+                reason
+            )),
+            Ok(Err(_)) => Err(
+                "Screenshot captured but delivery could not be confirmed (the delivery channel \
+                 was dropped). The image may not have been sent."
+                    .to_string(),
+            ),
+            Err(_) => Err(
+                "Screenshot captured but delivery could not be confirmed within the timeout. \
+                 The image may not have been sent."
+                    .to_string(),
+            ),
+        }
     }
 
     async fn action_click(&self, args: &Value, session_id: &str) -> Result<String, String> {
@@ -1360,6 +1477,10 @@ impl Tool for BrowserTool {
                     "selector": {
                         "type": "string",
                         "description": "CSS selector for the target element (for click, fill, get_text, wait, screenshot)"
+                    },
+                    "full_page": {
+                        "type": "boolean",
+                        "description": "For 'screenshot' WITHOUT a selector: capture the entire scrollable page instead of just the visible viewport (default false). Full-page captures of long pages may be too large to deliver and will be rejected — prefer the default viewport or a selector."
                     },
                     "value": {
                         "type": "string",

@@ -1223,6 +1223,8 @@ pub fn spawn_background_task_lead(
                                     file_path: path.clone(),
                                     filename,
                                 },
+                                // Fire-and-forget: no delivery receipt awaited.
+                                result_tx: None,
                             };
                             if let Err(e) = hub_arc.send_media(&session_id, &media).await {
                                 warn!("Failed to auto-send goal file {}: {}", path, e);
