@@ -1595,6 +1595,21 @@ pub struct BrowserConfig {
     /// silently claiming isolation. See [`Self::resolve_session_isolation`].
     #[serde(default)]
     pub session_isolation: Option<SessionIsolation>,
+    /// Maximum seconds to wait for a navigation/DOM-ready signal after `goto`
+    /// (and for a click-triggered navigation to settle). Clamped to 1..=120 by
+    /// [`Self::nav_timeout`]. Default: 30.
+    #[serde(default = "default_nav_timeout_secs")]
+    pub nav_timeout_secs: u64,
+    /// Default maximum seconds the `wait` action polls for its element
+    /// condition. Clamped to 1..=120 by [`Self::element_timeout`]. A per-call
+    /// `timeout_secs` argument overrides this (also clamped). Default: 10.
+    #[serde(default = "default_element_timeout_secs")]
+    pub element_timeout_secs: u64,
+    /// Overall per-action ceiling for the click nav-race (the short
+    /// stable-DOM fallback for a non-navigating click is derived from this but
+    /// kept small). Clamped to 1..=300 by [`Self::action_timeout`]. Default: 30.
+    #[serde(default = "default_action_timeout_secs")]
+    pub action_timeout_secs: u64,
 }
 
 impl Default for BrowserConfig {
@@ -1608,11 +1623,36 @@ impl Default for BrowserConfig {
             user_data_dir: default_browser_user_data_dir(),
             profile: None,
             session_isolation: None,
+            nav_timeout_secs: default_nav_timeout_secs(),
+            element_timeout_secs: default_element_timeout_secs(),
+            action_timeout_secs: default_action_timeout_secs(),
         }
     }
 }
 
 impl BrowserConfig {
+    /// Resolved navigation/DOM-ready timeout, clamped to a sane bounded range
+    /// (1..=120s) so a typo'd or absurd config value can neither hang the tool
+    /// (huge value) nor make navigation give up before any page can load
+    /// (zero/tiny value).
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    pub fn nav_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.nav_timeout_secs.clamp(1, 120))
+    }
+
+    /// Resolved default `wait`-action element-poll timeout, clamped to 1..=120s.
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    pub fn element_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.element_timeout_secs.clamp(1, 120))
+    }
+
+    /// Resolved overall per-action ceiling (used by the click nav-race),
+    /// clamped to 1..=300s.
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    pub fn action_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 300))
+    }
+
     /// Resolve the effective session-isolation mode, rejecting configurations
     /// that would falsely claim per-session cookie isolation.
     ///
@@ -1664,6 +1704,15 @@ fn default_screenshot_width() -> u32 {
 }
 fn default_screenshot_height() -> u32 {
     720
+}
+fn default_nav_timeout_secs() -> u64 {
+    30
+}
+fn default_element_timeout_secs() -> u64 {
+    10
+}
+fn default_action_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -3622,6 +3671,7 @@ allowed_user_ids = ["U123"]
             user_data_dir: None,
             profile: None,
             session_isolation: isolation,
+            ..BrowserConfig::default()
         }
     }
 
@@ -3669,6 +3719,47 @@ session_isolation = "incognito"
             result.is_err(),
             "unknown session_isolation variant should fail to parse"
         );
+    }
+
+    #[test]
+    fn browser_timeout_defaults_are_sane() {
+        let cfg = BrowserConfig::default();
+        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(30));
+        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(10));
+        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn browser_timeouts_clamp_out_of_range_values() {
+        // Zero is clamped up to the per-field minimum (1s) so navigation/wait
+        // never gives up before it can start.
+        let mut cfg = BrowserConfig::default();
+        cfg.nav_timeout_secs = 0;
+        cfg.element_timeout_secs = 0;
+        cfg.action_timeout_secs = 0;
+        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(1));
+
+        // Absurdly large values are clamped down to the per-field maximum so a
+        // typo can never hang the tool indefinitely.
+        cfg.nav_timeout_secs = 1_000_000;
+        cfg.element_timeout_secs = 1_000_000;
+        cfg.action_timeout_secs = 1_000_000;
+        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(120));
+        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(120));
+        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn browser_timeouts_in_range_pass_through() {
+        let mut cfg = BrowserConfig::default();
+        cfg.nav_timeout_secs = 45;
+        cfg.element_timeout_secs = 5;
+        cfg.action_timeout_secs = 90;
+        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(45));
+        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(90));
     }
 
     #[test]

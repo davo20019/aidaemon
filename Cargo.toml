@@ -107,6 +107,9 @@ tempfile = "3"
 proptest = "1"
 assert_cmd = "2"
 serial_test = "3"
+# `test-util` enables tokio's pausable fake clock (`#[tokio::test(start_paused = true)]`,
+# `tokio::time::advance`) used by the deterministic bounded-wait browser tests.
+tokio = { version = "1", features = ["test-util"] }
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/aidaemon-{ target }{ archive-suffix }"

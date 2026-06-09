@@ -86,6 +86,67 @@ fn validate_script_constraints(script: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The condition the `wait` action polls for. `Present` is the default and
+/// preserves the historical behavior (element exists in the DOM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitCondition {
+    /// Element matching the selector exists in the DOM (default).
+    Present,
+    /// Element is present AND laid out / not hidden via CSS.
+    Visible,
+    /// Element's `disabled` property is falsy.
+    Enabled,
+    /// Element is absent OR laid out as hidden.
+    Hidden,
+    /// Element's text contains the provided needle.
+    TextContains,
+}
+
+impl WaitCondition {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "present" => Ok(Self::Present),
+            "visible" => Ok(Self::Visible),
+            "enabled" => Ok(Self::Enabled),
+            "hidden" => Ok(Self::Hidden),
+            "text_contains" => Ok(Self::TextContains),
+            other => Err(format!(
+                "Invalid wait condition '{}'. Valid: present, visible, enabled, hidden, text_contains",
+                other
+            )),
+        }
+    }
+
+    fn success_message(self, selector: &str, needle: Option<&str>) -> String {
+        match self {
+            Self::Present => format!("Element '{}' found", selector),
+            Self::Visible => format!("Element '{}' is visible", selector),
+            Self::Enabled => format!("Element '{}' is enabled", selector),
+            Self::Hidden => format!("Element '{}' is hidden", selector),
+            Self::TextContains => format!(
+                "Element '{}' text contains the expected value ({} chars)",
+                selector,
+                needle.unwrap_or("").len()
+            ),
+        }
+    }
+
+    fn timeout_message(self, selector: &str, needle: Option<&str>, secs: u64) -> String {
+        let what = match self {
+            Self::Present => format!("element '{}' not found", selector),
+            Self::Visible => format!("element '{}' not visible", selector),
+            Self::Enabled => format!("element '{}' not enabled", selector),
+            Self::Hidden => format!("element '{}' still visible", selector),
+            Self::TextContains => format!(
+                "element '{}' text did not contain the expected value ({} chars)",
+                selector,
+                needle.unwrap_or("").len()
+            ),
+        };
+        format!("Timeout: {} after {}s", what, secs)
+    }
+}
+
 /// Decision returned by the approval gate. `Allow` lets the action reach the
 /// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
 /// method is touched.
@@ -161,7 +222,32 @@ pub struct BrowserTool {
     approval_tx: Option<ApprovalBroker>,
     /// How long to wait for an approval response before auto-denying.
     approval_timeout: Duration,
+    /// Bounded navigation/DOM-ready timeout (resolved + clamped from config).
+    /// Used by `action_navigate` after `goto` and by the `action_click`
+    /// nav-race when a click triggers a navigation.
+    nav_timeout: Duration,
+    /// Default `wait`-action element-poll timeout (resolved + clamped). A
+    /// per-call `timeout_secs` arg overrides this (also clamped to the same
+    /// bound).
+    element_timeout: Duration,
+    /// Overall per-action ceiling for the click nav-race. The short stable-DOM
+    /// fallback for a NON-navigating click is a small fraction of this so a
+    /// click that doesn't navigate returns fast.
+    action_timeout: Duration,
 }
+
+/// Upper bound on the element-poll timeout, mirroring `BrowserConfig`'s
+/// `element_timeout` clamp, applied to a per-call `timeout_secs` override.
+const MAX_ELEMENT_TIMEOUT_SECS: u64 = 120;
+
+/// Interval between element-state polls in the `wait` action. With a paused
+/// clock, tests advance by this step to drive the loop deterministically.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Short stable-DOM settle used by the click nav-race for a NON-navigating
+/// click: long enough for click-side JS to run, short enough that a plain click
+/// returns fast. Bounded well under `action_timeout`.
+const CLICK_SETTLE: Duration = Duration::from_millis(300);
 
 impl BrowserTool {
     /// Construct the browser tool, resolving and validating the session
@@ -177,6 +263,11 @@ impl BrowserTool {
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
     ) -> Result<Self, String> {
+        // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
+        // backend.
+        let nav_timeout = config.nav_timeout();
+        let element_timeout = config.element_timeout();
+        let action_timeout = config.action_timeout();
         let backend = ChromiumoxideBackend::new(config)?;
         let mode = backend.session_isolation();
         let (mode_label, shares_cookies) = match mode {
@@ -194,6 +285,9 @@ impl BrowserTool {
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+            nav_timeout,
+            element_timeout,
+            action_timeout,
         })
     }
 
@@ -211,6 +305,9 @@ impl BrowserTool {
             sessions: BrowserSessionRegistry::new(),
             approval_tx: None,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+            nav_timeout: Duration::from_secs(30),
+            element_timeout: Duration::from_secs(10),
+            action_timeout: Duration::from_secs(30),
         }
     }
 
@@ -230,7 +327,21 @@ impl BrowserTool {
             sessions: BrowserSessionRegistry::new(),
             approval_tx: Some(approval_tx),
             approval_timeout,
+            nav_timeout: Duration::from_secs(30),
+            element_timeout: Duration::from_secs(10),
+            action_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Test-only: override the resolved navigation/element/action timeouts so
+    /// the bounded-wait paths run under a paused fake clock without depending on
+    /// the production defaults.
+    #[cfg(test)]
+    pub fn with_timeouts(mut self, nav: Duration, element: Duration, action: Duration) -> Self {
+        self.nav_timeout = nav;
+        self.element_timeout = element;
+        self.action_timeout = action;
+        self
     }
 
     /// Read the active tab's last-known URL (cached in the session registry)
@@ -515,8 +626,20 @@ impl BrowserTool {
 
         page.goto(url).await?;
 
-        // Wait briefly for page load
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Wait for the navigation lifecycle / DOM-ready signal instead of a
+        // blind fixed sleep, bounded by `nav_timeout`. A page that never fires
+        // `load` does NOT hard-fail navigate — `wait_for_navigation` returns
+        // best-effort on its internal timeout. A genuine connection-class error
+        // here propagates so `dispatch_with_recovery` can classify it.
+        if let Err(e) = page.wait_for_navigation(self.nav_timeout).await {
+            // If the wait itself failed for a connection reason, the recovery
+            // wrapper handles it; surface it. The local timeout never reaches
+            // here (it returns Ok). See the connection-reset note below.
+            if backend::is_connection_error(&e) {
+                return Err(e);
+            }
+            warn!(error = %e, "navigation wait reported a non-connection error; proceeding to URL revalidation");
+        }
 
         // Revalidate the FINAL committed URL. A server-side redirect can land on
         // a blocked host (e.g. a public redirector → http://127.0.0.1/...) even
@@ -602,8 +725,31 @@ impl BrowserTool {
 
         page.click(selector).await?;
 
-        // Brief wait for any navigation/JS (and popup creation) to settle.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Nav-race (replaces the old fixed 500ms sleep): race a navigation
+        // signal against a short stable-DOM settle. A click that triggers a
+        // navigation waits for that navigation (bounded by `nav_timeout`, itself
+        // capped under `action_timeout`); a click that does NOT navigate returns
+        // quickly after `CLICK_SETTLE`. `wait_for_navigation` resolves only when
+        // a navigation actually completes, so for a non-navigating click the
+        // settle timer wins and we return fast.
+        let nav_budget = self.nav_timeout.min(self.action_timeout);
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(CLICK_SETTLE) => {
+                // Non-navigating (or fast) click: settle elapsed first. Return fast.
+            }
+            nav = page.wait_for_navigation(nav_budget) => {
+                // A navigation completed (or its bounded wait returned). Surface a
+                // connection-class error so recovery can classify it; otherwise
+                // proceed to popup detection.
+                if let Err(e) = nav {
+                    if backend::is_connection_error(&e) {
+                        return Err(e);
+                    }
+                    warn!(error = %e, "click navigation wait reported a non-connection error");
+                }
+            }
+        }
 
         // Popup detection: diff the live targets against what the session knew
         // before. A brand-new target is registered as a tab in this session
@@ -769,26 +915,101 @@ impl BrowserTool {
             .get("selector")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: selector".to_string())?;
-        let timeout_secs = args
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10);
+
+        // Condition: defaults to `present` (the historical behavior). Any unknown
+        // value is rejected up front so a typo doesn't silently fall through.
+        let condition = args
+            .get("condition")
+            .and_then(|v| v.as_str())
+            .unwrap_or("present");
+        let condition = WaitCondition::parse(condition)?;
+
+        // For `text_contains` a needle is required (accept either `text` or the
+        // shared `value` arg).
+        let needle = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("value").and_then(|v| v.as_str()));
+        if condition == WaitCondition::TextContains && needle.unwrap_or("").is_empty() {
+            return Err(
+                "Missing required parameter for condition 'text_contains': text (or value)"
+                    .to_string(),
+            );
+        }
+
+        // Resolve the per-call timeout: a provided `timeout_secs` overrides the
+        // configured default, clamped to the same bound the config applies.
+        let timeout = match args.get("timeout_secs").and_then(|v| v.as_u64()) {
+            Some(secs) => Duration::from_secs(secs.clamp(1, MAX_ELEMENT_TIMEOUT_SECS)),
+            None => self.element_timeout,
+        };
 
         let (page, _guard) = self.page_for(session_id).await?;
 
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let timeout_secs = timeout.as_secs();
 
         loop {
-            match page.find_element(selector).await {
-                Ok(_) => return Ok(format!("Element '{}' found", selector)),
-                Err(_) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(format!(
-                            "Timeout: element '{}' not found after {}s",
-                            selector, timeout_secs
-                        ));
+            // Evaluate the condition once. A connection-class error from a state
+            // probe is surfaced so `dispatch_with_recovery` can classify it; a
+            // benign "not yet" simply keeps polling.
+            match self
+                .evaluate_wait_condition(&page, condition, selector, needle)
+                .await
+            {
+                Ok(true) => return Ok(condition.success_message(selector, needle)),
+                Ok(false) => {}
+                Err(e) => {
+                    if backend::is_connection_error(&e) {
+                        return Err(e);
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    // Non-connection probe error (e.g. transient) — treat as
+                    // "not satisfied yet" and keep polling within the deadline.
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(condition.timeout_message(selector, needle, timeout_secs));
+            }
+            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Evaluate a single `wait` condition against the page. Returns `Ok(true)`
+    /// when satisfied, `Ok(false)` when not-yet, `Err` on a probe failure.
+    ///
+    /// Element state is checked WITHOUT interpolating the selector into a JS
+    /// source string (Task 14 rule): `present` uses the CDP DOM query
+    /// (`find_element`); `visible`/`hidden`/`enabled` use element-bound constant
+    /// predicates via the `PageHandle` state methods; `text_contains` reads the
+    /// element's own `inner_text`.
+    async fn evaluate_wait_condition(
+        &self,
+        page: &Arc<dyn PageHandle>,
+        condition: WaitCondition,
+        selector: &str,
+        needle: Option<&str>,
+    ) -> Result<bool, String> {
+        match condition {
+            WaitCondition::Present => Ok(page.find_element(selector).await.is_ok()),
+            WaitCondition::Visible => page.is_element_visible(selector).await,
+            WaitCondition::Enabled => {
+                // Enabled implies present; an absent element reads as not-enabled
+                // via the state probe, so no extra presence check is needed.
+                page.is_element_enabled(selector).await
+            }
+            WaitCondition::Hidden => {
+                // Hidden == not visible (absent or laid-out-hidden). The
+                // visibility probe returns false for an absent element, so the
+                // negation covers both cases.
+                Ok(!page.is_element_visible(selector).await?)
+            }
+            WaitCondition::TextContains => {
+                let needle = needle.unwrap_or("");
+                // A missing element yields no text → not satisfied yet.
+                match page.inner_text(selector).await {
+                    Ok(text) => Ok(text.contains(needle)),
+                    Err(e) if backend::is_connection_error(&e) => Err(e),
+                    Err(_) => Ok(false),
                 }
             }
         }
@@ -1007,7 +1228,15 @@ impl BrowserTool {
         let (target_id, context_id, page) = self.backend.create_page().await?;
         if let Some(url) = url {
             page.goto(url).await?;
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // Bounded navigation readiness instead of a fixed 2s sleep (see
+            // `action_navigate`). Best-effort: a never-`load` page proceeds to
+            // URL revalidation; a connection error propagates.
+            if let Err(e) = page.wait_for_navigation(self.nav_timeout).await {
+                if backend::is_connection_error(&e) {
+                    return Err(e);
+                }
+                warn!(error = %e, "new_tab navigation wait reported a non-connection error");
+            }
         }
         let current_url = page.url().await;
 
@@ -1115,7 +1344,7 @@ impl Tool for BrowserTool {
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for element), list_tabs (list this session's open tabs with their ids), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
+            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1142,7 +1371,16 @@ impl Tool for BrowserTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds for 'wait' action (default: 10)"
+                        "description": "Timeout in seconds for 'wait' action (default from config, clamped 1..=120)"
+                    },
+                    "condition": {
+                        "type": "string",
+                        "enum": ["present", "visible", "enabled", "hidden", "text_contains"],
+                        "description": "Condition for 'wait' (default: present). present=in DOM; visible=laid out & not hidden; enabled=not disabled; hidden=absent or hidden; text_contains=element text contains 'text'."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Needle for the 'wait' action's 'text_contains' condition (the substring to wait for in the element's text)"
                     },
                     "tab_id": {
                         "type": "string",

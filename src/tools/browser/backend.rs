@@ -45,6 +45,35 @@ pub trait PageHandle: Send + Sync {
     /// Returns `Ok(())` if an element matching `selector` exists, `Err` otherwise.
     async fn find_element(&self, selector: &str) -> Result<(), String>;
 
+    /// Wait for the page's navigation lifecycle to settle (the load event /
+    /// committed navigation), bounded by `timeout`.
+    ///
+    /// Used by `action_navigate` after `goto` (replacing the old fixed 2s sleep)
+    /// and by the `action_click` nav-race when a click triggered a navigation.
+    /// On the underlying CDP error this returns `Err`; on the LOCAL timeout
+    /// firing first the caller proceeds best-effort (a page that never fires
+    /// `load` must not hard-fail navigate). Implementations bound the wait
+    /// internally so a wedged page cannot hang the action.
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String>;
+
+    /// Whether the element matching `selector` is currently VISIBLE — present in
+    /// the DOM, laid out (non-zero box / has an `offsetParent`), and not hidden
+    /// via `display:none`/`visibility:hidden`. Returns `Ok(false)` when the
+    /// element is absent or laid out as hidden; `Err` only on a transport-class
+    /// failure.
+    ///
+    /// The selector reaches CDP's DOM query via `find_element` ONLY; the
+    /// visibility predicate runs as a CONSTANT JS function bound to the resolved
+    /// element object — the selector is NEVER interpolated into a JS source
+    /// string (Task 14 rule).
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String>;
+
+    /// Whether the element matching `selector` is ENABLED (its `disabled`
+    /// property is falsy). Returns `Ok(false)` when the element is absent or
+    /// disabled; `Err` only on a transport-class failure. Selector handling
+    /// matches [`Self::is_element_visible`] — no JS interpolation of the selector.
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String>;
+
     /// Click the element matching `selector`.
     async fn click(&self, selector: &str) -> Result<(), String>;
 
@@ -770,6 +799,78 @@ impl PageHandle for ChromiumoxidePage {
         Ok(())
     }
 
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String> {
+        // Bound chromiumoxide's `wait_for_navigation` (which resolves on the
+        // load/navigation lifecycle) with our own timer. On the LOCAL timeout we
+        // return Ok(()) best-effort: a page that never fires `load` (long-poll,
+        // streaming, SPA that never settles) must not hard-fail the action — the
+        // caller will still revalidate the committed URL. A genuine CDP error is
+        // surfaced so the recovery layer can classify it.
+        match tokio::time::timeout(timeout, self.page.wait_for_navigation()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("Navigation wait failed: {}", e)),
+            Err(_) => {
+                // LOCAL-TIMEOUT connection-reset criterion: our `tokio::time::
+                // timeout` cancelled the in-flight `wait_for_navigation` CDP
+                // future, which MAY leave the CDP command channel mid-request.
+                // We do NOT reconnect here unconditionally — the common case is a
+                // benign slow/never-`load` page where the connection is perfectly
+                // healthy, and reconnecting would needlessly drop every session's
+                // pages. Instead we rely on the Task 10 mechanism: the action's
+                // NEXT backend call (the final-committed-URL `page.url()`
+                // revalidation, or the following action's `ensure_ready` health
+                // gate) surfaces a connection-class error if the CDP channel was
+                // actually left dead, and `dispatch_with_recovery` then performs
+                // the single reconnect. A cancelled-but-healthy connection
+                // continues to work with no reset. This is the lightest correct
+                // behavior: reset only when a later call proves CDP is dead.
+                debug!("wait_for_navigation local-timeout; proceeding best-effort (next call's health gate catches a dead CDP)");
+                Ok(())
+            }
+        }
+    }
+
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String> {
+        // Resolve the element via the CDP DOM query (selector never enters a JS
+        // source string), then evaluate a CONSTANT predicate bound to the element
+        // object: laid-out (has an offsetParent OR a non-empty client rect) and
+        // not display:none/visibility:hidden. `position:fixed` elements have a
+        // null offsetParent yet are visible, so the rect check covers them.
+        let element = match self.page.find_element(selector).await {
+            Ok(el) => el,
+            // A missing element is "not visible", not a transport error.
+            Err(_) => return Ok(false),
+        };
+        let ret = element
+            .call_js_fn(
+                "function() { \
+                    const s = window.getComputedStyle(this); \
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false; \
+                    const r = this.getClientRects().length > 0; \
+                    return (this.offsetParent !== null || r); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| format!("Failed to check visibility of '{}': {}", selector, e))?;
+        Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String> {
+        let element = match self.page.find_element(selector).await {
+            Ok(el) => el,
+            Err(_) => return Ok(false),
+        };
+        // Constant predicate bound to the element: enabled == !disabled. The
+        // `disabled` IDL property is `false` for elements that don't support it,
+        // so non-form elements read as enabled.
+        let ret = element
+            .call_js_fn("function() { return !this.disabled; }", false)
+            .await
+            .map_err(|e| format!("Failed to check enabled state of '{}': {}", selector, e))?;
+        Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
     async fn click(&self, selector: &str) -> Result<(), String> {
         let element = self
             .page
@@ -957,6 +1058,12 @@ pub enum MockCall {
     /// Recorded by `MockBackend::reconnect`. Asserting on its count proves the
     /// tool layer reconnected exactly once on a connection-class error.
     Reconnect,
+    /// Recorded each time `wait_for_navigation` is invoked.
+    WaitForNavigation,
+    /// Recorded by `is_element_visible(selector)`.
+    IsVisible(String),
+    /// Recorded by `is_element_enabled(selector)`.
+    IsEnabled(String),
 }
 
 /// Which page operation a scripted connection-class error should fire on, used
@@ -1022,6 +1129,52 @@ pub struct MockBackend {
     /// teardown) by recording a `Shutdown` when a browser is live. Defaults to
     /// `true` (headless), matching the common config default.
     headless: AtomicBool,
+    /// When `true`, `wait_for_navigation` resolves immediately (modeling a click
+    /// that triggered a navigation). When `false` (default), it sleeps past the
+    /// click nav-race's short settle before resolving, so the settle wins and the
+    /// click returns fast (modeling a non-navigating click). Shared with pages.
+    click_navigates: Arc<AtomicBool>,
+    /// Deterministic element-state scripting, shared with every `MockPage`.
+    ///
+    /// Each state predicate (present/visible/enabled) reads a per-condition
+    /// "becomes-true-after-N-polls" countdown: while the counter is > 0 the poll
+    /// records its call, decrements, and reports the NOT-satisfied state; at 0 it
+    /// reports satisfied. A value of `u64::MAX` models a condition that NEVER
+    /// becomes true (the bounded-timeout path). `None` means "always satisfied"
+    /// (the default), so existing find_element-based tests keep their behavior.
+    element_state: Arc<Mutex<MockElementState>>,
+}
+
+/// Scripted, poll-counted element state for the `wait`-condition tests. Each
+/// `Option<u64>` is a countdown: `None` = condition already satisfied; `Some(n)`
+/// = becomes satisfied after `n` more polls (`u64::MAX` ≈ never). `text` is what
+/// `inner_text` returns once the present countdown reaches 0 (else empty).
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct MockElementState {
+    pub present_after: Option<u64>,
+    pub visible_after: Option<u64>,
+    pub enabled_after: Option<u64>,
+    pub hidden_after: Option<u64>,
+    pub text: Option<String>,
+    pub text_after: Option<u64>,
+}
+
+#[cfg(test)]
+impl MockElementState {
+    /// Decrement a countdown, returning whether the condition is NOW satisfied.
+    /// `None` is already-satisfied; `Some(0)` is satisfied; `Some(n>0)`
+    /// decrements toward satisfaction.
+    fn tick(slot: &mut Option<u64>) -> bool {
+        match slot {
+            None => true,
+            Some(0) => true,
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1043,6 +1196,8 @@ impl Default for MockBackend {
             attached: false,
             graceful_fails: false,
             headless: AtomicBool::new(true),
+            click_navigates: Arc::new(AtomicBool::new(false)),
+            element_state: Arc::new(Mutex::new(MockElementState::default())),
         }
     }
 }
@@ -1085,6 +1240,22 @@ impl MockBackend {
     /// detach WITHOUT a graceful browser-close command.
     pub fn attached(mut self) -> Self {
         self.attached = true;
+        self
+    }
+
+    /// Script deterministic, poll-counted element state for the `wait`-condition
+    /// tests (present/visible/enabled/hidden/text_contains). See
+    /// [`MockElementState`].
+    pub fn with_element_state(mut self, state: MockElementState) -> Self {
+        self.element_state = Arc::new(Mutex::new(state));
+        self
+    }
+
+    /// Model a click that triggers a navigation: `wait_for_navigation` resolves
+    /// immediately so the click nav-race's nav branch wins. The default models a
+    /// non-navigating click (the wait sleeps past the settle).
+    pub fn with_click_navigates(self) -> Self {
+        self.click_navigates.store(true, Ordering::SeqCst);
         self
     }
 
@@ -1183,6 +1354,10 @@ struct MockPage {
     pending_popup: Arc<Mutex<Option<TargetInfo>>>,
     /// Shared one-shot connection-error script (see `MockBackend::pending_fail`).
     pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// Shared scripted element state for the `wait`-condition tests.
+    element_state: Arc<Mutex<MockElementState>>,
+    /// Shared click-navigation flag for the click nav-race tests.
+    click_navigates: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -1214,7 +1389,52 @@ impl PageHandle for MockPage {
     async fn find_element(&self, selector: &str) -> Result<(), String> {
         self.record(MockCall::FindElement(selector.to_string()))
             .await;
-        Ok(())
+        // Respect a scripted `present_after` countdown so the `wait` action's
+        // `present` (and `hidden`) conditions can become true after N polls.
+        let satisfied = {
+            let mut st = self.element_state.lock().await;
+            MockElementState::tick(&mut st.present_after)
+        };
+        if satisfied {
+            Ok(())
+        } else {
+            Err(format!("Element not found '{}': not present yet", selector))
+        }
+    }
+
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String> {
+        self.record(MockCall::WaitForNavigation).await;
+        if self.click_navigates.load(Ordering::SeqCst) {
+            // Navigating click: resolve immediately so the nav branch wins the
+            // click nav-race (and so navigate's readiness wait returns promptly).
+            Ok(())
+        } else {
+            // Non-navigating click: a real `wait_for_navigation` would block
+            // until its internal timeout. Sleep for the full bound so the click
+            // nav-race's short settle wins; the bounded timeout means it never
+            // hangs even when navigation never occurs.
+            tokio::time::sleep(timeout).await;
+            Ok(())
+        }
+    }
+
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String> {
+        self.record(MockCall::IsVisible(selector.to_string())).await;
+        let mut st = self.element_state.lock().await;
+        // `hidden_after` models an element that starts VISIBLE and becomes hidden
+        // after N polls — the inverse countdown, used by the `hidden` condition.
+        if st.hidden_after.is_some() {
+            // Returns `false` (hidden) once the countdown reaches 0, `true`
+            // (still visible) before then.
+            return Ok(!MockElementState::tick(&mut st.hidden_after));
+        }
+        Ok(MockElementState::tick(&mut st.visible_after))
+    }
+
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String> {
+        self.record(MockCall::IsEnabled(selector.to_string())).await;
+        let mut st = self.element_state.lock().await;
+        Ok(MockElementState::tick(&mut st.enabled_after))
     }
 
     async fn click(&self, selector: &str) -> Result<(), String> {
@@ -1257,6 +1477,17 @@ impl PageHandle for MockPage {
         self.record(MockCall::InnerText(selector.to_string())).await;
         if let Some(err) = self.take_scripted_failure(FailOp::InnerText).await {
             return Err(err);
+        }
+        // If text is scripted with a poll countdown (text_contains condition),
+        // return empty until the countdown reaches 0, then the scripted text.
+        let mut st = self.element_state.lock().await;
+        if st.text.is_some() {
+            let ready = MockElementState::tick(&mut st.text_after);
+            return Ok(if ready {
+                st.text.clone().unwrap_or_default()
+            } else {
+                String::new()
+            });
         }
         Ok(self.text_result.clone())
     }
@@ -1328,6 +1559,8 @@ impl BrowserBackend for MockBackend {
                 targets: Arc::clone(&self.targets),
                 pending_popup: Arc::clone(&self.pending_popup),
                 pending_fail: Arc::clone(&self.pending_fail),
+                element_state: Arc::clone(&self.element_state),
+                click_navigates: Arc::clone(&self.click_navigates),
             }),
         ))
     }
@@ -1404,6 +1637,8 @@ impl BrowserBackend for MockBackend {
             targets: Arc::clone(&self.targets),
             pending_popup: Arc::clone(&self.pending_popup),
             pending_fail: Arc::clone(&self.pending_fail),
+            element_state: Arc::clone(&self.element_state),
+            click_navigates: Arc::clone(&self.click_navigates),
         }))
     }
 
@@ -1447,6 +1682,7 @@ mod isolation_tests {
             user_data_dir: None,
             profile: None,
             session_isolation: None,
+            ..BrowserConfig::default()
         }
     }
 

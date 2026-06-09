@@ -74,12 +74,13 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     assert_eq!(out, "Navigated to https://example.com/");
 
     // Lock down the call ordering: ensure_ready, then create_page (this session's
-    // first action), then goto, then a url() read for final-committed-URL
+    // first action), then goto, then a bounded navigation-readiness wait (Task 13
+    // — replaces the old fixed 2s sleep), then a url() read for final-committed-URL
     // revalidation (Task 8). The session registry mints a fresh page id, so
     // assert the create_page record exists and goto follows it.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 4, "expected 4 recorded calls: {calls:?}");
+    assert_eq!(calls.len(), 5, "expected 5 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -92,6 +93,11 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     );
     assert_eq!(
         calls[3],
+        MockCall::WaitForNavigation,
+        "navigate must wait for navigation readiness (no fixed sleep): {calls:?}"
+    );
+    assert_eq!(
+        calls[4],
         MockCall::Url,
         "navigate must read the committed url to revalidate it: {calls:?}"
     );
@@ -105,11 +111,14 @@ async fn dispatch_mutation_click_routes_through_backend() {
     let out = tool.call(&args.to_string()).await.unwrap();
     assert_eq!(out, "Clicked element '#submit'");
 
-    // Exact sequence: ensure_ready -> create_page -> click(selector). Asserts
-    // the click is recorded and that we did NOT route through goto/find_element.
+    // Exact sequence: ensure_ready -> create_page -> click(selector) -> a
+    // navigation-readiness probe (Task 13 nav-race; the non-navigating default
+    // returns fast via the short settle while still recording the probe).
+    // Asserts the click is recorded and that we did NOT route through
+    // goto/find_element.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 3, "expected 3 recorded calls: {calls:?}");
+    assert_eq!(calls.len(), 4, "expected 4 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -119,6 +128,11 @@ async fn dispatch_mutation_click_routes_through_backend() {
         calls[2],
         MockCall::Click("#submit".to_string()),
         "click should click after creating the page: {calls:?}"
+    );
+    assert_eq!(
+        calls[3],
+        MockCall::WaitForNavigation,
+        "click must run the nav-race probe (no fixed sleep): {calls:?}"
     );
 }
 
@@ -2983,5 +2997,403 @@ async fn creating_new_session_opportunistically_evicts_idle_sibling() {
         calls.contains(&MockCall::CloseTarget("t-idle".into()))
             && calls.contains(&MockCall::DisposeContext("ctx-idle".into())),
         "the idle sibling's tab + context must be disposed via the backend: {calls:?}"
+    );
+}
+
+// =============================================================================
+// Task 13 — deterministic bounded waits (fake clock)
+// =============================================================================
+//
+// These tests run under `#[tokio::test(start_paused = true)]`: the runtime
+// auto-advances the clock to the next pending timer whenever it goes idle, so a
+// poll loop that sleeps `WAIT_POLL_INTERVAL` between probes drives forward with
+// NO real time elapsing and NO manual `advance()` needed. A condition scripted
+// to become true after N polls (via `MockElementState`) resolves instantly; a
+// never-satisfied condition hits the bounded deadline instantly. This proves the
+// waits are bounded AND that they don't hang.
+
+use super::backend::MockElementState;
+
+/// Build a tool with short, paused-clock-friendly timeouts (element/nav/action
+/// all 4s) so the bounded-timeout deadline is reached in a small number of
+/// polls under the fake clock.
+fn wait_tool(backend: MockBackend) -> (BrowserTool, Arc<MockBackend>) {
+    let backend = Arc::new(backend);
+    let (media_tx, _rx) = mpsc::channel(8);
+    let (broker, _rec) = spawn_responder(ApprovalResponse::AllowSession);
+    let tool = BrowserTool::with_backend_and_approval(
+        backend.clone(),
+        media_tx,
+        broker,
+        Duration::from_secs(5),
+    )
+    .with_timeouts(
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+    );
+    (tool, backend)
+}
+
+// --- present ---------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn wait_present_succeeds_when_element_appears_before_deadline() {
+    let state = MockElementState {
+        present_after: Some(2),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args = json!({ "action": "wait", "selector": "#go", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Element '#go' found", "present should succeed: {out}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_present_times_out_when_element_never_appears() {
+    let state = MockElementState {
+        present_after: Some(u64::MAX),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args = json!({ "action": "wait", "selector": "#never", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("#never") && out.contains("4s"),
+        "present should bound-timeout: {out}"
+    );
+}
+
+// --- visible ---------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn wait_visible_succeeds_when_element_becomes_visible() {
+    let state = MockElementState {
+        visible_after: Some(3),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#v", "condition": "visible", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(
+        out, "Element '#v' is visible",
+        "visible should succeed: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_visible_times_out_when_never_visible() {
+    let state = MockElementState {
+        visible_after: Some(u64::MAX),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#v", "condition": "visible", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("not visible"),
+        "visible should bound-timeout: {out}"
+    );
+}
+
+// --- enabled ---------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn wait_enabled_succeeds_when_element_becomes_enabled() {
+    let state = MockElementState {
+        enabled_after: Some(2),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#e", "condition": "enabled", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(
+        out, "Element '#e' is enabled",
+        "enabled should succeed: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_enabled_times_out_when_never_enabled() {
+    let state = MockElementState {
+        enabled_after: Some(u64::MAX),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#e", "condition": "enabled", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("not enabled"),
+        "enabled should bound-timeout: {out}"
+    );
+}
+
+// --- hidden ----------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn wait_hidden_succeeds_when_element_becomes_hidden() {
+    // Starts visible, becomes hidden after 3 polls.
+    let state = MockElementState {
+        hidden_after: Some(3),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#h", "condition": "hidden", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(
+        out, "Element '#h' is hidden",
+        "hidden should succeed: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_hidden_times_out_when_element_stays_visible() {
+    // hidden_after = MAX means it stays visible forever, so `hidden` never holds.
+    let state = MockElementState {
+        hidden_after: Some(u64::MAX),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args =
+        json!({ "action": "wait", "selector": "#h", "condition": "hidden", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("still visible"),
+        "hidden should bound-timeout: {out}"
+    );
+}
+
+// --- text_contains ---------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn wait_text_contains_succeeds_when_text_appears() {
+    let state = MockElementState {
+        text: Some("Order complete: thank you".to_string()),
+        text_after: Some(2),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args = json!({
+        "action": "wait",
+        "selector": "#status",
+        "condition": "text_contains",
+        "text": "complete",
+        "_session_id": "s"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("text contains the expected value"),
+        "text_contains should succeed: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_text_contains_times_out_when_text_never_matches() {
+    // Text is present immediately but never contains the needle.
+    let state = MockElementState {
+        text: Some("still loading...".to_string()),
+        text_after: Some(0),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args = json!({
+        "action": "wait",
+        "selector": "#status",
+        "condition": "text_contains",
+        "text": "complete",
+        "_session_id": "s"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("did not contain"),
+        "text_contains should bound-timeout: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_text_contains_requires_a_needle() {
+    let (tool, _b) = wait_tool(MockBackend::new());
+    let args = json!({
+        "action": "wait",
+        "selector": "#status",
+        "condition": "text_contains",
+        "_session_id": "s"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error") && out.contains("text_contains") && out.contains("text"),
+        "text_contains without a needle should error: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_rejects_unknown_condition() {
+    let (tool, _b) = wait_tool(MockBackend::new());
+    let args = json!({
+        "action": "wait",
+        "selector": "#x",
+        "condition": "exists",
+        "_session_id": "s"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error") && out.contains("Invalid wait condition"),
+        "unknown condition should error: {out}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_per_call_timeout_overrides_default_and_clamps() {
+    // A per-call timeout_secs of 2 overrides the 4s default; the bounded timeout
+    // message reflects the override. (Clamping of an absurd value is asserted at
+    // the config level; here we prove the override path is wired.)
+    let state = MockElementState {
+        present_after: Some(u64::MAX),
+        ..Default::default()
+    };
+    let (tool, _b) = wait_tool(MockBackend::new().with_element_state(state));
+    let args = json!({
+        "action": "wait",
+        "selector": "#never",
+        "timeout_secs": 2,
+        "_session_id": "s"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("Error: Timeout") && out.contains("2s"),
+        "per-call timeout_secs should override the default: {out}"
+    );
+}
+
+// --- navigate readiness ----------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
+    // The navigating mock resolves wait_for_navigation immediately, so navigate
+    // returns promptly under the fake clock (no 2s blind sleep).
+    let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
+    let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Navigated to https://example.com/");
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    // Goto, then a navigation-readiness probe, then the committed-URL revalidation.
+    let goto_pos = calls
+        .iter()
+        .position(|c| matches!(c, MockCall::Goto(_)))
+        .expect("goto recorded");
+    let nav_pos = calls
+        .iter()
+        .position(|c| matches!(c, MockCall::WaitForNavigation))
+        .expect("nav-readiness probe recorded");
+    let url_pos = calls
+        .iter()
+        .position(|c| matches!(c, MockCall::Url))
+        .expect("url revalidation recorded");
+    assert!(
+        goto_pos < nav_pos && nav_pos < url_pos,
+        "navigate must goto -> wait-for-nav -> revalidate url: {calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn navigate_bounds_when_navigation_never_settles() {
+    // The non-navigating default makes wait_for_navigation sleep its full bound
+    // (4s). Under the paused clock this completes instantly, proving navigate is
+    // bounded (never hangs) even when `load` never fires, and still revalidates.
+    let (tool, backend) = wait_tool(MockBackend::new());
+    let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Navigated to https://example.com/");
+    assert!(
+        calls_contains(&backend, &MockCall::WaitForNavigation).await,
+        "navigate must still record the bounded navigation wait"
+    );
+}
+
+// --- click nav-race --------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn click_that_navigates_waits_for_navigation() {
+    // A click that triggers navigation: wait_for_navigation resolves immediately,
+    // so the nav branch of the race wins and the probe is recorded.
+    let (tool, backend) = wait_tool(MockBackend::new().with_click_navigates());
+    let args = json!({ "action": "click", "selector": "#go", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Clicked element '#go'");
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let click_pos = calls
+        .iter()
+        .position(|c| matches!(c, MockCall::Click(_)))
+        .expect("click recorded");
+    let nav_pos = calls
+        .iter()
+        .position(|c| matches!(c, MockCall::WaitForNavigation))
+        .expect("nav probe recorded");
+    assert!(
+        click_pos < nav_pos,
+        "a navigating click must wait for navigation after clicking: {calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_that_does_not_navigate_returns_fast_via_settle() {
+    // Non-navigating click: wait_for_navigation would block for its full bound,
+    // but the short CLICK_SETTLE wins the race so the click returns fast. Under
+    // the paused clock the settle elapses instantly; this proves a plain click
+    // doesn't pay the full navigation timeout.
+    let (tool, backend) = wait_tool(MockBackend::new());
+    let args = json!({ "action": "click", "selector": "#noop", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Clicked element '#noop'");
+    // The race still launched the nav probe (recorded), but the result is the
+    // fast settle path — the click succeeded without a popup/navigation.
+    assert!(
+        calls_contains(&backend, &MockCall::Click("#noop".to_string())).await,
+        "click must be recorded"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn click_navrace_still_detects_popup() {
+    // A click that opens a popup (target=_blank): the popup is revealed on click;
+    // the nav-race settle elapses; popup detection still attributes + reports it.
+    let (tool, backend) = wait_tool(MockBackend::new());
+
+    // Prime the session so it has an active tab id (the legitimate opener).
+    let prime = json!({ "action": "list_tabs", "_session_id": "s" });
+    tool.call(&prime.to_string()).await.unwrap();
+    let opener = backend
+        .calls()
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            MockCall::CreatePage(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("session's first page id");
+
+    backend
+        .script_popup_with_opener(
+            "popup-xyz",
+            "Popup",
+            "https://popup.example/oauth?code=SECRET",
+            Some(&opener),
+        )
+        .await;
+
+    let args = json!({ "action": "click", "selector": "#open", "_session_id": "s" });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        out.contains("opened new tab") && out.contains("popup-xyz"),
+        "click nav-race must still detect the spawned popup: {out}"
     );
 }

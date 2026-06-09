@@ -196,6 +196,11 @@ health_port = 8080
 # headless = true
 # screenshot_width = 1280
 # screenshot_height = 720
+# # Bounded wait timeouts (seconds). These replace fixed sleeps with real,
+# # capped waits so navigation/clicks aren't flaky or needlessly slow.
+# nav_timeout_secs = 30       # navigation / DOM-ready wait after goto (clamp 1..=120)
+# element_timeout_secs = 10   # default 'wait' action element-poll timeout (clamp 1..=120)
+# action_timeout_secs = 30    # overall per-action ceiling for the click nav-race (clamp 1..=300)
 # # Use an existing Chrome profile to inherit cookies/sessions (e.g. Cloudflare, GitHub, AWS)
 # user_data_dir = "~/Library/Application Support/Google/Chrome"
 # profile = "Default"    # or "Profile 1", "Profile 2", etc.
