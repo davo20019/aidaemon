@@ -102,6 +102,8 @@ use intent_routing::{
     classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
     is_internal_maintenance_intent, IntentComplexity,
 };
+// Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
+pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 #[cfg(test)]
 use intent_routing::{detect_schedule_heuristic, looks_like_recurring_intent_without_timing};
 #[path = "policy/policy_signals.rs"]

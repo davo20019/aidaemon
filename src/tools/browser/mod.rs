@@ -12,6 +12,7 @@ use crate::traits::{
 use crate::types::{MediaKind, MediaMessage};
 
 mod backend;
+pub mod policy;
 mod session;
 #[cfg(test)]
 mod tests;
