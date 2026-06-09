@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 
-use crate::events::{LlmPayloadInvalidMetric, PolicyMetricsData};
+use crate::events::{HarnessEvalSnapshot, LlmPayloadInvalidMetric, PolicyMetricsData};
 
 pub(in crate::agent) struct PolicyRuntimeMetrics {
     pub(in crate::agent) tool_exposure_samples: AtomicU64,
@@ -49,6 +49,8 @@ pub(in crate::agent) struct PolicyRuntimeMetrics {
     pub(in crate::agent) deferred_no_tool_model_switch_total: AtomicU64,
     pub(in crate::agent) deferred_no_tool_error_marker_total: AtomicU64,
     pub(in crate::agent) llm_payload_invalid_total: AtomicU64,
+    pub(in crate::agent) harness_eval_tasks_total: AtomicU64,
+    pub(in crate::agent) harness_eval_overall_milli_sum: AtomicU64,
 }
 
 impl PolicyRuntimeMetrics {
@@ -90,6 +92,8 @@ impl PolicyRuntimeMetrics {
             deferred_no_tool_model_switch_total: AtomicU64::new(0),
             deferred_no_tool_error_marker_total: AtomicU64::new(0),
             llm_payload_invalid_total: AtomicU64::new(0),
+            harness_eval_tasks_total: AtomicU64::new(0),
+            harness_eval_overall_milli_sum: AtomicU64::new(0),
         }
     }
 }
@@ -565,7 +569,34 @@ pub fn policy_metrics_snapshot() -> PolicyMetricsData {
             .llm_payload_invalid_total
             .load(Ordering::Relaxed),
         llm_payload_invalid_breakdown: llm_payload_invalid_breakdown_snapshot(),
+        harness_eval_tasks_total: POLICY_METRICS
+            .harness_eval_tasks_total
+            .load(Ordering::Relaxed),
+        harness_eval_overall_avg: {
+            let tasks = POLICY_METRICS
+                .harness_eval_tasks_total
+                .load(Ordering::Relaxed);
+            if tasks == 0 {
+                0.0
+            } else {
+                POLICY_METRICS
+                    .harness_eval_overall_milli_sum
+                    .load(Ordering::Relaxed) as f64
+                    / tasks as f64
+                    / 1000.0
+            }
+        },
     }
+}
+
+pub(super) fn record_harness_eval_task(snapshot: &HarnessEvalSnapshot) {
+    POLICY_METRICS
+        .harness_eval_tasks_total
+        .fetch_add(1, Ordering::Relaxed);
+    let milli = (f64::from(snapshot.scores.overall) * 1000.0).round() as u64;
+    POLICY_METRICS
+        .harness_eval_overall_milli_sum
+        .fetch_add(milli, Ordering::Relaxed);
 }
 
 pub(super) fn record_failed_task_tokens(tokens_used: u64) {

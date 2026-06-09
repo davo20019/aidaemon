@@ -1,0 +1,18 @@
+name: orchestrator_fallthrough_status
+description: Simple status check falls through orchestrator into tool loop
+session_id: eval_fallthrough_status_01
+user_text: Check my system status
+orchestrator: true
+mock_responses:
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - text: System inspected.
+expect:
+  orchestration_route: default_continue
+  tools_used:
+    - system_info
+  llm_calls_min: 1
+  tool_calls_min: 1
+  outcome: succeeded
+  direct_return: false

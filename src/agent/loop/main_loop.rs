@@ -233,6 +233,11 @@ impl Agent {
         if self.harness_eval_enabled() {
             self.install_harness_eval(harness_eval).await;
         }
+        let harness_eval_handle = if self.harness_eval_enabled() {
+            Some(self.harness_eval_handle())
+        } else {
+            None
+        };
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
         #[cfg(test)]
@@ -342,6 +347,7 @@ impl Agent {
                     .unwrap_or(false),
             ),
             read_files: super::loop_state::ReadFileObservationTracker::default(),
+            harness_eval: harness_eval_handle,
         };
 
         // Task-start planning call: generate a structured plan before the main loop.
@@ -674,17 +680,18 @@ impl Agent {
         loop {
             let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
-            self.with_harness_eval(|eval| {
-                eval.record_completion_progress(&completion_progress);
-                eval.record_iteration_progress(
-                    iteration as u32,
-                    turn_state.counters.total_tool_calls_attempted() as u32,
-                    turn_state.counters.total_successful_tool_calls() as u32,
-                    turn_state.evidence.evidence_gain_count() as u32,
-                    false,
-                );
-            })
-            .await;
+            turn_state
+                .with_harness_eval(|eval| {
+                    eval.record_completion_progress(&completion_progress);
+                    eval.record_iteration_progress(
+                        iteration as u32,
+                        turn_state.counters.total_tool_calls_attempted() as u32,
+                        turn_state.counters.total_successful_tool_calls() as u32,
+                        turn_state.evidence.evidence_gain_count() as u32,
+                        false,
+                    );
+                })
+                .await;
 
             // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {

@@ -372,6 +372,8 @@ pub struct PolicyMetricsData {
     pub deferred_no_tool_error_marker_total: u64,
     pub llm_payload_invalid_total: u64,
     pub llm_payload_invalid_breakdown: Vec<LlmPayloadInvalidMetric>,
+    pub harness_eval_tasks_total: u64,
+    pub harness_eval_overall_avg: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

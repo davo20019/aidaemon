@@ -928,6 +928,39 @@ impl Agent {
             .await
     }
 
+    /// Emit TaskEnd after recording a deterministic orchestration direct-return.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn emit_direct_return_task_end(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        status: TaskStatus,
+        outcome: crate::events::TaskOutcome,
+        task_start: Instant,
+        iteration: usize,
+        tool_calls_count: usize,
+        error: Option<String>,
+        summary: Option<String>,
+        direct_return_succeeded: bool,
+    ) {
+        if self.harness_eval_enabled() {
+            self.with_harness_eval(|eval| eval.record_direct_return(true, direct_return_succeeded))
+                .await;
+        }
+        self.emit_task_end(
+            emitter,
+            task_id,
+            status,
+            outcome,
+            task_start,
+            iteration,
+            tool_calls_count,
+            error,
+            summary,
+        )
+        .await;
+    }
+
     /// Emit a TaskEnd event. Called from every exit path in the agent loop.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn emit_task_end(
@@ -964,6 +997,9 @@ impl Agent {
             .await
             .get(emitter.session_id())
             .cloned();
+        if let Some(ref snapshot) = harness_eval_snapshot {
+            super::policy_metrics::record_harness_eval_task(snapshot);
+        }
         let _ = emitter
             .emit(
                 EventType::TaskEnd,

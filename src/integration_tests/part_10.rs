@@ -1310,9 +1310,11 @@ async fn test_attachment_stub_metadata_does_not_force_tool_required_loop() {
     );
     let inbound_text = build_inbound_text("", &[attachment.clone()]);
 
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "This image looks like a small PNG file.",
-    )]);
+    let vision_reply = MockProvider::text_response("This image looks like a small PNG file.");
+    let provider = MockProvider::with_responses(vec![
+        vision_reply.clone(),
+        vision_reply,
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let reply = harness

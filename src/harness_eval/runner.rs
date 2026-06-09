@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::events::EventStore;
 use crate::harness_eval::fixture::{
     assert_expectations, collect_run_result, HarnessEvalFixture, HarnessEvalRunResult,

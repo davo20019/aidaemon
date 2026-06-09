@@ -354,6 +354,9 @@ pub(super) async fn run_completion_phase(
                 "blocked_claimed_mutation_without_tool" | "blocked_unsatisfied_after_tools"
             ) {
                 agent
+                    .with_harness_eval(|eval| eval.record_post_exec_validation_failure())
+                    .await;
+                agent
                     .emit_warning_decision_point(
                         emitter,
                         task_id,

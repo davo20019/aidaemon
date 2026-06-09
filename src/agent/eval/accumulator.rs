@@ -249,12 +249,11 @@ impl HarnessEvalAccumulator {
         self.post_exec_validation_failures = self.post_exec_validation_failures.saturating_add(1);
     }
 
-    #[allow(dead_code)] // wired in Phase B tool/completion phases
+    #[allow(dead_code)] // wired when unrecovered error paths gain eval hooks
     pub fn record_unrecovered_error(&mut self) {
         self.unrecovered_errors = self.unrecovered_errors.saturating_add(1);
     }
 
-    #[allow(dead_code)]
     pub fn record_approval_denied(&mut self) {
         self.approval_denied = true;
     }

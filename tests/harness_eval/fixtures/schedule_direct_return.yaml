@@ -7,5 +7,7 @@ expect:
   llm_calls_max: 0
   tool_calls_max: 0
   outcome: succeeded
+  direct_return: true
+  orchestration_route: direct_reply
   response_contains:
     - confirm

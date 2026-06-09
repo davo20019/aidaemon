@@ -1,0 +1,12 @@
+name: internal_maintenance_direct_return
+description: Internal maintenance complex intent direct-returns without LLM
+session_id: eval_maint_01
+user_text: Analyze the knowledge base and identify stale entries, then process embeddings, consolidate memories, find outdated data, and report on decay old facts
+orchestrator: true
+expect:
+  llm_calls_max: 0
+  tool_calls_max: 0
+  outcome: succeeded
+  direct_return: true
+  response_contains:
+    - background jobs

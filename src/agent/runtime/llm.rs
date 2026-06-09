@@ -454,11 +454,7 @@ impl Agent {
                     ProviderErrorKind::BadRequest => {
                         if let Some(resp) = self
                             .try_text_only_vision_fallback(
-                                &provider,
-                                model,
-                                messages,
-                                tool_defs,
-                                options,
+                                &provider, model, messages, tool_defs, options,
                             )
                             .await
                         {
@@ -534,11 +530,7 @@ impl Agent {
                         if provider_err.kind == ProviderErrorKind::ServerError {
                             if let Some(resp) = self
                                 .try_text_only_vision_fallback(
-                                    &provider,
-                                    model,
-                                    messages,
-                                    tool_defs,
-                                    options,
+                                    &provider, model, messages, tool_defs, options,
                                 )
                                 .await
                             {

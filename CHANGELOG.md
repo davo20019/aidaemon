@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Harness eval instrumentation (Phase A)**: per-task effectiveness snapshot on `TaskEnd` (`HarnessEvalSnapshot`) scoring routing accuracy, progress yield, contract fulfillment, and tier-weighted cost efficiency. Configurable via `[diagnostics.harness_eval]`; sub-agent metrics roll up into the parent task at spawn complete.
 - **Harness eval offline suite (Phase B)**: YAML fixtures in `tests/harness_eval/fixtures/` with `cargo test --lib harness_eval` regression runner (`src/harness_eval/`).
 - **Harness eval analysis tooling (Phase C)**: `db_probe --eval-task`, `--eval-summary`, `--record-fixture`; `diagnose` action includes Harness Effectiveness section when snapshot present.
+- **Harness eval follow-ups**: orchestration direct-return metrics recorded before `TaskEnd` finalize; `TurnState` shares the eval accumulator handle; post-exec validation failures and terminal approval denials roll into quality metrics; `policy_metrics` exposes `harness_eval_tasks_total` and rolling `harness_eval_overall_avg`; CI runs `cargo test --lib harness_eval` explicitly; two new offline fixtures (`internal_maintenance_direct_return`, `orchestrator_fallthrough_status`) and stricter schedule direct-return expectations.
 
 ## [0.11.0] - 2026-06-08
 

@@ -538,6 +538,10 @@ impl Agent {
         }
     }
 
+    pub(in crate::agent) fn harness_eval_handle(&self) -> crate::agent::eval::HarnessEvalHandle {
+        Arc::clone(&self.harness_eval)
+    }
+
     pub(in crate::agent) async fn install_harness_eval(&self, accumulator: HarnessEvalAccumulator) {
         *self.harness_eval.write().await = Some(accumulator);
     }

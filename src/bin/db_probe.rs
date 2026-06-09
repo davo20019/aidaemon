@@ -176,8 +176,8 @@ mod tests {
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
-    use aidaemon::TaskEndData;
     use aidaemon::harness_eval::report::{format_eval_task_report, EvalTaskRow};
+    use aidaemon::TaskEndData;
 
     let row = sqlx::query(
         r#"
@@ -214,8 +214,8 @@ async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()>
 }
 
 async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> anyhow::Result<()> {
-    use aidaemon::TaskEndData;
     use aidaemon::harness_eval::report::{aggregate_summary, format_eval_summary_row, EvalTaskRow};
+    use aidaemon::TaskEndData;
 
     let rows = sqlx::query(
         r#"
@@ -267,8 +267,8 @@ async fn record_fixture_from_session(
     output: Option<&str>,
     include_text: bool,
 ) -> anyhow::Result<()> {
-    use aidaemon::{EventType, TaskEndData, ToolCallData, UserMessageData};
     use aidaemon::harness_eval::fixture::{build_recorded_fixture, fixtures_dir};
+    use aidaemon::{EventType, TaskEndData, ToolCallData, UserMessageData};
 
     let rows = if let Some(task_id) = task_id {
         sqlx::query(

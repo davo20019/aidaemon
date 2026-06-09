@@ -1043,6 +1043,12 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         // Track total calls per tool
         *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
 
+        if result_text.contains("Command denied by user.") {
+            agent
+                .with_harness_eval(|eval| eval.record_approval_denied())
+                .await;
+        }
+
         // Cache successful search_files results so the repetitive
         // redirect can replay them instead of sending a generic "BLOCKED"
         // message.  This solves the lost-context problem: when context

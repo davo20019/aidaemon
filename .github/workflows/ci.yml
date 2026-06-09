@@ -110,6 +110,9 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+      - name: Harness eval fixture suite
+        run: cargo test --lib harness_eval --all-features
+
   build-check:
     name: Build check (release)
     runs-on: ubuntu-latest

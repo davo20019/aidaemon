@@ -557,7 +557,9 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "deferred_no_tool_model_switch_total": metrics.deferred_no_tool_model_switch_total,
         "deferred_no_tool_error_marker_total": metrics.deferred_no_tool_error_marker_total,
         "llm_payload_invalid_total": metrics.llm_payload_invalid_total,
-        "llm_payload_invalid_breakdown": metrics.llm_payload_invalid_breakdown
+        "llm_payload_invalid_breakdown": metrics.llm_payload_invalid_breakdown,
+        "harness_eval_tasks_total": metrics.harness_eval_tasks_total,
+        "harness_eval_overall_avg": metrics.harness_eval_overall_avg
     }))
 }
 

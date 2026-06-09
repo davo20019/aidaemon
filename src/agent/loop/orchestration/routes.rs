@@ -112,7 +112,7 @@ async fn emit_direct_reply(
         .append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
         .await?;
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
@@ -122,6 +122,7 @@ async fn emit_direct_reply(
             0,
             None,
             Some(completion_note.to_string()),
+            true,
         )
         .await;
     Ok(direct_return_ok(message))
@@ -177,7 +178,7 @@ async fn confirm_scheduled_goal_activation(
         .append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
         .await?;
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
@@ -187,6 +188,7 @@ async fn confirm_scheduled_goal_activation(
             0,
             None,
             Some(completion_note.to_string()),
+            true,
         )
         .await;
     Ok(direct_return_ok(activation_msg))
@@ -273,7 +275,7 @@ async fn confirm_scheduled_goal_activation_batch(
         TaskOutcome::Failed
     };
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
@@ -283,6 +285,7 @@ async fn confirm_scheduled_goal_activation_batch(
             0,
             None,
             Some(completion_note.to_string()),
+            outcome == TaskOutcome::Succeeded,
         )
         .await;
     Ok(direct_return_ok(activation_msg))
@@ -434,7 +437,7 @@ pub(super) async fn maybe_handle_generic_cancel_request(
     };
 
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
@@ -444,6 +447,7 @@ pub(super) async fn maybe_handle_generic_cancel_request(
             0,
             None,
             Some(msg.clone()),
+            true,
         )
         .await;
 
@@ -499,7 +503,7 @@ async fn handle_scheduled_intent(
             .append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
             .await?;
         agent
-            .emit_task_end(
+            .emit_direct_return_task_end(
                 ctx.emitter,
                 ctx.task_id,
                 TaskStatus::Completed,
@@ -509,6 +513,7 @@ async fn handle_scheduled_intent(
                 0,
                 None,
                 Some(msg.chars().take(200).collect()),
+                true,
             )
             .await;
         return Ok(direct_return_ok(msg));
@@ -1219,7 +1224,7 @@ async fn handle_complex_intent(
             .append_assistant_message_with_event(ctx.emitter, &assistant_msg, "system", None, None)
             .await?;
         agent
-            .emit_task_end(
+            .emit_direct_return_task_end(
                 ctx.emitter,
                 ctx.task_id,
                 TaskStatus::Completed,
@@ -1229,6 +1234,7 @@ async fn handle_complex_intent(
                 0,
                 None,
                 Some(msg.chars().take(200).collect()),
+                true,
             )
             .await;
         return Ok(direct_return_ok(msg));
@@ -1359,21 +1365,23 @@ async fn handle_complex_intent(
                     )
                     .await;
 
+                let task_outcome = if response_has_user_value(&response, 0) {
+                    TaskOutcome::Succeeded
+                } else {
+                    TaskOutcome::Failed
+                };
                 agent
-                    .emit_task_end(
+                    .emit_direct_return_task_end(
                         ctx.emitter,
                         ctx.task_id,
                         TaskStatus::Completed,
-                        if response_has_user_value(&response, 0) {
-                            TaskOutcome::Succeeded
-                        } else {
-                            TaskOutcome::Failed
-                        },
+                        task_outcome,
                         ctx.task_start,
                         ctx.iteration,
                         0,
                         None,
                         Some(response.chars().take(200).collect()),
+                        task_outcome == TaskOutcome::Succeeded,
                     )
                     .await;
                 return Ok(direct_return_ok(response));
@@ -1411,7 +1419,7 @@ async fn handle_complex_intent(
 
                 record_failed_task_tokens(ctx.task_tokens_used);
                 agent
-                    .emit_task_end(
+                    .emit_direct_return_task_end(
                         ctx.emitter,
                         ctx.task_id,
                         TaskStatus::Failed,
@@ -1421,6 +1429,7 @@ async fn handle_complex_intent(
                         0,
                         Some(e.to_string()),
                         None,
+                        false,
                     )
                     .await;
                 return Ok(direct_return_ok(err_reply));
@@ -1494,7 +1503,7 @@ async fn handle_complex_intent(
 
     // Return immediately — user doesn't wait for task lead.
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             ctx.emitter,
             ctx.task_id,
             TaskStatus::Completed,
@@ -1504,6 +1513,7 @@ async fn handle_complex_intent(
             0,
             None,
             Some("Goal created, working in background.".to_string()),
+            true,
         )
         .await;
     Ok(direct_return_ok(goal_response))

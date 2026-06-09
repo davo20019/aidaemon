@@ -21,6 +21,8 @@ pub(super) use recovery::RecoveryState;
 pub(super) use reflection::ReflectionState;
 pub(super) use stall::StallTracker;
 
+use crate::agent::eval::{HarnessEvalAccumulator, HarnessEvalHandle};
+
 #[derive(Debug, Default)]
 pub(super) struct TurnState {
     pub stall: StallTracker,
@@ -32,4 +34,18 @@ pub(super) struct TurnState {
     pub directives: PendingDirectives,
     pub counters: LoopCounters,
     pub read_files: ReadFileObservationTracker,
+    pub harness_eval: Option<HarnessEvalHandle>,
+}
+
+impl TurnState {
+    pub(super) async fn with_harness_eval<R>(
+        &self,
+        f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,
+    ) -> Option<R> {
+        if let Some(handle) = &self.harness_eval {
+            handle.write().await.as_mut().map(f)
+        } else {
+            None
+        }
+    }
 }
