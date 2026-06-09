@@ -1130,10 +1130,18 @@ pub struct MockBackend {
     /// `true` (headless), matching the common config default.
     headless: AtomicBool,
     /// When `true`, `wait_for_navigation` resolves immediately (modeling a click
-    /// that triggered a navigation). When `false` (default), it sleeps past the
-    /// click nav-race's short settle before resolving, so the settle wins and the
-    /// click returns fast (modeling a non-navigating click). Shared with pages.
+    /// that triggered a navigation, or a navigate whose load event fires fast).
+    /// When `false` (default), navigation resolves immediately anyway — see
+    /// `nav_never_settles` for the never-resolving case. Shared with pages.
     click_navigates: Arc<AtomicBool>,
+    /// When `true`, `wait_for_navigation` sleeps the FULL `timeout` before
+    /// returning, modeling a page whose `load` event never fires (e.g. a
+    /// long-poll or streaming page). This is the OPT-IN path for tests that
+    /// specifically exercise the bounded-timeout behavior; it should be paired
+    /// with `#[tokio::test(start_paused = true)]` so the fake clock elapses
+    /// the timeout instantly. The default (`false`) makes `wait_for_navigation`
+    /// return immediately, keeping ordinary navigation tests fast. Shared with pages.
+    nav_never_settles: Arc<AtomicBool>,
     /// Deterministic element-state scripting, shared with every `MockPage`.
     ///
     /// Each state predicate (present/visible/enabled) reads a per-condition
@@ -1197,6 +1205,7 @@ impl Default for MockBackend {
             graceful_fails: false,
             headless: AtomicBool::new(true),
             click_navigates: Arc::new(AtomicBool::new(false)),
+            nav_never_settles: Arc::new(AtomicBool::new(false)),
             element_state: Arc::new(Mutex::new(MockElementState::default())),
         }
     }
@@ -1252,10 +1261,20 @@ impl MockBackend {
     }
 
     /// Model a click that triggers a navigation: `wait_for_navigation` resolves
-    /// immediately so the click nav-race's nav branch wins. The default models a
-    /// non-navigating click (the wait sleeps past the settle).
+    /// immediately so the click nav-race's nav branch wins. The default also
+    /// resolves immediately, so this flag's primary effect is semantic clarity in
+    /// tests that distinguish "navigating" from "non-navigating" clicks.
     pub fn with_click_navigates(self) -> Self {
         self.click_navigates.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Model a page whose `load` event NEVER fires: `wait_for_navigation` sleeps
+    /// the full `timeout` duration before returning. Use this OPT-IN flag in tests
+    /// that specifically exercise the bounded-timeout path, paired with
+    /// `#[tokio::test(start_paused = true)]` so the fake clock elapses instantly.
+    pub fn with_nav_never_settles(self) -> Self {
+        self.nav_never_settles.store(true, Ordering::SeqCst);
         self
     }
 
@@ -1358,6 +1377,9 @@ struct MockPage {
     element_state: Arc<Mutex<MockElementState>>,
     /// Shared click-navigation flag for the click nav-race tests.
     click_navigates: Arc<AtomicBool>,
+    /// Shared never-settles flag: when `true`, `wait_for_navigation` sleeps the
+    /// full timeout (opt-in for bounded-timeout tests under paused clock).
+    nav_never_settles: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -1404,16 +1426,19 @@ impl PageHandle for MockPage {
 
     async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String> {
         self.record(MockCall::WaitForNavigation).await;
-        if self.click_navigates.load(Ordering::SeqCst) {
-            // Navigating click: resolve immediately so the nav branch wins the
-            // click nav-race (and so navigate's readiness wait returns promptly).
+        if self.nav_never_settles.load(Ordering::SeqCst) {
+            // Opt-in never-settling mode: model a page whose `load` event never
+            // fires (long-poll, streaming). Sleep the full bound so bounded-timeout
+            // tests can verify the caller is not stuck. Pair with
+            // `#[tokio::test(start_paused = true)]` so the fake clock elapses
+            // this instantly with no real wall-clock cost.
+            tokio::time::sleep(timeout).await;
             Ok(())
         } else {
-            // Non-navigating click: a real `wait_for_navigation` would block
-            // until its internal timeout. Sleep for the full bound so the click
-            // nav-race's short settle wins; the bounded timeout means it never
-            // hangs even when navigation never occurs.
-            tokio::time::sleep(timeout).await;
+            // Default (fast) path: return immediately. Most tests just need
+            // `navigate`/`click` to dispatch; they don't care about the actual
+            // navigation-readiness wait. This avoids any real sleep, keeping the
+            // ordinary test suite instant even without a paused clock.
             Ok(())
         }
     }
@@ -1561,6 +1586,7 @@ impl BrowserBackend for MockBackend {
                 pending_fail: Arc::clone(&self.pending_fail),
                 element_state: Arc::clone(&self.element_state),
                 click_navigates: Arc::clone(&self.click_navigates),
+                nav_never_settles: Arc::clone(&self.nav_never_settles),
             }),
         ))
     }
@@ -1639,6 +1665,7 @@ impl BrowserBackend for MockBackend {
             pending_fail: Arc::clone(&self.pending_fail),
             element_state: Arc::clone(&self.element_state),
             click_navigates: Arc::clone(&self.click_navigates),
+            nav_never_settles: Arc::clone(&self.nav_never_settles),
         }))
     }
 

@@ -3303,10 +3303,11 @@ async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
 
 #[tokio::test(start_paused = true)]
 async fn navigate_bounds_when_navigation_never_settles() {
-    // The non-navigating default makes wait_for_navigation sleep its full bound
-    // (4s). Under the paused clock this completes instantly, proving navigate is
-    // bounded (never hangs) even when `load` never fires, and still revalidates.
-    let (tool, backend) = wait_tool(MockBackend::new());
+    // Opt in to never-settling: wait_for_navigation sleeps its full 4s bound.
+    // Under the paused clock this completes instantly (fake clock auto-advances),
+    // proving navigate is bounded (never hangs) even when `load` never fires,
+    // and still revalidates the committed URL afterward.
+    let (tool, backend) = wait_tool(MockBackend::new().with_nav_never_settles());
     let args = json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "s" });
     let out = tool.call(&args.to_string()).await.unwrap();
     assert_eq!(out, "Navigated to https://example.com/");
@@ -3344,10 +3345,11 @@ async fn click_that_navigates_waits_for_navigation() {
 
 #[tokio::test(start_paused = true)]
 async fn click_that_does_not_navigate_returns_fast_via_settle() {
-    // Non-navigating click: wait_for_navigation would block for its full bound,
-    // but the short CLICK_SETTLE wins the race so the click returns fast. Under
-    // the paused clock the settle elapses instantly; this proves a plain click
-    // doesn't pay the full navigation timeout.
+    // Non-navigating click: wait_for_navigation returns immediately (default fast
+    // path — no sleep). The click nav-race still launches the nav probe (recorded),
+    // but the result is the fast settle path. Under the paused clock the test
+    // completes instantly. Use `with_nav_never_settles()` to exercise the
+    // bounded-timeout path specifically.
     let (tool, backend) = wait_tool(MockBackend::new());
     let args = json!({ "action": "click", "selector": "#noop", "_session_id": "s" });
     let out = tool.call(&args.to_string()).await.unwrap();
