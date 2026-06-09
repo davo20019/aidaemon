@@ -1906,3 +1906,274 @@ async fn deferred_per_request_subresource_interception_stub() {
     // page whose loaded subresource targets a private IP and assert the
     // subresource request is failed with BlockedByClient.
 }
+
+// =============================================================================
+// Task 9 — Constrain JavaScript execution
+// =============================================================================
+//
+// JS-originated subresource/XHR/WebSocket interception shares the Task 8
+// deferral (chromiumoxide 0.8 browser-global only; no per-page seam; would
+// deadlock/untestable). The live-URL gate (`ensure_current_url_allowed`) is
+// the feasible mitigation: an approved execute_js still cannot read out a
+// private host the page redirected to post-load. See the `#[ignore]`d stub
+// above for the full CDP feasibility note.
+
+/// SCRIPT SIZE CAP: a script larger than MAX_SCRIPT_BYTES (64 KiB) is rejected
+/// with a clear size error BEFORE evaluation AND before the approval prompt
+/// is sent.
+#[tokio::test]
+async fn oversized_script_rejected_before_evaluate() {
+    // Build a script slightly over 64 KiB.
+    let script = "x".repeat(64 * 1024 + 1);
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
+
+    let args = serde_json::json!({
+        "action": "execute_js",
+        "script": script,
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    // The error must name the size and the limit.
+    assert!(
+        out.to_lowercase().contains("script too large") || out.to_lowercase().contains("too large"),
+        "oversized script must produce a size error: {out}"
+    );
+    assert!(
+        out.contains("65536") || out.contains("64"),
+        "size error must name the size limit: {out}"
+    );
+
+    // No Evaluate call must have been recorded.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+        "oversized script must not be evaluated: {calls:?}"
+    );
+
+    // Bonus: no approval prompt should have been sent (check is pre-approval).
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "oversized script must not produce an approval prompt (rejected before gate): {}",
+        recorder.count().await
+    );
+}
+
+/// BROWSER-MANAGEMENT API DENYLIST: scripts referencing window.open, chrome.*,
+/// or the debugger escape pattern are rejected without evaluation.
+#[tokio::test]
+async fn browser_management_api_denied_not_evaluated() {
+    let denied_scripts: &[(&str, &str)] = &[
+        // window.open spawns tabs outside the session/tab model.
+        ("window.open('https://evil.example')", "window.open"),
+        // chrome.* namespace gives access to privileged browser APIs.
+        ("chrome.debugger.attach({tabId:1},'1.3')", "chrome.debugger"),
+        ("chrome.management.getAll()", "chrome.management"),
+        (
+            "chrome.tabs.query({active:true},function(t){})",
+            "chrome.tabs",
+        ),
+        // Bare `chrome.` prefix — any chrome namespace access is blocked.
+        ("chrome.runtime.sendMessage('ext-id',{})", "chrome.runtime"),
+    ];
+
+    for (script, denied_capability) in denied_scripts {
+        let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
+
+        let args = serde_json::json!({
+            "action": "execute_js",
+            "script": script,
+            "_session_id": "sess-a"
+        });
+        let out = tool.call(&args.to_string()).await.unwrap();
+
+        // Error must name the capability class, not echo the full script.
+        assert!(
+            out.to_lowercase().contains("error"),
+            "denied script must produce an error [{denied_capability}]: {out}"
+        );
+        // Must not echo the whole script body back to the user.
+        // (The error may be longer than the script — it explains the policy —
+        // but must not literally contain the script text itself.)
+        assert!(
+            !out.contains(*script),
+            "error must not echo the whole script body [{denied_capability}]: {out}"
+        );
+
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+            "denied browser-management script must not be evaluated [{denied_capability}]: {calls:?}"
+        );
+    }
+
+    // CONTROL: a benign script must NOT be blocked.
+    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
+    let benign = "document.title";
+    let args = serde_json::json!({
+        "action": "execute_js",
+        "script": benign,
+        "_session_id": "sess-control"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        !out.to_lowercase().contains("browser management")
+            && !out.to_lowercase().contains("not allowed"),
+        "benign script must not be rejected by the denylist: {out}"
+    );
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+        "benign script must reach evaluate: {calls:?}"
+    );
+}
+
+/// PRIVATE-NETWORK BYPASS: an approved execute_js whose page's live URL is a
+/// blocked host must be refused BEFORE evaluation — the Task 8 live-URL gate
+/// (`ensure_current_url_allowed`) still holds for execute_js.
+#[tokio::test]
+async fn approved_execute_js_refused_on_blocked_current_url() {
+    // Page is sitting on the AWS metadata endpoint.
+    let blocked = "http://169.254.169.254/latest/meta-data/";
+    let (tool, backend, recorder) = approving_tool(
+        MockBackend::new().with_url(blocked),
+        ApprovalResponse::AllowOnce,
+    );
+
+    let args = serde_json::json!({
+        "action": "execute_js",
+        "script": "document.body.innerText",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    // Blocked by the live-URL gate, even though the user approved.
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+        "execute_js on a blocked URL must refuse with the host class: {out}"
+    );
+    // Must not leak the URL or path.
+    assert!(
+        !out.contains("169.254.169.254") && !out.contains("meta-data"),
+        "refusal must not leak the URL/path: {out}"
+    );
+    // Approval was prompted (the gate runs before the live-URL check but after
+    // the constraint check); script was NOT evaluated.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+        "execute_js on a blocked URL must not be evaluated: {calls:?}"
+    );
+    // The approval prompt was sent (constraint checks pass for a benign script,
+    // approval gate runs, then the live-URL check fires before evaluate).
+    assert_eq!(
+        recorder.count().await,
+        1,
+        "approval gate must have been reached before the live-URL check"
+    );
+}
+
+/// RESULT REDACTION — execute_js: when the script returns a value matching a
+/// secret pattern (e.g. an API key), the returned result must be redacted
+/// before reaching the caller.
+#[tokio::test]
+async fn execute_js_result_is_redacted() {
+    // An sk- prefixed key that matches the SECRET_PATTERNS "API key" regex.
+    // Pattern: sk-[a-zA-Z0-9]{20,}
+    let raw_secret = "sk-abc12345678901234567890";
+    let (tool, backend, _rec) = approving_tool(
+        MockBackend::new()
+            .with_eval_result(Some(serde_json::Value::String(raw_secret.to_string()))),
+        ApprovalResponse::AllowOnce,
+    );
+
+    let args = serde_json::json!({
+        "action": "execute_js",
+        "script": "getSecret()",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    // The raw secret must not appear in the output.
+    assert!(
+        !out.contains(raw_secret),
+        "execute_js result must have the secret redacted: {out}"
+    );
+    // The redaction marker must be present.
+    assert!(
+        out.contains("[REDACTED:") || out.contains("REDACTED"),
+        "execute_js result must contain a redaction marker: {out}"
+    );
+    // The evaluate call DID happen — redaction is applied to the RESULT, not
+    // the script. The script itself was benign.
+    assert!(
+        calls_contains(&backend, &MockCall::Evaluate("getSecret()".to_string())).await,
+        "the evaluate must have been called for a valid script: backend calls"
+    );
+}
+
+/// RESULT REDACTION — get_text: text extracted from the DOM that contains a
+/// secret pattern is also redacted (same spec requirement: "returned DOM
+/// content passes existing secret redaction").
+#[tokio::test]
+async fn get_text_result_is_redacted() {
+    // A Bearer token in the page text.
+    // Pattern: Bearer\s+[a-zA-Z0-9\-._~+/]+=*
+    let raw_secret = "Bearer eyJhbGciOiJSUzI1NiJ9";
+    let (tool, backend, _rec) = approving_tool(
+        MockBackend::new().with_text_result(raw_secret),
+        ApprovalResponse::AllowSession,
+    );
+
+    let args = serde_json::json!({
+        "action": "get_text",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    // The raw bearer token must not survive in the output.
+    assert!(
+        !out.contains("eyJhbGciOiJSUzI1NiJ9"),
+        "get_text result must have the bearer token redacted: {out}"
+    );
+    assert!(
+        out.contains("[REDACTED:") || out.contains("REDACTED"),
+        "get_text result must contain a redaction marker: {out}"
+    );
+    // body_text was still called (redaction applied to result, not blocked).
+    assert!(
+        calls_contains(&backend, &MockCall::BodyText).await,
+        "body_text must have been called: backend calls"
+    );
+}
+
+/// DENIED SCRIPT NOT EVALUATED (Task 7 confirmation): a user Deny on execute_js
+/// means no Evaluate is recorded. This is Task 7 behavior; included here for
+/// completeness per the spec.
+#[tokio::test]
+async fn denied_execute_js_not_evaluated() {
+    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    let args = serde_json::json!({
+        "action": "execute_js",
+        "script": "document.title",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+
+    assert!(
+        out.to_lowercase().contains("denied"),
+        "Deny response must produce a denied message: {out}"
+    );
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+        "a denied execute_js must not be evaluated: {calls:?}"
+    );
+}

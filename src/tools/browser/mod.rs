@@ -33,6 +33,59 @@ use tokio::sync::OwnedMutexGuard;
 /// window. Overridable in tests so the timeout path runs in milliseconds.
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Maximum allowed size of a `script` argument for `execute_js`. Generous for
+/// legitimate automation (64 KiB covers virtually any real workflow) while
+/// bounding potential abuse via enormous payloads.
+const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+
+/// Patterns whose presence in a script argument means the script is attempting
+/// to use a privileged browser-management API that bypasses the session/tab
+/// model or the approval boundary. Scripts matching any of these are rejected
+/// before evaluation.
+///
+/// Rationale for each entry:
+/// - `window.open` — spawns tabs outside the BrowserTool session/tab model,
+///   making them invisible to the registry and unaccountable to the caller.
+/// - `chrome.` — the chrome.* namespace (chrome.debugger, chrome.management,
+///   chrome.tabs, chrome.runtime, etc.) exposes privileged extension/DevTools
+///   APIs that can detach the debugger, enumerate/modify tabs across all
+///   sessions, or exfiltrate data via cross-context messaging. Any access to
+///   this namespace is blocked.
+const JS_DENYLIST: &[&str] = &["window.open", "chrome."];
+
+/// Validate script constraints before the approval gate so that a doomed
+/// script is never sent for user approval and never touches the backend.
+///
+/// Returns `Ok(())` when the script passes all checks, or `Err(reason)` with
+/// a user-facing error message when a check fails. The reason MUST NOT echo
+/// the script body — it names only the violated constraint.
+fn validate_script_constraints(script: &str) -> Result<(), String> {
+    // 1. Size cap: reject scripts larger than MAX_SCRIPT_BYTES.
+    let byte_len = script.len();
+    if byte_len > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "Script too large: {} bytes (max {}). Split the work into smaller steps.",
+            byte_len, MAX_SCRIPT_BYTES
+        ));
+    }
+
+    // 2. Browser-management API denylist: reject scripts referencing privileged
+    //    browser-management APIs that bypass the session/tab model. Each pattern
+    //    is specific enough (not a natural-language single word) that substring
+    //    matching is appropriate per the project's keyword-matching guidelines.
+    for &pattern in JS_DENYLIST {
+        if script.contains(pattern) {
+            return Err(format!(
+                "Script uses a disallowed browser-management API ('{}' is not permitted). \
+                 Use BrowserTool tab actions (new_tab, switch_tab, close_tab) for tab management.",
+                pattern
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Decision returned by the approval gate. `Allow` lets the action reach the
 /// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
 /// method is touched.
@@ -663,8 +716,13 @@ impl BrowserTool {
             page.body_text().await?
         };
 
-        // Truncate if very long
+        // Truncate if very long.
         let text = crate::utils::truncate_with_note(&text, 4000);
+
+        // Apply secret redaction AFTER truncation. DOM content can contain
+        // tokens, API keys, or bearer tokens embedded in the page — these must
+        // not reach the user or event persistence in their raw form.
+        let text = crate::tools::sanitize::redact_secrets(&text);
 
         Ok(text)
     }
@@ -692,6 +750,10 @@ impl BrowserTool {
         };
 
         let value_str = crate::utils::truncate_with_note(&value_str, 4000);
+
+        // Apply secret redaction AFTER truncation so the redacted form is what
+        // reaches the user and event persistence — never the raw secret.
+        let value_str = crate::tools::sanitize::redact_secrets(&value_str);
 
         Ok(value_str)
     }
@@ -969,6 +1031,17 @@ impl Tool for BrowserTool {
         let needs_session = !matches!(action, "close" | "set_mode");
         if needs_session && session_id.is_empty() {
             return Ok("Error: browser actions require a session id".to_string());
+        }
+
+        // Script constraint validation — runs BEFORE the approval gate so a
+        // doomed script is never sent for user approval and never reaches the
+        // backend. Only applies to execute_js (other actions have no script arg).
+        if action == "execute_js" {
+            let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(reason) = validate_script_constraints(script) {
+                warn!(action, "execute_js script rejected by constraint check");
+                return Ok(format!("Error: {}", reason));
+            }
         }
 
         // Approval gate — runs BEFORE any backend/page method is touched, so a
