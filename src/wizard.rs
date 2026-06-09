@@ -1003,6 +1003,58 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
         }
     }
 
+    // ── Whisper STT (optional) ──────────────────────────────────────────
+    let stt_probe = crate::stt_setup::probe_stt_environment();
+    let mut stt_enabled = false;
+    let mut stt_language = "en".to_string();
+    let mut stt_probe_final = stt_probe.clone();
+
+    println!();
+    println!("  Optional: Voice note transcription (Whisper STT)");
+    println!("  When your model lacks native audio, voice notes are transcribed");
+    println!("  locally via whisper-cli + ffmpeg before reaching the LLM.");
+    println!();
+    println!(
+        "  {}",
+        crate::stt_setup::format_stt_probe_report(&stt_probe)
+    );
+
+    if stt_probe.whisper_cli.is_some() {
+        let enable = Confirm::new()
+            .with_prompt("  Enable Whisper STT fallback for voice notes?")
+            .default(stt_probe.is_complete())
+            .interact()?;
+
+        if enable {
+            stt_probe_final = stt_probe.clone();
+            if stt_probe_final.model_path.is_none() {
+                let model_path: String = Input::new()
+                    .with_prompt("  Path to Whisper GGML model (.bin)")
+                    .interact_text()?;
+                stt_probe_final =
+                    crate::stt_setup::SttProbe::resolve(None, Some(model_path.trim()), None);
+            }
+            if !stt_probe_final.is_complete() {
+                println!("  STT stack incomplete — skipping (install ffmpeg and/or model).");
+            } else {
+                stt_enabled = true;
+                let lang: String = Input::new()
+                    .with_prompt("  Transcription language (e.g. en, es; empty = auto)")
+                    .default("en".to_string())
+                    .allow_empty(true)
+                    .interact_text()?;
+                stt_language = if lang.trim().is_empty() {
+                    "auto".to_string()
+                } else {
+                    lang.trim().to_string()
+                };
+                println!("  Whisper STT enabled.");
+            }
+        }
+    } else {
+        println!("  whisper-cli not found — install whisper.cpp to enable local transcription.");
+    }
+
     // ── Store secrets in OS keychain if available ───────────────────────
     let mut any_secret_in_keychain = false;
 
@@ -1120,6 +1172,8 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     } else {
         "\n# Uncomment to enable browser tool:\n# [browser]\n# enabled = true\n".to_string()
     };
+    let stt_section =
+        crate::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
 
     let config = format!(
         r#"[provider]
@@ -1148,7 +1202,7 @@ daemon_ws_url = "wss://terminal.aidaemon.ai/v1/ws/daemon"
 
 [daemon]
 health_port = 8080
-{browser_section}
+{browser_section}{stt_section}
 # Uncomment to enable email triggers:
 # [triggers.email]
 # host = "imap.gmail.com"
@@ -1181,6 +1235,9 @@ health_port = 8080
     println!("  Run `aidaemon install-service` to start on boot (systemd/launchd).");
     if browser_enabled {
         println!("  Run `aidaemon browser login` to log into services for the agent.");
+    }
+    if stt_enabled {
+        println!("  Voice notes will use Whisper STT when native audio is unavailable.");
     }
     println!();
     println!(

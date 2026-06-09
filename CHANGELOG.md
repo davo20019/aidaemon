@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-06-09
+
 ### Added
 
+- **read_file image vision**: reading JPEG, PNG, GIF, or WebP files attaches them as tool-origin images so the LLM receives pixels on follow-up turns (same synthetic observation path as browser screenshots).
+- **Browser tool hardening**: session-scoped tab isolation, interactive action approvals, secret-safe fill/screenshot output, bounded waits, graceful reconnect/shutdown, and ~80 mock-backend contract tests. New observation actions `get_console_logs` and `get_network_errors` capture per-tab console output and network load failures (secret- and origin-redacted). Ignored real-Chrome smoke test: `cargo test --features browser browser_smoke_real_chrome -- --ignored --nocapture`.
 - **Vision / image understanding**: user-uploaded images from Telegram, Slack, and Discord are lazily base64-encoded for the current turn and sent to vision-capable LLM providers (OpenAI-compatible passthrough, Anthropic/Gemini mappers). Structured `MessageAttachment` metadata is persisted alongside the existing `[File received: ...]` text stub. Configurable via `[files] vision_enabled`, `max_vision_image_mb`, and `vision_mime_types`. Graceful fallback to text-only when vision is disabled, files are missing, or the provider rejects image payloads.
 - **Native audio input**: voice notes and audio file uploads are lazily encoded as OpenAI-style `input_audio` blocks for audio-capable models (OpenAI audio models with `modalities: ["text"]`, Gemini `inlineData`). Configurable via `[files] audio_enabled`, `max_audio_mb`, `audio_mime_types`, and `audio_model_patterns`. Graceful fallback to text stub + system hint when audio is disabled, the model is ineligible, or encoding fails. Multimodal token budgeting uses byte surrogates so large audio payloads do not explode context estimates.
+- **Whisper STT fallback**: when native audio is skipped, optionally transcribe inbound audio with local `whisper-cli` (ffmpeg prep for OGG/Opus) and append `[Transcription of <file>]: ...` to the user message before the LLM turn. Configurable via `[files.stt]` (`enabled`, `cli_path`, `model_path`, `ffmpeg_path`, `language`, `max_audio_mb`, `timeout_secs`). Opt-in (`enabled = false` by default). Setup wizard probes whisper-cli/ffmpeg/model paths; `manage_config` `enable_stt` action auto-writes `[files.stt]` (optional `stt_cli_path`, `stt_model_path`, `stt_ffmpeg_path`, `stt_language`).
 - **Browser screenshot vision**: browser `screenshot` actions save PNGs to the shared inbox and attach them to tool results so the LLM always receives pixels (synthetic user observation message at render time). Tool-origin images stay vision-eligible in archived turns for follow-up questions; user uploads remain current-turn-only.
 - **Harness eval instrumentation (Phase A)**: per-task effectiveness snapshot on `TaskEnd` (`HarnessEvalSnapshot`) scoring routing accuracy, progress yield, contract fulfillment, and tier-weighted cost efficiency. Configurable via `[diagnostics.harness_eval]`; sub-agent metrics roll up into the parent task at spawn complete.
 - **Harness eval offline suite (Phase B)**: YAML fixtures in `tests/harness_eval/fixtures/` with `cargo test --lib harness_eval` regression runner (`src/harness_eval/`).
@@ -18,8 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Harness eval follow-ups**: orchestration direct-return metrics recorded before `TaskEnd` finalize; `TurnState` shares the eval accumulator handle; post-exec validation failures and terminal approval denials roll into quality metrics; `policy_metrics` exposes `harness_eval_tasks_total` and rolling `harness_eval_overall_avg`; CI runs `cargo test --lib harness_eval` explicitly; two new offline fixtures (`internal_maintenance_direct_return`, `orchestrator_fallthrough_status`) and stricter schedule direct-return expectations.
 - **Harness eval phase wiring + fixture suite expansion**: bootstrap direct-return shortcuts (stop/cancel, time query, etc.) now install and finalize `HarnessEvalSnapshot`; message-build, tool-prelude, response-fallthrough, and stopping-phase signals (context drops, intent/evidence gates, budget extensions) roll into progress/routing payloads; YAML fixtures support `seed.goals`, `routing_models`, `stop_reason`, and `response_fallthrough`; 15 offline fixtures cover cancel, deferred-no-tool, repetition/stall guards, and orchestration fallthrough paths.
 
+### Changed
+
+- **Browser SSRF policy (Task 8)**: tool-initiated navigations are validated pre-flight and the final committed URL is revalidated after load (blocking redirect-to-loopback). Per-request CDP subresource/XHR/WebSocket interception remains **deferred** — chromiumoxide 0.8 has no safe per-request continue/abort seam; see the Task 8 feasibility note in `src/tools/browser/tests.rs`.
+
 ### Fixed
 
+- **Harness eval telemetry on deferred/stall paths**: post-tool deferred loops now record `stall_guard_fires`; pre-tool deferred loops in the main completion guard record `deferred_no_tool_events`; false-capability-denial retries record stall guards.
+- **Harness eval `contract_fulfilled` alignment**: boolean flag and `ContractFulfillmentPayload.fulfilled` now use the same obligation checks as `contract_fulfillment` scoring (no longer true when mutation was expected but missing).
+- **Harness eval progress yield for chat turns**: clean 1–3 iteration conversational successes get modest non-zero progress credit instead of always scoring 0.00.
+- **Post-tool deferred recovery**: first deferral after successful tools tries structured tool-output completion before another LLM iteration; memory-related false-capability-denial phrases (`don't have that in my records`, etc.) trigger the same recovery path.
+- **Richer `db_probe --eval-task` output**: reports deferred-no-tool count, no-progress iterations, contract obligation fields, and validation/error flags.
 - **Bootstrap stop/cancel missing harness eval snapshot**: exact `stop`/`cancel`/`abort` commands handled in bootstrap returned `TaskEnd` without `harness_eval`, breaking offline fixtures and `db_probe --eval-task` for those paths.
 
 ## [0.11.0] - 2026-06-08

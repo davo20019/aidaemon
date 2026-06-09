@@ -829,6 +829,7 @@ impl Agent {
             self.specialists.clone(),
             self.vision_config.clone(),
             self.audio_config.clone(),
+            self.stt_config.clone(),
             self.harness_eval_config.clone(),
         ));
 

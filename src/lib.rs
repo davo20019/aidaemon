@@ -32,6 +32,7 @@ mod session;
 mod skills;
 mod startup;
 mod state;
+mod stt_setup;
 mod tasks;
 #[cfg(feature = "terminal-bridge")]
 mod terminal_bridge;

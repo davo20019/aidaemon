@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::traits::{
-    ReadFileResultMetadata, ReadFileSelectionMetadata, Tool, ToolCallMetadata, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
+    AttachmentProvenance, MessageAttachment, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
+    ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
 
@@ -126,6 +127,16 @@ impl ReadFileTool {
 
         let file_size = metadata.len();
         let modified = format_modified_rfc3339(&metadata);
+
+        if let Some(mime_type) = sniff_file_image_mime(&path).await? {
+            return Ok(image_file_outcome(
+                path_str,
+                &path,
+                file_size,
+                modified.as_deref(),
+                mime_type,
+            ));
+        }
 
         // Check for binary
         if fs_utils::is_binary_file(&path).await? {
@@ -374,6 +385,53 @@ async fn read_selected_lines(
     }
 }
 
+async fn sniff_file_image_mime(path: &Path) -> anyhow::Result<Option<&'static str>> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut header = [0u8; 16];
+    let n = file.read(&mut header).await?;
+    Ok(crate::channels::attachments::sniff_image_mime(&header[..n]))
+}
+
+fn image_file_outcome(
+    display_path: &str,
+    path: &Path,
+    file_size: u64,
+    modified: Option<&str>,
+    mime_type: &str,
+) -> ToolCallOutcome {
+    let mut output = format!("Image file: {}\nSize: {} bytes\n", display_path, file_size);
+    if let Some(modified) = modified {
+        output.push_str(&format!("Modified: {}\n", modified));
+    }
+    output.push_str(&format!("Type: {mime_type}\n"));
+    output.push_str("Attached for vision analysis.");
+
+    let canonical_path = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+
+    ToolCallOutcome {
+        output,
+        metadata: ToolCallMetadata {
+            attachments: vec![MessageAttachment {
+                local_path: canonical_path,
+                filename,
+                mime_type: mime_type.to_string(),
+                size_bytes: file_size,
+                provenance: AttachmentProvenance::ToolObservation,
+                source_tool: Some("read_file".to_string()),
+            }],
+            ..ToolCallMetadata::default()
+        },
+    }
+}
+
 fn format_modified_rfc3339(metadata: &std::fs::Metadata) -> Option<String> {
     let modified = metadata.modified().ok()?;
     let modified_utc: chrono::DateTime<chrono::Utc> = modified.into();
@@ -533,14 +591,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_binary() {
+    async fn test_read_file_jpeg_image_attaches_vision_metadata() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[0xFF, 0xD8, 0xFF, 0x00, 0x10, 0x00]).unwrap();
         let args = json!({"path": f.path().to_str().unwrap()}).to_string();
-        let result = ReadFileTool.call(&args).await.unwrap();
-        assert!(result.contains("Binary file"));
-        assert!(result.contains("Size: 6 bytes"));
-        assert!(result.contains("Modified:"));
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("Image file"));
+        assert!(outcome.output.contains("image/jpeg"));
+        assert!(outcome.output.contains("Attached for vision analysis"));
+        assert!(outcome.metadata.read_file.is_none());
+        let attachment = outcome
+            .metadata
+            .attachments
+            .first()
+            .expect("jpeg image attachment");
+        assert_eq!(attachment.mime_type, "image/jpeg");
+        assert_eq!(attachment.provenance, AttachmentProvenance::ToolObservation);
+        assert_eq!(attachment.source_tool.as_deref(), Some("read_file"));
+        assert!(Path::new(&attachment.local_path).exists());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_png_image_without_null_bytes() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02])
+            .unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("Image file"));
+        assert!(outcome.output.contains("image/png"));
+        assert_eq!(outcome.metadata.attachments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_non_image_binary_still_stubbed() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0x00, 0x01, 0x02, 0x03, 0x04]).unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("Binary file"));
+        assert!(outcome.output.contains("cannot display contents"));
+        assert!(outcome.metadata.attachments.is_empty());
     }
 
     #[tokio::test]

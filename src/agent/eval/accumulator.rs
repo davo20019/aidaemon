@@ -5,7 +5,9 @@ use crate::events::{
 };
 use crate::execution_policy::ModelProfile;
 
-use super::scoring::{build_scores, weighted_tokens_from_raw, HarnessEvalConfig};
+use super::scoring::{
+    build_scores, contract_is_fulfilled, weighted_tokens_from_raw, HarnessEvalConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Budget/Timeout wired incrementally; all variants used in snapshots
@@ -413,9 +415,7 @@ impl HarnessEvalAccumulator {
             &acc.seed.config,
         );
 
-        let contract_fulfilled = acc.contract.mutation_count > 0
-            || !acc.contract.expects_mutation && acc.contract.observation_count > 0
-            || !acc.contract.requires_observation;
+        let contract_fulfilled = contract_is_fulfilled(&acc.contract);
 
         HarnessEvalSnapshot {
             task_id: acc.seed.task_id,
@@ -500,8 +500,7 @@ impl From<ContractSnapshot> for crate::events::ContractFulfillmentPayload {
             verification_required: value.verification_required,
             verification_count: value.verification_count,
             verification_blocks: value.verification_blocks,
-            fulfilled: value.mutation_count > 0
-                || (!value.expects_mutation && value.observation_count > 0),
+            fulfilled: contract_is_fulfilled(&value),
         }
     }
 }

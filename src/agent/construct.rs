@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::channels::ChannelHub;
 use crate::config::{
-    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig,
+    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
 };
 use crate::events::EventStore;
 use crate::goal_tokens::GoalTokenRegistry;
@@ -62,6 +62,7 @@ impl Agent {
         interactive_slot: Option<u32>,
         vision_config: VisionConfig,
         audio_config: AudioConfig,
+        stt_config: SttConfig,
         harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
@@ -152,6 +153,7 @@ impl Agent {
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
+            stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }
@@ -173,6 +175,11 @@ impl Agent {
     #[cfg(test)]
     pub fn set_test_audio_config(&mut self, audio: AudioConfig) {
         self.audio_config = audio;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_stt_config(&mut self, stt: SttConfig) {
+        self.stt_config = stt;
     }
 
     #[cfg(test)]
@@ -282,6 +289,7 @@ impl Agent {
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         vision_config: VisionConfig,
         audio_config: AudioConfig,
+        stt_config: SttConfig,
         harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         let fallback = llm_runtime
@@ -345,6 +353,7 @@ impl Agent {
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
             audio_config,
+            stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }

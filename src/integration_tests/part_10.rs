@@ -1338,6 +1338,117 @@ async fn test_audio_ineligible_model_sends_text_stub_only() {
     );
 }
 
+/// When native audio is skipped, Whisper STT fallback appends transcription text.
+#[tokio::test]
+async fn test_stt_fallback_appends_transcription_when_native_audio_skipped() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::agent::stt::{content_has_transcription, format_transcription_line};
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+    use crate::config::SttConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mock_cli = tmp.path().join("mock-whisper-cli.sh");
+    std::fs::write(
+        &mock_cli,
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -of) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s' 'Who is my dad?' > "${out}.txt"
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&mock_cli).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&mock_cli, perms).unwrap();
+
+    let model_path = tmp.path().join("model.bin");
+    std::fs::write(&model_path, b"mock").unwrap();
+
+    let mut wav = tempfile::NamedTempFile::new().unwrap();
+    wav.write_all(b"RIFF....WAVEfmt ").unwrap();
+
+    let attachment = message_attachment(
+        wav.path().to_path_buf(),
+        "voice.wav".to_string(),
+        "audio/wav".to_string(),
+        16,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("what did they say?", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "They asked who their dad is.",
+    )]);
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness.agent.set_test_stt_config(SttConfig {
+        enabled: true,
+        cli_path: mock_cli,
+        model_path,
+        ffmpeg_path: std::path::PathBuf::from("ffmpeg"),
+        language: "en".to_string(),
+        max_audio_bytes: 25 * 1_048_576,
+        timeout_secs: 30,
+        mime_types: vec!["audio/wav".to_string(), "audio/ogg".to_string()],
+    });
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "stt_fallback_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let history = harness
+        .state
+        .get_history("stt_fallback_test", 5)
+        .await
+        .unwrap();
+    let user_msg = history
+        .iter()
+        .find(|m| m.role == "user")
+        .expect("user message persisted");
+    let content = user_msg.content.as_deref().unwrap_or("");
+    assert!(
+        content_has_transcription(content),
+        "user message should include STT transcription, got: {content}"
+    );
+    assert!(content.contains(&format_transcription_line("voice.wav", "Who is my dad?")));
+
+    let call_log = harness.provider.call_log.lock().await;
+    let llm_user_text = call_log
+        .iter()
+        .flat_map(|call| call.messages.iter())
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        llm_user_text
+            .iter()
+            .any(|text| content_has_transcription(text)),
+        "LLM payload should include transcription text"
+    );
+    assert!(
+        !call_log
+            .iter()
+            .any(|call| llm_messages_contain_input_audio(&call.messages)),
+        "STT fallback must not send input_audio blocks"
+    );
+}
+
 /// Non-image attachments on ineligible models should not produce vision blocks.
 #[tokio::test]
 async fn test_non_image_attachment_is_text_stub_only() {

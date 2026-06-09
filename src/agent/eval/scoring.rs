@@ -79,10 +79,44 @@ pub fn compute_progress_yield(progress: &ProgressSnapshot) -> f32 {
         + progress.observation_count as f32
         + progress.verification_count as f32;
     let mut score = (yield_units / iterations).min(1.0);
+    // Conversational/direct-reply turns may legitimately produce zero tool yield;
+    // give modest credit when the loop stayed clean (no stall churn).
+    if score < f32::EPSILON
+        && progress.stall_guard_fires == 0
+        && progress.deferred_no_tool_events <= 1
+        && progress.iterations <= 3
+    {
+        score = (1.0 / iterations).min(0.5);
+    }
     if progress.stall_guard_fires > 2 {
         score *= 0.8;
     }
     score.clamp(0.0, 1.0)
+}
+
+/// Whether all active completion-contract obligations were satisfied.
+pub fn contract_is_fulfilled(contract: &ContractSnapshot) -> bool {
+    let mut checks = 0_u32;
+    let mut passed = 0_u32;
+    if contract.requires_observation {
+        checks += 1;
+        if contract.observation_count > 0 {
+            passed += 1;
+        }
+    }
+    if contract.expects_mutation {
+        checks += 1;
+        if contract.mutation_count > 0 {
+            passed += 1;
+        }
+    }
+    if contract.verification_required {
+        checks += 1;
+        if contract.verification_count > 0 && contract.verification_blocks <= 2 {
+            passed += 1;
+        }
+    }
+    checks == 0 || passed == checks
 }
 
 pub fn compute_contract_fulfillment(contract: &ContractSnapshot, outcome: TaskOutcome) -> f32 {
@@ -237,5 +271,24 @@ mod tests {
         let cheap = weighted_tokens_from_raw(1000, 100, Some(ModelProfile::Cheap), &config);
         let strong = weighted_tokens_from_raw(1000, 100, Some(ModelProfile::Strong), &config);
         assert!(strong > cheap);
+    }
+
+    #[test]
+    fn contract_is_fulfilled_requires_mutation_when_expected() {
+        let mut contract = ContractSnapshot::default();
+        contract.expects_mutation = true;
+        contract.mutation_count = 0;
+        assert!(!contract_is_fulfilled(&contract));
+        contract.mutation_count = 1;
+        assert!(contract_is_fulfilled(&contract));
+    }
+
+    #[test]
+    fn progress_yield_credits_clean_conversational_turns() {
+        let progress = ProgressSnapshot {
+            iterations: 1,
+            ..Default::default()
+        };
+        assert!(compute_progress_yield(&progress) >= 0.5);
     }
 }

@@ -170,7 +170,8 @@ fn is_consequential(text: &str) -> bool {
 pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> BrowserActionRisk {
     match action {
         // ── Observation ───────────────────────────────────────────────────────
-        "get_text" | "screenshot" | "wait" | "list_tabs" => BrowserActionRisk {
+        "get_text" | "screenshot" | "wait" | "list_tabs" | "get_console_logs"
+        | "get_network_errors" => BrowserActionRisk {
             class: BrowserRiskClass::Observation,
             sensitive: false,
             consequential: false,
@@ -231,7 +232,14 @@ mod tests {
 
     #[test]
     fn observation_actions_map_correctly() {
-        for action in &["get_text", "screenshot", "wait", "list_tabs"] {
+        for action in &[
+            "get_text",
+            "screenshot",
+            "wait",
+            "list_tabs",
+            "get_console_logs",
+            "get_network_errors",
+        ] {
             let r = classify(action, None, None);
             assert_eq!(
                 r.class,

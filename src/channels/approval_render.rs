@@ -107,9 +107,9 @@ fn strip_approval_footer(text: &str) -> String {
 /// Build the message body shown after the user chooses Allow / Deny.
 pub(super) fn finalize_approval_message(original: &str, response: &ApprovalResponse) -> String {
     let body = strip_approval_footer(original);
-    let (icon, status) = response_status(&response);
+    let (icon, status) = response_status(response);
     let mut text = format!("{body}\n\n{icon} {status}");
-    if let Some(detail) = response_status_detail(&response) {
+    if let Some(detail) = response_status_detail(response) {
         text.push_str(&format!("\n{detail}"));
     }
     text
@@ -171,7 +171,7 @@ pub(super) fn build_approval_message_text(
     );
 
     if !warnings.is_empty() {
-        text.push_str("\n");
+        text.push('\n');
         for warning in warnings {
             text.push_str(&format!("\n• {}", html_escape(warning)));
         }

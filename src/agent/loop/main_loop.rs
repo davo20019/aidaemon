@@ -133,6 +133,7 @@ impl Agent {
     /// `heartbeat` is an optional atomic timestamp updated on each activity point.
     /// Channels pass `Some(heartbeat)` so the typing indicator can detect stalls;
     /// sub-agents, triggers, and tests pass `None`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_message_impl(
         &self,
         session_id: &str,

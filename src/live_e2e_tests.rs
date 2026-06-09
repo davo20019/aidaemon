@@ -149,6 +149,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 
@@ -343,6 +344,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 

@@ -455,6 +455,7 @@ async fn setup_test_agent_internal(
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 
@@ -560,6 +561,7 @@ pub async fn setup_test_agent_with_models(
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
     // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
@@ -650,6 +652,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 
@@ -887,6 +890,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         None, // interactive_slot — slot routing not exercised in tests
         crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
         crate::config::AudioConfig::from_files(&crate::config::FilesConfig::default()),
+        crate::config::SttConfig::from_files(&crate::config::FilesConfig::default()),
         (&crate::config::DiagnosticsHarnessEvalConfig::default()).into(),
     );
 

@@ -1332,6 +1332,66 @@ impl ConfigManagerTool {
 
         Ok(response.join("\n"))
     }
+
+    async fn enable_stt(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let probe = crate::stt_setup::SttProbe::resolve(
+            args.stt_cli_path.as_deref(),
+            args.stt_model_path.as_deref(),
+            args.stt_ffmpeg_path.as_deref(),
+        );
+
+        let mut issues = Vec::new();
+        if probe.whisper_cli.is_none() {
+            issues.push("whisper-cli not found (install whisper.cpp or set stt_cli_path)");
+        }
+        if probe.ffmpeg.is_none() {
+            issues.push("ffmpeg not found (install ffmpeg)");
+        }
+        if probe.model_path.is_none() {
+            issues.push("Whisper model not found (download a GGML .bin or set stt_model_path)");
+        }
+        if !issues.is_empty() {
+            let bullet_list = issues
+                .iter()
+                .map(|issue| format!("- {issue}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(format!(
+                "Cannot enable STT:\n{bullet_list}\n\n{}",
+                crate::stt_setup::format_stt_probe_report(&probe)
+            ));
+        }
+
+        let language = args
+            .stt_language
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("en");
+
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        crate::stt_setup::apply_stt_to_config_table(&mut doc, &probe, true, language)?;
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = Self::validate_config(&new_content) {
+            return Ok(format!(
+                "Refused to enable STT: {}.\n\nThe config was NOT modified.",
+                e
+            ));
+        }
+
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+        }
+
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        set_owner_only_permissions(&self.config_path);
+
+        Ok(format!(
+            "Enabled Whisper STT fallback ([files.stt]).\n\n{}\n- language: `{language}`\n\nConfig validated and saved. Restart aidaemon (`/restart`) to apply — STT is loaded at startup.",
+            crate::stt_setup::format_stt_probe_report(&probe)
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1359,6 +1419,14 @@ struct ConfigArgs {
     failover_index: Option<usize>,
     #[serde(default = "default_true")]
     save_secrets_to_keychain: bool,
+    #[serde(default)]
+    stt_cli_path: Option<String>,
+    #[serde(default)]
+    stt_model_path: Option<String>,
+    #[serde(default)]
+    stt_language: Option<String>,
+    #[serde(default)]
+    stt_ffmpeg_path: Option<String>,
     /// Session ID for routing approval requests (injected by agent).
     #[serde(default)]
     _session_id: String,
@@ -1371,17 +1439,16 @@ fn default_true() -> bool {
 fn manage_config_schema() -> Value {
     json!({
         "name": "manage_config",
-        "description": "Read or update aidaemon config.toml with backup and validation.",
+        "description": "Read/update config.toml (backup+validate).",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider"],
-                    "description": "Config action"
+                    "enum": ["read", "get", "set", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt"]
                 },
-                "key": { "type": "string", "description": "TOML key path (get/set)" },
-                "value": { "type": "string", "description": "TOML literal (set)" },
+                "key": { "type": "string" },
+                "value": { "type": "string" },
                 "provider": { "type": "string" },
                 "api_key": { "type": "string" },
                 "base_url": { "type": "string" },
@@ -1389,8 +1456,11 @@ fn manage_config_schema() -> Value {
                 "primary_model": { "type": "string" },
                 "fast_model": { "type": "string" },
                 "smart_model": { "type": "string" },
-                "failover_index": { "type": "integer", "description": "Index for remove_failover_provider" },
-                "save_secrets_to_keychain": { "type": "boolean" }
+                "failover_index": { "type": "integer" },
+                "save_secrets_to_keychain": { "type": "boolean" },
+                "stt_cli_path": { "type": "string" },
+                "stt_model_path": { "type": "string" },
+                "stt_language": { "type": "string" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -1431,6 +1501,7 @@ impl Tool for ConfigManagerTool {
             "list_failover_providers" => self.list_failover_providers().await,
             "add_failover_provider" => self.add_failover_provider(&args).await,
             "remove_failover_provider" => self.remove_failover_provider(&args).await,
+            "enable_stt" => self.enable_stt(&args).await,
             "read" => {
                 let content = tokio::fs::read_to_string(&self.config_path).await?;
                 let mut doc: toml::Value = content.parse()?;
@@ -1533,7 +1604,7 @@ impl Tool for ConfigManagerTool {
                 Err(e) => Ok(format!("Restore failed: {}", e)),
             },
             _ => Ok(format!(
-                "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', or 'remove_failover_provider'.",
+                "Unknown action: {}. Use 'read', 'get', 'set', 'restore', 'list_provider_presets', 'switch_provider', 'list_failover_providers', 'add_failover_provider', 'remove_failover_provider', or 'enable_stt'.",
                 args.action
             )),
         }
@@ -1643,6 +1714,10 @@ mod tests {
             smart_model: String::new(),
             save_secrets_to_keychain: true,
             failover_index: None,
+            stt_cli_path: None,
+            stt_model_path: None,
+            stt_language: None,
+            stt_ffmpeg_path: None,
             _session_id: "test-session".to_string(),
         }
     }
@@ -1679,10 +1754,9 @@ mod tests {
         // per-tool payload budget. If you trip this assert by adding features,
         // compress the description text — do not raise the ceiling without
         // updating the Pillar C implementation plan.
-        // NOTE: plan ceiling was 900. manage_config has a 9-value action enum
-        // (including 4 named failover-provider actions required by the base prompt)
-        // plus 12 parameters. Structural floor is ~672 bytes; ceiling 950 gives
-        // comfortable room for short descriptions on non-obvious params.
+        // NOTE: plan ceiling was 900. manage_config has a 10-value action enum
+        // (including enable_stt + 4 failover-provider actions) plus 15 parameters.
+        // Descriptions trimmed to stay within payload budget.
         let bytes = serde_json::to_string(&manage_config_schema())
             .unwrap()
             .len();
@@ -1901,5 +1975,74 @@ default = "grok-4"
         );
         assert_eq!(cfg.provider.fallbacks[0].api_key, "second-key");
         assert_eq!(cfg.provider.fallbacks[0].models.default_model, "grok-4");
+    }
+
+    #[tokio::test]
+    async fn enable_stt_writes_files_stt_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("whisper-cli");
+        std::fs::write(&cli, b"").unwrap();
+        let model = dir.path().join("model.bin");
+        std::fs::write(&model, b"fake").unwrap();
+        let ffmpeg = dir.path().join("ffmpeg");
+        std::fs::write(&ffmpeg, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (_cfg_dir, path) = write_temp_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+fast = "gpt-4o-mini"
+smart = "gpt-4o"
+"#,
+        );
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "enable_stt".to_string();
+        args.stt_cli_path = Some(cli.to_string_lossy().to_string());
+        args.stt_model_path = Some(model.to_string_lossy().to_string());
+        args.stt_ffmpeg_path = Some(ffmpeg.to_string_lossy().to_string());
+        args.stt_language = Some("en".to_string());
+
+        let reply = tool.enable_stt(&args).await.unwrap();
+        assert!(reply.contains("Enabled Whisper STT fallback"));
+        assert!(reply.contains("/restart"));
+
+        let saved = fs::read_to_string(&path).expect("read saved config");
+        let cfg: AppConfig = toml::from_str(&saved).expect("parse saved config");
+        assert!(cfg.files.stt.enabled);
+        assert_eq!(cfg.files.stt.language, "en");
+    }
+
+    #[tokio::test]
+    async fn enable_stt_reports_missing_stack() {
+        let (_dir, path) = write_temp_config(
+            r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+"#,
+        );
+        let tool = approving_tool(path);
+        let mut args = test_args();
+        args.action = "enable_stt".to_string();
+        args.stt_cli_path = Some("/nonexistent/whisper-cli".to_string());
+        args.stt_model_path = Some("/nonexistent/model.bin".to_string());
+        args.stt_ffmpeg_path = Some("/nonexistent/ffmpeg".to_string());
+
+        let reply = tool.enable_stt(&args).await.unwrap();
+        assert!(reply.contains("Cannot enable STT"));
     }
 }

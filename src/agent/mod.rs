@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::channels::ChannelHub;
 use crate::config::{
-    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig,
+    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, SttConfig, VisionConfig,
 };
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
@@ -251,6 +251,7 @@ mod stopping_helpers;
 mod stopping_phase;
 #[path = "loop/stopping_progress.rs"]
 mod stopping_progress;
+pub(crate) mod stt;
 #[path = "loop/system_directives.rs"]
 mod system_directives;
 #[path = "runtime/system_prompt.rs"]
@@ -453,6 +454,8 @@ pub struct Agent {
     vision_config: VisionConfig,
     /// Native audio input settings for multimodal LLM requests.
     audio_config: AudioConfig,
+    /// Local Whisper STT fallback when native audio is skipped.
+    stt_config: SttConfig,
     /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
     harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
     /// Harness eval scoring configuration.
@@ -542,6 +545,7 @@ impl Agent {
         turn_render::RenderOptions {
             vision: self.vision_config.clone(),
             audio: self.audio_config.clone(),
+            stt: self.stt_config.clone(),
             model: model.to_string(),
         }
     }
@@ -680,6 +684,7 @@ impl Agent {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_message_with_attachments(
         &self,
         session_id: &str,

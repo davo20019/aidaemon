@@ -20,12 +20,16 @@ use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 use policy::BrowserRiskClass;
 
 mod backend;
+mod diagnostics;
 pub mod policy;
 mod session;
+#[cfg(all(test, feature = "browser"))]
+mod smoke;
 #[cfg(test)]
 mod tests;
 
 use backend::{BrowserBackend, ChromiumoxideBackend, PageHandle};
+use diagnostics::BrowserDiagnosticsStore;
 use session::{BrowserSessionRegistry, TabView};
 
 use tokio::sync::OwnedMutexGuard;
@@ -182,7 +186,7 @@ struct ActionArgs<'a> {
 /// - For inputs without a `scheme://authority` form (e.g. `about:blank`,
 ///   `data:`, or a schemeless `host.com/path?x=secret`), cut at the first `/`,
 ///   `?`, or `#`, stripping any path/query/fragment so none of it can leak.
-fn redact_origin(url: &str) -> String {
+pub(super) fn redact_origin(url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
         return String::new();
@@ -237,37 +241,37 @@ fn format_browser_approval_prompt(
     _risk: &policy::BrowserActionRisk,
 ) -> String {
     match action {
-        "list_tabs" => return "List open browser tabs".to_string(),
-        "close" => return "Close browser".to_string(),
+        "list_tabs" => "List open browser tabs".to_string(),
+        "close" => "Close browser".to_string(),
         "close_tab" => {
-            return format!("Close browser tab {}", tab_id.unwrap_or("?"));
+            format!("Close browser tab {}", tab_id.unwrap_or("?"))
         }
-        "navigate" => return format!("Open website: {origin}"),
-        "new_tab" => return format!("Open new tab: {origin}"),
+        "navigate" => format!("Open website: {origin}"),
+        "new_tab" => format!("Open new tab: {origin}"),
         "switch_tab" => {
-            return format!("Switch to browser tab {}", tab_id.unwrap_or("?"));
+            format!("Switch to browser tab {}", tab_id.unwrap_or("?"))
         }
         "execute_js" => {
             let bytes = script_len.unwrap_or(0);
-            return format!("Run JavaScript on {origin} ({bytes} bytes)");
+            format!("Run JavaScript on {origin} ({bytes} bytes)")
         }
         "click" => {
             if let Some(sel) = selector {
                 return format!("Click \"{sel}\" on {origin}");
             }
-            return format!("Click on {origin}");
+            format!("Click on {origin}")
         }
         "fill" => {
             if let Some(sel) = selector {
                 return format!("Fill in \"{sel}\" on {origin}");
             }
-            return format!("Fill in a form field on {origin}");
+            format!("Fill in a form field on {origin}")
         }
-        "get_text" => return format!("Read page text from {origin}"),
-        "screenshot" => return format!("Take screenshot of {origin}"),
-        "wait" => return format!("Wait on {origin}"),
-        "set_mode" => return format!("Change browser mode on {origin}"),
-        _ => return format!("Browser action on {origin}"),
+        "get_text" => format!("Read page text from {origin}"),
+        "screenshot" => format!("Take screenshot of {origin}"),
+        "wait" => format!("Wait on {origin}"),
+        "set_mode" => format!("Change browser mode on {origin}"),
+        _ => format!("Browser action on {origin}"),
     }
 }
 
@@ -401,6 +405,8 @@ pub struct BrowserTool {
     /// fallback for a NON-navigating click is a small fraction of this so a
     /// click that doesn't navigate returns fast.
     action_timeout: Duration,
+    /// Console logs and network load failures, scoped per session/tab.
+    diagnostics: BrowserDiagnosticsStore,
 }
 
 /// Upper bound on the element-poll timeout, mirroring `BrowserConfig`'s
@@ -457,6 +463,7 @@ impl BrowserTool {
             nav_timeout,
             element_timeout,
             action_timeout,
+            diagnostics: BrowserDiagnosticsStore::new(),
         })
     }
 
@@ -478,6 +485,7 @@ impl BrowserTool {
             nav_timeout: Duration::from_secs(30),
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
+            diagnostics: BrowserDiagnosticsStore::new(),
         }
     }
 
@@ -501,6 +509,7 @@ impl BrowserTool {
             nav_timeout: Duration::from_secs(30),
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
+            diagnostics: BrowserDiagnosticsStore::new(),
         }
     }
 
@@ -720,6 +729,11 @@ impl BrowserTool {
             .sessions
             .get_or_create_page(session_id, &*self.backend)
             .await?;
+        if let Some(tab_id) = self.sessions.active_target_id(session_id).await {
+            self.diagnostics
+                .ensure_listeners(&page, session_id, &tab_id)
+                .await;
+        }
         let guard = action_lock.lock_owned().await;
         Ok((page, guard))
     }
@@ -1301,6 +1315,7 @@ impl BrowserTool {
         // (we never send it a close command). Left as a documented follow-up.
         let result = self.backend.shutdown().await;
         self.sessions.invalidate_all_pages().await;
+        self.diagnostics.reset_attached().await;
         result
     }
 
@@ -1342,6 +1357,14 @@ impl BrowserTool {
                 .action_list_tabs(session_id)
                 .await
                 .map(DispatchResult::text_only),
+            "get_console_logs" => self
+                .action_get_console_logs(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
+            "get_network_errors" => self
+                .action_get_network_errors(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
             "new_tab" => self
                 .action_new_tab(args, session_id)
                 .await
@@ -1360,7 +1383,7 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "close" => self.action_close().await.map(DispatchResult::text_only),
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, new_tab, switch_tab, close_tab, set_mode, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
         }
@@ -1430,6 +1453,7 @@ impl BrowserTool {
         // the next page resolution mints fresh handles against the new
         // connection. Then reconnect exactly once.
         self.sessions.invalidate_all_pages().await;
+        self.diagnostics.reset_attached().await;
         if let Err(reconnect_err) = self.backend.reconnect().await {
             return Err(format!(
                 "Browser connection lost and reconnect failed: {}. \
@@ -1457,6 +1481,56 @@ impl BrowserTool {
              manually if needed after checking the page state.",
             action
         ))
+    }
+
+    /// Resolve the tab id for diagnostics actions: explicit `tab_id` arg or the
+    /// session's active tab.
+    async fn resolve_tab_id(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        if let Some(tab_id) = args.get("tab_id").and_then(|v| v.as_str()) {
+            if tab_id.is_empty() {
+                return Err("tab_id must not be empty".to_string());
+            }
+            let tabs = self.sessions.list_tabs(session_id).await;
+            if !tabs.iter().any(|t| t.tab_id == tab_id) {
+                return Err(format!(
+                    "Unknown tab '{}'. It does not belong to this session. Use list_tabs to see open tabs.",
+                    tab_id
+                ));
+            }
+            return Ok(tab_id.to_string());
+        }
+        self.sessions
+            .active_target_id(session_id)
+            .await
+            .ok_or_else(|| {
+                "No active tab in this session. Use list_tabs or new_tab first.".to_string()
+            })
+    }
+
+    async fn action_get_console_logs(
+        &self,
+        args: &Value,
+        session_id: &str,
+    ) -> Result<String, String> {
+        let (_page, _guard) = self.page_for(session_id).await?;
+        let tab_id = self.resolve_tab_id(args, session_id).await?;
+        Ok(self
+            .diagnostics
+            .format_console_logs(session_id, &tab_id)
+            .await)
+    }
+
+    async fn action_get_network_errors(
+        &self,
+        args: &Value,
+        session_id: &str,
+    ) -> Result<String, String> {
+        let (_page, _guard) = self.page_for(session_id).await?;
+        let tab_id = self.resolve_tab_id(args, session_id).await?;
+        Ok(self
+            .diagnostics
+            .format_network_errors(session_id, &tab_id)
+            .await)
     }
 
     /// `list_tabs`: render this session's tabs — opaque id, title, REDACTED
@@ -1601,6 +1675,7 @@ impl BrowserTool {
         if let Err(e) = self.backend.close_target(&target_id).await {
             warn!(tab_id, error = %e, "backend close_target failed after session removal");
         }
+        self.diagnostics.drop_tab(session_id, tab_id).await;
 
         match new_active {
             Some(active) => Ok(format!(
@@ -1678,13 +1753,13 @@ impl Tool for BrowserTool {
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
+            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "list_tabs", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
+                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
                         "description": "The browser action to perform"
                     },
                     "url": {
@@ -1722,7 +1797,7 @@ impl Tool for BrowserTool {
                     },
                     "tab_id": {
                         "type": "string",
-                        "description": "Opaque tab id from list_tabs/new_tab (required for 'switch_tab' and 'close_tab')"
+                        "description": "Opaque tab id from list_tabs/new_tab (required for 'switch_tab' and 'close_tab'; optional for 'get_console_logs' and 'get_network_errors' — defaults to the active tab)"
                     }
                 },
                 "required": ["action"],
@@ -1785,6 +1860,8 @@ impl Tool for BrowserTool {
             Some("screenshot") => ToolCallSemantics::observation(),
             // list_tabs just reads the session's tab set — pure observation.
             Some("list_tabs") => ToolCallSemantics::observation(),
+            Some("get_console_logs" | "get_network_errors") => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
             // new_tab/switch_tab change which page subsequent actions target,
             // mirroring navigate's observation classification (they don't mutate
             // page content, they reposition the session).

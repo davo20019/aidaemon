@@ -454,6 +454,9 @@ pub(super) async fn run_completion_phase(
                 stall_count = stall_count.saturating_add(1);
                 consecutive_clean_iterations = 0;
                 pending_system_messages.push(SystemDirective::SuccessfulToolEvidenceMustBeUsed);
+                agent
+                    .with_harness_eval(|eval| eval.record_stall_guard())
+                    .await;
                 warn!(
                     session_id,
                     iteration,
@@ -1394,6 +1397,7 @@ pub(super) async fn run_completion_phase(
                 deferred_no_tool_streak = 0;
                 // Fall through to the normal completion path below
             } else {
+                let mut recovered_post_tool_deferral = false;
                 // Pre-execution deferrals ("I'll do X") should not consume the
                 // main stall budget. Reserve stall_count for post-tool loops so
                 // we don't fail as "stuck" before any tool ever executes.
@@ -1402,172 +1406,225 @@ pub(super) async fn run_completion_phase(
                     POLICY_METRICS
                         .deferred_no_tool_deferral_detected_total
                         .fetch_add(1, Ordering::Relaxed);
+                    agent
+                        .with_harness_eval(|eval| eval.record_deferred_no_tool_event())
+                        .await;
+                    consecutive_clean_iterations = 0;
                 } else {
-                    stall_count = stall_count.saturating_add(1);
-                    deferred_no_tool_streak = 0;
-                }
-                consecutive_clean_iterations = 0;
-
-                // Hard escape: when force_text is active (tools stripped) and we
-                // have tool history, deferred-action ContinueLoop is a dead end —
-                // the model cannot use tools. Build a fallback reply immediately
-                // instead of looping forever.
-                if force_text_response && has_tool_attempts && !learning_ctx.tool_calls.is_empty() {
-                    let actions: Vec<&str> =
-                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                    // First post-tool deferral: try recovering from the latest tool
+                    // result before burning another LLM iteration on "I'll do X" text.
                     let candidate =
                         latest_task_tool_result_for_completion(agent, session_id, task_id, 2500)
                             .await;
-                    reply = build_completion_fallback_reply(
-                        candidate.as_ref(),
-                        &actions,
-                        learning_ctx.tool_calls.len(),
-                    );
-                    info!(
-                        session_id,
-                        iteration,
-                        stall_count,
-                        total_successful_tool_calls,
-                        "Force-text deferred-action hard escape: replaced with fallback reply"
-                    );
-                    // Fall through to normal completion path (no ContinueLoop)
+                    if let Some(candidate) = candidate.as_ref() {
+                        if candidate.tool_name == "send_file" {
+                            reply = super::stopping_phase::send_file_completion_reply().to_string();
+                            recovered_post_tool_deferral = true;
+                        } else if let Some(tool_reply) = build_tool_output_completion_reply(
+                            &candidate.tool_name,
+                            &candidate.tool_output,
+                            candidate.artifact_delivered,
+                        ) {
+                            reply = tool_reply;
+                            recovered_post_tool_deferral = true;
+                        } else if let Some(tool_reply) =
+                            build_structured_tool_output_completion_reply(
+                                &candidate.tool_name,
+                                &candidate.tool_output,
+                                candidate.artifact_delivered,
+                            )
+                        {
+                            reply = tool_reply;
+                            recovered_post_tool_deferral = true;
+                        }
+                    }
+                    if recovered_post_tool_deferral {
+                        info!(
+                            session_id,
+                            iteration,
+                            total_successful_tool_calls,
+                            "Recovered first post-tool deferred reply from successful tool output"
+                        );
+                    } else {
+                        stall_count = stall_count.saturating_add(1);
+                        deferred_no_tool_streak = 0;
+                        agent
+                            .with_harness_eval(|eval| eval.record_stall_guard())
+                            .await;
+                        consecutive_clean_iterations = 0;
+                    }
+                }
+
+                if recovered_post_tool_deferral {
+                    // Fall through to the normal completion path below.
                 } else {
-                    warn!(
-                        session_id,
-                        iteration,
-                        stall_count,
-                        deferred_no_tool_streak,
-                        total_successful_tool_calls,
-                        has_tool_attempts,
-                        "Deferred-action reply without concrete results; continuing loop"
-                    );
-
-                    // Check if the deferred-action reply itself contains an
-                    // INTENT_GATE marker claiming needs_tools:true — i.e. the model
-                    // explicitly told us it needs tool access to fulfil this request.
-                    // This is more reliable than `expects_mutation` which also matches
-                    // pure text-generation tasks ("write a tweet").
-                    let response_claims_needs_tools = {
-                        let lower_reply = reply.to_ascii_lowercase();
-                        lower_reply.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
-                            && lower_reply.contains("\"needs_tools\":true")
-                    };
-                    let deferred_nudge = if !has_tool_attempts {
-                        // A claimed-but-unexecuted mutation always needs a
-                        // tool call — never downgrade it to plain-text mode,
-                        // which would accept the fabrication next iteration.
-                        if needs_tools_for_turn
-                            || response_claims_needs_tools
-                            || claims_unfulfilled_mutation
-                            || claims_unfulfilled_delegation
-                        {
-                            SystemDirective::DeferredToolCallRequired
-                        } else {
-                            force_text_response = true;
-                            SystemDirective::ToolModeDisabledPlainText
-                        }
-                    } else if incomplete_live_work_summary {
-                        SystemDirective::LiveWorkPivotRequired
-                    } else {
-                        SystemDirective::DeferredProvideConcreteResults
-                    };
-
-                    pending_system_messages.push(deferred_nudge);
-
-                    // Fallback expansion: widen tool set once after exactly two
-                    // no-progress iterations, even in no-tool-call paths.
-                    let fallback_trigger = if !has_tool_attempts {
-                        deferred_no_tool_streak == 2
-                    } else {
-                        stall_count == 2
-                    };
-                    if fallback_trigger && !fallback_expanded_once {
-                        fallback_expanded_once = true;
-                        let previous_count = tool_defs.len();
-                        let widened = agent.filter_tool_definitions_for_policy(
-                            base_tool_defs,
-                            available_capabilities,
-                            &policy_bundle.policy,
-                            policy_bundle.risk_score,
-                            true,
-                        );
-                        let widened = agent
-                            .restrict_connected_api_setup_tools_for_request(user_text, &widened);
-                        let widened = agent.ensure_connected_api_tools_exposed(
-                            user_text,
-                            &widened,
-                            base_tool_defs,
-                        );
-                        let widened = if restrict_to_personal_memory_tools {
-                            filter_tool_defs_for_personal_memory(&widened)
-                        } else {
-                            widened
-                        };
-                        if !widened.is_empty() {
-                            POLICY_METRICS
-                                .fallback_expansion_total
-                                .fetch_add(1, Ordering::Relaxed);
-                            tool_defs = widened;
-                            info!(
-                                session_id,
-                                iteration,
-                                previous_count,
-                                widened_count = tool_defs.len(),
-                                "No-progress fallback expansion applied (deferred-action path)"
-                            );
-                        }
-                    }
-
-                    if !has_tool_attempts
-                        && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
-                        && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                    // Hard escape: when force_text is active (tools stripped) and we
+                    // have tool history, deferred-action ContinueLoop is a dead end —
+                    // the model cannot use tools. Build a fallback reply immediately
+                    // instead of looping forever.
+                    if force_text_response
+                        && has_tool_attempts
+                        && !learning_ctx.tool_calls.is_empty()
                     {
-                        if let Some(next_model) = agent
-                            .pick_fallback_excluding(&model, &[], llm_router.as_ref())
-                            .await
-                        {
-                            info!(
-                                session_id,
-                                iteration,
-                                from_model = %model,
-                                to_model = %next_model,
-                                "Deferred/no-tool recovery: switching model for one retry window"
-                            );
-                            model = next_model;
-                            deferred_no_tool_model_switches += 1;
-                            POLICY_METRICS
-                                .deferred_no_tool_model_switch_total
-                                .fetch_add(1, Ordering::Relaxed);
-                            // Strategy changed, give the new model a fresh stall budget.
-                            stall_count = 0;
-                            pending_system_messages.push(SystemDirective::RecoveryModeModelSwitch);
-                        }
-                    }
-
-                    if !has_tool_attempts
-                        && deferred_no_tool_streak >= MAX_STALL_ITERATIONS
-                        && !learning_ctx
-                            .errors
-                            .iter()
-                            .any(|(e, _)| e == DEFERRED_NO_TOOL_ERROR_MARKER)
-                    {
-                        learning_ctx
-                            .errors
-                            .push((DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false));
-                        POLICY_METRICS
-                            .deferred_no_tool_error_marker_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        let actions: Vec<&str> =
+                            learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                        let candidate = latest_task_tool_result_for_completion(
+                            agent, session_id, task_id, 2500,
+                        )
+                        .await;
+                        reply = build_completion_fallback_reply(
+                            candidate.as_ref(),
+                            &actions,
+                            learning_ctx.tool_calls.len(),
+                        );
+                        info!(
+                            session_id,
+                            iteration,
+                            stall_count,
+                            total_successful_tool_calls,
+                            "Force-text deferred-action hard escape: replaced with fallback reply"
+                        );
+                        // Fall through to normal completion path (no ContinueLoop)
+                    } else {
                         warn!(
                             session_id,
                             iteration,
+                            stall_count,
                             deferred_no_tool_streak,
-                            "Deferred/no-tool recovery exhausted: recording terminal marker"
+                            total_successful_tool_calls,
+                            has_tool_attempts,
+                            "Deferred-action reply without concrete results; continuing loop"
                         );
-                    }
 
-                    commit_state!();
-                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
-                } // end force_text hard escape else
+                        // Check if the deferred-action reply itself contains an
+                        // INTENT_GATE marker claiming needs_tools:true — i.e. the model
+                        // explicitly told us it needs tool access to fulfil this request.
+                        // This is more reliable than `expects_mutation` which also matches
+                        // pure text-generation tasks ("write a tweet").
+                        let response_claims_needs_tools = {
+                            let lower_reply = reply.to_ascii_lowercase();
+                            lower_reply.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
+                                && lower_reply.contains("\"needs_tools\":true")
+                        };
+                        let deferred_nudge = if !has_tool_attempts {
+                            // A claimed-but-unexecuted mutation always needs a
+                            // tool call — never downgrade it to plain-text mode,
+                            // which would accept the fabrication next iteration.
+                            if needs_tools_for_turn
+                                || response_claims_needs_tools
+                                || claims_unfulfilled_mutation
+                                || claims_unfulfilled_delegation
+                            {
+                                SystemDirective::DeferredToolCallRequired
+                            } else {
+                                force_text_response = true;
+                                SystemDirective::ToolModeDisabledPlainText
+                            }
+                        } else if incomplete_live_work_summary {
+                            SystemDirective::LiveWorkPivotRequired
+                        } else {
+                            SystemDirective::DeferredProvideConcreteResults
+                        };
+
+                        pending_system_messages.push(deferred_nudge);
+
+                        // Fallback expansion: widen tool set once after exactly two
+                        // no-progress iterations, even in no-tool-call paths.
+                        let fallback_trigger = if !has_tool_attempts {
+                            deferred_no_tool_streak == 2
+                        } else {
+                            stall_count == 2
+                        };
+                        if fallback_trigger && !fallback_expanded_once {
+                            fallback_expanded_once = true;
+                            let previous_count = tool_defs.len();
+                            let widened = agent.filter_tool_definitions_for_policy(
+                                base_tool_defs,
+                                available_capabilities,
+                                &policy_bundle.policy,
+                                policy_bundle.risk_score,
+                                true,
+                            );
+                            let widened = agent.restrict_connected_api_setup_tools_for_request(
+                                user_text, &widened,
+                            );
+                            let widened = agent.ensure_connected_api_tools_exposed(
+                                user_text,
+                                &widened,
+                                base_tool_defs,
+                            );
+                            let widened = if restrict_to_personal_memory_tools {
+                                filter_tool_defs_for_personal_memory(&widened)
+                            } else {
+                                widened
+                            };
+                            if !widened.is_empty() {
+                                POLICY_METRICS
+                                    .fallback_expansion_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tool_defs = widened;
+                                info!(
+                                    session_id,
+                                    iteration,
+                                    previous_count,
+                                    widened_count = tool_defs.len(),
+                                    "No-progress fallback expansion applied (deferred-action path)"
+                                );
+                            }
+                        }
+
+                        if !has_tool_attempts
+                            && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
+                            && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                        {
+                            if let Some(next_model) = agent
+                                .pick_fallback_excluding(&model, &[], llm_router.as_ref())
+                                .await
+                            {
+                                info!(
+                                    session_id,
+                                    iteration,
+                                    from_model = %model,
+                                    to_model = %next_model,
+                                    "Deferred/no-tool recovery: switching model for one retry window"
+                                );
+                                model = next_model;
+                                deferred_no_tool_model_switches += 1;
+                                POLICY_METRICS
+                                    .deferred_no_tool_model_switch_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                // Strategy changed, give the new model a fresh stall budget.
+                                stall_count = 0;
+                                pending_system_messages
+                                    .push(SystemDirective::RecoveryModeModelSwitch);
+                            }
+                        }
+
+                        if !has_tool_attempts
+                            && deferred_no_tool_streak >= MAX_STALL_ITERATIONS
+                            && !learning_ctx
+                                .errors
+                                .iter()
+                                .any(|(e, _)| e == DEFERRED_NO_TOOL_ERROR_MARKER)
+                        {
+                            learning_ctx
+                                .errors
+                                .push((DEFERRED_NO_TOOL_ERROR_MARKER.to_string(), false));
+                            POLICY_METRICS
+                                .deferred_no_tool_error_marker_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                session_id,
+                                iteration,
+                                deferred_no_tool_streak,
+                                "Deferred/no-tool recovery exhausted: recording terminal marker"
+                            );
+                        }
+
+                        commit_state!();
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                    } // end force_text hard escape else
+                } // end recovered_post_tool_deferral else
             }
         }
 

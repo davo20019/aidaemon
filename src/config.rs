@@ -2071,6 +2071,29 @@ pub struct FilesConfig {
     pub audio_mime_types: Vec<String>,
     #[serde(default = "default_audio_model_patterns")]
     pub audio_model_patterns: Vec<String>,
+    #[serde(default)]
+    pub stt: SttFilesConfig,
+}
+
+/// Local Whisper STT settings under `[files.stt]`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SttFilesConfig {
+    #[serde(default = "default_stt_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_stt_cli_path")]
+    pub cli_path: String,
+    #[serde(default = "default_stt_model_path")]
+    pub model_path: String,
+    #[serde(default = "default_stt_ffmpeg_path")]
+    pub ffmpeg_path: String,
+    #[serde(default = "default_stt_language")]
+    pub language: String,
+    #[serde(default = "default_stt_max_audio_mb")]
+    pub max_audio_mb: u64,
+    #[serde(default = "default_stt_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_stt_mime_types")]
+    pub mime_types: Vec<String>,
 }
 
 /// Vision/image encoding settings derived from `[files]` config.
@@ -2126,6 +2149,59 @@ impl AudioConfig {
     }
 }
 
+/// Resolved Whisper STT settings for runtime use.
+#[derive(Debug, Clone)]
+pub struct SttConfig {
+    pub enabled: bool,
+    pub cli_path: std::path::PathBuf,
+    pub model_path: std::path::PathBuf,
+    pub ffmpeg_path: std::path::PathBuf,
+    pub language: String,
+    pub max_audio_bytes: u64,
+    pub timeout_secs: u64,
+    pub mime_types: Vec<String>,
+}
+
+impl SttConfig {
+    pub fn from_files(files: &FilesConfig) -> Self {
+        Self {
+            enabled: files.stt.enabled,
+            cli_path: std::path::PathBuf::from(
+                shellexpand::tilde(&files.stt.cli_path).into_owned(),
+            ),
+            model_path: std::path::PathBuf::from(
+                shellexpand::tilde(&files.stt.model_path).into_owned(),
+            ),
+            ffmpeg_path: std::path::PathBuf::from(
+                shellexpand::tilde(&files.stt.ffmpeg_path).into_owned(),
+            ),
+            language: files.stt.language.clone(),
+            max_audio_bytes: files.stt.max_audio_mb.saturating_mul(1_048_576),
+            timeout_secs: files.stt.timeout_secs,
+            mime_types: files.stt.mime_types.clone(),
+        }
+    }
+
+    pub fn mime_allowed(&self, mime: &str) -> bool {
+        self.mime_types.iter().any(|allowed| allowed == mime)
+    }
+}
+
+impl Default for SttFilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stt_enabled(),
+            cli_path: default_stt_cli_path(),
+            model_path: default_stt_model_path(),
+            ffmpeg_path: default_stt_ffmpeg_path(),
+            language: default_stt_language(),
+            max_audio_mb: default_stt_max_audio_mb(),
+            timeout_secs: default_stt_timeout_secs(),
+            mime_types: default_stt_mime_types(),
+        }
+    }
+}
+
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
@@ -2141,6 +2217,7 @@ impl Default for FilesConfig {
             max_audio_mb: default_max_audio_mb(),
             audio_mime_types: default_audio_mime_types(),
             audio_model_patterns: default_audio_model_patterns(),
+            stt: SttFilesConfig::default(),
         }
     }
 }
@@ -2195,6 +2272,38 @@ fn default_audio_model_patterns() -> Vec<String> {
         "audio".to_string(),
         "gemini-2".to_string(),
         "gemini-3".to_string(),
+    ]
+}
+fn default_stt_enabled() -> bool {
+    false
+}
+fn default_stt_cli_path() -> String {
+    "/opt/homebrew/bin/whisper-cli".to_string()
+}
+fn default_stt_model_path() -> String {
+    "~/models/whisper/ggml-medium.en.bin".to_string()
+}
+fn default_stt_ffmpeg_path() -> String {
+    "ffmpeg".to_string()
+}
+fn default_stt_language() -> String {
+    "en".to_string()
+}
+fn default_stt_max_audio_mb() -> u64 {
+    25
+}
+fn default_stt_timeout_secs() -> u64 {
+    120
+}
+fn default_stt_mime_types() -> Vec<String> {
+    vec![
+        "audio/ogg".to_string(),
+        "audio/mpeg".to_string(),
+        "audio/mp3".to_string(),
+        "audio/wav".to_string(),
+        "audio/flac".to_string(),
+        "audio/aac".to_string(),
+        "audio/webm".to_string(),
     ]
 }
 

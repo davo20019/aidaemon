@@ -54,19 +54,35 @@ pub fn format_eval_task_report(row: &EvalTaskRow) -> String {
         eval.routing.model_escalated
     ));
     out.push_str(&format!(
-        "- progress: iterations={} tools_ok={}/{} evidence_gain={} stall_guards={} repetition_guards={}\n",
+        "- progress: iterations={} tools_ok={}/{} evidence_gain={} stall_guards={} repetition_guards={} deferred_no_tool={} no_progress_iters={}\n",
         eval.progress.iterations,
         eval.progress.tool_calls_succeeded,
         eval.progress.tool_calls_attempted,
         eval.progress.evidence_gain_total,
         eval.progress.stall_guard_fires,
-        eval.progress.repetition_guard_fires
+        eval.progress.repetition_guard_fires,
+        eval.progress.deferred_no_tool_events,
+        eval.progress.no_progress_iterations
+    ));
+    let contract = &eval.quality.contract;
+    out.push_str(&format!(
+        "- contract: expects_mutation={} mutations={} requires_observation={} observations={} verification_required={} verifications={} verification_blocks={} fulfilled={}\n",
+        contract.expects_mutation,
+        contract.mutation_count,
+        contract.requires_observation,
+        contract.observation_count,
+        contract.verification_required,
+        contract.verification_count,
+        contract.verification_blocks,
+        contract.fulfilled
     ));
     out.push_str(&format!(
-        "- quality: stop_reason={} contract_fulfilled={} validation_failures={}\n",
+        "- quality: stop_reason={} contract_fulfilled={} validation_failures={} unrecovered_errors={} approval_denied={}\n",
         eval.quality.stop_reason,
         eval.quality.contract_fulfilled,
-        eval.quality.post_exec_validation_failures
+        eval.quality.post_exec_validation_failures,
+        eval.quality.unrecovered_errors,
+        eval.quality.approval_denied
     ));
     out.push_str(&format!(
         "- cost: raw_tokens={} weighted_tokens={} llm_calls={} sub_agent_weighted={} failed_waste={}\n",
@@ -129,12 +145,21 @@ pub fn format_diagnose_harness_section(eval: &HarnessEvalSnapshot) -> String {
         eval.routing.tools_actually_used
     ));
     out.push_str(&format!(
-        "- Progress yield: {:.2} (iterations={}, tools_ok={})\n",
-        eval.scores.progress_yield, eval.progress.iterations, eval.progress.tool_calls_succeeded
+        "- Progress yield: {:.2} (iterations={}, tools_ok={}, deferred_no_tool={}, no_progress_iters={})\n",
+        eval.scores.progress_yield,
+        eval.progress.iterations,
+        eval.progress.tool_calls_succeeded,
+        eval.progress.deferred_no_tool_events,
+        eval.progress.no_progress_iterations
     ));
     out.push_str(&format!(
-        "- Contract: {:.2} fulfilled={} stop_reason={}\n",
-        eval.scores.contract_fulfillment, eval.quality.contract_fulfilled, eval.quality.stop_reason
+        "- Contract: {:.2} fulfilled={} stop_reason={} expects_mutation={} mutations={} validation_failures={}\n",
+        eval.scores.contract_fulfillment,
+        eval.quality.contract_fulfilled,
+        eval.quality.stop_reason,
+        eval.quality.contract.expects_mutation,
+        eval.quality.contract.mutation_count,
+        eval.quality.post_exec_validation_failures
     ));
     out.push_str(&format!(
         "- Cost: weighted_tokens={} raw={} llm_calls={}\n",

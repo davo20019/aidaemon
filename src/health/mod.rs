@@ -1,5 +1,7 @@
 //! First-class health probe system with structured metrics, trend analysis, and alerting.
 
+#![allow(dead_code)] // opt-in subsystem; several APIs are for probes, db_probe, and future dashboards
+
 pub mod alerts;
 pub mod probes;
 pub mod store;

@@ -251,6 +251,16 @@ health_port = 8080
 # audio_mime_types = ["audio/ogg", "audio/mpeg", "audio/mp3", "audio/wav", "audio/flac", "audio/aac"]
 # audio_model_patterns = ["audio", "gemini-2", "gemini-3"]
 # Native audio requires audio-capable models (e.g. gpt-4o-audio-preview, gpt-audio-1.5, gemini-2.x flash).
+#
+# [files.stt]
+# enabled = false
+# cli_path = "/opt/homebrew/bin/whisper-cli"
+# model_path = "~/models/whisper/ggml-medium.en.bin"
+# ffmpeg_path = "ffmpeg"
+# language = "en"
+# max_audio_mb = 25
+# timeout_secs = 120
+# Fallback only: runs when native input_audio is skipped (e.g. gemma-4-26b + voice notes).
 
 # [cli_agents]
 # Delegate to external CLI coding agents (claude, codex, gemini, …). Off by default.

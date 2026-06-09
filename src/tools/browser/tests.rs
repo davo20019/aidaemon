@@ -3744,3 +3744,74 @@ async fn click_navrace_still_detects_popup() {
         "click nav-race must still detect the spawned popup: {out}"
     );
 }
+
+// =============================================================================
+// Task 15 — browser diagnostics (console logs + network errors)
+// =============================================================================
+
+#[tokio::test]
+async fn get_console_logs_returns_scripted_entries_for_active_tab() {
+    let backend = MockBackend::new().with_console_logs(vec![
+        ("error", "smoke-console-error"),
+        ("log", "hello from page"),
+    ]);
+    let (tool, _backend, _rec) = mock_tool_with(backend);
+
+    let prime = json!({ "action": "list_tabs", "_session_id": "sess-a" });
+    tool.call(&prime.to_string()).await.unwrap();
+
+    let out = tool
+        .call(&json!({ "action": "get_console_logs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    assert!(out.contains("smoke-console-error"), "{out}");
+    assert!(out.contains("[error]"), "{out}");
+    assert!(!out.contains("token"), "{out}");
+}
+
+#[tokio::test]
+async fn get_network_errors_redacts_url_origin() {
+    let backend = MockBackend::new().with_network_errors(vec![(
+        "https://api.example.com/secret/path?token=SECRET",
+        "Document: net::ERR_FAILED",
+    )]);
+    let (tool, _backend, _rec) = mock_tool_with(backend);
+
+    tool.call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    let out = tool
+        .call(&json!({ "action": "get_network_errors", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    assert!(out.contains("https://api.example.com"), "{out}");
+    assert!(out.contains("net::ERR_FAILED"), "{out}");
+    assert!(!out.contains("SECRET"), "{out}");
+    assert!(!out.contains("/secret"), "{out}");
+}
+
+#[tokio::test]
+async fn get_console_logs_unknown_tab_is_rejected() {
+    let (tool, _backend, _rec) = mock_tool();
+
+    tool.call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "get_console_logs",
+                "tab_id": "not-a-real-tab",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(out.contains("Unknown tab"), "{out}");
+}

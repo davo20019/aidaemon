@@ -13,11 +13,21 @@ pub(in crate::agent) async fn run_bootstrap_phase(
 ) -> anyhow::Result<BootstrapOutcome> {
     let agent = services.agent;
     let session_id = ctx.session_id;
-    let user_text = ctx.user_text;
     let status_tx = ctx.status_tx.clone();
     let user_role = ctx.user_role;
     let channel_ctx = ctx.channel_ctx.clone();
     info!(session_id, "Bootstrap phase started");
+
+    let model_for_stt = agent.llm_runtime.snapshot().primary_model();
+    let user_text_enriched = crate::agent::stt::maybe_enrich_user_text(
+        ctx.user_text,
+        ctx.attachments,
+        &agent.stt_config,
+        &agent.audio_config,
+        &model_for_stt,
+    )
+    .await;
+    let user_text = user_text_enriched.as_str();
     let resume_checkpoint = if is_resume_request(user_text) {
         match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
             Ok(checkpoint) => checkpoint,

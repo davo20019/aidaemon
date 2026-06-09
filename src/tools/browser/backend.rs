@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::{BrowserConfig, SessionIsolation};
+use crate::tools::browser::diagnostics::BrowserDiagnosticsStore;
 
 /// Upper bound on how long the graceful Chrome shutdown (`Browser::close()` +
 /// `Browser::wait()`) and per-resource disposal (close-target / dispose-context)
@@ -129,6 +130,17 @@ pub trait PageHandle: Send + Sync {
     /// key events via `type_str` after the field is cleared through an
     /// element-bound JS function.
     async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String>;
+
+    /// Spawn listeners that record console logs and network load failures into
+    /// `store` for `(session_id, tab_id)`. Default: no-op (mock pages without
+    /// scripted logs).
+    async fn attach_diagnostics(
+        &self,
+        _session_id: &str,
+        _tab_id: &str,
+        _store: BrowserDiagnosticsStore,
+    ) {
+    }
 }
 
 /// Lightweight description of a live browser target/tab, returned by
@@ -1027,6 +1039,67 @@ impl PageHandle for ChromiumoxidePage {
     async fn url(&self) -> Option<String> {
         self.page.url().await.ok().flatten()
     }
+
+    async fn attach_diagnostics(
+        &self,
+        session_id: &str,
+        tab_id: &str,
+        store: BrowserDiagnosticsStore,
+    ) {
+        use chromiumoxide::cdp::browser_protocol::network::EventLoadingFailed;
+        use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+
+        let session_id = session_id.to_string();
+        let tab_id = tab_id.to_string();
+        let page = Arc::clone(&self.page);
+
+        if let Ok(mut stream) = page.event_listener::<EventConsoleApiCalled>().await {
+            let store = store.clone();
+            let session_id = session_id.clone();
+            let tab_id = tab_id.clone();
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let level = format!("{:?}", event.r#type);
+                    let message = format_console_api_args(&event.args);
+                    store
+                        .record_console(&session_id, &tab_id, &level, &message)
+                        .await;
+                }
+            });
+        }
+
+        if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
+            let page_for_url = Arc::clone(&page);
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let url = page_for_url.url().await.ok().flatten().unwrap_or_default();
+                    let detail = format!("{:?}: {}", event.r#type, event.error_text);
+                    store
+                        .record_network_error(&session_id, &tab_id, &url, &detail)
+                        .await;
+                }
+            });
+        }
+    }
+}
+
+fn format_console_api_args(
+    args: &[chromiumoxide::cdp::js_protocol::runtime::RemoteObject],
+) -> String {
+    args.iter()
+        .map(|arg| {
+            if let Some(v) = &arg.value {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+            } else if let Some(desc) = &arg.description {
+                desc.clone()
+            } else {
+                "(object)".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // =============================================================================
@@ -1162,6 +1235,8 @@ pub struct MockBackend {
     /// becomes true (the bounded-timeout path). `None` means "always satisfied"
     /// (the default), so existing find_element-based tests keep their behavior.
     element_state: Arc<Mutex<MockElementState>>,
+    diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
+    diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// Scripted, poll-counted element state for the `wait`-condition tests. Each
@@ -1218,6 +1293,8 @@ impl Default for MockBackend {
             click_navigates: Arc::new(AtomicBool::new(false)),
             nav_never_settles: Arc::new(AtomicBool::new(false)),
             element_state: Arc::new(Mutex::new(MockElementState::default())),
+            diagnostic_console: Arc::new(Mutex::new(Vec::new())),
+            diagnostic_network: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -1254,6 +1331,30 @@ impl MockBackend {
     /// assert origin redaction in `list_tabs`.
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    /// Script console logs recorded when diagnostics listeners attach to a page.
+    pub fn with_console_logs(mut self, logs: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+        self.diagnostic_console = Arc::new(Mutex::new(
+            logs.into_iter()
+                .map(|(level, msg)| (level.into(), msg.into()))
+                .collect(),
+        ));
+        self
+    }
+
+    /// Script network errors recorded when diagnostics listeners attach to a page.
+    pub fn with_network_errors(
+        mut self,
+        errors: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.diagnostic_network = Arc::new(Mutex::new(
+            errors
+                .into_iter()
+                .map(|(url, err)| (url.into(), err.into()))
+                .collect(),
+        ));
         self
     }
 
@@ -1399,6 +1500,10 @@ struct MockPage {
     /// Shared never-settles flag: when `true`, `wait_for_navigation` sleeps the
     /// full timeout (opt-in for bounded-timeout tests under paused clock).
     nav_never_settles: Arc<AtomicBool>,
+    /// Scripted console logs flushed into the diagnostics store on attach.
+    diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
+    /// Scripted network errors flushed into the diagnostics store on attach.
+    diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[cfg(test)]
@@ -1557,6 +1662,24 @@ impl PageHandle for MockPage {
         self.record(MockCall::Url).await;
         self.url.clone()
     }
+
+    async fn attach_diagnostics(
+        &self,
+        session_id: &str,
+        tab_id: &str,
+        store: BrowserDiagnosticsStore,
+    ) {
+        for (level, message) in self.diagnostic_console.lock().await.iter() {
+            store
+                .record_console(session_id, tab_id, level, message)
+                .await;
+        }
+        for (url, error) in self.diagnostic_network.lock().await.iter() {
+            store
+                .record_network_error(session_id, tab_id, url, error)
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1609,6 +1732,8 @@ impl BrowserBackend for MockBackend {
                 element_state: Arc::clone(&self.element_state),
                 click_navigates: Arc::clone(&self.click_navigates),
                 nav_never_settles: Arc::clone(&self.nav_never_settles),
+                diagnostic_console: Arc::clone(&self.diagnostic_console),
+                diagnostic_network: Arc::clone(&self.diagnostic_network),
             }),
         ))
     }
@@ -1688,6 +1813,8 @@ impl BrowserBackend for MockBackend {
             element_state: Arc::clone(&self.element_state),
             click_navigates: Arc::clone(&self.click_navigates),
             nav_never_settles: Arc::clone(&self.nav_never_settles),
+            diagnostic_console: Arc::clone(&self.diagnostic_console),
+            diagnostic_network: Arc::clone(&self.diagnostic_network),
         }))
     }
 

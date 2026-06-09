@@ -85,6 +85,12 @@ fn false_capability_denial_detects_live_search_fallback_text() {
 }
 
 #[test]
+fn false_capability_denial_detects_memory_record_denial() {
+    let reply = "I don't have that in my records, but I can help you add it.";
+    assert!(looks_like_false_capability_denial_after_tool_success(reply));
+}
+
+#[test]
 fn evidence_grounding_challenge_detects_made_up_question() {
     let reply = "Since the returned errors, does it mean you made them up?";
     assert!(looks_like_evidence_grounding_challenge(reply));
