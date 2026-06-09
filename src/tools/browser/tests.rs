@@ -477,3 +477,374 @@ async fn two_sessions_reuse_pages_without_deadlock() {
         "the two sessions' pages must differ: {ids:?}"
     );
 }
+
+// =============================================================================
+// Task 5: explicit tab management
+// =============================================================================
+
+/// Extract the opaque tab id reported by a `new_tab` / `Opened new tab <id>`
+/// result, or by the active line of a list_tabs result. Used to drive
+/// subsequent switch/close actions without hardcoding ids.
+fn tab_id_from_opened(result: &str) -> String {
+    // "Opened new tab <id> ..." — the id is the 4th whitespace token.
+    result
+        .split_whitespace()
+        .nth(3)
+        .expect("opened-tab result must contain an id")
+        .to_string()
+}
+
+/// `list_tabs` reports the session's tabs with opaque ids + titles + REDACTED
+/// origins. A path/query in a tab's URL must NOT leak into the output.
+#[tokio::test]
+async fn list_tabs_reports_tabs_with_redacted_origins() {
+    // The mock's pages report a URL with a path + secret query string. new_tab
+    // snapshots this into the session, so list_tabs must redact it to the origin.
+    let secret = "https://app.example/dashboard?session_token=SECRET123&reset=abc";
+    let (tool, _backend, _rx) = mock_tool_with(MockBackend::new().with_url(secret));
+
+    // Open the session's first tab via navigate.
+    let nav =
+        json!({ "action": "navigate", "url": "https://first.example/", "_session_id": "sess-a" });
+    tool.call(&nav.to_string()).await.unwrap();
+
+    // new_tab — its page reports the secret url; only the origin must be shown.
+    let nt = json!({ "action": "new_tab", "_session_id": "sess-a" });
+    tool.call(&nt.to_string()).await.unwrap();
+
+    let out = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    // Two tabs, with the active marker present.
+    assert!(out.contains("Open tabs (2)"), "expected two tabs: {out}");
+    assert!(
+        out.contains("[active]"),
+        "an active tab must be marked: {out}"
+    );
+
+    // CRITICAL: no path/query leak. The secret token and the path must be absent.
+    assert!(
+        !out.contains("session_token"),
+        "list_tabs must redact query strings (secret leaked): {out}"
+    );
+    assert!(
+        !out.contains("SECRET123"),
+        "list_tabs must not surface the secret token: {out}"
+    );
+    assert!(
+        !out.contains("/dashboard"),
+        "list_tabs must redact the path: {out}"
+    );
+}
+
+/// `new_tab` adds a tab AND makes it active, so a subsequent action operates on
+/// the new tab's page (a distinct page id from the original).
+#[tokio::test]
+async fn new_tab_adds_and_activates_tab() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // First tab via navigate.
+    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
+    tool.call(&nav.to_string()).await.unwrap();
+
+    let ids_before = create_page_ids(&backend).await;
+    assert_eq!(ids_before.len(), 1, "one page so far: {ids_before:?}");
+
+    // Open a second tab.
+    let nt = json!({ "action": "new_tab", "_session_id": "sess-a" });
+    let out = tool.call(&nt.to_string()).await.unwrap();
+    assert!(
+        out.contains("Opened new tab"),
+        "new_tab should report id: {out}"
+    );
+
+    let ids_after = create_page_ids(&backend).await;
+    assert_eq!(
+        ids_after.len(),
+        2,
+        "new_tab must create a second page: {ids_after:?}"
+    );
+
+    // list_tabs shows two tabs with the second active (new_tab activates it).
+    let list = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(list.contains("Open tabs (2)"), "two tabs expected: {list}");
+    // The active tab id must be the newly opened one (last created page id).
+    let new_id = &ids_after[1];
+    let active_line = list
+        .lines()
+        .find(|l| l.contains("[active]"))
+        .expect("an active tab line must exist");
+    assert!(
+        active_line.contains(new_id.as_str()),
+        "the newly opened tab must be active: active='{active_line}' new_id='{new_id}'"
+    );
+}
+
+/// Regression for `target=_blank`: a click that spawns a popup must report the
+/// new tab's id, and `list_tabs` must then show BOTH tabs — the new tab is
+/// discoverable and switchable, never silently left behind.
+#[tokio::test]
+async fn popup_after_click_is_discoverable() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // Establish the session's first tab.
+    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
+    tool.call(&nav.to_string()).await.unwrap();
+
+    // Script a popup that will appear the next time list_targets runs (i.e. the
+    // diff after the click). Give it a URL with a secret path/query to also prove
+    // redaction flows through to list_tabs.
+    backend
+        .script_popup(
+            "popup-target-xyz",
+            "Popup Page",
+            "https://popup.example/oauth?code=TOPSECRET",
+        )
+        .await;
+
+    // Click — should detect the popup and report its tab id.
+    let out = tool
+        .call(
+            &json!({ "action": "click", "selector": "#open", "_session_id": "sess-a" }).to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.contains("opened new tab") && out.contains("popup-target-xyz"),
+        "click must report the spawned popup's tab id: {out}"
+    );
+
+    // list_tabs now shows BOTH the original and the popup tab.
+    let list = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        list.contains("Open tabs (2)"),
+        "both tabs must be listed: {list}"
+    );
+    assert!(
+        list.contains("popup-target-xyz"),
+        "the popup tab must be discoverable via list_tabs: {list}"
+    );
+    // Redaction still holds for the popup's url.
+    assert!(
+        !list.contains("TOPSECRET") && !list.contains("/oauth"),
+        "popup url must be redacted to origin: {list}"
+    );
+
+    // The original tab stays active (popups are registered, not auto-activated).
+    let active_line = list
+        .lines()
+        .find(|l| l.contains("[active]"))
+        .expect("an active tab line must exist");
+    assert!(
+        !active_line.contains("popup-target-xyz"),
+        "popup must NOT be auto-activated: {active_line}"
+    );
+}
+
+/// `switch_tab` to a valid tab changes the active page; a subsequent action then
+/// runs on the switched-to tab.
+#[tokio::test]
+async fn switch_tab_changes_active_page() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // First tab.
+    let nav = json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" });
+    tool.call(&nav.to_string()).await.unwrap();
+    let first_id = create_page_ids(&backend).await[0].clone();
+
+    // Second tab (now active).
+    tool.call(&json!({ "action": "new_tab", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+
+    // Switch back to the first tab by its id.
+    let out = tool
+        .call(
+            &json!({ "action": "switch_tab", "tab_id": first_id, "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.contains(&format!("Switched to tab {first_id}")),
+        "switch_tab must confirm the active tab: {out}"
+    );
+
+    // list_tabs now marks the first tab active again.
+    let list = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    let active_line = list
+        .lines()
+        .find(|l| l.contains("[active]"))
+        .expect("an active tab line must exist");
+    assert!(
+        active_line.contains(first_id.as_str()),
+        "after switch, the first tab must be active: {active_line}"
+    );
+}
+
+/// Cross-session safety: a session must NOT be able to switch to or close
+/// another session's tab. An unknown id, and another session's real id, both
+/// error.
+#[tokio::test]
+async fn switch_and_close_reject_unknown_and_cross_session_tabs() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // Session A has one tab.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let a_tab = create_page_ids(&backend).await[0].clone();
+
+    // Session B has one tab — capture B's real tab id.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-b" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let b_tab = create_page_ids(&backend).await[1].clone();
+    assert_ne!(a_tab, b_tab, "the two sessions must hold different tab ids");
+
+    // A switching to a totally unknown id errors.
+    let out = tool
+        .call(
+            &json!({ "action": "switch_tab", "tab_id": "no-such-tab", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.starts_with("Error:") && out.to_lowercase().contains("unknown tab"),
+        "switch to unknown tab must error: {out}"
+    );
+
+    // A switching to B's REAL tab id must be rejected (cross-session).
+    let out = tool
+        .call(
+            &json!({ "action": "switch_tab", "tab_id": b_tab, "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.starts_with("Error:") && out.to_lowercase().contains("does not belong"),
+        "A must not switch to B's tab: {out}"
+    );
+
+    // A closing B's REAL tab id must be rejected too.
+    let out = tool
+        .call(
+            &json!({ "action": "close_tab", "tab_id": b_tab, "_session_id": "sess-a" }).to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.starts_with("Error:") && out.to_lowercase().contains("does not belong"),
+        "A must not close B's tab: {out}"
+    );
+
+    // Sanity: B can still switch to its own tab.
+    let out = tool
+        .call(
+            &json!({ "action": "switch_tab", "tab_id": b_tab, "_session_id": "sess-b" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.contains("Switched to tab"),
+        "B must be able to switch to its own tab: {out}"
+    );
+}
+
+/// `close_tab` removes the tab and reports the new active tab; closing the
+/// active tab promotes a remaining one.
+#[tokio::test]
+async fn close_tab_removes_and_reports_new_active() {
+    let (tool, _backend, _rx) = mock_tool();
+
+    // First tab + a second (active) tab.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let opened = tool
+        .call(&json!({ "action": "new_tab", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    let second_id = tab_id_from_opened(&opened);
+
+    // Close the active (second) tab — the first must become active again.
+    let out = tool
+        .call(
+            &json!({ "action": "close_tab", "tab_id": second_id, "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.contains(&format!("Closed tab {second_id}")) && out.contains("Active tab is now"),
+        "close_tab must report removal and the new active tab: {out}"
+    );
+
+    // Only one tab remains.
+    let list = tool
+        .call(&json!({ "action": "list_tabs", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        list.contains("Open tabs (1)"),
+        "one tab must remain: {list}"
+    );
+    assert!(
+        !list.contains(second_id.as_str()),
+        "the closed tab must be gone: {list}"
+    );
+}
+
+/// Existing single-page actions still operate on the active tab after the
+/// multi-tab refactor (the active tab IS the page).
+#[tokio::test]
+async fn single_page_actions_use_active_tab() {
+    let (tool, backend, _rx) =
+        mock_tool_with(MockBackend::new().with_text_result("active tab text"));
+
+    // Navigate establishes the active tab.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+
+    // get_text routes through the active tab's page.
+    let out = tool
+        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert_eq!(out, "active tab text");
+
+    // Still exactly one page (no spurious tab creation).
+    let ids = create_page_ids(&backend).await;
+    assert_eq!(
+        ids.len(),
+        1,
+        "single-page flow must not create extra tabs: {ids:?}"
+    );
+}

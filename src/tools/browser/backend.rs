@@ -15,7 +15,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+use chromiumoxide::cdp::browser_protocol::target::{
+    CloseTargetParams, CreateTargetParams, TargetId,
+};
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -74,6 +76,18 @@ pub trait PageHandle: Send + Sync {
     async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String>;
 }
 
+/// Lightweight description of a live browser target/tab, returned by
+/// [`BrowserBackend::list_targets`]. The `target_id` is the chromiumoxide target
+/// id string (used as the opaque, stable tab id surfaced to the LLM); `title`
+/// and `url` are best-effort and may be `None`/empty if the page is still
+/// loading or unreachable.
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    pub target_id: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+}
+
 /// A browser backend: owns the connection lifecycle and hands out page handles.
 #[async_trait]
 pub trait BrowserBackend: Send + Sync {
@@ -100,24 +114,18 @@ pub trait BrowserBackend: Send + Sync {
     /// so this encapsulates the full set_mode behavior.
     async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String>;
 
-    // --- Tab/target management (declared for later tasks; thin today) ---
-    // These are part of the seam's contract per the Phase 0 checklist but are
-    // not yet wired to any tool action, so they are unused for now.
+    // --- Tab/target management ---
 
-    /// List target/tab identifiers currently open.
-    #[allow(dead_code)]
-    async fn list_targets(&self) -> Result<Vec<String>, String>;
+    /// List every live target/tab the browser currently holds, with best-effort
+    /// title and URL. Used to diff for popup detection and to render `list_tabs`.
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String>;
 
-    /// Create a new target/tab at `url`, returning its identifier.
-    #[allow(dead_code)]
-    async fn create_target(&self, url: &str) -> Result<String, String>;
+    /// Resolve an existing target by id into a page handle, so a session can bind
+    /// it as its active tab (the chromiumoxide-level "switch"). Returns `Err` if
+    /// the target is unknown to the browser.
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String>;
 
-    /// Switch the active target/tab to `target_id`.
-    #[allow(dead_code)]
-    async fn switch_target(&self, target_id: &str) -> Result<(), String>;
-
-    /// Close the target/tab identified by `target_id`.
-    #[allow(dead_code)]
+    /// Close the target/tab identified by `target_id` at the browser level.
     async fn close_target(&self, target_id: &str) -> Result<(), String>;
 
     // --- Connection health (declared for later tasks; thin today) ---
@@ -402,22 +410,55 @@ impl BrowserBackend for ChromiumoxideBackend {
         }
     }
 
-    // The tool does not expose tab/target actions yet; these are thin stubs that
-    // later tasks will flesh out against the live chromiumoxide target API.
-    async fn list_targets(&self) -> Result<Vec<String>, String> {
-        Err("Tab/target management not yet implemented".to_string())
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        let pages = browser
+            .pages()
+            .await
+            .map_err(|e| format!("Failed to list browser tabs: {}", e))?;
+        let mut infos = Vec::with_capacity(pages.len());
+        for page in pages {
+            let target_id = page.target_id().as_ref().to_string();
+            // Title/URL are best-effort: a still-loading or detached page can
+            // error here, which must not abort the whole listing.
+            let title = page.get_title().await.ok().flatten();
+            let url = page.url().await.ok().flatten();
+            infos.push(TargetInfo {
+                target_id,
+                title,
+                url,
+            });
+        }
+        Ok(infos)
     }
 
-    async fn create_target(&self, _url: &str) -> Result<String, String> {
-        Err("Tab/target management not yet implemented".to_string())
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        let page = browser
+            .get_page(TargetId::new(target_id.to_string()))
+            .await
+            .map_err(|e| format!("Tab '{}' not found: {}", target_id, e))?;
+        Ok(Arc::new(ChromiumoxidePage {
+            page: Arc::new(page),
+        }))
     }
 
-    async fn switch_target(&self, _target_id: &str) -> Result<(), String> {
-        Err("Tab/target management not yet implemented".to_string())
-    }
-
-    async fn close_target(&self, _target_id: &str) -> Result<(), String> {
-        Err("Tab/target management not yet implemented".to_string())
+    async fn close_target(&self, target_id: &str) -> Result<(), String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        browser
+            .execute(CloseTargetParams::new(TargetId::new(target_id.to_string())))
+            .await
+            .map_err(|e| format!("Failed to close tab '{}': {}", target_id, e))?;
+        Ok(())
     }
 
     async fn is_connected(&self) -> bool {
@@ -636,6 +677,14 @@ pub struct MockBackend {
     /// Monotonic counter behind a Mutex, used to mint a fresh synthetic page id
     /// for each `create_page` call (so distinct sessions get distinct ids).
     next_page_id: Mutex<u64>,
+    /// Live targets the mock browser "holds". `create_page`/`page_for_target`
+    /// append/track here; `list_targets` returns these. Each entry is a
+    /// `TargetInfo`. Shared with `MockPage` so a click can reveal a popup.
+    targets: Arc<Mutex<Vec<TargetInfo>>>,
+    /// A scripted popup revealed (appended to `targets`) the next time a page
+    /// CLICK happens, modeling a `target=_blank`/`window.open` spawn. Shared with
+    /// `MockPage` so the reveal is tied to the click, not to `list_targets`.
+    pending_popup: Arc<Mutex<Option<TargetInfo>>>,
 }
 
 #[cfg(test)]
@@ -649,6 +698,8 @@ impl Default for MockBackend {
             url: Some("https://mock.example/".to_string()),
             connected: AtomicBool::new(false),
             next_page_id: Mutex::new(0),
+            targets: Arc::new(Mutex::new(Vec::new())),
+            pending_popup: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -672,9 +723,29 @@ impl MockBackend {
         self
     }
 
+    /// Override the URL the mock's pages report from `url()` (and that `new_tab`
+    /// snapshots into the session). Lets tests feed a path/query-bearing URL to
+    /// assert origin redaction in `list_tabs`.
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
     /// Shared handle to the recorded call log, for assertions.
     pub fn calls(&self) -> Arc<Mutex<Vec<MockCall>>> {
         Arc::clone(&self.calls)
+    }
+
+    /// Script a popup target that will appear the next time `list_targets` is
+    /// called, simulating a click that opened a new tab (`target=_blank` /
+    /// `window.open`). The given `url` is used verbatim so tests can assert
+    /// origin redaction (e.g. include a path + query string).
+    pub async fn script_popup(&self, target_id: &str, title: &str, url: &str) {
+        *self.pending_popup.lock().await = Some(TargetInfo {
+            target_id: target_id.to_string(),
+            title: Some(title.to_string()),
+            url: Some(url.to_string()),
+        });
     }
 
     async fn record(&self, call: MockCall) {
@@ -693,6 +764,10 @@ struct MockPage {
     text_result: String,
     screenshot_bytes: Vec<u8>,
     url: Option<String>,
+    /// Shared live-target list + scripted popup, so a click on this page can
+    /// reveal a popup target (modeling target=_blank/window.open).
+    targets: Arc<Mutex<Vec<TargetInfo>>>,
+    pending_popup: Arc<Mutex<Option<TargetInfo>>>,
 }
 
 #[cfg(test)]
@@ -718,6 +793,11 @@ impl PageHandle for MockPage {
 
     async fn click(&self, selector: &str) -> Result<(), String> {
         self.record(MockCall::Click(selector.to_string())).await;
+        // A click reveals any scripted popup: it appears as a new live target,
+        // exactly as a real target=_blank/window.open would after the click.
+        if let Some(popup) = self.pending_popup.lock().await.take() {
+            self.targets.lock().await.push(popup);
+        }
         Ok(())
     }
 
@@ -779,6 +859,12 @@ impl BrowserBackend for MockBackend {
             format!("mock-page-{}", *counter)
         };
         self.record(MockCall::CreatePage(page_id.clone())).await;
+        // Register the new target so list_targets/popup-diff can see it.
+        self.targets.lock().await.push(TargetInfo {
+            target_id: page_id.clone(),
+            title: Some("mock tab".to_string()),
+            url: self.url.clone(),
+        });
         Ok((
             page_id.clone(),
             Arc::new(MockPage {
@@ -788,6 +874,8 @@ impl BrowserBackend for MockBackend {
                 text_result: self.text_result.clone(),
                 screenshot_bytes: self.screenshot_bytes.clone(),
                 url: self.url.clone(),
+                targets: Arc::clone(&self.targets),
+                pending_popup: Arc::clone(&self.pending_popup),
             }),
         ))
     }
@@ -803,19 +891,37 @@ impl BrowserBackend for MockBackend {
         Ok(format!("Switched to {} mode.", mode))
     }
 
-    async fn list_targets(&self) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String> {
+        Ok(self.targets.lock().await.clone())
     }
 
-    async fn create_target(&self, _url: &str) -> Result<String, String> {
-        Ok("mock-target".to_string())
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String> {
+        let known = self
+            .targets
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.target_id == target_id);
+        if !known {
+            return Err(format!("Tab '{}' not found", target_id));
+        }
+        Ok(Arc::new(MockPage {
+            page_id: target_id.to_string(),
+            calls: Arc::clone(&self.calls),
+            eval_result: self.eval_result.clone(),
+            text_result: self.text_result.clone(),
+            screenshot_bytes: self.screenshot_bytes.clone(),
+            url: self.url.clone(),
+            targets: Arc::clone(&self.targets),
+            pending_popup: Arc::clone(&self.pending_popup),
+        }))
     }
 
-    async fn switch_target(&self, _target_id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn close_target(&self, _target_id: &str) -> Result<(), String> {
+    async fn close_target(&self, target_id: &str) -> Result<(), String> {
+        self.targets
+            .lock()
+            .await
+            .retain(|t| t.target_id != target_id);
         Ok(())
     }
 

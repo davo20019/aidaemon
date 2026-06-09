@@ -17,9 +17,44 @@ mod session;
 mod tests;
 
 use backend::{BrowserBackend, ChromiumoxideBackend, PageHandle};
-use session::BrowserSessionRegistry;
+use session::{BrowserSessionRegistry, TabView};
 
 use tokio::sync::OwnedMutexGuard;
+
+/// Reduce a full URL to its origin (`scheme://host[:port]`), dropping path,
+/// query, and fragment — these can carry secrets (session tokens, reset codes)
+/// and must never be surfaced in a tab listing.
+///
+/// Parsing is deliberately dependency-free string surgery: take everything
+/// before the first `/`, `?`, or `#` that follows the `scheme://` authority.
+/// Inputs that don't look like `scheme://host` (e.g. `about:blank`, an empty
+/// string) are returned trimmed of any path/query/fragment but otherwise
+/// unchanged, since there is no origin to extract.
+fn redact_origin(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    // Find the scheme separator.
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = scheme_end + 3;
+        let authority_and_rest = &url[after_scheme..];
+        // Authority ends at the first '/', '?', or '#'.
+        let authority_len = authority_and_rest
+            .find(['/', '?', '#'])
+            .unwrap_or(authority_and_rest.len());
+        return format!(
+            "{}://{}",
+            &url[..scheme_end],
+            &authority_and_rest[..authority_len]
+        );
+    }
+    // No scheme://authority form (e.g. about:blank, data:, mailto:). Strip any
+    // path/query/fragment after a scheme that uses a single ':' opaque part by
+    // cutting at the first '?', '#', or '/'.
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    url[..cut].to_string()
+}
 
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
@@ -150,14 +185,78 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: selector".to_string())?;
 
+        // Resolve the session's (active) page FIRST so that creating a session's
+        // first page does not itself look like a popup. Then snapshot the
+        // browser's live targets BEFORE the click so we can detect a popup
+        // (target=_blank / window.open) the click may spawn. We diff against the
+        // GLOBAL target set (not just this session's tabs) so a tab another
+        // session happens to own is never misattributed as our popup.
         let (page, _guard) = self.page_for(session_id).await?;
+
+        let known_before: Vec<String> = self
+            .backend
+            .list_targets()
+            .await
+            .map(|ts| ts.into_iter().map(|t| t.target_id).collect())
+            .unwrap_or_default();
 
         page.click(selector).await?;
 
-        // Brief wait for any navigation/JS to complete
+        // Brief wait for any navigation/JS (and popup creation) to settle.
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        Ok(format!("Clicked element '{}'", selector))
+        // Popup detection: diff the live targets against what the session knew
+        // before. Any brand-new target is registered as a tab in this session so
+        // it is discoverable/switchable — a target=_blank click never silently
+        // leaves later actions stranded on the old implicit page. The new tab is
+        // NOT auto-activated (the plan does not require it); the current tab
+        // stays active unless the caller explicitly switches.
+        let new_tab_id = self
+            .detect_and_register_popup(session_id, &known_before)
+            .await;
+
+        match new_tab_id {
+            Some(tab_id) => Ok(format!(
+                "Clicked element '{}' (opened new tab: {})",
+                selector, tab_id
+            )),
+            None => Ok(format!("Clicked element '{}'", selector)),
+        }
+    }
+
+    /// After an action that may spawn a popup, diff the browser's live targets
+    /// against `known_before`. Register the FIRST new target as a tab in the
+    /// session (not active) and return its opaque tab id. Returns `None` when no
+    /// new target appeared or the diff couldn't be computed.
+    async fn detect_and_register_popup(
+        &self,
+        session_id: &str,
+        known_before: &[String],
+    ) -> Option<String> {
+        let targets = self.backend.list_targets().await.ok()?;
+        for t in targets {
+            if known_before.iter().any(|k| k == &t.target_id) {
+                continue;
+            }
+            // A target unknown to this session appeared. Bind a page handle to it
+            // so the session can operate on it later, then register it.
+            let page = self.backend.page_for_target(&t.target_id).await.ok()?;
+            let registered = self
+                .sessions
+                .add_tab(
+                    session_id,
+                    &t.target_id,
+                    page,
+                    t.url.clone(),
+                    t.title.clone(),
+                    /* make_active */ false,
+                )
+                .await;
+            if let Some(id) = registered {
+                return Some(id);
+            }
+        }
+        None
     }
 
     async fn action_fill(&self, args: &Value, session_id: &str) -> Result<String, String> {
@@ -271,6 +370,133 @@ impl BrowserTool {
     async fn action_close(&self) -> Result<String, String> {
         self.backend.close().await
     }
+
+    /// `list_tabs`: render this session's tabs — opaque id, title, REDACTED
+    /// origin (never the full URL — paths/queries can carry secrets), and which
+    /// is active. Ensures the session has at least one tab first (so a fresh
+    /// session reports its single page rather than "no tabs").
+    async fn action_list_tabs(&self, session_id: &str) -> Result<String, String> {
+        // Touch page_for to guarantee the session exists with its first tab.
+        let (_page, _guard) = self.page_for(session_id).await?;
+
+        let tabs = self.sessions.list_tabs(session_id).await;
+        if tabs.is_empty() {
+            return Ok("No open tabs.".to_string());
+        }
+        Ok(Self::format_tab_list(&tabs))
+    }
+
+    fn format_tab_list(tabs: &[TabView]) -> String {
+        let mut out = format!("Open tabs ({}):", tabs.len());
+        for tab in tabs {
+            let marker = if tab.active { " [active]" } else { "" };
+            let title = tab.title.as_deref().unwrap_or("(untitled)");
+            let origin = tab
+                .url
+                .as_deref()
+                .map(redact_origin)
+                .filter(|o| !o.is_empty())
+                .unwrap_or_else(|| "(no url)".to_string());
+            out.push_str(&format!(
+                "\n- {}{}: \"{}\" — {}",
+                tab.tab_id, marker, title, origin
+            ));
+        }
+        out
+    }
+
+    /// `new_tab`: open a new tab (a new page in this session's context),
+    /// optionally navigating it to `url` (SSRF-validated). The new tab becomes
+    /// active, since opening a tab implies you want to use it. Returns its
+    /// opaque tab id.
+    async fn action_new_tab(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        // Ensure the session exists (and has its first tab) before adding more.
+        let (_page, _guard) = self.page_for(session_id).await?;
+
+        let url = args.get("url").and_then(|v| v.as_str());
+        if let Some(url) = url {
+            if let Err(reason) = crate::tools::web_fetch::validate_url_for_ssrf(url) {
+                return Err(format!("Navigation blocked: {}", reason));
+            }
+        }
+
+        let (target_id, page) = self.backend.create_page().await?;
+        if let Some(url) = url {
+            page.goto(url).await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+        let current_url = page.url().await;
+
+        let tab_id = self
+            .sessions
+            .add_tab(
+                session_id,
+                &target_id,
+                page,
+                current_url,
+                None,
+                /* make_active */ true,
+            )
+            .await
+            .ok_or_else(|| "failed to register new tab for this session".to_string())?;
+
+        match url {
+            Some(url) => Ok(format!("Opened new tab {} at {}", tab_id, url)),
+            None => Ok(format!("Opened new tab {} (active)", tab_id)),
+        }
+    }
+
+    /// `switch_tab`: make `tab_id` the session's active tab. The id is validated
+    /// to belong to THIS session — a tab id from another session is rejected.
+    async fn action_switch_tab(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        // Ensure the session exists before validating ownership.
+        let (_page, _guard) = self.page_for(session_id).await?;
+
+        let tab_id = args
+            .get("tab_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: tab_id".to_string())?;
+
+        let view = self.sessions.switch_tab(session_id, tab_id).await?;
+        let origin = view
+            .url
+            .as_deref()
+            .map(redact_origin)
+            .filter(|o| !o.is_empty())
+            .unwrap_or_else(|| "(no url)".to_string());
+        Ok(format!("Switched to tab {} — {}", view.tab_id, origin))
+    }
+
+    /// `close_tab`: close `tab_id` (validated to belong to this session) and
+    /// report the new active tab, if any remains.
+    async fn action_close_tab(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        // Ensure the session exists before validating ownership.
+        let (_page, _guard) = self.page_for(session_id).await?;
+
+        let tab_id = args
+            .get("tab_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: tab_id".to_string())?;
+
+        let (target_id, new_active) = self.sessions.close_tab(session_id, tab_id).await?;
+
+        // Best-effort backend close; the tab is already removed from the session
+        // so a backend failure doesn't leave a dangling session reference.
+        if let Err(e) = self.backend.close_target(&target_id).await {
+            warn!(tab_id, error = %e, "backend close_target failed after session removal");
+        }
+
+        match new_active {
+            Some(active) => Ok(format!(
+                "Closed tab {}. Active tab is now {}.",
+                tab_id, active
+            )),
+            None => Ok(format!(
+                "Closed tab {}. No tabs remain open in this session.",
+                tab_id
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -286,18 +512,18 @@ impl Tool for BrowserTool {
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for element), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows.",
+            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for element), list_tabs (list this session's open tabs with their ids), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "set_mode", "close"],
+                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "list_tabs", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
                         "description": "The browser action to perform"
                     },
                     "url": {
                         "type": "string",
-                        "description": "URL to navigate to (for 'navigate' action)"
+                        "description": "URL to navigate to (for 'navigate', or optionally for 'new_tab')"
                     },
                     "selector": {
                         "type": "string",
@@ -314,6 +540,10 @@ impl Tool for BrowserTool {
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Timeout in seconds for 'wait' action (default: 10)"
+                    },
+                    "tab_id": {
+                        "type": "string",
+                        "description": "Opaque tab id from list_tabs/new_tab (required for 'switch_tab' and 'close_tab')"
                     }
                 },
                 "required": ["action"],
@@ -343,10 +573,14 @@ impl Tool for BrowserTool {
             "get_text" => self.action_get_text(&args, session_id).await,
             "execute_js" => self.action_execute_js(&args, session_id).await,
             "wait" => self.action_wait(&args, session_id).await,
+            "list_tabs" => self.action_list_tabs(session_id).await,
+            "new_tab" => self.action_new_tab(&args, session_id).await,
+            "switch_tab" => self.action_switch_tab(&args, session_id).await,
+            "close_tab" => self.action_close_tab(&args, session_id).await,
             "set_mode" => self.action_set_mode(&args).await,
             "close" => self.action_close().await,
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, set_mode, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
         };
@@ -393,8 +627,15 @@ impl Tool for BrowserTool {
             Some("wait") => ToolCallSemantics::observation()
                 .with_verification_mode(ToolVerificationMode::ResultContent),
             Some("screenshot") => ToolCallSemantics::observation(),
+            // list_tabs just reads the session's tab set — pure observation.
+            Some("list_tabs") => ToolCallSemantics::observation(),
+            // new_tab/switch_tab change which page subsequent actions target,
+            // mirroring navigate's observation classification (they don't mutate
+            // page content, they reposition the session).
+            Some("new_tab" | "switch_tab") => ToolCallSemantics::observation(),
             Some("click" | "fill" | "execute_js") => ToolCallSemantics::mutation(),
-            Some("close" | "set_mode") => ToolCallSemantics::administrative(),
+            // close_tab tears down session state — administrative, like close.
+            Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
             _ => ToolCallSemantics::mutation(),
         }
     }
