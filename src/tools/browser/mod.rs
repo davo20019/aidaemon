@@ -119,11 +119,14 @@ impl BrowserTool {
 
         page.type_text(selector, value).await?;
 
-        Ok(format!(
-            "Filled '{}' with '{}'",
+        tracing::info!(
+            action = "fill",
             selector,
-            crate::utils::truncate_str(value, 23)
-        ))
+            value_bytes = value.len(),
+            "browser fill"
+        );
+
+        Ok(format!("Filled '{}'", selector))
     }
 
     async fn action_get_text(&self, args: &Value) -> Result<String, String> {

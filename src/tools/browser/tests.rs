@@ -193,6 +193,35 @@ async fn screenshot_with_selector_records_element_target() {
 }
 
 #[tokio::test]
+async fn fill_result_contains_selector_but_not_value() {
+    // Security: the fill result must NOT echo back the typed value (could be a
+    // password or API token). The first 23 chars of the value are the specific
+    // slice the old code returned via truncate_str — assert those are absent too.
+    let (tool, _backend, _rx) = mock_tool();
+
+    let value = "hunter2-super-secret-token-1234567890";
+    let args = json!({ "action": "fill", "selector": "#password", "value": value });
+    let result = tool.call(&args.to_string()).await.unwrap();
+
+    // The selector must appear in the result so callers know which field was filled.
+    assert!(
+        result.contains("#password"),
+        "fill result must contain the selector: {result}"
+    );
+
+    // The value (or its 23-char prefix) must NOT appear in the result.
+    let prefix_23 = crate::utils::truncate_str(value, 23);
+    assert!(
+        !result.contains(value),
+        "fill result must not contain the full value: {result}"
+    );
+    assert!(
+        !result.contains(prefix_23.as_str()),
+        "fill result must not contain the 23-char truncated prefix of the value: {result}"
+    );
+}
+
+#[tokio::test]
 async fn screenshot_without_selector_records_full_page_target() {
     let (tool, backend, mut rx) = mock_tool();
 
