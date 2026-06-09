@@ -25,6 +25,12 @@ pub struct Fact {
     /// Privacy level controlling where this fact can be recalled.
     #[serde(default = "default_fact_privacy")]
     pub privacy: FactPrivacy,
+    /// When the fact was originally stated or inferred in the event stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen_at: Option<DateTime<Utc>>,
+    /// The exact snippet of conversation that generated this fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_excerpt: Option<String>,
 }
 
 fn default_fact_privacy() -> FactPrivacy {

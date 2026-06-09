@@ -483,6 +483,58 @@ async fn test_upsert_fact_insert() {
 }
 
 #[tokio::test]
+async fn test_upsert_fact_with_provenance_round_trips() {
+    let (store, _db) = setup_test_store().await;
+
+    let first_seen = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    store
+        .upsert_fact_with_provenance(
+            "identity",
+            "partner",
+            "Aracely Zambrano",
+            "user_stated",
+            None,
+            FactPrivacy::Global,
+            Some(first_seen),
+            Some("my wife is Aracely Zambrano"),
+        )
+        .await
+        .unwrap();
+
+    // Provenance lives on the fact itself (not the event), so it survives even
+    // though no event row exists here — the 0f durability guarantee.
+    let facts = store.get_facts(Some("identity")).await.unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].source, "user_stated");
+    assert_eq!(facts[0].first_seen_at, Some(first_seen));
+    assert_eq!(
+        facts[0].source_excerpt.as_deref(),
+        Some("my wife is Aracely Zambrano")
+    );
+
+    // The plain upsert_fact default leaves provenance unset (default is NOT
+    // user_stated / not a fabricated origin).
+    store
+        .upsert_fact(
+            "identity",
+            "city",
+            "Quito",
+            "agent",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    let city = store.get_facts(Some("identity")).await.unwrap();
+    let city = city.iter().find(|f| f.key == "city").unwrap();
+    assert_eq!(city.first_seen_at, None);
+    assert_eq!(city.source_excerpt, None);
+}
+
+#[tokio::test]
 async fn test_upsert_fact_supersede() {
     let (store, _db) = setup_test_store().await;
 

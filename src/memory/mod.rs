@@ -1,5 +1,6 @@
 pub mod binary;
 pub mod context_window;
+pub mod core_profile;
 pub mod embeddings;
 pub mod expertise;
 pub mod manager;

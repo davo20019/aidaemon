@@ -506,6 +506,8 @@ impl SqliteStateStore {
         let last_recalled_str: Option<String> = row.get("last_recalled_at");
         let privacy_str: Option<String> = row.try_get("privacy").unwrap_or(None);
         let channel_id: Option<String> = row.try_get("channel_id").unwrap_or(None);
+        let first_seen_str: Option<String> = row.try_get("first_seen_at").unwrap_or(None);
+        let source_excerpt: Option<String> = row.try_get("source_excerpt").unwrap_or(None);
 
         let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
             .map(|dt| dt.with_timezone(&Utc))
@@ -537,6 +539,12 @@ impl SqliteStateStore {
             privacy: privacy_str
                 .map(|s| FactPrivacy::from_str_lossy(&s))
                 .unwrap_or(FactPrivacy::Global),
+            first_seen_at: first_seen_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            source_excerpt,
         }
     }
 

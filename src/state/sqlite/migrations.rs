@@ -760,6 +760,21 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
 
+    // --- Provenance Capture Migrations ---
+    // Add first_seen_at and source_excerpt to facts table
+    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN first_seen_at TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN source_excerpt TEXT")
+        .execute(pool)
+        .await;
+
+    // Backfill legacy source values
+    // All legacy facts without consolidation provenance are marked "inferred"
+    sqlx::query("UPDATE facts SET source = 'inferred' WHERE source NOT IN ('consolidation', 'user_stated', 'derived', 'inferred')")
+        .execute(pool)
+        .await?;
+
     // --- Facts History Migration ---
     // Ensure facts can keep superseded history while enforcing a single active
     // row per (category, key).

@@ -16,6 +16,8 @@ fn fact(category: &str, key: &str, value: &str) -> Fact {
         last_recalled_at: None,
         channel_id: None,
         privacy: crate::types::FactPrivacy::Global,
+        first_seen_at: None,
+        source_excerpt: None,
     }
 }
 

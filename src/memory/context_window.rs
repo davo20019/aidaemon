@@ -329,12 +329,10 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
 
         let head_end = byte_index_after_chars(result, struct_head);
         let tail_start = byte_index_before_last_chars(result, struct_tail);
-        let omitted = total_chars.saturating_sub(struct_head + struct_tail);
         let compressed = format!(
-            "{}\n\n[truncated {} chars from structured payload of {} total]\n\n{}",
+            "{}\n\n{}\n\n{}",
             &result[..head_end],
-            omitted,
-            total_chars,
+            crate::utils::truncation_notice(struct_head + struct_tail, total_chars),
             &result[tail_start..]
         );
 
@@ -351,12 +349,10 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
     if max_chars <= ANNOTATION_OVERHEAD + MIN_HEAD_CHARS + MIN_TAIL_CHARS {
         let head_chars = max_chars.saturating_sub(ANNOTATION_OVERHEAD).max(1);
         let head_end = byte_index_after_chars(result, head_chars);
-        let omitted = total_chars.saturating_sub(head_chars);
         return format!(
-            "{}\n\n[truncated {} chars from {} total]",
+            "{}\n\n{}",
             &result[..head_end],
-            omitted,
-            total_chars
+            crate::utils::truncation_notice(head_chars, total_chars)
         );
     }
 
@@ -379,12 +375,10 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
 
     let head_end = byte_index_after_chars(result, head_chars);
     let tail_start = byte_index_before_last_chars(result, tail_chars);
-    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
     let compressed = format!(
-        "{}\n\n[truncated {} chars from middle of {} total]\n\n{}",
+        "{}\n\n{}\n\n{}",
         &result[..head_end],
-        omitted,
-        total_chars,
+        crate::utils::truncation_notice(head_chars + tail_chars, total_chars),
         &result[tail_start..]
     );
 
@@ -906,7 +900,7 @@ mod tests {
         let long = format!("HEAD:{}:TAIL", "x".repeat(5000));
         let result = compress_tool_result("test_tool", &long, 2000);
         assert!(result.len() < long.len());
-        assert!(result.contains("[truncated"));
+        assert!(result.contains("OUTPUT TRUNCATED"));
         assert!(result.contains("HEAD:"));
         assert!(result.contains(":TAIL"));
     }
@@ -922,7 +916,7 @@ mod tests {
         );
         let result = compress_tool_result("http_request", &structured, 600);
         assert!(result.contains("JSON summary:"));
-        assert!(result.contains("structured payload"));
+        assert!(result.contains("OUTPUT TRUNCATED"));
         // Head+tail: should contain both the beginning (JSON summary) and the
         // end of the payload (closing braces from the JSON structure).
         assert!(result.contains("]\n}"));

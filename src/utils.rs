@@ -79,6 +79,25 @@ fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
     format!("{}{}", truncated, suffix)
 }
 
+/// Build an explicit, instructional truncation notice for tool output that was
+/// cut down before re-entering the model context. A passive marker like
+/// "(truncated)" is routinely ignored — the model fills the gap and fabricates
+/// the omitted content (e.g. inventing the rest of a user list). This notice
+/// states how much is missing and forbids enumerating what isn't visible.
+pub fn truncation_notice(shown_chars: usize, total_chars: usize) -> String {
+    let omitted = total_chars.saturating_sub(shown_chars);
+    format!(
+        "[⚠ OUTPUT TRUNCATED — {shown} of {total} characters shown; {omitted} omitted and \
+         NOT visible to you. Do NOT enumerate, list, count, or quote any item that is not \
+         literally present in the text you can see — inventing the omitted content is an \
+         error. If the user needs the full result, tell them it is longer than you can see \
+         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.]",
+        shown = shown_chars,
+        total = total_chars,
+        omitted = omitted,
+    )
+}
+
 /// Extract a JSON object from LLM output, handling code fences and preamble text.
 /// Tries direct parse first, then falls back to finding `{...}` bounds.
 pub fn extract_json_object(raw: &str) -> Option<String> {
@@ -126,6 +145,24 @@ mod tests {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello", 5), "hello");
         assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn test_truncation_notice_reports_amounts_and_forbids_fabrication() {
+        let notice = truncation_notice(100, 250);
+        assert!(notice.contains("OUTPUT TRUNCATED"));
+        assert!(notice.contains("100 of 250"));
+        // 150 omitted = 250 - 100
+        assert!(notice.contains("150 omitted"));
+        // Must instruct the model not to invent the omitted content.
+        assert!(notice.contains("Do NOT enumerate"));
+    }
+
+    #[test]
+    fn test_truncation_notice_saturates_when_shown_exceeds_total() {
+        // Defensive: shown > total must not underflow.
+        let notice = truncation_notice(300, 250);
+        assert!(notice.contains("0 omitted"));
     }
 
     #[test]

@@ -7,17 +7,12 @@ use crate::traits::{Fact, Message};
 pub(super) enum CriticalFactQuery {
     OwnerName,
     AssistantName,
-    CoreRelationships,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CriticalFactSummary {
     pub owner_name: Option<String>,
     pub assistant_name: Option<String>,
-    pub relationships: Vec<String>,
-    /// Key personal facts about the owner (birthday, location, pets, preferences)
-    /// that should always be available in context without tool calls.
-    pub personal_facts: Vec<String>,
 }
 
 pub(super) fn is_personal_memory_tool(name: &str) -> bool {
@@ -60,25 +55,6 @@ fn extract_name_from_phrase(value: &str) -> Option<String> {
     None
 }
 
-fn relationship_label_for_key(lower_key: &str) -> Option<&'static str> {
-    if lower_key.contains("wife")
-        || lower_key.contains("husband")
-        || lower_key.contains("spouse")
-        || lower_key.contains("partner")
-    {
-        return Some("partner");
-    }
-    if lower_key.contains("daughter")
-        || lower_key.contains("son")
-        || lower_key.contains("children")
-        || lower_key.contains("child")
-        || lower_key.contains("kids")
-    {
-        return Some("children");
-    }
-    None
-}
-
 pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -117,26 +93,11 @@ pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFact
         return Some(CriticalFactQuery::AssistantName);
     }
 
-    let asks_relationships = contains_keyword_as_words(&lower, "who is my wife")
-        || contains_keyword_as_words(&lower, "who is my husband")
-        || contains_keyword_as_words(&lower, "who is my spouse")
-        || contains_keyword_as_words(&lower, "who is my partner")
-        || contains_keyword_as_words(&lower, "do i have daughters")
-        || contains_keyword_as_words(&lower, "do i have daughter")
-        || contains_keyword_as_words(&lower, "do i have sons")
-        || contains_keyword_as_words(&lower, "do i have kids")
-        || contains_keyword_as_words(&lower, "who are my children");
-    if asks_relationships {
-        return Some(CriticalFactQuery::CoreRelationships);
-    }
-
     None
 }
 
 pub(super) fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
     let mut summary = CriticalFactSummary::default();
-    let mut seen_relationships: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
 
     for fact in facts {
         let key = fact.key.trim();
@@ -175,84 +136,6 @@ pub(super) fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSumma
                 summary.assistant_name = normalize_name_candidate(value);
             }
         }
-
-        if summary.relationships.len() < 4 {
-            if let Some(label) = relationship_label_for_key(&lower_key) {
-                let clean_value = value
-                    .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
-                    .trim();
-                if !clean_value.is_empty() && clean_value.len() <= 160 {
-                    let line = format!("{}: {}", label, clean_value);
-                    let dedupe = line.to_ascii_lowercase();
-                    if seen_relationships.insert(dedupe) {
-                        summary.relationships.push(line);
-                    }
-                }
-            }
-        }
-
-        // Extract key personal facts (birthday, location, pets, food, hobbies, etc.)
-        if summary.personal_facts.len() < 12 {
-            let is_personal_cat = matches!(
-                lower_cat.as_str(),
-                "personal"
-                    | "preference"
-                    | "family"
-                    | "profile"
-                    | "user"
-                    | "identity"
-                    | "lifestyle"
-                    | "food"
-                    | "pet"
-                    | "pets"
-                    | "location"
-                    | "hobby"
-                    | "hobbies"
-            );
-            let is_personal_key = lower_key.contains("birthday")
-                || lower_key.contains("birth_date")
-                || lower_key.contains("location")
-                || lower_key.contains("city")
-                || lower_key.contains("country")
-                || lower_key.contains("pet")
-                || lower_key.contains("food")
-                || lower_key.contains("cuisine")
-                || lower_key.contains("hobby")
-                || lower_key.contains("language")
-                || lower_key.contains("coffee")
-                || lower_key.contains("drink")
-                || lower_key.contains("children")
-                || lower_key.contains("daughters")
-                || lower_key.contains("sons")
-                || lower_key.contains("family");
-            // Skip keys already handled as owner_name/assistant_name/relationships
-            let is_handled = matches!(
-                lower_key.as_str(),
-                "name"
-                    | "owner_name"
-                    | "user_name"
-                    | "full_name"
-                    | "my_name"
-                    | "owner"
-                    | "assistant_name"
-                    | "bot_name"
-                    | "ai_name"
-                    | "daemon_name"
-            ) || relationship_label_for_key(&lower_key).is_some();
-
-            if (is_personal_cat || is_personal_key) && !is_handled {
-                let clean_value = value
-                    .trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))
-                    .trim();
-                if !clean_value.is_empty() && clean_value.len() <= 200 {
-                    let line = format!("{}: {}", key, clean_value);
-                    let dedupe = line.to_ascii_lowercase();
-                    if seen_relationships.insert(dedupe) {
-                        summary.personal_facts.push(line);
-                    }
-                }
-            }
-        }
     }
 
     summary
@@ -273,16 +156,6 @@ pub(super) fn deterministic_reply_for_critical_query(
             || "I don't have a pinned assistant name in critical memory right now.".to_string(),
             |name| format!("My name is {}.", name),
         ),
-        CriticalFactQuery::CoreRelationships => {
-            if summary.relationships.is_empty() {
-                "I don't have core relationship details pinned yet.".to_string()
-            } else {
-                format!(
-                    "Here are the core relationship details I have pinned:\n- {}",
-                    summary.relationships.join("\n- ")
-                )
-            }
-        }
     }
 }
 
@@ -299,16 +172,6 @@ pub(super) fn build_critical_facts_prompt_block(summary: &CriticalFactSummary) -
     }
     if let Some(assistant_name) = summary.assistant_name.as_ref() {
         lines.push(format!("• Assistant name → {}", assistant_name));
-    }
-    if !summary.relationships.is_empty() {
-        for rel in summary.relationships.iter().take(4) {
-            lines.push(format!("• {}", rel));
-        }
-    }
-    if !summary.personal_facts.is_empty() {
-        for fact in summary.personal_facts.iter().take(12) {
-            lines.push(format!("• {}", fact));
-        }
     }
     lines.push("═══════════════════════════════════════════════".to_string());
 
@@ -692,6 +555,8 @@ mod tests {
             last_recalled_at: None,
             channel_id: None,
             privacy: FactPrivacy::Global,
+            first_seen_at: None,
+            source_excerpt: None,
         }
     }
 
@@ -1005,10 +870,6 @@ mod tests {
             detect_critical_fact_query("What is your bot name?"),
             Some(CriticalFactQuery::AssistantName)
         );
-        assert_eq!(
-            detect_critical_fact_query("Do I have daughters?"),
-            Some(CriticalFactQuery::CoreRelationships)
-        );
     }
 
     #[test]
@@ -1045,8 +906,6 @@ mod tests {
         let summary = extract_critical_fact_summary(&facts);
         assert_eq!(summary.owner_name.as_deref(), Some("Test Owner"));
         assert_eq!(summary.assistant_name.as_deref(), Some("TestBot"));
-        assert_eq!(summary.relationships.len(), 1);
-        assert!(summary.relationships[0].contains("children"));
     }
 
     #[test]
@@ -1054,8 +913,6 @@ mod tests {
         let summary = CriticalFactSummary {
             owner_name: Some("Test Owner".to_string()),
             assistant_name: Some("TestBot".to_string()),
-            relationships: vec!["children: Sofia".to_string()],
-            personal_facts: vec![],
         };
         assert_eq!(
             deterministic_reply_for_critical_query(CriticalFactQuery::OwnerName, &summary),
@@ -1065,11 +922,6 @@ mod tests {
             deterministic_reply_for_critical_query(CriticalFactQuery::AssistantName, &summary),
             "My name is TestBot."
         );
-        assert!(deterministic_reply_for_critical_query(
-            CriticalFactQuery::CoreRelationships,
-            &summary
-        )
-        .contains("children: Sofia"));
     }
 
     #[test]

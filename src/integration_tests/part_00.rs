@@ -782,7 +782,8 @@ async fn test_owner_system_prompt_has_no_restrictions() {
 
 #[tokio::test]
 async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let mut harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    harness.agent.set_test_orchestrator_mode();
 
     harness
         .state

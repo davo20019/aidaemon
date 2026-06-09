@@ -56,7 +56,7 @@ async fn test_tool_result_compressed() {
     let large = "x".repeat(5000);
     let compressed = compress_tool_result("terminal", &large, 2000);
     assert!(compressed.len() < 5000);
-    assert!(compressed.contains("[truncated"));
+    assert!(compressed.contains("OUTPUT TRUNCATED"));
     assert!(compressed.contains("5000"));
 }
 

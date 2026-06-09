@@ -233,6 +233,9 @@ impl Consolidator {
         result.behavior_patterns_recorded =
             self.extract_failure_patterns_from_decisions(&events).await;
 
+        // 4.5. Extract and stamp fact provenance
+        self.extract_and_stamp_fact_provenance(&events).await;
+
         // 5. Mark events as consolidated
         // Note: Episode creation is handled exclusively by MemoryManager (LLM-quality episodes)
         let event_ids: Vec<i64> = events.iter().map(|e| e.id).collect();
@@ -249,6 +252,76 @@ impl Consolidator {
         );
 
         Ok(result)
+    }
+
+    async fn extract_and_stamp_fact_provenance(&self, events: &[Event]) {
+        let mut last_user_message = None;
+        let mut last_msg_time = None;
+
+        for event in events {
+            if event.event_type == crate::events::EventType::UserMessage {
+                if let Ok(data) = event.parse_data::<super::UserMessageData>() {
+                    last_user_message = Some(data.content);
+                    last_msg_time = Some(event.created_at);
+                }
+            } else if event.event_type == crate::events::EventType::ToolCall
+                && event.tool_name.as_deref() == Some("remember_fact")
+            {
+                if let Ok(data) = event.parse_data::<super::ToolCallData>() {
+                    if let Ok(args) = serde_json::from_value::<serde_json::Value>(data.arguments) {
+                        let mut entries = Vec::new();
+
+                        if let Some(facts_arr) = args.get("facts").and_then(|v| v.as_array()) {
+                            for f in facts_arr {
+                                if let (Some(c), Some(k), Some(v)) = (
+                                    f.get("category").and_then(|val| val.as_str()),
+                                    f.get("key").and_then(|val| val.as_str()),
+                                    f.get("value").and_then(|val| val.as_str()),
+                                ) {
+                                    entries.push((c.to_string(), k.to_string(), v.to_string()));
+                                }
+                            }
+                        } else if let (Some(c), Some(k), Some(v)) = (
+                            args.get("category").and_then(|val| val.as_str()),
+                            args.get("key").and_then(|val| val.as_str()),
+                            args.get("value").and_then(|val| val.as_str()),
+                        ) {
+                            entries.push((c.to_string(), k.to_string(), v.to_string()));
+                        }
+
+                        for (category, key, value) in entries {
+                            let mut source = "derived";
+                            let mut source_excerpt = None;
+                            let mut first_seen_at = None;
+
+                            if let Some(msg) = &last_user_message {
+                                let lower_msg = msg.to_lowercase();
+                                let lower_val = value.to_lowercase();
+                                if lower_val.len() > 3 && lower_msg.contains(&lower_val) {
+                                    source = "user_stated";
+                                }
+                                source_excerpt = Some(crate::utils::truncate_str(msg, 200));
+                                first_seen_at = last_msg_time;
+                            }
+
+                            let first_seen_str = first_seen_at.map(|dt| dt.to_rfc3339());
+                            let _ = sqlx::query(
+                                "UPDATE facts
+                                 SET source = ?, first_seen_at = ?, source_excerpt = ?
+                                 WHERE category = ? AND key = ? AND superseded_at IS NULL",
+                            )
+                            .bind(source)
+                            .bind(&first_seen_str)
+                            .bind(&source_excerpt)
+                            .bind(&category)
+                            .bind(&key)
+                            .execute(&self.pool)
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn procedure_meets_evidence_gate(&self, procedure: &Procedure) -> bool {

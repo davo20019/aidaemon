@@ -281,6 +281,13 @@ struct CompletionSignals {
     explicit_verification_requested: bool,
     observable_target_request: bool,
     visible_state_problem: bool,
+    /// A question whose answer requires observing live external/system state
+    /// (e.g. "how many users?", "who are the admins?", "any blocked users?").
+    /// These have no file/URL target and no "show me / on this site" phrasing,
+    /// so they are NOT `observable_target_request`, yet they still need a tool
+    /// to observe. Without this signal the contract treats them as plain-text
+    /// knowledge questions and the prelude hard-blocks the lookup tool.
+    live_state_query: bool,
 }
 
 pub(super) fn looks_like_question_request(lower_text: &str) -> bool {
@@ -540,6 +547,30 @@ fn infer_completion_signals(
         asks_change
     };
 
+    // Interrogatives that enumerate or quantify live system/entity state. These
+    // need a tool to observe the answer even though they carry no file/URL
+    // target. Scoped to questions so plain conversational text is unaffected.
+    let live_state_query = is_question
+        && (lower_text.starts_with("any ")
+            || text_contains_any_phrase(
+                lower_text,
+                &[
+                    "how many",
+                    "how much",
+                    "who are",
+                    "who is",
+                    "who's",
+                    "list the",
+                    "list all",
+                    "what are the",
+                    "which ",
+                    "are there any",
+                    "is there any",
+                    "do i have any",
+                    "do we have any",
+                ],
+            ));
+
     CompletionSignals {
         is_question,
         asks_schedule,
@@ -554,6 +585,7 @@ fn infer_completion_signals(
         explicit_verification_requested,
         observable_target_request,
         visible_state_problem,
+        live_state_query,
     }
 }
 
@@ -622,6 +654,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     let requires_observation = signals.explicit_verification_requested
         || signals.observable_target_request
         || signals.visible_state_problem
+        || signals.live_state_query
         || task_kind == CompletionTaskKind::Diagnose
         || (matches!(
             task_kind,
@@ -728,6 +761,45 @@ mod tests {
         assert!(contract.expects_mutation);
         assert!(!contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
+    }
+    #[test]
+    fn live_state_questions_require_observation_so_lookup_tools_are_not_blocked() {
+        // Regression: factual questions about live system state were classified
+        // as plain-text knowledge questions (requires_observation=false), so the
+        // prelude hard-blocked the shell/lookup tool and the model fabricated an
+        // answer or returned a bare "Done.".
+        for q in [
+            "How many users?",
+            "Who are admin users?",
+            "Any blocked/inactive users?",
+            "Which modules are enabled?",
+            "How much disk is free?",
+        ] {
+            let contract = infer_completion_contract(q, &[]);
+            assert!(
+                contract.requires_observation,
+                "expected requires_observation for live-state question: {q:?}"
+            );
+            assert!(
+                !contract.expects_mutation,
+                "live-state question should not expect mutation: {q:?}"
+            );
+        }
+        // "How many users?" carries no file/URL target and requests no explicit
+        // verification, so requires_observation alone does NOT arm a completion
+        // verification block (has_concrete_verification_reason stays false) —
+        // confirming requires_observation flips off the plain-text gate without
+        // introducing loop risk for a plain answer.
+        let bare = infer_completion_contract("How many users?", &[]);
+        assert!(!bare.explicit_verification_requested);
+        assert!(bare.verification_targets.is_empty());
+    }
+    #[test]
+    fn conversational_questions_stay_plain_text() {
+        // A question that does not enumerate live state must not be flagged.
+        let contract = infer_completion_contract("What do you think of this idea?", &[]);
+        assert!(!contract.requires_observation);
+        assert!(!contract.expects_mutation);
     }
     #[test]
     fn generic_check_request_does_not_force_verification_without_target() {

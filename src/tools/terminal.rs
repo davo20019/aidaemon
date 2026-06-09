@@ -479,13 +479,16 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
         result.push_str("(no output)");
     }
     if result.len() > max_chars {
+        let total_chars = result.chars().count();
         // Find the nearest valid UTF-8 char boundary at or before max_chars
         let mut truncate_at = max_chars;
         while truncate_at > 0 && !result.is_char_boundary(truncate_at) {
             truncate_at -= 1;
         }
         result.truncate(truncate_at);
-        result.push_str("\n... (truncated)");
+        let shown_chars = result.chars().count();
+        result.push('\n');
+        result.push_str(&crate::utils::truncation_notice(shown_chars, total_chars));
     }
     result
 }
@@ -2736,10 +2739,13 @@ mod tests {
         let result = format_output(&long_output, "", 100);
         assert!(
             result.len() > 100,
-            "truncated output should include the suffix"
+            "truncated output should include the notice"
         );
-        assert!(result.ends_with("\n... (truncated)"));
-        // The content portion before the suffix should be exactly max_chars long
+        assert!(result.contains("OUTPUT TRUNCATED"));
+        // The notice must report the omitted amount so the model can't silently
+        // fabricate the rest (100 shown of 200 total).
+        assert!(result.contains("100 of 200"));
+        // The content portion before the notice should be exactly max_chars long
         let prefix = &result[..100];
         assert_eq!(prefix, "a".repeat(100));
     }
@@ -2754,7 +2760,7 @@ mod tests {
             // Must not panic and must be valid UTF-8 (String guarantees this)
             assert!(!result.is_empty());
             if output.len() > max {
-                assert!(result.ends_with("\n... (truncated)"));
+                assert!(result.contains("OUTPUT TRUNCATED"));
             }
         }
     }

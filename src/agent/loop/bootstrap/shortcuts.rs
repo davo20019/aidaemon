@@ -380,6 +380,13 @@ pub(super) async fn maybe_handle_non_resolving_confirmation_shortcut(
         return Ok(None);
     }
 
+    if prev_assistant
+        .trim()
+        .starts_with("I still need the specific")
+    {
+        return Ok(None);
+    }
+
     let reply = build_specific_answer_request(prev_assistant);
     let reply =
         emit_bootstrap_direct_reply(agent, emitter, task_id, session_id, Instant::now(), &reply)
@@ -725,5 +732,20 @@ mod tests {
             "Persistent context. Not just chat.\n\nWant me to tweak this or post it?",
         );
         assert!(reply.contains("Please answer directly: Want me to tweak this or post it?"));
+    }
+
+    #[test]
+    fn test_confirmation_shortcut_pass_through() {
+        // First nudge
+        let reply1 = build_specific_answer_request("Want me to tweak this or post it?");
+        assert!(reply1.starts_with("I still need the specific"));
+
+        // Second nudge (fallback)
+        let reply2 = build_specific_answer_request(
+            "Here is a very long question that exceeds the limit so we use the fallback..."
+                .repeat(3)
+                .as_str(),
+        );
+        assert!(reply2.starts_with("I still need the specific"));
     }
 }

@@ -570,6 +570,33 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
+        let core_profile_str = if inject_personal && user_role == UserRole::Owner && self.depth == 0
+        {
+            let cached_ids = self
+                .session_core_profile_ids
+                .read()
+                .await
+                .get(session_id)
+                .cloned();
+            let (profile_str, new_ids) = crate::memory::core_profile::build_core_profile(
+                &self.state,
+                cached_ids,
+                people_enabled,
+            )
+            .await
+            .unwrap_or_default();
+
+            if let Some(ids) = new_ids {
+                self.session_core_profile_ids
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), ids);
+            }
+            profile_str
+        } else {
+            String::new()
+        };
+
         let core_inputs = core_prompt::assemble_core_inputs(
             user_role,
             channel_ctx,
@@ -585,6 +612,7 @@ impl Agent {
                 .map(|(name, desc)| (name.to_string(), desc))
                 .collect(),
             channel_rules,
+            core_profile_str,
         );
         // Pillar A Task 7: per-session core cache. On a HIT (aggregate hash
         // unchanged since this session's last task) the rendered bytes are reused
@@ -1121,6 +1149,7 @@ mod tests {
                 .into_iter()
                 .map(|(n, d)| (n.to_string(), d))
                 .collect(),
+            String::new(),
             String::new(),
         );
         let rendered = render_core_prompt(&core_inputs);

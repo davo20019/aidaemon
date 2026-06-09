@@ -206,7 +206,8 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
 
 #[async_trait]
 impl crate::traits::FactStore for SqliteStateStore {
-    async fn upsert_fact(
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_fact_with_provenance(
         &self,
         category: &str,
         key: &str,
@@ -214,6 +215,8 @@ impl crate::traits::FactStore for SqliteStateStore {
         source: &str,
         channel_id: Option<&str>,
         privacy: FactPrivacy,
+        first_seen_at: Option<DateTime<Utc>>,
+        source_excerpt: Option<&str>,
     ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         let privacy_str = privacy.to_string();
@@ -486,8 +489,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                 // Insert new fact with embedding — ignore duplicate entry errors (code 2067)
                 // that can occur due to active-unique constraint race conditions.
                 let insert_result = sqlx::query(
-                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
-                     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                    "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding, first_seen_at, source_excerpt)
+                     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
                 )
                 .bind(category_clean)
                 .bind(&key_for_write)
@@ -498,6 +501,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                 .bind(channel_id)
                 .bind(&privacy_str)
                 .bind(&embedding_blob)
+                .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                .bind(source_excerpt)
                 .execute(&self.pool)
                 .await;
 
@@ -513,7 +518,9 @@ impl crate::traits::FactStore for SqliteStateStore {
                             "UPDATE facts
                              SET value = ?, source = ?, updated_at = ?,
                                  channel_id = ?, privacy = ?,
-                                 embedding = COALESCE(?, embedding)
+                                 embedding = COALESCE(?, embedding),
+                                 first_seen_at = COALESCE(?, first_seen_at),
+                                 source_excerpt = COALESCE(?, source_excerpt)
                              WHERE category = ? AND key = ? AND superseded_at IS NULL",
                         )
                         .bind(value)
@@ -522,6 +529,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                         .bind(channel_id)
                         .bind(&privacy_str)
                         .bind(&embedding_blob)
+                        .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                        .bind(source_excerpt)
                         .bind(category_clean)
                         .bind(&key_for_write)
                         .execute(&self.pool)
@@ -534,7 +543,9 @@ impl crate::traits::FactStore for SqliteStateStore {
                                 "UPDATE facts
                                  SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
                                      channel_id = ?, privacy = ?,
-                                     embedding = COALESCE(?, embedding)
+                                     embedding = COALESCE(?, embedding),
+                                     first_seen_at = COALESCE(?, first_seen_at),
+                                     source_excerpt = COALESCE(?, source_excerpt)
                                  WHERE id = ?",
                             )
                             .bind(value)
@@ -543,6 +554,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                             .bind(channel_id)
                             .bind(&privacy_str)
                             .bind(&embedding_blob)
+                            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                            .bind(source_excerpt)
                             .bind(old_id)
                             .execute(&self.pool)
                             .await?;
@@ -566,11 +579,13 @@ impl crate::traits::FactStore for SqliteStateStore {
                     .await?;
                 } else {
                     sqlx::query(
-                        "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
+                        "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?), first_seen_at = COALESCE(first_seen_at, ?), source_excerpt = COALESCE(source_excerpt, ?) WHERE id = ?",
                     )
                     .bind(source)
                     .bind(&now)
                     .bind(&embedding_blob)
+                    .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                    .bind(source_excerpt)
                     .bind(old_id)
                     .execute(&self.pool)
                     .await?;
@@ -580,8 +595,8 @@ impl crate::traits::FactStore for SqliteStateStore {
             // No existing fact - insert new with embedding
             // Ignore duplicate entry errors (code 2067) from concurrent inserts
             let insert_result = sqlx::query(
-                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, channel_id, privacy, embedding, first_seen_at, source_excerpt)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             )
             .bind(category_clean)
             .bind(&key_for_write)
@@ -592,6 +607,8 @@ impl crate::traits::FactStore for SqliteStateStore {
             .bind(channel_id)
             .bind(&privacy_str)
             .bind(&embedding_blob)
+            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+            .bind(source_excerpt)
             .execute(&self.pool)
             .await;
 
@@ -606,7 +623,9 @@ impl crate::traits::FactStore for SqliteStateStore {
                         "UPDATE facts
                          SET value = ?, source = ?, updated_at = ?,
                              channel_id = ?, privacy = ?,
-                             embedding = COALESCE(?, embedding)
+                             embedding = COALESCE(?, embedding),
+                             first_seen_at = COALESCE(?, first_seen_at),
+                             source_excerpt = COALESCE(?, source_excerpt)
                          WHERE category = ? AND key = ? AND superseded_at IS NULL",
                     )
                     .bind(value)
@@ -615,6 +634,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                     .bind(channel_id)
                     .bind(&privacy_str)
                     .bind(&embedding_blob)
+                    .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                    .bind(source_excerpt)
                     .bind(category_clean)
                     .bind(&key_for_write)
                     .execute(&self.pool)
@@ -637,7 +658,9 @@ impl crate::traits::FactStore for SqliteStateStore {
                                 "UPDATE facts
                                  SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
                                      channel_id = ?, privacy = ?,
-                                     embedding = COALESCE(?, embedding)
+                                     embedding = COALESCE(?, embedding),
+                                     first_seen_at = COALESCE(?, first_seen_at),
+                                     source_excerpt = COALESCE(?, source_excerpt)
                                  WHERE id = ?",
                             )
                             .bind(value)
@@ -646,6 +669,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                             .bind(channel_id)
                             .bind(&privacy_str)
                             .bind(&embedding_blob)
+                            .bind(first_seen_at.as_ref().map(|dt| dt.to_rfc3339()))
+                            .bind(source_excerpt)
                             .bind(id)
                             .execute(&self.pool)
                             .await?;
@@ -749,12 +774,12 @@ impl crate::traits::FactStore for SqliteStateStore {
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>> {
         // Only return current (non-superseded) facts
         let rows = if let Some(cat) = category {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
                 .bind(cat)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -769,7 +794,7 @@ impl crate::traits::FactStore for SqliteStateStore {
     async fn get_relevant_facts(&self, query: &str, max: usize) -> anyhow::Result<Vec<Fact>> {
         // Load facts with stored embeddings
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -926,7 +951,7 @@ impl crate::traits::FactStore for SqliteStateStore {
 
         // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -1069,7 +1094,7 @@ impl crate::traits::FactStore for SqliteStateStore {
     ) -> anyhow::Result<Vec<Fact>> {
         // Get channel-scoped facts from OTHER channels that are relevant to the query
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
              FROM facts
              WHERE superseded_at IS NULL
                AND privacy = 'channel'
@@ -1166,7 +1191,7 @@ impl crate::traits::FactStore for SqliteStateStore {
 
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
         let rows = sqlx::query(
-            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
              FROM facts WHERE superseded_at IS NULL ORDER BY category, key"
         )
         .fetch_all(&self.pool)

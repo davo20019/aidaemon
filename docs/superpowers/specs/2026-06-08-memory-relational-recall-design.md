@@ -74,6 +74,14 @@
 > 0f must *repurpose* it with a backfill decision, not add it; split 0f into **PR2.5 capture (early,
 > time-sensitive) + PR6 recall (depends on PR3)**; added the minimum-shippable-path floor (PR1+PR2+PR3),
 > a 0e migration-from-flat-facts test, and a precedence-keyway integration test.
+> **8th review pass (edge-case hardening):** Top-N cap now applies **after merge over entities** (a
+> salient person can't get their name in but birthday cut at N+1); `confidence`-as-salience must be
+> hash-excluded like `recall_count` if it drifts; classifier entity field is now `entities: Vec<String>`
+> (compound denials → one retry); 0e migration **fails open** on ambiguous flat facts (pet keyed `son`
+> stays a flat fact, never a wrong edge); resolved the prune open-question toward an `event_archives`
+> soft-delete (hot table stays small, provenance recall joins the archive for real excerpts); added a
+> component-arity test (correctly framed: count mismatch is a compile error; the real test is that the
+> 7th component actually changes the aggregate hash).
 > Companion to [`memory-graph-analysis.md`](../../memory-graph-analysis.md) and
 > [`memory-system-design-notes.md`](../../memory-system-design-notes.md) (the polyglot-memory brainstorm).
 > This spec narrows that long-term direction in response to a **concrete, reproduced failure**.
@@ -298,7 +306,10 @@ birthdays stored only as `person_facts` rank below flat-fact trivia:
 - **`Person` records with a relationship role** (partner/spouse/children): **always high salience** —
   they are the relationships this whole spec is about; do not subject them to the recall lottery.
 - **`person_facts`:** `category_weight + recency` only (no recall term); or inherit the owner-person's
-  recall signal if cheap. Confidence may stand in for the missing recall component.
+  recall signal if cheap. Confidence may stand in for the missing recall component — **but if `confidence`
+  drifts during background consolidation, treat it exactly like `recall_count`: a selection input only,
+  *excluded from the cache hash*** (step 2 of the frozen algorithm), or it will silently bust the core
+  cache mid-session.
 
 - **Pinned wins (force-in); unpinned can be force-out** — "force-out" means **not selected into the
   top-N**, i.e. an unpinned fact competes on salience and can lose its slot; it is *not* a separate
@@ -306,6 +317,11 @@ birthdays stored only as `person_facts` rank below flat-fact trivia:
   automatic capture (addresses the "no control / unpredictable memory" complaint from the research
   notes).
 - **Bounded** by N so the cached core stays small no matter how many facts accumulate over years.
+- **Apply the N cutoff AFTER merge, over *entities*, not over shredded rows (avoids split entities).**
+  If Top-N ranked the raw shredded rows, a salient person could land their `name` row at rank N and have
+  their `birthday` row fall to N+1 — rendering `Bella` with no birthday. Merge the shredded rows into
+  entities first (per the merge/render rules below), score and cap **the merged entity**, so a selected
+  entity carries all its attributes or none.
 - **Rendered deterministically**, grouped for readability (an "About you" block: identity lines, then
   relationships with linked name+birthday, then other high-salience facts). Synonym normalization so
   "wife"/"spouse"/"husband" resolve to the `partner` role and "kids"/"daughter"/"son" to `children`.
@@ -417,8 +433,11 @@ only be stamped going forward (the prune already destroyed the past).
 **Classifier-dependency resolution (critical sequencing — Option A):** 0e's kinship injection is
 **classifier-gated**, and 0d and 0f also route through a classifier. Rather than ship the classifier in
 PR4 (which 0e/PR3 precedes) or build three calls, **PR3 ships the one shared classifier** with a single
-output struct — e.g. `{ intent: kinship | provenance | needs_grounding | none, entity: Option<String> }`
-— and PR4/PR6 only **consume** it (PR4 adds the gate, PR6 adds the recall route). This removes the
+output struct — e.g. `{ intent: kinship | provenance | needs_grounding | none, entities: Vec<String> }`
+(**`entities` is a list, not a single `Option<String>`** — a compound question like "when are my wife
+*and* daughter's birthdays?" can be missing **both**, and one forced retry should instruct the model to
+look up *all* missing entities at once rather than looping per-entity) — and PR4/PR6 only **consume** it
+(PR4 adds the gate, PR6 adds the recall route). This removes the
 PR3-needs-PR4 cycle and the "one classifier, two/three outputs" promise becomes a concrete deliverable
 owned by PR3. Name that struct once in the plan.
 
@@ -614,9 +633,10 @@ the module is today **shadow-mode scaffolding** ("*not* wired into the agent's d
 knowledge / other) — **not** the `{ intent, entity }` shape these fixes need. So the **classifier ships in
 PR3** (it's on 0e's critical path), and PR4/PR6 consume it:
 - Add a **new** classifier function with a **single shared output struct** —
-  `{ intent: kinship | provenance | needs_grounding | none, entity: Option<String> }` — not three calls,
+  `{ intent: kinship | provenance | needs_grounding | none, entities: Vec<String> }` — not three calls,
   not an overload of `classify_intent`. One call serves 0e's kinship flag (PR3), Fix 3's groundedness
-  (PR4), and 0f's provenance routing (PR6).
+  (PR4), and 0f's provenance routing (PR6). `entities` is a **list** so a compound denial ("my wife and
+  daughter's birthdays") forces **one** retry covering all missing entities, not a loop per entity.
 - **Fail-open**, matching the module's existing ~5s-timeout / any-error → no-op contract: a classifier
   error degrades to the pre-filter-only path (Fix 3) and to "no kinship injection" (0e), never to a hang
   or a blocked reply.
@@ -645,6 +665,13 @@ makes the reproduced kinship questions deterministic — owner-centric only, not
 - **Population:** derive edges from existing data at migration time (owner's `partner`/`children`/parent
   facts + `people` records) and keep them in sync when `manage_people` / `remember_fact` writes a
   relationship. No new user action required.
+- **Migration must fail open on ambiguous flat facts.** Real flat data is messy — a pet keyed `son`, an
+  un-pairable date, a role word inside a sentence. If a flat fact can't be **confidently** converted to a
+  typed edge, **leave it as a flat fact** (Fix 2's fallback render still surfaces it) rather than create a
+  wrong edge — a wrong `owner —child→ Rex(the dog)` edge is worse than no edge, because it answers kinship
+  queries confidently and incorrectly. The user corrects via `manage_people`, which writes the edge cleanly.
+  Test the ambiguous case explicitly: a `son: Rex` flat fact with no corroborating Person record does **not**
+  silently become a child edge.
 - **Retrieval — direct edges are ground truth; co-parent is an *inference*, not "deterministic"
   (resolves an internal contradiction):** a parent named by a **stored edge** is exact —
   `dad_of(X) = { p : p —parent→ X }` returns the owner when `owner —parent→ X` is stored, and that is
@@ -866,6 +893,12 @@ the critical path for relational recall.
 - **Cache invariants:** the new core component participates in the aggregate hash; unchanged
   relationships → cache HIT (block byte-stable across turns); a changed relationship → exactly one
   re-render. Extends the existing `core_prompt.rs` cache-decision tests.
+- **Component arity (the `COMPONENT_COUNT` 6→7 bump):** a count/array mismatch is a **compile error**
+  (the `entries` array literal is fixed-size), not a runtime panic — so the real risk is a *silently
+  forgotten or duplicated* component: bumping the count but hashing the wrong field, or omitting
+  `core_profile` from the entries. Add a test that **changing only the core-profile input changes the
+  aggregate hash** (proves the 7th component is actually wired into the hash, not just counted) and that
+  no two components share a hash for distinct inputs.
 - **Integration (mock LLM) — 0b is DIRECT recall only, NOT kinship derivation:** in an owner DM seeded
   with a partner + 2 children **and** a non-relationship high-salience fact (for 0b use a
   **high-`recall_count`** allergy/employer — *not* a pinned one; pinned-fact inclusion is a 0c test),
@@ -953,8 +986,12 @@ the critical path for relational recall.
 - [ ] Should Fix 2's deterministic block let us *shrink* the volatile per-turn people injection
       (avoid double-emission)? (Defer; measure first — and note per Bug 3 there is little owner-DM
       people text to shrink today, since the graph is fetched but not rendered.)
-- [ ] **Prune-timing aggressiveness (0f-adjacent):** consolidated events are pruned within minutes
-      (~25 min observed in live forensics), which is what makes raw-utterance provenance unrecoverable and
-      may also hurt recent-conversation recall. 0f preserves *fact* provenance regardless, but should the
-      event-prune cutoff be lengthened, or an append-only utterance log kept, so the *raw* record survives
-      longer? (Heavier; measure recall impact before changing the prune contract.)
+- [x] **Prune-timing aggressiveness (0f-adjacent)** — **leaning: archive, don't lengthen the cutoff.**
+      Consolidated events are pruned within minutes (~25 min observed), making raw-utterance provenance
+      unrecoverable. Lengthening the prune cutoff keeps the **hot** `events` table heavy (it's on the
+      read path). Prefer a **soft-delete / async move to an `event_archives` table**: the hot `events`
+      table stays small (prune contract unchanged for the read path), while
+      `manage_memories(action='provenance')` can **join the archive** to surface the actual conversational
+      excerpt where a fact was learned — not just the stamped `source_excerpt`. This gives 0f richer
+      "where did I learn this" answers without bloating the hot path. (Still measure storage growth;
+      archive can have its own, much longer, retention.)

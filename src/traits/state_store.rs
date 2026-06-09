@@ -64,6 +64,25 @@ pub trait FactStore: Send + Sync {
         source: &str,
         channel_id: Option<&str>,
         privacy: FactPrivacy,
+    ) -> anyhow::Result<()> {
+        self.upsert_fact_with_provenance(
+            category, key, value, source, channel_id, privacy, None, None,
+        )
+        .await
+    }
+
+    /// Upsert a fact with full provenance data.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_fact_with_provenance(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        source: &str,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+        first_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+        source_excerpt: Option<&str>,
     ) -> anyhow::Result<()>;
 
     /// Get all facts, optionally filtered by category.
