@@ -11,6 +11,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
@@ -24,6 +25,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::{BrowserConfig, SessionIsolation};
+
+/// Upper bound on how long the graceful Chrome shutdown (`Browser::close()` +
+/// `Browser::wait()`) and per-resource disposal (close-target / dispose-context)
+/// are allowed to take before we give up and fall back to the abrupt teardown.
+/// Keeps a wedged/dying Chrome from hanging the close path (or the daemon's
+/// shutdown) indefinitely.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A handle to a single browser page/tab. Methods mirror the chromiumoxide
 /// `Page` operations the tool's actions need today. Some methods (e.g. the tab
@@ -116,16 +124,38 @@ pub trait BrowserBackend: Send + Sync {
     /// Ensure a browser is launched or connected and ready for use.
     async fn ensure_ready(&self) -> Result<(), String>;
 
-    /// Create a NEW page/tab and return its `(target_id, handle)`.
+    /// Create a NEW page/tab and return its `(target_id, context_id, handle)`.
     ///
     /// Unlike the old `current_page()` (which grabbed the first existing tab and
     /// thus shared one page across all sessions), this always creates a distinct
     /// page so the session registry can give each `_session_id` its own tab.
-    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String>;
+    ///
+    /// `context_id` is `Some(id)` in `browser_context` isolation mode — the CDP
+    /// browser-context id the page was created in, so the session can dispose it
+    /// on eviction/close. It is `None` in `page` isolation mode (the page lives in
+    /// the default shared context, which is never disposed).
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String>;
 
-    /// Close the browser session. Returns a user-facing status message
-    /// describing what happened (disconnected vs. closed vs. no-op).
-    async fn close(&self) -> Result<String, String>;
+    /// Gracefully shut the browser session down. Returns a user-facing status
+    /// message describing what happened (disconnected vs. closed vs. no-op).
+    ///
+    /// For a LAUNCHED browser this performs a graceful Chrome shutdown
+    /// (`Browser::close()` + `Browser::wait()`, bounded by a timeout) before
+    /// falling back to aborting the handler task; for an ATTACHED browser
+    /// (`remote_debugging_port`) it detaches WITHOUT sending a browser-close
+    /// command, so the user's own Chrome keeps running. Idempotent: safe to call
+    /// repeatedly (a second call on an already-closed backend is a no-op).
+    ///
+    /// This is the single graceful-teardown path; `close`, `set_headless_mode`'s
+    /// restart, idle eviction, and daemon shutdown all route through it.
+    async fn shutdown(&self) -> Result<String, String>;
+
+    /// Dispose the per-session resources surfaced by idle eviction (or session
+    /// close): close each tab target, then dispose any per-session CDP browser
+    /// context. Best-effort and bounded — a failure on one resource is logged and
+    /// does not block the others or wedge the caller. Does NOT close the browser
+    /// itself (that is [`BrowserBackend::shutdown`]'s job).
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]);
 
     /// Apply a headless/visible mode switch, restarting the browser on the next
     /// action if the mode actually changed. Returns a user-facing status
@@ -294,45 +324,113 @@ impl ChromiumoxideBackend {
     /// runs without holding this mutex.
     ///
     /// In `Page` isolation mode the page is created in the default (shared)
-    /// browser context — sessions share cookies. In `BrowserContext` mode a new
-    /// incognito browser context is created per session, giving real per-session
-    /// cookie/cache isolation. The created context is NOT disposed here;
-    /// disposal-on-close is deferred (see Task 11). This is a known, bounded
-    /// context leak for the process lifetime.
-    async fn new_blank_page(&self) -> Result<(String, Arc<chromiumoxide::Page>), String> {
+    /// browser context — sessions share cookies, and the returned context id is
+    /// `None`. In `BrowserContext` mode a new incognito browser context is
+    /// created per session, giving real per-session cookie/cache isolation, and
+    /// its id is returned so the session can dispose it on eviction/close
+    /// (`dispose_session`), closing the context leak that earlier tasks deferred.
+    async fn new_blank_page(
+        &self,
+    ) -> Result<(String, Option<String>, Arc<chromiumoxide::Page>), String> {
         let guard = self.browser.lock().await;
         let browser = guard
             .as_ref()
             .ok_or_else(|| "Browser not initialized".to_string())?;
 
-        let page = match self.session_isolation {
-            SessionIsolation::Page => browser
-                .new_page("about:blank")
-                .await
-                .map_err(|e| format!("Failed to create new page: {}", e))?,
+        let (page, context_id) = match self.session_isolation {
+            SessionIsolation::Page => (
+                browser
+                    .new_page("about:blank")
+                    .await
+                    .map_err(|e| format!("Failed to create new page: {}", e))?,
+                None,
+            ),
             SessionIsolation::BrowserContext => {
                 // Create a fresh incognito browser context so this session's
-                // cookies/cache are isolated from every other session.
+                // cookies/cache are isolated from every other session. The id is
+                // returned to the caller and stored in the session/tab state so
+                // it can be disposed when the session is evicted or closed.
                 let context_id = browser
                     .create_browser_context(Default::default())
                     .await
                     .map_err(|e| format!("Failed to create isolated browser context: {}", e))?;
-                // NOTE: context_id is intentionally not disposed here — disposal
-                // on session close is a deferred concern (Task 11).
                 debug!("Created isolated browser context for session");
+                let context_id_str = context_id.as_ref().to_string();
                 let params = CreateTargetParams::builder()
                     .url("about:blank")
                     .browser_context_id(context_id)
                     .build()
                     .map_err(|e| format!("Failed to build isolated page parameters: {}", e))?;
-                browser
+                let page = browser
                     .new_page(params)
                     .await
-                    .map_err(|e| format!("Failed to create new isolated page: {}", e))?
+                    .map_err(|e| format!("Failed to create new isolated page: {}", e))?;
+                (page, Some(context_id_str))
             }
         };
         let target_id = page.target_id().as_ref().to_string();
-        Ok((target_id, Arc::new(page)))
+        Ok((target_id, context_id, Arc::new(page)))
+    }
+
+    /// Abruptly tear the browser down: drop the `Browser`, mark the handler dead,
+    /// abort the handler task, and clear `connected_to_existing`. This is the
+    /// fallback when a graceful close/wait errors or times out, and the only
+    /// teardown an ATTACHED browser ever needs (we must NOT send a browser-close
+    /// command to the user's own Chrome). The caller holds the `browser` guard.
+    async fn abort_teardown(&self, guard: &mut Option<Browser>) {
+        *guard = None;
+        self.handler_alive.store(false, Ordering::SeqCst);
+        let mut handle_guard = self.browser_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+        *self.connected_to_existing.lock().await = false;
+    }
+
+    /// The shared graceful-teardown core. Returns a user-facing status message.
+    ///
+    /// - LAUNCHED browser: take the `Browser` out and call `close().await` then
+    ///   `wait().await`, bounded by [`SHUTDOWN_TIMEOUT`]. On error/timeout, fall
+    ///   back to [`Self::abort_teardown`]. Either way the handler is aborted and
+    ///   state cleared.
+    /// - ATTACHED browser (`connected_to_existing`): NEVER send a browser-close
+    ///   command (that would kill the user's Chrome) — just detach + abort.
+    /// - No browser held: no-op (idempotent).
+    async fn graceful_teardown(&self) -> String {
+        let mut guard = self.browser.lock().await;
+        if guard.is_none() {
+            return "No browser session was active.".to_string();
+        }
+
+        let was_connected = *self.connected_to_existing.lock().await;
+        if was_connected {
+            // Attached: detach only. Do NOT close the user's Chrome.
+            self.abort_teardown(&mut guard).await;
+            info!("Disconnected from existing Chrome (browser still running)");
+            return "Disconnected from Chrome (your browser is still running).".to_string();
+        }
+
+        // Launched: take ownership so we can call the &mut close()/wait().
+        let mut browser = guard.take().expect("guard is Some (checked above)");
+        let graceful = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            browser.close().await.map_err(|e| e.to_string())?;
+            // wait() collects the child process so it doesn't become a zombie.
+            browser.wait().await.map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await;
+
+        // The Browser is dropped here regardless (the `take()`d value goes out of
+        // scope), so even a timed-out close still releases the connection.
+        match graceful {
+            Ok(Ok(())) => info!("Browser closed gracefully"),
+            Ok(Err(e)) => warn!(error = %e, "graceful browser close failed; forcing teardown"),
+            Err(_) => warn!("graceful browser close timed out; forcing teardown"),
+        }
+        // Clear remaining state (handler/handle/flag). `guard` is already None.
+        self.abort_teardown(&mut guard).await;
+        info!("Browser session closed");
+        "Browser session closed.".to_string()
     }
 
     /// Spawn the SUPERVISED CDP event-handler drain task.
@@ -488,32 +586,48 @@ impl BrowserBackend for ChromiumoxideBackend {
         self.launch_or_connect(&mut guard).await
     }
 
-    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String> {
-        let (target_id, page) = self.new_blank_page().await?;
-        Ok((target_id, Arc::new(ChromiumoxidePage { page })))
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String> {
+        let (target_id, context_id, page) = self.new_blank_page().await?;
+        Ok((target_id, context_id, Arc::new(ChromiumoxidePage { page })))
     }
 
-    async fn close(&self) -> Result<String, String> {
-        let mut guard = self.browser.lock().await;
-        if guard.is_some() {
-            let was_connected = *self.connected_to_existing.lock().await;
-            *guard = None;
-            // Abort the handler task and mark it not alive.
-            self.handler_alive.store(false, Ordering::SeqCst);
-            let mut handle_guard = self.browser_handle.lock().await;
-            if let Some(handle) = handle_guard.take() {
-                handle.abort();
+    async fn shutdown(&self) -> Result<String, String> {
+        Ok(self.graceful_teardown().await)
+    }
+
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]) {
+        // Best-effort: with no live browser there is nothing to dispose.
+        if self.browser.lock().await.is_none() {
+            return;
+        }
+        // Close each tab target first, then dispose the browser context(s).
+        for target_id in tab_target_ids {
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.close_target(target_id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(target_id, error = %e, "dispose_session: close_target failed"),
+                Err(_) => warn!(target_id, "dispose_session: close_target timed out"),
             }
-            *self.connected_to_existing.lock().await = false;
-            if was_connected {
-                info!("Disconnected from existing Chrome (browser still running)");
-                Ok("Disconnected from Chrome (your browser is still running).".to_string())
-            } else {
-                info!("Browser session closed");
-                Ok("Browser session closed.".to_string())
+        }
+        for context_id in context_ids {
+            let guard = self.browser.lock().await;
+            let Some(browser) = guard.as_ref() else {
+                return;
+            };
+            match tokio::time::timeout(
+                SHUTDOWN_TIMEOUT,
+                browser.dispose_browser_context(context_id.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => debug!(context_id, "disposed isolated browser context"),
+                Ok(Err(e)) => {
+                    warn!(context_id, error = %e, "dispose_session: dispose_browser_context failed")
+                }
+                Err(_) => warn!(
+                    context_id,
+                    "dispose_session: dispose_browser_context timed out"
+                ),
             }
-        } else {
-            Ok("No browser session was active.".to_string())
         }
     }
 
@@ -535,16 +649,12 @@ impl BrowserBackend for ChromiumoxideBackend {
 
         self.headless.store(new_headless, Ordering::Relaxed);
 
-        // Close existing browser so next call launches with the new mode
-        let mut guard = self.browser.lock().await;
-        if guard.is_some() {
-            *guard = None;
-            self.handler_alive.store(false, Ordering::SeqCst);
-            let mut handle_guard = self.browser_handle.lock().await;
-            if let Some(handle) = handle_guard.take() {
-                handle.abort();
-            }
-            *self.connected_to_existing.lock().await = false;
+        // Gracefully close the existing browser so the next call launches with
+        // the new mode. Reuses the shared graceful-teardown path (launched →
+        // close()+wait()+timeout+fallback; attached → detach only).
+        let had_browser = self.browser.lock().await.is_some();
+        if had_browser {
+            self.graceful_teardown().await;
             info!(mode, "Browser mode changed, restarting on next use");
             Ok(format!(
                 "Switched to {} mode. Browser will restart on next action.",
@@ -822,8 +932,17 @@ pub enum MockCall {
     /// synthetic target id handed back, so tests can assert two sessions caused
     /// two distinct pages.
     CreatePage(String),
-    Close,
+    /// Recorded by `shutdown`. `graceful` is `true` when the mock performed a
+    /// graceful close (launched browser), `false` when it merely detached an
+    /// attached browser WITHOUT issuing a browser-close command.
+    Shutdown {
+        graceful: bool,
+    },
     SetHeadlessMode(bool),
+    /// Recorded by `dispose_session` per tab target id it closed.
+    CloseTarget(String),
+    /// Recorded by `dispose_session` per browser context id it disposed.
+    DisposeContext(String),
     Goto(String),
     FindElement(String),
     Click(String),
@@ -886,6 +1005,17 @@ pub struct MockBackend {
     /// runs, it returns the connection error and clears the slot, so the retry
     /// (against a fresh page after reconnect) succeeds. Shared with `MockPage`.
     pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// When `true`, `create_page` hands back a synthetic browser-context id (one
+    /// per page), modeling `browser_context` isolation. When `false`, context
+    /// ids are `None` (the `page`-isolation default).
+    isolate_contexts: bool,
+    /// When `true`, the mock models an ATTACHED browser (`connected_to_existing`):
+    /// `shutdown` detaches WITHOUT a graceful close (records `graceful: false`).
+    attached: bool,
+    /// When `true`, the mock models a graceful close that ERRORS/TIMES OUT —
+    /// `shutdown` still tears down and records `graceful: false`, exercising the
+    /// forced-cleanup fallback path.
+    graceful_fails: bool,
 }
 
 #[cfg(test)]
@@ -903,6 +1033,9 @@ impl Default for MockBackend {
             pending_popup: Arc::new(Mutex::new(None)),
             handler_alive: Arc::new(AtomicBool::new(true)),
             pending_fail: Arc::new(Mutex::new(None)),
+            isolate_contexts: false,
+            attached: false,
+            graceful_fails: false,
         }
     }
 }
@@ -931,6 +1064,27 @@ impl MockBackend {
     /// assert origin redaction in `list_tabs`.
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    /// Model `browser_context` isolation: `create_page` returns a synthetic
+    /// context id per page (so eviction has something to dispose).
+    pub fn with_isolated_contexts(mut self) -> Self {
+        self.isolate_contexts = true;
+        self
+    }
+
+    /// Model an ATTACHED browser (`connected_to_existing`): `shutdown` must
+    /// detach WITHOUT a graceful browser-close command.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
+
+    /// Model a graceful close that errors/times out: `shutdown` still tears down
+    /// (forced-cleanup fallback) and records `graceful: false`.
+    pub fn with_failing_graceful_close(mut self) -> Self {
+        self.graceful_fails = true;
         self
     }
 
@@ -1134,13 +1288,18 @@ impl BrowserBackend for MockBackend {
         Ok(())
     }
 
-    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String> {
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String> {
         let page_id = {
             let mut counter = self.next_page_id.lock().await;
             *counter += 1;
             format!("mock-page-{}", *counter)
         };
         self.record(MockCall::CreatePage(page_id.clone())).await;
+        // In browser_context isolation mode, hand back a synthetic context id
+        // (one per page) so eviction/close has something to dispose.
+        let context_id = self
+            .isolate_contexts
+            .then(|| format!("mock-ctx-{}", page_id));
         // Register the new target so list_targets/popup-diff can see it.
         self.targets.lock().await.push(TargetInfo {
             target_id: page_id.clone(),
@@ -1151,6 +1310,7 @@ impl BrowserBackend for MockBackend {
         });
         Ok((
             page_id.clone(),
+            context_id,
             Arc::new(MockPage {
                 page_id,
                 calls: Arc::clone(&self.calls),
@@ -1165,10 +1325,33 @@ impl BrowserBackend for MockBackend {
         ))
     }
 
-    async fn close(&self) -> Result<String, String> {
-        self.record(MockCall::Close).await;
+    async fn shutdown(&self) -> Result<String, String> {
+        // Attached or failing-graceful both end in a forced/detach teardown that
+        // records `graceful: false`; a healthy launched browser records
+        // `graceful: true`. Either way the connection ends up torn down.
+        let graceful = !self.attached && !self.graceful_fails;
+        self.record(MockCall::Shutdown { graceful }).await;
         self.connected.store(false, Ordering::Relaxed);
-        Ok("Browser session closed.".to_string())
+        self.handler_alive.store(false, Ordering::SeqCst);
+        if self.attached {
+            Ok("Disconnected from Chrome (your browser is still running).".to_string())
+        } else {
+            Ok("Browser session closed.".to_string())
+        }
+    }
+
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]) {
+        for target_id in tab_target_ids {
+            self.record(MockCall::CloseTarget(target_id.clone())).await;
+            self.targets
+                .lock()
+                .await
+                .retain(|t| &t.target_id != target_id);
+        }
+        for context_id in context_ids {
+            self.record(MockCall::DisposeContext(context_id.clone()))
+                .await;
+        }
     }
 
     async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String> {

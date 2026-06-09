@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -44,6 +45,11 @@ pub struct TabEntry {
     pub page: Arc<dyn PageHandle>,
     pub last_url: Option<String>,
     pub title: Option<String>,
+    /// The CDP browser-context id this tab's page was created in, when the
+    /// backend is in `browser_context` isolation mode; `None` in `page` mode (the
+    /// shared default context, which is never disposed). Stored so eviction/close
+    /// can dispose the per-session context via the backend.
+    pub context_id: Option<String>,
 }
 
 /// Per-session browser state: the tabs the session owns, which one is active,
@@ -91,6 +97,26 @@ pub struct TabView {
     pub url: Option<String>,
     pub active: bool,
 }
+
+/// The browser-side resources of a session that idle-eviction removed, returned
+/// so the caller can dispose them via the backend (close the tab targets, then
+/// dispose the per-session browser context(s)). Deduplicated: each context id
+/// appears once even if the session had several tabs sharing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvictedSession {
+    /// The internal `_session_id` that was evicted (for logging).
+    pub session_id: String,
+    /// Backend target ids of every tab the session held — to `close_target`.
+    pub tab_target_ids: Vec<String>,
+    /// Distinct CDP browser-context ids the session held — to dispose.
+    pub context_ids: Vec<String>,
+}
+
+/// Default idle threshold after which a session's tabs + browser context are
+/// evicted. Used for opportunistic eviction (and any future periodic task). 30
+/// minutes balances reclaiming resources on a quiet 24/7 daemon against not
+/// tearing a session down mid-workflow.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 impl BrowserSessionRegistry {
     pub fn new() -> Self {
@@ -151,9 +177,24 @@ impl BrowserSessionRegistry {
             }
         }
 
+        // Opportunistic idle eviction: before minting a brand-new session, sweep
+        // idle siblings so a daemon with session churn can't grow the registry
+        // (and leak CDP browser contexts) without bound. `Instant::now()` is
+        // captured HERE and passed into the deterministic `evict_idle`, so the
+        // sweep itself stays clock-injectable for tests. Disposal of the evicted
+        // resources runs WITHOUT holding the registry lock.
+        let evicted = self
+            .evict_idle(Instant::now(), DEFAULT_SESSION_IDLE_TIMEOUT)
+            .await;
+        for ev in &evicted {
+            backend
+                .dispose_session(&ev.tab_target_ids, &ev.context_ids)
+                .await;
+        }
+
         // Slow path: create a new page on the backend WITHOUT holding the
         // registry lock (page creation may launch/await the browser).
-        let (page_id, page) = backend.create_page().await?;
+        let (page_id, context_id, page) = backend.create_page().await?;
 
         // Re-lock to insert. A concurrent caller for the same session could have
         // raced us; if so, prefer the already-stored active tab and drop ours.
@@ -170,6 +211,7 @@ impl BrowserSessionRegistry {
                 page: Arc::clone(&page),
                 last_url: None,
                 title: None,
+                context_id,
             };
             state.active_target_id = page_id;
             state.tabs.push(tab);
@@ -183,6 +225,7 @@ impl BrowserSessionRegistry {
             page: Arc::clone(&page),
             last_url: None,
             title: None,
+            context_id,
         };
         let state = BrowserSessionState {
             tabs: vec![tab],
@@ -202,6 +245,7 @@ impl BrowserSessionRegistry {
     /// If the session is unknown, this is a no-op returning `None` — callers
     /// only register tabs for sessions that already exist (a page must have been
     /// created for the click/new_tab to run).
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_tab(
         &self,
         session_id: &str,
@@ -209,6 +253,7 @@ impl BrowserSessionRegistry {
         page: Arc<dyn PageHandle>,
         url: Option<String>,
         title: Option<String>,
+        context_id: Option<String>,
         make_active: bool,
     ) -> Option<String> {
         let mut sessions = self.sessions.lock().await;
@@ -227,6 +272,7 @@ impl BrowserSessionRegistry {
             page,
             last_url: url,
             title,
+            context_id,
         };
         let id = tab.tab_id.clone();
         state.tabs.push(tab);
@@ -344,6 +390,113 @@ impl BrowserSessionRegistry {
             state.tabs.clear();
             state.active_target_id.clear();
         }
+    }
+
+    /// Remove every session whose `last_used_at` is older than `max_idle`
+    /// relative to `now`, returning each removed session's backend resources so
+    /// the caller can dispose them (close tab targets, then dispose the
+    /// per-session browser context(s)).
+    ///
+    /// `now` is INJECTED (never read from the clock inside) so eviction is fully
+    /// deterministic and testable with a synthetic clock.
+    ///
+    /// An evicted session's per-session APPROVAL flag is also dropped: an idle
+    /// session that later returns is a fresh start and re-approves on its next
+    /// consequential action — the safe default (we never silently carry a stale
+    /// approval across a teardown the user never saw). The session entry itself
+    /// is removed entirely (unlike `invalidate_all_pages`, which keeps the entry
+    /// after a reconnect), since idle eviction reclaims the session wholesale.
+    pub async fn evict_idle(&self, now: Instant, max_idle: Duration) -> Vec<EvictedSession> {
+        let mut sessions = self.sessions.lock().await;
+        let idle_ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, state)| now.duration_since(state.last_used_at) >= max_idle)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let mut evicted = Vec::with_capacity(idle_ids.len());
+        for id in idle_ids {
+            let Some(state) = sessions.remove(&id) else {
+                continue;
+            };
+            let tab_target_ids: Vec<String> =
+                state.tabs.iter().map(|t| t.target_id.clone()).collect();
+            // Distinct context ids (several tabs can share one context).
+            let mut context_ids: Vec<String> = Vec::new();
+            for ctx in state.tabs.iter().filter_map(|t| t.context_id.clone()) {
+                if !context_ids.contains(&ctx) {
+                    context_ids.push(ctx);
+                }
+            }
+            evicted.push(EvictedSession {
+                session_id: id,
+                tab_target_ids,
+                context_ids,
+            });
+        }
+        drop(sessions);
+
+        // Drop approval state for every evicted session (safe-default re-approve).
+        if !evicted.is_empty() {
+            let mut approvals = self.approvals.lock().await;
+            for ev in &evicted {
+                approvals.remove(&ev.session_id);
+            }
+        }
+
+        evicted
+    }
+
+    /// Test-only: directly seed a session with a controlled `last_used_at` and a
+    /// fixed set of `(target_id, context_id)` tabs (all sharing `page` as their
+    /// handle), optionally pre-approved. Lets eviction tests drive a synthetic
+    /// clock without touching the backend or `Instant::now()`.
+    #[cfg(test)]
+    pub async fn seed_session_for_test(
+        &self,
+        session_id: &str,
+        last_used_at: Instant,
+        tabs: Vec<(String, Option<String>)>,
+        page: Arc<dyn PageHandle>,
+        approved: bool,
+    ) {
+        let tab_entries: Vec<TabEntry> = tabs
+            .into_iter()
+            .map(|(target_id, context_id)| TabEntry {
+                tab_id: target_id.clone(),
+                target_id,
+                page: Arc::clone(&page),
+                last_url: None,
+                title: None,
+                context_id,
+            })
+            .collect();
+        let active_target_id = tab_entries
+            .first()
+            .map(|t| t.target_id.clone())
+            .unwrap_or_default();
+        let state = BrowserSessionState {
+            tabs: tab_entries,
+            active_target_id,
+            last_used_at,
+            action_lock: Arc::new(Mutex::new(())),
+        };
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), state);
+        if approved {
+            self.approvals
+                .lock()
+                .await
+                .insert(session_id.to_string(), true);
+        }
+    }
+
+    /// Test-only: whether a session entry currently exists in the registry.
+    #[cfg(test)]
+    pub async fn has_session_for_test(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
     }
 
     /// Snapshot of this session's tabs for `list_tabs`. Empty if the session is

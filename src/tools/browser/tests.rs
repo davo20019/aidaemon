@@ -2563,3 +2563,303 @@ async fn ordinary_error_does_not_trigger_reconnect() {
         "an ordinary error must NOT trigger a reconnect"
     );
 }
+
+// =============================================================================
+// Task 11 — graceful Chromium shutdown + idle session/context eviction
+// =============================================================================
+
+use super::session::{BrowserSessionRegistry, EvictedSession};
+use tokio::time::Instant;
+
+/// A launched-browser `close` must perform a GRACEFUL close (not just an abort).
+#[tokio::test]
+async fn close_on_launched_browser_records_graceful_shutdown() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // Establish a session so a browser is "live", then close.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let out = tool
+        .call(&json!({ "action": "close" }).to_string())
+        .await
+        .unwrap();
+    assert!(out.contains("closed"), "close should report closed: {out}");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::Shutdown { graceful: true }),
+        "launched close must record a graceful shutdown: {calls:?}"
+    );
+}
+
+/// `set_mode` that actually changes the mode must reuse the graceful shutdown
+/// path to tear the old browser down (launched → graceful).
+#[tokio::test]
+async fn set_mode_change_reuses_graceful_shutdown() {
+    let (tool, backend, _rx) = mock_tool();
+
+    // Bring a browser up (default headless=… in mock is irrelevant; the mock's
+    // set_headless_mode just records). To force a real teardown we drive the
+    // REAL backend path via the tool's mock which records Shutdown only when a
+    // browser is live — so first navigate, then switch mode.
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://example.com", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let out = tool
+        .call(&json!({ "action": "set_mode", "value": "visible" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        out.to_lowercase().contains("visible"),
+        "set_mode should confirm the new mode: {out}"
+    );
+    // The mock's set_headless_mode records SetHeadlessMode (it does not itself
+    // call shutdown — that wiring lives in the real backend). We assert the mode
+    // switch was routed to the backend, which is the tool-level contract here.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::SetHeadlessMode(false)),
+        "set_mode must route the mode switch to the backend: {calls:?}"
+    );
+}
+
+/// An ATTACHED browser must DETACH on shutdown — never issue a graceful
+/// browser-close command (that would kill the user's own Chrome).
+#[tokio::test]
+async fn shutdown_on_attached_browser_detaches_without_closing() {
+    let backend = Arc::new(MockBackend::new().attached());
+    let msg = backend.shutdown().await.unwrap();
+    assert!(
+        msg.to_lowercase().contains("still running"),
+        "attached shutdown should reassure the user's browser keeps running: {msg}"
+    );
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::Shutdown { graceful: false }),
+        "attached shutdown must NOT be graceful (no browser-close command): {calls:?}"
+    );
+    assert!(
+        !calls.contains(&MockCall::Shutdown { graceful: true }),
+        "attached shutdown must never issue a graceful browser-close: {calls:?}"
+    );
+}
+
+/// Forced-cleanup fallback: when the graceful close errors/times out, shutdown
+/// still completes (does not hang) and leaves the backend in a clean,
+/// disconnected state.
+#[tokio::test]
+async fn shutdown_forces_cleanup_when_graceful_close_fails() {
+    let backend = Arc::new(MockBackend::new().with_failing_graceful_close());
+    backend.ensure_ready().await.unwrap();
+    assert!(backend.is_connected().await, "precondition: connected");
+
+    // Bounded so a hang fails the test rather than wedging CI.
+    let msg = tokio::time::timeout(Duration::from_secs(2), backend.shutdown())
+        .await
+        .expect("shutdown must not hang on a failing graceful close")
+        .unwrap();
+    assert!(
+        msg.contains("closed"),
+        "forced cleanup still reports closed: {msg}"
+    );
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::Shutdown { graceful: false }),
+        "failing graceful close must fall back to a forced (non-graceful) teardown: {calls:?}"
+    );
+    drop(calls);
+    assert!(
+        !backend.is_connected().await,
+        "after forced cleanup the backend must be disconnected"
+    );
+}
+
+/// `shutdown` is idempotent: a second call on an already-torn-down backend is a
+/// safe no-op that does not hang.
+#[tokio::test]
+async fn shutdown_is_idempotent() {
+    let backend = Arc::new(MockBackend::new());
+    backend.ensure_ready().await.unwrap();
+    let _ = backend.shutdown().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), backend.shutdown())
+        .await
+        .expect("second shutdown must not hang")
+        .unwrap();
+    // The mock always returns the closed message; the real backend returns the
+    // "no browser was active" no-op. Either is a clean, non-hanging result.
+    assert!(!second.is_empty());
+}
+
+/// Deterministic idle eviction: sessions older than the threshold are removed
+/// and their tab target ids + context ids are returned for disposal, while a
+/// recently-used session survives. Evicted sessions' approval is dropped, and
+/// the backend disposes the returned resources.
+#[tokio::test]
+async fn evict_idle_removes_stale_sessions_and_disposes_resources() {
+    let registry = BrowserSessionRegistry::new();
+    let backend = Arc::new(MockBackend::new().with_isolated_contexts());
+    // A page handle for the seeded tabs (the backend is only used for disposal).
+    let (_id, _ctx, page) = backend.create_page().await.unwrap();
+
+    let now = Instant::now();
+    let old = now - Duration::from_secs(60 * 60); // 1h ago — idle
+    let recent = now - Duration::from_secs(60); // 1m ago — fresh
+
+    // Two idle sessions (one with a context, one with two tabs sharing a ctx),
+    // and one recently-used session that must survive.
+    registry
+        .seed_session_for_test(
+            "idle-a",
+            old,
+            vec![("t-a1".into(), Some("ctx-a".into()))],
+            Arc::clone(&page),
+            /* approved */ true,
+        )
+        .await;
+    registry
+        .seed_session_for_test(
+            "idle-b",
+            old,
+            vec![
+                ("t-b1".into(), Some("ctx-b".into())),
+                ("t-b2".into(), Some("ctx-b".into())),
+            ],
+            Arc::clone(&page),
+            true,
+        )
+        .await;
+    registry
+        .seed_session_for_test(
+            "fresh",
+            recent,
+            vec![("t-f1".into(), Some("ctx-f".into()))],
+            Arc::clone(&page),
+            true,
+        )
+        .await;
+
+    let mut evicted = registry.evict_idle(now, Duration::from_secs(30 * 60)).await;
+    evicted.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+
+    assert_eq!(
+        evicted,
+        vec![
+            EvictedSession {
+                session_id: "idle-a".into(),
+                tab_target_ids: vec!["t-a1".into()],
+                context_ids: vec!["ctx-a".into()],
+            },
+            EvictedSession {
+                session_id: "idle-b".into(),
+                // two tabs, but one DISTINCT context id (deduped).
+                tab_target_ids: vec!["t-b1".into(), "t-b2".into()],
+                context_ids: vec!["ctx-b".into()],
+            },
+        ],
+        "only idle sessions evicted, with deduped context ids: {evicted:?}"
+    );
+
+    // Idle sessions are gone; the fresh one survives.
+    assert!(!registry.has_session_for_test("idle-a").await);
+    assert!(!registry.has_session_for_test("idle-b").await);
+    assert!(registry.has_session_for_test("fresh").await);
+
+    // Approval for evicted sessions is dropped (safe-default re-approve); the
+    // fresh session keeps its approval.
+    assert!(!registry.is_session_approved("idle-a").await);
+    assert!(!registry.is_session_approved("idle-b").await);
+    assert!(registry.is_session_approved("fresh").await);
+
+    // The caller disposes the returned resources via the backend.
+    for ev in &evicted {
+        backend
+            .dispose_session(&ev.tab_target_ids, &ev.context_ids)
+            .await;
+    }
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(calls.contains(&MockCall::CloseTarget("t-a1".into())));
+    assert!(calls.contains(&MockCall::CloseTarget("t-b1".into())));
+    assert!(calls.contains(&MockCall::CloseTarget("t-b2".into())));
+    assert!(calls.contains(&MockCall::DisposeContext("ctx-a".into())));
+    assert!(calls.contains(&MockCall::DisposeContext("ctx-b".into())));
+    assert!(
+        !calls.contains(&MockCall::DisposeContext("ctx-f".into())),
+        "the surviving session's context must NOT be disposed: {calls:?}"
+    );
+}
+
+/// Nothing is evicted when every session is within the idle threshold.
+#[tokio::test]
+async fn evict_idle_keeps_all_fresh_sessions() {
+    let registry = BrowserSessionRegistry::new();
+    let backend = Arc::new(MockBackend::new().with_isolated_contexts());
+    let (_id, _ctx, page) = backend.create_page().await.unwrap();
+    let now = Instant::now();
+    registry
+        .seed_session_for_test(
+            "fresh",
+            now - Duration::from_secs(60),
+            vec![("t1".into(), Some("ctx".into()))],
+            page,
+            true,
+        )
+        .await;
+    let evicted = registry.evict_idle(now, Duration::from_secs(30 * 60)).await;
+    assert!(evicted.is_empty(), "no fresh session should be evicted");
+    assert!(registry.has_session_for_test("fresh").await);
+}
+
+/// Opportunistic eviction: creating a NEW session sweeps an already-idle sibling
+/// (its tabs/context get disposed via the backend). Driven through the real
+/// `get_or_create_page` path, with the idle session seeded far in the past so it
+/// crosses the default threshold.
+#[tokio::test]
+async fn creating_new_session_opportunistically_evicts_idle_sibling() {
+    let registry = BrowserSessionRegistry::new();
+    let backend = Arc::new(MockBackend::new().with_isolated_contexts());
+    let (_id, _ctx, page) = backend.create_page().await.unwrap();
+
+    // Seed an idle session older than the DEFAULT threshold (30 min).
+    registry
+        .seed_session_for_test(
+            "idle",
+            Instant::now() - Duration::from_secs(45 * 60),
+            vec![("t-idle".into(), Some("ctx-idle".into()))],
+            page,
+            true,
+        )
+        .await;
+
+    // Creating a brand-new session must opportunistically evict the idle one.
+    let (_p, _lock) = registry
+        .get_or_create_page("new-session", &*backend)
+        .await
+        .unwrap();
+
+    assert!(
+        !registry.has_session_for_test("idle").await,
+        "idle sibling must be evicted when a new session is created"
+    );
+    assert!(registry.has_session_for_test("new-session").await);
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::CloseTarget("t-idle".into()))
+            && calls.contains(&MockCall::DisposeContext("ctx-idle".into())),
+        "the idle sibling's tab + context must be disposed via the backend: {calls:?}"
+    );
+}

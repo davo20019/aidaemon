@@ -669,6 +669,12 @@ impl BrowserTool {
                     page,
                     t.url.clone(),
                     t.title.clone(),
+                    // A popup inherits its opener's browser context (which the
+                    // session already tracks on its opener tab), so we record no
+                    // additional context id here — avoids a double-dispose of the
+                    // same context on eviction.
+                    /* context_id */
+                    None,
                     /* make_active */ false,
                 )
                 .await;
@@ -808,7 +814,13 @@ impl BrowserTool {
     }
 
     async fn action_close(&self) -> Result<String, String> {
-        self.backend.close().await
+        // Route through the backend's graceful shutdown (launched →
+        // close()+wait()+timeout+fallback; attached → detach without a
+        // browser-close command). All cached session pages are now stale handles
+        // into a torn-down connection, so drop them too.
+        let result = self.backend.shutdown().await;
+        self.sessions.invalidate_all_pages().await;
+        result
     }
 
     /// Dispatch a single action to its handler (no recovery). Pulled out of
@@ -983,7 +995,7 @@ impl BrowserTool {
             }
         }
 
-        let (target_id, page) = self.backend.create_page().await?;
+        let (target_id, context_id, page) = self.backend.create_page().await?;
         if let Some(url) = url {
             page.goto(url).await?;
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -1016,6 +1028,7 @@ impl BrowserTool {
                 page,
                 current_url,
                 None,
+                context_id,
                 /* make_active */ true,
             )
             .await
