@@ -839,6 +839,9 @@ impl BrowserTool {
                 // arm sends it via InputFile::file(path).
                 let path = std::env::temp_dir()
                     .join(format!("aidaemon-screenshot-{}.png", uuid::Uuid::new_v4()));
+                // Arm the cleanup guard BEFORE writing so a partial file left by a
+                // failed write (e.g. ENOSPC) is still removed on the early return.
+                let guard = TempFileGuard { path: path.clone() };
                 if let Err(e) = std::fs::write(&path, &png_bytes) {
                     return Err(format!(
                         "Screenshot captured but failed to buffer it for delivery as a file: {}. \
@@ -846,7 +849,6 @@ impl BrowserTool {
                         e
                     ));
                 }
-                let guard = TempFileGuard { path: path.clone() };
                 (
                     MediaKind::Document {
                         file_path: path.to_string_lossy().into_owned(),
