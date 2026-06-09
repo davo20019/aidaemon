@@ -73,6 +73,13 @@ impl BrowserSessionState {
 #[derive(Default)]
 pub struct BrowserSessionRegistry {
     sessions: Mutex<HashMap<String, BrowserSessionState>>,
+    /// Per-session approval flag. `true` once the user granted session-level
+    /// approval (AllowSession/AllowAlways) for ordinary navigation/mutation, so
+    /// later ordinary actions in that session skip the prompt. Point-of-action
+    /// approvals (execute_js, consequential click/fill) NEVER set this — they
+    /// are re-prompted every call. Kept in its own map so it survives even when a
+    /// session's last tab is closed.
+    approvals: Mutex<HashMap<String, bool>>,
 }
 
 /// A tab as surfaced to the tool/LLM: opaque id, title, raw URL (the tool
@@ -89,7 +96,29 @@ impl BrowserSessionRegistry {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this session has been granted session-level approval for ordinary
+    /// navigation/mutation. Point-of-action actions ignore this and always
+    /// prompt.
+    pub async fn is_session_approved(&self, session_id: &str) -> bool {
+        *self
+            .approvals
+            .lock()
+            .await
+            .get(session_id)
+            .unwrap_or(&false)
+    }
+
+    /// Mark this session approved for ordinary navigation/mutation, so later
+    /// ordinary actions in this session don't re-prompt.
+    pub async fn mark_session_approved(&self, session_id: &str) {
+        self.approvals
+            .lock()
+            .await
+            .insert(session_id.to_string(), true);
     }
 
     /// Resolve the ACTIVE tab's page + the session action lock, creating a fresh

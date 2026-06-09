@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -6,10 +7,15 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
 };
-use crate::types::{MediaKind, MediaMessage};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+
+use policy::BrowserRiskClass;
 
 mod backend;
 pub mod policy;
@@ -21,6 +27,32 @@ use backend::{BrowserBackend, ChromiumoxideBackend, PageHandle};
 use session::{BrowserSessionRegistry, TabView};
 
 use tokio::sync::OwnedMutexGuard;
+
+/// Default time the user has to respond to a browser approval prompt before the
+/// action is auto-denied (fail safe). Matches the terminal/config approval
+/// window. Overridable in tests so the timeout path runs in milliseconds.
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Decision returned by the approval gate. `Allow` lets the action reach the
+/// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
+/// method is touched.
+enum GateDecision {
+    Allow,
+    Deny(String),
+}
+
+/// The parsed, approval-relevant fields of a single browser tool call. Bundled
+/// so the gate and prompt builder take one borrow instead of many positional
+/// args. The `value` (fill text) is deliberately NOT carried here — it must
+/// never reach the prompt.
+struct ActionArgs<'a> {
+    action: &'a str,
+    url: Option<&'a str>,
+    selector: Option<&'a str>,
+    script: Option<&'a str>,
+    tab_id: Option<&'a str>,
+    session_id: &'a str,
+}
 
 /// Reduce a full URL to its origin (`scheme://host[:port]`), dropping any
 /// userinfo, path, query, and fragment — all of which can carry secrets
@@ -68,6 +100,14 @@ pub struct BrowserTool {
     media_tx: mpsc::Sender<MediaMessage>,
     /// Per-session page state, keyed by trusted internal `_session_id`.
     sessions: BrowserSessionRegistry,
+    /// Transport used to prompt the user Allow/Deny at action time.
+    ///
+    /// `None` means no approval channel is wired (only possible in tests via
+    /// `with_backend`); in that case every action that would require approval
+    /// fails safe to Deny without touching the backend.
+    approval_tx: Option<ApprovalBroker>,
+    /// How long to wait for an approval response before auto-denying.
+    approval_timeout: Duration,
 }
 
 impl BrowserTool {
@@ -82,6 +122,7 @@ impl BrowserTool {
     pub fn new(
         config: BrowserConfig,
         media_tx: mpsc::Sender<MediaMessage>,
+        approval_tx: ApprovalBroker,
     ) -> Result<Self, String> {
         let backend = ChromiumoxideBackend::new(config)?;
         let mode = backend.session_isolation();
@@ -98,10 +139,14 @@ impl BrowserTool {
             backend: Arc::new(backend),
             media_tx,
             sessions: BrowserSessionRegistry::new(),
+            approval_tx: Some(approval_tx),
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
         })
     }
 
-    /// Test-only constructor that injects an arbitrary backend (e.g. the mock).
+    /// Test-only constructor that injects an arbitrary backend (e.g. the mock)
+    /// with NO approval channel — exercises the missing-channel (fail-safe Deny)
+    /// path for actions that require approval.
     #[cfg(test)]
     pub fn with_backend(
         backend: Arc<dyn BrowserBackend>,
@@ -111,6 +156,234 @@ impl BrowserTool {
             backend,
             media_tx,
             sessions: BrowserSessionRegistry::new(),
+            approval_tx: None,
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
+        }
+    }
+
+    /// Test-only constructor that injects a backend AND an approval broker plus a
+    /// (short) approval timeout, so approval allow/deny/timeout paths are
+    /// exercisable in milliseconds.
+    #[cfg(test)]
+    pub fn with_backend_and_approval(
+        backend: Arc<dyn BrowserBackend>,
+        media_tx: mpsc::Sender<MediaMessage>,
+        approval_tx: ApprovalBroker,
+        approval_timeout: Duration,
+    ) -> Self {
+        Self {
+            backend,
+            media_tx,
+            sessions: BrowserSessionRegistry::new(),
+            approval_tx: Some(approval_tx),
+            approval_timeout,
+        }
+    }
+
+    /// Read the active tab's last-known URL (cached in the session registry)
+    /// WITHOUT touching the backend, so the approval prompt can show a redacted
+    /// origin before any page method runs. Returns `None` if the session has no
+    /// active tab yet or its URL is unknown.
+    async fn active_origin_for_prompt(&self, session_id: &str) -> Option<String> {
+        let tabs = self.sessions.list_tabs(session_id).await;
+        let active = tabs.iter().find(|t| t.active).or_else(|| tabs.first())?;
+        active
+            .url
+            .as_deref()
+            .map(redact_origin)
+            .filter(|o| !o.is_empty())
+    }
+
+    /// Build the secret-safe approval prompt string for an action.
+    ///
+    /// NEVER include: the `fill` value, the full `execute_js` script (only
+    /// "JavaScript execution" + byte length), or full URLs with path/query/
+    /// fragment (origins are redacted via [`redact_origin`]).
+    async fn build_prompt(
+        &self,
+        args: &ActionArgs<'_>,
+        risk: &policy::BrowserActionRisk,
+    ) -> String {
+        // Origin: for url-bearing actions use the url arg; otherwise the active
+        // tab's last-known origin (or "current page" when unknown).
+        let origin = match args.url {
+            Some(u) => {
+                let r = redact_origin(u);
+                if r.is_empty() {
+                    "current page".to_string()
+                } else {
+                    r
+                }
+            }
+            None => self
+                .active_origin_for_prompt(args.session_id)
+                .await
+                .unwrap_or_else(|| "current page".to_string()),
+        };
+
+        // Target description — never the fill value, never the script body.
+        let target = if args.action == "execute_js" {
+            let bytes = args.script.map(|s| s.len()).unwrap_or(0);
+            format!("JavaScript execution ({bytes} bytes)")
+        } else if let Some(sel) = args.selector {
+            format!("element {sel}")
+        } else if let Some(tab) = args.tab_id {
+            format!("tab {tab}")
+        } else {
+            "page".to_string()
+        };
+
+        let class = match risk.class {
+            BrowserRiskClass::Observation => "observation",
+            BrowserRiskClass::Navigation => "navigation",
+            BrowserRiskClass::Mutation => "mutation",
+            BrowserRiskClass::Administrative => "administrative",
+        };
+        let mut tags = String::from(class);
+        if risk.consequential {
+            tags.push_str(", consequential");
+        }
+        if risk.sensitive {
+            tags.push_str(", sensitive");
+        }
+
+        format!(
+            "Browser {} — {origin} [target: {target}] [risk: {tags}]",
+            args.action
+        )
+    }
+
+    /// Send an approval request and await the user's decision, failing safe to
+    /// `Deny` on a closed channel or timeout. Returns `None` only when no
+    /// approval channel is wired (the caller treats that as a fail-safe Deny).
+    async fn request_approval(
+        &self,
+        command: String,
+        risk_level: RiskLevel,
+        warnings: Vec<String>,
+        session_id: &str,
+    ) -> Option<ApprovalResponse> {
+        let broker = self.approval_tx.as_ref()?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if broker
+            .send(ApprovalRequest {
+                command,
+                session_id: session_id.to_string(),
+                risk_level,
+                warnings,
+                permission_mode: PermissionMode::Default,
+                response_tx,
+                kind: Default::default(),
+            })
+            .await
+            .is_err()
+        {
+            warn!("browser approval channel closed; denying action");
+            return Some(ApprovalResponse::Deny);
+        }
+        match tokio::time::timeout(self.approval_timeout, response_rx).await {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(_)) => {
+                warn!("browser approval response channel closed; denying action");
+                Some(ApprovalResponse::Deny)
+            }
+            Err(_) => {
+                warn!("browser approval request timed out; denying action");
+                Some(ApprovalResponse::Deny)
+            }
+        }
+    }
+
+    /// The approval gate. Runs BEFORE any backend/page method is touched, so a
+    /// denied action can never reach the browser. Returns [`GateDecision::Allow`]
+    /// only when the action is permitted.
+    ///
+    /// Per-class rules:
+    /// - `Observation` (get_text/screenshot/wait/list_tabs): never prompt.
+    /// - `Administrative` (close/close_tab/set_mode): never prompt — local
+    ///   lifecycle / mode switch, not a consequential web side effect.
+    /// - `sensitive || consequential` (every `execute_js`, plus consequential
+    ///   click/fill): point-of-action — ALWAYS prompt, every call, regardless of
+    ///   any prior session approval. A non-Deny response allows ONLY this single
+    ///   action and NEVER records persistent/session approval.
+    /// - `Navigation` / ordinary `Mutation`: session-level. Allowed without a
+    ///   prompt once the session is approved; otherwise prompt. `AllowOnce`
+    ///   allows just this action; `AllowSession`/`AllowAlways` also mark the
+    ///   session approved so subsequent ordinary actions don't re-prompt.
+    /// - Missing approval channel + an action that needs approval → fail safe to
+    ///   Deny (observations/administrative still run).
+    async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
+        let action = args.action;
+        let session_id = args.session_id;
+        let risk = policy::classify(action, args.selector, args.script);
+
+        // Free actions: never prompt.
+        if matches!(
+            risk.class,
+            BrowserRiskClass::Observation | BrowserRiskClass::Administrative
+        ) {
+            return GateDecision::Allow;
+        }
+
+        let point_of_action = risk.sensitive || risk.consequential;
+
+        // Session-level fast path: an already-approved session skips the prompt
+        // for ordinary navigation/mutation — but NEVER for point-of-action.
+        if !point_of_action && self.sessions.is_session_approved(session_id).await {
+            return GateDecision::Allow;
+        }
+
+        // From here we need to prompt. If no channel is wired, fail safe.
+        if self.approval_tx.is_none() {
+            warn!(
+                action,
+                "browser action requires approval but no approval channel is wired; denying"
+            );
+            return GateDecision::Deny(
+                "Approval required, but no approval channel is available. Action denied."
+                    .to_string(),
+            );
+        }
+
+        let risk_level = if point_of_action {
+            RiskLevel::High
+        } else {
+            RiskLevel::Medium
+        };
+        let mut warnings = Vec::new();
+        if risk.sensitive {
+            warnings.push(
+                "Sensitive action: arbitrary JavaScript can read or exfiltrate page data"
+                    .to_string(),
+            );
+        }
+        if risk.consequential {
+            warnings
+                .push("Consequential action (may submit, purchase, delete, or send)".to_string());
+        }
+        let command = self.build_prompt(args, &risk).await;
+
+        let resp = self
+            .request_approval(command, risk_level, warnings, session_id)
+            .await;
+
+        match resp {
+            // No channel: already handled above, but keep the fail-safe.
+            None => GateDecision::Deny(
+                "Approval required, but no approval channel is available. Action denied."
+                    .to_string(),
+            ),
+            Some(ApprovalResponse::Deny) => GateDecision::Deny("Denied by user.".to_string()),
+            Some(ApprovalResponse::AllowOnce) => GateDecision::Allow,
+            Some(ApprovalResponse::AllowSession) | Some(ApprovalResponse::AllowAlways) => {
+                // Point-of-action approvals NEVER persist: each consequential
+                // action / execute_js must be approved on its own. Only ordinary
+                // navigation/mutation marks the session approved.
+                if !point_of_action {
+                    self.sessions.mark_session_approved(session_id).await;
+                }
+                GateDecision::Allow
+            }
         }
     }
 
@@ -593,6 +866,31 @@ impl Tool for BrowserTool {
             .get("_session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        // Reject an empty/missing session id BEFORE the approval gate or any
+        // backend launch — a missing session id must never prompt the user or
+        // launch a browser. (Administrative actions like `close` operate on the
+        // global backend and don't need a session id.)
+        let needs_session = !matches!(action, "close" | "set_mode");
+        if needs_session && session_id.is_empty() {
+            return Ok("Error: browser actions require a session id".to_string());
+        }
+
+        // Approval gate — runs BEFORE any backend/page method is touched, so a
+        // denied action can never reach the browser. We only invoke the
+        // `action_*` handler when the gate allows.
+        let action_args = ActionArgs {
+            action,
+            url: args.get("url").and_then(|v| v.as_str()),
+            selector: args.get("selector").and_then(|v| v.as_str()),
+            script: args.get("script").and_then(|v| v.as_str()),
+            tab_id: args.get("tab_id").and_then(|v| v.as_str()),
+            session_id,
+        };
+        if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
+            warn!(action, "Browser action blocked by approval gate");
+            return Ok(format!("Error: {}", reason));
+        }
 
         let result = match action {
             "navigate" => self.action_navigate(&args, session_id).await,

@@ -5,14 +5,17 @@
 //! later tasks will touch.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
+use crate::tools::ApprovalBroker;
 use crate::traits::Tool;
-use crate::types::{MediaKind, MediaMessage};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 fn mock_tool() -> (
     BrowserTool,
@@ -22,7 +25,33 @@ fn mock_tool() -> (
     mock_tool_with(MockBackend::new())
 }
 
+/// Dispatch-smoke helper: wires an AUTO-APPROVING approval broker so these
+/// pre-Task-7 tests exercise the action dispatch paths (navigate/click/fill/
+/// execute_js) without each one being blocked by the approval gate. The
+/// missing-channel (fail-safe Deny) path is exercised explicitly by
+/// `no_channel_tool()` / the Task-7 missing-channel test.
 fn mock_tool_with(
+    backend: MockBackend,
+) -> (
+    BrowserTool,
+    Arc<MockBackend>,
+    mpsc::Receiver<crate::types::MediaMessage>,
+) {
+    let backend = Arc::new(backend);
+    let (media_tx, media_rx) = mpsc::channel(8);
+    let (broker, _recorder) = spawn_responder(ApprovalResponse::AllowSession);
+    let tool = BrowserTool::with_backend_and_approval(
+        backend.clone(),
+        media_tx,
+        broker,
+        Duration::from_secs(5),
+    );
+    (tool, backend, media_rx)
+}
+
+/// Build a tool with NO approval channel (every approval-requiring action fails
+/// safe to Deny).
+fn no_channel_tool(
     backend: MockBackend,
 ) -> (
     BrowserTool,
@@ -955,5 +984,480 @@ async fn single_page_actions_use_active_tab() {
         ids.len(),
         1,
         "single-page flow must not create extra tabs: {ids:?}"
+    );
+}
+
+// =============================================================================
+// Task 7: request approval at execution time
+// =============================================================================
+
+/// Captures every `ApprovalRequest.command` the gate sends, so tests can count
+/// prompts and assert prompt content (secret-exclusion). Backed by a spawned
+/// task that drains the broker channel and replies with a scripted response.
+#[derive(Clone)]
+struct ApprovalRecorder {
+    commands: Arc<Mutex<Vec<String>>>,
+}
+
+impl ApprovalRecorder {
+    async fn commands(&self) -> Vec<String> {
+        self.commands.lock().await.clone()
+    }
+
+    async fn count(&self) -> usize {
+        self.commands.lock().await.len()
+    }
+}
+
+/// Spawn a responder that replies to every approval request with `reply`,
+/// recording the prompt `command` of each. Returns the broker (to inject into
+/// the tool) and the recorder (to assert on).
+fn spawn_responder(reply: ApprovalResponse) -> (ApprovalBroker, ApprovalRecorder) {
+    let (tx, mut rx) = mpsc::channel(8);
+    let broker = ApprovalBroker::new(tx);
+    let recorder = ApprovalRecorder {
+        commands: Arc::new(Mutex::new(Vec::new())),
+    };
+    let commands = recorder.commands.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            commands.lock().await.push(req.command.clone());
+            let _ = req.response_tx.send(reply.clone());
+        }
+    });
+    (broker, recorder)
+}
+
+/// Spawn a responder that NEVER replies (drops the oneshot sender), but still
+/// records each request — used for the timeout path.
+fn spawn_silent_responder() -> (ApprovalBroker, ApprovalRecorder) {
+    let (tx, mut rx) = mpsc::channel(8);
+    let broker = ApprovalBroker::new(tx);
+    let recorder = ApprovalRecorder {
+        commands: Arc::new(Mutex::new(Vec::new())),
+    };
+    let commands = recorder.commands.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            commands.lock().await.push(req.command.clone());
+            // Drop req (and its response_tx) without replying → the gate times out.
+            drop(req);
+        }
+    });
+    (broker, recorder)
+}
+
+fn approving_tool(
+    backend: MockBackend,
+    reply: ApprovalResponse,
+) -> (BrowserTool, Arc<MockBackend>, ApprovalRecorder) {
+    let backend = Arc::new(backend);
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let (broker, recorder) = spawn_responder(reply);
+    let tool = BrowserTool::with_backend_and_approval(
+        backend.clone(),
+        media_tx,
+        broker,
+        Duration::from_secs(5),
+    );
+    (tool, backend, recorder)
+}
+
+async fn calls_contains(backend: &MockBackend, needle: &MockCall) -> bool {
+    backend.calls().lock().await.contains(needle)
+}
+
+/// ALLOW: an approving responder lets a navigate reach the backend and succeed.
+#[tokio::test]
+async fn approval_allow_lets_navigate_reach_backend() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    let out = tool
+        .call(
+            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out, "Navigated to https://example.com/");
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("https://example.com/".to_string())
+        )
+        .await,
+        "an approved navigate must reach the backend goto"
+    );
+    assert_eq!(
+        recorder.count().await,
+        1,
+        "navigate must prompt exactly once"
+    );
+}
+
+/// DENY: a denying responder blocks the navigation — the backend goto is never
+/// recorded and the result reports denial.
+#[tokio::test]
+async fn approval_deny_blocks_navigation_before_backend() {
+    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    let out = tool
+        .call(
+            &json!({ "action": "navigate", "url": "https://evil.example/", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.to_lowercase().contains("denied"),
+        "denied navigate must report denial: {out}"
+    );
+    // The denied action must NOT have touched the backend at all.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            MockCall::Goto(_) | MockCall::CreatePage(_) | MockCall::EnsureReady
+        )),
+        "a denied navigation must never reach the backend: {calls:?}"
+    );
+}
+
+/// DENY on a consequential click: the backend click is never recorded.
+#[tokio::test]
+async fn approval_deny_blocks_consequential_click_before_backend() {
+    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    // "#delete" → consequential (point-of-action), so it always prompts.
+    let out = tool
+        .call(
+            &json!({ "action": "click", "selector": "#delete", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.to_lowercase().contains("denied"),
+        "denied click must report denial: {out}"
+    );
+    assert!(
+        !calls_contains(&backend, &MockCall::Click("#delete".to_string())).await,
+        "a denied click must never reach the backend"
+    );
+}
+
+/// TIMEOUT: a responder that never replies → the gate auto-denies fast, with no
+/// backend call.
+#[tokio::test]
+async fn approval_timeout_denies_without_backend() {
+    let backend = Arc::new(MockBackend::new());
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let (broker, recorder) = spawn_silent_responder();
+    // ~50ms timeout so the test runs fast.
+    let tool = BrowserTool::with_backend_and_approval(
+        backend.clone(),
+        media_tx,
+        broker,
+        Duration::from_millis(50),
+    );
+
+    let start = std::time::Instant::now();
+    let out = tool
+        .call(
+            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.to_lowercase().contains("denied"),
+        "timed-out approval must deny: {out}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "timeout path must resolve quickly, took {elapsed:?}"
+    );
+    assert_eq!(
+        recorder.count().await,
+        1,
+        "the request was sent (and recorded) before timing out"
+    );
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Goto(_))),
+        "a timed-out navigation must never reach the backend: {calls:?}"
+    );
+}
+
+/// MISSING CHANNEL: with no broker, a mutation is denied with no backend call,
+/// while an observation still runs.
+#[tokio::test]
+async fn missing_channel_denies_mutation_but_allows_observation() {
+    // `no_channel_tool` constructs the tool with NO approval channel.
+    let (tool, backend, _rx) = no_channel_tool(MockBackend::new());
+
+    // A navigation requires approval → fail safe to Deny, no backend.
+    let nav = tool
+        .call(
+            &json!({ "action": "navigate", "url": "https://example.com/", "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        nav.to_lowercase().contains("approval") || nav.to_lowercase().contains("denied"),
+        "navigate must be denied with no channel: {nav}"
+    );
+    assert!(
+        backend.calls().lock().await.is_empty(),
+        "a denied navigation must not touch the backend with no channel"
+    );
+
+    // An observation (get_text) is free — it runs without a channel.
+    let obs = tool
+        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        !obs.to_lowercase().contains("denied"),
+        "an observation must not be denied with no channel: {obs}"
+    );
+    assert!(
+        calls_contains(&backend, &MockCall::BodyText).await,
+        "the observation must have reached the backend"
+    );
+}
+
+/// OBSERVATION-FREE: even with a responder that would DENY if asked, an
+/// observation runs WITHOUT sending any approval request.
+#[tokio::test]
+async fn observations_never_prompt() {
+    let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    for action in &["get_text", "screenshot", "list_tabs"] {
+        let out = tool
+            .call(&json!({ "action": action, "_session_id": "sess-obs" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            !out.to_lowercase().contains("denied"),
+            "observation '{action}' must not be denied: {out}"
+        );
+    }
+
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "observations must never send an approval request: {:?}",
+        recorder.commands().await
+    );
+    // And they reached the backend (proof they actually ran).
+    assert!(
+        calls_contains(&backend, &MockCall::BodyText).await,
+        "get_text observation must have run"
+    );
+}
+
+/// SESSION-LEVEL REUSE: AllowSession on the first navigation suppresses the
+/// prompt for a SECOND navigation in the same session (one prompt total), yet
+/// both reach the backend.
+#[tokio::test]
+async fn session_approval_suppresses_second_navigation_prompt() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1, "first navigation must prompt");
+
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        1,
+        "second navigation in an approved session must NOT prompt again"
+    );
+
+    // Both navigations reached the backend.
+    assert!(
+        calls_contains(&backend, &MockCall::Goto("https://a.example/".to_string())).await
+            && calls_contains(&backend, &MockCall::Goto("https://b.example/".to_string())).await,
+        "both navigations must reach the backend"
+    );
+}
+
+/// POINT-OF-ACTION: every `execute_js` call prompts even after AllowSession —
+/// session approval must NOT suppress execute_js prompts. Also proves the prompt
+/// never contains the script body.
+#[tokio::test]
+async fn execute_js_prompts_every_call_and_hides_script() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    let sentinel = "SECRET_IN_SCRIPT";
+    let script = format!("var token = '{sentinel}'; return token;");
+
+    for _ in 0..2 {
+        tool.call(
+            &json!({ "action": "execute_js", "script": script, "_session_id": "sess-a" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        recorder.count().await,
+        2,
+        "each execute_js must prompt, even after AllowSession: {:?}",
+        recorder.commands().await
+    );
+
+    // The prompt must NOT leak the script body / sentinel.
+    for cmd in recorder.commands().await {
+        assert!(
+            !cmd.contains(sentinel),
+            "execute_js prompt must not contain the script body: {cmd}"
+        );
+    }
+
+    // Both evaluations reached the backend (they were each approved).
+    assert!(
+        calls_contains(&backend, &MockCall::Evaluate(script.clone())).await,
+        "approved execute_js must reach the backend"
+    );
+}
+
+/// POINT-OF-ACTION: a consequential click prompts even after a prior ordinary
+/// (navigation) AllowSession marked the session approved.
+#[tokio::test]
+async fn consequential_click_prompts_despite_session_approval() {
+    let (tool, _backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    // Ordinary navigation marks the session approved (one prompt).
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1);
+
+    // A consequential click ("#delete") must still prompt despite the approved
+    // session.
+    tool.call(
+        &json!({ "action": "click", "selector": "#delete", "_session_id": "sess-a" }).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        2,
+        "consequential click must prompt even in an approved session"
+    );
+}
+
+/// SECRET-SAFE PROMPT: a consequential fill prompt must not leak the typed value.
+#[tokio::test]
+async fn consequential_fill_prompt_hides_value() {
+    let (tool, _backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    // "#submit-password" selector is opaque/hyphenated (not consequential), so
+    // force point-of-action via a standalone consequential token in the selector.
+    let secret_value = "hunter2-super-secret";
+    tool.call(
+        &json!({
+            "action": "fill",
+            "selector": "#submit",
+            "value": secret_value,
+            "_session_id": "sess-a"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let cmds = recorder.commands().await;
+    assert_eq!(
+        cmds.len(),
+        1,
+        "consequential fill must prompt once: {cmds:?}"
+    );
+    assert!(
+        !cmds[0].contains(secret_value),
+        "fill prompt must not leak the typed value: {}",
+        cmds[0]
+    );
+    // But it should name the field so the user knows what's happening.
+    assert!(
+        cmds[0].contains("#submit"),
+        "fill prompt should identify the target selector: {}",
+        cmds[0]
+    );
+}
+
+/// ALLOW_ONCE on ordinary navigation must NOT mark the session approved: a
+/// second ordinary navigation prompts again.
+#[tokio::test]
+async fn allow_once_does_not_persist_session_approval() {
+    let (tool, _backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowOnce);
+
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://a.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    tool.call(
+        &json!({ "action": "navigate", "url": "https://b.example/", "_session_id": "sess-a" })
+            .to_string(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recorder.count().await,
+        2,
+        "AllowOnce must not persist session approval — each navigation prompts"
+    );
+}
+
+/// ADMINISTRATIVE actions (close/set_mode/close_tab) never prompt, even with a
+/// would-deny responder.
+#[tokio::test]
+async fn administrative_actions_never_prompt() {
+    let (tool, _backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+
+    let out = tool
+        .call(&json!({ "action": "close", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        !out.to_lowercase().contains("denied"),
+        "close (administrative) must not be denied: {out}"
+    );
+    assert_eq!(
+        recorder.count().await,
+        0,
+        "administrative actions must not prompt"
     );
 }
