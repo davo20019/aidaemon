@@ -540,8 +540,23 @@ pub(super) async fn emit_bootstrap_direct_reply(
         .append_assistant_message_with_event(emitter, &assistant_msg, "system", None, None)
         .await?;
 
+    if agent.harness_eval_enabled() {
+        let turn_id = agent.current_turn_ids.read().await.get(session_id).cloned();
+        let mut harness_eval = HarnessEvalAccumulator::new(HarnessEvalSeed {
+            task_id: task_id.to_string(),
+            turn_id,
+            depth: agent.depth as u32,
+            parent_task_id: agent.task_id.clone(),
+            completion_task_kind: "conversational".to_string(),
+            followup_mode: None,
+            config: agent.harness_eval_config.clone(),
+        });
+        harness_eval.record_bootstrap("bootstrap_direct_return", vec![], None, false);
+        agent.install_harness_eval(harness_eval).await;
+    }
+
     agent
-        .emit_task_end(
+        .emit_direct_return_task_end(
             emitter,
             task_id,
             TaskStatus::Completed,
@@ -551,6 +566,7 @@ pub(super) async fn emit_bootstrap_direct_reply(
             0,
             None,
             Some(reply_text.chars().take(200).collect()),
+            true,
         )
         .await;
 

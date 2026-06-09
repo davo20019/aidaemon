@@ -796,6 +796,9 @@ pub(super) async fn run_tool_prelude_phase(
             session_id,
             "Intent gate: requiring narration before tool execution"
         );
+        agent
+            .with_harness_eval(|eval| eval.record_intent_gate_fire())
+            .await;
         for tc in &resp.tool_calls {
             let result_text = "[SYSTEM] Before executing tools, briefly state what you \
                     understand the user is asking and what you plan to do. \
@@ -977,6 +980,9 @@ pub(super) async fn run_tool_prelude_phase(
         if let Some(violation) =
             assess_pre_execution_evidence_gate(&tc.name, &tc.arguments, evidence_state)
         {
+            agent
+                .with_harness_eval(|eval| eval.record_evidence_gate_block())
+                .await;
             validation_state.record_failure(ValidationFailure::MissingEvidence);
             validation_state.note_retry(LoopRepetitionReason::MissingEvidence);
             learning_ctx.record_replay_note(
@@ -1200,6 +1206,11 @@ pub(super) async fn run_tool_prelude_phase(
                                             .await;
                                             }
                                             Ok(()) => {
+                                                agent
+                                                    .with_harness_eval(|eval| {
+                                                        eval.record_critique_replan()
+                                                    })
+                                                    .await;
                                                 // Clear stale linear intent plan — rejected
                                                 // critique means the plan that produced it
                                                 // is invalid.

@@ -34,6 +34,74 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+const MULTIMODAL_IMAGE_TOKEN_SURROGATE: usize = 1_200;
+const MULTIMODAL_AUDIO_BYTES_PER_TOKEN: usize = 100;
+
+fn estimate_audio_tokens_from_base64_len(base64_len: usize) -> usize {
+    // Rough surrogate: ~1 token per 100 bytes of raw audio (base64 is ~4/3 inflation).
+    let raw_bytes = base64_len.saturating_mul(3) / 4;
+    raw_bytes
+        .saturating_div(MULTIMODAL_AUDIO_BYTES_PER_TOKEN)
+        .max(64)
+}
+
+fn surrogate_multimodal_content_tokens(content: &Value) -> Option<usize> {
+    let blocks = content.as_array()?;
+    let mut total = 0usize;
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    total = total.saturating_add(estimate_tokens(text));
+                }
+            }
+            Some("image_url") => {
+                total = total.saturating_add(MULTIMODAL_IMAGE_TOKEN_SURROGATE);
+            }
+            Some("input_audio") => {
+                let b64_len = block
+                    .get("input_audio")
+                    .and_then(|a| a.get("data"))
+                    .and_then(|d| d.as_str())
+                    .map(str::len)
+                    .unwrap_or(0);
+                total = total.saturating_add(estimate_audio_tokens_from_base64_len(b64_len));
+            }
+            _ => {}
+        }
+    }
+    Some(total)
+}
+
+/// Estimate tokens for a message array, substituting surrogates for multimodal base64 payloads.
+pub fn estimate_multimodal_message_tokens(messages: &[Value]) -> usize {
+    let mut surrogate_messages = messages.to_vec();
+    let mut used_surrogate = false;
+
+    for msg in surrogate_messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(content) = msg.get("content") else {
+            continue;
+        };
+        if let Some(tokens) = surrogate_multimodal_content_tokens(content) {
+            msg["content"] = json!(format!("[multimodal-surrogate:{tokens}]"));
+            used_surrogate = true;
+        }
+    }
+
+    let json = match serde_json::to_string(&surrogate_messages) {
+        Ok(s) => s,
+        Err(_) => return estimate_tokens(&serde_json::to_string(messages).unwrap_or_default()),
+    };
+
+    if used_surrogate {
+        tracing::debug!("Using multimodal surrogate token estimate for context budget");
+    }
+    estimate_tokens(&json)
+}
+
 /// Estimate the serialized token cost of OpenAI-format tool definitions.
 pub fn estimate_tool_definition_tokens(tool_defs: &[Value]) -> usize {
     let tools_json = serde_json::to_string(tool_defs).unwrap_or_default();
@@ -832,6 +900,25 @@ pub fn spawn_incremental_summarization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimodal_audio_surrogate_does_not_explode_estimate() {
+        let huge_b64 = "A".repeat(1_400_000);
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "listen"},
+                {"type": "input_audio", "input_audio": {"data": huge_b64, "format": "opus"}}
+            ]
+        })];
+        let naive = estimate_tokens(&serde_json::to_string(&messages).unwrap());
+        let surrogate = estimate_multimodal_message_tokens(&messages);
+        assert!(
+            surrogate < naive / 10,
+            "surrogate {surrogate} vs naive {naive}"
+        );
+        assert!(surrogate < 50_000);
+    }
 
     #[test]
     fn test_estimate_tokens() {

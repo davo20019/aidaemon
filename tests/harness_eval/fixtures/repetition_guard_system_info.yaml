@@ -1,0 +1,36 @@
+name: repetition_guard_system_info
+description: Repeated identical system_info calls trigger repetition guard redirects
+session_id: eval_repetition_01
+user_text: Run system checks repeatedly
+mock_responses:
+  - tool_call:
+      name: no_such_tool
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+expect:
+  guard_fired:
+    - RepetitiveCallDetection
+  llm_calls_min: 4

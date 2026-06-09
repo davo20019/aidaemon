@@ -3,8 +3,11 @@ use crate::harness_eval::fixture::{
     assert_expectations, collect_run_result, HarnessEvalFixture, HarnessEvalRunResult,
     MockResponseSpec,
 };
-use crate::testing::{setup_test_agent, setup_test_agent_orchestrator, MockProvider};
-use crate::traits::ProviderResponse;
+use crate::state::sqlite::SqliteStateStore;
+use crate::testing::{
+    setup_test_agent, setup_test_agent_orchestrator, setup_test_agent_with_models, MockProvider,
+};
+use crate::traits::{Goal, GoalStore, ProviderResponse};
 use crate::types::{ChannelContext, UserRole};
 
 pub async fn run_fixture(fixture: &HarnessEvalFixture) -> anyhow::Result<HarnessEvalRunResult> {
@@ -13,9 +16,13 @@ pub async fn run_fixture(fixture: &HarnessEvalFixture) -> anyhow::Result<Harness
 
     let harness = if fixture.orchestrator {
         setup_test_agent_orchestrator(provider).await?
+    } else if fixture.routing_models {
+        setup_test_agent_with_models(provider, "primary-model", "smart-model").await?
     } else {
         setup_test_agent(provider).await?
     };
+
+    apply_seed(&harness.state, &fixture.session_id, &fixture.seed).await?;
 
     let user_role = parse_user_role(&fixture.user_role);
     let response = harness
@@ -35,6 +42,19 @@ pub async fn run_fixture(fixture: &HarnessEvalFixture) -> anyhow::Result<Harness
         .query_recent_events(&fixture.session_id, 200)
         .await?;
     collect_run_result(&events, &response)
+}
+
+async fn apply_seed(
+    state: &SqliteStateStore,
+    session_id: &str,
+    seed: &crate::harness_eval::fixture::FixtureSeed,
+) -> anyhow::Result<()> {
+    for goal_spec in &seed.goals {
+        let mut goal = Goal::new_finite(&goal_spec.description, session_id);
+        goal.status = goal_spec.status.clone();
+        state.create_goal(&goal).await?;
+    }
+    Ok(())
 }
 
 pub async fn run_and_assert(fixture: &HarnessEvalFixture) -> anyhow::Result<HarnessEvalRunResult> {
@@ -73,9 +93,10 @@ mod tests {
         let dir = fixtures_dir();
         let fixtures = load_fixtures_dir(&dir).expect("load fixtures");
         assert!(
-            !fixtures.is_empty(),
-            "expected at least one fixture in {}",
-            dir.display()
+            fixtures.len() >= 15,
+            "expected at least 15 fixtures in {}, got {}",
+            dir.display(),
+            fixtures.len()
         );
         for (path, fixture) in fixtures {
             run_and_assert(&fixture)

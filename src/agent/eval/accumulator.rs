@@ -57,6 +57,10 @@ pub struct RoutingSnapshot {
     pub policy_profile: Option<String>,
     pub model_escalated: bool,
     pub outcome: TaskOutcome,
+    pub response_fallthrough: bool,
+    pub intent_gate_fires: u32,
+    pub evidence_gate_blocks: u32,
+    pub critique_replan_fires: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +76,11 @@ pub struct ProgressSnapshot {
     pub verification_count: u32,
     pub plan_steps_completed: Option<u32>,
     pub plan_steps_total: Option<u32>,
+    pub tool_defs_count: u32,
+    pub est_input_tokens: u32,
+    pub context_drops: u32,
+    pub deferred_no_tool_events: u32,
+    pub budget_extensions: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +135,10 @@ pub struct HarnessEvalAccumulator {
     sub_agent_weighted_tokens: u64,
     sub_agent_spawn_count: u32,
     sub_agent_failures: u32,
+    response_fallthrough: bool,
+    intent_gate_fires: u32,
+    evidence_gate_blocks: u32,
+    critique_replan_fires: u32,
 }
 
 impl HarnessEvalAccumulator {
@@ -155,6 +168,10 @@ impl HarnessEvalAccumulator {
             sub_agent_weighted_tokens: 0,
             sub_agent_spawn_count: 0,
             sub_agent_failures: 0,
+            response_fallthrough: false,
+            intent_gate_fires: 0,
+            evidence_gate_blocks: 0,
+            critique_replan_fires: 0,
             seed,
         }
     }
@@ -193,6 +210,42 @@ impl HarnessEvalAccumulator {
         if succeeded {
             self.stop_reason = StopReason::DirectReturn;
         }
+    }
+
+    pub fn record_response_fallthrough(&mut self) {
+        self.response_fallthrough = true;
+    }
+
+    pub fn record_message_build(
+        &mut self,
+        tool_defs_count: u32,
+        est_input_tokens: u32,
+        context_drops: u32,
+    ) {
+        self.progress.tool_defs_count = tool_defs_count;
+        self.progress.est_input_tokens = est_input_tokens;
+        self.progress.context_drops = context_drops;
+    }
+
+    pub fn record_intent_gate_fire(&mut self) {
+        self.intent_gate_fires = self.intent_gate_fires.saturating_add(1);
+    }
+
+    pub fn record_evidence_gate_block(&mut self) {
+        self.evidence_gate_blocks = self.evidence_gate_blocks.saturating_add(1);
+    }
+
+    pub fn record_critique_replan(&mut self) {
+        self.critique_replan_fires = self.critique_replan_fires.saturating_add(1);
+    }
+
+    pub fn record_deferred_no_tool_event(&mut self) {
+        self.progress.deferred_no_tool_events =
+            self.progress.deferred_no_tool_events.saturating_add(1);
+    }
+
+    pub fn record_budget_extension(&mut self) {
+        self.progress.budget_extensions = self.progress.budget_extensions.saturating_add(1);
     }
 
     pub fn record_model_escalated(&mut self) {
@@ -333,6 +386,10 @@ impl HarnessEvalAccumulator {
             policy_profile: acc.policy_profile.clone(),
             model_escalated: acc.model_escalated,
             outcome,
+            response_fallthrough: acc.response_fallthrough,
+            intent_gate_fires: acc.intent_gate_fires,
+            evidence_gate_blocks: acc.evidence_gate_blocks,
+            critique_replan_fires: acc.critique_replan_fires,
         };
 
         let cost = CostSnapshot {
@@ -377,6 +434,10 @@ impl HarnessEvalAccumulator {
                 skills_activated: routing.skills_activated,
                 policy_profile: routing.policy_profile,
                 model_escalated: routing.model_escalated,
+                response_fallthrough: routing.response_fallthrough,
+                intent_gate_fires: routing.intent_gate_fires,
+                evidence_gate_blocks: routing.evidence_gate_blocks,
+                critique_replan_fires: routing.critique_replan_fires,
             },
             progress: acc.progress.into(),
             quality: QualityEvalPayload {
@@ -420,6 +481,11 @@ impl From<ProgressSnapshot> for crate::events::ProgressEvalPayload {
             repetition_guard_fires: value.repetition_guard_fires,
             plan_steps_completed: value.plan_steps_completed,
             plan_steps_total: value.plan_steps_total,
+            tool_defs_count: value.tool_defs_count,
+            est_input_tokens: value.est_input_tokens,
+            context_drops: value.context_drops,
+            deferred_no_tool_events: value.deferred_no_tool_events,
+            budget_extensions: value.budget_extensions,
         }
     }
 }
@@ -486,6 +552,10 @@ mod tests {
                 skills_activated: Vec::new(),
                 policy_profile: None,
                 model_escalated: false,
+                response_fallthrough: false,
+                intent_gate_fires: 0,
+                evidence_gate_blocks: 0,
+                critique_replan_fires: 0,
             },
             progress: ProgressEvalPayload {
                 iterations: 2,
@@ -497,6 +567,11 @@ mod tests {
                 repetition_guard_fires: 0,
                 plan_steps_completed: None,
                 plan_steps_total: None,
+                tool_defs_count: 0,
+                est_input_tokens: 0,
+                context_drops: 0,
+                deferred_no_tool_events: 0,
+                budget_extensions: 0,
             },
             quality: QualityEvalPayload {
                 outcome: outcome.to_string(),

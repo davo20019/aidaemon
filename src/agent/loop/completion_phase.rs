@@ -408,6 +408,9 @@ pub(super) async fn run_completion_phase(
                 deferred_no_tool_streak = 0;
             } else {
                 deferred_no_tool_streak = deferred_no_tool_streak.saturating_add(1);
+                agent
+                    .with_harness_eval(|eval| eval.record_deferred_no_tool_event())
+                    .await;
                 consecutive_clean_iterations = 0;
                 pending_system_messages.push(SystemDirective::DeferredToolCallRequired);
                 warn!(

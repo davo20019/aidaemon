@@ -198,6 +198,10 @@ mod tests {
             policy_profile: Some("balanced".to_string()),
             model_escalated: false,
             outcome: TaskOutcome::Succeeded,
+            response_fallthrough: false,
+            intent_gate_fires: 0,
+            evidence_gate_blocks: 0,
+            critique_replan_fires: 0,
         }
     }
 

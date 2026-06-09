@@ -1020,6 +1020,17 @@ async fn test_turn_id_groups_messages_within_a_turn() {
     );
 }
 
+fn llm_messages_contain_input_audio(messages: &[serde_json::Value]) -> bool {
+    messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_audio"))
+            })
+    })
+}
+
 fn llm_messages_contain_image_url(messages: &[serde_json::Value]) -> bool {
     messages.iter().any(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("user")
@@ -1173,7 +1184,161 @@ async fn test_vision_disabled_sends_text_stub_only() {
     );
 }
 
-/// Non-image attachments (e.g. audio) should not produce vision blocks.
+/// Audio attachments reach the LLM as input_audio when model matches audio patterns.
+#[tokio::test]
+async fn test_audio_attachment_reaches_provider_as_input_audio() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+    let mut ogg = tempfile::NamedTempFile::new().unwrap();
+    ogg.write_all(&[1, 2, 3, 4, 5]).unwrap();
+
+    let attachment = message_attachment(
+        ogg.path().to_path_buf(),
+        "voice.ogg".to_string(),
+        "audio/ogg".to_string(),
+        5,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("what did they say?", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "They asked about the weather.",
+    )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    harness
+        .agent
+        .set_test_model("gemini-2.0-flash")
+        .await;
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "audio_multimodal_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        call_log
+            .iter()
+            .any(|call| llm_messages_contain_input_audio(&call.messages)),
+        "expected input_audio block in LLM payload"
+    );
+}
+
+/// When audio is disabled, attachments stay as text stubs only.
+#[tokio::test]
+async fn test_audio_disabled_sends_text_stub_only() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+    use crate::config::{AudioConfig, FilesConfig};
+
+    let mut ogg = tempfile::NamedTempFile::new().unwrap();
+    ogg.write_all(&[1, 2, 3, 4]).unwrap();
+
+    let attachment = message_attachment(
+        ogg.path().to_path_buf(),
+        "voice.ogg".to_string(),
+        "audio/ogg".to_string(),
+        4,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("listen", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I received your audio but cannot process it while audio is disabled.",
+    )]);
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    let mut files = FilesConfig::default();
+    files.audio_enabled = false;
+    harness
+        .agent
+        .set_test_audio_config(AudioConfig::from_files(&files));
+    harness
+        .agent
+        .set_test_model("gemini-2.0-flash")
+        .await;
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "audio_disabled_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        !call_log
+            .iter()
+            .any(|call| llm_messages_contain_input_audio(&call.messages)),
+        "audio disabled must not send input_audio blocks"
+    );
+}
+
+/// Ineligible models should not receive input_audio blocks.
+#[tokio::test]
+async fn test_audio_ineligible_model_sends_text_stub_only() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+
+    let mut ogg = tempfile::NamedTempFile::new().unwrap();
+    ogg.write_all(&[1, 2, 3, 4]).unwrap();
+
+    let attachment = message_attachment(
+        ogg.path().to_path_buf(),
+        "voice.ogg".to_string(),
+        "audio/ogg".to_string(),
+        4,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("listen", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I saved the audio but this model cannot hear it.",
+    )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "audio_ineligible_model_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        !call_log
+            .iter()
+            .any(|call| llm_messages_contain_input_audio(&call.messages)),
+        "mock-model must not send input_audio blocks"
+    );
+}
+
+/// Non-image attachments on ineligible models should not produce vision blocks.
 #[tokio::test]
 async fn test_non_image_attachment_is_text_stub_only() {
     use crate::channels::attachments::{build_inbound_text, message_attachment};

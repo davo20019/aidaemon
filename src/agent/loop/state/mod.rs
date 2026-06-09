@@ -23,6 +23,8 @@ pub(super) use stall::StallTracker;
 
 use crate::agent::eval::{HarnessEvalAccumulator, HarnessEvalHandle};
 
+/// Per-turn loop state. `harness_eval` shares the agent's accumulator handle
+/// (single source of truth for phase instrumentation through TaskEnd finalize).
 #[derive(Debug, Default)]
 pub(super) struct TurnState {
     pub stall: StallTracker,
@@ -35,9 +37,16 @@ pub(super) struct TurnState {
     pub counters: LoopCounters,
     pub read_files: ReadFileObservationTracker,
     pub harness_eval: Option<HarnessEvalHandle>,
+    /// Alias for plan terminology — same handle as `harness_eval`.
+    pub eval: Option<HarnessEvalHandle>,
 }
 
 impl TurnState {
+    pub(super) fn attach_harness_eval(&mut self, handle: HarnessEvalHandle) {
+        self.harness_eval = Some(handle.clone());
+        self.eval = Some(handle);
+    }
+
     pub(super) async fn with_harness_eval<R>(
         &self,
         f: impl FnOnce(&mut HarnessEvalAccumulator) -> R,

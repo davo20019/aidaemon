@@ -347,8 +347,12 @@ impl Agent {
                     .unwrap_or(false),
             ),
             read_files: super::loop_state::ReadFileObservationTracker::default(),
-            harness_eval: harness_eval_handle,
+            harness_eval: None,
+            eval: None,
         };
+        if let Some(handle) = harness_eval_handle {
+            turn_state.attach_harness_eval(handle);
+        }
 
         // Task-start planning call: generate a structured plan before the main loop.
         // Skipped for conversational queries, short messages, and acknowledgments.
@@ -957,7 +961,12 @@ impl Agent {
                 .await?
                 {
                     match outcome {
-                        ResponsePhaseOutcome::ContinueLoop => continue,
+                        ResponsePhaseOutcome::ContinueLoop => {
+                            turn_state
+                                .with_harness_eval(|eval| eval.record_response_fallthrough())
+                                .await;
+                            continue;
+                        }
                         ResponsePhaseOutcome::Return(result) => return result,
                         ResponsePhaseOutcome::ProceedToToolExecution => {}
                     }
@@ -1133,6 +1142,16 @@ impl Agent {
                 },
             )
             .await?;
+            let context_drops = tool_defs.len().saturating_sub(effective_tool_defs.len()) as u32;
+            turn_state
+                .with_harness_eval(|eval| {
+                    eval.record_message_build(
+                        effective_tool_defs.len() as u32,
+                        est_input_tokens,
+                        context_drops,
+                    );
+                })
+                .await;
             let message_build_ms = message_build_start.elapsed().as_millis() as u64;
 
             let llm_stall = turn_state.stall.for_llm_phase();

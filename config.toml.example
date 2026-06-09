@@ -246,6 +246,11 @@ health_port = 8080
 # vision_enabled = true
 # max_vision_image_mb = 4
 # vision_mime_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+# audio_enabled = true
+# max_audio_mb = 10
+# audio_mime_types = ["audio/ogg", "audio/mpeg", "audio/mp3", "audio/wav", "audio/flac", "audio/aac"]
+# audio_model_patterns = ["audio", "gemini-2", "gemini-3"]
+# Native audio requires audio-capable models (e.g. gpt-4o-audio-preview, gpt-audio-1.5, gemini-2.x flash).
 
 # [cli_agents]
 # Delegate to external CLI coding agents (claude, codex, gemini, …). Off by default.

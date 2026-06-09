@@ -45,6 +45,11 @@ name: my_case
 session_id: eval_my_case_01
 user_text: Check my system status
 orchestrator: true          # use orchestrator-mode harness (routing tests)
+routing_models: true        # non-uniform primary/smart tiers (routing + deferred-no-tool tests)
+seed:                       # optional DB state before handle_message
+  goals:
+    - description: Daily health check
+      status: active
 mock_responses:
   - tool_call:
       name: system_info
@@ -54,10 +59,12 @@ expect:
   orchestration_route: default_continue
   tools_used: [system_info]
   outcome: succeeded
+  stop_reason: completed    # completed | stall | error | budget | timeout | cancelled | direct_return
+  response_fallthrough: true # orchestration returned ContinueLoop into execution loop
   overall_min: 0.5
 ```
 
-**Assertion priority:** structural fields first (`orchestration_route`, `tools_used`, score mins), then optional `response_contains` (brittle — use sparingly).
+**Assertion priority:** structural fields first (`orchestration_route`, `tools_used`, `stop_reason`, score mins), then optional `response_contains` (brittle — use sparingly; match actual bootstrap/orchestration copy).
 
 ## Online analysis
 

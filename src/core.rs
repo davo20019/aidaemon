@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
-use crate::config::{AppConfig, VisionConfig};
+use crate::config::{AppConfig, AudioConfig, VisionConfig};
 use crate::daemon;
 
 use crate::health::HealthProbeManager;
@@ -244,6 +244,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
             None
         },
         VisionConfig::from_files(&config.files),
+        AudioConfig::from_files(&config.files),
         (&config.diagnostics.harness_eval).into(),
     ));
 

@@ -654,6 +654,14 @@ pub struct RoutingEvalPayload {
     pub policy_profile: Option<String>,
     #[serde(default)]
     pub model_escalated: bool,
+    #[serde(default)]
+    pub response_fallthrough: bool,
+    #[serde(default)]
+    pub intent_gate_fires: u32,
+    #[serde(default)]
+    pub evidence_gate_blocks: u32,
+    #[serde(default)]
+    pub critique_replan_fires: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +677,16 @@ pub struct ProgressEvalPayload {
     pub plan_steps_completed: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_steps_total: Option<u32>,
+    #[serde(default)]
+    pub tool_defs_count: u32,
+    #[serde(default)]
+    pub est_input_tokens: u32,
+    #[serde(default)]
+    pub context_drops: u32,
+    #[serde(default)]
+    pub deferred_no_tool_events: u32,
+    #[serde(default)]
+    pub budget_extensions: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

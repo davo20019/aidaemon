@@ -303,6 +303,14 @@ impl OpenAiCompatibleProvider {
             body["id_slot"] = json!(options.id_slot.unwrap_or(self.slot_routing.background_slot));
         }
 
+        // OpenAI audio models require `modalities` when `input_audio` blocks are present.
+        // Text-only agent responses: modalities = ["text"] only (no audio output).
+        // If a provider rejects this, it may also require `audio: { voice, format }` —
+        // validate against your configured audio model and adjust if needed.
+        if crate::providers::multimodal::messages_contain_audio_blocks(messages) {
+            body["modalities"] = json!(["text"]);
+        }
+
         match &options.response_mode {
             ResponseMode::Text => {}
             ResponseMode::JsonObject => {

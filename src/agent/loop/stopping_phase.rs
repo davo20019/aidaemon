@@ -818,6 +818,9 @@ pub(super) async fn run_stopping_phase(
                 let old_budget_i64 = budget as i64;
                 let new_budget_i64 = new_budget_u64 as i64;
                 budget_extensions_count += 1;
+                agent
+                    .with_harness_eval(|eval| eval.record_budget_extension())
+                    .await;
                 effective_task_budget = Some(new_budget_u64);
                 budget_warning_sent = false;
                 info!(
@@ -1244,6 +1247,9 @@ pub(super) async fn run_stopping_phase(
                     && productive
                 {
                     budget_extensions_count += 1;
+                    agent
+                        .with_harness_eval(|eval| eval.record_budget_extension())
+                        .await;
                     effective_daily_budget = Some(new_daily_budget);
                     pending_system_messages.push(SystemDirective::GlobalDailyBudgetAutoExtended {
                         old_budget: daily_budget as i64,

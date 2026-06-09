@@ -12,7 +12,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::channels::ChannelHub;
-use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig};
+use crate::config::{
+    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig,
+};
 use crate::events::EventStore;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::SharedLlmRuntime;
@@ -59,6 +61,7 @@ impl Agent {
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         interactive_slot: Option<u32>,
         vision_config: VisionConfig,
+        audio_config: AudioConfig,
         harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
@@ -148,6 +151,7 @@ impl Agent {
             interactive_slot,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
+            audio_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }
@@ -164,6 +168,16 @@ impl Agent {
     #[cfg(test)]
     pub fn set_test_vision_config(&mut self, vision: VisionConfig) {
         self.vision_config = vision;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_audio_config(&mut self, audio: AudioConfig) {
+        self.audio_config = audio;
+    }
+
+    #[cfg(test)]
+    pub async fn set_test_model(&self, model: impl Into<String>) {
+        *self.model.write().await = model.into();
     }
 
     /// Reset agent to orchestrator mode (depth=0) for integration tests.
@@ -267,6 +281,7 @@ impl Agent {
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         vision_config: VisionConfig,
+        audio_config: AudioConfig,
         harness_eval_config: HarnessEvalConfig,
     ) -> Self {
         let fallback = llm_runtime
@@ -329,6 +344,7 @@ impl Agent {
             interactive_slot: None,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             vision_config,
+            audio_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
         }

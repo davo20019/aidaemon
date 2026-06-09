@@ -2063,6 +2063,14 @@ pub struct FilesConfig {
     pub max_vision_image_mb: u64,
     #[serde(default = "default_vision_mime_types")]
     pub vision_mime_types: Vec<String>,
+    #[serde(default = "default_audio_enabled")]
+    pub audio_enabled: bool,
+    #[serde(default = "default_max_audio_mb")]
+    pub max_audio_mb: u64,
+    #[serde(default = "default_audio_mime_types")]
+    pub audio_mime_types: Vec<String>,
+    #[serde(default = "default_audio_model_patterns")]
+    pub audio_model_patterns: Vec<String>,
 }
 
 /// Vision/image encoding settings derived from `[files]` config.
@@ -2087,6 +2095,37 @@ impl VisionConfig {
     }
 }
 
+/// Native audio input settings derived from `[files]` config.
+#[derive(Debug, Clone)]
+pub struct AudioConfig {
+    pub enabled: bool,
+    pub max_audio_bytes: u64,
+    pub mime_types: Vec<String>,
+    pub model_patterns: Vec<String>,
+}
+
+impl AudioConfig {
+    pub fn from_files(files: &FilesConfig) -> Self {
+        Self {
+            enabled: files.audio_enabled,
+            max_audio_bytes: files.max_audio_mb.saturating_mul(1_048_576),
+            mime_types: files.audio_mime_types.clone(),
+            model_patterns: files.audio_model_patterns.clone(),
+        }
+    }
+
+    pub fn mime_allowed(&self, mime: &str) -> bool {
+        self.mime_types.iter().any(|allowed| allowed == mime)
+    }
+
+    pub fn model_supports_audio(&self, model: &str) -> bool {
+        let model_lower = model.to_ascii_lowercase();
+        self.model_patterns
+            .iter()
+            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
+    }
+}
+
 impl Default for FilesConfig {
     fn default() -> Self {
         Self {
@@ -2098,6 +2137,10 @@ impl Default for FilesConfig {
             vision_enabled: default_vision_enabled(),
             max_vision_image_mb: default_max_vision_image_mb(),
             vision_mime_types: default_vision_mime_types(),
+            audio_enabled: default_audio_enabled(),
+            max_audio_mb: default_max_audio_mb(),
+            audio_mime_types: default_audio_mime_types(),
+            audio_model_patterns: default_audio_model_patterns(),
         }
     }
 }
@@ -2129,6 +2172,29 @@ fn default_vision_mime_types() -> Vec<String> {
         "image/png".to_string(),
         "image/gif".to_string(),
         "image/webp".to_string(),
+    ]
+}
+fn default_audio_enabled() -> bool {
+    true
+}
+fn default_max_audio_mb() -> u64 {
+    10
+}
+fn default_audio_mime_types() -> Vec<String> {
+    vec![
+        "audio/ogg".to_string(),
+        "audio/mpeg".to_string(),
+        "audio/mp3".to_string(),
+        "audio/wav".to_string(),
+        "audio/flac".to_string(),
+        "audio/aac".to_string(),
+    ]
+}
+fn default_audio_model_patterns() -> Vec<String> {
+    vec![
+        "audio".to_string(),
+        "gemini-2".to_string(),
+        "gemini-3".to_string(),
     ]
 }
 

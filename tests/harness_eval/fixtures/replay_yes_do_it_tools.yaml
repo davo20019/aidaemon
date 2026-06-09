@@ -1,0 +1,21 @@
+name: replay_yes_do_it_tools
+description: Acknowledgment follow-up with intent gate proceeds to tools
+session_id: eval_replay_yes_01
+user_text: Yes, do it.
+routing_models: true
+mock_responses:
+  - text: |
+      arguments:
+      name: terminal
+      command: ls
+      [INTENT_GATE]
+      {"complexity":"simple","can_answer_now":true,"needs_tools":true,"is_acknowledgment":true}
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - text: Applied the requested changes.
+expect:
+  llm_calls_min: 3
+  tools_used:
+    - system_info
+  outcome: succeeded

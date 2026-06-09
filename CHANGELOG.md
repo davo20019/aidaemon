@@ -10,11 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Vision / image understanding**: user-uploaded images from Telegram, Slack, and Discord are lazily base64-encoded for the current turn and sent to vision-capable LLM providers (OpenAI-compatible passthrough, Anthropic/Gemini mappers). Structured `MessageAttachment` metadata is persisted alongside the existing `[File received: ...]` text stub. Configurable via `[files] vision_enabled`, `max_vision_image_mb`, and `vision_mime_types`. Graceful fallback to text-only when vision is disabled, files are missing, or the provider rejects image payloads.
+- **Native audio input**: voice notes and audio file uploads are lazily encoded as OpenAI-style `input_audio` blocks for audio-capable models (OpenAI audio models with `modalities: ["text"]`, Gemini `inlineData`). Configurable via `[files] audio_enabled`, `max_audio_mb`, `audio_mime_types`, and `audio_model_patterns`. Graceful fallback to text stub + system hint when audio is disabled, the model is ineligible, or encoding fails. Multimodal token budgeting uses byte surrogates so large audio payloads do not explode context estimates.
 - **Browser screenshot vision**: browser `screenshot` actions save PNGs to the shared inbox and attach them to tool results so the LLM always receives pixels (synthetic user observation message at render time). Tool-origin images stay vision-eligible in archived turns for follow-up questions; user uploads remain current-turn-only.
 - **Harness eval instrumentation (Phase A)**: per-task effectiveness snapshot on `TaskEnd` (`HarnessEvalSnapshot`) scoring routing accuracy, progress yield, contract fulfillment, and tier-weighted cost efficiency. Configurable via `[diagnostics.harness_eval]`; sub-agent metrics roll up into the parent task at spawn complete.
 - **Harness eval offline suite (Phase B)**: YAML fixtures in `tests/harness_eval/fixtures/` with `cargo test --lib harness_eval` regression runner (`src/harness_eval/`).
 - **Harness eval analysis tooling (Phase C)**: `db_probe --eval-task`, `--eval-summary`, `--record-fixture`; `diagnose` action includes Harness Effectiveness section when snapshot present.
 - **Harness eval follow-ups**: orchestration direct-return metrics recorded before `TaskEnd` finalize; `TurnState` shares the eval accumulator handle; post-exec validation failures and terminal approval denials roll into quality metrics; `policy_metrics` exposes `harness_eval_tasks_total` and rolling `harness_eval_overall_avg`; CI runs `cargo test --lib harness_eval` explicitly; two new offline fixtures (`internal_maintenance_direct_return`, `orchestrator_fallthrough_status`) and stricter schedule direct-return expectations.
+- **Harness eval phase wiring + fixture suite expansion**: bootstrap direct-return shortcuts (stop/cancel, time query, etc.) now install and finalize `HarnessEvalSnapshot`; message-build, tool-prelude, response-fallthrough, and stopping-phase signals (context drops, intent/evidence gates, budget extensions) roll into progress/routing payloads; YAML fixtures support `seed.goals`, `routing_models`, `stop_reason`, and `response_fallthrough`; 15 offline fixtures cover cancel, deferred-no-tool, repetition/stall guards, and orchestration fallthrough paths.
+
+### Fixed
+
+- **Bootstrap stop/cancel missing harness eval snapshot**: exact `stop`/`cancel`/`abort` commands handled in bootstrap returned `TaskEnd` without `harness_eval`, breaking offline fixtures and `db_probe --eval-task` for those paths.
 
 ## [0.11.0] - 2026-06-08
 

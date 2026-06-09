@@ -237,7 +237,10 @@ impl Agent {
         Ok(None)
     }
 
-    /// When the provider rejects a multimodal payload, strip image blocks and retry once.
+    /// When the provider rejects a multimodal payload, strip image/audio blocks and retry once.
+    ///
+    /// TODO(v2): tiered multimodal fallback — strip `input_audio` first and retry;
+    /// only strip `image_url` on a second failure so mixed photo+voice turns keep images.
     async fn try_text_only_vision_fallback(
         &self,
         provider: &Arc<dyn ModelProvider>,
@@ -246,15 +249,15 @@ impl Agent {
         tool_defs: &[Value],
         options: &ChatOptions,
     ) -> Option<crate::traits::ProviderResponse> {
-        if !crate::providers::multimodal::messages_contain_vision_blocks(messages) {
+        if !crate::providers::multimodal::messages_contain_multimodal_blocks(messages) {
             return None;
         }
         warn!(
             model,
-            "Provider rejected vision payload; retrying once with text-only content"
+            "Provider rejected multimodal payload; retrying once with text-only content"
         );
         let mut text_only = messages.to_vec();
-        crate::providers::multimodal::strip_image_blocks_from_messages(&mut text_only);
+        crate::providers::multimodal::strip_multimodal_blocks_from_messages(&mut text_only);
         match provider
             .chat_with_options(model, &text_only, tool_defs, options)
             .await

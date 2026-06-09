@@ -1,6 +1,7 @@
 use super::*;
+use crate::agent::attachment_content::build_attachment_content;
 use crate::agent::turn_render::RenderMode;
-use crate::agent::vision::{build_multimodal_content, user_message_content_matches};
+use crate::agent::vision::user_message_content_matches;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::MessageAttachment;
 
@@ -224,7 +225,7 @@ pub(super) async fn run_message_build_phase(
     let pending_system_messages = &mut *ctx.pending_system_messages;
     let empty_response_retry_pending = ctx.empty_response_retry_pending;
     let status_tx = ctx.status_tx;
-    let render_options = agent.render_options();
+    let render_options = agent.render_options(model);
 
     let total_context_budget =
         crate::memory::context_window::model_context_budget(model, &agent.context_window_config);
@@ -641,11 +642,13 @@ pub(super) async fn run_message_build_phase(
             } else {
                 current_attachments
             };
-            let build = build_multimodal_content(
+            let build = build_attachment_content(
                 user_text,
                 attachments,
                 RenderMode::Current,
                 &render_options.vision,
+                &render_options.audio,
+                model,
             );
             messages.push(json!({
                 "role": "user",
@@ -1024,7 +1027,8 @@ pub(super) async fn run_message_build_phase(
     // Final enforcement must happen after every prompt component has been inserted.
     // Earlier trimming cannot account for execution checkpoints and one-shot directives.
     if agent.context_window_config.enabled {
-        let message_tokens = crate::memory::context_window::estimate_tokens(&messages_json);
+        let message_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let final_tool_budget = total_context_budget.saturating_sub(
             message_tokens + RESPONSE_RESERVE_TOKENS + TOKEN_ESTIMATE_SAFETY_MARGIN,
         );

@@ -1,0 +1,15 @@
+name: remember_fact_simple
+description: Agent stores a user preference via remember_fact
+session_id: eval_remember_01
+user_text: Remember that my favorite editor is vim
+mock_responses:
+  - tool_call:
+      name: remember_fact
+      arguments: '{"facts":[{"category":"preference","key":"favorite_editor","value":"vim"}]}'
+  - text: Got it — I'll remember your favorite editor is vim.
+expect:
+  tools_used:
+    - remember_fact
+  tool_calls_min: 1
+  outcome: succeeded
+  llm_calls_min: 2

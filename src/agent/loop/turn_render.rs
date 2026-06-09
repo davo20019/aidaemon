@@ -21,7 +21,7 @@ use super::sliding_window::summarize_tool_result;
 // `Message`, `ToolCall`, `json`, `Value`, and `MAX_OLD_ASSISTANT_CONTENT_CHARS`
 // all live in the `agent` module scope.
 use super::*;
-use crate::config::VisionConfig;
+use crate::config::{AudioConfig, VisionConfig};
 use crate::events::TerminalState;
 use crate::traits::AttachmentProvenance;
 
@@ -31,6 +31,8 @@ pub(crate) const RENDERER_VERSION: u32 = 3;
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
     pub vision: VisionConfig,
+    pub audio: AudioConfig,
+    pub model: String,
 }
 
 impl Default for RenderOptions {
@@ -46,6 +48,8 @@ impl Default for RenderOptions {
                     "image/webp".to_string(),
                 ],
             },
+            audio: AudioConfig::from_files(&crate::config::FilesConfig::default()),
+            model: String::new(),
         }
     }
 }
@@ -195,6 +199,7 @@ fn append_tool_observation_messages(
 fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
     let mut vision_skipped = false;
+    let mut audio_skipped = false;
 
     let mut rendered: Vec<Value> = Vec::new();
 
@@ -214,14 +219,19 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
 
         let content = if m.role == "user" && !m.attachments.is_empty() {
             let text = m.content.as_deref().unwrap_or("");
-            let built = crate::agent::vision::build_multimodal_content(
+            let built = crate::agent::attachment_content::build_attachment_content(
                 text,
                 &m.attachments,
                 RenderMode::Current,
                 &options.vision,
+                &options.audio,
+                &options.model,
             );
             if built.vision_skipped {
                 vision_skipped = true;
+            }
+            if built.audio_skipped {
+                audio_skipped = true;
             }
             built.content
         } else {
@@ -260,6 +270,15 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
             json!({
                 "role": "system",
                 "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+            }),
+        );
+    }
+    if audio_skipped {
+        rendered.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::audio::AUDIO_SKIPPED_SYSTEM_HINT,
             }),
         );
     }

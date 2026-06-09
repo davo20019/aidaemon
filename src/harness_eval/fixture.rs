@@ -25,9 +25,32 @@ pub struct HarnessEvalFixture {
     /// When true, use orchestrator-mode test harness (required for orchestration routing).
     #[serde(default)]
     pub orchestrator: bool,
+    /// When true, use non-uniform primary/smart model tiers (routing tests).
+    #[serde(default)]
+    pub routing_models: bool,
     #[serde(default)]
     pub mock_responses: Vec<MockResponseSpec>,
     pub expect: ExpectBlock,
+    /// Optional DB seed data applied before handle_message.
+    #[serde(default)]
+    pub seed: FixtureSeed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FixtureSeed {
+    #[serde(default)]
+    pub goals: Vec<SeedGoal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedGoal {
+    pub description: String,
+    #[serde(default = "default_active_status")]
+    pub status: String,
+}
+
+fn default_active_status() -> String {
+    "active".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -40,6 +63,8 @@ pub struct ExpectBlock {
     pub tools_used: Vec<String>,
     #[serde(default)]
     pub outcome: Option<String>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
     #[serde(default)]
     pub llm_calls_min: Option<u32>,
     #[serde(default)]
@@ -60,6 +85,8 @@ pub struct ExpectBlock {
     pub overall_min: Option<f32>,
     #[serde(default)]
     pub direct_return: Option<bool>,
+    #[serde(default)]
+    pub response_fallthrough: Option<bool>,
     #[serde(default)]
     pub guard_fired: Vec<String>,
     #[serde(default)]
@@ -306,6 +333,23 @@ pub fn assert_expectations(
         );
     }
 
+    if let Some(expected) = &expect.stop_reason {
+        anyhow::ensure!(
+            eval.quality.stop_reason == *expected,
+            "[{}] stop_reason: expected {expected}, got {}",
+            fixture.name,
+            eval.quality.stop_reason
+        );
+    }
+
+    if expect.response_fallthrough == Some(true) {
+        anyhow::ensure!(
+            eval.routing.response_fallthrough,
+            "[{}] expected response_fallthrough=true",
+            fixture.name
+        );
+    }
+
     for guard in &expect.guard_fired {
         let fired = match guard.as_str() {
             "RepetitiveCallDetection" => eval.progress.repetition_guard_fires > 0,
@@ -378,12 +422,15 @@ pub fn build_recorded_fixture(
         user_text: user_text.to_string(),
         user_role: "owner".to_string(),
         orchestrator: false,
+        routing_models: false,
         mock_responses: Vec::new(),
+        seed: FixtureSeed::default(),
         expect: ExpectBlock {
             orchestration_route: Some(eval.orchestration_route.clone()),
             tools_required_predicted: Some(eval.routing.tools_required_predicted),
             tools_used: tool_names.to_vec(),
             outcome: Some(task_end.effective_outcome().as_str().to_string()),
+            stop_reason: Some(eval.quality.stop_reason.clone()),
             llm_calls_min: None,
             llm_calls_max: Some(eval.cost.llm_calls),
             tool_calls_min: None,
@@ -394,6 +441,7 @@ pub fn build_recorded_fixture(
             cost_efficiency_min: Some(round_score(eval.scores.cost_efficiency)),
             overall_min: Some(round_score(eval.scores.overall)),
             direct_return: Some(eval.routing.direct_return_attempted),
+            response_fallthrough: Some(eval.routing.response_fallthrough),
             guard_fired: Vec::new(),
             decision_types_seen: Vec::new(),
             response_contains: Vec::new(),

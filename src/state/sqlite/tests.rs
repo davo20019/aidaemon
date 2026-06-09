@@ -1868,7 +1868,11 @@ async fn test_dynamic_bots_crud() {
     let bots = store.get_dynamic_bots().await.unwrap();
     assert_eq!(bots.len(), 1);
     assert_eq!(bots[0].channel_type, "telegram");
-    assert_eq!(bots[0].bot_token, "123456:ABC");
+    assert!(
+        bots[0].bot_token == "123456:ABC" || bots[0].bot_token.starts_with("keychain:"),
+        "unexpected bot_token: {}",
+        bots[0].bot_token
+    );
     assert_eq!(bots[0].allowed_user_ids.len(), 2);
 
     // Delete

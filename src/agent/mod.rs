@@ -13,7 +13,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::channels::ChannelHub;
-use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig};
+use crate::config::{
+    AudioConfig, IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig,
+};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     LlmCallData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
@@ -222,6 +224,8 @@ mod compaction;
 #[path = "runtime/llm.rs"]
 mod llm;
 pub(in crate::agent) use llm::LlmCallTelemetry;
+pub(crate) mod attachment_content;
+pub(crate) mod audio;
 pub(in crate::agent) mod eval;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
@@ -447,6 +451,8 @@ pub struct Agent {
     session_core_profile_ids: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>>,
     /// Vision/image encoding settings for multimodal LLM requests.
     vision_config: VisionConfig,
+    /// Native audio input settings for multimodal LLM requests.
+    audio_config: AudioConfig,
     /// Per-task harness effectiveness accumulator (cleared after TaskEnd).
     harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
     /// Harness eval scoring configuration.
@@ -532,9 +538,11 @@ impl Agent {
         self.depth
     }
 
-    pub(crate) fn render_options(&self) -> turn_render::RenderOptions {
+    pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {
         turn_render::RenderOptions {
             vision: self.vision_config.clone(),
+            audio: self.audio_config.clone(),
+            model: model.to_string(),
         }
     }
 

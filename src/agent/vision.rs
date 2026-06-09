@@ -68,28 +68,27 @@ pub struct MultimodalBuildResult {
     pub vision_skipped: bool,
 }
 
-/// Build OpenAI-style multimodal `content` for a user message.
-pub fn build_multimodal_content(
-    text: &str,
+pub struct ImageBlocksResult {
+    pub blocks: Vec<Value>,
+    pub encoded_any: bool,
+    pub skipped_any: bool,
+}
+
+/// Build `image_url` blocks for eligible image attachments.
+pub fn build_image_blocks(
     attachments: &[MessageAttachment],
     mode: RenderMode,
     vision: &VisionConfig,
-) -> MultimodalBuildResult {
+) -> ImageBlocksResult {
     let encode_vision = matches!(mode, RenderMode::Current) && vision.enabled;
-    build_multimodal_content_force(text, attachments, encode_vision, vision)
-}
 
-fn build_multimodal_content_force(
-    text: &str,
-    attachments: &[MessageAttachment],
-    encode_vision: bool,
-    vision: &VisionConfig,
-) -> MultimodalBuildResult {
-    let text = text.trim();
-    if !encode_vision || attachments.is_empty() {
-        return MultimodalBuildResult {
-            content: Value::String(text.to_string()),
-            vision_skipped: !attachments.is_empty(),
+    if !encode_vision {
+        return ImageBlocksResult {
+            blocks: Vec::new(),
+            encoded_any: false,
+            skipped_any: attachments
+                .iter()
+                .any(|a| vision.mime_allowed(&a.mime_type)),
         };
     }
 
@@ -99,17 +98,14 @@ fn build_multimodal_content_force(
         .collect();
 
     if image_attachments.is_empty() {
-        return MultimodalBuildResult {
-            content: Value::String(text.to_string()),
-            vision_skipped: !attachments.is_empty(),
+        return ImageBlocksResult {
+            blocks: Vec::new(),
+            encoded_any: false,
+            skipped_any: false,
         };
     }
 
     let mut blocks = Vec::new();
-    if !text.is_empty() {
-        blocks.push(json!({"type": "text", "text": text}));
-    }
-
     let mut encoded_any = false;
     let mut skipped_any = false;
 
@@ -137,16 +133,44 @@ fn build_multimodal_content_force(
         }
     }
 
-    if !encoded_any {
+    ImageBlocksResult {
+        blocks,
+        encoded_any,
+        skipped_any,
+    }
+}
+
+fn build_multimodal_content_force(
+    text: &str,
+    attachments: &[MessageAttachment],
+    encode_vision: bool,
+    vision: &VisionConfig,
+) -> MultimodalBuildResult {
+    let text = text.trim();
+    if !encode_vision || attachments.is_empty() {
+        return MultimodalBuildResult {
+            content: Value::String(text.to_string()),
+            vision_skipped: !attachments.is_empty(),
+        };
+    }
+
+    let image_result = build_image_blocks(attachments, RenderMode::Current, vision);
+    if !image_result.encoded_any {
         return MultimodalBuildResult {
             content: Value::String(text.to_string()),
             vision_skipped: true,
         };
     }
 
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    blocks.extend(image_result.blocks);
+
     MultimodalBuildResult {
         content: Value::Array(blocks),
-        vision_skipped: skipped_any,
+        vision_skipped: image_result.skipped_any,
     }
 }
 
@@ -259,17 +283,11 @@ mod tests {
             },
         ];
 
-        let result = build_multimodal_content(
-            "compare these",
-            &attachments,
-            RenderMode::Current,
-            &vision_config(),
-        );
-        let blocks = result.content.as_array().unwrap();
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["type"], "text");
+        let result = build_image_blocks(&attachments, RenderMode::Current, &vision_config());
+        let blocks = result.blocks;
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "image_url");
         assert_eq!(blocks[1]["type"], "image_url");
-        assert_eq!(blocks[2]["type"], "image_url");
     }
 
     #[test]
@@ -281,16 +299,15 @@ mod tests {
             size_bytes: 1,
             ..Default::default()
         }];
-        let result = build_multimodal_content(
-            "stub text",
+        let result = build_image_blocks(
             &attachments,
             RenderMode::Archived {
                 terminal_state: crate::events::TerminalState::Completed,
             },
             &vision_config(),
         );
-        assert!(result.content.is_string());
-        assert_eq!(result.content.as_str(), Some("stub text"));
+        assert!(!result.encoded_any);
+        assert!(result.blocks.is_empty());
     }
 
     #[test]
@@ -302,9 +319,8 @@ mod tests {
             size_bytes: 1,
             ..Default::default()
         }];
-        let result =
-            build_multimodal_content("hello", &attachments, RenderMode::Current, &vision_config());
-        assert!(result.content.is_string());
-        assert!(result.vision_skipped);
+        let result = build_image_blocks(&attachments, RenderMode::Current, &vision_config());
+        assert!(!result.encoded_any);
+        assert!(result.skipped_any);
     }
 }
