@@ -40,6 +40,48 @@
 #![allow(dead_code)]
 
 use crate::agent::keyword_match;
+use crate::tools::web_fetch::{classify_blocked_host, BlockedHostClass};
+
+// ─── Network policy glue (SSRF) ─────────────────────────────────────────────────
+//
+// ONE source of truth for "what is a blocked host" lives in
+// `web_fetch::classify_blocked_host` / `validate_url_for_ssrf`. This module only
+// adapts that shared decision into a SECRET-SAFE, structured error for the
+// browser tool: the returned message names ONLY the host class — never the URL,
+// path, query, or any embedded credentials. (The classifier never receives the
+// chance to echo caller data: it returns a fixed enum, and we render only its
+// `.label()`.)
+
+/// A request that the private-network policy refuses to allow. Carries only the
+/// host CLASS — by construction it cannot leak the URL or any secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedRequest {
+    pub class: BlockedHostClass,
+}
+
+impl BlockedRequest {
+    /// A user/LLM-facing, secret-free message: only the fixed host-class label.
+    pub fn message(self) -> String {
+        format!("Navigation blocked: target is a {}", self.class.label())
+    }
+}
+
+/// Validate a URL against the shared private-network policy.
+///
+/// Returns `Ok(())` for an allowed public http(s) URL, or `Err(BlockedRequest)`
+/// naming only the host class for anything the shared policy blocks (loopback,
+/// RFC1918/unique-local private ranges, link-local/metadata, IPv4-mapped IPv6,
+/// disallowed schemes, malformed URLs).
+///
+/// This is the single seam every browser code path (tool-initiated navigation,
+/// final-URL revalidation, and — if/when CDP interception lands — per-request
+/// interception) should call, so the policy never diverges between surfaces.
+pub fn validate_network_url(url: &str) -> Result<(), BlockedRequest> {
+    match classify_blocked_host(url) {
+        None => Ok(()),
+        Some(class) => Err(BlockedRequest { class }),
+    }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 

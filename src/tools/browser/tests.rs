@@ -74,11 +74,12 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     assert_eq!(out, "Navigated to https://example.com/");
 
     // Lock down the call ordering: ensure_ready, then create_page (this session's
-    // first action), then goto. The session registry mints a fresh page id, so
+    // first action), then goto, then a url() read for final-committed-URL
+    // revalidation (Task 8). The session registry mints a fresh page id, so
     // assert the create_page record exists and goto follows it.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 3, "expected 3 recorded calls: {calls:?}");
+    assert_eq!(calls.len(), 4, "expected 4 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -88,6 +89,11 @@ async fn dispatch_observation_navigate_routes_through_backend() {
         calls[2],
         MockCall::Goto("https://example.com/".to_string()),
         "navigate must goto after creating the page: {calls:?}"
+    );
+    assert_eq!(
+        calls[3],
+        MockCall::Url,
+        "navigate must read the committed url to revalidate it: {calls:?}"
     );
 }
 
@@ -1460,4 +1466,188 @@ async fn administrative_actions_never_prompt() {
         0,
         "administrative actions must not prompt"
     );
+}
+
+// =============================================================================
+// Task 8 — request-level network policy (SSRF) enforcement
+// =============================================================================
+//
+// These tests pin the two enforcement points that ARE feasible without a real
+// Chrome (and thus testable in CI against the mock backend):
+//
+//   1. The validator is applied to every tool-initiated navigation
+//      (`navigate`, `new_tab`) — already exercised elsewhere but re-asserted
+//      here for the network-policy contract.
+//   2. The FINAL committed page URL is revalidated after `goto` settles, so a
+//      server-side redirect that lands on a blocked host is caught even though
+//      per-request subresource interception is deferred (see module docs in
+//      `web_fetch::classify_blocked_host` and the Task 8 report).
+//
+// Per-request subresource/XHR/WebSocket interception is NOT implemented (see the
+// CDP feasibility finding); these tests deliberately do not claim it.
+
+/// RED→GREEN: a public URL that *redirects* to `127.0.0.1` (modeled by the mock
+/// reporting a loopback committed URL after goto) must be treated as BLOCKED.
+/// The action must NOT report success, and the error must name only the host
+/// CLASS — never the loopback URL or its secret query string.
+#[tokio::test]
+async fn navigate_redirect_to_loopback_is_blocked_on_final_url() {
+    // Public URL passes the pre-flight check, but after goto the page's
+    // committed URL is a loopback address carrying a secret token.
+    let committed = "http://127.0.0.1:8080/admin?token=SUPERSECRET";
+    let (tool, _backend, _rec) = approving_tool(
+        MockBackend::new().with_url(committed),
+        ApprovalResponse::AllowSession,
+    );
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://public-redirector.example/go",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    // Must be reported as blocked, not as a successful navigation.
+    assert!(
+        !out.starts_with("Navigated to"),
+        "a redirect to loopback must not be reported as a successful navigation: {out}"
+    );
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("loopback"),
+        "blocked navigation must name the loopback host class: {out}"
+    );
+    // Secret-safety: neither the loopback URL nor its query/token may leak.
+    assert!(
+        !out.contains("127.0.0.1")
+            && !out.contains("SUPERSECRET")
+            && !out.contains("token")
+            && !out.contains("admin"),
+        "blocked-navigation error must not leak the URL/path/query/credentials: {out}"
+    );
+}
+
+/// A redirect that lands on an ALLOWED public URL still reports success.
+#[tokio::test]
+async fn navigate_redirect_to_public_is_allowed() {
+    let (tool, _backend, _rec) = approving_tool(
+        MockBackend::new().with_url("https://final.example/page"),
+        ApprovalResponse::AllowSession,
+    );
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://start.example/",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.starts_with("Navigated to"),
+        "a redirect to a public host must still succeed: {out}"
+    );
+}
+
+/// The pre-flight validator still blocks a tool-initiated navigation whose URL
+/// is itself a private/link-local target, and names only the host class.
+#[tokio::test]
+async fn navigate_to_metadata_endpoint_is_blocked_preflight() {
+    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+        "metadata endpoint must be blocked with its host class: {out}"
+    );
+    assert!(
+        !out.contains("security-credentials") && !out.contains("meta-data"),
+        "block error must not echo the metadata path: {out}"
+    );
+    // A pre-flight block must never reach the backend.
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.iter().any(|c| matches!(c, MockCall::Goto(_))),
+        "a pre-flight-blocked navigation must never goto: {calls:?}"
+    );
+}
+
+/// `new_tab` with a private URL is blocked pre-flight (host class only).
+#[tokio::test]
+async fn new_tab_to_private_url_is_blocked() {
+    let (tool, _backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "new_tab",
+                "url": "http://10.0.0.5/internal?secret=abc",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("private network"),
+        "new_tab to a private URL must be blocked with its host class: {out}"
+    );
+    assert!(
+        !out.contains("10.0.0.5") && !out.contains("secret"),
+        "new_tab block error must not leak the URL/query: {out}"
+    );
+}
+
+/// DEFERRED — per-request CDP subresource interception.
+///
+/// This stub documents the boundary we DO NOT currently enforce, and is a
+/// placeholder for a future real-Chrome integration test. It is `#[ignore]`d so
+/// it never runs in CI (no real Chrome) and never fakes a pass.
+///
+/// ## Why it's deferred (chromiumoxide 0.8 feasibility finding)
+///
+/// chromiumoxide 0.8 exposes request interception ONLY as a browser-global flag
+/// (`BrowserConfig::enable_request_intercept`, mapped to `config.request_intercept`
+/// and applied at target creation in `handler/target.rs`). There is no
+/// `Page::set_request_interception` and no public per-request continue/abort
+/// callback. When interception is enabled, `NetworkManager::on_fetch_request_paused`
+/// (handler/network.rs:135) deliberately does NOT auto-continue
+/// (`if !user_request_interception_enabled && protocol_..._enabled`), so EVERY
+/// paused request would hang unless an external consumer drains
+/// `Fetch.requestPaused` (forwarded to `event_listener`s via `consume_event!`)
+/// and issues `ContinueRequest`/`FailRequest` itself. That requires a dedicated,
+/// never-failing per-browser pump whose stall would deadlock ALL browser
+/// traffic, and it cannot be exercised by the mock backend. Shipping it would
+/// trade a real, testable boundary (pre-flight + final-URL revalidation) for a
+/// fragile, untestable one — so subresource/XHR/WebSocket interception is
+/// deferred pending a chromiumoxide upgrade or a raw-CDP pump with auto-continue
+/// fallback. See the Task 8 report.
+#[tokio::test]
+#[ignore = "requires real Chrome + CDP Fetch pump; deferred (see doc comment)"]
+async fn deferred_per_request_subresource_interception_stub() {
+    // Intentionally empty: documents the deferred boundary without asserting a
+    // capability we do not have. When implemented, this should drive a real
+    // page whose loaded subresource targets a private IP and assert the
+    // subresource request is failed with BlockedByClient.
 }

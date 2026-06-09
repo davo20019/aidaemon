@@ -419,9 +419,11 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: url".to_string())?;
 
-        // Block navigation to internal/private IPs (SSRF protection)
-        if let Err(reason) = crate::tools::web_fetch::validate_url_for_ssrf(url) {
-            return Err(format!("Navigation blocked: {}", reason));
+        // Pre-flight SSRF check on the requested URL. The error names ONLY the
+        // host class (loopback/private/link-local) — never the URL, path,
+        // query, or credentials — via the shared policy seam.
+        if let Err(blocked) = policy::validate_network_url(url) {
+            return Err(blocked.message());
         }
 
         let (page, _guard) = self.page_for(session_id).await?;
@@ -430,6 +432,26 @@ impl BrowserTool {
 
         // Wait briefly for page load
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Revalidate the FINAL committed URL. A server-side redirect can land on
+        // a blocked host (e.g. a public redirector → http://127.0.0.1/...) even
+        // though the requested URL was public and per-request subresource
+        // interception is deferred (see the Task 8 report / CDP feasibility
+        // note). If the committed URL is blocked, treat the navigation as
+        // blocked and surface ONLY the host class — never the committed URL,
+        // which may carry a path/query/token.
+        if let Some(final_url) = page.url().await {
+            if let Err(blocked) = policy::validate_network_url(&final_url) {
+                warn!(
+                    class = blocked.class.label(),
+                    "navigation landed on a blocked host after redirect; blocking"
+                );
+                return Err(format!(
+                    "Navigation blocked: redirected to a {}",
+                    blocked.class.label()
+                ));
+            }
+        }
 
         Ok(format!("Navigated to {}", url))
     }
@@ -717,8 +739,9 @@ impl BrowserTool {
 
         let url = args.get("url").and_then(|v| v.as_str());
         if let Some(url) = url {
-            if let Err(reason) = crate::tools::web_fetch::validate_url_for_ssrf(url) {
-                return Err(format!("Navigation blocked: {}", reason));
+            // Pre-flight SSRF check (host class only — no URL/secret leak).
+            if let Err(blocked) = policy::validate_network_url(url) {
+                return Err(blocked.message());
             }
         }
 
@@ -728,6 +751,24 @@ impl BrowserTool {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
         let current_url = page.url().await;
+
+        // Revalidate the new tab's FINAL committed URL the same way navigate
+        // does, so a redirect to a blocked host can't leave a live tab pointed
+        // at an internal address. Close the tab and report the host class only.
+        if let Some(ref final_url) = current_url {
+            if let Err(blocked) = policy::validate_network_url(final_url) {
+                warn!(
+                    class = blocked.class.label(),
+                    "new tab landed on a blocked host after redirect; closing"
+                );
+                // Best-effort backend cleanup — the tab was never registered.
+                let _ = self.backend.close_target(&target_id).await;
+                return Err(format!(
+                    "Navigation blocked: redirected to a {}",
+                    blocked.class.label()
+                ));
+            }
+        }
 
         let tab_id = self
             .sessions

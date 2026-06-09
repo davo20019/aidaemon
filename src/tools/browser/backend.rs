@@ -64,6 +64,20 @@ pub trait PageHandle: Send + Sync {
     async fn screenshot(&self, selector: Option<&str>) -> Result<Vec<u8>, String>;
 
     /// Current page URL, if available.
+    ///
+    /// The action layer (`action_navigate`/`action_new_tab`) calls this AFTER a
+    /// `goto` settles and revalidates the committed URL against the shared
+    /// private-network policy (`policy::validate_network_url`). This catches
+    /// server-side redirects to a blocked host (e.g. a public redirector landing
+    /// on `http://127.0.0.1/...`).
+    ///
+    /// NOTE (deferred): this is NOT per-request subresource interception. Frame,
+    /// script, XHR/fetch, WebSocket, and form-POST requests issued by the page
+    /// are NOT individually validated, because chromiumoxide 0.8 offers no
+    /// per-request continue/abort seam without a fragile browser-global Fetch
+    /// pump (see the `#[ignore]`d `deferred_per_request_subresource_interception_stub`
+    /// test for the full feasibility finding). Enforcement today is: validated
+    /// tool-initiated navigations + final-committed-URL revalidation.
     async fn url(&self) -> Option<String>;
 
     /// Replace the entire content of the element matching `selector` with
