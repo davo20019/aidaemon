@@ -175,6 +175,188 @@ mod tests {
     }
 }
 
+async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
+    use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{format_eval_task_report, EvalTaskRow};
+
+    let row = sqlx::query(
+        r#"
+        SELECT session_id, created_at, data
+        FROM events
+        WHERE event_type = 'task_end' AND task_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?
+    .with_context(|| format!("no TaskEnd found for task_id={task_id}"))?;
+
+    let session_id: String = row.get("session_id");
+    let created_at: String = row.get("created_at");
+    let data_json: String = row.get("data");
+    let task_end: TaskEndData = serde_json::from_str(&data_json).context("parse TaskEnd JSON")?;
+    let eval = task_end
+        .harness_eval
+        .clone()
+        .context("TaskEnd has no harness_eval snapshot (enable [diagnostics.harness_eval])")?;
+
+    let report = format_eval_task_report(&EvalTaskRow {
+        task_id: task_id.to_string(),
+        session_id,
+        created_at,
+        task_end,
+        eval,
+    });
+    println!("{report}");
+    Ok(())
+}
+
+async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> anyhow::Result<()> {
+    use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{aggregate_summary, format_eval_summary_row, EvalTaskRow};
+
+    let rows = sqlx::query(
+        r#"
+        SELECT session_id, task_id, created_at, data
+        FROM events
+        WHERE event_type = 'task_end'
+          AND created_at >= datetime('now', printf('-%d hours', ?))
+          AND json_extract(data, '$.harness_eval') IS NOT NULL
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(hours)
+    .fetch_all(pool)
+    .await?;
+
+    let mut eval_rows = Vec::new();
+    for row in rows {
+        let data_json: String = row.get("data");
+        let Ok(task_end) = serde_json::from_str::<TaskEndData>(&data_json) else {
+            continue;
+        };
+        let Some(eval) = task_end.harness_eval.clone() else {
+            continue;
+        };
+        if root_only && eval.depth > 0 {
+            continue;
+        }
+        if root_only && eval.parent_task_id.is_some() {
+            continue;
+        }
+        eval_rows.push(EvalTaskRow {
+            task_id: row.get("task_id"),
+            session_id: row.get("session_id"),
+            created_at: row.get("created_at"),
+            task_end,
+            eval,
+        });
+    }
+
+    let stats = aggregate_summary(&eval_rows);
+    println!("{}", format_eval_summary_row(&stats, hours, root_only));
+    Ok(())
+}
+
+async fn record_fixture_from_session(
+    pool: &SqlitePool,
+    session_id: &str,
+    task_id: Option<&str>,
+    output: Option<&str>,
+    include_text: bool,
+) -> anyhow::Result<()> {
+    use aidaemon::{EventType, TaskEndData, ToolCallData, UserMessageData};
+    use aidaemon::harness_eval::fixture::{build_recorded_fixture, fixtures_dir};
+
+    let rows = if let Some(task_id) = task_id {
+        sqlx::query(
+            r#"
+            SELECT event_type, task_id, tool_name, data, created_at
+            FROM events
+            WHERE session_id = ? AND task_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT event_type, task_id, tool_name, data, created_at
+            FROM events
+            WHERE session_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut task_end: Option<TaskEndData> = None;
+    let mut resolved_task_id = task_id.map(str::to_string);
+    let mut user_text = String::new();
+    let mut tool_names = Vec::new();
+
+    for row in &rows {
+        let event_type: String = row.get("event_type");
+        let data_json: String = row.get("data");
+        if event_type == EventType::TaskEnd.as_str() {
+            if let Ok(end) = serde_json::from_str::<TaskEndData>(&data_json) {
+                if end.harness_eval.is_some() {
+                    resolved_task_id = Some(end.task_id.clone());
+                    task_end = Some(end);
+                }
+            }
+        } else if event_type == EventType::UserMessage.as_str() && user_text.is_empty() {
+            if let Ok(msg) = serde_json::from_str::<UserMessageData>(&data_json) {
+                user_text = msg.content;
+            }
+        } else if event_type == EventType::ToolCall.as_str() {
+            if let Ok(data) = serde_json::from_str::<ToolCallData>(&data_json) {
+                tool_names.push(data.name);
+            }
+        }
+    }
+
+    let task_end = task_end.context("no TaskEnd with harness_eval found for session/task")?;
+    let eval = task_end
+        .harness_eval
+        .as_ref()
+        .context("TaskEnd missing harness_eval")?;
+    let task_id = resolved_task_id.context("could not resolve task_id")?;
+    if user_text.is_empty() {
+        user_text = task_end
+            .summary
+            .clone()
+            .unwrap_or_else(|| "(unknown user text)".to_string());
+    }
+
+    let name = task_id.chars().take(32).collect::<String>();
+    let mut fixture =
+        build_recorded_fixture(&name, session_id, &user_text, eval, &task_end, &tool_names);
+    if include_text {
+        if let Some(summary) = task_end.summary.as_ref() {
+            fixture.expect.response_contains = vec![summary.chars().take(40).collect()];
+        }
+    }
+
+    let output_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fixtures_dir().join(format!("{name}.yaml")));
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let yaml = serde_yaml::to_string(&fixture)?;
+    std::fs::write(&output_path, yaml)?;
+    println!("Recorded fixture -> {}", output_path.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -221,6 +403,28 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or(7)
         .clamp(1, 720);
+    let eval_task = args
+        .windows(2)
+        .find(|w| w[0] == "--eval-task")
+        .map(|w| w[1].clone());
+    let eval_summary = args.iter().any(|arg| arg == "--eval-summary");
+    let eval_hours = args
+        .windows(2)
+        .find(|w| w[0] == "--eval-hours")
+        .map(|w| w[1].parse::<i64>())
+        .transpose()?
+        .unwrap_or(24)
+        .clamp(1, 720);
+    let eval_include_subagents = args.iter().any(|arg| arg == "--eval-include-subagents");
+    let record_fixture_session = args
+        .windows(2)
+        .find(|w| w[0] == "--record-fixture")
+        .map(|w| w[1].clone());
+    let record_fixture_output = args
+        .windows(2)
+        .find(|w| w[0] == "--output")
+        .map(|w| w[1].clone());
+    let record_fixture_include_text = args.iter().any(|arg| arg == "--include-text");
 
     let env_path = resolve_runtime_env_file_path(&runtime_working_dir());
     if env_path.exists() {
@@ -240,6 +444,26 @@ async fn main() -> anyhow::Result<()> {
         .pragma("journal_mode", "WAL");
 
     let pool = SqlitePool::connect_with(opts).await?;
+
+    if let Some(task_id) = eval_task.as_deref() {
+        print_eval_task(&pool, task_id).await?;
+        return Ok(());
+    }
+    if eval_summary {
+        print_eval_summary(&pool, eval_hours, !eval_include_subagents).await?;
+        return Ok(());
+    }
+    if let Some(session_id) = record_fixture_session.as_deref() {
+        record_fixture_from_session(
+            &pool,
+            session_id,
+            task_filter.as_deref(),
+            record_fixture_output.as_deref(),
+            record_fixture_include_text,
+        )
+        .await?;
+        return Ok(());
+    }
 
     if let Some(needle) = msg_search.as_ref() {
         println!("== Message Search ==");

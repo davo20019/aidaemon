@@ -1,0 +1,11 @@
+name: complex_goal_routing
+description: Multi-step request enters orchestrator loop (may fall through to LLM)
+session_id: eval_complex_01
+user_text: Refactor the auth module, add tests, and deploy to staging
+orchestrator: true
+mock_responses:
+  - text: I'll break this into steps and start with inspection.
+expect:
+  llm_calls_min: 1
+  outcome: succeeded
+  overall_min: 0.4

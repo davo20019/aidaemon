@@ -10,7 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Vision / image understanding**: user-uploaded images from Telegram, Slack, and Discord are lazily base64-encoded for the current turn and sent to vision-capable LLM providers (OpenAI-compatible passthrough, Anthropic/Gemini mappers). Structured `MessageAttachment` metadata is persisted alongside the existing `[File received: ...]` text stub. Configurable via `[files] vision_enabled`, `max_vision_image_mb`, and `vision_mime_types`. Graceful fallback to text-only when vision is disabled, files are missing, or the provider rejects image payloads.
+- **Browser screenshot vision**: browser `screenshot` actions save PNGs to the shared inbox and attach them to tool results so the LLM always receives pixels (synthetic user observation message at render time). Tool-origin images stay vision-eligible in archived turns for follow-up questions; user uploads remain current-turn-only.
 - **Harness eval instrumentation (Phase A)**: per-task effectiveness snapshot on `TaskEnd` (`HarnessEvalSnapshot`) scoring routing accuracy, progress yield, contract fulfillment, and tier-weighted cost efficiency. Configurable via `[diagnostics.harness_eval]`; sub-agent metrics roll up into the parent task at spawn complete.
+- **Harness eval offline suite (Phase B)**: YAML fixtures in `tests/harness_eval/fixtures/` with `cargo test --lib harness_eval` regression runner (`src/harness_eval/`).
+- **Harness eval analysis tooling (Phase C)**: `db_probe --eval-task`, `--eval-summary`, `--record-fixture`; `diagnose` action includes Harness Effectiveness section when snapshot present.
 
 ## [0.11.0] - 2026-06-08
 

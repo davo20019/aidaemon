@@ -11,9 +11,10 @@ mod dashboard;
 mod db;
 #[allow(dead_code)]
 mod events;
+pub use events::{EventType, TaskEndData, ToolCallData, UserMessageData};
 mod execution_policy;
 mod goal_tokens;
-#[allow(dead_code)]
+pub mod harness_eval;
 mod health;
 mod heartbeat;
 mod llm_markers;

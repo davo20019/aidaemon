@@ -1,0 +1,11 @@
+name: schedule_direct_return
+description: Scheduled intent should direct-return before first LLM call
+session_id: eval_schedule_01
+user_text: Check deployment tomorrow at 9am
+orchestrator: true
+expect:
+  llm_calls_max: 0
+  tool_calls_max: 0
+  outcome: succeeded
+  response_contains:
+    - confirm

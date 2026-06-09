@@ -1,0 +1,15 @@
+name: mock_tool_then_reply
+description: Tool loop with mocked system_info matches structural expectations
+session_id: eval_tool_mock_01
+user_text: What is my system info?
+orchestrator: true
+mock_responses:
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - text: Here is your system information.
+expect:
+  tools_used:
+    - system_info
+  llm_calls_min: 1
+  outcome: succeeded

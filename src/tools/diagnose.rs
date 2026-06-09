@@ -1613,7 +1613,21 @@ Rules: no invented event IDs; confidence 0..1.",
             &recovery_section,
         );
         let llm_section = self.build_llm_telemetry_section(&resolved_task).await;
-        Ok(format!("{diagnosis}{llm_section}"))
+        let harness_section = events
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if event.event_type != EventType::TaskEnd {
+                    return None;
+                }
+                event
+                    .parse_data::<TaskEndData>()
+                    .ok()
+                    .and_then(|data| data.harness_eval)
+            })
+            .map(|eval| crate::harness_eval::report::format_diagnose_harness_section(&eval))
+            .unwrap_or_default();
+        Ok(format!("{diagnosis}{harness_section}{llm_section}"))
     }
 
     /// Render a compact `LlmCall` telemetry block for a task: latency
@@ -2786,6 +2800,7 @@ mod tests {
                 task_id: Some("t1".to_string()),
                 annotations: Vec::new(),
                 turn_id: None,
+                attachments: Vec::new(),
             },
             Some("t1"),
         )
