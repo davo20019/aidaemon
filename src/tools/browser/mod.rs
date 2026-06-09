@@ -12,14 +12,20 @@ use crate::traits::{
 use crate::types::{MediaKind, MediaMessage};
 
 mod backend;
+mod session;
 #[cfg(test)]
 mod tests;
 
-use backend::{BrowserBackend, ChromiumoxideBackend};
+use backend::{BrowserBackend, ChromiumoxideBackend, PageHandle};
+use session::BrowserSessionRegistry;
+
+use tokio::sync::OwnedMutexGuard;
 
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
     media_tx: mpsc::Sender<MediaMessage>,
+    /// Per-session page state, keyed by trusted internal `_session_id`.
+    sessions: BrowserSessionRegistry,
 }
 
 impl BrowserTool {
@@ -27,6 +33,7 @@ impl BrowserTool {
         Self {
             backend: Arc::new(ChromiumoxideBackend::new(config)),
             media_tx,
+            sessions: BrowserSessionRegistry::new(),
         }
     }
 
@@ -36,10 +43,40 @@ impl BrowserTool {
         backend: Arc<dyn BrowserBackend>,
         media_tx: mpsc::Sender<MediaMessage>,
     ) -> Self {
-        Self { backend, media_tx }
+        Self {
+            backend,
+            media_tx,
+            sessions: BrowserSessionRegistry::new(),
+        }
     }
 
-    async fn action_navigate(&self, args: &Value) -> Result<String, String> {
+    /// Resolve this session's page and acquire its action lock, held for the
+    /// WHOLE action via the returned owned guard.
+    ///
+    /// The flow is: `ensure_ready()` (global browser launch) → resolve/create
+    /// the session's page via the registry → take the per-session action lock.
+    /// The action lock serializes a single session's own calls while letting
+    /// DIFFERENT sessions proceed concurrently — it is NOT the global browser
+    /// mutex, so distinct sessions do not serialize on each other.
+    async fn page_for(
+        &self,
+        session_id: &str,
+    ) -> Result<(Arc<dyn PageHandle>, OwnedMutexGuard<()>), String> {
+        // Reject empty session id BEFORE launching the browser.
+        if session_id.is_empty() {
+            return Err("browser actions require a session id".to_string());
+        }
+
+        self.backend.ensure_ready().await?;
+        let (page, action_lock) = self
+            .sessions
+            .get_or_create_page(session_id, &*self.backend)
+            .await?;
+        let guard = action_lock.lock_owned().await;
+        Ok((page, guard))
+    }
+
+    async fn action_navigate(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -50,8 +87,7 @@ impl BrowserTool {
             return Err(format!("Navigation blocked: {}", reason));
         }
 
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         page.goto(url).await?;
 
@@ -62,8 +98,7 @@ impl BrowserTool {
     }
 
     async fn action_screenshot(&self, args: &Value, session_id: &str) -> Result<String, String> {
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         let selector = args.get("selector").and_then(|v| v.as_str());
         let png_bytes = page.screenshot(selector).await?;
@@ -87,14 +122,13 @@ impl BrowserTool {
         Ok(format!("Screenshot taken and sent to chat. {}", caption))
     }
 
-    async fn action_click(&self, args: &Value) -> Result<String, String> {
+    async fn action_click(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let selector = args
             .get("selector")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: selector".to_string())?;
 
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         page.click(selector).await?;
 
@@ -104,7 +138,7 @@ impl BrowserTool {
         Ok(format!("Clicked element '{}'", selector))
     }
 
-    async fn action_fill(&self, args: &Value) -> Result<String, String> {
+    async fn action_fill(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let selector = args
             .get("selector")
             .and_then(|v| v.as_str())
@@ -114,8 +148,7 @@ impl BrowserTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: value".to_string())?;
 
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         page.replace_text(selector, value).await?;
 
@@ -129,9 +162,8 @@ impl BrowserTool {
         Ok(format!("Filled '{}'", selector))
     }
 
-    async fn action_get_text(&self, args: &Value) -> Result<String, String> {
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+    async fn action_get_text(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        let (page, _guard) = self.page_for(session_id).await?;
 
         let text = if let Some(selector) = args.get("selector").and_then(|v| v.as_str()) {
             page.inner_text(selector).await?
@@ -145,14 +177,13 @@ impl BrowserTool {
         Ok(text)
     }
 
-    async fn action_execute_js(&self, args: &Value) -> Result<String, String> {
+    async fn action_execute_js(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let script = args
             .get("script")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: script".to_string())?;
 
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         let result = page.evaluate(script).await?;
 
@@ -166,7 +197,7 @@ impl BrowserTool {
         Ok(value_str)
     }
 
-    async fn action_wait(&self, args: &Value) -> Result<String, String> {
+    async fn action_wait(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let selector = args
             .get("selector")
             .and_then(|v| v.as_str())
@@ -176,8 +207,7 @@ impl BrowserTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(10);
 
-        self.backend.ensure_ready().await?;
-        let page = self.backend.current_page().await?;
+        let (page, _guard) = self.page_for(session_id).await?;
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
 
@@ -284,13 +314,13 @@ impl Tool for BrowserTool {
             .unwrap_or("");
 
         let result = match action {
-            "navigate" => self.action_navigate(&args).await,
+            "navigate" => self.action_navigate(&args, session_id).await,
             "screenshot" => self.action_screenshot(&args, session_id).await,
-            "click" => self.action_click(&args).await,
-            "fill" => self.action_fill(&args).await,
-            "get_text" => self.action_get_text(&args).await,
-            "execute_js" => self.action_execute_js(&args).await,
-            "wait" => self.action_wait(&args).await,
+            "click" => self.action_click(&args, session_id).await,
+            "fill" => self.action_fill(&args, session_id).await,
+            "get_text" => self.action_get_text(&args, session_id).await,
+            "execute_js" => self.action_execute_js(&args, session_id).await,
+            "wait" => self.action_wait(&args, session_id).await,
             "set_mode" => self.action_set_mode(&args).await,
             "close" => self.action_close().await,
             _ => Err(format!(

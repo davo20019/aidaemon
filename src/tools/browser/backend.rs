@@ -79,8 +79,12 @@ pub trait BrowserBackend: Send + Sync {
     /// Ensure a browser is launched or connected and ready for use.
     async fn ensure_ready(&self) -> Result<(), String>;
 
-    /// Get the current page (or create an `about:blank` page if none exists).
-    async fn current_page(&self) -> Result<Arc<dyn PageHandle>, String>;
+    /// Create a NEW page/tab and return its `(target_id, handle)`.
+    ///
+    /// Unlike the old `current_page()` (which grabbed the first existing tab and
+    /// thus shared one page across all sessions), this always creates a distinct
+    /// page so the session registry can give each `_session_id` its own tab.
+    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String>;
 
     /// Close the browser session. Returns a user-facing status message
     /// describing what happened (disconnected vs. closed vs. no-op).
@@ -163,26 +167,23 @@ impl ChromiumoxideBackend {
         }
     }
 
-    async fn get_page(&self) -> Result<Arc<chromiumoxide::Page>, String> {
+    /// Create a fresh `about:blank` page and return its target id + handle.
+    ///
+    /// The global browser mutex is held only long enough to issue `new_page`;
+    /// the returned handle owns its own `Arc<Page>`, so the action that follows
+    /// runs without holding this mutex.
+    async fn new_blank_page(&self) -> Result<(String, Arc<chromiumoxide::Page>), String> {
         let guard = self.browser.lock().await;
         let browser = guard
             .as_ref()
             .ok_or_else(|| "Browser not initialized".to_string())?;
 
-        let pages = browser
-            .pages()
+        let page = browser
+            .new_page("about:blank")
             .await
-            .map_err(|e| format!("Failed to get pages: {}", e))?;
-
-        if let Some(page) = pages.into_iter().next() {
-            Ok(Arc::new(page))
-        } else {
-            let page = browser
-                .new_page("about:blank")
-                .await
-                .map_err(|e| format!("Failed to create new page: {}", e))?;
-            Ok(Arc::new(page))
-        }
+            .map_err(|e| format!("Failed to create new page: {}", e))?;
+        let target_id = page.target_id().as_ref().to_string();
+        Ok((target_id, Arc::new(page)))
     }
 }
 
@@ -286,9 +287,9 @@ impl BrowserBackend for ChromiumoxideBackend {
         Ok(())
     }
 
-    async fn current_page(&self) -> Result<Arc<dyn PageHandle>, String> {
-        let page = self.get_page().await?;
-        Ok(Arc::new(ChromiumoxidePage { page }))
+    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String> {
+        let (target_id, page) = self.new_blank_page().await?;
+        Ok((target_id, Arc::new(ChromiumoxidePage { page })))
     }
 
     async fn close(&self) -> Result<String, String> {
@@ -550,7 +551,10 @@ impl PageHandle for ChromiumoxidePage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockCall {
     EnsureReady,
-    CurrentPage,
+    /// Recorded each time the backend creates a new per-session page. Carries the
+    /// synthetic target id handed back, so tests can assert two sessions caused
+    /// two distinct pages.
+    CreatePage(String),
     Close,
     SetHeadlessMode(bool),
     Goto(String),
@@ -580,6 +584,9 @@ pub struct MockBackend {
     /// URL returned by `url`.
     url: Option<String>,
     connected: AtomicBool,
+    /// Monotonic counter behind a Mutex, used to mint a fresh synthetic page id
+    /// for each `create_page` call (so distinct sessions get distinct ids).
+    next_page_id: Mutex<u64>,
 }
 
 #[cfg(test)]
@@ -592,6 +599,7 @@ impl Default for MockBackend {
             screenshot_bytes: vec![0x89, 0x50, 0x4e, 0x47],
             url: Some("https://mock.example/".to_string()),
             connected: AtomicBool::new(false),
+            next_page_id: Mutex::new(0),
         }
     }
 }
@@ -627,6 +635,10 @@ impl MockBackend {
 
 #[cfg(test)]
 struct MockPage {
+    /// Synthetic page/target id this handle was created with. Lets tests tie a
+    /// recorded action back to the specific per-session page it ran on.
+    #[allow(dead_code)]
+    page_id: String,
     calls: Arc<Mutex<Vec<MockCall>>>,
     eval_result: Option<serde_json::Value>,
     text_result: String,
@@ -711,15 +723,24 @@ impl BrowserBackend for MockBackend {
         Ok(())
     }
 
-    async fn current_page(&self) -> Result<Arc<dyn PageHandle>, String> {
-        self.record(MockCall::CurrentPage).await;
-        Ok(Arc::new(MockPage {
-            calls: Arc::clone(&self.calls),
-            eval_result: self.eval_result.clone(),
-            text_result: self.text_result.clone(),
-            screenshot_bytes: self.screenshot_bytes.clone(),
-            url: self.url.clone(),
-        }))
+    async fn create_page(&self) -> Result<(String, Arc<dyn PageHandle>), String> {
+        let page_id = {
+            let mut counter = self.next_page_id.lock().await;
+            *counter += 1;
+            format!("mock-page-{}", *counter)
+        };
+        self.record(MockCall::CreatePage(page_id.clone())).await;
+        Ok((
+            page_id.clone(),
+            Arc::new(MockPage {
+                page_id,
+                calls: Arc::clone(&self.calls),
+                eval_result: self.eval_result.clone(),
+                text_result: self.text_result.clone(),
+                screenshot_bytes: self.screenshot_bytes.clone(),
+                url: self.url.clone(),
+            }),
+        ))
     }
 
     async fn close(&self) -> Result<String, String> {
