@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::channels::ChannelHub;
-use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig};
+use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig};
 use crate::events::EventStore;
 use crate::goal_tokens::GoalTokenRegistry;
 use crate::llm_runtime::SharedLlmRuntime;
@@ -58,6 +58,7 @@ impl Agent {
         inherited_project_scope: Option<String>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         interactive_slot: Option<u32>,
+        vision_config: VisionConfig,
     ) -> Self {
         init_policy_tunables_once(policy_config.uncertainty_clarify_threshold);
         let fallback = if let Some(router) = llm_runtime.router() {
@@ -145,6 +146,7 @@ impl Agent {
             turn_anchors: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             interactive_slot,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            vision_config,
         }
     }
 
@@ -154,6 +156,11 @@ impl Agent {
     pub fn set_test_executor_mode(&mut self) {
         self.depth = 1;
         self.role = AgentRole::Executor;
+    }
+
+    #[cfg(test)]
+    pub fn set_test_vision_config(&mut self, vision: VisionConfig) {
+        self.vision_config = vision;
     }
 
     /// Reset agent to orchestrator mode (depth=0) for integration tests.
@@ -256,6 +263,7 @@ impl Agent {
         inherited_project_scope: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
+        vision_config: VisionConfig,
     ) -> Self {
         let fallback = llm_runtime
             .router()
@@ -316,6 +324,7 @@ impl Agent {
             // main generation loop does. They default to the background slot.
             interactive_slot: None,
             session_core_profile_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            vision_config,
         }
     }
 }

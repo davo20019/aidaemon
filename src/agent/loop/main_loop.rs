@@ -137,6 +137,7 @@ impl Agent {
         &self,
         session_id: &str,
         user_text: &str,
+        attachments: &[crate::traits::MessageAttachment],
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         user_role: UserRole,
         channel_ctx: ChannelContext,
@@ -151,6 +152,7 @@ impl Agent {
             &BootstrapCtx {
                 session_id,
                 user_text,
+                attachments,
                 status_tx: status_tx.clone(),
                 user_role,
                 channel_ctx: &channel_ctx,
@@ -1086,6 +1088,7 @@ impl Agent {
                     session_id,
                     iteration,
                     user_text: &llm_user_text,
+                    current_attachments: attachments,
                     completed_tool_calls: &learning_ctx.tool_calls,
                     model: &model,
                     core_prompt: &core_prompt_bytes,

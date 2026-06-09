@@ -1,10 +1,15 @@
 use super::*;
+use crate::agent::turn_render::RenderMode;
+use crate::agent::vision::{build_multimodal_content, user_message_content_matches};
 use crate::execution_policy::PolicyBundle;
+use crate::traits::MessageAttachment;
 
 pub(super) struct MessageBuildCtx<'a> {
     pub session_id: &'a str,
     pub iteration: usize,
     pub user_text: &'a str,
+    /// Attachments for the current user turn (images saved to inbox).
+    pub current_attachments: &'a [MessageAttachment],
     pub completed_tool_calls: &'a [String],
     pub model: &'a str,
     /// Pillar A: message-zero bytes (session-static CORE prompt). Byte-stable
@@ -61,11 +66,33 @@ fn truncate_parent_for_empty_retry(content: &str) -> String {
     out
 }
 
+fn is_current_user_message(message: &Value, user_text: &str) -> bool {
+    message.get("role").and_then(|r| r.as_str()) == Some("user")
+        && message
+            .get("content")
+            .is_some_and(|content| user_message_content_matches(content, user_text))
+}
+
+fn find_current_user_position(messages: &[Value], user_text: &str) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|m| is_current_user_message(m, user_text))
+}
+
+fn current_turn_user_attachments(
+    turn: &crate::events::FetchedTurn,
+    user_text: &str,
+) -> Vec<MessageAttachment> {
+    turn.messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .find(|m| m.content.as_deref() == Some(user_text))
+        .map(|m| m.attachments.clone())
+        .unwrap_or_default()
+}
+
 fn build_empty_response_retry_messages(existing: &[Value], user_text: &str) -> Vec<Value> {
-    let current_idx = existing.iter().rposition(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-    });
+    let current_idx = find_current_user_position(existing, user_text);
     let search_end = current_idx.unwrap_or(existing.len());
 
     let prev_assistant = existing
@@ -187,6 +214,7 @@ pub(super) async fn run_message_build_phase(
     let session_id = ctx.session_id;
     let iteration = ctx.iteration;
     let user_text = ctx.user_text;
+    let current_attachments = ctx.current_attachments;
     let completed_tool_calls = ctx.completed_tool_calls;
     let model = ctx.model;
     let core_prompt = ctx.core_prompt;
@@ -196,6 +224,7 @@ pub(super) async fn run_message_build_phase(
     let pending_system_messages = &mut *ctx.pending_system_messages;
     let empty_response_retry_pending = ctx.empty_response_retry_pending;
     let status_tx = ctx.status_tx;
+    let render_options = agent.render_options();
 
     let total_context_budget =
         crate::memory::context_window::model_context_budget(model, &agent.context_window_config);
@@ -289,6 +318,7 @@ pub(super) async fn run_message_build_phase(
                         &turn.messages,
                         super::turn_render::RenderMode::Archived { terminal_state },
                         super::turn_render::RENDERER_VERSION,
+                        &render_options,
                     );
                     let est = crate::memory::context_window::estimate_tokens(
                         &serde_json::to_string(&rendered).unwrap_or_default(),
@@ -360,6 +390,7 @@ pub(super) async fn run_message_build_phase(
             created_at: chrono::Utc::now(),
             importance: 1.0,
             turn_id: synthetic_turn_id.clone(),
+            attachments: current_attachments.to_vec(),
             ..Message::runtime_defaults()
         };
         turns.push(crate::events::FetchedTurn {
@@ -417,6 +448,7 @@ pub(super) async fn run_message_build_phase(
                     &turn.messages,
                     super::turn_render::RenderMode::Archived { terminal_state },
                     super::turn_render::RENDERER_VERSION,
+                    &render_options,
                 )
             };
             let (bytes, hit, reason) = super::turn_render_cache::render_cache_decision(
@@ -436,6 +468,7 @@ pub(super) async fn run_message_build_phase(
                     &turn.messages,
                     super::turn_render::RenderMode::Archived { terminal_state },
                     super::turn_render::RENDERER_VERSION,
+                    &render_options,
                 );
                 assert_eq!(
                     fresh, bytes,
@@ -550,6 +583,7 @@ pub(super) async fn run_message_build_phase(
         &current_turn.messages,
         super::turn_render::RenderMode::Current,
         super::turn_render::RENDERER_VERSION,
+        &render_options,
     );
 
     // Step 6 (assembly, part 1): archived turns first, then the current turn.
@@ -595,13 +629,27 @@ pub(super) async fn run_message_build_phase(
     {
         let has_current_user_msg = messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
-                && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+                && m.get("content").is_some_and(|content| {
+                    crate::agent::vision::user_message_content_matches(content, user_text)
+                })
         });
 
         if !has_current_user_msg {
+            let turn_attachments = current_turn_user_attachments(&current_turn, user_text);
+            let attachments: &[MessageAttachment] = if !turn_attachments.is_empty() {
+                &turn_attachments
+            } else {
+                current_attachments
+            };
+            let build = build_multimodal_content(
+                user_text,
+                attachments,
+                RenderMode::Current,
+                &render_options.vision,
+            );
             messages.push(json!({
                 "role": "user",
-                "content": user_text,
+                "content": build.content,
             }));
         }
     }
@@ -630,7 +678,9 @@ pub(super) async fn run_message_build_phase(
                 .copied()
                 .rev()
                 .find(|&pos| {
-                    messages[pos].get("content").and_then(|c| c.as_str()) == Some(user_text)
+                    messages[pos].get("content").is_some_and(|content| {
+                        crate::agent::vision::user_message_content_matches(content, user_text)
+                    })
                 })
                 .or_else(|| user_positions.last().copied());
 
@@ -689,10 +739,7 @@ pub(super) async fn run_message_build_phase(
     // chain. Such stray user messages confuse the model into responding to them
     // instead of the current task. Remove them.
     {
-        let current_task_pos = messages.iter().rposition(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("user")
-                && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-        });
+        let current_task_pos = find_current_user_position(&messages, user_text);
         if let Some(task_pos) = current_task_pos {
             // Find the end of the current task's tool chain (last assistant/tool after task_pos)
             let chain_end = messages
@@ -788,13 +835,8 @@ pub(super) async fn run_message_build_phase(
         // Locate the current-turn region: from the current user message (last
         // occurrence matching `user_text`) to the end of `messages`. Archived
         // turns precede it and are left untouched.
-        let current_region_idx = messages
-            .iter()
-            .rposition(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-            })
-            .unwrap_or(0);
+        let current_region_idx =
+            find_current_user_position(&messages, user_text).unwrap_or(0);
         let archived_prefix: Vec<Value> = messages[..current_region_idx].to_vec();
         let current_region: Vec<Value> = messages[current_region_idx..].to_vec();
         // The archived prefix already consumed `archived_budget`; the current
@@ -874,13 +916,8 @@ pub(super) async fn run_message_build_phase(
     // This insertion happens BEFORE message zero is inserted, so the boundary is
     // located against the current `messages` (no leading system prompt yet).
     if !task_context_tail.is_empty() {
-        let tail_insert_pos = messages
-            .iter()
-            .rposition(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-            })
-            .unwrap_or(messages.len());
+        let tail_insert_pos =
+            find_current_user_position(&messages, user_text).unwrap_or(messages.len());
         messages.insert(
             tail_insert_pos,
             json!({
@@ -955,7 +992,9 @@ pub(super) async fn run_message_build_phase(
         if non_system_non_user_count == 0 {
             messages.retain(|m| {
                 m.get("role").and_then(|r| r.as_str()) != Some("user")
-                    || m.get("content").and_then(|c| c.as_str()) == Some(user_text)
+                    || m.get("content").is_some_and(|content| {
+                        user_message_content_matches(content, user_text)
+                    })
             });
             pending_system_messages.push(SystemDirective::FreshConversationContext);
         }
@@ -1342,6 +1381,7 @@ mod tests {
             session_id: "test-session",
             iteration: 2,
             user_text: "Find the system details and summarize them.",
+            current_attachments: &[],
             completed_tool_calls: &completed_tool_calls,
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
@@ -1409,6 +1449,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "Inspect the repository.",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: system_prompt,
@@ -1431,6 +1472,7 @@ mod tests {
             session_id: "test-session",
             iteration: 2,
             user_text: "Inspect the repository.",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: system_prompt,
@@ -1526,6 +1568,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "Fresh question now",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
@@ -1600,6 +1643,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "Current question",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
@@ -1713,6 +1757,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "List all available tools.",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "gemma-4-26b",
             core_prompt: "You are a helpful test assistant.",
@@ -1839,6 +1884,7 @@ mod tests {
             session_id: "test-session",
             iteration: 2,
             user_text: "Can you test your tools?",
+            current_attachments: &[],
             completed_tool_calls: &completed_tool_calls,
             model: "gemma-4-26b",
             core_prompt: &system_prompt,
@@ -1914,6 +1960,7 @@ mod tests {
             session_id: "test-session",
             iteration: 1,
             user_text: "Current question",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: core,
@@ -2034,6 +2081,7 @@ mod tests {
             session_id: "reuse-session",
             iteration: 1,
             user_text: "Same task",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: core,
@@ -2056,6 +2104,7 @@ mod tests {
             session_id: "reuse-session",
             iteration: 2,
             user_text: "Same task",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: core,
@@ -2121,6 +2170,7 @@ mod tests {
             session_id: "sort-session",
             iteration: 1,
             user_text: "Do work",
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: "CORE",
@@ -2173,6 +2223,7 @@ mod tests {
             session_id: session,
             iteration,
             user_text,
+            current_attachments: &[],
             completed_tool_calls: &[],
             model: "mock-model",
             core_prompt: "CORE-PROMPT-BYTES",
@@ -2793,6 +2844,7 @@ mod tests {
                 session_id: _,
                 iteration: _,
                 user_text: _,
+                current_attachments: _,
                 completed_tool_calls: _,
                 model: _,
                 core_prompt: _,
@@ -2804,5 +2856,41 @@ mod tests {
                 status_tx: _,
             } = c;
         };
+    }
+
+    #[test]
+    fn fresh_context_isolation_preserves_multimodal_user_message() {
+        let user_text = "What do you see here?";
+        let mut messages = vec![
+            json!({"role": "system", "content": "core"}),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]
+            }),
+        ];
+        let non_system_non_user_count = messages
+            .iter()
+            .filter(|m| {
+                let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                role != "system" && role != "user"
+            })
+            .count();
+        assert_eq!(non_system_non_user_count, 0);
+        messages.retain(|m| {
+            m.get("role").and_then(|r| r.as_str()) != Some("user")
+                || m.get("content").is_some_and(|content| {
+                    user_message_content_matches(content, user_text)
+                })
+        });
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")),
+            "multimodal user message must survive fresh-context retain"
+        );
     }
 }

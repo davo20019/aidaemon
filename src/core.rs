@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::agent::Agent;
 use crate::channels::{ChannelHub, SessionMap};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, VisionConfig};
 use crate::daemon;
 
 use crate::health::HealthProbeManager;
@@ -243,6 +243,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         } else {
             None
         },
+        VisionConfig::from_files(&config.files),
     ));
 
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.

@@ -112,6 +112,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         content: Some(user_text.to_string()),
         importance: 0.5, // Will be updated by score_message below
         turn_id: Some(user_msg_id.clone()),
+        attachments: ctx.attachments.to_vec(),
         ..Message::new_runtime(user_msg_id, session_id, "user")
     };
     // Calculate heuristic score immediately
@@ -120,7 +121,13 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     user_msg.importance = score;
 
     agent
-        .append_user_message_with_event(&emitter, &user_msg, user_role, &channel_ctx, false)
+        .append_user_message_with_event(
+            &emitter,
+            &user_msg,
+            user_role,
+            &channel_ctx,
+            !ctx.attachments.is_empty(),
+        )
         .await?;
 
     if let Some(reply) = super::shortcuts::maybe_handle_stop_command(

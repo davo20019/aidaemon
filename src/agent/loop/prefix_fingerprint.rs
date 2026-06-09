@@ -186,16 +186,21 @@ pub(crate) fn provider_call_fingerprint(
 /// matching user message is present, so the pre-boundary region degrades to
 /// "everything after message zero" rather than panicking.
 pub(crate) fn boundary_pos(messages: &[Value], user_text: &str) -> usize {
-    messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, m)| {
-            m.get("role").and_then(|r| r.as_str()) == Some("user")
-                && m.get("content").and_then(|c| c.as_str()) == Some(user_text)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(messages.len())
+    find_current_user_boundary(messages, user_text).unwrap_or(messages.len())
+}
+
+fn find_current_user_boundary(messages: &[Value], user_text: &str) -> Option<usize> {
+    messages.iter().enumerate().rev().find_map(|(i, m)| {
+        if m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content").is_some_and(|content| {
+                crate::agent::vision::user_message_content_matches(content, user_text)
+            })
+        {
+            Some(i)
+        } else {
+            None
+        }
+    })
 }
 
 /// Hash the pre-boundary history region of an intermediate build stage.

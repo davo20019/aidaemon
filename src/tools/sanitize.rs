@@ -593,6 +593,27 @@ fn friendly_tool_label(name: &str) -> String {
     .to_string()
 }
 
+/// Whether a `manage_memories`/`manage_people` action only reads state (so the
+/// status ping should say "checking memory" rather than "updating memory").
+/// Unknown/new actions default to write — never mislabel a mutation as a read.
+fn memory_action_is_read(action: &str) -> bool {
+    matches!(
+        action,
+        "search"
+            | "list"
+            | "view"
+            | "recall"
+            | "get"
+            | "find"
+            | "export"
+            | "audit"
+            | "list_goals"
+            | "list_scheduled"
+            | "list_scheduled_matching"
+            | "diagnose_scheduled"
+    )
+}
+
 /// Tools whose summaries carry raw commands and absolute paths. For these we
 /// suppress the summary entirely so only the friendly label shows.
 fn summary_is_command_bearing(name: &str) -> bool {
@@ -610,6 +631,25 @@ fn summary_is_command_bearing(name: &str) -> bool {
 /// - All other summaries are passed through `redact_secrets` and length-capped
 ///   using char-safe truncation.
 pub fn user_facing_tool_activity(name: &str, summary: &str) -> (String, String) {
+    // `manage_memories`/`manage_people` carry the action ("search", "list",
+    // "forget", …) as their summary. A read action rendered with the static
+    // "updating memory" label produced contradictory text like
+    // "Using updating memory: search...". Pick the verb from the action and
+    // drop the now-redundant action summary.
+    if matches!(name, "manage_memories" | "manage_people") {
+        let action = summary
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let label = if memory_action_is_read(&action) {
+            "checking memory"
+        } else {
+            "updating memory"
+        };
+        return (label.to_string(), String::new());
+    }
+
     let label = friendly_tool_label(name);
 
     if summary_is_command_bearing(name) {
@@ -957,6 +997,47 @@ mod tests {
         let rendered_done = format!("✓ {label}: {clean}");
         assert!(!rendered_start.contains("spawn_agent"));
         assert!(!rendered_done.contains("/Users/davidloor"));
+    }
+
+    #[test]
+    fn user_facing_activity_memory_search_reads_not_updates() {
+        // Regression: a memory search rendered as "updating memory: search".
+        let (label, summary) = user_facing_tool_activity("manage_memories", "search");
+        assert_eq!(label, "checking memory");
+        assert!(
+            summary.is_empty(),
+            "redundant bare action should be dropped"
+        );
+        // Rendered as the channel would: clean, no contradictory verb.
+        assert_eq!(format!("Using {label}..."), "Using checking memory...");
+
+        for read in ["list", "list_goals", "list_scheduled", "diagnose_scheduled"] {
+            let (label, _) = user_facing_tool_activity("manage_memories", read);
+            assert_eq!(label, "checking memory", "action {read} should read");
+        }
+    }
+
+    #[test]
+    fn user_facing_activity_memory_writes_stay_updating() {
+        for write in [
+            "forget",
+            "set_privacy",
+            "create_scheduled_goal",
+            "trigger_now",
+        ] {
+            let (label, summary) = user_facing_tool_activity("manage_memories", write);
+            assert_eq!(label, "updating memory", "action {write} should write");
+            assert!(summary.is_empty());
+        }
+        // manage_people follows the same read/write split.
+        assert_eq!(
+            user_facing_tool_activity("manage_people", "view John").0,
+            "checking memory"
+        );
+        assert_eq!(
+            user_facing_tool_activity("manage_people", "add Jane").0,
+            "updating memory"
+        );
     }
 
     #[test]

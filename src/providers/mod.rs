@@ -1,6 +1,7 @@
 mod anthropic_native;
 mod error;
 mod google_genai;
+pub(crate) mod multimodal;
 mod openai_compatible;
 mod xai_native;
 

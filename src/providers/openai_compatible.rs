@@ -454,7 +454,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let content = message["content"].as_str().map(|s| s.to_string());
+        let content = message
+            .get("content")
+            .and_then(crate::agent::vision::content_value_as_text);
 
         let mut tool_calls = Vec::new();
         if let Some(tcs) = message["tool_calls"].as_array() {

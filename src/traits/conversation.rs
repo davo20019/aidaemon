@@ -30,6 +30,21 @@ pub enum MessageAnnotation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_tool: Option<String>,
     },
+    InboundFileAttachment {
+        filename: String,
+        local_path: String,
+        mime_type: String,
+        size_bytes: u64,
+    },
+}
+
+/// Metadata for a file saved from an inbound channel message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAttachment {
+    pub local_path: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
 }
 
 pub fn infer_message_annotations(content: &str) -> Vec<MessageAnnotation> {
@@ -151,7 +166,8 @@ fn annotation_appended_marker(annotation: &MessageAnnotation) -> Option<&'static
         MessageAnnotation::AppendedToolStats => Some(APPENDED_TOOL_STATS_MARKER),
         MessageAnnotation::AppendedSystemNotice => Some(APPENDED_SYSTEM_MARKER),
         MessageAnnotation::EntireSystemNotice
-        | MessageAnnotation::WrappedUntrustedExternalData { .. } => None,
+        | MessageAnnotation::WrappedUntrustedExternalData { .. }
+        | MessageAnnotation::InboundFileAttachment { .. } => None,
     }
 }
 
@@ -233,6 +249,8 @@ pub struct Message {
     /// paths that bypass the auto-stamping layer (tests, migrations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 fn default_importance() -> f32 {
@@ -254,6 +272,7 @@ impl Default for Message {
             importance: default_importance(),
             embedding: None,
             turn_id: None,
+            attachments: Vec::new(),
         }
     }
 }

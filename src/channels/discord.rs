@@ -17,6 +17,7 @@ use serenity::Client;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{build_help_text, sanitize_filename, split_message};
 use crate::agent::Agent;
@@ -517,47 +518,46 @@ impl DiscordChannel {
             return;
         }
 
-        let text = if msg.content.is_empty() && !msg.attachments.is_empty() {
-            // File message
-            if self.files_enabled {
-                match self.handle_file_message(ctx, &msg).await {
-                    Ok(file_text) => file_text,
-                    Err(e) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("File error: {}", e))
-                            .await;
-                        return;
+        let (body_text, inbound_attachments) =
+            if msg.content.is_empty() && !msg.attachments.is_empty() {
+                if self.files_enabled {
+                    match self.handle_file_message(ctx, &msg).await {
+                        Ok(attachments) => (String::new(), attachments),
+                        Err(e) => {
+                            let _ = msg
+                                .channel_id
+                                .say(&ctx.http, format!("File error: {}", e))
+                                .await;
+                            return;
+                        }
+                    }
+                } else {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, "I can only process text messages.")
+                        .await;
+                    return;
+                }
+            } else if !msg.content.is_empty() {
+                let mut attachments = Vec::new();
+                if self.files_enabled && !msg.attachments.is_empty() {
+                    match self.handle_file_message(ctx, &msg).await {
+                        Ok(file_attachments) => attachments = file_attachments,
+                        Err(e) => {
+                            let _ = msg
+                                .channel_id
+                                .say(&ctx.http, format!("File error: {}", e))
+                                .await;
+                            return;
+                        }
                     }
                 }
+                (msg.content.clone(), attachments)
             } else {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, "I can only process text messages.")
-                    .await;
                 return;
-            }
-        } else if !msg.content.is_empty() {
-            // Text might be accompanied by attachments
-            let mut text = msg.content.clone();
-            if self.files_enabled && !msg.attachments.is_empty() {
-                match self.handle_file_message(ctx, &msg).await {
-                    Ok(file_text) => {
-                        text = format!("{}\n{}", file_text, text);
-                    }
-                    Err(e) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("File error: {}", e))
-                            .await;
-                        return;
-                    }
-                }
-            }
-            text
-        } else {
-            return;
-        };
+            };
+
+        let text = super::attachments::build_inbound_text(&body_text, &inbound_attachments);
 
         // Handle slash-style commands (text commands starting with /)
         if text.starts_with('/') {
@@ -807,6 +807,8 @@ impl DiscordChannel {
         let http = ctx.http.clone();
         tokio::spawn(async move {
             let mut current_text = text;
+            let inbound_attachments = inbound_attachments;
+            let mut attachments_sent = false;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -816,10 +818,16 @@ impl DiscordChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
+                let attachments_for_call = if attachments_sent {
+                    &[][..]
+                } else {
+                    &inbound_attachments[..]
+                };
                 let result = tokio::select! {
-                    r = agent.handle_message(
+                    r = agent.handle_message_with_attachments(
                         &session_id,
                         &current_text,
+                        attachments_for_call,
                         Some(current_status_tx.clone()),
                         user_role,
                         channel_ctx.clone(),
@@ -838,6 +846,7 @@ impl DiscordChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
+                attachments_sent = true;
                 current_typing_cancel.cancel();
                 current_status_task.abort();
 
@@ -1021,8 +1030,8 @@ impl DiscordChannel {
         &self,
         _ctx: &Context,
         msg: &SerenityMessage,
-    ) -> anyhow::Result<String> {
-        let mut contexts = Vec::new();
+    ) -> anyhow::Result<Vec<crate::traits::MessageAttachment>> {
+        let mut attachments = Vec::new();
 
         for attachment in &msg.attachments {
             let max_bytes = self.max_file_size_mb * 1_048_576;
@@ -1057,22 +1066,15 @@ impl DiscordChannel {
                 "Saved inbound Discord file"
             );
 
-            let size_display = if bytes.len() > 1_048_576 {
-                format!("{:.1} MB", bytes.len() as f64 / 1_048_576.0)
-            } else {
-                format!("{:.0} KB", bytes.len() as f64 / 1024.0)
-            };
-
-            contexts.push(format!(
-                "[File received: {} ({}, {})\nSaved to: {}]",
+            attachments.push(super::attachments::message_attachment(
+                dest_path,
                 sanitized,
-                size_display,
-                mime_type,
-                dest_path.display()
+                mime_type.to_string(),
+                bytes.len() as u64,
             ));
         }
 
-        Ok(contexts.join("\n"))
+        Ok(attachments)
     }
 
     /// Handle a button interaction (approval flow).
@@ -1115,12 +1117,9 @@ impl DiscordChannel {
             _ => return,
         };
 
-        let label = match &response {
-            ApprovalResponse::AllowOnce => "Allowed (once)",
-            ApprovalResponse::AllowSession => "Allowed (this session)",
-            ApprovalResponse::AllowAlways => "Allowed (always)",
-            ApprovalResponse::Deny => "Denied",
-        };
+        // Acknowledge the interaction and update the message to remove buttons
+        let original_content = interaction.message.content.clone();
+        let updated = approval_render::finalize_approval_message(&original_content, &response);
 
         // Send the response
         {
@@ -1131,10 +1130,6 @@ impl DiscordChannel {
                 warn!(approval_id, "Stale approval callback (no pending request)");
             }
         }
-
-        // Acknowledge the interaction and update the message to remove buttons
-        let original_content = interaction.message.content.clone();
-        let updated = format!("{} — {}", original_content, label);
 
         let _ = interaction
             .create_response(
@@ -1296,12 +1291,8 @@ impl Channel for DiscordChannel {
             );
         }
 
-        // Determine which buttons to show based on permission_mode and risk_level
-        let use_session_button = match permission_mode {
-            PermissionMode::Cautious => true,
-            PermissionMode::Default => risk_level >= RiskLevel::Critical,
-            PermissionMode::Yolo => false,
-        };
+        let use_session_button =
+            approval_render::approval_use_session_button(permission_mode, risk_level);
 
         let buttons = if use_session_button {
             CreateActionRow::Buttons(vec![
@@ -1329,31 +1320,12 @@ impl Channel for DiscordChannel {
             ])
         };
 
-        // Build message with risk info
-        let (risk_icon, risk_label) = match risk_level {
-            RiskLevel::Safe => ("ℹ️", "New command"),
-            RiskLevel::Medium => ("⚠️", "Medium risk"),
-            RiskLevel::High => ("🔶", "High risk"),
-            RiskLevel::Critical => ("🚨", "Critical risk"),
-        };
-
-        let mut text = format!("{} **{}**\n\n```\n{}\n```", risk_icon, risk_label, command);
-
-        if !warnings.is_empty() {
-            text.push('\n');
-            for warning in warnings {
-                text.push_str(&format!("\n• {}", warning));
-            }
-        }
-
-        // Add explanation based on which button is shown
-        if use_session_button {
-            text.push_str("\n\n*\"Allow Session\" approves this command type until restart.*");
-        } else {
-            text.push_str("\n\n*\"Allow Always\" permanently approves this command type.*");
-        }
-
-        text.push_str(&format!("\n\n*[{}]*", short_id));
+        let text = approval_render::build_approval_message_discord(
+            command,
+            risk_level,
+            warnings,
+            use_session_button,
+        );
 
         let msg = CreateMessage::new()
             .content(&text)

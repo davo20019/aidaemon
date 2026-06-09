@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::traits::{Message, MessageAnnotation, ToolCall};
+use crate::traits::{Message, MessageAnnotation, MessageAttachment, ToolCall};
 
 use super::{TaskStatus, ToolCallInfo};
 
@@ -76,6 +76,7 @@ pub struct ConversationTurn {
     pub tool_calls: Option<Vec<ToolCallInfo>>,
     pub annotations: Vec<MessageAnnotation>,
     pub turn_id: Option<String>,
+    pub attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +143,13 @@ fn annotations_from_event_data(data: &Value) -> Vec<MessageAnnotation> {
         .unwrap_or_default()
 }
 
+fn attachments_from_event_data(data: &Value) -> Vec<MessageAttachment> {
+    data.get("attachments")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<MessageAttachment>>(value).ok())
+        .unwrap_or_default()
+}
+
 /// Project a single canonical conversation event into an event-native turn.
 pub fn turn_from_event(
     event_id: i64,
@@ -173,6 +181,7 @@ pub fn turn_from_event(
             tool_calls: None,
             annotations: annotations_from_event_data(data),
             turn_id: turn_id.clone(),
+            attachments: attachments_from_event_data(data),
         }),
         "assistant_response" => Some(ConversationTurn {
             event_id,
@@ -189,6 +198,7 @@ pub fn turn_from_event(
             tool_calls: tool_calls_from_assistant_response(data),
             annotations: annotations_from_event_data(data),
             turn_id: turn_id.clone(),
+            attachments: Vec::new(),
         }),
         "tool_result" => Some(ConversationTurn {
             event_id,
@@ -217,6 +227,7 @@ pub fn turn_from_event(
             tool_calls: None,
             annotations: annotations_from_event_data(data),
             turn_id: turn_id.clone(),
+            attachments: Vec::new(),
         }),
         _ => None,
     }
@@ -256,6 +267,7 @@ impl ConversationTurn {
             // so messages reconstructed on hydrate carry the turn's opening
             // user-message UUID. Legacy events without it remain None.
             turn_id: self.turn_id,
+            attachments: self.attachments,
         }
     }
 }

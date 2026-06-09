@@ -453,6 +453,7 @@ async fn setup_test_agent_internal(
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
+        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
     );
 
     if use_test_executor_mode {
@@ -555,6 +556,7 @@ pub async fn setup_test_agent_with_models(
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
+        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
     );
     // Note: keeps orchestrator mode (depth=0) — used by orchestration tests
 
@@ -642,6 +644,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
+        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
     );
 
     let channel = Arc::new(TestChannel::new());
@@ -876,6 +879,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
         None, // interactive_slot — slot routing not exercised in tests
+        crate::config::VisionConfig::from_files(&crate::config::FilesConfig::default()),
     );
 
     // Set executor mode so tests exercise the execution loop directly

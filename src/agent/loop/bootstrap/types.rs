@@ -10,6 +10,7 @@ pub(in crate::agent) enum BootstrapOutcome {
 pub(in crate::agent) struct BootstrapCtx<'a> {
     pub session_id: &'a str,
     pub user_text: &'a str,
+    pub attachments: &'a [crate::traits::MessageAttachment],
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub user_role: UserRole,
     pub channel_ctx: &'a ChannelContext,

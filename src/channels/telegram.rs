@@ -20,12 +20,12 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
+use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
     build_help_text, html_escape, markdown_to_telegram_html, sanitize_filename, split_message,
     strip_latex,
 };
-use super::telegram_approval_render as approval_render;
 use super::telegram_bootstrap_signing::{
     random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
     terminal_tenant_bot_bootstrap_url,
@@ -786,8 +786,8 @@ impl TelegramChannel {
 
         let (response, label) = if prefix == "goal" {
             match action {
-                "confirm" => (ApprovalResponse::AllowOnce, "Confirmed ✅"),
-                "cancel" => (ApprovalResponse::Deny, "Cancelled ❌"),
+                "confirm" => (ApprovalResponse::AllowOnce, "Confirmed ✅".to_string()),
+                "cancel" => (ApprovalResponse::Deny, "Cancelled ❌".to_string()),
                 _ => {
                     let _ = bot
                         .answer_callback_query(q.id)
@@ -812,20 +812,16 @@ impl TelegramChannel {
                     return;
                 }
             };
-            let label = match &response {
-                ApprovalResponse::AllowOnce => "Allowed (once)",
-                ApprovalResponse::AllowSession => "Allowed (this session)",
-                ApprovalResponse::AllowAlways => "Allowed (always)",
-                ApprovalResponse::Deny => "Denied",
-            };
-            (response, label)
+            let (icon, label) = approval_render::response_status(&response);
+            (response, format!("{icon} {label}"))
         };
 
-        // Send the response
+        // Send the response (check pending before updating the message)
         let mut pending = self.pending_approvals.lock().await;
-        if let Some(tx) = pending.remove(approval_id) {
-            let _ = tx.send(response);
-        } else {
+        let response_tx = pending.remove(approval_id);
+        drop(pending);
+
+        let Some(response_tx) = response_tx else {
             warn!(approval_id, "Stale approval callback (no pending request)");
             let _ = bot
                 .answer_callback_query(q.id.clone())
@@ -848,17 +844,18 @@ impl TelegramChannel {
                 }
             }
             return;
-        }
+        };
 
         // Acknowledge the callback and update the message
-        let _ = bot.answer_callback_query(q.id).text(label).await;
+        let _ = bot.answer_callback_query(q.id).text(&label).await;
 
         if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
             let original = m.text().unwrap_or("");
-            let _ = bot
-                .edit_message_text(m.chat.id, m.id, format!("{} — {}", original, label))
-                .await;
+            let updated = approval_render::finalize_approval_message(original, &response);
+            let _ = bot.edit_message_text(m.chat.id, m.id, updated).await;
         }
+
+        let _ = response_tx.send(response);
     }
 
     async fn handle_command(&self, text: &str, msg: &teloxide::types::Message, bot: &Bot) {
@@ -1840,12 +1837,12 @@ impl TelegramChannel {
     }
 
     /// Handle an incoming file/photo/audio/video/voice message.
-    /// Downloads the file, saves to inbox, and returns a context string for the agent.
+    /// Downloads the file, saves to inbox, and returns attachment metadata.
     async fn handle_file_message(
         &self,
         msg: &teloxide::types::Message,
         bot: &Bot,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<crate::traits::MessageAttachment> {
         // Extract file_id, file_size, filename, and mime_type from the message
         let (file_id, file_size, filename, mime_type) = if let Some(doc) = msg.document() {
             (
@@ -1945,6 +1942,12 @@ impl TelegramChannel {
         }
         let bytes = response.bytes().await?;
 
+        let (filename, mime_type) = if msg.photo().is_some() {
+            super::attachments::telegram_photo_filename_and_mime(&bytes)
+        } else {
+            (filename, mime_type)
+        };
+
         // Sanitize filename: strip path separators, null bytes, limit length
         let sanitized = sanitize_filename(&filename);
         let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -1964,27 +1967,12 @@ impl TelegramChannel {
             "Saved inbound file"
         );
 
-        // Build context string for the agent
-        let size_display = if bytes.len() > 1_048_576 {
-            format!("{:.1} MB", bytes.len() as f64 / 1_048_576.0)
-        } else {
-            format!("{:.0} KB", bytes.len() as f64 / 1024.0)
-        };
-
-        let caption = msg.caption().unwrap_or("");
-        let mut context = format!(
-            "[File received: {} ({}, {})\nSaved to: {}]",
+        Ok(super::attachments::message_attachment(
+            dest_path,
             sanitized,
-            size_display,
             mime_type,
-            dest_path.display()
-        );
-        if !caption.is_empty() {
-            context.push('\n');
-            context.push_str(caption);
-        }
-
-        Ok(context)
+            bytes.len() as u64,
+        ))
     }
 
     /// Auto-send file attachments referenced as absolute paths in a reply.
@@ -4274,14 +4262,17 @@ impl TelegramChannel {
 
         let user_role = determine_role(&self.owner_user_ids, user_id);
 
-        let text = if let Some(web_app_data) = msg.web_app_data() {
+        let mut inbound_attachments = Vec::new();
+        let mut body_text = String::new();
+
+        if let Some(web_app_data) = msg.web_app_data() {
             match Self::parse_web_app_action(&web_app_data.data) {
                 Some(TelegramWebAppAction::ContinueOnComputer { relay_session_id }) => {
                     self.handle_continue_on_computer_action(&bot, &msg, user_id, relay_session_id)
                         .await;
                     return;
                 }
-                Some(TelegramWebAppAction::AgentMessage(text)) => text,
+                Some(TelegramWebAppAction::AgentMessage(text)) => body_text = text,
                 None => {
                     let _ = bot
                         .send_message(
@@ -4305,14 +4296,27 @@ impl TelegramChannel {
                         .await;
                         return;
                     }
-                    TelegramWebAppAction::AgentMessage(text) => text,
+                    TelegramWebAppAction::AgentMessage(text) => body_text = text,
                 }
             } else {
-                t.to_string()
+                body_text = t.to_string();
             }
-        } else if self.files_enabled {
+        } else if !self.files_enabled {
+            let _ = bot
+                .send_message(msg.chat.id, "I can only process text messages.")
+                .await;
+            return;
+        }
+
+        if self.files_enabled
+            && (msg.document().is_some()
+                || msg.photo().is_some()
+                || msg.audio().is_some()
+                || msg.video().is_some()
+                || msg.voice().is_some())
+        {
             match self.handle_file_message(&msg, &bot).await {
-                Ok(file_text) => file_text,
+                Ok(attachment) => inbound_attachments.push(attachment),
                 Err(e) => {
                     let _ = bot
                         .send_message(msg.chat.id, format!("File error: {}", e))
@@ -4320,12 +4324,19 @@ impl TelegramChannel {
                     return;
                 }
             }
-        } else {
+            if body_text.is_empty() {
+                if let Some(caption) = msg.caption() {
+                    body_text = caption.to_string();
+                }
+            }
+        } else if body_text.is_empty() {
             let _ = bot
                 .send_message(msg.chat.id, "I can only process text messages.")
                 .await;
             return;
-        };
+        }
+
+        let text = super::attachments::build_inbound_text(&body_text, &inbound_attachments);
 
         // Handle slash commands.
         // `/setup` is spawned in a separate task because `handle_setup_command`
@@ -4838,6 +4849,8 @@ impl TelegramChannel {
             let _typing_guard = TypingGuard(typing_guard_token.clone());
 
             let mut current_text = text;
+            let inbound_attachments = inbound_attachments;
+            let mut attachments_sent = false;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -4851,8 +4864,13 @@ impl TelegramChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
+                let attachments_for_call = if attachments_sent {
+                    &[][..]
+                } else {
+                    &inbound_attachments[..]
+                };
                 let result = tokio::select! {
-                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    r = agent.handle_message_with_attachments(&session_id, &current_text, attachments_for_call, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -4866,6 +4884,7 @@ impl TelegramChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
+                attachments_sent = true;
                 current_typing_cancel.cancel();
                 // Abort the status display task to prevent blocking if a background
                 // CLI agent monitoring task still holds a status_tx clone.
@@ -5200,7 +5219,6 @@ impl Channel for TelegramChannel {
             risk_level,
             warnings,
             use_session_button,
-            short_id,
         );
 
         match self
@@ -5267,8 +5285,7 @@ impl Channel for TelegramChannel {
 
         let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id);
 
-        let text =
-            approval_render::build_goal_confirmation_text(goal_description, details, short_id);
+        let text = approval_render::build_goal_confirmation_text(goal_description, details);
 
         match self
             .bot

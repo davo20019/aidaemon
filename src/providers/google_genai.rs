@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::llm_markers::TEXT_ONLY_RESPONSE_MARKER;
-use crate::providers::ProviderError;
+use crate::providers::{multimodal, ProviderError};
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
     ToolChoiceMode,
@@ -238,10 +238,10 @@ impl GoogleGenAiProvider {
                     }
                 }
                 "user" => {
-                    let text = msg["content"].as_str().unwrap_or("");
+                    let parts = multimodal::openai_content_to_gemini_parts(&msg["content"]);
                     contents.push(json!({
                         "role": "user",
-                        "parts": [{ "text": text }]
+                        "parts": parts
                     }));
                 }
                 "assistant" => {

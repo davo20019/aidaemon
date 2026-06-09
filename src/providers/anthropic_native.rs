@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 use zeroize::Zeroize;
 
-use crate::providers::ProviderError;
+use crate::providers::{multimodal, ProviderError};
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
     ToolChoiceMode,
@@ -82,11 +82,10 @@ impl AnthropicNativeProvider {
                     }
                 }
                 "user" => {
-                    let content_str = msg["content"].as_str().unwrap_or("");
-                    // Anthropic user message content is string or array of blocks
+                    let content = multimodal::openai_content_to_anthropic_blocks(&msg["content"]);
                     anthropic_msgs.push(json!({
                         "role": "user",
-                        "content": content_str
+                        "content": content
                     }));
                 }
                 "assistant" => {

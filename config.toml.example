@@ -237,6 +237,16 @@ health_port = 8080
 # max_response_chars = 8000
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
+# [files]
+# Channel file inbox/outbox and LLM vision for uploaded images.
+# enabled = true
+# inbox_dir = "~/.aidaemon/files/inbox"
+# max_file_size_mb = 10
+# retention_hours = 24
+# vision_enabled = true
+# max_vision_image_mb = 4
+# vision_mime_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+
 # [cli_agents]
 # Delegate to external CLI coding agents (claude, codex, gemini, …). Off by default.
 # enabled = true

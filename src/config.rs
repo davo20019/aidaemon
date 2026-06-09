@@ -2057,6 +2057,34 @@ pub struct FilesConfig {
     pub max_file_size_mb: u64,
     #[serde(default = "default_retention_hours")]
     pub retention_hours: u64,
+    #[serde(default = "default_vision_enabled")]
+    pub vision_enabled: bool,
+    #[serde(default = "default_max_vision_image_mb")]
+    pub max_vision_image_mb: u64,
+    #[serde(default = "default_vision_mime_types")]
+    pub vision_mime_types: Vec<String>,
+}
+
+/// Vision/image encoding settings derived from `[files]` config.
+#[derive(Debug, Clone)]
+pub struct VisionConfig {
+    pub enabled: bool,
+    pub max_image_bytes: u64,
+    pub mime_types: Vec<String>,
+}
+
+impl VisionConfig {
+    pub fn from_files(files: &FilesConfig) -> Self {
+        Self {
+            enabled: files.vision_enabled,
+            max_image_bytes: files.max_vision_image_mb.saturating_mul(1_048_576),
+            mime_types: files.vision_mime_types.clone(),
+        }
+    }
+
+    pub fn mime_allowed(&self, mime: &str) -> bool {
+        self.mime_types.iter().any(|allowed| allowed == mime)
+    }
 }
 
 impl Default for FilesConfig {
@@ -2067,6 +2095,9 @@ impl Default for FilesConfig {
             outbox_dirs: default_outbox_dirs(),
             max_file_size_mb: default_max_file_size_mb(),
             retention_hours: default_retention_hours(),
+            vision_enabled: default_vision_enabled(),
+            max_vision_image_mb: default_max_vision_image_mb(),
+            vision_mime_types: default_vision_mime_types(),
         }
     }
 }
@@ -2085,6 +2116,20 @@ fn default_max_file_size_mb() -> u64 {
 }
 fn default_retention_hours() -> u64 {
     24
+}
+fn default_vision_enabled() -> bool {
+    true
+}
+fn default_max_vision_image_mb() -> u64 {
+    4
+}
+fn default_vision_mime_types() -> Vec<String> {
+    vec![
+        "image/jpeg".to_string(),
+        "image/png".to_string(),
+        "image/gif".to_string(),
+        "image/webp".to_string(),
+    ]
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

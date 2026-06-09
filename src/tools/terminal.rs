@@ -464,6 +464,18 @@ async fn drain_to_buffer<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: Ar
 }
 
 /// Format combined stdout/stderr output with optional truncation.
+/// Render an elapsed-seconds count as a friendly duration for user-facing
+/// progress messages (e.g. 65 -> "1m 5s", 40 -> "40s", 3600 -> "1h 0m").
+fn humanize_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
     let mut result = String::new();
     if !stdout.is_empty() {
@@ -1428,6 +1440,11 @@ impl TerminalTool {
                             // Consume the immediate first tick; we want periodic pings only.
                             ping_interval.tick().await;
                             let mut ping_count: u32 = 0;
+                            // Last output already shown to the user in a periodic
+                            // ping. Used to suppress redundant "still running, no
+                            // new output" channel messages (the agent already told
+                            // the user the command is running).
+                            let mut last_pinged_output: Option<String> = None;
 
                             loop {
                                 tokio::select! {
@@ -1460,26 +1477,26 @@ impl TerminalTool {
                                             2500,
                                         );
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
-                                        let status = if exit_code == Some(0) {
-                                            "completed"
+                                        // Short, friendly status ping only — no pid, no raw command
+                                        // (those stay in status_tx + logs). The actual output is
+                                        // delivered by agent re-engagement below, or the verbatim
+                                        // fallback when re-engagement can't run.
+                                        let message = if exit_code == Some(0) {
+                                            format!(
+                                                "✅ Background command finished in {}.",
+                                                humanize_elapsed(elapsed_secs)
+                                            )
                                         } else {
-                                            "finished with errors"
-                                        };
-                                        // Short status ping only — the raw command output is NOT
-                                        // dumped here. The agent re-engagement below feeds the output
-                                        // back through the LLM so the user gets a properly formatted,
-                                        // summarized reply instead of a wall of raw stdout. The output
-                                        // is only delivered verbatim as a fallback (see below) when
-                                        // re-engagement can't run or produces nothing.
-                                        let mut message = format!(
-                                            "Background terminal command {} after {}s.\nCommand: `{}`",
-                                            status, elapsed_secs, command_summary
-                                        );
-                                        if let Some(code) = exit_code {
-                                            if code != 0 {
-                                                message.push_str(&format!("\n[exit code: {}]", code));
+                                            let mut m = format!(
+                                                "⚠️ Background command finished with errors in {}",
+                                                humanize_elapsed(elapsed_secs)
+                                            );
+                                            if let Some(code) = exit_code {
+                                                m.push_str(&format!(" (exit code {})", code));
                                             }
-                                        }
+                                            m.push('.');
+                                            m
+                                        };
 
                                         if let Some(ref tx) = status_tx_for_notify {
                                             if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
@@ -1567,14 +1584,8 @@ impl TerminalTool {
                                             &format_output(&stdout, &stderr, max_output_chars),
                                             1000,
                                         );
-                                        let mut message = format!(
-                                            "Background terminal command still running after {}s (pid={}).\nCommand: `{}`",
-                                            elapsed_secs, pid, command_summary
-                                        );
-                                        if !latest_output.trim().is_empty() {
-                                            message.push_str(&format!("\n\nLatest output:\n{}", latest_output));
-                                        }
-
+                                        // Internal progress signal (typing indicator + logs).
+                                        // pid and the raw command belong here, not in the chat.
                                         if let Some(ref tx) = status_tx_for_notify {
                                             if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
                                                 name: "terminal".to_string(),
@@ -1592,46 +1603,63 @@ impl TerminalTool {
                                             }
                                         }
 
-                                        let mut delivered = false;
-                                        if let Some(ref hub) = hub_for_notify {
-                                            if let Err(e) = hub.send_text(&session_for_notify, &message).await {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    session_id = %session_for_notify,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier failed direct hub periodic delivery"
-                                                );
-                                            } else {
-                                                delivered = true;
-                                            }
-                                        }
+                                        // User-facing channel ping: only when there is genuinely
+                                        // NEW output to report. The agent already told the user the
+                                        // command is running, so repeated "still running, no output"
+                                        // pings are noise. pid and the raw command stay out of chat.
+                                        let output_trimmed = latest_output.trim();
+                                        let has_new_output = !output_trimmed.is_empty()
+                                            && output_trimmed != "(no output)"
+                                            && last_pinged_output.as_deref() != Some(output_trimmed);
+                                        if has_new_output {
+                                            last_pinged_output = Some(output_trimmed.to_string());
+                                            let message = format!(
+                                                "⏳ Still working on it — running for {}. Latest update:\n{}",
+                                                humanize_elapsed(elapsed_secs),
+                                                latest_output
+                                            );
 
-                                        if !delivered {
-                                            if let Some(ref state) = state_for_notify {
-                                                let entry = crate::traits::NotificationEntry::new(
-                                                    &goal_id_for_notify,
-                                                    &session_for_notify,
-                                                    "progress",
-                                                    &message,
-                                                );
-                                                if let Err(e) = state.enqueue_notification(&entry).await {
+                                            let mut delivered = false;
+                                            if let Some(ref hub) = hub_for_notify {
+                                                if let Err(e) = hub.send_text(&session_for_notify, &message).await {
                                                     warn!(
                                                         pid,
                                                         error = %e,
                                                         session_id = %session_for_notify,
-                                                        goal_id = %goal_id_for_notify,
                                                         command = %command_for_notify,
-                                                        "Terminal background notifier failed to enqueue periodic progress notification"
+                                                        "Terminal background notifier failed direct hub periodic delivery"
+                                                    );
+                                                } else {
+                                                    delivered = true;
+                                                }
+                                            }
+
+                                            if !delivered {
+                                                if let Some(ref state) = state_for_notify {
+                                                    let entry = crate::traits::NotificationEntry::new(
+                                                        &goal_id_for_notify,
+                                                        &session_for_notify,
+                                                        "progress",
+                                                        &message,
+                                                    );
+                                                    if let Err(e) = state.enqueue_notification(&entry).await {
+                                                        warn!(
+                                                            pid,
+                                                            error = %e,
+                                                            session_id = %session_for_notify,
+                                                            goal_id = %goal_id_for_notify,
+                                                            command = %command_for_notify,
+                                                            "Terminal background notifier failed to enqueue periodic progress notification"
+                                                        );
+                                                    }
+                                                } else {
+                                                    warn!(
+                                                        pid,
+                                                        session_id = %session_for_notify,
+                                                        command = %command_for_notify,
+                                                        "Terminal background notifier has no fallback queue; periodic update dropped"
                                                     );
                                                 }
-                                            } else {
-                                                warn!(
-                                                    pid,
-                                                    session_id = %session_for_notify,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier has no fallback queue; periodic update dropped"
-                                                );
                                             }
                                         }
                                         } // close else for ping_count cap
@@ -2716,6 +2744,18 @@ mod tests {
     // ── format_output tests ──
 
     #[test]
+    fn test_humanize_elapsed() {
+        assert_eq!(humanize_elapsed(0), "0s");
+        assert_eq!(humanize_elapsed(40), "40s");
+        assert_eq!(humanize_elapsed(59), "59s");
+        assert_eq!(humanize_elapsed(60), "1m 0s");
+        assert_eq!(humanize_elapsed(65), "1m 5s");
+        assert_eq!(humanize_elapsed(3599), "59m 59s");
+        assert_eq!(humanize_elapsed(3600), "1h 0m");
+        assert_eq!(humanize_elapsed(3725), "1h 2m");
+    }
+
+    #[test]
     fn test_format_stdout_only() {
         let result = format_output("hello", "", 1000);
         assert_eq!(result, "hello");
@@ -2882,7 +2922,6 @@ mod tests {
             if pending.iter().any(|entry| {
                 entry.session_id == "sess_notify"
                     && entry.notification_type == "progress"
-                    && entry.message.contains("Background terminal command")
                     && entry.message.contains("terminal-notify-ok")
             }) {
                 found = true;
@@ -2920,9 +2959,11 @@ mod tests {
         .await
         .with_state(state.clone() as Arc<dyn StateStore>);
 
+        // Emit output early so a periodic ping has something NEW to report —
+        // no-output commands are now intentionally quiet until completion.
         let response = tool
             .call(
-                r#"{"action":"run","command":"sleep 3; echo terminal-sequence-ok","_session_id":"sess_seq","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"echo working-update; sleep 3; echo terminal-sequence-ok","_session_id":"sess_seq","_user_role":"Owner"}"#,
             )
             .await
             .unwrap();
@@ -2939,12 +2980,12 @@ mod tests {
             for entry in pending.iter().filter(|entry| {
                 entry.session_id == "sess_seq" && entry.notification_type == "progress"
             }) {
-                if entry.message.contains("still running after") {
+                if entry.message.contains("Still working on it")
+                    && entry.message.contains("working-update")
+                {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("completed")
-                    && entry.message.contains("terminal-sequence-ok")
-                {
+                if entry.message.contains("Background command finished") {
                     saw_completion = true;
                 }
             }
@@ -2961,6 +3002,72 @@ mod tests {
         assert!(
             saw_completion,
             "expected background completion notification with final output"
+        );
+    }
+
+    /// A long-running command that produces no output until completion must NOT
+    /// spam the user with periodic "still running" pings — only the completion
+    /// notification should reach the channel. (The agent already told the user
+    /// the command is running.)
+    #[tokio::test]
+    async fn test_background_terminal_no_output_is_quiet_until_completion() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 3","_session_id":"sess_quiet","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        let mut saw_progress_ping = false;
+        let mut saw_completion = false;
+        for _ in 0..60 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            for entry in pending.iter().filter(|entry| {
+                entry.session_id == "sess_quiet" && entry.notification_type == "progress"
+            }) {
+                if entry.message.contains("Still working on it") {
+                    saw_progress_ping = true;
+                }
+                if entry.message.contains("Background command finished") {
+                    saw_completion = true;
+                }
+            }
+            if saw_completion {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert!(
+            !saw_progress_ping,
+            "no-output command should not emit periodic progress pings"
+        );
+        assert!(
+            saw_completion,
+            "completion notification should still arrive"
         );
     }
 
@@ -3011,7 +3118,7 @@ mod tests {
             !pending.iter().any(|entry| {
                 entry.session_id == "sess_kill"
                     && entry.notification_type == "progress"
-                    && entry.message.contains("Background terminal command")
+                    && entry.message.contains("Background command finished")
             }),
             "kill action should suppress background completion notification"
         );
@@ -3156,9 +3263,7 @@ mod tests {
         for _ in 0..50 {
             let pending = state.get_pending_notifications(20).await.unwrap();
             if pending.iter().any(|entry| {
-                entry.session_id == "sess_disown"
-                    && entry.message.contains("Background terminal command")
-                    && entry.message.contains("disown-ok")
+                entry.session_id == "sess_disown" && entry.message.contains("disown-ok")
             }) {
                 found = true;
                 break;

@@ -48,6 +48,7 @@ Then run `aidaemon` — the setup wizard walks you through picking a provider, e
 
 ### Channels
 Talk to it on **Telegram**, **Slack** (Socket Mode), or **Discord**. Run multiple bots, add new ones at runtime with `/connect`, no restart needed.
+Send images with a caption and the agent analyzes them via vision-capable LLMs (toggle with `[files] vision_enabled` in config).
 Telegram owners can also run `/terminal [agent] [working_dir]` to launch the hosted terminal Mini App (`https://terminal.aidaemon.ai`) for direct CLI-agent sessions with automatic secure daemon pairing.
 
 ### Tools & Agents

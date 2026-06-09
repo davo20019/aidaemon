@@ -827,6 +827,7 @@ impl Agent {
             inherited_project_scope,
             root_tools,
             self.specialists.clone(),
+            self.vision_config.clone(),
         ));
 
         if let Some(spawn_tool) = spawn_tool {

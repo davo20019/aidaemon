@@ -1,3 +1,5 @@
+mod approval_render;
+pub(crate) mod attachments;
 pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]
@@ -7,7 +9,6 @@ mod hub;
 #[cfg(feature = "slack")]
 mod slack;
 pub(crate) mod telegram;
-mod telegram_approval_render;
 mod telegram_bootstrap_signing;
 
 use std::sync::atomic::{AtomicU64, Ordering};

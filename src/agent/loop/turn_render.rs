@@ -21,10 +21,33 @@ use super::sliding_window::summarize_tool_result;
 // `Message`, `ToolCall`, `json`, `Value`, and `MAX_OLD_ASSISTANT_CONTENT_CHARS`
 // all live in the `agent` module scope.
 use super::*;
+use crate::config::VisionConfig;
 use crate::events::TerminalState;
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-pub(crate) const RENDERER_VERSION: u32 = 1;
+pub(crate) const RENDERER_VERSION: u32 = 2;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RenderOptions {
+    pub vision: VisionConfig,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            vision: VisionConfig {
+                enabled: true,
+                max_image_bytes: 4 * 1_048_576,
+                mime_types: vec![
+                    "image/jpeg".to_string(),
+                    "image/png".to_string(),
+                    "image/gif".to_string(),
+                    "image/webp".to_string(),
+                ],
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenderMode {
@@ -37,10 +60,13 @@ pub(crate) fn render_turn(
     turn_messages: &[Message],
     mode: RenderMode,
     _version: u32,
+    options: &RenderOptions,
 ) -> Vec<Value> {
     match mode {
-        RenderMode::Current => render_current(turn_messages),
-        RenderMode::Archived { terminal_state } => render_archived(turn_messages, terminal_state),
+        RenderMode::Current => render_current(turn_messages, options),
+        RenderMode::Archived { terminal_state } => {
+            render_archived(turn_messages, terminal_state, options)
+        }
     }
 }
 
@@ -131,10 +157,11 @@ fn attach_tool_routing(obj: &mut Value, m: &Message) {
 /// **Current** mode: append-only, full content. Single source of truth for the
 /// `&Message → Value` conversion (Task 7 deletes the inline copy in
 /// `message_build_phase.rs` and routes through here).
-fn render_current(turn_messages: &[Message]) -> Vec<Value> {
+fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
+    let mut vision_skipped = false;
 
-    turn_messages
+    let mut rendered: Vec<Value> = turn_messages
         .iter()
         // Skip tool results with empty/missing tool_name.
         .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
@@ -148,9 +175,25 @@ fn render_current(turn_messages: &[Message]) -> Vec<Value> {
                 return None;
             }
 
+            let content = if m.role == "user" && !m.attachments.is_empty() {
+                let text = m.content.as_deref().unwrap_or("");
+                let built = crate::agent::vision::build_multimodal_content(
+                    text,
+                    &m.attachments,
+                    RenderMode::Current,
+                    &options.vision,
+                );
+                if built.vision_skipped {
+                    vision_skipped = true;
+                }
+                built.content
+            } else {
+                json!(m.content)
+            };
+
             let mut obj = json!({
                 "role": m.role,
-                "content": m.content,
+                "content": content,
             });
 
             if let Some(tc_json) = &m.tool_calls_json {
@@ -172,14 +215,30 @@ fn render_current(turn_messages: &[Message]) -> Vec<Value> {
             attach_tool_routing(&mut obj, m);
             Some(obj)
         })
-        .collect()
+        .collect();
+
+    if vision_skipped {
+        rendered.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT,
+            }),
+        );
+    }
+
+    rendered
 }
 
 /// **Archived** mode: single pass IN ORDER (chronological, in-place
 /// transforms; NEVER regrouped into user/assistant/tools). The turn's message
 /// order is preserved so assistant `tool_calls` keep immediately preceding
 /// their `tool` results.
-fn render_archived(turn_messages: &[Message], terminal_state: TerminalState) -> Vec<Value> {
+fn render_archived(
+    turn_messages: &[Message],
+    terminal_state: TerminalState,
+    _options: &RenderOptions,
+) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
 
     // Pre-scan: index of the LAST substantive assistant record — non-empty
@@ -444,6 +503,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let joined = serde_json::to_string(&out).unwrap();
         assert!(
@@ -474,6 +534,7 @@ mod tests {
                 terminal_state: TerminalState::Failed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let joined = serde_json::to_string(&out).unwrap();
         assert!(joined.contains("[failed: 1 tool steps, no text reply]"));
@@ -488,6 +549,7 @@ mod tests {
                 terminal_state: TerminalState::Interrupted,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         assert!(serde_json::to_string(&out)
             .unwrap()
@@ -503,6 +565,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         assert!(serde_json::to_string(&out)
             .unwrap()
@@ -522,6 +585,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let b = render_turn(
             &turn,
@@ -529,6 +593,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         assert_eq!(a, b);
     }
@@ -536,7 +601,12 @@ mod tests {
     #[test]
     fn current_mode_is_append_only_full() {
         let turn = vec![user("hi"), assistant("there")];
-        let out = render_turn(&turn, RenderMode::Current, RENDERER_VERSION);
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
         // Current keeps full content, both messages, in order.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["content"], "hi");
@@ -557,6 +627,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
         // user → assistant(tool_calls) → tool → assistant(final): order
@@ -577,6 +648,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         assert!(
             out.iter().all(|m| m["role"] != "user"),
@@ -605,6 +677,7 @@ mod tests {
                 terminal_state: TerminalState::Completed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let joined = serde_json::to_string(&out).unwrap();
         assert!(
@@ -626,7 +699,12 @@ mod tests {
             tool("terminal", "c1", "exit 1"),
             assistant("I wasn't able to complete this task."),
         ];
-        let cur = render_turn(&turn, RenderMode::Current, RENDERER_VERSION);
+        let cur = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
         assert!(
             !serde_json::to_string(&cur)
                 .unwrap()
@@ -639,6 +717,7 @@ mod tests {
                 terminal_state: TerminalState::Failed,
             },
             RENDERER_VERSION,
+            &RenderOptions::default(),
         );
         let aj = serde_json::to_string(&arch).unwrap();
         assert!(aj.contains("[failed: 1 tool steps, no text reply]"));
@@ -646,5 +725,70 @@ mod tests {
             !aj.contains("I wasn't able to complete"),
             "Archived failure boilerplate is replaced by the deterministic terminal placeholder"
         );
+    }
+
+    #[test]
+    fn current_mode_encodes_image_attachments_as_multimodal_array() {
+        use crate::traits::MessageAttachment;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+        let stub = format!(
+            "[File received: photo.png (0 KB, image/png)\nSaved to: {}]",
+            file.path().display()
+        );
+        let turn = vec![Message {
+            role: "user".to_string(),
+            content: Some(stub),
+            attachments: vec![MessageAttachment {
+                local_path: file.path().to_string_lossy().into_owned(),
+                filename: "photo.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 8,
+            }],
+            ..Message::runtime_defaults()
+        }];
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let user_msg = out
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("user message");
+        let blocks = user_msg["content"].as_array().expect("multimodal array");
+        assert!(blocks.iter().any(|b| b["type"] == "text"));
+        assert!(blocks.iter().any(|b| b["type"] == "image_url"));
+    }
+
+    #[test]
+    fn archived_mode_keeps_image_attachments_as_text_stub() {
+        let turn = vec![Message {
+            role: "user".to_string(),
+            content: Some(
+                "[File received: photo.png (1 KB, image/png)\nSaved to: /tmp/x.png]".to_string(),
+            ),
+            attachments: vec![crate::traits::MessageAttachment {
+                local_path: "/tmp/x.png".to_string(),
+                filename: "photo.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 1024,
+            }],
+            ..Message::runtime_defaults()
+        }];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(out[0]["content"].is_string());
     }
 }

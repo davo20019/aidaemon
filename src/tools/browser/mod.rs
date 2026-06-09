@@ -224,6 +224,51 @@ fn redact_url_for_display(url: &str) -> String {
     url[..cut].to_string()
 }
 
+/// User-facing description of a browser action for approval prompts.
+/// Never includes fill values or script bodies.
+fn format_browser_approval_prompt(
+    action: &str,
+    origin: &str,
+    selector: Option<&str>,
+    tab_id: Option<&str>,
+    script_len: Option<usize>,
+    _risk: &policy::BrowserActionRisk,
+) -> String {
+    match action {
+        "list_tabs" => return "List open browser tabs".to_string(),
+        "close" => return "Close browser".to_string(),
+        "close_tab" => {
+            return format!("Close browser tab {}", tab_id.unwrap_or("?"));
+        }
+        "navigate" => return format!("Open website: {origin}"),
+        "new_tab" => return format!("Open new tab: {origin}"),
+        "switch_tab" => {
+            return format!("Switch to browser tab {}", tab_id.unwrap_or("?"));
+        }
+        "execute_js" => {
+            let bytes = script_len.unwrap_or(0);
+            return format!("Run JavaScript on {origin} ({bytes} bytes)");
+        }
+        "click" => {
+            if let Some(sel) = selector {
+                return format!("Click \"{sel}\" on {origin}");
+            }
+            return format!("Click on {origin}");
+        }
+        "fill" => {
+            if let Some(sel) = selector {
+                return format!("Fill in \"{sel}\" on {origin}");
+            }
+            return format!("Fill in a form field on {origin}");
+        }
+        "get_text" => return format!("Read page text from {origin}"),
+        "screenshot" => return format!("Take screenshot of {origin}"),
+        "wait" => return format!("Wait on {origin}"),
+        "set_mode" => return format!("Change browser mode on {origin}"),
+        _ => return format!("Browser action on {origin}"),
+    }
+}
+
 /// Telegram-safe upper bounds for an outbound screenshot, enforced BEFORE the
 /// image is enqueued onto the media channel. A VIEWPORT capture at the default
 /// window size is always within these; a `full_page` capture of a tall page can
@@ -501,35 +546,13 @@ impl BrowserTool {
                 .unwrap_or_else(|| "current page".to_string()),
         };
 
-        // Target description — never the fill value, never the script body.
-        let target = if args.action == "execute_js" {
-            let bytes = args.script.map(|s| s.len()).unwrap_or(0);
-            format!("JavaScript execution ({bytes} bytes)")
-        } else if let Some(sel) = args.selector {
-            format!("element {sel}")
-        } else if let Some(tab) = args.tab_id {
-            format!("tab {tab}")
-        } else {
-            "page".to_string()
-        };
-
-        let class = match risk.class {
-            BrowserRiskClass::Observation => "observation",
-            BrowserRiskClass::Navigation => "navigation",
-            BrowserRiskClass::Mutation => "mutation",
-            BrowserRiskClass::Administrative => "administrative",
-        };
-        let mut tags = String::from(class);
-        if risk.consequential {
-            tags.push_str(", consequential");
-        }
-        if risk.sensitive {
-            tags.push_str(", sensitive");
-        }
-
-        format!(
-            "Browser {} — {origin} [target: {target}] [risk: {tags}]",
-            args.action
+        format_browser_approval_prompt(
+            args.action,
+            &origin,
+            args.selector,
+            args.tab_id,
+            args.script.map(|s| s.len()),
+            risk,
         )
     }
 
@@ -632,14 +655,12 @@ impl BrowserTool {
         };
         let mut warnings = Vec::new();
         if risk.sensitive {
-            warnings.push(
-                "Sensitive action: arbitrary JavaScript can read or exfiltrate page data"
-                    .to_string(),
-            );
+            warnings.push("This can read or access private data on the page.".to_string());
         }
         if risk.consequential {
-            warnings
-                .push("Consequential action (may submit, purchase, delete, or send)".to_string());
+            warnings.push(
+                "This may submit forms, make purchases, delete data, or send messages.".to_string(),
+            );
         }
         let command = self.build_prompt(args, &risk).await;
 
@@ -1714,5 +1735,47 @@ impl Tool for BrowserTool {
             Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
             _ => ToolCallSemantics::mutation(),
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::format_browser_approval_prompt;
+    use crate::tools::browser::policy::{self, BrowserRiskClass};
+
+    fn sample_risk() -> policy::BrowserActionRisk {
+        policy::BrowserActionRisk {
+            class: BrowserRiskClass::Navigation,
+            sensitive: false,
+            consequential: false,
+        }
+    }
+
+    #[test]
+    fn navigate_prompt_is_plain_language() {
+        let prompt = format_browser_approval_prompt(
+            "navigate",
+            "https://newtarget.com",
+            None,
+            None,
+            None,
+            &sample_risk(),
+        );
+        assert_eq!(prompt, "Open website: https://newtarget.com");
+        assert!(!prompt.contains("[target:"));
+        assert!(!prompt.contains("[risk:"));
+    }
+
+    #[test]
+    fn execute_js_prompt_hides_script_body() {
+        let prompt = format_browser_approval_prompt(
+            "execute_js",
+            "https://example.com",
+            None,
+            None,
+            Some(512),
+            &sample_risk(),
+        );
+        assert_eq!(prompt, "Run JavaScript on https://example.com (512 bytes)");
     }
 }

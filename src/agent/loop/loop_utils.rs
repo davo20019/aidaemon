@@ -848,13 +848,21 @@ pub(super) fn merge_consecutive_messages(messages: &mut Vec<Value>) {
             .unwrap_or("")
             .to_string();
         if (curr_role == "assistant" || curr_role == "user") && prev_role == curr_role {
-            let curr_content = messages[i]
-                .get("content")
+            let prev_content_value = messages[i - 1].get("content");
+            let curr_content_value = messages[i].get("content");
+            // Never merge multimodal (array) or other non-string content — merging
+            // would destroy image blocks.
+            if !prev_content_value.is_some_and(|c| c.is_string())
+                || !curr_content_value.is_some_and(|c| c.is_string())
+            {
+                i += 1;
+                continue;
+            }
+            let curr_content = curr_content_value
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            let prev_content = messages[i - 1]
-                .get("content")
+            let prev_content = prev_content_value
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();

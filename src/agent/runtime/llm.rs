@@ -414,6 +414,32 @@ impl Agent {
                         .await
                     }
                     ProviderErrorKind::BadRequest => {
+                        if crate::providers::multimodal::messages_contain_vision_blocks(messages) {
+                            warn!(
+                                model,
+                                "Provider rejected vision payload; retrying once with text-only content"
+                            );
+                            let mut text_only = messages.to_vec();
+                            crate::providers::multimodal::strip_image_blocks_from_messages(
+                                &mut text_only,
+                            );
+                            match provider
+                                .chat_with_options(model, &text_only, tool_defs, options)
+                                .await
+                            {
+                                Ok(resp) => {
+                                    self.stamp_lastgood().await;
+                                    return Ok(resp);
+                                }
+                                Err(retry_err) => {
+                                    warn!(
+                                        model,
+                                        error = %retry_err,
+                                        "Text-only vision fallback retry also failed"
+                                    );
+                                }
+                            }
+                        }
                         if *options != ChatOptions::default() {
                             warn!(
                                 model,

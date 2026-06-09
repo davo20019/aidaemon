@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::{TaskOutcome, TaskStatus};
-use crate::traits::MessageAnnotation;
+use crate::traits::{MessageAnnotation, MessageAttachment};
 
 // =============================================================================
 // Session Events
@@ -71,9 +71,10 @@ pub struct UserMessageData {
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Structured file attachments (images, documents, etc.) saved to the inbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
-
-/// Data for AssistantResponse event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantResponseData {
     /// Canonical conversation message ID
@@ -1092,6 +1093,7 @@ mod tests {
             annotations: vec![],
             user_role: None,
             turn_id: Some("t1".to_string()),
+            attachments: vec![],
         };
         let back: UserMessageData =
             serde_json::from_value(serde_json::to_value(&um).unwrap()).unwrap();

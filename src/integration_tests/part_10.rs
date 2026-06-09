@@ -1019,3 +1019,272 @@ async fn test_turn_id_groups_messages_within_a_turn() {
         "Turn 2 should have at least one non-user message stamped with its turn_id"
     );
 }
+
+fn llm_messages_contain_image_url(messages: &[serde_json::Value]) -> bool {
+    messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url"))
+            })
+    })
+}
+
+/// Vision-enabled image uploads should reach the LLM as multimodal content blocks.
+#[tokio::test]
+async fn test_vision_image_attachment_reaches_provider_as_multimodal() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+
+    let mut png = tempfile::NamedTempFile::new().unwrap();
+    png.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+        .unwrap();
+
+    let attachment = message_attachment(
+        png.path().to_path_buf(),
+        "test.png".to_string(),
+        "image/png".to_string(),
+        9,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("what is this?", &attachments);
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("Prior context acknowledged."),
+        MockProvider::text_response("Summary of prior conversation."),
+        MockProvider::text_response("That looks like a PNG image."),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "vision_multimodal_test",
+            "Hello before the image.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "vision_multimodal_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let agent_calls: Vec<_> = call_log
+        .iter()
+        .filter(|call| {
+            !call.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("conversation summarizer"))
+            })
+        })
+        .collect();
+    assert!(
+        agent_calls
+            .iter()
+            .any(|call| llm_messages_contain_image_url(&call.messages)),
+        "expected an agent LLM call with image_url content block, got: {:?}",
+        agent_calls
+            .iter()
+            .map(|c| &c.messages)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// When vision is disabled, attachments stay as text stubs only.
+#[tokio::test]
+async fn test_vision_disabled_sends_text_stub_only() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+    use crate::config::{FilesConfig, VisionConfig};
+
+    let mut png = tempfile::NamedTempFile::new().unwrap();
+    png.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+        .unwrap();
+
+    let attachment = message_attachment(
+        png.path().to_path_buf(),
+        "test.png".to_string(),
+        "image/png".to_string(),
+        9,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("describe this", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I received your file but cannot view images while vision is disabled.",
+    )]);
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    let mut files = FilesConfig::default();
+    files.vision_enabled = false;
+    harness
+        .agent
+        .set_test_vision_config(VisionConfig::from_files(&files));
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "vision_disabled_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        !call_log
+            .iter()
+            .any(|call| llm_messages_contain_image_url(&call.messages)),
+        "vision disabled must not send image_url blocks"
+    );
+    assert!(
+        call_log.iter().any(|call| {
+            call.messages.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("[File received: test.png"))
+            })
+        }),
+        "user message should still include the text stub"
+    );
+}
+
+/// Non-image attachments (e.g. audio) should not produce vision blocks.
+#[tokio::test]
+async fn test_non_image_attachment_is_text_stub_only() {
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+
+    let attachment = message_attachment(
+        std::path::PathBuf::from("/tmp/voice.ogg"),
+        "voice.ogg".to_string(),
+        "audio/ogg".to_string(),
+        1200,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("transcribe this", &attachments);
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I saved the audio file but cannot transcribe it in this test.",
+    )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "vision_audio_stub_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        !call_log
+            .iter()
+            .any(|call| llm_messages_contain_image_url(&call.messages)),
+        "audio attachments must not produce image_url blocks"
+    );
+}
+
+/// File uploads with structured attachments should still trigger compaction on the stub marker.
+#[tokio::test]
+async fn test_vision_attachment_still_triggers_compaction() {
+    use std::io::Write;
+
+    use crate::channels::attachments::{build_inbound_text, message_attachment};
+
+    let mut png = tempfile::NamedTempFile::new().unwrap();
+    png.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+        .unwrap();
+
+    let attachment = message_attachment(
+        png.path().to_path_buf(),
+        "doc.png".to_string(),
+        "image/png".to_string(),
+        9,
+    );
+    let attachments = vec![attachment.clone()];
+    let inbound_text = build_inbound_text("Check the doc and fix the issue.", &attachments);
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "Would you like me to get more detailed information for any specific trial(s)?",
+        ),
+        MockProvider::text_response("Summary of prior conversation."),
+        MockProvider::text_response("I reviewed the uploaded document and identified the issue."),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "vision_compaction_test",
+            "These are the NCT trial numbers: NCT06737964 and NCT06737965.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message_with_attachments(
+            "vision_compaction_test",
+            &inbound_text,
+            &[attachment],
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    assert!(
+        call_log.len() >= 3,
+        "file upload with attachment should trigger compaction LLM call; got {} calls",
+        call_log.len()
+    );
+    assert!(
+        call_log.iter().any(|call| {
+            call.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("Summary of prior conversation."))
+            })
+        }),
+        "expected compaction summary in an LLM call"
+    );
+}

@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::channels::ChannelHub;
-use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig};
+use crate::config::{IterationLimitConfig, PathAliasConfig, PolicyConfig, VisionConfig};
 use crate::events::{
     AssistantResponseData, DecisionPointData, DecisionType, ErrorData, EventStore, EventType,
     LlmCallData, SubAgentCompleteData, SubAgentSpawnData, TaskEndData, TaskStartData, TaskStatus,
@@ -266,6 +266,7 @@ pub(crate) mod turn_eviction;
 pub(crate) mod turn_render;
 #[path = "loop/turn_render_cache.rs"]
 pub(crate) mod turn_render_cache;
+pub(crate) mod vision;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 use system_prompt::format_goal_context;
@@ -441,6 +442,8 @@ pub struct Agent {
     /// Locks the selected facts on the first owner turn to prevent the profile from
     /// shifting within a session due to recall_count bumps.
     session_core_profile_ids: Arc<tokio::sync::RwLock<HashMap<String, Vec<String>>>>,
+    /// Vision/image encoding settings for multimodal LLM requests.
+    vision_config: VisionConfig,
 }
 
 struct AgentLimits {
@@ -518,6 +521,12 @@ impl Agent {
     /// Current recursion depth of this agent.
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    pub(crate) fn render_options(&self) -> turn_render::RenderOptions {
+        turn_render::RenderOptions {
+            vision: self.vision_config.clone(),
+        }
     }
 
     /// Maximum recursion depth allowed.
@@ -623,6 +632,28 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
+        self.handle_message_with_attachments(
+            session_id,
+            user_text,
+            &[],
+            status_tx,
+            user_role,
+            channel_ctx,
+            heartbeat,
+        )
+        .await
+    }
+
+    pub async fn handle_message_with_attachments(
+        &self,
+        session_id: &str,
+        user_text: &str,
+        attachments: &[crate::traits::MessageAttachment],
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        user_role: UserRole,
+        channel_ctx: ChannelContext,
+        heartbeat: Option<Arc<AtomicU64>>,
+    ) -> anyhow::Result<String> {
         let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
             let is_scheduled_goal =
                 goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;
@@ -644,6 +675,7 @@ impl Agent {
             .handle_message_impl(
                 session_id,
                 user_text,
+                attachments,
                 status_tx,
                 user_role,
                 channel_ctx,

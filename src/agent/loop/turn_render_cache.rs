@@ -103,6 +103,7 @@ mod tests {
             importance: 0.0,
             embedding: None,
             turn_id: Some("turn-1".to_string()),
+            attachments: Vec::new(),
         }
     }
 

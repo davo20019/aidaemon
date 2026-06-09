@@ -786,10 +786,11 @@ impl SlackChannel {
             .map(|s| s.to_string());
 
         // Check for file attachments (skip for Public users)
-        let file_context = if self.files_enabled && user_role != UserRole::Public {
+        let mut inbound_attachments = Vec::new();
+        if self.files_enabled && user_role != UserRole::Public {
             if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
                 match self.handle_incoming_files(files).await {
-                    Ok(ctx) => Some(ctx),
+                    Ok(attachments) => inbound_attachments = attachments,
                     Err(e) => {
                         let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
                         let _ = self
@@ -802,19 +803,17 @@ impl SlackChannel {
                         return;
                     }
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
+        }
 
         // Build the text to send to the agent
-        let agent_text = match file_context {
-            Some(ctx) if text.is_empty() => ctx,
-            Some(ctx) => format!("{}\n{}", ctx, text),
-            None if text.is_empty() => return,
-            None => text.clone(),
+        let agent_text = if inbound_attachments.is_empty() {
+            if text.is_empty() {
+                return;
+            }
+            text.clone()
+        } else {
+            super::attachments::build_inbound_text(&text, &inbound_attachments)
         };
 
         // Handle slash commands sent as text (block Public users)
@@ -1334,6 +1333,8 @@ impl SlackChannel {
             let _typing_guard = TypingGuard(typing_guard_token.clone());
 
             let mut current_text = agent_text;
+            let inbound_attachments = inbound_attachments;
+            let mut attachments_sent = false;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -1343,8 +1344,13 @@ impl SlackChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
+                let attachments_for_call = if attachments_sent {
+                    &[][..]
+                } else {
+                    &inbound_attachments[..]
+                };
                 let result = tokio::select! {
-                    r = agent.handle_message(&session_id, &current_text, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    r = agent.handle_message_with_attachments(&session_id, &current_text, attachments_for_call, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 10), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -1358,6 +1364,7 @@ impl SlackChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
+                attachments_sent = true;
                 current_typing_cancel.cancel();
                 // Abort the status display task to prevent blocking if a background
                 // CLI agent monitoring task still holds a status_tx clone.
@@ -1613,12 +1620,25 @@ impl SlackChannel {
                 _ => continue,
             };
 
-            let label = match &response {
-                ApprovalResponse::AllowOnce => "Allowed (once)",
-                ApprovalResponse::AllowSession => "Allowed (this session)",
-                ApprovalResponse::AllowAlways => "Allowed (always)",
-                ApprovalResponse::Deny => "Denied",
-            };
+            // Update the original message via response_url
+            if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
+                let original_text = payload
+                    .pointer("/message/text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Command approval");
+                let updated =
+                    super::approval_render::finalize_approval_message(original_text, &response);
+                let updated_payload = serde_json::json!({
+                    "replace_original": true,
+                    "text": updated,
+                });
+                let _ = self
+                    .http
+                    .post(response_url)
+                    .json(&updated_payload)
+                    .send()
+                    .await;
+            }
 
             // Send the response via oneshot channel
             {
@@ -1628,19 +1648,6 @@ impl SlackChannel {
                 } else {
                     warn!(approval_id, "Stale Slack approval callback");
                 }
-            }
-
-            // Update the original message via response_url
-            if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
-                let original_text = payload
-                    .pointer("/message/text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Command approval");
-                let updated = serde_json::json!({
-                    "replace_original": true,
-                    "text": format!("{} — {}", original_text, label),
-                });
-                let _ = self.http.post(response_url).json(&updated).send().await;
             }
         }
     }
@@ -1836,8 +1843,11 @@ impl SlackChannel {
     }
 
     /// Handle incoming file attachments.
-    async fn handle_incoming_files(&self, files: &[Value]) -> anyhow::Result<String> {
-        let mut contexts = Vec::new();
+    async fn handle_incoming_files(
+        &self,
+        files: &[Value],
+    ) -> anyhow::Result<Vec<crate::traits::MessageAttachment>> {
+        let mut attachments = Vec::new();
 
         for file in files {
             let filename = file.get("name").and_then(|v| v.as_str()).unwrap_or("file");
@@ -1856,10 +1866,15 @@ impl SlackChannel {
                 );
             }
 
-            // Download via url_private_download with bot token
             let download_url = match file.get("url_private_download").and_then(|v| v.as_str()) {
                 Some(u) => u,
-                None => continue,
+                None => {
+                    tracing::warn!(
+                        filename,
+                        "Slack file missing url_private_download; skipping"
+                    );
+                    continue;
+                }
             };
 
             let resp = self
@@ -1889,22 +1904,15 @@ impl SlackChannel {
                 "Saved inbound Slack file"
             );
 
-            let size_display = if bytes.len() > 1_048_576 {
-                format!("{:.1} MB", bytes.len() as f64 / 1_048_576.0)
-            } else {
-                format!("{:.0} KB", bytes.len() as f64 / 1024.0)
-            };
-
-            contexts.push(format!(
-                "[File received: {} ({}, {})\nSaved to: {}]",
+            attachments.push(super::attachments::message_attachment(
+                dest_path,
                 sanitized,
-                size_display,
-                mime_type,
-                dest_path.display()
+                mime_type.to_string(),
+                bytes.len() as u64,
             ));
         }
 
-        Ok(contexts.join("\n"))
+        Ok(attachments)
     }
 
     /// Upload a file to Slack using the new files.getUploadURLExternal flow.
@@ -2197,39 +2205,15 @@ impl Channel for SlackChannel {
             );
         }
 
-        // Determine which buttons to show based on permission_mode and risk_level
-        let use_session_button = match permission_mode {
-            PermissionMode::Cautious => true,
-            PermissionMode::Default => risk_level >= RiskLevel::Critical,
-            PermissionMode::Yolo => false,
-        };
+        let use_session_button =
+            super::approval_render::approval_use_session_button(permission_mode, risk_level);
 
-        // Build message with risk info
-        let (risk_icon, risk_label) = match risk_level {
-            RiskLevel::Safe => ("ℹ️", "New command"),
-            RiskLevel::Medium => ("⚠️", "Medium risk"),
-            RiskLevel::High => ("🔶", "High risk"),
-            RiskLevel::Critical => ("🚨", "Critical risk"),
-        };
-
-        let mut message_text = format!("{} *{}*\n```{}```", risk_icon, risk_label, command);
-
-        if !warnings.is_empty() {
-            message_text.push('\n');
-            for warning in warnings {
-                message_text.push_str(&format!("\n• {}", warning));
-            }
-        }
-
-        // Add explanation based on which button is shown
-        if use_session_button {
-            message_text
-                .push_str("\n\n_\"Allow Session\" approves this command type until restart._");
-        } else {
-            message_text.push_str("\n\n_\"Allow Always\" permanently approves this command type._");
-        }
-
-        message_text.push_str(&format!("\n_[{}]_", short_id));
+        let message_text = super::approval_render::build_approval_message_slack(
+            command,
+            risk_level,
+            warnings,
+            use_session_button,
+        );
 
         // Build Block Kit message with approval buttons
         let action_buttons = if use_session_button {
@@ -2290,7 +2274,7 @@ impl Channel for SlackChannel {
 
         let mut body = serde_json::json!({
             "channel": channel_id,
-            "text": format!("{} {} - Command requires approval: `{}`", risk_icon, risk_label, command),
+            "text": message_text,
             "blocks": blocks,
         });
         if let Some(ts) = &thread_ts {

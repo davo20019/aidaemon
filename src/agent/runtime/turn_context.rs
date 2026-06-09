@@ -404,6 +404,7 @@ impl Agent {
                     "content": normalized_msg.content.clone().unwrap_or_default(),
                     "message_id": normalized_msg.id.clone(),
                     "has_attachments": has_attachments,
+                    "attachments": normalized_msg.attachments.clone(),
                     "annotations": normalized_msg.annotations.clone(),
                     // Provenance for downstream projections/consolidation.
                     "channel_visibility": channel_ctx.visibility.to_string(),
