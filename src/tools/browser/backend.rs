@@ -543,6 +543,19 @@ impl MockBackend {
         Self::default()
     }
 
+    /// Override the value returned by `evaluate`. `Some(Value::Null)` mimics a
+    /// JS expression that returns `null`; `None` mimics `undefined`/void.
+    pub fn with_eval_result(mut self, eval_result: Option<serde_json::Value>) -> Self {
+        self.eval_result = eval_result;
+        self
+    }
+
+    /// Override the text returned by `inner_text` and `body_text`.
+    pub fn with_text_result(mut self, text: impl Into<String>) -> Self {
+        self.text_result = text.into();
+        self
+    }
+
     /// Shared handle to the recorded call log, for assertions.
     pub fn calls(&self) -> Arc<Mutex<Vec<MockCall>>> {
         Arc::clone(&self.calls)
