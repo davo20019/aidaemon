@@ -237,6 +237,54 @@ const MAX_SCREENSHOT_DIM_SUM: u32 = 9000;
 const MAX_SCREENSHOT_RATIO: u32 = 18;
 const MAX_SCREENSHOT_BYTES: usize = 9_000_000;
 
+/// Upper bound on a screenshot delivered as a DOCUMENT (Telegram `sendDocument`
+/// accepts large PNGs — ~50MB, no pixel-dimension limit — where `sendPhoto`
+/// rejects them). Kept safely under Telegram's 50MB bot limit. A capture over
+/// the photo caps but under this is sent as a file; over this it is refused.
+const MAX_SCREENSHOT_DOCUMENT_BYTES: usize = 49 * 1024 * 1024;
+
+/// How an oversized-vs-in-cap screenshot should be delivered, decided purely by
+/// encoded byte length + whether it is within the photo caps. Pulled out as a
+/// pure function so all three branches are unit-testable without allocating a
+/// real 49MB buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotDelivery {
+    /// Within the photo caps → deliver inline as a `MediaKind::Photo`.
+    Photo,
+    /// Over the photo caps but within `MAX_SCREENSHOT_DOCUMENT_BYTES` → deliver
+    /// as a `MediaKind::Document` (file attachment).
+    Document,
+    /// Over `MAX_SCREENSHOT_DOCUMENT_BYTES` → cannot be delivered at all.
+    TooLarge,
+}
+
+/// Decide how to deliver a screenshot from its encoded byte length and whether
+/// it exceeded the photo caps (`oversize_reason`: `None` = within photo caps,
+/// `Some(_)` = over them — mirrors [`screenshot_oversize_reason`]'s output).
+fn screenshot_delivery_kind(
+    byte_len: usize,
+    oversize_reason: Option<String>,
+) -> ScreenshotDelivery {
+    match oversize_reason {
+        None => ScreenshotDelivery::Photo,
+        Some(_) if byte_len <= MAX_SCREENSHOT_DOCUMENT_BYTES => ScreenshotDelivery::Document,
+        Some(_) => ScreenshotDelivery::TooLarge,
+    }
+}
+
+/// RAII guard that deletes a temp file on drop. Guarantees the buffered
+/// screenshot file is removed on EVERY return path (success, delivery failure,
+/// timeout, early error) without scattering manual `remove_file` calls.
+struct TempFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Parse the pixel dimensions of a PNG from its header WITHOUT decoding the
 /// image (no `image` crate dependency). A PNG is the 8-byte signature followed
 /// by the IHDR chunk; width is the big-endian `u32` at bytes `[16..20]` and
@@ -767,30 +815,66 @@ impl BrowserTool {
             .unwrap_or_else(|| "current page".to_string());
         let caption = format!("Screenshot of {}", display_url);
 
-        // Bound the image BEFORE enqueueing. An oversized capture (typically a
-        // full-page screenshot of a long page) would be silently dropped by the
-        // channel (Telegram: PHOTO_INVALID_DIMENSIONS), so we reject it here with
-        // an actionable error instead of falsely claiming it was sent.
-        if let Some(reason) = screenshot_oversize_reason(&png_bytes) {
-            return Err(format!(
-                "Screenshot is too large to deliver ({}). Try the default viewport \
-                 capture (omit full_page) or pass a selector to capture a specific element.",
-                reason
-            ));
-        }
-
         // Guard the delivery path: never enqueue media with an empty session id.
         if session_id.is_empty() {
             return Err("browser actions require a session id".to_string());
         }
 
+        // Decide HOW to deliver based on size. A viewport capture is always a
+        // Photo. A full-page capture of a long page can exceed Telegram's
+        // sendPhoto caps (PHOTO_INVALID_DIMENSIONS); rather than refusing it, we
+        // fall back to sendDocument, which accepts large PNGs (~50MB, no pixel
+        // limit) — the full page actually arrives as a viewable image file. Only
+        // a capture larger than even the document cap is refused.
+        let oversize_reason = screenshot_oversize_reason(&png_bytes);
+        let delivery = screenshot_delivery_kind(png_bytes.len(), oversize_reason);
+
+        // `as_file` selects the honest, mode-aware success string below. The
+        // optional temp-file guard owns cleanup of the buffered Document file on
+        // every return path (it removes the file when dropped).
+        let (kind, as_file, _temp_guard) = match delivery {
+            ScreenshotDelivery::Photo => (MediaKind::Photo { data: png_bytes }, false, None),
+            ScreenshotDelivery::Document => {
+                // Buffer the PNG to a unique temp file; the channel's Document
+                // arm sends it via InputFile::file(path).
+                let path = std::env::temp_dir()
+                    .join(format!("aidaemon-screenshot-{}.png", uuid::Uuid::new_v4()));
+                if let Err(e) = std::fs::write(&path, &png_bytes) {
+                    return Err(format!(
+                        "Screenshot captured but failed to buffer it for delivery as a file: {}. \
+                         The image was not sent.",
+                        e
+                    ));
+                }
+                let guard = TempFileGuard { path: path.clone() };
+                (
+                    MediaKind::Document {
+                        file_path: path.to_string_lossy().into_owned(),
+                        filename: "screenshot.png".to_string(),
+                    },
+                    true,
+                    Some(guard),
+                )
+            }
+            ScreenshotDelivery::TooLarge => {
+                return Err(format!(
+                    "Screenshot is too large to deliver even as a file ({} bytes, max {}). \
+                     Capture a specific element with a selector.",
+                    png_bytes.len(),
+                    MAX_SCREENSHOT_DOCUMENT_BYTES
+                ));
+            }
+        };
+
         // Honest delivery: ask the media listener to report the ACTUAL outcome.
+        // `_temp_guard` (if any) is held across the await and dropped on every
+        // return path below, guaranteeing the temp file is cleaned up.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         self.media_tx
             .send(MediaMessage {
                 session_id: session_id.to_string(),
                 caption: caption.clone(),
-                kind: MediaKind::Photo { data: png_bytes },
+                kind,
                 result_tx: Some(result_tx),
             })
             .await
@@ -799,7 +883,17 @@ impl BrowserTool {
         // Wait (bounded) for the listener to confirm delivery, then report
         // HONESTLY — never claim "sent" unless the channel actually accepted it.
         match tokio::time::timeout(Duration::from_secs(30), result_rx).await {
-            Ok(Ok(Ok(()))) => Ok(format!("Screenshot captured and delivered to chat. {}", caption)),
+            Ok(Ok(Ok(()))) => {
+                if as_file {
+                    Ok(format!(
+                        "Screenshot captured and delivered to chat as a file (the full page was \
+                         too large for an inline image). {}",
+                        caption
+                    ))
+                } else {
+                    Ok(format!("Screenshot captured and delivered to chat. {}", caption))
+                }
+            }
             Ok(Ok(Err(reason))) => Err(format!(
                 "Screenshot captured but could NOT be delivered to chat: {}. The image was not sent.",
                 reason

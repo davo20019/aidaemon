@@ -628,30 +628,113 @@ async fn screenshot_delivery_success_is_reported() {
     assert!(matches!(captured[0].kind, MediaKind::Photo { .. }));
 }
 
-/// OVERSIZED: a capture whose PNG header encodes oversized dimensions must be
-/// rejected BEFORE any media is enqueued — the media channel receives nothing.
+/// OVERSIZED (over photo caps, under doc cap): a capture whose PNG header
+/// encodes over-photo-cap dimensions but whose total byte length is under the
+/// document cap is now delivered AS A DOCUMENT (file attachment), not rejected.
+/// The Document temp file must be cleaned up after delivery.
 #[tokio::test]
-async fn screenshot_oversized_rejected_before_enqueue() {
-    // PNG header encoding 8000x8000 → width+height = 16000 > the 9000 cap.
+async fn screenshot_oversized_delivered_as_document() {
+    // PNG header encoding 8000x8000 → width+height = 16000 > the 9000 photo cap,
+    // but the buffer is tiny (well under the document cap), so it becomes a Document.
     let oversized = png_header(8000, 8000);
     let backend = MockBackend::new().with_screenshot_bytes(oversized);
     let (tool, _backend, rx) = mock_tool_with(backend);
     let media = spawn_media_responder(rx, Ok(()));
 
     let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
-    let msg = tool.call(&args.to_string()).await.unwrap();
+    let out = tool.call(&args.to_string()).await.unwrap();
     assert!(
-        msg.starts_with("Error:") && msg.contains("too large to deliver"),
-        "oversized must report a clear too-large error: {msg}"
+        out.contains("delivered to chat as a file"),
+        "oversized capture should report delivery as a file: {out}"
     );
 
-    // Give the responder a moment; nothing should ever have been enqueued.
-    tokio::task::yield_now().await;
     let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1, "exactly one media message enqueued");
+    let (path, filename) = match &captured[0].kind {
+        MediaKind::Document {
+            file_path,
+            filename,
+        } => (file_path.clone(), filename.clone()),
+        _ => panic!("oversized capture must be enqueued as a Document"),
+    };
+    assert_eq!(
+        filename, "screenshot.png",
+        "filename should be screenshot.png"
+    );
+    // Cleanup: the temp file at the Document path must no longer exist after the
+    // call returned (delivery result received → temp file removed).
     assert!(
-        captured.is_empty(),
-        "oversized capture must NOT enqueue any media: {} enqueued",
-        captured.len()
+        !std::path::Path::new(&path).exists(),
+        "temp screenshot file must be cleaned up after delivery: {path}"
+    );
+}
+
+/// DOCUMENT DELIVERY FAILURE: when the channel rejects a Document delivery, the
+/// tool reports non-delivery honestly AND still cleans up the temp file.
+#[tokio::test]
+async fn screenshot_document_delivery_failure_is_reported_and_cleaned_up() {
+    let oversized = png_header(8000, 8000);
+    let backend = MockBackend::new().with_screenshot_bytes(oversized);
+    let (tool, _backend, rx) = mock_tool_with(backend);
+    let media = spawn_media_responder(rx, Err("file too large".to_string()));
+
+    let args = json!({ "action": "screenshot", "full_page": true, "_session_id": "sess-a" });
+    let msg = tool.call(&args.to_string()).await.unwrap();
+    assert!(
+        msg.starts_with("Error:"),
+        "a rejected document delivery must surface as an error: {msg}"
+    );
+    assert!(
+        msg.contains("could NOT be delivered") || msg.contains("not sent"),
+        "must honestly report non-delivery: {msg}"
+    );
+
+    let captured = media.messages.lock().await;
+    assert_eq!(captured.len(), 1);
+    let path = match &captured[0].kind {
+        MediaKind::Document { file_path, .. } => file_path.clone(),
+        _ => panic!("must be a Document"),
+    };
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "temp screenshot file must be cleaned up even on delivery failure: {path}"
+    );
+}
+
+/// Unit test for the pure size-decision helper. Exercises all three branches
+/// (Photo / Document / TooLarge) cheaply with byte-length numbers — no real
+/// 49MB allocation. `oversize_reason` mirrors `screenshot_oversize_reason`'s
+/// Option output: `None` = within photo caps, `Some(_)` = over photo caps.
+#[test]
+fn screenshot_delivery_kind_decides_by_size() {
+    use super::ScreenshotDelivery;
+
+    // Within photo caps (no oversize reason) → Photo, regardless of byte length.
+    assert_eq!(
+        super::screenshot_delivery_kind(1_000, None),
+        ScreenshotDelivery::Photo
+    );
+
+    // Over photo caps but under the document cap → Document.
+    assert_eq!(
+        super::screenshot_delivery_kind(1_000, Some("dimensions 8000x8000".to_string())),
+        ScreenshotDelivery::Document
+    );
+    assert_eq!(
+        super::screenshot_delivery_kind(
+            super::MAX_SCREENSHOT_DOCUMENT_BYTES,
+            Some("dimensions 8000x8000".to_string())
+        ),
+        ScreenshotDelivery::Document
+    );
+
+    // Over photo caps AND over the document cap → TooLarge.
+    assert_eq!(
+        super::screenshot_delivery_kind(
+            super::MAX_SCREENSHOT_DOCUMENT_BYTES + 1,
+            Some("dimensions 8000x8000".to_string())
+        ),
+        ScreenshotDelivery::TooLarge
     );
 }
 
