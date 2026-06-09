@@ -413,6 +413,38 @@ impl BrowserTool {
         Ok((page, guard))
     }
 
+    /// Defense-in-depth gate for observation/JS actions: read the page's LIVE
+    /// committed URL and re-validate it against the shared private-network policy
+    /// BEFORE reading/capturing/evaluating any page content.
+    ///
+    /// Per-request subresource interception is deferred (see the `PageHandle::url`
+    /// doc + the `#[ignore]`d feasibility stub), so a page can still reach a
+    /// blocked host AFTER load via a meta-refresh, JS-driven `location` change, or
+    /// nested frame. The final-URL revalidation in `action_navigate`/`action_new_tab`
+    /// only catches redirects at navigation time — it cannot catch a post-load
+    /// redirect. This helper closes that gap for the exfiltration vectors named in
+    /// the finding: by re-checking the live URL right before each observation/JS
+    /// action, a post-load redirect to a private host cannot be read out,
+    /// screenshotted, or evaluated.
+    ///
+    /// On block, returns a structured host-CLASS error only — never the URL,
+    /// path, query, or any embedded credentials.
+    async fn ensure_current_url_allowed(&self, page: &Arc<dyn PageHandle>) -> Result<(), String> {
+        if let Some(current_url) = page.url().await {
+            if let Err(blocked) = policy::validate_network_url(&current_url) {
+                warn!(
+                    class = blocked.class.label(),
+                    "observation/JS action refused: current page is on a blocked host"
+                );
+                return Err(format!(
+                    "Action blocked: current page is a {}",
+                    blocked.class.label()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn action_navigate(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let url = args
             .get("url")
@@ -446,6 +478,13 @@ impl BrowserTool {
                     class = blocked.class.label(),
                     "navigation landed on a blocked host after redirect; blocking"
                 );
+                // Neutralize the committed state: the page is currently sitting on
+                // the blocked host, so a subsequent get_text/screenshot/execute_js
+                // could read/capture/evaluate the blocked content even though we're
+                // about to return an error. Reset to about:blank so nothing on the
+                // blocked host remains observable. Best-effort: a failure here does
+                // not change the outcome (the action is still blocked).
+                let _ = page.goto("about:blank").await;
                 return Err(format!(
                     "Navigation blocked: redirected to a {}",
                     blocked.class.label()
@@ -458,6 +497,10 @@ impl BrowserTool {
 
     async fn action_screenshot(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let (page, _guard) = self.page_for(session_id).await?;
+
+        // Defense-in-depth: refuse to capture if the live committed URL is a
+        // blocked host (e.g. reached via post-load JS-redirect/meta-refresh).
+        self.ensure_current_url_allowed(&page).await?;
 
         let selector = args.get("selector").and_then(|v| v.as_str());
         let png_bytes = page.screenshot(selector).await?;
@@ -610,6 +653,10 @@ impl BrowserTool {
     async fn action_get_text(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let (page, _guard) = self.page_for(session_id).await?;
 
+        // Defense-in-depth: refuse to read if the live committed URL is a blocked
+        // host (e.g. reached via post-load JS-redirect/meta-refresh).
+        self.ensure_current_url_allowed(&page).await?;
+
         let text = if let Some(selector) = args.get("selector").and_then(|v| v.as_str()) {
             page.inner_text(selector).await?
         } else {
@@ -629,6 +676,13 @@ impl BrowserTool {
             .ok_or_else(|| "Missing required parameter: script".to_string())?;
 
         let (page, _guard) = self.page_for(session_id).await?;
+
+        // Defense-in-depth: refuse to evaluate if the live committed URL is a
+        // blocked host (e.g. reached via post-load JS-redirect/meta-refresh).
+        // This runs AFTER the approval gate (which fires in `call()` before
+        // dispatch) but BEFORE the script is evaluated, so an approved execute_js
+        // still cannot read out a private host the page redirected to post-load.
+        self.ensure_current_url_allowed(&page).await?;
 
         let result = page.evaluate(script).await?;
 

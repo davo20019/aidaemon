@@ -1643,6 +1643,261 @@ async fn new_tab_to_private_url_is_blocked() {
 /// fragile, untestable one — so subresource/XHR/WebSocket interception is
 /// deferred pending a chromiumoxide upgrade or a raw-CDP pump with auto-continue
 /// fallback. See the Task 8 report.
+/// PART 1 — STATE NEUTRALIZATION: a navigate whose final committed URL is a
+/// blocked host must not only return the block error, it must also RESET the page
+/// to about:blank so the blocked content is not left committed/observable. We
+/// assert both: the block error AND a recorded `goto("about:blank")` after the
+/// original goto.
+#[tokio::test]
+async fn navigate_blocked_redirect_resets_page_to_about_blank() {
+    let committed = "http://127.0.0.1/secret";
+    let (tool, backend, _rec) = approving_tool(
+        MockBackend::new().with_url(committed),
+        ApprovalResponse::AllowSession,
+    );
+
+    let out = tool
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://public-redirector.example/go",
+                "_session_id": "sess-a"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    // Still reported as blocked (host class only).
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("loopback"),
+        "blocked redirect must report the loopback host class: {out}"
+    );
+    assert!(
+        !out.contains("127.0.0.1") && !out.contains("/secret"),
+        "block error must not leak the URL/path: {out}"
+    );
+
+    // The committed state must have been neutralized via goto("about:blank").
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    let goto_count = calls
+        .iter()
+        .filter(|c| matches!(c, MockCall::Goto(_)))
+        .count();
+    assert!(
+        calls.contains(&MockCall::Goto("about:blank".to_string())),
+        "blocked redirect must reset the page to about:blank: {calls:?}"
+    );
+    // There must be the original goto to the requested URL AND the about:blank
+    // reset (two gotos total), proving the reset happens AFTER landing.
+    assert_eq!(
+        goto_count, 2,
+        "expected the original goto plus the about:blank reset: {calls:?}"
+    );
+}
+
+/// PART 2 — OBSERVATION REFUSED: when the page's LIVE committed URL is a blocked
+/// host (e.g. reached via a post-load JS-redirect / meta-refresh), get_text,
+/// screenshot, and execute_js must each REFUSE before reading/capturing/
+/// evaluating. The error names ONLY the host class (no IP/path/query), and the
+/// underlying read/capture/evaluate call must NOT have been recorded.
+#[tokio::test]
+async fn observation_actions_refuse_on_blocked_current_url() {
+    // The page is currently sitting on a link-local metadata endpoint with a
+    // secret path — modeling a post-load redirect we never approved.
+    let blocked = "http://169.254.169.254/latest/meta-data/iam/security-credentials/";
+
+    // get_text refuses before body_text/inner_text.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(blocked),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+            "get_text on a blocked URL must refuse with the host class: {out}"
+        );
+        assert!(
+            !out.contains("169.254.169.254")
+                && !out.contains("security-credentials")
+                && !out.contains("meta-data"),
+            "get_text refusal must not leak the URL/path: {out}"
+        );
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.contains(&MockCall::BodyText)
+                && !calls.iter().any(|c| matches!(c, MockCall::InnerText(_))),
+            "get_text must refuse BEFORE reading any text: {calls:?}"
+        );
+    }
+
+    // screenshot refuses before capturing.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(blocked),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(&json!({ "action": "screenshot", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+            "screenshot on a blocked URL must refuse with the host class: {out}"
+        );
+        assert!(
+            !out.contains("169.254.169.254")
+                && !out.contains("security-credentials")
+                && !out.contains("meta-data"),
+            "screenshot refusal must not leak the URL/path: {out}"
+        );
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.iter().any(|c| matches!(c, MockCall::Screenshot(_))),
+            "screenshot must refuse BEFORE capturing: {calls:?}"
+        );
+    }
+
+    // execute_js refuses before evaluating (after the approval gate).
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(blocked),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(
+                &json!({
+                    "action": "execute_js",
+                    "script": "document.body.innerText",
+                    "_session_id": "sess-a"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+            "execute_js on a blocked URL must refuse with the host class: {out}"
+        );
+        assert!(
+            !out.contains("169.254.169.254")
+                && !out.contains("security-credentials")
+                && !out.contains("meta-data"),
+            "execute_js refusal must not leak the URL/path: {out}"
+        );
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+            "execute_js must refuse BEFORE evaluating: {calls:?}"
+        );
+    }
+}
+
+/// PART 2 — PRIVATE-NETWORK CLASS: the same refusal holds for an RFC1918 private
+/// host, proving the gate uses the shared classifier rather than a special case.
+#[tokio::test]
+async fn observation_actions_refuse_on_private_current_url() {
+    let blocked = "http://10.0.0.5/internal?secret=abc";
+    let (tool, backend, _rec) = approving_tool(
+        MockBackend::new().with_url(blocked),
+        ApprovalResponse::AllowSession,
+    );
+
+    let out = tool
+        .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+        .await
+        .unwrap();
+    assert!(
+        out.to_lowercase().contains("block") && out.to_lowercase().contains("private network"),
+        "get_text on a private URL must refuse with the host class: {out}"
+    );
+    assert!(
+        !out.contains("10.0.0.5") && !out.contains("secret") && !out.contains("internal"),
+        "refusal must not leak the URL/query: {out}"
+    );
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        !calls.contains(&MockCall::BodyText),
+        "get_text must refuse before reading on a private host: {calls:?}"
+    );
+}
+
+/// REGRESSION: with the live URL on a PUBLIC host, get_text / screenshot /
+/// execute_js still proceed normally (the gate only blocks blocked hosts).
+#[tokio::test]
+async fn observation_actions_allowed_on_public_current_url() {
+    let public = "https://app.example/dashboard";
+
+    // get_text proceeds.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new()
+                .with_url(public)
+                .with_text_result("public body"),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(&json!({ "action": "get_text", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert_eq!(out, "public body", "public get_text must proceed: {out}");
+        assert!(
+            calls_contains(&backend, &MockCall::BodyText).await,
+            "public get_text must reach body_text"
+        );
+    }
+
+    // screenshot proceeds. Use mock_tool_with so the media receiver stays alive
+    // (the screenshot is pushed onto the media channel on success).
+    {
+        let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_url(public));
+        let out = tool
+            .call(&json!({ "action": "screenshot", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.starts_with("Screenshot taken and sent to chat."),
+            "public screenshot must proceed: {out}"
+        );
+        assert!(
+            calls_contains(&backend, &MockCall::Screenshot(None)).await,
+            "public screenshot must reach the capture"
+        );
+    }
+
+    // execute_js proceeds.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(public),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(
+                &json!({ "action": "execute_js", "script": "1 + 1", "_session_id": "sess-a" })
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.to_lowercase().contains("block"),
+            "public execute_js must not be blocked: {out}"
+        );
+        assert!(
+            calls_contains(&backend, &MockCall::Evaluate("1 + 1".to_string())).await,
+            "public execute_js must reach evaluate"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires real Chrome + CDP Fetch pump; deferred (see doc comment)"]
 async fn deferred_per_request_subresource_interception_stub() {
