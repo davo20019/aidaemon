@@ -1720,27 +1720,29 @@ pub(super) async fn run_completion_phase(
         };
 
         // Sanitize user-facing output before any channel-specific redaction.
-        let pre_sanitize_non_empty = !reply.trim().is_empty();
+        let pre_sanitize_chars = reply.trim().chars().count();
         let reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
 
-        // Safety net: if sanitization stripped a non-empty reply to empty,
-        // fall back to activity summary instead of sending blank message.
-        let reply = if pre_sanitize_non_empty && reply.trim().is_empty() {
-            warn!(
-                session_id,
-                iteration,
-                "Sanitization stripped reply to empty — falling back to activity summary"
-            );
-            if !learning_ctx.tool_calls.is_empty() {
-                let refs: Vec<&str> = learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
-                build_activity_summary_reply(&refs)
+        // Safety net: if sanitization stripped a non-empty reply to empty or
+        // to a dangling lead-in stub ("Here are the results:"), fall back to
+        // an activity summary instead of sending a contentless message.
+        let reply =
+            if crate::tools::sanitize::reply_gutted_by_sanitization(pre_sanitize_chars, &reply) {
+                warn!(
+                    session_id,
+                    iteration, "Sanitization gutted reply — falling back to activity summary"
+                );
+                if !learning_ctx.tool_calls.is_empty() {
+                    let refs: Vec<&str> =
+                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                    build_activity_summary_reply(&refs)
+                } else {
+                    // Genuine edge case: no tools either.  Use a generic acknowledgement.
+                    "Done.".to_string()
+                }
             } else {
-                // Genuine edge case: no tools either.  Use a generic acknowledgement.
-                "Done.".to_string()
-            }
-        } else {
-            reply
-        };
+                reply
+            };
 
         let reply = match channel_ctx.visibility {
             ChannelVisibility::Public | ChannelVisibility::PublicExternal => {
@@ -1767,6 +1769,30 @@ pub(super) async fn run_completion_phase(
                 reply_preview = &reply.chars().take(200).collect::<String>() as &str,
                 "Zero-tool completion with deferred-action text detected — possible stall pattern"
             );
+        }
+
+        // The model asked the user to upload/provide a file it can locate
+        // itself (small models default to chat behavior on fresh contexts).
+        // Force one retry with an explicit lookup directive instead of
+        // accepting the punt. Fires once per turn to prevent loops.
+        if total_successful_tool_calls == 0
+            && ctx.completion_progress.file_access_retry_count == 0
+            && crate::agent::response_analysis::reply_defers_file_access(&reply)
+            && crate::agent::response_analysis::user_text_references_file(user_text)
+        {
+            ctx.completion_progress.file_access_retry_count += 1;
+            let hint = user_text.chars().take(300).collect::<String>();
+            pending_system_messages.push(SystemDirective::LocateFileInsteadOfAsking {
+                user_text_hint: hint,
+            });
+            warn!(
+                session_id,
+                iteration,
+                reply_preview = &reply.chars().take(200).collect::<String>() as &str,
+                "Reply defers file access to user despite available lookup tools — forcing retry"
+            );
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
         // Quality guard: reject canned ack responses and low-quality replies.

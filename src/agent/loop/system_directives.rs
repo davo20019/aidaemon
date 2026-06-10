@@ -159,6 +159,21 @@ pub(in crate::agent) enum SystemDirective {
     ResponseQualityNudge {
         user_text_hint: String,
     },
+    /// The model asked the user to upload/provide a file it can locate
+    /// itself with search tools. Injected once per turn to force a retry.
+    LocateFileInsteadOfAsking {
+        user_text_hint: String,
+    },
+    /// N consecutive tool calls returned nothing. The search term is likely
+    /// wrong — reorient instead of repeating or concluding absence.
+    EmptyResultStreakVaryTerms {
+        streak: usize,
+    },
+    /// The user approved the assistant's own immediately-prior proposal.
+    /// Anchor the turn to that proposal so the model executes exactly it.
+    ApprovedProposalAnchor {
+        proposal: String,
+    },
     /// Injected when plan detection heuristics identify a multi-step task
     /// that benefits from structured execution with verification.
     PlanSuggestion {
@@ -484,6 +499,33 @@ impl SystemDirective {
                  Do NOT print raw tool-call syntax like call:terminal or <|tool_call>. \
                  If you still need a tool, call it using the structured tool interface. \
                  Otherwise, write a clear, structured response.",
+                user_text_hint
+            ),
+            Self::EmptyResultStreakVaryTerms { streak } => format!(
+                "[SYSTEM] {} consecutive tool calls returned no results. An empty result for one \
+                 search term is NOT evidence of absence — the term is probably wrong. Before \
+                 searching again: (1) re-read the earlier messages in this conversation — your own \
+                 prior replies may already contain the exact filename, path, or answer; use it \
+                 directly. (2) vary the term: substrings, initials, abbreviations, fewer words \
+                 (e.g. files named with 'NC' will not match 'non-compete'). (3) filename listings \
+                 (ls/find/glob) do NOT match file contents — use a content search (grep -r, \
+                 mdfind) when the term may only appear inside the file.",
+                streak
+            ),
+            Self::ApprovedProposalAnchor { proposal } => format!(
+                "[SYSTEM] The user just approved YOUR OWN proposal quoted below. Execute exactly \
+                 that — do not re-plan, re-search, or substitute a different action. If the \
+                 proposal names a specific file, command, or target, act on that exact target now.\n\
+                 Your proposal: \"{}\"",
+                proposal
+            ),
+            Self::LocateFileInsteadOfAsking { user_text_hint } => format!(
+                "[SYSTEM] The user referenced a file by name. Do NOT ask the user to upload it or \
+                 provide a path — you have tools to locate it yourself. \
+                 Call search_files with a glob built from the filename; if the default directory \
+                 has no match, retry with \"path\": \"~\" to search the home directory. \
+                 Then read the file and answer the user's question. \
+                 User request: \"{}\"",
                 user_text_hint
             ),
             Self::PlanSuggestion { hint } => hint.clone(),

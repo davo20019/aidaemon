@@ -593,6 +593,16 @@ pub(super) async fn apply_result_learning(
     if no_evidence_result {
         *state.no_evidence_result_streak = state.no_evidence_result_streak.saturating_add(1);
         state.no_evidence_tools_seen.insert(tc.name.clone());
+        // Repeated empties usually mean the search term is wrong, not that
+        // the target is absent — reorient the model before it concludes
+        // "doesn't exist" against evidence already in the conversation.
+        if should_nudge_vary_terms(*state.no_evidence_result_streak) {
+            let nudge = SystemDirective::EmptyResultStreakVaryTerms {
+                streak: *state.no_evidence_result_streak,
+            };
+            state.pending_system_messages.push(nudge.clone());
+            *result_text = format!("{}\n\n{}", result_text, nudge.render());
+        }
     } else {
         *state.no_evidence_result_streak = 0;
         state.no_evidence_tools_seen.clear();
@@ -874,9 +884,40 @@ fn take_pending_reflection_solution_ids_for_recovery(
         .unwrap_or_default()
 }
 
+/// Fire the vary-terms nudge at every third consecutive empty result —
+/// once per escalation level, not on every empty call.
+fn should_nudge_vary_terms(streak: usize) -> bool {
+    streak > 0 && streak.is_multiple_of(3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vary_terms_nudge_fires_at_streak_multiples_of_three() {
+        // 6 consecutive empty greps for a wrong term ("non-compete" vs files
+        // named "NC Agreement") previously produced zero intervention.
+        assert!(!should_nudge_vary_terms(1));
+        assert!(!should_nudge_vary_terms(2));
+        assert!(should_nudge_vary_terms(3));
+        assert!(!should_nudge_vary_terms(4));
+        assert!(should_nudge_vary_terms(6));
+    }
+
+    #[test]
+    fn vary_terms_directive_reorients_search_strategy() {
+        let rendered = SystemDirective::EmptyResultStreakVaryTerms { streak: 3 }.render();
+        assert!(rendered.contains("vary"), "must tell model to vary terms");
+        assert!(
+            rendered.contains("earlier messages") || rendered.contains("this conversation"),
+            "must point back at prior conversation evidence"
+        );
+        assert!(
+            rendered.to_lowercase().contains("not evidence of absence"),
+            "must counter the empty-result-means-missing fallacy"
+        );
+    }
 
     #[test]
     fn cli_result_substantive_detection_prefers_large_non_error_payloads() {

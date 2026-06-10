@@ -15,7 +15,13 @@ use super::fs_utils;
 
 pub struct ReadFileTool;
 
-const MAX_FILE_SIZE: u64 = 100 * 1024; // 100KB
+/// Per-call cap on returned content (bytes of line text). Reads that would
+/// exceed it return the first lines that fit plus a continuation hint
+/// instead of an unbounded payload.
+const MAX_READ_CHARS: usize = 100 * 1024;
+/// Individual lines longer than this (minified JS, JSONL, ...) are truncated
+/// with a marker; line-based paging can't help inside a single line.
+const MAX_LINE_CHARS: usize = 2_000;
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -30,7 +36,7 @@ impl Tool for ReadFileTool {
     fn schema(&self) -> Value {
         json!({
             "name": "read_file",
-            "description": "Read file contents with line numbers and metadata. Use this instead of terminal cat/head/tail. Read a file in full once when it fits the limit. For a large file with an unknown target location, use search_files first, then read one exact surrounding range. Sequential ranges must not overlap; previously covered content is replayed from the task-local artifact.",
+            "description": "Read file contents with line numbers and metadata. Use this instead of terminal cat/head/tail. Read a file in full once when it fits the limit; oversized reads return the first page plus an exact continuation call to follow. For a large file with a known target, use search_files first, then read one exact surrounding range. Sequential ranges must not overlap; previously covered content is replayed from the task-local artifact.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -138,13 +144,31 @@ impl ReadFileTool {
             ));
         }
 
+        // Documents (PDF, Word) can't be decoded here, but dead-ending with
+        // "binary" makes models give up or ask the user to convert the file.
+        // Return an exact terminal extraction command instead. Checked before
+        // the NUL-byte binary test: small text-only PDFs contain no NUL bytes
+        // and would otherwise be dumped as raw PDF syntax.
+        if let Some(kind) = sniff_document_kind(&path).await? {
+            return Ok(ToolCallOutcome::from_output(document_extraction_stub(
+                kind,
+                path_str,
+                file_size,
+                modified.as_deref(),
+            )));
+        }
+
         // Check for binary
         if fs_utils::is_binary_file(&path).await? {
             let mut out = format!("Binary file: {}\nSize: {} bytes\n", path_str, file_size);
             if let Some(modified) = &modified {
                 out.push_str(&format!("Modified: {}\n", modified));
             }
-            out.push_str("Type: binary (cannot display contents)");
+            out.push_str("Type: binary (cannot display contents).\n");
+            out.push_str(&format!(
+                "If you need its contents, run the terminal tool with: file \"{}\" to identify the format, then choose a matching extraction command.",
+                shell_safe_path(path_str)
+            ));
             return Ok(ToolCallOutcome::from_output(out));
         }
 
@@ -169,13 +193,9 @@ impl ReadFileTool {
         }
 
         let uses_subset = start > 0 || end != usize::MAX || tail_lines.is_some();
-        if file_size > MAX_FILE_SIZE && !uses_subset {
-            anyhow::bail!(
-                "File too large: {} bytes (max {}). Use start_line/end_line or tail_lines to read a subset.",
-                file_size,
-                MAX_FILE_SIZE
-            );
-        }
+        // Oversized full reads no longer error: the per-call cap below
+        // returns the first page with an explicit continuation hint, which
+        // small-context models follow far more reliably than an error.
 
         let selection = if let Some(count) = tail_lines {
             ReadSelection::Tail { count }
@@ -224,6 +244,7 @@ impl ReadFileTool {
             file_size,
             modified: modified.clone(),
             selected_lines: selected.lines.clone(),
+            truncated: selected.truncated,
         };
 
         if total_lines == 0 {
@@ -271,8 +292,11 @@ pub(crate) fn render_read_file_output(metadata: &ReadFileResultMetadata) -> Stri
     let start_line = metadata.returned_start_line.unwrap_or(1);
     let end_line = metadata.returned_end_line.unwrap_or(start_line);
     let header_summary = match metadata.selection {
-        ReadFileSelectionMetadata::Full => format!("{} lines", metadata.total_lines),
-        ReadFileSelectionMetadata::BoundedRange { .. }
+        ReadFileSelectionMetadata::Full if !metadata.truncated => {
+            format!("{} lines", metadata.total_lines)
+        }
+        ReadFileSelectionMetadata::Full
+        | ReadFileSelectionMetadata::BoundedRange { .. }
         | ReadFileSelectionMetadata::OpenEndedRange { .. } => {
             format!(
                 "lines {}-{} of {}",
@@ -293,7 +317,100 @@ pub(crate) fn render_read_file_output(metadata: &ReadFileResultMetadata) -> Stri
     );
     let selected_content = metadata.selected_lines.join("\n");
     let formatted = fs_utils::format_with_line_numbers(&selected_content, start_line - 1);
-    format!("{}{}", header, formatted)
+    match continuation_hint(metadata) {
+        Some(hint) => format!("{}{}\n{}", header, formatted, hint),
+        None => format!("{}{}", header, formatted),
+    }
+}
+
+/// Render a read result within a character budget, cutting on line
+/// boundaries and appending an explicit continuation hint when lines had to
+/// be dropped. Results that fit are rendered unchanged, so big-budget models
+/// see exactly what they do today.
+///
+/// For tail selections the most recent lines are kept (the end of a log is
+/// the signal); for everything else the first lines are kept so sequential
+/// paging works.
+pub(crate) fn render_read_file_output_within(
+    metadata: &ReadFileResultMetadata,
+    max_chars: usize,
+) -> String {
+    let full = render_read_file_output(metadata);
+    if full.chars().count() <= max_chars {
+        return full;
+    }
+
+    // Reserve room for the header and continuation hint, then keep whole
+    // numbered lines until the budget is spent.
+    const HINT_RESERVE: usize = 360;
+    let start_line = metadata.returned_start_line.unwrap_or(1);
+    let end_line = metadata.returned_end_line.unwrap_or(start_line);
+    let keep_from_end = matches!(metadata.selection, ReadFileSelectionMetadata::Tail { .. });
+    let number_width = end_line.to_string().len().max(3) + 3; // "NNN | "
+    let budget = max_chars.saturating_sub(HINT_RESERVE + 120);
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let lines: Box<dyn Iterator<Item = &String>> = if keep_from_end {
+        Box::new(metadata.selected_lines.iter().rev())
+    } else {
+        Box::new(metadata.selected_lines.iter())
+    };
+    for line in lines {
+        let cost = number_width + line.chars().count() + 1;
+        if !kept.is_empty() && used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(line.clone());
+    }
+    if keep_from_end {
+        kept.reverse();
+    }
+
+    let mut adjusted = metadata.clone();
+    adjusted.truncated = true;
+    if keep_from_end {
+        adjusted.returned_start_line = Some(end_line.saturating_sub(kept.len()).saturating_add(1));
+    } else {
+        adjusted.returned_end_line = Some(start_line + kept.len() - 1);
+    }
+    adjusted.selected_lines = kept;
+    render_read_file_output(&adjusted)
+}
+
+/// Build an explicit, copyable next-call instruction for truncated reads.
+/// Small-context models follow a literal tool-call template far more
+/// reliably than a generic "output was truncated" notice.
+pub(crate) fn continuation_hint(metadata: &ReadFileResultMetadata) -> Option<String> {
+    if !metadata.truncated {
+        return None;
+    }
+    let start_line = metadata.returned_start_line?;
+    let end_line = metadata.returned_end_line?;
+    if matches!(metadata.selection, ReadFileSelectionMetadata::Tail { .. }) {
+        return Some(format!(
+            "[NOTE: tail output truncated to fit the output limit — only the last {} lines were returned; lines before {} are NOT visible to you. Use start_line/end_line to read earlier sections.]",
+            metadata.selected_lines.len(),
+            start_line
+        ));
+    }
+    let shown = end_line
+        .saturating_sub(start_line)
+        .saturating_add(1)
+        .max(50);
+    let next_start = end_line + 1;
+    let next_end = end_line.saturating_add(shown).min(metadata.total_lines);
+    Some(format!(
+        "[NOTE: output truncated at line {} — lines {}-{} of {} were NOT returned and are NOT visible to you. Do not guess their content. To continue reading, call read_file with {{\"path\": \"{}\", \"start_line\": {}, \"end_line\": {}}}.]",
+        end_line,
+        next_start,
+        metadata.total_lines,
+        metadata.total_lines,
+        metadata.display_path,
+        next_start,
+        next_end
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +430,23 @@ struct SelectedLines {
     total_lines: usize,
     start_index: usize,
     end_display: usize,
+    /// True when the per-call output cap dropped lines the request asked for.
+    truncated: bool,
+}
+
+/// Truncate a single overlong line, keeping a marker so the model knows
+/// content is missing rather than absent.
+fn cap_line(line: String) -> String {
+    if line.len() <= MAX_LINE_CHARS {
+        return line;
+    }
+    let total_chars = line.chars().count();
+    if total_chars <= MAX_LINE_CHARS {
+        return line;
+    }
+    let mut kept: String = line.chars().take(MAX_LINE_CHARS).collect();
+    kept.push_str(&format!("… [line truncated; {} chars total]", total_chars));
+    kept
 }
 
 async fn read_selected_lines(
@@ -323,66 +457,170 @@ async fn read_selected_lines(
     let mut reader = BufReader::new(file).lines();
 
     match selection {
-        ReadSelection::Full => {
-            let mut lines = Vec::new();
-            while let Some(line) = reader.next_line().await? {
-                lines.push(line);
-            }
-            let total_lines = lines.len();
-            Ok(SelectedLines {
-                lines,
-                total_lines,
-                start_index: 0,
-                end_display: total_lines,
-            })
-        }
-        ReadSelection::Range {
-            start,
-            end_exclusive,
-        } => {
+        ReadSelection::Full | ReadSelection::Range { .. } => {
+            let (start, end_exclusive) = match selection {
+                ReadSelection::Range {
+                    start,
+                    end_exclusive,
+                } => (start, end_exclusive),
+                _ => (0, None),
+            };
+
             let mut lines = Vec::new();
             let mut total_lines: usize = 0;
+            let mut stored_bytes: usize = 0;
+            let mut capped = false;
 
             while let Some(line) = reader.next_line().await? {
                 total_lines += 1;
                 let zero_based_index = total_lines - 1;
-                if zero_based_index >= start
-                    && end_exclusive.is_none_or(|end| zero_based_index < end)
-                {
-                    lines.push(line);
+                let in_range = zero_based_index >= start
+                    && end_exclusive.is_none_or(|end| zero_based_index < end);
+                if in_range && !capped {
+                    let line = cap_line(line);
+                    if !lines.is_empty() && stored_bytes + line.len() > MAX_READ_CHARS {
+                        capped = true;
+                    } else {
+                        stored_bytes += line.len() + 1;
+                        lines.push(line);
+                    }
                 }
+                // Keep counting to EOF so total_lines (and the continuation
+                // hint) stay accurate even after the cap is hit.
             }
 
-            let end_display = end_exclusive.unwrap_or(total_lines).min(total_lines);
+            let (end_display, truncated) = if capped {
+                (start + lines.len(), true)
+            } else {
+                (end_exclusive.unwrap_or(total_lines).min(total_lines), false)
+            };
             Ok(SelectedLines {
                 lines,
                 total_lines,
                 start_index: start,
                 end_display,
+                truncated,
             })
         }
         ReadSelection::Tail { count } => {
-            let mut lines = VecDeque::with_capacity(count);
+            let mut lines: VecDeque<String> = VecDeque::new();
             let mut total_lines: usize = 0;
+            let mut stored_bytes: usize = 0;
 
             while let Some(line) = reader.next_line().await? {
                 total_lines += 1;
                 if lines.len() == count {
-                    lines.pop_front();
+                    if let Some(dropped) = lines.pop_front() {
+                        stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
+                    }
                 }
+                let line = cap_line(line);
+                stored_bytes += line.len() + 1;
                 lines.push_back(line);
+                // Bound memory and output: keep only the most recent lines
+                // that fit the per-call cap.
+                while stored_bytes > MAX_READ_CHARS && lines.len() > 1 {
+                    if let Some(dropped) = lines.pop_front() {
+                        stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
+                    }
+                }
             }
 
             let lines: Vec<String> = lines.into_iter().collect();
             let start_index = total_lines.saturating_sub(lines.len());
+            let truncated = lines.len() < count.min(total_lines);
             Ok(SelectedLines {
                 lines,
                 total_lines,
                 start_index,
                 end_display: total_lines,
+                truncated,
             })
         }
     }
+}
+
+/// Document formats `read_file` cannot decode itself but whose text the
+/// model can extract with one terminal command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentKind {
+    Pdf,
+    Word,
+}
+
+/// Detect PDF (magic bytes) and Word documents (zip/OLE magic + extension).
+async fn sniff_document_kind(path: &Path) -> anyhow::Result<Option<DocumentKind>> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut header = [0u8; 8];
+    let n = file.read(&mut header).await?;
+    let header = &header[..n];
+
+    if header.starts_with(b"%PDF") {
+        return Ok(Some(DocumentKind::Pdf));
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    let is_zip = header.starts_with(b"PK\x03\x04");
+    let is_ole = header.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]);
+    match extension.as_deref() {
+        Some("docx") if is_zip => Ok(Some(DocumentKind::Word)),
+        Some("doc") if is_ole => Ok(Some(DocumentKind::Word)),
+        _ => Ok(None),
+    }
+}
+
+/// Escape double quotes so the suggested command stays a single shell token
+/// even for paths with spaces or quotes.
+fn shell_safe_path(path: &str) -> String {
+    path.replace('"', "\\\"")
+}
+
+fn document_extraction_stub(
+    kind: DocumentKind,
+    display_path: &str,
+    file_size: u64,
+    modified: Option<&str>,
+) -> String {
+    let label = match kind {
+        DocumentKind::Pdf => "PDF document",
+        DocumentKind::Word => "Word document",
+    };
+    let mut out = format!("{}: {}\nSize: {} bytes\n", label, display_path, file_size);
+    if let Some(modified) = modified {
+        out.push_str(&format!("Modified: {}\n", modified));
+    }
+    let quoted = shell_safe_path(display_path);
+    match kind {
+        DocumentKind::Pdf => {
+            out.push_str(
+                "This tool cannot extract PDF text directly. Run the terminal tool to extract it:\n",
+            );
+            out.push_str(&format!("  pdftotext -layout \"{}\" -\n", quoted));
+            #[cfg(target_os = "macos")]
+            out.push_str(&format!(
+                "If pdftotext is not installed, use Spotlight's extracted text:\n  mdls -raw -name kMDItemTextContent \"{}\"\n",
+                quoted
+            ));
+            #[cfg(not(target_os = "macos"))]
+            out.push_str(
+                "If pdftotext is not installed, install poppler-utils (e.g. apt install poppler-utils) or use pandoc.\n",
+            );
+        }
+        DocumentKind::Word => {
+            out.push_str(
+                "This tool cannot extract Word document text directly. Run the terminal tool to extract it:\n",
+            );
+            #[cfg(target_os = "macos")]
+            out.push_str(&format!("  textutil -convert txt -stdout \"{}\"\n", quoted));
+            #[cfg(not(target_os = "macos"))]
+            out.push_str(&format!("  pandoc -t plain \"{}\"\n", quoted));
+        }
+    }
+    out.push_str("Do not ask the user to convert the file — extract it yourself.");
+    out
 }
 
 async fn sniff_file_image_mime(path: &Path) -> anyhow::Result<Option<&'static str>> {
@@ -634,6 +872,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pdf_file_returns_extraction_hint_not_dead_end() {
+        let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        f.write_all(b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n")
+            .unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        let args = json!({"path": &path}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("PDF"));
+        assert!(
+            outcome.output.contains("pdftotext"),
+            "must give an exact terminal extraction command, got: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains(&path),
+            "extraction command must include the file path"
+        );
+        assert!(!outcome.output.contains("cannot display contents"));
+        assert!(outcome.metadata.read_file.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pdf_detected_by_magic_even_without_null_bytes() {
+        // A small text-only PDF can pass the NUL-byte binary check; raw PDF
+        // syntax must never be dumped as if it were the document text.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "%PDF-1.4\nplain ascii body without nulls\n").unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("pdftotext"));
+        assert!(!outcome.output.contains("plain ascii body"));
+    }
+
+    #[tokio::test]
+    async fn test_docx_file_returns_extraction_hint() {
+        let mut f = tempfile::Builder::new().suffix(".docx").tempfile().unwrap();
+        f.write_all(b"PK\x03\x04docx-zip-payload").unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.output.contains("Word document"),
+            "got: {}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("textutil") || outcome.output.contains("pandoc"),
+            "must suggest a concrete extraction command, got: {}",
+            outcome.output
+        );
+        assert!(!outcome.output.contains("cannot display contents"));
+    }
+
+    #[tokio::test]
+    async fn test_generic_binary_stub_suggests_identifying_format() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0x00, 0x01, 0x02, 0x03, 0x04]).unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("cannot display contents"));
+        assert!(
+            outcome.output.contains("terminal"),
+            "binary stub must point to the terminal tool instead of dead-ending, got: {}",
+            outcome.output
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_file_non_image_binary_still_stubbed() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[0x00, 0x01, 0x02, 0x03, 0x04]).unwrap();
@@ -667,12 +992,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_long_lines_truncated_with_marker() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "short line").unwrap();
+        writeln!(f, "{}", "z".repeat(10_000)).unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.output.contains("line truncated"));
+        assert!(!outcome.output.contains(&"z".repeat(3_000)));
+        let metadata = outcome.metadata.read_file.unwrap();
+        assert!(
+            metadata.selected_lines[1].chars().count() < 2_100,
+            "stored line should be capped, got {} chars",
+            metadata.selected_lines[1].chars().count()
+        );
+        assert_eq!(metadata.selected_lines[0], "short line");
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_range_read_is_capped_with_continuation_hint() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 1..=25_000 {
+            writeln!(f, "line number {} with some padding text", i).unwrap();
+        }
+        let args = json!({"path": f.path().to_str().unwrap(), "start_line": 1, "end_line": 25_000})
+            .to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome.metadata.read_file.clone().unwrap();
+
+        assert!(metadata.truncated, "capped range read must set truncated");
+        assert!(
+            metadata.selected_lines.len() < 25_000,
+            "returned {} lines, expected capped subset",
+            metadata.selected_lines.len()
+        );
+        assert_eq!(metadata.total_lines, 25_000);
+        let end = metadata.returned_end_line.unwrap();
+        assert!(
+            outcome
+                .output
+                .contains(&format!("\"start_line\": {}", end + 1)),
+            "output must include an exact continuation call; output tail: {}",
+            &outcome.output[outcome.output.len().saturating_sub(400)..]
+        );
+        assert!(outcome.output.contains("NOT returned"));
+    }
+
+    #[tokio::test]
+    async fn test_full_read_of_large_file_returns_first_page() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 1..=25_000 {
+            writeln!(f, "line number {} with some padding text", i).unwrap();
+        }
+        assert!(f.as_file().metadata().unwrap().len() > MAX_READ_CHARS as u64);
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .expect("oversized full read should auto-page, not error");
+        let metadata = outcome.metadata.read_file.clone().unwrap();
+
+        assert!(metadata.truncated);
+        assert_eq!(metadata.returned_start_line, Some(1));
+        assert_eq!(metadata.total_lines, 25_000);
+        assert!(outcome.output.contains("| line number 1 "));
+        assert!(outcome.output.contains("NOT returned"));
+        let end = metadata.returned_end_line.unwrap();
+        assert!(outcome
+            .output
+            .contains(&format!("\"start_line\": {}", end + 1)));
+    }
+
+    #[tokio::test]
+    async fn test_huge_tail_lines_request_is_bounded() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc\n").unwrap();
+        let args =
+            json!({"path": f.path().to_str().unwrap(), "tail_lines": 1_000_000_u64}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome.metadata.read_file.unwrap();
+
+        assert_eq!(metadata.selected_lines, vec!["a", "b", "c"]);
+        assert!(!metadata.truncated);
+    }
+
+    #[tokio::test]
+    async fn test_small_full_read_has_no_truncation_hint() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "alpha\nbeta\ngamma\n").unwrap();
+        let args = json!({"path": f.path().to_str().unwrap()}).to_string();
+
+        let outcome = ReadFileTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+        let metadata = outcome.metadata.read_file.unwrap();
+
+        assert!(!metadata.truncated);
+        assert!(!outcome.output.contains("NOT returned"));
+        assert!(outcome.output.contains("3 lines"));
+    }
+
+    fn render_test_metadata(line_count: usize) -> ReadFileResultMetadata {
+        ReadFileResultMetadata {
+            display_path: "/tmp/example.txt".to_string(),
+            canonical_path: "/tmp/example.txt".to_string(),
+            selection: ReadFileSelectionMetadata::Full,
+            returned_start_line: Some(1),
+            returned_end_line: Some(line_count),
+            total_lines: line_count,
+            file_size: (line_count * 32) as u64,
+            modified: Some("2026-06-10T00:00:00+00:00".to_string()),
+            selected_lines: (1..=line_count)
+                .map(|i| format!("content line {} with some padding", i))
+                .collect(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn test_render_within_budget_identical_when_it_fits() {
+        let metadata = render_test_metadata(5);
+        assert_eq!(
+            render_read_file_output_within(&metadata, 10_000),
+            render_read_file_output(&metadata)
+        );
+    }
+
+    #[test]
+    fn test_render_within_budget_cuts_on_line_boundary_with_hint() {
+        let metadata = render_test_metadata(500);
+        let out = render_read_file_output_within(&metadata, 2_000);
+
+        assert!(
+            out.chars().count() <= 2_400,
+            "output should respect budget (+slack), got {} chars",
+            out.chars().count()
+        );
+        assert!(out.contains("NOT returned"));
+        assert!(out.contains("\"start_line\": "));
+        // Every rendered content line must be complete — cut between lines,
+        // never inside one.
+        for line in out.lines() {
+            if let Some((_, content)) = line.split_once(" | ") {
+                assert!(
+                    content.ends_with("with some padding"),
+                    "line cut mid-content: {line:?}"
+                );
+            }
+        }
+        // The hint must point at the first line that was dropped.
+        let last_shown = out
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" | ")
+                    .and_then(|(n, _)| n.trim().parse::<usize>().ok())
+            })
+            .max()
+            .unwrap();
+        assert!(out.contains(&format!("\"start_line\": {}", last_shown + 1)));
+    }
+
+    #[test]
+    fn test_render_within_budget_tail_keeps_most_recent_lines() {
+        let mut metadata = render_test_metadata(500);
+        metadata.selection = ReadFileSelectionMetadata::Tail {
+            requested_lines: 500,
+        };
+        let out = render_read_file_output_within(&metadata, 2_000);
+
+        assert!(
+            out.contains("| content line 500 "),
+            "tail render must keep the final lines"
+        );
+        assert!(
+            !out.contains("| content line 1 "),
+            "tail render must drop the oldest lines first"
+        );
+    }
+
+    #[test]
+    fn test_render_within_budget_always_keeps_at_least_one_line() {
+        let metadata = render_test_metadata(50);
+        let out = render_read_file_output_within(&metadata, 10);
+        assert!(out.contains("| content line 1 "));
+    }
+
+    #[tokio::test]
     async fn test_read_large_file_with_line_range() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         for i in 1..=25_000 {
             writeln!(f, "line {}", i).unwrap();
         }
-        assert!(f.as_file().metadata().unwrap().len() > MAX_FILE_SIZE);
+        assert!(f.as_file().metadata().unwrap().len() > MAX_READ_CHARS as u64);
 
         let args =
             json!({"path": f.path().to_str().unwrap(), "start_line": 24998, "end_line": 25000})
@@ -691,7 +1217,7 @@ mod tests {
         for i in 1..=25_000 {
             writeln!(f, "line {}", i).unwrap();
         }
-        assert!(f.as_file().metadata().unwrap().len() > MAX_FILE_SIZE);
+        assert!(f.as_file().metadata().unwrap().len() > MAX_READ_CHARS as u64);
 
         let args = json!({"path": f.path().to_str().unwrap(), "tail_lines": 3}).to_string();
         let result = ReadFileTool.call(&args).await.unwrap();

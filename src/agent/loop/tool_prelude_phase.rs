@@ -389,6 +389,23 @@ fn turn_is_approval_of_prior_proposal(turn_context: &TurnContext) -> bool {
         && assistant_proposed_action(&turn_context.recent_messages)
 }
 
+/// When the turn is a short approval of the assistant's own prior proposal,
+/// return that proposal text so the loop can anchor execution to it.
+/// Without the anchor, small models drift into re-planning ("Yes, read the
+/// Right one" → six fresh searches and no read).
+pub(in crate::agent) fn approved_proposal_text(turn_context: &TurnContext) -> Option<String> {
+    if !turn_is_approval_of_prior_proposal(turn_context) {
+        return None;
+    }
+    turn_context
+        .recent_messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .map(|content| crate::utils::truncate_str(content.trim(), 600))
+}
+
 /// A read-only lookup turn: the user asked a question, so a tool the model
 /// reaches for is almost certainly to *observe* state, not to mutate it.
 fn turn_is_interrogative_lookup(turn_context: &TurnContext) -> bool {
@@ -417,9 +434,14 @@ fn turn_is_interrogative_lookup(turn_context: &TurnContext) -> bool {
 /// Whether the plain-text redirect should spare this blocked tool. Pure-read
 /// tools never irreversibly mutate, so blocking them only forces the model to
 /// fabricate an answer instead of looking it up — always exempt. `terminal`
-/// can also mutate, so it is exempt only on an interrogative lookup turn;
+/// can also mutate, so it is exempt when the turn is an interrogative lookup
+/// OR the command itself classifies as observation-only (find/ls/grep/...);
 /// destructive commands remain gated by command-risk approval downstream.
-fn plain_text_redirect_exempts_lookup(tool_name: &str, turn_context: &TurnContext) -> bool {
+fn plain_text_redirect_exempts_lookup(
+    tool_name: &str,
+    arguments: &str,
+    turn_context: &TurnContext,
+) -> bool {
     const PURE_READ_TOOLS: &[&str] = &[
         "read_file",
         "search_files",
@@ -430,7 +452,23 @@ fn plain_text_redirect_exempts_lookup(tool_name: &str, turn_context: &TurnContex
     if PURE_READ_TOOLS.contains(&tool_name) {
         return true;
     }
-    tool_name == "terminal" && turn_is_interrogative_lookup(turn_context)
+    if tool_name != "terminal" {
+        return false;
+    }
+    turn_is_interrogative_lookup(turn_context) || terminal_command_is_read_only(arguments)
+}
+
+/// True when a terminal call's command classifies as pure observation
+/// (observes state, mutates nothing). Malformed arguments fail closed.
+fn terminal_command_is_read_only(arguments: &str) -> bool {
+    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let semantics = crate::tools::command_semantics::classify_shell_command(command);
+    semantics.observes_state() && !semantics.mutates_state()
 }
 
 fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
@@ -451,6 +489,15 @@ fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
     // hints, just not for hard tool blocking.
     !turn_context.completion_contract.expects_mutation
         && !turn_context.completion_contract.requires_observation
+}
+
+/// The text-only drift redirect protects a plain-text turn from drifting
+/// into tool execution — but only before any tool has actually run. Once
+/// tools have legitimately executed this turn (e.g. exempted lookups), the
+/// turn has proven it needs them; redirecting a later call to plain text
+/// forces the model to fabricate mid-chain.
+fn text_only_redirect_applies(turn_context: &TurnContext, tool_calls_executed: usize) -> bool {
+    tool_calls_executed == 0 && turn_prefers_plain_text_completion(turn_context)
 }
 
 fn summarize_tool_arguments(arguments: &str) -> Value {
@@ -848,7 +895,7 @@ pub(super) async fn run_tool_prelude_phase(
             .tool_calls
             .iter()
             .filter(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
-            .all(|tc| plain_text_redirect_exempts_lookup(&tc.name, turn_context));
+            .all(|tc| plain_text_redirect_exempts_lookup(&tc.name, &tc.arguments, turn_context));
         // Child sessions (spawned TaskLead/Executor) exist to execute actions —
         // never redirect them to plain-text mode. `sub-` is the legacy prefix
         // kept for in-flight tasks; new sessions use `specialist:`.
@@ -864,7 +911,7 @@ pub(super) async fn run_tool_prelude_phase(
             && !any_computer_use
             && !all_side_effecting_are_memory
             && !all_side_effecting_are_lookup
-            && turn_prefers_plain_text_completion(turn_context)
+            && text_only_redirect_applies(turn_context, execution_state.tool_calls_used)
         {
             validation_state.note_replan();
             learning_ctx.record_replay_note(
@@ -1491,6 +1538,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn approved_proposal_text_returns_the_proposal_on_short_approval() {
+        // "Would you like me to read X?" → "Yes, read the Right one" must
+        // anchor the turn to the proposal so the model executes it instead
+        // of drifting into re-searching.
+        let turn = turn_with(
+            "Yes, read the Right one",
+            vec![assistant_proposal_msg()],
+            false,
+            false,
+        );
+        let proposal = super::approved_proposal_text(&turn).expect("approval should anchor");
+        assert!(proposal.contains("Would you like me to"));
+    }
+
+    #[test]
+    fn approved_proposal_text_ignores_non_approval_turns() {
+        let question = turn_with(
+            "what's the weather like?",
+            vec![assistant_proposal_msg()],
+            false,
+            false,
+        );
+        assert!(super::approved_proposal_text(&question).is_none());
+
+        let no_proposal = turn_with("yes", vec![], false, false);
+        assert!(super::approved_proposal_text(&no_proposal).is_none());
+    }
+
+    #[test]
+    fn text_only_redirect_only_applies_before_any_tool_has_executed() {
+        // Once observation tools have legitimately run this turn, the turn has
+        // proven it needs tools; redirecting a later call to plain text forces
+        // fabrication mid-chain (the pdftotext-after-read_file failure).
+        let turn = turn_with(
+            "Can you read the file and tell me what it's about? Offer Letter (1).pdf",
+            vec![],
+            false,
+            false,
+        );
+        assert!(super::text_only_redirect_applies(&turn, 0));
+        assert!(!super::text_only_redirect_applies(&turn, 3));
+    }
+
+    #[test]
+    fn read_only_terminal_command_exempt_from_plain_text_redirect() {
+        // "Can you read the file and tell me what it's about? <file>.pdf" is
+        // not interrogative by shape (doesn't end with '?'), but the model's
+        // `find` fallback is a pure lookup — blocking it forces fabrication.
+        let turn = turn_with(
+            "Can you read the file and tell me what it's about? Offer Letter (1).pdf",
+            vec![],
+            false,
+            false,
+        );
+        let arguments =
+            r#"{"action": "run", "command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#;
+        assert!(super::plain_text_redirect_exempts_lookup(
+            "terminal", arguments, &turn
+        ));
+    }
+
+    #[test]
+    fn mutating_terminal_command_still_redirected_on_text_only_turn() {
+        let turn = turn_with("write me a short poem about rust", vec![], false, false);
+        let arguments = r#"{"action": "run", "command": "rm -rf ~/tmp/scratch"}"#;
+        assert!(!super::plain_text_redirect_exempts_lookup(
+            "terminal", arguments, &turn
+        ));
+    }
+
+    #[test]
+    fn malformed_terminal_arguments_not_exempt() {
+        let turn = turn_with("write me a short poem about rust", vec![], false, false);
+        assert!(!super::plain_text_redirect_exempts_lookup(
+            "terminal", "not-json", &turn
+        ));
+    }
+
     fn assistant_proposal_msg() -> Value {
         json!({
             "role": "assistant",
@@ -1581,7 +1707,11 @@ mod tests {
         // instead of fabricating an answer.
         let tc = turn_with("How many users?", vec![], false, false);
         assert!(turn_is_interrogative_lookup(&tc));
-        assert!(plain_text_redirect_exempts_lookup("terminal", &tc));
+        assert!(plain_text_redirect_exempts_lookup(
+            "terminal",
+            r#"{"action": "run", "command": "drush user:list"}"#,
+            &tc
+        ));
     }
 
     #[test]
@@ -1594,7 +1724,11 @@ mod tests {
         ] {
             let tc = turn_with(q, vec![], false, false);
             assert!(
-                plain_text_redirect_exempts_lookup("terminal", &tc),
+                plain_text_redirect_exempts_lookup(
+                    "terminal",
+                    r#"{"action": "run", "command": "drush user:list"}"#,
+                    &tc
+                ),
                 "terminal lookup should be spared for: {q:?}"
             );
         }
@@ -1607,7 +1741,11 @@ mod tests {
         // gated by command-risk approval downstream.
         let tc = turn_with("Write me a poem about cats.", vec![], false, false);
         assert!(!turn_is_interrogative_lookup(&tc));
-        assert!(!plain_text_redirect_exempts_lookup("terminal", &tc));
+        assert!(!plain_text_redirect_exempts_lookup(
+            "terminal",
+            r#"{"action": "run", "command": "npm run build"}"#,
+            &tc
+        ));
     }
 
     #[test]
@@ -1617,7 +1755,7 @@ mod tests {
         assert!(!turn_is_interrogative_lookup(&tc));
         for tool in ["read_file", "search_files", "web_search", "web_fetch"] {
             assert!(
-                plain_text_redirect_exempts_lookup(tool, &tc),
+                plain_text_redirect_exempts_lookup(tool, "{}", &tc),
                 "pure-read tool should always be spared: {tool}"
             );
         }

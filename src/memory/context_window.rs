@@ -377,8 +377,6 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
 
     // Keep space for marker text; preserve as much head+tail signal as possible.
     const ANNOTATION_OVERHEAD: usize = 64;
-    const MAX_HEAD_CHARS: usize = 1000;
-    const MAX_TAIL_CHARS: usize = 800;
     const MIN_HEAD_CHARS: usize = 120;
     const MIN_TAIL_CHARS: usize = 80;
 
@@ -424,11 +422,12 @@ pub fn compress_tool_result(tool_name: &str, result: &str, max_chars: usize) -> 
         );
     }
 
+    // Head/tail scale with the configured budget so raising
+    // max_tool_result_chars genuinely increases what the model sees; only
+    // the MIN floors are fixed (they keep tiny budgets usable).
     let available = max_chars.saturating_sub(ANNOTATION_OVERHEAD);
-    let mut head_chars = (available * 5) / 9;
-    let mut tail_chars = available.saturating_sub(head_chars);
-    head_chars = head_chars.clamp(MIN_HEAD_CHARS, MAX_HEAD_CHARS);
-    tail_chars = tail_chars.clamp(MIN_TAIL_CHARS, MAX_TAIL_CHARS);
+    let mut head_chars = ((available * 5) / 9).max(MIN_HEAD_CHARS);
+    let mut tail_chars = available.saturating_sub(head_chars).max(MIN_TAIL_CHARS);
     if head_chars + tail_chars > available {
         tail_chars = available.saturating_sub(head_chars);
     }
@@ -672,6 +671,9 @@ pub async fn extract_inline_facts(
                         CORRECTIONS: If the user is correcting or updating previously stated information (e.g., \"actually\", \"not X, it's Y\", \
                         \"I changed\", \"I meant\"), extract the CORRECTED fact using the same key format as the original would have used. \
                         The corrected value will automatically supersede the old one.\n\n\
+                        IDENTITY: The 'user' category is ONLY for facts the user states about THEMSELVES in first person. \
+                        Never store another person's name (friend, family member, client, applicant, public figure) under a user \
+                        identity key like 'name'. When the user talks about someone else, do not extract a 'user' fact from it.\n\n\
                         If nothing is worth remembering, return an empty array: []\n\n\
                         Examples:\n\
                         - \"My dog's name is Bella\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Bella\"}]\n\
@@ -752,6 +754,37 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
     }
 }
 
+/// Identity-class `user` fact keys that require first-person evidence in the
+/// user's own message before they may be persisted.
+const USER_IDENTITY_KEYS: &[&str] = &["name", "full_name", "first_name", "last_name", "nickname"];
+
+/// Returns true when an extracted `user` identity fact (e.g. `name`) has no
+/// supporting evidence in the user's own words.
+///
+/// Guards against the extraction model misattributing a third-party name
+/// (someone merely mentioned in conversation) — or a hallucinated one — as
+/// the user's identity, which then poisons every future prompt that injects
+/// the user profile.
+pub(crate) fn identity_fact_lacks_user_evidence(
+    category: &str,
+    key: &str,
+    value: &str,
+    user_text: &str,
+) -> bool {
+    if !category.trim().eq_ignore_ascii_case("user") {
+        return false;
+    }
+    let key_norm = key.trim().to_ascii_lowercase();
+    if !USER_IDENTITY_KEYS.contains(&key_norm.as_str()) {
+        return false;
+    }
+    let value_norm = value.trim().to_lowercase();
+    if value_norm.len() <= 1 {
+        return true;
+    }
+    !user_text.to_lowercase().contains(&value_norm)
+}
+
 /// Run progressive fact extraction in the background.
 /// Spawns a tokio task that extracts facts and stores them immediately.
 #[allow(clippy::too_many_arguments)]
@@ -785,7 +818,26 @@ pub fn spawn_progressive_extraction(
         .await
         {
             Ok(facts) if !facts.is_empty() => {
+                let source_excerpt = crate::utils::truncate_str(&user_text, 200);
+                let first_seen_at = chrono::Utc::now();
+                let mut written: Vec<serde_json::Value> = Vec::new();
                 for fact in facts {
+                    // Identity facts (user.name etc.) must be evidenced by the
+                    // user's own words — third-party names mentioned in
+                    // conversation are not the user's identity.
+                    if identity_fact_lacks_user_evidence(
+                        &fact.category,
+                        &fact.key,
+                        &fact.value,
+                        &user_text,
+                    ) {
+                        warn!(
+                            key = fact.key,
+                            value = fact.value,
+                            "Skipping user identity fact without evidence in the user's message"
+                        );
+                        continue;
+                    }
                     // Progressive extraction can capture personal info; default to
                     // conservative privacy unless explicitly promoted later.
                     let privacy = if fact.category.trim().eq_ignore_ascii_case("user") {
@@ -794,17 +846,51 @@ pub fn spawn_progressive_extraction(
                         crate::types::FactPrivacy::Channel
                     };
                     if let Err(e) = state
-                        .upsert_fact(
+                        .upsert_fact_with_provenance(
                             &fact.category,
                             &fact.key,
                             &fact.value,
                             "progressive",
                             channel_id.as_deref(),
                             privacy,
+                            Some(first_seen_at),
+                            Some(source_excerpt.as_str()),
                         )
                         .await
                     {
                         warn!(error = %e, key = fact.key, "Failed to store progressive fact");
+                    } else {
+                        written.push(json!({
+                            "category": fact.category,
+                            "key": fact.key,
+                            "value": fact.value,
+                        }));
+                    }
+                }
+                // Flight-recorder entry so every background memory write is
+                // auditable: which facts, from which excerpt, into which channel.
+                if !written.is_empty() {
+                    let event = crate::events::Event::new(
+                        "background:progressive_extraction",
+                        crate::events::EventType::DecisionPoint,
+                        json!({
+                            "code": "memory_write",
+                            "decision_type": "memory_write",
+                            "severity": "info",
+                            "summary": format!(
+                                "Progressive extraction stored {} fact(s)",
+                                written.len()
+                            ),
+                            "metadata": {
+                                "source": "progressive",
+                                "channel_id": channel_id,
+                                "facts": written,
+                                "source_excerpt": source_excerpt,
+                            },
+                        }),
+                    );
+                    if let Err(e) = event_store.append(event).await {
+                        debug!(error = %e, "Failed to record memory_write event");
                     }
                 }
             }
@@ -902,6 +988,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_guard_blocks_unevidenced_user_name() {
+        // Third-party or hallucinated name not present in the user's words.
+        assert!(identity_fact_lacks_user_evidence(
+            "user",
+            "name",
+            "Edison Mendez",
+            "Tell me about the beca applicant and their nationality"
+        ));
+    }
+
+    #[test]
+    fn identity_guard_allows_first_person_name() {
+        assert!(!identity_fact_lacks_user_evidence(
+            "user",
+            "name",
+            "David Loor",
+            "Hi, my name is David Loor and I live in Quito"
+        ));
+        // Case-insensitive match.
+        assert!(!identity_fact_lacks_user_evidence(
+            "user",
+            "Name",
+            "david loor",
+            "I'm David Loor"
+        ));
+    }
+
+    #[test]
+    fn identity_guard_ignores_non_identity_facts() {
+        // Other user facts are not gated (dog_name is not the user's identity).
+        assert!(!identity_fact_lacks_user_evidence(
+            "user",
+            "dog_name",
+            "Bella",
+            "what's the weather?"
+        ));
+        // Non-user categories are never gated.
+        assert!(!identity_fact_lacks_user_evidence(
+            "project",
+            "name",
+            "aidaemon",
+            "unrelated text"
+        ));
+    }
+
+    #[test]
+    fn identity_guard_blocks_trivial_values() {
+        assert!(identity_fact_lacks_user_evidence("user", "name", "x", "x"));
+        assert!(identity_fact_lacks_user_evidence(
+            "user", "name", " ", "anything"
+        ));
+    }
+
+    #[test]
     fn multimodal_audio_surrogate_does_not_explode_estimate() {
         let huge_b64 = "A".repeat(1_400_000);
         let messages = vec![json!({
@@ -990,6 +1130,49 @@ mod tests {
         assert!(result.contains("OUTPUT TRUNCATED"));
         assert!(result.contains("HEAD:"));
         assert!(result.contains(":TAIL"));
+    }
+
+    #[test]
+    fn test_compress_tool_result_uses_full_configured_budget() {
+        // A result just over the limit must keep most of the configured
+        // budget, not get clamped to a fixed ~1800 chars regardless of config.
+        let long = format!("HEAD:{}:TAIL", "x".repeat(4500));
+        let result = compress_tool_result("test_tool", &long, 4000);
+        let kept = result.chars().count();
+        assert!(
+            kept > 3000,
+            "4000-char budget should retain >3000 chars, kept {kept}"
+        );
+    }
+
+    #[test]
+    fn test_compress_tool_result_scales_with_larger_budget() {
+        // Raising max_tool_result_chars must actually increase retained
+        // content (important when users configure big-context models).
+        let long = format!("HEAD:{}:TAIL", "x".repeat(30000));
+        let small = compress_tool_result("test_tool", &long, 4000);
+        let large = compress_tool_result("test_tool", &long, 16000);
+        let small_kept = small.chars().count();
+        let large_kept = large.chars().count();
+        assert!(
+            large_kept > small_kept * 2,
+            "16k budget should retain far more than 4k budget (small={small_kept}, large={large_kept})"
+        );
+        assert!(
+            large_kept > 12000,
+            "16k budget should retain >12000 chars, kept {large_kept}"
+        );
+        assert!(large.contains("HEAD:"));
+        assert!(large.contains(":TAIL"));
+        assert!(large.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn test_compress_tool_result_tiny_budget_still_bounded() {
+        let long = "y".repeat(10000);
+        let result = compress_tool_result("test_tool", &long, 300);
+        assert!(result.contains("OUTPUT TRUNCATED"));
+        assert!(result.chars().count() < 1000);
     }
 
     #[test]

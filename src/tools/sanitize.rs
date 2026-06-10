@@ -436,6 +436,35 @@ pub fn sanitize_user_facing_reply(reply: &str) -> String {
     strip_tool_name_references(&meta_cleaned)
 }
 
+/// Detect a reply that sanitization reduced to a dangling lead-in stub.
+///
+/// When a model regurgitates a tool result verbatim ("Here are the results:
+/// [UNTRUSTED EXTERNAL DATA ...] No matches found"), stripping the internal
+/// markers can leave only the lead-in ("Here are the results:") — a reply
+/// that carries no answer. Callers should fall back to an activity summary.
+///
+/// `pre_sanitize_chars` is the trimmed char count before sanitization.
+pub fn reply_gutted_by_sanitization(pre_sanitize_chars: usize, sanitized: &str) -> bool {
+    if pre_sanitize_chars == 0 {
+        return false;
+    }
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let post_chars = trimmed.chars().count();
+    // Lost more than half the content AND what remains is a short lead-in
+    // ending in a colon with no complete sentence before it — the classic
+    // dangling "Here are the results:" stub. A reply that still contains a
+    // full sentence ("...role. Key terms include:") carries an answer.
+    let has_complete_sentence =
+        trimmed.contains(". ") || trimmed.contains("! ") || trimmed.contains("? ");
+    post_chars < 80
+        && pre_sanitize_chars > post_chars * 2
+        && trimmed.ends_with(':')
+        && !has_complete_sentence
+}
+
 /// Lightweight second-pass sanitizer for `handle_message()`.
 ///
 /// Unlike the full `sanitize_user_facing_reply()`, this catches control
@@ -1003,6 +1032,39 @@ pub fn is_trusted_tool(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::types::ChannelVisibility;
+
+    #[test]
+    fn gutted_reply_detects_dangling_lead_in_stub() {
+        // "Here are the results: [UNTRUSTED EXTERNAL DATA ...] No matches"
+        // sanitizes down to just the lead-in — carries no answer.
+        let sanitized = "Here are the results:";
+        assert!(reply_gutted_by_sanitization(160, sanitized));
+    }
+
+    #[test]
+    fn gutted_reply_detects_fully_stripped_reply() {
+        assert!(reply_gutted_by_sanitization(80, "   "));
+    }
+
+    #[test]
+    fn gutted_reply_ignores_untouched_short_replies() {
+        // Nothing was stripped (pre == post) — even if it ends with ':'.
+        let reply = "Here are the results:";
+        assert!(!reply_gutted_by_sanitization(reply.chars().count(), reply));
+    }
+
+    #[test]
+    fn gutted_reply_ignores_substantive_replies() {
+        let reply =
+            "The offer letter is from WebFirst for a Lead Developer role. Key terms include:";
+        assert!(!reply_gutted_by_sanitization(400, reply));
+        assert!(!reply_gutted_by_sanitization(reply.chars().count(), reply));
+    }
+
+    #[test]
+    fn gutted_reply_ignores_empty_input() {
+        assert!(!reply_gutted_by_sanitization(0, ""));
+    }
 
     #[test]
     fn user_facing_activity_relabels_internal_tool_names() {

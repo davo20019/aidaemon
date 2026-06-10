@@ -86,8 +86,8 @@ pub use verification::VerificationTracker;
 // Deterministic tools
 pub(crate) mod fs_utils;
 mod read_file;
-pub(crate) use read_file::render_read_file_output;
 pub use read_file::ReadFileTool;
+pub(crate) use read_file::{render_read_file_output, render_read_file_output_within};
 mod write_file;
 pub use write_file::WriteFileTool;
 mod edit_file;

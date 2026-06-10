@@ -116,8 +116,20 @@ fn parse_shell_structure(command: &str) -> Option<ShellStructure> {
     })
 }
 
+/// Remove redirections that discard or duplicate streams without touching
+/// the filesystem (`2>/dev/null`, `>/dev/null`, `&>/dev/null`, `2>&1`).
+/// They are pure noise suppression, not mutations.
+fn strip_non_mutating_redirections(command: &str) -> String {
+    static NON_MUTATING_REDIRECT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?:[0-9]+|&)?>{1,2}\s*/dev/null|[0-9]+>&[0-9]+").unwrap()
+        });
+    NON_MUTATING_REDIRECT.replace_all(command, " ").into_owned()
+}
+
 pub(crate) fn classify_shell_command(command: &str) -> ToolCallSemantics {
-    let Some(structure) = parse_shell_structure(command) else {
+    let command = strip_non_mutating_redirections(command);
+    let Some(structure) = parse_shell_structure(&command) else {
         return ToolCallSemantics::mutation();
     };
     let mut observes = false;
@@ -152,6 +164,18 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
 
     if lower == "cd" || lower.starts_with("cd ") {
         return ToolCallSemantics::administrative();
+    }
+
+    // Document text extractors recommended by read_file's PDF/Word stubs.
+    // `pdftotext <in> -` streams to stdout (pure observation); without the
+    // trailing `-` it writes a .txt next to the input (mutation).
+    if lower.starts_with("pdftotext ") {
+        return if lower.ends_with(" -") {
+            ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent)
+        } else {
+            ToolCallSemantics::mutation()
+        };
     }
 
     if matches!(
@@ -222,6 +246,10 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
             "grep ",
             "stat ",
             "wc ",
+            "mdls ",
+            "mdfind ",
+            "locate ",
+            "strings ",
             "date",
             "uname",
             "whoami",
@@ -330,6 +358,60 @@ fn classify_simple_shell_command(command: &str) -> ToolCallSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_extractors_classify_as_observation() {
+        // These are the exact commands read_file's PDF/Word stubs recommend —
+        // they must classify as observation or the text-only gate blocks the
+        // very command we told the model to run.
+        for cmd in [
+            "pdftotext -layout \"/Users/x/Downloads/Offer Letter (1).pdf\" -",
+            "mdls -raw -name kMDItemTextContent \"/Users/x/file.pdf\"",
+            "mdfind -name \"Offer Letter\"",
+            "strings /tmp/blob.bin",
+        ] {
+            let semantics = classify_shell_command(cmd);
+            assert!(
+                semantics.observes_state() && !semantics.mutates_state(),
+                "expected pure observation for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdftotext_without_stdout_target_still_mutates() {
+        // `pdftotext report.pdf` writes report.txt next to the input.
+        let semantics = classify_shell_command("pdftotext report.pdf");
+        assert!(semantics.mutates_state());
+    }
+
+    #[test]
+    fn dev_null_redirect_does_not_count_as_mutation() {
+        // `find ... 2>/dev/null` is the canonical noise-suppressed lookup;
+        // discarding output mutates nothing.
+        let semantics = classify_shell_command("find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null");
+        assert!(semantics.observes_state());
+        assert!(!semantics.mutates_state());
+    }
+
+    #[test]
+    fn stderr_to_stdout_dup_does_not_count_as_mutation() {
+        let semantics = classify_shell_command("ls -la /tmp 2>&1");
+        assert!(semantics.observes_state());
+        assert!(!semantics.mutates_state());
+    }
+
+    #[test]
+    fn redirect_to_real_file_still_mutates() {
+        let semantics = classify_shell_command("ls -la > files.txt");
+        assert!(semantics.mutates_state());
+    }
+
+    #[test]
+    fn append_to_dev_null_does_not_mutate() {
+        let semantics = classify_shell_command("grep -r foo . >> /dev/null");
+        assert!(!semantics.mutates_state());
+    }
 
     #[test]
     fn test_strip_leading_cd() {

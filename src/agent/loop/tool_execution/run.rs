@@ -45,6 +45,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let learning_ctx = &mut *ctx.learning_ctx;
     let task_tokens_used = ctx.task_tokens_used;
     let _user_text = ctx.user_text;
+    let model = ctx.model;
     let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
     let active_skill_names = ctx.active_skill_names;
     let active_untrusted_external_reference_skills = ctx.active_untrusted_external_reference_skills;
@@ -820,12 +821,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     ReadDecision::Execute | ReadDecision::Unknown => {}
                 }
                 let synthetic = match &decision {
-                    ReadDecision::Replay { metadata, .. } => Some(
-                        ToolResultNotice::SemanticReadReplay {
-                            rendered_output: crate::tools::render_read_file_output(metadata),
-                        }
-                        .render(),
-                    ),
+                    ReadDecision::Replay { metadata, .. } => {
+                        // Replays must respect the same per-model cap as live
+                        // reads — a replayed full-file artifact injected raw
+                        // can be far larger than any compressed live result.
+                        let rendered_output = if agent.context_window_config.enabled {
+                            crate::tools::render_read_file_output_within(
+                                metadata,
+                                agent.context_window_config.tool_result_chars_for(model),
+                            )
+                        } else {
+                            crate::tools::render_read_file_output(metadata)
+                        };
+                        Some(ToolResultNotice::SemanticReadReplay { rendered_output }.render())
+                    }
                     ReadDecision::PartialOverlap {
                         covered_intervals,
                         uncovered_intervals,
@@ -956,6 +965,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tc,
             &ToolExecutionIoCtx {
                 effective_arguments: &effective_arguments,
+                model,
                 idempotency_key: execution_state
                     .current_step
                     .as_ref()
@@ -1017,7 +1027,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     result_text = crate::memory::context_window::compress_tool_result(
                         "terminal",
                         &result_text,
-                        agent.context_window_config.max_tool_result_chars,
+                        agent.context_window_config.tool_result_chars_for(model),
                     );
                 }
             }

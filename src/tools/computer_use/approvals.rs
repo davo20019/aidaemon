@@ -14,9 +14,11 @@ use crate::types::ApprovalResponse;
 
 #[derive(Clone, Default)]
 pub struct ApprovalState {
-    session_approved: Arc<Mutex<HashSet<String>>>,
-    inspect_approved: Arc<Mutex<HashSet<(String, String)>>>,
-    mutate_approved: Arc<Mutex<HashSet<(String, String)>>>,
+    /// Apps approved for inspect+control in a session, keyed by (session, bundle).
+    /// A single per-app grant covers both screenshots and click/type — the user
+    /// is asked once per app, not once per scope. Consequential actions still
+    /// require a separate point-of-action confirmation (see `ensure_consequential`).
+    app_approved: Arc<Mutex<HashSet<(String, String)>>>,
     mutating_actions: Arc<Mutex<HashMap<String, u32>>>,
 }
 
@@ -31,13 +33,10 @@ impl ApprovalState {
 
     #[cfg(test)]
     pub async fn approve_all_for_test(&self, session_id: &str, bundle_id: &str) {
-        self.session_approved
+        self.app_approved
             .lock()
             .await
-            .insert(session_id.to_string());
-        let key = (session_id.to_string(), bundle_id.to_string());
-        self.inspect_approved.lock().await.insert(key.clone());
-        self.mutate_approved.lock().await.insert(key);
+            .insert((session_id.to_string(), bundle_id.to_string()));
     }
 
     pub async fn record_mutating_action(
@@ -57,47 +56,13 @@ impl ApprovalState {
         Ok(())
     }
 
-    pub async fn ensure_session(
-        &self,
-        approval_tx: &ApprovalBroker,
-        session_id: &str,
-        task_id: &str,
-    ) -> Result<(), String> {
-        if self.session_approved.lock().await.contains(session_id) {
-            return Ok(());
-        }
-        let summary = "Enable native desktop computer use for this chat session? \
-                       This allows inspecting app windows and screenshots.";
-        let response = request_approval(
-            approval_tx,
-            session_id,
-            summary,
-            RiskLevel::Medium,
-            vec!["Screenshots may expose private on-screen content.".to_string()],
-            Some(task_id),
-        )
-        .await?;
-        match response {
-            ApprovalResponse::AllowOnce | ApprovalResponse::AllowSession => {
-                self.session_approved
-                    .lock()
-                    .await
-                    .insert(session_id.to_string());
-                Ok(())
-            }
-            ApprovalResponse::AllowAlways => {
-                self.session_approved
-                    .lock()
-                    .await
-                    .insert(session_id.to_string());
-                Ok(())
-            }
-            ApprovalResponse::Deny => Err("computer_use session denied by user".to_string()),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn ensure_app_scope(
+    /// Ensure the user has approved aidaemon to operate `app` in this session.
+    ///
+    /// One combined prompt per app grants both inspection (screenshots) and
+    /// control (click/type). Persists for the session on Allow Always. This does
+    /// NOT authorize consequential actions (send/delete/purchase/publish) — those
+    /// are gated separately at point of action.
+    pub async fn ensure_app(
         &self,
         approval_tx: &ApprovalBroker,
         config: &ComputerUseConfig,
@@ -105,7 +70,6 @@ impl ApprovalState {
         task_id: &str,
         bundle_id: &str,
         app_name: &str,
-        mutate: bool,
     ) -> Result<(), String> {
         if config
             .always_allowed_apps
@@ -115,51 +79,32 @@ impl ApprovalState {
             return Ok(());
         }
         let key = (session_id.to_string(), bundle_id.to_string());
-        let store = if mutate {
-            &self.mutate_approved
-        } else {
-            &self.inspect_approved
-        };
-        if store.lock().await.contains(&key) {
+        if self.app_approved.lock().await.contains(&key) {
             return Ok(());
         }
-        let (summary, risk, warnings) = if mutate {
-            (
-                format!("Allow computer_use to control '{app_name}' ({bundle_id})?"),
-                RiskLevel::High,
-                vec![
-                    "Mutating actions move focus and may click/type in the target app.".to_string(),
-                ],
-            )
-        } else {
-            (
-                format!("Allow computer_use to inspect '{app_name}' ({bundle_id})?"),
-                RiskLevel::Medium,
-                vec!["Inspection captures an accessibility tree and screenshot.".to_string()],
-            )
-        };
+        let summary = format!("Allow aidaemon to inspect and control '{app_name}' ({bundle_id})?");
         let response = request_approval(
             approval_tx,
             session_id,
             &summary,
-            risk,
-            warnings,
+            RiskLevel::High,
+            vec![
+                "Captures screenshots (may expose private content) and can click/type in this app."
+                    .to_string(),
+                "Send/delete/purchase-style actions will still ask for confirmation each time."
+                    .to_string(),
+            ],
             Some(task_id),
         )
         .await?;
         match response {
-            ApprovalResponse::AllowOnce | ApprovalResponse::AllowSession => {
-                store.lock().await.insert(key);
+            ApprovalResponse::AllowOnce
+            | ApprovalResponse::AllowSession
+            | ApprovalResponse::AllowAlways => {
+                self.app_approved.lock().await.insert(key);
                 Ok(())
             }
-            ApprovalResponse::AllowAlways => {
-                store.lock().await.insert(key);
-                Ok(())
-            }
-            ApprovalResponse::Deny => Err(format!(
-                "computer_use {} denied for {app_name}",
-                if mutate { "control" } else { "inspection" }
-            )),
+            ApprovalResponse::Deny => Err(format!("computer_use denied for {app_name}")),
         }
     }
 

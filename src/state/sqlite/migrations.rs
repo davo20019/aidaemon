@@ -769,9 +769,14 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
 
-    // Backfill legacy source values
-    // All legacy facts without consolidation provenance are marked "inferred"
-    sqlx::query("UPDATE facts SET source = 'inferred' WHERE source NOT IN ('consolidation', 'user_stated', 'derived', 'inferred')")
+    // Backfill legacy source values: facts with an unknown source are marked
+    // "inferred". The allowlist MUST contain every source value live writers
+    // stamp ('progressive' from progressive extraction, 'agent' from
+    // remember_fact, 'task_learning' from task learning, 'consolidation' from
+    // memory consolidation, plus the stamped 'user_stated'/'derived'
+    // provenance values) — this runs on every startup, so anything missing
+    // here gets its provenance permanently scrubbed.
+    sqlx::query("UPDATE facts SET source = 'inferred' WHERE source NOT IN ('consolidation', 'user_stated', 'derived', 'inferred', 'progressive', 'agent', 'task_learning')")
         .execute(pool)
         .await?;
 
@@ -1656,6 +1661,19 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             message_count INTEGER NOT NULL DEFAULT 0,
             last_message_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Rendered system-prompt snapshots, deduplicated by content hash.
+    // Written insert-or-ignore from the instructions-snapshot path so any past
+    // llm_call can be replayed exactly (snapshot + message events).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS prompt_snapshots (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )",
     )
     .execute(pool)

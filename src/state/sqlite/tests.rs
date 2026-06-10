@@ -3402,3 +3402,87 @@ async fn test_episode_retrieval_at_lower_threshold() {
         "Episode about kubernetes should be relevant to container deployment query"
     );
 }
+
+#[tokio::test]
+async fn migration_backfill_preserves_live_fact_sources() {
+    let (store, _db_file) = setup_test_store().await;
+
+    // Every source value a live writer stamps must survive migration re-runs
+    // (migrations execute on every startup).
+    let live_sources = [
+        "progressive",
+        "agent",
+        "task_learning",
+        "consolidation",
+        "user_stated",
+        "derived",
+    ];
+    for src in live_sources {
+        store
+            .upsert_fact(
+                "technical",
+                &format!("source_test_{}", src),
+                &format!("value for {}", src),
+                src,
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+    }
+    // Unknown legacy sources should still be backfilled to "inferred".
+    store
+        .upsert_fact(
+            "technical",
+            "source_test_legacy",
+            "value for legacy",
+            "mystery_source",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    super::migrations::migrate_state(&store.pool).await.unwrap();
+
+    let facts = store.get_facts(Some("technical")).await.unwrap();
+    for src in live_sources {
+        let fact = facts
+            .iter()
+            .find(|f| f.key == format!("source_test_{}", src))
+            .unwrap_or_else(|| panic!("fact for source {} missing", src));
+        assert_eq!(
+            fact.source, src,
+            "live source '{}' must not be scrubbed by the migration backfill",
+            src
+        );
+    }
+    let legacy = facts
+        .iter()
+        .find(|f| f.key == "source_test_legacy")
+        .expect("legacy fact missing");
+    assert_eq!(legacy.source, "inferred");
+}
+
+#[tokio::test]
+async fn prompt_snapshot_roundtrip_and_dedup() {
+    let (store, _db_file) = setup_test_store().await;
+
+    store
+        .save_prompt_snapshot("abc123", "You are aidaemon. Core prompt v1.")
+        .await
+        .unwrap();
+    // Idempotent: re-saving the same hash (even with different content) keeps
+    // the original row — the hash IS the content identity.
+    store
+        .save_prompt_snapshot("abc123", "different content, same hash")
+        .await
+        .unwrap();
+
+    let content = store.get_prompt_snapshot("abc123").await.unwrap();
+    assert_eq!(
+        content.as_deref(),
+        Some("You are aidaemon. Core prompt v1.")
+    );
+    assert_eq!(store.get_prompt_snapshot("missing").await.unwrap(), None);
+}

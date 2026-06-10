@@ -1167,10 +1167,15 @@ impl SlackChannel {
                 let text = match &update {
                     StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
                     StatusUpdate::ToolStart { name, summary } => {
+                        let mut chars = name.chars();
+                        let cap_name = match chars.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+                        };
                         if summary.is_empty() {
-                            format!("_Using {}..._", name)
+                            format!("_{}..._", cap_name)
                         } else {
-                            format!("_Using {}: {}..._", name, summary)
+                            format!("_{}: {}..._", cap_name, summary)
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {
@@ -1485,10 +1490,17 @@ impl SlackChannel {
                             let text = match &update {
                                 StatusUpdate::Thinking(_) => "_Thinking..._".to_string(),
                                 StatusUpdate::ToolStart { name, summary } => {
+                                    let mut chars = name.chars();
+                                    let cap_name = match chars.next() {
+                                        None => String::new(),
+                                        Some(f) => {
+                                            f.to_uppercase().collect::<String>() + chars.as_str()
+                                        }
+                                    };
                                     if summary.is_empty() {
-                                        format!("_Using {}..._", name)
+                                        format!("_{}..._", cap_name)
                                     } else {
-                                        format!("_Using {}: {}..._", name, summary)
+                                        format!("_{}: {}..._", cap_name, summary)
                                     }
                                 }
                                 StatusUpdate::BudgetExtended {

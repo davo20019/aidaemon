@@ -29,6 +29,8 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub learning_ctx: &'a mut LearningContext,
     pub task_tokens_used: u64,
     pub user_text: &'a str,
+    /// Model selected for this turn — used to resolve per-model tool result caps.
+    pub model: &'a str,
     pub restrict_to_personal_memory_tools: bool,
     pub active_skill_names: &'a [String],
     pub active_untrusted_external_reference_skills: &'a [String],

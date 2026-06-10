@@ -303,6 +303,7 @@ impl ReadFileObservationTracker {
                 file_size: newest.file_size,
                 modified: newest.modified.clone(),
                 selected_lines,
+                truncated: false,
             },
             covered_intervals,
         }
@@ -401,6 +402,7 @@ mod tests {
             file_size: (total_lines * 16) as u64,
             modified: Some(modified.to_string()),
             selected_lines: lines.iter().map(|line| (*line).to_string()).collect(),
+            truncated: false,
         }
     }
 

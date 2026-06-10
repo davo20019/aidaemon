@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn reply_defers_file_access_detects_upload_requests() {
+    for reply in [
+        "I don't have access to that specific PDF file yet. Could you please upload the file or provide the full path to it on your system?",
+        "Please provide the path to the file and I'll take a look.",
+        "Could you attach the file so I can read it?",
+        "I don't have direct access to that file just by its name.",
+    ] {
+        assert!(
+            reply_defers_file_access(reply),
+            "should detect deferred file access: {reply:?}"
+        );
+    }
+}
+
+#[test]
+fn reply_defers_file_access_ignores_real_answers() {
+    for reply in [
+        "The offer letter is from WebFirst for a Lead Developer position starting in July.",
+        "I found the file and read it — here's the summary.",
+        "Done. The script now parses the path argument correctly.",
+    ] {
+        assert!(
+            !reply_defers_file_access(reply),
+            "false positive on: {reply:?}"
+        );
+    }
+}
+
+#[test]
+fn user_text_references_file_detects_filenames_and_paths() {
+    for text in [
+        "Can you read the file and tell me what it's about? David Loor  WebFirst Offer Letter Lead Developer (1).pdf",
+        "summarize ~/Downloads/report.docx",
+        "what's in /tmp/output.log",
+        "check notes.md please",
+    ] {
+        assert!(
+            user_text_references_file(text),
+            "should detect file reference: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn user_text_references_file_ignores_plain_chat() {
+    for text in [
+        "write me a poem about rust",
+        "what's my cat's name?",
+        "how do I improve my resume for tech jobs",
+    ] {
+        assert!(
+            !user_text_references_file(text),
+            "false positive on: {text:?}"
+        );
+    }
+}
+
+#[test]
 fn test_extract_intent_gate_single_line_json() {
     let input = "Answer first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[\"deployment_url\"]}";
     let (cleaned, gate) = extract_intent_gate(input);

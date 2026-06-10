@@ -64,8 +64,9 @@ pub mod store_prelude {
         ConversationSummaryStore, DialogueStateStore, DynamicBotStore, DynamicCliAgentStore,
         DynamicMcpServerStore, EpisodeStore, FactStore, GoalBudgetStore, GoalNotificationStore,
         GoalScheduleStore, GoalStore, HealthCheckStore, LearningStore, MessageStore,
-        NotificationStore, OAuthStore, PeopleStore, ScheduledRunStore, SessionChannelStore,
-        SettingsStore, SkillStore, StateStore, TaskDispatchStore, TaskStore, TokenUsageStore,
+        NotificationStore, OAuthStore, PeopleStore, PromptSnapshotStore, ScheduledRunStore,
+        SessionChannelStore, SettingsStore, SkillStore, StateStore, TaskDispatchStore, TaskStore,
+        TokenUsageStore,
     };
 }
 

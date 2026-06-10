@@ -16,6 +16,9 @@ const MAX_RESULTS: usize = 200;
 const DEFAULT_MAX_RESULTS: usize = 50;
 const MAX_FILES_SCANNED: usize = 10_000;
 const MAX_DEPTH: usize = 20;
+/// Total directory entries one walk may visit before returning a partial
+/// result. Keeps whole-home searches fast instead of watchdog-fatal.
+const MAX_ENTRIES_VISITED: usize = 150_000;
 const MAX_CONTENT_SEARCH_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB per file
 
 #[async_trait]
@@ -130,7 +133,7 @@ impl Tool for SearchFilesTool {
             &content_regex,
             &glob_regex,
             max_results,
-            0,
+            MAX_ENTRIES_VISITED,
             &mut results,
             &mut stats,
         )
@@ -149,9 +152,21 @@ impl Tool for SearchFilesTool {
                 stats.files_scanned,
                 search_dir.display()
             );
+            if stats.truncated {
+                output.push('\n');
+                output.push_str(&truncation_note(&stats));
+            }
             if let Some(note) = &default_path_note {
                 output.push('\n');
                 output.push_str(note);
+                // The model gave no 'path' and found nothing in cwd — point it
+                // at common user locations so it retries instead of giving up.
+                output.push('\n');
+                output.push_str(
+                    "The file may live elsewhere. Retry with an explicit 'path' — common user locations: ~/Downloads, ~/Desktop, ~/Documents, or ~ to search the whole home directory.",
+                );
+                output.push('\n');
+                output.push_str(whole_machine_search_hint());
             }
             if stats.oversized_files_skipped > 0 {
                 output.push('\n');
@@ -211,6 +226,33 @@ struct SearchResult {
 struct SearchStats {
     files_scanned: usize,
     oversized_files_skipped: usize,
+    /// Directory entries visited during the walk (files + dirs, matched or not).
+    entries_visited: usize,
+    /// True when the walk stopped early (entry or wall-clock budget) — the
+    /// "no matches" result is then partial, not definitive.
+    truncated: bool,
+}
+
+/// Fast whole-machine lookup hint. Crawling the entire disk file-by-file is
+/// slow and permission-fenced; the OS file index answers in milliseconds.
+fn whole_machine_search_hint() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "For a whole-machine filename search, use the terminal tool with Spotlight instead of crawling: mdfind -name \"<filename>\" (instant, indexed)."
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "For a whole-machine filename search, use the terminal tool with the file index if available: locate \"<filename>\" (or plocate), falling back to find / -name."
+    }
+}
+
+/// Honest coverage note for a budget-truncated walk. Without it, "no matches"
+/// reads as definitive and the model stops looking.
+fn truncation_note(stats: &SearchStats) -> String {
+    format!(
+        "Note: the search stopped early after visiting {} directory entries — coverage was partial, NOT exhaustive. The file may still exist. Retry with a narrower 'path' (e.g. ~/Downloads, ~/Documents) for a complete scan of that directory.",
+        stats.entries_visited
+    )
 }
 
 impl SearchResult {
@@ -248,33 +290,51 @@ fn glob_to_regex(glob: &str) -> anyhow::Result<Regex> {
     Regex::new(&regex).map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", glob, e))
 }
 
-fn walk_dir<'a>(
-    dir: &'a Path,
-    content_regex: &'a Option<Regex>,
-    glob_regex: &'a Option<Regex>,
+/// Wall-clock budget for one search walk. Large trees (a whole home
+/// directory) must return a partial-but-fast answer, never hang until the
+/// tool watchdog kills the call.
+const MAX_WALK_MILLIS: u128 = 15_000;
+
+/// Breadth-first, budgeted directory walk.
+///
+/// BFS matters: a file in a shallow user directory (~/Downloads/x.pdf) is
+/// found within the first few thousand entries even when a sibling tree
+/// (~/Library) holds hundreds of thousands — depth-first got lost in the
+/// deep tree and timed out. `max_entries` bounds total entries visited;
+/// exceeding it (or the time budget) sets `stats.truncated`.
+async fn walk_dir(
+    root: &Path,
+    content_regex: &Option<Regex>,
+    glob_regex: &Option<Regex>,
     max_results: usize,
-    depth: usize,
-    results: &'a mut Vec<SearchResult>,
-    stats: &'a mut SearchStats,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        if depth > MAX_DEPTH
-            || results.len() >= max_results
-            || stats.files_scanned >= MAX_FILES_SCANNED
-        {
+    max_entries: usize,
+    results: &mut Vec<SearchResult>,
+    stats: &mut SearchStats,
+) {
+    let started = std::time::Instant::now();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if results.len() >= max_results || stats.files_scanned >= MAX_FILES_SCANNED {
             return;
         }
 
-        let mut entries = match tokio::fs::read_dir(dir).await {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => continue,
         };
-
-        let mut subdirs = Vec::new();
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             if results.len() >= max_results || stats.files_scanned >= MAX_FILES_SCANNED {
-                break;
+                return;
+            }
+            stats.entries_visited += 1;
+            if stats.entries_visited >= max_entries
+                || started.elapsed().as_millis() > MAX_WALK_MILLIS
+            {
+                stats.truncated = true;
+                return;
             }
 
             let path = entry.path();
@@ -282,8 +342,11 @@ fn walk_dir<'a>(
 
             if let Ok(file_type) = entry.file_type().await {
                 if file_type.is_dir() {
-                    if !fs_utils::should_skip_dir(&file_name) && !file_name.starts_with('.') {
-                        subdirs.push(path);
+                    if depth < MAX_DEPTH
+                        && !fs_utils::should_skip_dir(&file_name)
+                        && !file_name.starts_with('.')
+                    {
+                        queue.push_back((path, depth + 1));
                     }
                     continue;
                 }
@@ -337,26 +400,138 @@ fn walk_dir<'a>(
                 });
             }
         }
-
-        // Recurse into subdirectories
-        for subdir in subdirs {
-            walk_dir(
-                &subdir,
-                content_regex,
-                glob_regex,
-                max_results,
-                depth + 1,
-                results,
-                stats,
-            )
-            .await;
-        }
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn breadth_first_walk_finds_shallow_file_under_tight_budget() {
+        // A file two levels down (~/Downloads/x.pdf shape) must be found
+        // before the walk exhausts its budget inside a deep sibling tree —
+        // the failure mode that made home-directory searches time out.
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("aaa_huge").join("lvl1");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..300 {
+            std::fs::write(deep.join(format!("noise_{i}.txt")), "x").unwrap();
+        }
+        let shallow = root.path().join("bbb_docs");
+        std::fs::create_dir(&shallow).unwrap();
+        std::fs::write(shallow.join("target.pdf"), "pdf").unwrap();
+
+        let glob = glob_to_regex("*target.pdf").unwrap();
+        let mut results = Vec::new();
+        let mut stats = SearchStats::default();
+        walk_dir(
+            root.path(),
+            &None,
+            &Some(glob),
+            10,
+            50, // entry budget far smaller than the deep tree
+            &mut results,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1, "shallow file must be found under budget");
+        assert!(results[0].path.ends_with("target.pdf"));
+    }
+
+    #[tokio::test]
+    async fn walk_truncates_at_entry_budget_and_reports_it() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            std::fs::write(root.path().join(format!("file_{i}.txt")), "x").unwrap();
+        }
+
+        let glob = glob_to_regex("*.zzz").unwrap();
+        let mut results = Vec::new();
+        let mut stats = SearchStats::default();
+        walk_dir(
+            root.path(),
+            &None,
+            &Some(glob),
+            10,
+            10,
+            &mut results,
+            &mut stats,
+        )
+        .await;
+
+        assert!(stats.truncated, "budget exhaustion must set truncated");
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_search_output_carries_honest_note() {
+        // The output must tell the model coverage was partial — otherwise
+        // "no matches" reads as a definitive answer and it gives up.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(dir.path().join(format!("file_{i}.txt")), "x").unwrap();
+        }
+        // max_results=1 path is fine; we exercise the public call with a
+        // glob that cannot match, against a tree we know exceeds the test
+        // budget via the internal walker — so use walk_dir + render check
+        // indirectly: the call() budget is large, so instead assert the
+        // note constant is wired by checking a tiny-budget walk + format.
+        let glob = glob_to_regex("*.zzz").unwrap();
+        let mut results = Vec::new();
+        let mut stats = SearchStats::default();
+        walk_dir(
+            dir.path(),
+            &None,
+            &Some(glob),
+            10,
+            5,
+            &mut results,
+            &mut stats,
+        )
+        .await;
+        assert!(stats.truncated);
+        let note = truncation_note(&stats);
+        assert!(note.contains("partial"), "note: {note}");
+        assert!(
+            note.contains("path"),
+            "note must steer toward narrower path"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_path_no_match_suggests_user_directories() {
+        // No 'path' arg → tool defaults to cwd. When nothing matches a
+        // filename-style glob, the output must point the model at common
+        // user locations instead of dead-ending.
+        let args = serde_json::json!({
+            "glob": "*zz-definitely-not-present-xyz (1).pdf"
+        })
+        .to_string();
+        let result = SearchFilesTool.call(&args).await.unwrap();
+
+        assert!(result.contains("No matches found"));
+        assert!(
+            result.contains("~/Downloads"),
+            "no-match default-path output must suggest user dirs, got: {result}"
+        );
+        assert!(result.contains("'path'"));
+    }
+
+    #[tokio::test]
+    async fn explicit_path_no_match_has_no_user_dir_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "glob": "*zz-definitely-not-present-xyz.pdf",
+            "path": dir.path().to_str().unwrap()
+        })
+        .to_string();
+        let result = SearchFilesTool.call(&args).await.unwrap();
+
+        assert!(result.contains("No matches found"));
+        assert!(!result.contains("~/Downloads"));
+    }
 
     #[test]
     fn test_schema_has_required_fields() {

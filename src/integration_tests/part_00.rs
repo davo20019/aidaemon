@@ -6,8 +6,8 @@
 
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
-    setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads,
-    setup_test_agent_root, setup_test_agent_root_with_extra_tools_and_llm_timeout,
+    setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads, setup_test_agent_root,
+    setup_test_agent_root_with_extra_tools_and_llm_timeout,
     setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
     MockTool,
 };
@@ -903,6 +903,17 @@ async fn test_system_prompt_pins_critical_facts_for_owner_dm() {
     assert!(
         system_content.contains("partner: Alice"),
         "Relationship should be present in critical facts"
+    );
+    // Regression guard: the exact-value directives must not hijack questions
+    // about entities under discussion ("Who's the owner?" after a company
+    // came up means that company's owner, not the operator).
+    assert!(
+        system_content.contains("ONLY your user's identity and your own"),
+        "Critical facts block must scope pinned values to user/assistant identity"
+    );
+    assert!(
+        system_content.contains("do NOT apply to other entities"),
+        "Stored-fact rule must exclude entities from the conversation"
     );
 }
 

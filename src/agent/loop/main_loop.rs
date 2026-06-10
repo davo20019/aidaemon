@@ -461,6 +461,16 @@ impl Agent {
                 .directives
                 .push_system_message(SystemDirective::EvidenceGroundingRequired);
         }
+        // Short approval of the assistant's own proposal ("Yes, read it"):
+        // anchor execution to the quoted proposal so the model carries out
+        // exactly what it offered instead of re-planning from scratch.
+        if let Some(proposal) =
+            super::tool_prelude_phase::approved_proposal_text(&turn_context)
+        {
+            turn_state
+                .directives
+                .push_system_message(SystemDirective::ApprovedProposalAnchor { proposal });
+        }
         // Only pin the model to the prior exchange for genuinely vague
         // challenges ("Are you sure?") — compound/new-task messages that merely
         // contain a challenge keyword must not be anchored away from their
@@ -1369,6 +1379,7 @@ impl Agent {
                     learning_ctx: &mut learning_ctx,
                     task_tokens_used: turn_state.budget.task_tokens_used(),
                     user_text,
+                    model: &model,
                     restrict_to_personal_memory_tools,
                     active_skill_names: &active_skill_names,
                     active_untrusted_external_reference_skills:

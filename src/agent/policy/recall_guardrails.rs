@@ -162,21 +162,28 @@ pub(super) fn deterministic_reply_for_critical_query(
 pub(super) fn build_critical_facts_prompt_block(summary: &CriticalFactSummary) -> Option<String> {
     let mut lines = vec![
         "═══ CRITICAL FACTS — USE THESE EXACT VALUES ═══".to_string(),
-        "IMPORTANT: When asked about any fact below, reply with the EXACT value shown here."
+        "These pinned values cover ONLY your user's identity and your own — no other entity."
             .to_string(),
+        "When asked about a fact below, reply with the EXACT value shown here.".to_string(),
         "Do NOT substitute, paraphrase, or infer different values from training data.".to_string(),
+        "They do NOT apply to subjects from the current conversation: if the question refers to \
+         an entity just discussed (e.g. \"the owner\"/\"the founder\" of a company), answer from \
+         that conversation context, not from this block."
+            .to_string(),
     ];
 
+    let mut fact_count = 0;
     if let Some(owner_name) = summary.owner_name.as_ref() {
         lines.push(format!("• Owner name → {}", owner_name));
+        fact_count += 1;
     }
     if let Some(assistant_name) = summary.assistant_name.as_ref() {
         lines.push(format!("• Assistant name → {}", assistant_name));
+        fact_count += 1;
     }
     lines.push("═══════════════════════════════════════════════".to_string());
 
-    // Need at least header + one fact + footer = 4 lines minimum
-    if lines.len() <= 4 {
+    if fact_count == 0 {
         None
     } else {
         Some(lines.join("\n"))
@@ -532,6 +539,8 @@ pub(super) fn tool_result_indicates_no_evidence(result_text: &str) -> bool {
         || lower.contains("no information")
         || lower.contains("no relevant")
         || lower.contains("no evidence")
+        // Terminal's empty-output marker: a grep/find that printed nothing.
+        || lower.contains("(no output)")
 }
 
 #[cfg(test)]
@@ -922,6 +931,38 @@ mod tests {
             deterministic_reply_for_critical_query(CriticalFactQuery::AssistantName, &summary),
             "My name is TestBot."
         );
+    }
+
+    #[test]
+    fn critical_facts_block_scopes_to_user_and_assistant_identity() {
+        // Telemetry case: after a SpaceX conversation, "Who's the owner?" was
+        // answered with the pinned owner name instead of the company's owner.
+        // The block must say its values cover ONLY the user's/assistant's own
+        // identity and that conversational antecedents win.
+        let summary = CriticalFactSummary {
+            owner_name: Some("Test Owner".to_string()),
+            assistant_name: None,
+        };
+        let block = build_critical_facts_prompt_block(&summary).expect("block should render");
+        assert!(
+            block.contains("ONLY your user's identity and your own"),
+            "block must scope pinned values to user/assistant identity: {}",
+            block
+        );
+        assert!(
+            block.contains("current conversation"),
+            "block must defer to conversational antecedents: {}",
+            block
+        );
+        // Existing consumers depend on these markers.
+        assert!(block.contains("CRITICAL FACTS"));
+        assert!(block.contains("• Owner name → Test Owner"));
+    }
+
+    #[test]
+    fn critical_facts_block_empty_summary_renders_nothing() {
+        let block = build_critical_facts_prompt_block(&CriticalFactSummary::default());
+        assert!(block.is_none(), "no pinned facts → no block: {:?}", block);
     }
 
     #[test]

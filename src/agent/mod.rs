@@ -94,6 +94,8 @@ use response_analysis::{
     claims_completed_side_effect, claims_delegation_started, is_substantive_text_response,
     looks_like_deferred_action_response, looks_like_multi_part_request,
 };
+#[cfg(test)]
+use response_analysis::{reply_defers_file_access, user_text_references_file};
 #[path = "intent/keywords.rs"]
 mod intent_keywords;
 #[path = "intent/intent_routing.rs"]

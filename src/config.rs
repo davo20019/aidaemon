@@ -2629,6 +2629,12 @@ pub struct ContextWindowConfig {
     /// Maximum characters for tool results before truncation (default: 2000).
     #[serde(default = "default_tool_result_chars")]
     pub max_tool_result_chars: usize,
+    /// Per-model tool result character caps (model name → max chars).
+    /// Overrides `max_tool_result_chars` for the named model. Models listed
+    /// in `model_budgets` but not here get a cap scaled proportionally to
+    /// their budget.
+    #[serde(default)]
+    pub model_tool_result_chars: HashMap<String, usize>,
     /// Number of recent messages to always keep in the window (default: 6).
     #[serde(default = "default_summary_window")]
     pub summary_window: usize,
@@ -2647,10 +2653,35 @@ impl Default for ContextWindowConfig {
             default_budget: default_context_budget(),
             model_budgets: HashMap::new(),
             max_tool_result_chars: default_tool_result_chars(),
+            model_tool_result_chars: HashMap::new(),
             summary_window: default_summary_window(),
             progressive_facts: true,
             summarize_threshold: default_summarize_threshold(),
         }
+    }
+}
+
+impl ContextWindowConfig {
+    /// Effective tool-result character cap for a specific model.
+    ///
+    /// Resolution order: explicit `model_tool_result_chars` entry → cap
+    /// scaled by the model's `model_budgets` ratio against `default_budget`
+    /// (floored so tiny budgets stay usable) → global `max_tool_result_chars`.
+    pub fn tool_result_chars_for(&self, model: &str) -> usize {
+        const MIN_TOOL_RESULT_CHARS: usize = 1_000;
+        if let Some(&chars) = self.model_tool_result_chars.get(model) {
+            return chars;
+        }
+        if let Some(&budget) = self.model_budgets.get(model) {
+            if let Some(scaled) = self
+                .max_tool_result_chars
+                .saturating_mul(budget)
+                .checked_div(self.default_budget)
+            {
+                return scaled.max(MIN_TOOL_RESULT_CHARS);
+            }
+        }
+        self.max_tool_result_chars
     }
 }
 
@@ -3161,6 +3192,54 @@ impl AppConfig {
 mod tests {
     use super::*;
     use once_cell::sync::Lazy;
+
+    #[test]
+    fn tool_result_chars_for_unknown_model_uses_global_default() {
+        let config = ContextWindowConfig::default();
+        assert_eq!(
+            config.tool_result_chars_for("some-model"),
+            config.max_tool_result_chars
+        );
+    }
+
+    #[test]
+    fn tool_result_chars_for_explicit_override_wins() {
+        let mut config = ContextWindowConfig::default();
+        config.model_budgets.insert("gemma-3-4b".to_string(), 8_000);
+        config
+            .model_tool_result_chars
+            .insert("gemma-3-4b".to_string(), 1_500);
+        assert_eq!(config.tool_result_chars_for("gemma-3-4b"), 1_500);
+    }
+
+    #[test]
+    fn tool_result_chars_for_scales_down_with_small_model_budget() {
+        // Small local model: budget 8k tokens vs default 48k → tool results
+        // shrink proportionally so a single read can't swamp the window.
+        let mut config = ContextWindowConfig::default();
+        config.model_budgets.insert("gemma-3-4b".to_string(), 8_000);
+        let chars = config.tool_result_chars_for("gemma-3-4b");
+        assert!(
+            chars < config.max_tool_result_chars,
+            "small budget should shrink the cap, got {chars}"
+        );
+        assert!(chars >= 1_000, "cap must not drop below usable floor");
+    }
+
+    #[test]
+    fn tool_result_chars_for_scales_up_with_large_model_budget() {
+        // Big cloud model: budget 192k tokens → tool results may grow so
+        // powerful models see more of each file in one read.
+        let mut config = ContextWindowConfig::default();
+        config
+            .model_budgets
+            .insert("claude-fable-5".to_string(), 192_000);
+        let chars = config.tool_result_chars_for("claude-fable-5");
+        assert!(
+            chars > config.max_tool_result_chars,
+            "large budget should raise the cap, got {chars}"
+        );
+    }
 
     static ENV_EXPANSION_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
     static TERMINAL_WEB_APP_URL_ENV_LOCK: Lazy<std::sync::Mutex<()>> =

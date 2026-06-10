@@ -73,6 +73,64 @@ pub(super) fn looks_like_deferred_action_response(text: &str) -> bool {
         || lower.contains("[tool_call:")
 }
 
+/// Detect a reply that punts file access back to the user ("please upload
+/// the file", "provide the full path") instead of locating it with tools.
+/// Multi-word phrases — substring matching is appropriate here (see
+/// keyword-matching guidance in CLAUDE.md).
+pub(super) fn reply_defers_file_access(text: &str) -> bool {
+    let normalized = text
+        .replace('\u{2019}', "'")
+        .trim()
+        .to_ascii_lowercase()
+        .replace(char::is_whitespace, " ");
+    const DEFER_PHRASES: &[&str] = &[
+        "upload the file",
+        "upload that file",
+        "upload it to",
+        "attach the file",
+        "attach that file",
+        "provide the full path",
+        "provide the path",
+        "provide the file",
+        "provide a path",
+        "share the file",
+        "don't have access to that",
+        "don't have access to the file",
+        "don't have direct access",
+        "do not have access to that",
+        "do not have direct access",
+        "once i have access",
+    ];
+    DEFER_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+}
+
+/// Detect whether the user's message references a concrete file: a token
+/// with a known document/code extension, or an explicit path.
+pub(super) fn user_text_references_file(text: &str) -> bool {
+    const FILE_EXTENSIONS: &[&str] = &[
+        ".pdf", ".docx", ".doc", ".txt", ".md", ".csv", ".xlsx", ".pptx", ".json", ".log", ".rs",
+        ".py", ".js", ".ts", ".html", ".css", ".toml", ".yaml", ".yml", ".png", ".jpg", ".jpeg",
+        ".zip", ".epub",
+    ];
+    for raw_token in text.split_whitespace() {
+        let token = raw_token
+            .trim_matches(|c: char| c.is_ascii_punctuation() && c != '.' && c != '/' && c != '~')
+            .to_ascii_lowercase();
+        if token.starts_with("~/") || (token.starts_with('/') && token.len() > 1) {
+            return true;
+        }
+        if FILE_EXTENSIONS
+            .iter()
+            .any(|ext| token.ends_with(ext) && token.len() > ext.len())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect first-person past-tense side-effect claims like "I have deleted…",
 /// "I've removed…", "I created…". Used by the completion phase to catch
 /// fabricated action claims: a reply asserting a completed side effect in a

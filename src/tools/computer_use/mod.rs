@@ -127,14 +127,14 @@ impl ComputerUseTool {
         action_class: ActionClass,
         summary: Option<&str>,
     ) -> Result<(), String> {
-        self.approval_state
-            .ensure_session(&self.approval, &ctx.session_id, &ctx.task_id)
-            .await?;
-
         let observation = matches!(
             action,
-            ComputerActionKind::GetAppState | ComputerActionKind::ListApps
+            ComputerActionKind::GetAppState
+                | ComputerActionKind::ListApps
+                | ComputerActionKind::Screenshot
         );
+        // One combined per-app approval (inspect + control) — the user is asked
+        // once per app, not once per scope or per session.
         if let (Some(bundle_id), Some(app_name)) = (bundle_id, app_name) {
             if is_prohibited_bundle(bundle_id) {
                 return Err(format!(
@@ -142,14 +142,13 @@ impl ComputerUseTool {
                 ));
             }
             self.approval_state
-                .ensure_app_scope(
+                .ensure_app(
                     &self.approval,
                     &self.config,
                     &ctx.session_id,
                     &ctx.task_id,
                     bundle_id,
                     app_name,
-                    !observation,
                 )
                 .await?;
         }

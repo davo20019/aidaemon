@@ -368,10 +368,15 @@ impl DiscordChannel {
                 let text = match &update {
                     StatusUpdate::Thinking(_) => "Thinking...".to_string(),
                     StatusUpdate::ToolStart { name, summary } => {
+                        let mut chars = name.chars();
+                        let cap_name = match chars.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+                        };
                         if summary.is_empty() {
-                            format!("Using {}...", name)
+                            format!("{}...", cap_name)
                         } else {
-                            format!("Using {}: {}...", name, summary)
+                            format!("{}: {}...", cap_name, summary)
                         }
                     }
                     StatusUpdate::ToolProgress { name, chunk } => {

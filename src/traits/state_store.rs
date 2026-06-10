@@ -1042,6 +1042,28 @@ pub trait NotificationStore: Send + Sync {
     }
 }
 
+/// Rendered system-prompt snapshots, deduplicated by content hash.
+///
+/// Enables exact replay of past LLM calls: the `instructions_snapshot`
+/// decision-point event records the core prompt's `core_hash` (plus the
+/// volatile context tail inline); this store maps that hash back to the full
+/// rendered core prompt text. Rows are written insert-or-ignore, so storage
+/// grows only when the rendered prompt actually changes (deploys, config or
+/// memory shape changes) — not per interaction.
+#[async_trait]
+pub trait PromptSnapshotStore: Send + Sync {
+    /// Persist a rendered prompt keyed by its hash. Must be idempotent.
+    async fn save_prompt_snapshot(&self, _hash: &str, _content: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Fetch a stored prompt snapshot by exact hash.
+    #[allow(dead_code)] // Read path is db_probe; kept on the trait for tests/tools.
+    async fn get_prompt_snapshot(&self, _hash: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+}
+
 /// Facade trait kept for backwards compatibility.
 ///
 /// This lets call sites keep using `Arc<dyn StateStore>`, while new code can
@@ -1073,6 +1095,7 @@ pub trait StateStore:
     + ConversationSummaryStore
     + HealthCheckStore
     + NotificationStore
+    + PromptSnapshotStore
 {
 }
 
@@ -1103,5 +1126,6 @@ impl<T> StateStore for T where
         + ConversationSummaryStore
         + HealthCheckStore
         + NotificationStore
+        + PromptSnapshotStore
 {
 }

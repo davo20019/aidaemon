@@ -1540,6 +1540,7 @@ pub(crate) mod migrations;
 mod notifications;
 mod oauth;
 mod people;
+mod prompt_snapshots;
 mod session_channels;
 mod settings;
 mod skills;

@@ -222,7 +222,15 @@ pub async fn build_core_profile(
         return Ok((String::new(), new_cache));
     }
 
-    let mut out = String::from("## Core Profile\n\n");
+    let mut out = String::from(
+        "## Core Profile\n\
+         Stored background memory about your operator (\"the owner\"). IMPORTANT: when \
+         the user's message contains a definite reference (\"the owner\", \"the CEO\", \
+         \"it\", \"they\") with an antecedent in the recent conversation, resolve it \
+         against the conversation FIRST — e.g. after discussing a company, \"Who's the \
+         owner?\" means that company's owner, NOT your operator. Only fall back to this \
+         profile when no conversational antecedent exists.\n\n",
+    );
     for entity in selected_entities {
         for line in entity.lines {
             out.push_str(&format!("{}\n", line));

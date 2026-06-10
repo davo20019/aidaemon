@@ -425,6 +425,10 @@ async fn main() -> anyhow::Result<()> {
         .find(|w| w[0] == "--output")
         .map(|w| w[1].clone());
     let record_fixture_include_text = args.iter().any(|arg| arg == "--include-text");
+    let prompt_hash = args
+        .windows(2)
+        .find(|w| w[0] == "--prompt")
+        .map(|w| w[1].clone());
 
     let env_path = resolve_runtime_env_file_path(&runtime_working_dir());
     if env_path.exists() {
@@ -445,6 +449,26 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = SqlitePool::connect_with(opts).await?;
 
+    if let Some(hash) = prompt_hash.as_deref() {
+        // Prefix match for convenience: `--prompt 4848ae26` finds the full hash.
+        let rows = sqlx::query(
+            "SELECT hash, content, created_at FROM prompt_snapshots WHERE hash LIKE ? || '%' ORDER BY created_at DESC LIMIT 5",
+        )
+        .bind(hash)
+        .fetch_all(&pool)
+        .await?;
+        if rows.is_empty() {
+            println!("No prompt snapshot matching hash prefix {:?}", hash);
+        }
+        for row in rows {
+            let full_hash: String = row.get("hash");
+            let created_at: String = row.get("created_at");
+            let content: String = row.get("content");
+            println!("== Prompt Snapshot {} (saved {}) ==", full_hash, created_at);
+            println!("{}", content);
+        }
+        return Ok(());
+    }
     if let Some(task_id) = eval_task.as_deref() {
         print_eval_task(&pool, task_id).await?;
         return Ok(());

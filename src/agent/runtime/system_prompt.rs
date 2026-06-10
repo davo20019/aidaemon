@@ -712,6 +712,22 @@ impl Agent {
             core_prompt_bytes.hash(&mut hasher);
             tail.hash(&mut hasher);
             let prompt_hash = format!("{:016x}", hasher.finish());
+
+            // Persist the rendered core prompt deduplicated by its own hash
+            // (the core is byte-stable across turns; the tail is volatile and
+            // recorded inline below). Together with the message events this
+            // makes any past llm_call exactly replayable.
+            let mut core_hasher = std::collections::hash_map::DefaultHasher::new();
+            core_prompt_bytes.hash(&mut core_hasher);
+            let core_hash = format!("{:016x}", core_hasher.finish());
+            if let Err(e) = self
+                .state
+                .save_prompt_snapshot(&core_hash, &core_prompt_bytes)
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to save prompt snapshot");
+            }
+
             self.emit_decision_point(
                 emitter,
                 task_id,
@@ -720,8 +736,10 @@ impl Agent {
                 "Prepared instruction snapshot for this interaction".to_string(),
                 json!({
                     "prompt_hash": prompt_hash,
+                    "core_hash": core_hash,
                     "core_prompt_chars": core_prompt_bytes.len(),
                     "task_context_tail_chars": tail.len(),
+                    "task_context_tail": tail,
                     "tools_count": tools_count,
                     "skills_count": active_skills.len()
                 }),
@@ -1031,7 +1049,11 @@ impl Agent {
              Do NOT paraphrase, infer, or substitute a different value from your training data. \
              If the critical facts say `pet_name: Luna`, your answer MUST say \"Luna\" — not \"Pixel\" or any other name. \
              If a tool result says `**coffee**: black coffee`, your answer MUST say \"black coffee\" — not \"oat milk lattes\". \
-             Treat stored fact values as ground truth that overrides anything in your training data.",
+             Treat stored fact values as ground truth that overrides anything in your training data. \
+             Stored facts describe YOUR USER and YOU — they do NOT apply to other entities. \
+             If the question's subject is a person, company, or thing from the current conversation \
+             (e.g. \"the owner\" right after discussing a company means that company's owner), \
+             resolve it against the conversation, not against stored facts.",
         );
 
         rules

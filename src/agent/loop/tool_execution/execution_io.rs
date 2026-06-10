@@ -12,6 +12,8 @@ pub(super) struct ToolExecutionIoResult {
 
 pub(super) struct ToolExecutionIoCtx<'a> {
     pub effective_arguments: &'a str,
+    /// Model selected for this turn — used to resolve per-model tool result caps.
+    pub model: &'a str,
     pub idempotency_key: Option<&'a str>,
     pub injected_project_dir: Option<&'a str>,
     pub project_scope: Option<&'a str>,
@@ -179,13 +181,39 @@ pub(super) async fn execute_tool_call_io(
         }
     }
 
-    // Compress large tool results to save context budget
+    // Compress large tool results to save context budget. The cap is
+    // per-model so small-context local models get tighter results while
+    // big-context models keep more.
     if agent.context_window_config.enabled {
-        result_text = crate::memory::context_window::compress_tool_result(
-            &tc.name,
-            &result_text,
-            agent.context_window_config.max_tool_result_chars,
-        );
+        let max_chars = agent.context_window_config.tool_result_chars_for(ctx.model);
+        // read_file results with typed metadata get line-boundary paging with
+        // an explicit continuation hint instead of destructive mid-drop
+        // compression — the model can keep reading from the exact cut point.
+        let read_file_metadata = (tc.name == "read_file" && !result_is_err)
+            .then_some(result_metadata.read_file.as_ref())
+            .flatten();
+        if let Some(read_metadata) = read_file_metadata {
+            if result_text.chars().count() > max_chars {
+                result_text =
+                    crate::tools::render_read_file_output_within(read_metadata, max_chars);
+                if let Some(injected_dir) = ctx.injected_project_dir {
+                    result_text = format!(
+                        "{}\n\n{}",
+                        result_text,
+                        ToolResultNotice::PathAutoInjectedFromProjectContext {
+                            injected_dir: injected_dir.to_string(),
+                        }
+                        .render()
+                    );
+                }
+            }
+        } else {
+            result_text = crate::memory::context_window::compress_tool_result(
+                &tc.name,
+                &result_text,
+                max_chars,
+            );
+        }
     }
 
     let tool_duration_ms = tool_exec_start.elapsed().as_millis().min(u64::MAX as u128) as u64;

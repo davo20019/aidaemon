@@ -301,6 +301,11 @@ pub struct ReadFileResultMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified: Option<String>,
     pub selected_lines: Vec<String>,
+    /// True when the read returned fewer lines than requested because the
+    /// per-call output cap was hit. The rendered output then carries an
+    /// explicit continuation hint.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Structured execution metadata returned by tools.

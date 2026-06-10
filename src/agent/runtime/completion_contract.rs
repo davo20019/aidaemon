@@ -79,6 +79,9 @@ pub(super) struct CompletionProgress {
     /// Count of times the response-quality nudge has been injected.
     /// Used to prevent infinite nudge loops — only fire once.
     pub quality_nudge_count: usize,
+    /// Count of times the locate-file retry nudge has been injected (model
+    /// asked the user to upload a file it could find itself). Fires once.
+    pub file_access_retry_count: usize,
 }
 
 impl CompletionProgress {
