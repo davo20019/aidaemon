@@ -24,13 +24,29 @@ longer matches today's binary, and you're asked to re-approve endlessly. Running
 as a launchd background agent makes it worse (the system won't reliably show the
 grant dialog).
 
-The fix is to package the daemon as a small signed **`.app` bundle** with a fixed
-**bundle identifier** (`ai.aidaemon`). macOS then ties the grant to the bundle id,
-and re-signing a new build with the *same* identity keeps the grant valid. The
-scripts below automate this.
+The mitigation is to package the daemon as a small signed **`.app` bundle** with
+a fixed **bundle identifier** (`ai.aidaemon`), signed by a stable local identity
+(`aidaemon-dev`). macOS keys the grant to the bundle's *designated requirement*
+(identifier + signing certificate), which is the same across rebuilds — so in
+principle re-signing a new build keeps the grant valid. The scripts below
+automate this.
+
+> **Honest caveat (self-signed dev setup):** with a *self-signed* identity on
+> recent macOS, this is not bulletproof. The grant can still need re-approving
+> after a rebuild, and has been observed to degrade at runtime into a
+> "trusted-but-no-access" state — `AXIsProcessTrusted()` returns true while the
+> actual accessibility/screen queries return an empty stub (you'll see a blank
+> screenshot and an empty tree). When that happens, re-grant: System Settings →
+> Privacy & Security → Accessibility (and Screen Recording), remove the
+> `aidaemon` entry, re-add `~/Applications/aidaemon.app`, toggle it on, and
+> restart the daemon. **The durable fix is a real Apple Developer ID
+> certificate + notarization** (instead of the self-signed `aidaemon-dev`),
+> which makes the grant stable across rebuilds and avoids the runtime
+> degradation; sign releases with it for end users.
 
 > One-time manual grant: unavoidable (Apple's rule).
-> Re-granting on every rebuild: avoided, via the signed bundle.
+> Re-granting after a rebuild: usually avoided with the signed bundle, but a
+> self-signed dev identity may still require it (and a Developer ID fixes it).
 
 ---
 
@@ -59,8 +75,10 @@ scripts/package-macos-app.sh --build      # --build does the release build for y
 scripts/package-macos-app.sh
 ```
 
-That's it. After a rebuild, just re-run `scripts/package-macos-app.sh` — the
-grants persist because the bundle id and signing identity don't change.
+After a rebuild, re-run `scripts/package-macos-app.sh`. The bundle id and signing
+identity don't change, so the grant usually carries over — but on a self-signed
+dev setup you may need to re-grant if access degrades (see the caveat above). A
+Developer ID identity removes that uncertainty.
 
 ---
 
