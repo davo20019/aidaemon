@@ -5,15 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.2] - 2026-06-10
 
 ### Added
 
+- **Command context in DM status pings**: terminal status pings in private 1-on-1 DMs now show the command being run (`` Running a command: `cargo build --release` ``) instead of a bare "Running a command...". The command is hardened before display: home directory shortened to `~`, secrets redacted *before* truncation (a boundary-cut key can never leak a prefix), whitespace collapsed, capped to fit the 80-char status budget. Group, public, external, and internal channels — and any future visibility variant — fail closed to the bare label. DM ToolComplete pings likewise show the redacted first line of command output.
+- **Prompt snapshots**: rendered system prompts are persisted once per content hash (`prompt_snapshots` table, `PromptSnapshotStore` trait), letting any past `llm_call` be replayed exactly from its `instructions_snapshot` event. `db_probe` can inspect stored snapshots.
 - **Native computer use (macOS)**: new feature-gated `computer_use` tool lets the agent operate native macOS apps — it reads an app's accessibility tree, captures a window screenshot, and clicks/types/scrolls in a loop until the task completes. Perception feeds the existing tool-origin vision pipeline (only the latest screenshot is retained per turn). Build with `--features computer_use-macos` and enable `[computer_use] enabled = true`. Layered safety: per-session approval, per-app inspect/control scopes, one-use point-of-action confirmation for consequential actions, generation-bound element indices, and hard blocks (secure fields, login windows, Terminal, aidaemon itself). A vision+tools-capable model is pinned for the duration of a GUI task; the loop aborts at start if none qualifies. Standalone `computer_use_probe` binary for manual harness testing. Full setup: `COMPUTER_USE_MACOS.md`.
 - **macOS signed app-bundle packaging**: `aidaemon install-service` now packages the daemon as a signed `~/Applications/aidaemon.app` (stable bundle id `ai.aidaemon`) and points launchd at the binary inside it, giving `computer_use` Accessibility / Screen Recording grants a stable code identity (the bundle's designated requirement) instead of an ad-hoc signature that changes every build. New `scripts/create-signing-identity.sh` (one-time self-signed identity) and `scripts/package-macos-app.sh` (build + bundle + sign + reload) support the dev loop. The daemon now prevents idle sleep itself (`caffeinate -i -w <pid>`) rather than via a launchd `caffeinate` wrapper, keeping a clean TCC code identity. Note: with a *self-signed* identity on recent macOS the grant is not fully rebuild-proof — it may need re-granting after a rebuild and can degrade at runtime to "trusted-but-no-access"; a real Apple Developer ID + notarization is the durable fix (see `COMPUTER_USE_MACOS.md`).
 
+### Changed
+
+- **Per-model tool-result caps**: large tool results are compressed against a per-model character budget (`tool_result_chars_for`) instead of one global cap, so small-context local models get tighter results while big-context models keep more. `read_file` results page on line boundaries with an explicit continuation hint instead of destructive mid-drop compression, and semantic read replays respect the same cap.
+- **search_files hardening**: bounded BFS traversal budget and richer match context for small-model file discovery.
+- **Status ping copy**: dropped the "Using " prefix and capitalized the activity label ("Running a command..." instead of "Using running a command...").
+- **Core profile prompt**: definite references ("the owner", "it", "they") resolve against the recent conversation first, falling back to stored owner facts only when no antecedent exists.
+
 ### Fixed
 
+- **Fact source provenance backfill**: a startup migration normalizes unknown `facts.source` values to `inferred` against an explicit allowlist of live writer-stamped sources, so legacy rows can't masquerade as user-stated provenance.
+- **Gutted-reply fallback**: replies that sanitization reduced to a dangling lead-in stub ("Here are the results:") are detected and replaced with an activity summary instead of being sent as a non-answer.
 - **computer_use AppleScript injection**: app activation now targets the process by PID instead of interpolating the app name into an AppleScript string.
 - **computer_use app enumeration race**: `list_apps` no longer aborts with a transient "Invalid index" when the process table changes mid-scan (defensive per-process reads + retry).
 - **computer_use multi-step flows**: the plain-text completion guardrail no longer redirects an in-progress GUI flow back to text, so the agent can carry a desktop task through multiple clicks.
