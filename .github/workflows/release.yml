@@ -36,8 +36,8 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v4
         with:
-          path: ~/.cache/huggingface/
-          key: fastembed-allminilml6v2
+          path: .fastembed_cache
+          key: fastembed-allminilml6v2-v2
 
       - name: Run tests
         run: cargo test --all-features

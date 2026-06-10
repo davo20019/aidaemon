@@ -225,7 +225,7 @@ cargo test test_tool_execution        # run a single integration test
 - **`TestChannel`** — mock `Channel` that captures outgoing messages. Not wired to ChannelHub — tests call `agent.handle_message()` directly.
 - **`setup_test_agent(provider)`** — creates a fully wired `Agent` with real `SqliteStateStore` (temp file), real `EventStore`/`PlanStore`, real `EmbeddingService`, and `SystemInfoTool` only. Returns `TestHarness { agent, state, provider, channel }`. Each call creates an isolated DB for safe parallel execution.
 
-First run downloads the fastembed model (~25MB, cached in `~/.cache/`).
+First run downloads the fastembed model (~25MB, cached in `.fastembed_cache/` in the working directory — fastembed's `InitOptions::default()`, not `~/.cache/`). CI caches this dir to avoid HuggingFace 429 rate limits.
 
 ## Debugging with db_probe
 
