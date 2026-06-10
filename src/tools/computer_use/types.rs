@@ -107,16 +107,29 @@ pub fn format_condensed_refresh(snapshot: &AppSnapshot, focus_index: Option<u32>
             out.push_str(&format_element_line(el));
         }
     }
-    let nearby: Vec<_> = snapshot
+    // List ALL interactive (clickable) controls, not just the first few. After a
+    // click the layout's other buttons (e.g. a calculator's "9", "+", "=") must
+    // still be visible by index, otherwise the model re-runs the full, expensive
+    // get_app_state every step just to find the next target — which is what
+    // burns the task token budget. Cap keeps dense apps bounded.
+    const MAX_INTERACTIVE: usize = 60;
+    let total_interactive = snapshot.elements.iter().filter(|e| e.interactive).count();
+    let interactive: Vec<_> = snapshot
         .elements
         .iter()
-        .take(12)
+        .filter(|e| e.interactive)
+        .take(MAX_INTERACTIVE)
         .map(format_element_line)
         .collect();
-    if !nearby.is_empty() {
-        out.push_str("nearby_elements:\n");
-        for line in nearby {
+    if !interactive.is_empty() {
+        out.push_str("interactive_elements:\n");
+        for line in interactive {
             out.push_str(&line);
+        }
+        if total_interactive > MAX_INTERACTIVE {
+            out.push_str(
+                "[more interactive elements omitted — call get_app_state for the full tree]\n",
+            );
         }
     }
     if snapshot.truncated {

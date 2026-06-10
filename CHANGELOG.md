@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **computer_use clicks no longer need the app frontmost**: element clicks now use an AX press (`AXPress`) as the primary method, which activates the control directly without moving the real cursor or requiring the target window to be in the foreground — a GUI task succeeds even while the user is looking at another window. A synthetic cursor click (with the foreground guard) remains the fallback for controls that can't be AX-pressed and for raw coordinate clicks.
 
 - **computer_use `screenshot` action**: a dedicated action that captures the target app window and delivers the image to the user's chat (and attaches it for the model), so an explicit "send me a screenshot" works instead of the model inventing an unknown action. Screenshots still attach automatically to every other action's result.
+- **computer_use condensed refresh lists all interactive controls**: after a mutating action the refresh now shows every clickable control (capped, with an omission marker for dense apps) instead of only the first few. Previously the model couldn't see the buttons it needed next (e.g. a calculator's "9"/"+"/"=") and re-ran the expensive full `get_app_state` every step — which inflated iteration counts and burned the task token budget on simple GUI tasks.
 
 ### Observability
 
