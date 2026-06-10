@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **computer_use AppleScript injection**: app activation now targets the process by PID instead of interpolating the app name into an AppleScript string.
 - **computer_use app enumeration race**: `list_apps` no longer aborts with a transient "Invalid index" when the process table changes mid-scan (defensive per-process reads + retry).
 - **computer_use multi-step flows**: the plain-text completion guardrail no longer redirects an in-progress GUI flow back to text, so the agent can carry a desktop task through multiple clicks.
+- **Leaked running-task queue stall**: a task left `Running` past 1 hour (an abnormal channel-handler exit that never finalized it) is now reaped automatically instead of blocking the session's message queue forever — new messages stranded behind a phantom "running" task previously required a daemon restart. The `computer_use` approval wait was also lowered to 120s so it resolves to a clean denial well before the 300s tool-call watchdog, which was the collision that produced the leaked task.
 
 ## [0.11.1] - 2026-06-09
 

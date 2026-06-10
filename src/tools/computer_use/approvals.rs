@@ -216,10 +216,16 @@ async fn request_approval(
         return Err(format!("Approval channel closed: {send_err}"));
     }
 
+    // Keep the per-approval wait comfortably below the agent's tool-call
+    // watchdog (300s): if the approval wait reached the watchdog, the tool call
+    // is killed mid-await, the turn ends abnormally, and the running-task entry
+    // can leak (the queue then stalls behind a phantom task). 120s gives the
+    // user time to respond while still resolving to a clean "denied" well before
+    // the watchdog fires. Child sessions get a short non-interactive wait.
     let timeout_secs = if session_id.starts_with("sub-") || session_id.starts_with("specialist:") {
         10
     } else {
-        300
+        120
     };
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx).await {
         Ok(Ok(response)) => Ok(response),

@@ -402,20 +402,7 @@ fn windows_for_app(app: &AXUIElement) -> Result<Vec<AXUIElement>, String> {
     let Some(items) = value.as_array() else {
         return Ok(Vec::new());
     };
-    // Only accept genuine window elements. Without Accessibility access (or with
-    // a degraded AX response) this attribute can yield non-window elements
-    // (e.g. the application element itself), which would otherwise be walked as
-    // a self-referential tree. Filtering to AXWindow turns that into a clear
-    // "no accessible window" error instead of an empty, truncated snapshot.
-    Ok(items
-        .iter()
-        .filter_map(|item| item.as_element())
-        .filter(|el| {
-            optional_string_attr(el, AX_ROLE_ATTRIBUTE)
-                .map(|r| r == "AXWindow")
-                .unwrap_or(false)
-        })
-        .collect())
+    Ok(items.iter().filter_map(|item| item.as_element()).collect())
 }
 
 struct WalkState {

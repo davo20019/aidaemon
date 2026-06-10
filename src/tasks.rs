@@ -9,6 +9,14 @@ use tokio_util::sync::CancellationToken;
 /// are treated as duplicates, even after the original was popped from the queue.
 const DEDUP_WINDOW_SECS: i64 = 120;
 
+/// A task still marked `Running` after this many seconds is treated as leaked:
+/// its channel handler never finalized it (an abnormal turn exit, a dropped
+/// future, or a panic), so without this it would block the session's message
+/// queue forever — every new message stranded behind a phantom "running" task.
+/// Set far above any legitimate task wall-clock (agent turns and `computer_use`
+/// GUI flows are minutes, not hours), so this only ever reaps genuine leaks.
+const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
+
 /// A queued message waiting to be processed.
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
@@ -199,6 +207,30 @@ impl TaskRegistry {
         entries
     }
 
+    /// Mark leaked `Running` tasks (older than [`MAX_RUNNING_TASK_AGE_SECS`]) as
+    /// `Failed` so they stop blocking the session queue and surface as resolved
+    /// in `/tasks`. Cancels each reaped task's token to nudge any still-alive
+    /// hung future to exit. Returns the reaped task ids for logging.
+    fn reap_stale_running_locked(tasks: &mut HashMap<u64, TaskHandle>) -> Vec<u64> {
+        let now = Utc::now();
+        let mut reaped = Vec::new();
+        for handle in tasks.values_mut() {
+            let stale = matches!(handle.entry.status, TaskStatus::Running)
+                && (now - handle.entry.started_at).num_seconds() > MAX_RUNNING_TASK_AGE_SECS;
+            if stale {
+                handle.cancel_token.cancel();
+                if let Some(ref typing) = handle.typing_cancel {
+                    typing.cancel();
+                }
+                handle.entry.status =
+                    TaskStatus::Failed("stale: task was never finalized".to_string());
+                handle.entry.finished_at = Some(now);
+                reaped.push(handle.entry.id);
+            }
+        }
+        reaped
+    }
+
     /// Remove oldest finished tasks when count exceeds max_completed.
     fn cleanup_locked(tasks: &mut HashMap<u64, TaskHandle>, max_completed: usize) {
         let mut finished: Vec<u64> = tasks
@@ -220,8 +252,20 @@ impl TaskRegistry {
     }
 
     /// Check if a session has a running task.
+    ///
+    /// Reaps leaked (stale) running tasks first, so a phantom task that was
+    /// never finalized can't make this return `true` forever and block the
+    /// session's queue.
     pub async fn has_running_task(&self, session_id: &str) -> bool {
-        let tasks = self.tasks.read().await;
+        let mut tasks = self.tasks.write().await;
+        let reaped = Self::reap_stale_running_locked(&mut tasks);
+        if !reaped.is_empty() {
+            tracing::warn!(
+                ?reaped,
+                session_id,
+                "Reaped stale running task(s) that were never finalized"
+            );
+        }
         tasks.values().any(|h| {
             h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
         })
@@ -363,7 +407,17 @@ impl TaskRegistry {
         text: &str,
         dedup_key: Option<&str>,
     ) -> QueueOutcome {
-        let tasks = self.tasks.read().await;
+        let mut tasks = self.tasks.write().await;
+        // Reap leaked running tasks first: a phantom that was never finalized
+        // must not strand this message in a queue nobody will drain.
+        let reaped = Self::reap_stale_running_locked(&mut tasks);
+        if !reaped.is_empty() {
+            tracing::warn!(
+                ?reaped,
+                session_id,
+                "Reaped stale running task(s) before queue decision"
+            );
+        }
         let running = tasks.values().any(|h| {
             h.entry.session_id == session_id && matches!(h.entry.status, TaskStatus::Running)
         });
@@ -371,8 +425,8 @@ impl TaskRegistry {
             return QueueOutcome::NoRunningTask;
         }
 
-        // Keep holding the task-map read lock while queueing so
-        // finalize_and_drain (which takes the write lock first) cannot
+        // Keep holding the task-map write lock while queueing so
+        // finalize_and_drain (which also takes the write lock first) cannot
         // finalize-and-drain between our check and our push.
         let now = Utc::now();
         let hash = Self::text_hash(dedup_key.unwrap_or(text));
@@ -735,6 +789,52 @@ mod tests {
                 .queue_message_if_running(session, "status?", Some("200"))
                 .await,
             QueueOutcome::Duplicate
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stale_running_task_is_reaped_and_unblocks_queue() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (task_id, _token) = registry.register(session, "leaked task").await;
+
+        // Force the task to look leaked: started long before the staleness cap
+        // and never finalized (simulates an abnormal channel-handler exit).
+        {
+            let mut tasks = registry.tasks.write().await;
+            let handle = tasks.get_mut(&task_id).unwrap();
+            handle.entry.started_at =
+                Utc::now() - chrono::Duration::seconds(MAX_RUNNING_TASK_AGE_SECS + 60);
+        }
+
+        // The phantom must not report as running...
+        assert!(!registry.has_running_task(session).await);
+        // ...and a new message must process directly, not queue behind it.
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "new message", Some("m1"))
+                .await,
+            QueueOutcome::NoRunningTask
+        ));
+        // The reaped task is surfaced as Failed (resolved) in listings.
+        let entries = registry.list_for_session(session).await;
+        assert!(matches!(entries[0].status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_recent_running_task_is_not_reaped() {
+        let registry = TaskRegistry::new(10);
+        let session = "test-session";
+        let (_task_id, _token) = registry.register(session, "active task").await;
+
+        // A freshly-registered task is genuinely running and must still gate
+        // the queue (no false-positive reaping of legitimate work).
+        assert!(registry.has_running_task(session).await);
+        assert!(matches!(
+            registry
+                .queue_message_if_running(session, "follow-up", Some("m1"))
+                .await,
+            QueueOutcome::Queued(1)
         ));
     }
 
