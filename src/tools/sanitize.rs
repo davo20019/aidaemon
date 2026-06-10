@@ -569,6 +569,28 @@ pub fn redact_secrets(text: &str) -> String {
     result
 }
 
+/// Replace the current user's home directory prefix with `~` in status-ping
+/// summaries. Only occurrences followed by `/` are rewritten, so paths that
+/// merely share the prefix (`/Users/davidloorx`) are untouched.
+///
+/// Must run BEFORE `redact_secrets`: the "File path" secret pattern matches
+/// `/Users/...` and `/home/...` and would otherwise swallow the whole path as
+/// `[REDACTED:File path]`. A `~/` path no longer matches that pattern.
+pub fn shorten_home_dir(text: &str) -> String {
+    match dirs::home_dir() {
+        Some(home) => shorten_home_dir_with(text, &home.to_string_lossy()),
+        None => text.to_string(),
+    }
+}
+
+fn shorten_home_dir_with(text: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.len() < 2 {
+        return text.to_string();
+    }
+    text.replace(&format!("{}/", home), "~/")
+}
+
 /// Maximum length of a user-facing status-ping summary (characters, not bytes).
 const STATUS_SUMMARY_MAX_CHARS: usize = 80;
 
@@ -626,11 +648,16 @@ fn summary_is_command_bearing(name: &str) -> bool {
 /// paths, and secrets never leak to the user.
 ///
 /// - The label hides orchestration internals like `spawn_agent`.
-/// - Command-bearing tools (terminal) return an empty summary — only the label
-///   shows, never the raw command or absolute paths.
+/// - Command-bearing tools (terminal) return an empty summary unless the channel
+///   is a private 1-on-1 DM (`ChannelVisibility::Private`); in a DM the redacted
+///   command is shown (home paths shortened, secrets scrubbed).
 /// - All other summaries are passed through `redact_secrets` and length-capped
 ///   using char-safe truncation.
-pub fn user_facing_tool_activity(name: &str, summary: &str) -> (String, String) {
+pub fn user_facing_tool_activity(
+    name: &str,
+    summary: &str,
+    visibility: crate::types::ChannelVisibility,
+) -> (String, String) {
     // `manage_memories`/`manage_people` carry the action ("search", "list",
     // "forget", …) as their summary. A read action rendered with the static
     // "updating memory" label produced contradictory text like
@@ -652,12 +679,16 @@ pub fn user_facing_tool_activity(name: &str, summary: &str) -> (String, String) 
 
     let label = friendly_tool_label(name);
 
-    if summary_is_command_bearing(name) {
-        // Never expose the raw command / absolute paths; the label is enough.
+    if summary_is_command_bearing(name)
+        && !matches!(visibility, crate::types::ChannelVisibility::Private)
+    {
+        // Never expose the raw command / absolute paths outside a 1-on-1 DM.
+        // Any new visibility variant lands here (fail closed).
         return (label, String::new());
     }
 
-    let cleaned = redact_secrets(summary);
+    let cleaned = shorten_home_dir(summary);
+    let cleaned = redact_secrets(&cleaned);
     let cleaned = crate::utils::truncate_str(cleaned.trim(), STATUS_SUMMARY_MAX_CHARS);
     (label, cleaned)
 }
@@ -971,38 +1002,57 @@ pub fn is_trusted_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChannelVisibility;
 
     #[test]
     fn user_facing_activity_relabels_internal_tool_names() {
-        let (label, _summary) = user_facing_tool_activity("spawn_agent", "executor: do the thing");
+        let (label, _summary) = user_facing_tool_activity(
+            "spawn_agent",
+            "executor: do the thing",
+            ChannelVisibility::Private,
+        );
         assert_eq!(label, "delegating to a specialist");
         assert_ne!(label, "spawn_agent");
         assert!(!label.contains("spawn_agent"));
 
-        let (label, _) = user_facing_tool_activity("cli_agent", "claude working");
+        let (label, _) =
+            user_facing_tool_activity("cli_agent", "claude working", ChannelVisibility::Private);
         assert_eq!(label, "delegating to a CLI agent");
     }
 
     #[test]
-    fn user_facing_activity_hides_raw_command_and_paths() {
-        let summary = "cd '/Users/davidloor/projects/resume/google' && pdftotext resume.pdf -";
-        let (label, clean) = user_facing_tool_activity("terminal", summary);
+    fn user_facing_activity_hides_raw_command_outside_private_dm() {
+        let summary = "`cd ~/projects/resume/google && pdftotext resume.pdf -`";
+        for vis in [
+            ChannelVisibility::PrivateGroup,
+            ChannelVisibility::Public,
+            ChannelVisibility::PublicExternal,
+            ChannelVisibility::Internal,
+        ] {
+            let (label, clean) = user_facing_tool_activity("terminal", summary, vis);
+            assert_eq!(label, "running a command");
+            assert!(clean.is_empty(), "{vis:?} must suppress the command");
+        }
+    }
+
+    #[test]
+    fn user_facing_activity_shows_redacted_command_in_private_dm() {
+        let summary = "`curl -H \"Authorization: Bearer abc123\" https://api.example.com`";
+        let (label, clean) =
+            user_facing_tool_activity("terminal", summary, ChannelVisibility::Private);
         assert_eq!(label, "running a command");
-        // The raw absolute path / full command must not appear verbatim.
-        assert!(!clean.contains("/Users/davidloor/projects/resume"));
-        assert!(!clean.contains("pdftotext"));
-        assert!(!clean.contains("&&"));
-        // Rendered as both channels would: "Using {label}: {clean}" / "✓ {label}: {clean}".
-        let rendered_start = format!("Using {label}: {clean}");
-        let rendered_done = format!("✓ {label}: {clean}");
-        assert!(!rendered_start.contains("spawn_agent"));
-        assert!(!rendered_done.contains("/Users/davidloor"));
+        assert!(clean.contains("curl"), "command should be visible: {clean}");
+        assert!(
+            !clean.contains("abc123"),
+            "secret must be redacted: {clean}"
+        );
     }
 
     #[test]
     fn user_facing_activity_memory_search_reads_not_updates() {
         // Regression: a memory search rendered as "updating memory: search".
-        let (label, summary) = user_facing_tool_activity("manage_memories", "search");
+        let (label, summary) =
+            user_facing_tool_activity("manage_memories", "search", ChannelVisibility::Private);
         assert_eq!(label, "checking memory");
         assert!(
             summary.is_empty(),
@@ -1012,7 +1062,8 @@ mod tests {
         assert_eq!(format!("Using {label}..."), "Using checking memory...");
 
         for read in ["list", "list_goals", "list_scheduled", "diagnose_scheduled"] {
-            let (label, _) = user_facing_tool_activity("manage_memories", read);
+            let (label, _) =
+                user_facing_tool_activity("manage_memories", read, ChannelVisibility::Private);
             assert_eq!(label, "checking memory", "action {read} should read");
         }
     }
@@ -1025,24 +1076,29 @@ mod tests {
             "create_scheduled_goal",
             "trigger_now",
         ] {
-            let (label, summary) = user_facing_tool_activity("manage_memories", write);
+            let (label, summary) =
+                user_facing_tool_activity("manage_memories", write, ChannelVisibility::Private);
             assert_eq!(label, "updating memory", "action {write} should write");
             assert!(summary.is_empty());
         }
         // manage_people follows the same read/write split.
         assert_eq!(
-            user_facing_tool_activity("manage_people", "view John").0,
+            user_facing_tool_activity("manage_people", "view John", ChannelVisibility::Private).0,
             "checking memory"
         );
         assert_eq!(
-            user_facing_tool_activity("manage_people", "add Jane").0,
+            user_facing_tool_activity("manage_people", "add Jane", ChannelVisibility::Private).0,
             "updating memory"
         );
     }
 
     #[test]
     fn user_facing_activity_unknown_tool_passes_through() {
-        let (label, clean) = user_facing_tool_activity("some_future_tool", "did something useful");
+        let (label, clean) = user_facing_tool_activity(
+            "some_future_tool",
+            "did something useful",
+            ChannelVisibility::Private,
+        );
         assert_eq!(label, "some_future_tool");
         assert_eq!(clean, "did something useful");
     }
@@ -1050,7 +1106,8 @@ mod tests {
     #[test]
     fn user_facing_activity_caps_long_summary() {
         let long = "a".repeat(300);
-        let (_label, clean) = user_facing_tool_activity("web_search", &long);
+        let (_label, clean) =
+            user_facing_tool_activity("web_search", &long, ChannelVisibility::Private);
         assert!(clean.chars().count() <= STATUS_SUMMARY_MAX_CHARS);
     }
 
@@ -1805,5 +1862,26 @@ mod tests {
         let once = wrap_untrusted_output("http_request", "HTTP 201 Created\n\n{\"id\":\"123\"}");
         let twice = wrap_untrusted_output("http_request", &once);
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn shorten_home_dir_rewrites_prefix_occurrences() {
+        let cmd = r#"grep -rn "non-compete" /Users/davidloor/Documents /Users/davidloor/Desktop"#;
+        assert_eq!(
+            shorten_home_dir_with(cmd, "/Users/davidloor"),
+            r#"grep -rn "non-compete" ~/Documents ~/Desktop"#
+        );
+    }
+
+    #[test]
+    fn shorten_home_dir_ignores_similar_prefixes_and_degenerate_homes() {
+        // A longer username sharing the prefix must not be rewritten.
+        assert_eq!(
+            shorten_home_dir_with("ls /Users/davidloorx/tmp", "/Users/davidloor"),
+            "ls /Users/davidloorx/tmp"
+        );
+        // Degenerate home values never rewrite anything.
+        assert_eq!(shorten_home_dir_with("ls /tmp", "/"), "ls /tmp");
+        assert_eq!(shorten_home_dir_with("ls /tmp", ""), "ls /tmp");
     }
 }

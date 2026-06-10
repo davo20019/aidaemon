@@ -295,6 +295,13 @@ async fn test_full_stack_status_updates_received() {
     let has_tool_start = updates
         .iter()
         .any(|u| matches!(u, StatusUpdate::ToolStart { name, .. } if name == "running a command"));
+    let dm_start_shows_command = updates.iter().any(|u| {
+        matches!(
+            u,
+            StatusUpdate::ToolStart { name, summary }
+                if name == "running a command" && summary.contains("echo hello")
+        )
+    });
     let has_tool_complete = updates.iter().any(
         |u| matches!(u, StatusUpdate::ToolComplete { name, .. } if name == "running a command"),
     );
@@ -315,6 +322,11 @@ async fn test_full_stack_status_updates_received() {
     assert!(
         has_tool_complete,
         "Should have received ToolComplete for terminal. Updates: {:?}",
+        updates
+    );
+    assert!(
+        dm_start_shows_command,
+        "Private-DM ToolStart should carry the redacted command. Updates: {:?}",
         updates
     );
 }

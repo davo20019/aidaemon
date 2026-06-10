@@ -1380,6 +1380,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 crate::tools::sanitize::user_facing_tool_activity(
                     &tc.name,
                     &summarize_completed_tool_result(&result_text),
+                    channel_ctx.visibility,
                 );
             send_status(
                 &status_tx,

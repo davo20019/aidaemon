@@ -33,6 +33,7 @@ pub(super) async fn execute_tool_call_io(
     let (start_label, start_summary) = crate::tools::sanitize::user_facing_tool_activity(
         &tc.name,
         &summarize_tool_args(&tc.name, ctx.effective_arguments),
+        ctx.channel_ctx.visibility,
     );
     send_status(
         ctx.status_tx,

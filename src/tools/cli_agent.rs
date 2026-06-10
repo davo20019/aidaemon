@@ -2177,6 +2177,7 @@ impl CliAgentTool {
                         let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
                             tool_name,
                             "killed - infinite loop detected",
+                            crate::types::ChannelVisibility::Public,
                         );
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
@@ -2229,8 +2230,11 @@ impl CliAgentTool {
                     } else {
                         format!("exited with code {:?}", exit_code)
                     };
-                    let (label, summary) =
-                        crate::tools::sanitize::user_facing_tool_activity(tool_name, &raw_summary);
+                    let (label, summary) = crate::tools::sanitize::user_facing_tool_activity(
+                        tool_name,
+                        &raw_summary,
+                        crate::types::ChannelVisibility::Public,
+                    );
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
                         name: label,
                         summary,
