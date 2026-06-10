@@ -48,6 +48,7 @@ impl Default for RenderOptions {
                     "image/gif".to_string(),
                     "image/webp".to_string(),
                 ],
+                model_patterns: vec!["gpt-4o".to_string()],
             },
             audio: AudioConfig::from_files(&crate::config::FilesConfig::default()),
             stt: SttConfig::from_files(&crate::config::FilesConfig::default()),
@@ -162,11 +163,14 @@ fn attach_tool_routing(obj: &mut Value, m: &Message) {
 }
 
 /// Append synthetic user messages carrying tool observation images for the LLM.
+/// When `encode_image` is false, emit the label-only stub (used for superseded
+/// tool observations within the same turn — latest-screenshot retention).
 fn append_tool_observation_messages(
     out: &mut Vec<Value>,
     m: &Message,
     options: &RenderOptions,
     vision_skipped: &mut bool,
+    encode_image: bool,
 ) {
     if m.role != "tool" {
         return;
@@ -181,18 +185,65 @@ fn append_tool_observation_messages(
     let tool_name = m.tool_name.as_deref().unwrap_or("tool");
     let hint = m.content.as_deref().unwrap_or("");
     let label = crate::agent::vision::format_tool_observation_label(tool_name, hint);
-    let built = crate::agent::vision::build_tool_observation_content(
-        &label,
-        &m.attachments,
-        &options.vision,
-    );
-    if built.vision_skipped {
-        *vision_skipped = true;
-    }
+    let content = if encode_image {
+        let built = crate::agent::vision::build_tool_observation_content(
+            &label,
+            &m.attachments,
+            &options.vision,
+        );
+        if built.vision_skipped {
+            *vision_skipped = true;
+        }
+        built.content
+    } else {
+        json!(label)
+    };
     out.push(json!({
         "role": "user",
-        "content": built.content,
+        "content": content,
     }));
+}
+
+fn latest_tool_observation_indices(
+    messages: &[Message],
+) -> std::collections::HashMap<String, usize> {
+    use std::collections::HashMap;
+    let mut latest = HashMap::new();
+    for (idx, m) in messages.iter().enumerate() {
+        if m.role != "tool" {
+            continue;
+        }
+        for att in &m.attachments {
+            if att.provenance != AttachmentProvenance::ToolObservation {
+                continue;
+            }
+            let source = att
+                .source_tool
+                .as_deref()
+                .or(m.tool_name.as_deref())
+                .unwrap_or("tool");
+            latest.insert(source.to_string(), idx);
+        }
+    }
+    latest
+}
+
+fn should_encode_tool_observation_image(
+    m: &Message,
+    msg_idx: usize,
+    latest: &std::collections::HashMap<String, usize>,
+) -> bool {
+    m.attachments.iter().any(|a| {
+        if a.provenance != AttachmentProvenance::ToolObservation {
+            return false;
+        }
+        let source = a
+            .source_tool
+            .as_deref()
+            .or(m.tool_name.as_deref())
+            .unwrap_or("tool");
+        latest.get(source) == Some(&msg_idx)
+    })
 }
 
 /// **Current** mode: append-only, full content. Single source of truth for the
@@ -203,13 +254,15 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
     let mut vision_skipped = false;
     let mut audio_skipped = false;
     let mut stt_failed = false;
+    let latest_tool_observations = latest_tool_observation_indices(turn_messages);
 
     let mut rendered: Vec<Value> = Vec::new();
 
-    for m in turn_messages
+    for (msg_idx, m) in turn_messages
         .iter()
+        .enumerate()
         // Skip tool results with empty/missing tool_name.
-        .filter(|m| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
+        .filter(|(_, m)| !(m.role == "tool" && m.tool_name.as_ref().is_none_or(|n| n.is_empty())))
     {
         // Drop learned-helplessness / budget-exhaustion boilerplate so the
         // model never reads its own prior "I failed" text and gives up.
@@ -275,7 +328,13 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
 
         attach_tool_routing(&mut obj, m);
         rendered.push(obj);
-        append_tool_observation_messages(&mut rendered, m, options, &mut vision_skipped);
+        append_tool_observation_messages(
+            &mut rendered,
+            m,
+            options,
+            &mut vision_skipped,
+            should_encode_tool_observation_image(m, msg_idx, &latest_tool_observations),
+        );
     }
 
     if vision_skipped {
@@ -437,7 +496,7 @@ fn render_archived(
                 let mut obj = json!({ "role": "tool", "content": summary });
                 attach_tool_routing(&mut obj, m);
                 out.push(obj);
-                append_tool_observation_messages(&mut out, m, options, &mut vision_skipped);
+                append_tool_observation_messages(&mut out, m, options, &mut vision_skipped, true);
             }
 
             _ => {}
@@ -911,6 +970,94 @@ mod tests {
             .as_array()
             .expect("multimodal observation");
         assert!(blocks.iter().any(|b| b["type"] == "image_url"));
+    }
+
+    #[test]
+    fn current_mode_keeps_only_latest_tool_observation_image() {
+        use crate::agent::vision::VISION_SKIPPED_SYSTEM_HINT;
+        use crate::traits::{AttachmentProvenance, MessageAttachment};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file1 = NamedTempFile::new().unwrap();
+        file1
+            .write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+        let mut file2 = NamedTempFile::new().unwrap();
+        file2
+            .write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            .unwrap();
+
+        let attachment = |path: &std::path::Path| MessageAttachment {
+            local_path: path.to_string_lossy().into_owned(),
+            filename: "screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size_bytes: 8,
+            provenance: AttachmentProvenance::ToolObservation,
+            source_tool: Some("computer_use".to_string()),
+        };
+
+        let turn = vec![
+            assistant_empty_with_tool_call(),
+            Message {
+                role: "tool".to_string(),
+                content: Some("step 1".to_string()),
+                tool_call_id: Some("c1".to_string()),
+                tool_name: Some("computer_use".to_string()),
+                attachments: vec![attachment(file1.path())],
+                ..Message::runtime_defaults()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls_json: Some(
+                    r#"[{"id":"c2","type":"function","function":{"name":"computer_use","arguments":"{}"}}]"#
+                        .to_string(),
+                ),
+                ..Message::runtime_defaults()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some("step 2".to_string()),
+                tool_call_id: Some("c2".to_string()),
+                tool_name: Some("computer_use".to_string()),
+                attachments: vec![attachment(file2.path())],
+                ..Message::runtime_defaults()
+            },
+        ];
+
+        let out = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(
+            !out.iter().any(|m| {
+                m["role"] == "system" && m["content"].as_str() == Some(VISION_SKIPPED_SYSTEM_HINT)
+            }),
+            "superseded observations must not inject vision-skipped hint"
+        );
+
+        let observations: Vec<_> = out
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("computer_use"))
+                    || m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|text| text.contains("computer_use"))
+                        })
+                    })
+            })
+            .collect();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0]["content"].is_string());
+        assert!(observations[1]["content"].is_array());
     }
 
     #[test]

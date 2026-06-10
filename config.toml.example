@@ -217,6 +217,26 @@ health_port = 8080
 # # REJECTED at startup rather than silently claiming isolation it can't deliver.
 # session_isolation = "page"
 
+# [computer_use]
+# Native macOS desktop control: the agent inspects and operates GUI apps via the
+# accessibility tree + screenshots (click, type, scroll). macOS-only and
+# feature-gated — build with `--features computer_use-macos`. Requires a one-time
+# Accessibility + Screen Recording grant; SETUP: COMPUTER_USE_MACOS.md
+# (run scripts/create-signing-identity.sh then scripts/package-macos-app.sh so
+# the permission grants survive rebuilds).
+# enabled = true
+# screenshot_max_width = 1280
+# screenshot_max_height = 800
+# screenshot_max_bytes = 2000000
+# ax_max_depth = 12
+# ax_max_nodes = 500
+# action_timeout_secs = 10
+# max_mutating_actions = 15
+# max_consecutive_observations = 3
+# max_wall_clock_secs = 600
+# always_allowed_apps = []
+# mirror_screenshots_to_channel = false
+
 # [triggers.email]
 # host = "imap.gmail.com"
 # port = 993
@@ -246,6 +266,7 @@ health_port = 8080
 # vision_enabled = true
 # max_vision_image_mb = 4
 # vision_mime_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+# vision_model_patterns = ["gpt-4o", "gemini", "claude-3", "gemma"]
 # audio_enabled = true
 # max_audio_mb = 10
 # audio_mime_types = ["audio/ogg", "audio/mpeg", "audio/mp3", "audio/wav", "audio/flac", "audio/aac"]

@@ -15,6 +15,8 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 #[cfg(feature = "browser")]
 use crate::tools::BrowserTool;
+#[cfg(feature = "computer_use")]
+use crate::tools::ComputerUseTool;
 #[cfg(feature = "slack")]
 use crate::tools::ReadChannelHistoryTool;
 use crate::tools::{
@@ -177,6 +179,8 @@ enum OptionalToolId {
     Diagnose,
     #[cfg(feature = "browser")]
     Browser,
+    #[cfg(feature = "computer_use")]
+    ComputerUse,
     SendFile,
     CliAgents,
     HealthProbe,
@@ -197,6 +201,11 @@ fn optional_enabled_diagnostics(config: &AppConfig) -> bool {
 #[cfg(feature = "browser")]
 fn optional_enabled_browser(config: &AppConfig) -> bool {
     config.browser.enabled
+}
+
+#[cfg(feature = "computer_use")]
+fn optional_enabled_computer_use(config: &AppConfig) -> bool {
+    config.computer_use.enabled
 }
 
 fn optional_enabled_files(config: &AppConfig) -> bool {
@@ -222,6 +231,12 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::Browser,
         name: "browser",
         enabled_if: optional_enabled_browser,
+    },
+    #[cfg(feature = "computer_use")]
+    OptionalToolSpec {
+        id: OptionalToolId::ComputerUse,
+        name: "computer_use",
+        enabled_if: optional_enabled_computer_use,
     },
     OptionalToolSpec {
         id: OptionalToolId::SendFile,
@@ -476,6 +491,21 @@ pub async fn register_optional_tools(
                 )
                 .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
                 tools.push(Arc::new(browser_tool));
+            }
+            #[cfg(feature = "computer_use")]
+            OptionalToolId::ComputerUse => {
+                if !config.tools.is_enabled("computer_use") {
+                    continue;
+                }
+                std::fs::create_dir_all(&inbox_dir)?;
+                let vision = crate::config::VisionConfig::from_files(&config.files);
+                tools.push(Arc::new(ComputerUseTool::new(
+                    config.computer_use.clone(),
+                    vision,
+                    std::path::PathBuf::from(&inbox_dir),
+                    approval_tx.clone(),
+                    media_tx.clone(),
+                )));
             }
             OptionalToolId::SendFile => {
                 if !config.tools.is_enabled("send_file") {

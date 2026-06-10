@@ -39,6 +39,10 @@ mod terminal_bridge;
 mod terminal_lite;
 mod token_alerts;
 mod tools;
+#[cfg(feature = "computer_use")]
+pub use config::ComputerUseConfig;
+#[cfg(feature = "computer_use")]
+pub use tools::computer_use;
 mod traits;
 mod triggers;
 mod types;
@@ -290,6 +294,12 @@ pub fn run() -> anyhow::Result<()> {
             config::AppConfig::load(&config_path)?
         }
     };
+
+    // Keep the Mac awake while the daemon runs. The launchd plist launches the
+    // binary directly (not via a caffeinate wrapper) to keep a clean TCC code
+    // identity for computer_use, so the daemon prevents idle sleep itself.
+    #[cfg(target_os = "macos")]
+    daemon::spawn_macos_keep_awake();
 
     // Run async
     tokio::runtime::Builder::new_multi_thread()

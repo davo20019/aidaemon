@@ -373,6 +373,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub browser: BrowserConfig,
     #[serde(default)]
+    pub computer_use: ComputerUseConfig,
+    #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
     pub subagents: SubagentsConfig,
@@ -1630,6 +1632,89 @@ impl Default for BrowserConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct ComputerUseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cu_screenshot_max_width")]
+    pub screenshot_max_width: u32,
+    #[serde(default = "default_cu_screenshot_max_height")]
+    pub screenshot_max_height: u32,
+    #[serde(default = "default_cu_screenshot_max_bytes")]
+    pub screenshot_max_bytes: u64,
+    #[serde(default = "default_cu_ax_max_depth")]
+    pub ax_max_depth: u32,
+    #[serde(default = "default_cu_ax_max_nodes")]
+    pub ax_max_nodes: u32,
+    #[serde(default = "default_cu_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    #[serde(default = "default_cu_max_mutating_actions")]
+    pub max_mutating_actions: u32,
+    #[serde(default = "default_cu_max_consecutive_observations")]
+    pub max_consecutive_observations: u32,
+    #[serde(default = "default_cu_max_wall_clock_secs")]
+    pub max_wall_clock_secs: u64,
+    #[serde(default)]
+    pub always_allowed_apps: Vec<String>,
+    #[serde(default)]
+    pub mirror_screenshots_to_channel: bool,
+}
+
+fn default_cu_screenshot_max_width() -> u32 {
+    1280
+}
+fn default_cu_screenshot_max_height() -> u32 {
+    800
+}
+fn default_cu_screenshot_max_bytes() -> u64 {
+    2_000_000
+}
+fn default_cu_ax_max_depth() -> u32 {
+    12
+}
+fn default_cu_ax_max_nodes() -> u32 {
+    500
+}
+fn default_cu_action_timeout_secs() -> u64 {
+    10
+}
+fn default_cu_max_mutating_actions() -> u32 {
+    15
+}
+fn default_cu_max_consecutive_observations() -> u32 {
+    3
+}
+fn default_cu_max_wall_clock_secs() -> u64 {
+    600
+}
+
+impl Default for ComputerUseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            screenshot_max_width: default_cu_screenshot_max_width(),
+            screenshot_max_height: default_cu_screenshot_max_height(),
+            screenshot_max_bytes: default_cu_screenshot_max_bytes(),
+            ax_max_depth: default_cu_ax_max_depth(),
+            ax_max_nodes: default_cu_ax_max_nodes(),
+            action_timeout_secs: default_cu_action_timeout_secs(),
+            max_mutating_actions: default_cu_max_mutating_actions(),
+            max_consecutive_observations: default_cu_max_consecutive_observations(),
+            max_wall_clock_secs: default_cu_max_wall_clock_secs(),
+            always_allowed_apps: Vec::new(),
+            mirror_screenshots_to_channel: false,
+        }
+    }
+}
+
+impl ComputerUseConfig {
+    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
+    pub fn action_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.action_timeout_secs.clamp(1, 120))
+    }
+}
+
 impl BrowserConfig {
     /// Resolved navigation/DOM-ready timeout, clamped to a sane bounded range
     /// (1..=120s) so a typo'd or absurd config value can neither hang the tool
@@ -2063,6 +2148,8 @@ pub struct FilesConfig {
     pub max_vision_image_mb: u64,
     #[serde(default = "default_vision_mime_types")]
     pub vision_mime_types: Vec<String>,
+    #[serde(default = "default_vision_model_patterns")]
+    pub vision_model_patterns: Vec<String>,
     #[serde(default = "default_audio_enabled")]
     pub audio_enabled: bool,
     #[serde(default = "default_max_audio_mb")]
@@ -2102,6 +2189,8 @@ pub struct VisionConfig {
     pub enabled: bool,
     pub max_image_bytes: u64,
     pub mime_types: Vec<String>,
+    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
+    pub model_patterns: Vec<String>,
 }
 
 impl VisionConfig {
@@ -2110,7 +2199,19 @@ impl VisionConfig {
             enabled: files.vision_enabled,
             max_image_bytes: files.max_vision_image_mb.saturating_mul(1_048_576),
             mime_types: files.vision_mime_types.clone(),
+            model_patterns: files.vision_model_patterns.clone(),
         }
+    }
+
+    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
+    pub fn model_supports_vision(&self, model: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let model_lower = model.to_ascii_lowercase();
+        self.model_patterns
+            .iter()
+            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
     }
 
     pub fn mime_allowed(&self, mime: &str) -> bool {
@@ -2213,6 +2314,7 @@ impl Default for FilesConfig {
             vision_enabled: default_vision_enabled(),
             max_vision_image_mb: default_max_vision_image_mb(),
             vision_mime_types: default_vision_mime_types(),
+            vision_model_patterns: default_vision_model_patterns(),
             audio_enabled: default_audio_enabled(),
             max_audio_mb: default_max_audio_mb(),
             audio_mime_types: default_audio_mime_types(),
@@ -2249,6 +2351,32 @@ fn default_vision_mime_types() -> Vec<String> {
         "image/png".to_string(),
         "image/gif".to_string(),
         "image/webp".to_string(),
+    ]
+}
+fn default_vision_model_patterns() -> Vec<String> {
+    vec![
+        "gpt-4o".to_string(),
+        "gpt-4".to_string(),
+        "gpt-5".to_string(),
+        "o1".to_string(),
+        "o3".to_string(),
+        "o4".to_string(),
+        "gemini".to_string(),
+        "claude-3".to_string(),
+        "claude-sonnet".to_string(),
+        "claude-opus".to_string(),
+        "claude-haiku".to_string(),
+        "fable".to_string(),
+        "gemma".to_string(),
+        "llava".to_string(),
+        "qwen-vl".to_string(),
+        "qwen2-vl".to_string(),
+        "qwen2.5-vl".to_string(),
+        "qwen3-vl".to_string(),
+        "internvl".to_string(),
+        "vision".to_string(),
+        "pixtral".to_string(),
+        "mistral-large".to_string(),
     ]
 }
 fn default_audio_enabled() -> bool {

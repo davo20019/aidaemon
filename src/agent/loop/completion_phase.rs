@@ -91,6 +91,11 @@ pub(super) async fn run_completion_phase(
     let mut force_text_response = *ctx.force_text_response;
     let mut force_text_fast_path_accepted = false;
     let execution_state = &mut *ctx.execution_state;
+    #[cfg(feature = "computer_use")]
+    let computer_use_pin_active =
+        crate::agent::computer_use::task_has_computer_use_pin(task_id).await;
+    #[cfg(not(feature = "computer_use"))]
+    let computer_use_pin_active = false;
 
     macro_rules! commit_state {
         () => {
@@ -422,6 +427,7 @@ pub(super) async fn run_completion_phase(
 
                 if deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
                     && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                    && !computer_use_pin_active
                 {
                     if let Some(next_model) = agent
                         .pick_fallback_excluding(&model, &[], llm_router.as_ref())
@@ -739,7 +745,7 @@ pub(super) async fn run_completion_phase(
                                 let next_model = router
                                     .select_for_profile(policy_bundle.policy.model_profile)
                                     .to_string();
-                                if next_model != model {
+                                if next_model != model && !computer_use_pin_active {
                                     info!(
                                         session_id,
                                         iteration,
@@ -1576,6 +1582,7 @@ pub(super) async fn run_completion_phase(
                         if !has_tool_attempts
                             && deferred_no_tool_streak >= DEFERRED_NO_TOOL_SWITCH_THRESHOLD
                             && deferred_no_tool_model_switches < MAX_DEFERRED_NO_TOOL_MODEL_SWITCHES
+                            && !computer_use_pin_active
                         {
                             if let Some(next_model) = agent
                                 .pick_fallback_excluding(&model, &[], llm_router.as_ref())

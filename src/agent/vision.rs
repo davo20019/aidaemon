@@ -245,6 +245,7 @@ mod tests {
             enabled: true,
             max_image_bytes: 4 * 1_048_576,
             mime_types: default_vision_mime_types(),
+            model_patterns: vec!["gpt-4o".to_string()],
         }
     }
 

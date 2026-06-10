@@ -174,6 +174,9 @@ mod stopping_conditions;
 #[path = "loop/tool_loop_state.rs"]
 mod tool_loop_state;
 
+#[cfg(feature = "computer_use")]
+mod computer_use;
+
 #[path = "loop/bootstrap_phase.rs"]
 mod bootstrap_phase;
 #[path = "loop/completion_checks.rs"]

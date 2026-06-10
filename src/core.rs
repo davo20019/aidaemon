@@ -1324,6 +1324,25 @@ fn build_base_system_prompt(config: &AppConfig, skill_names: &[String]) -> Strin
         ""
     };
 
+    let computer_use_table_row = if cfg!(feature = "computer_use") && config.computer_use.enabled {
+        "| Control native macOS apps (inspect windows, click, type) | computer_use | — |\n\
+         | Click a button in a desktop dialog or system UI | computer_use | — |\n"
+    } else {
+        ""
+    };
+
+    let computer_use_guidance = if cfg!(feature = "computer_use") && config.computer_use.enabled {
+        "\n\n## Desktop Computer Use\n\
+        Use computer_use only for native macOS apps; use browser for websites and \
+        localhost dev servers. Always call get_app_state first and pass its \
+        snapshot_generation to every mutating action. Prefer element_index over raw \
+        coordinates when the accessibility tree exposes the target. After each action \
+        you receive a condensed state refresh plus a screenshot — verify the result \
+        visually before the next step."
+    } else {
+        ""
+    };
+
     let cli_agent_guidance = if config.cli_agents.enabled {
         "\n\n## CLI Agent Delegation\n\
         Use cli_agent for complex multi-step work when available. Always set working_dir.\n\
@@ -1523,7 +1542,7 @@ treating an error as active — stale log lines may only describe a past failure
 ## Tool Selection Guide
 | Task | Preferred Tool | Fallback |
 |------|---------------|----------|
-{browser_table_row}| Search the web | web_search | terminal (curl for APIs) |
+{browser_table_row}{computer_use_table_row}| Search the web | web_search | terminal (curl for APIs) |
 | Read web pages, articles, docs | web_fetch | http_request for REST/JSON APIs; browser for login/JS pages; terminal (curl) if web_fetch fails |
 | Read file contents | read_file | — |
 | Write/create files | write_file | — |
@@ -1550,7 +1569,7 @@ treating an error as active — stale log lines may only describe a past failure
 ## Tools
 Your tool schemas are the authoritative reference for what each tool does and
 how to call it. Use the Tool Selection Guide table above to pick the right
-tool for a task; consult the schema for parameters and semantics.{cli_agent_guidance}{api_runtime_context}{direct_mode_doc}
+tool for a task; consult the schema for parameters and semantics.{cli_agent_guidance}{computer_use_guidance}{api_runtime_context}{direct_mode_doc}
 
 ## Built-in Channels
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \

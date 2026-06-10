@@ -5,6 +5,9 @@ pub mod browser;
 mod channel_history;
 mod cli_agent;
 pub(crate) mod command_semantics;
+#[cfg(feature = "computer_use")]
+#[allow(dead_code)]
+pub mod computer_use;
 mod config_manager;
 mod diagnose;
 mod goal_trace;
@@ -30,6 +33,8 @@ pub use browser::BrowserTool;
 #[cfg(feature = "slack")]
 pub use channel_history::ReadChannelHistoryTool;
 pub use cli_agent::CliAgentTool;
+#[cfg(feature = "computer_use")]
+pub use computer_use::ComputerUseTool;
 pub use config_manager::ConfigManagerTool;
 pub use diagnose::DiagnoseTool;
 pub use goal_trace::GoalTraceTool;

@@ -685,6 +685,11 @@ impl Agent {
         loop {
             let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
+            #[cfg(feature = "computer_use")]
+            {
+                model =
+                    crate::agent::computer_use::resolve_model_for_task(&task_id, &model).await;
+            }
             turn_state
                 .with_harness_eval(|eval| {
                     eval.record_completion_progress(&completion_progress);

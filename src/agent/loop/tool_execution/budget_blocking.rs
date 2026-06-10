@@ -138,11 +138,26 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
+    } else if tc.name == "computer_use" && prior_calls >= 40 {
+        // computer_use drives multi-step GUI flows where each step is a separate
+        // call (get_app_state observation + click/type mutation), so a healthy
+        // 5–15 step task legitimately makes dozens of calls. The tool enforces
+        // its own meaningful-progress budgets internally (max_mutating_actions,
+        // max_consecutive_observations); this is only a runaway backstop set far
+        // above any real GUI task.
+        Some(
+            ToolResultNotice::GenericToolBudgetBlocked {
+                tool_name: tc.name.clone(),
+                prior_calls,
+            }
+            .render(),
+        )
     } else if prior_calls >= 8
         && !matches!(
             tc.name.as_str(),
             "terminal"
                 | "cli_agent"
+                | "computer_use"
                 | "read_file"
                 | "edit_file"
                 | "write_file"

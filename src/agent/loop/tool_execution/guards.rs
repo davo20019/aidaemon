@@ -273,7 +273,15 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
             | "web_fetch"
             | "terminal"
     );
-    let effective_same_tool_limit = if higher_threshold_tool {
+    // computer_use is a special case: a GUI task is *inherently* a long run of
+    // the same tool (every inspect/click/type is `computer_use`), so the
+    // consecutive-same-tool heuristic doesn't apply. Bound it far higher and let
+    // its own meaningful-progress budgets (max_mutating_actions,
+    // max_consecutive_observations) and the 40-call budget_blocking cap govern.
+    let computer_use_loop = tc.name == "computer_use";
+    let effective_same_tool_limit = if computer_use_loop {
+        40
+    } else if higher_threshold_tool {
         MAX_CONSECUTIVE_SAME_TOOL + 8 // 16 for versatile/research tools
     } else {
         MAX_CONSECUTIVE_SAME_TOOL
@@ -285,7 +293,11 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
         // Even with different commands, 24+ consecutive same-tool
         // calls without switching tools indicates a stuck loop.
         let is_diverse = unique * 2 > total;
-        let diverse_limit = MAX_CONSECUTIVE_SAME_TOOL + 8;
+        let diverse_limit = if computer_use_loop {
+            40
+        } else {
+            MAX_CONSECUTIVE_SAME_TOOL + 8
+        };
         agent
             .emit_warning_decision_point(
                 emitter,

@@ -75,7 +75,14 @@ impl Agent {
         options: &ChatOptions,
         last_err: &ProviderError,
         telemetry: &mut LlmCallTelemetry,
+        pin_model: Option<&str>,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
+        if pin_model.is_some() {
+            return Err(anyhow::anyhow!(
+                "{} (model pinned for active computer_use task — fallback disabled)",
+                last_err.recovery_failed_message()
+            ));
+        }
         // Entering the cascade means the original call already failed.
         telemetry.fell_back = true;
         let mut tried: Vec<String> = vec![failed_model.to_string()];
@@ -304,6 +311,7 @@ impl Agent {
         tool_defs: &[Value],
         options: &ChatOptions,
         telemetry: &mut LlmCallTelemetry,
+        pin_model: Option<&str>,
     ) -> anyhow::Result<crate::traits::ProviderResponse> {
         // Default telemetry: first attempt, no fallback, on the requested model.
         // Recovery paths below mutate this as they retry/cascade.
@@ -340,6 +348,7 @@ impl Agent {
                             options,
                             &billing_err,
                             telemetry,
+                            pin_model,
                         )
                         .await;
                 }
@@ -451,6 +460,7 @@ impl Agent {
                             options,
                             &provider_err,
                             telemetry,
+                            pin_model,
                         )
                         .await
                     }
@@ -522,6 +532,7 @@ impl Agent {
                             options,
                             &provider_err,
                             telemetry,
+                            pin_model,
                         )
                         .await
                     }
@@ -572,6 +583,7 @@ impl Agent {
                             options,
                             &provider_err,
                             telemetry,
+                            pin_model,
                         )
                         .await
                     }
@@ -613,6 +625,7 @@ impl Agent {
                                     options,
                                     &provider_err,
                                     telemetry,
+                                    pin_model,
                                 )
                                 .await;
                         }
@@ -654,6 +667,7 @@ impl Agent {
                             options,
                             &provider_err,
                             telemetry,
+                            pin_model,
                         )
                         .await
                     }
@@ -771,6 +785,7 @@ mod tests {
                 &[],
                 &ChatOptions::default(),
                 &mut telemetry,
+                None,
             )
             .await
             .expect("recover via alternate provider");

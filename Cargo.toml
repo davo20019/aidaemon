@@ -17,6 +17,11 @@ name = "db_probe"
 path = "src/bin/db_probe.rs"
 required-features = ["encryption"]
 
+[[bin]]
+name = "computer_use_probe"
+path = "src/bin/computer_use_probe.rs"
+required-features = ["computer_use-macos"]
+
 [dependencies]
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
@@ -75,6 +80,9 @@ portable-pty = { version = "0.8", optional = true }
 # migration is scoped separately.
 keyring = { version = "3", features = ["apple-native"] }
 tikv-jemallocator = "0.6"
+axuielement = { version = "0.9", optional = true }
+xcap = { version = "0.9", optional = true }
+enigo = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
@@ -96,6 +104,8 @@ terminal-bridge = [
     "dep:portable-pty",
 ]
 encryption = ["libsqlite3-sys/bundled-sqlcipher"]
+computer_use = []
+computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
 
 [profile.release]
 lto = true

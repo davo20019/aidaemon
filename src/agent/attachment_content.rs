@@ -100,6 +100,7 @@ mod tests {
                 "image/gif".to_string(),
                 "image/webp".to_string(),
             ],
+            model_patterns: vec!["gpt-4o".to_string()],
         }
     }
 

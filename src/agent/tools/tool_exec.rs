@@ -151,6 +151,27 @@ impl Agent {
                         map.insert("_project_scope".to_string(), json!(project_scope));
                     }
                 }
+                #[cfg(feature = "computer_use")]
+                if name == "computer_use" {
+                    let runtime = self.llm_runtime.snapshot();
+                    let current_model =
+                        match tokio::time::timeout(Duration::from_secs(2), self.model.read()).await
+                        {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => runtime.primary_model(),
+                        };
+                    map.insert("_model".to_string(), json!(current_model));
+                    map.insert(
+                        "_provider_kind".to_string(),
+                        json!(format!("{:?}", runtime.provider_kind())),
+                    );
+                    if let Some(router) = runtime.router() {
+                        map.insert(
+                            "_model_chain".to_string(),
+                            json!(router.all_models_ordered()),
+                        );
+                    }
+                }
                 serde_json::to_string(&map)?
             }
             _ => arguments.to_string(),

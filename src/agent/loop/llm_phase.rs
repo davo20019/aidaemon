@@ -471,16 +471,25 @@ pub(super) async fn run_llm_phase(
 
     let mut llm_telemetry = LlmCallTelemetry::default();
     let llm_call_start = Instant::now();
+    #[cfg(feature = "computer_use")]
+    let pin_model = crate::agent::computer_use::pinned_model_for_task(task_id).await;
+    #[cfg(not(feature = "computer_use"))]
+    let pin_model: Option<String> = None;
+    #[cfg(feature = "computer_use")]
+    let effective_model = pin_model.as_deref().unwrap_or(model);
+    #[cfg(not(feature = "computer_use"))]
+    let effective_model = model;
     let mut resp = match tokio::time::timeout(
         timeout_dur,
         services.agent.call_llm_with_recovery(
             llm_provider,
             llm_router,
-            model,
+            effective_model,
             messages,
             effective_tools,
             &llm_options,
             &mut llm_telemetry,
+            pin_model.as_deref(),
         ),
     )
     .await

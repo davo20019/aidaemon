@@ -854,7 +854,14 @@ pub(super) async fn run_tool_prelude_phase(
         // kept for in-flight tasks; new sessions use `specialist:`.
         let is_child_session =
             session_id.starts_with("sub-") || session_id.starts_with("specialist:");
+        // computer_use drives a multi-step desktop GUI flow (inspect → click →
+        // type → verify) that is inherently side-effecting and gated by its own
+        // approval ladder. Once the model is operating the desktop it must never
+        // be redirected to plain-text completion, or the GUI task stalls after
+        // the first observation.
+        let any_computer_use = resp.tool_calls.iter().any(|tc| tc.name == "computer_use");
         if !is_child_session
+            && !any_computer_use
             && !all_side_effecting_are_memory
             && !all_side_effecting_are_lookup
             && turn_prefers_plain_text_completion(turn_context)

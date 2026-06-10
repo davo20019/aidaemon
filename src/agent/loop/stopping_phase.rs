@@ -116,6 +116,11 @@ pub(super) async fn run_stopping_phase(
     let mut effective_goal_daily_budget = *ctx.effective_goal_daily_budget;
     let successful_send_file_keys = ctx.successful_send_file_keys;
     let mut model = ctx.model.clone();
+    #[cfg(feature = "computer_use")]
+    let computer_use_pin_active =
+        crate::agent::computer_use::task_has_computer_use_pin(task_id).await;
+    #[cfg(not(feature = "computer_use"))]
+    let computer_use_pin_active = false;
     let soft_threshold = ctx.soft_threshold;
     let soft_warn_at = ctx.soft_warn_at;
     let mut soft_limit_warned = *ctx.soft_limit_warned;
@@ -1977,7 +1982,7 @@ pub(super) async fn run_stopping_phase(
                         let next_model = router
                             .select_for_profile(policy_bundle.policy.model_profile)
                             .to_string();
-                        if next_model != model {
+                        if next_model != model && !computer_use_pin_active {
                             info!(
                                 session_id,
                                 iteration,
@@ -1999,7 +2004,7 @@ pub(super) async fn run_stopping_phase(
                     let next_model = router
                         .select_for_profile(policy_bundle.policy.model_profile)
                         .to_string();
-                    if next_model != model {
+                    if next_model != model && !computer_use_pin_active {
                         info!(
                             session_id,
                             iteration,
