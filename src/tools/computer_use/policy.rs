@@ -16,6 +16,7 @@ pub enum ActionClass {
 pub enum ComputerActionKind {
     ListApps,
     GetAppState,
+    Screenshot,
     ActivateApp,
     Click,
     TypeText,
@@ -29,6 +30,7 @@ impl ComputerActionKind {
         match action {
             "list_apps" => Ok(Self::ListApps),
             "get_app_state" => Ok(Self::GetAppState),
+            "screenshot" => Ok(Self::Screenshot),
             "activate_app" => Ok(Self::ActivateApp),
             "click" => Ok(Self::Click),
             "type_text" => Ok(Self::TypeText),
@@ -36,7 +38,7 @@ impl ComputerActionKind {
             "scroll" => Ok(Self::Scroll),
             "set_value" => Ok(Self::SetValue),
             other => Err(format!(
-                "Unknown computer_use action '{other}'. Valid: list_apps, get_app_state, activate_app, click, type_text, press_key, scroll, set_value"
+                "Unknown computer_use action '{other}'. Valid: list_apps, get_app_state, screenshot, activate_app, click, type_text, press_key, scroll, set_value"
             )),
         }
     }
@@ -45,6 +47,7 @@ impl ComputerActionKind {
         match self {
             Self::ListApps => "list_apps",
             Self::GetAppState => "get_app_state",
+            Self::Screenshot => "screenshot",
             Self::ActivateApp => "activate_app",
             Self::Click => "click",
             Self::TypeText => "type_text",
@@ -56,7 +59,7 @@ impl ComputerActionKind {
 
     pub fn base_class(self) -> ActionClass {
         match self {
-            Self::ListApps | Self::GetAppState => ActionClass::Observation,
+            Self::ListApps | Self::GetAppState | Self::Screenshot => ActionClass::Observation,
             Self::ActivateApp | Self::Click | Self::TypeText | Self::PressKey | Self::Scroll => {
                 ActionClass::LocalMutation
             }
@@ -65,7 +68,7 @@ impl ComputerActionKind {
     }
 
     pub fn requires_snapshot_generation(self) -> bool {
-        !matches!(self, Self::ListApps | Self::GetAppState)
+        !matches!(self, Self::ListApps | Self::GetAppState | Self::Screenshot)
     }
 }
 

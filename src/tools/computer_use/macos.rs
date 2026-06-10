@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use axuielement::ax_action::AX_PRESS_ACTION;
 use axuielement::ax_attribute::attributes::{
     AX_DESCRIPTION_ATTRIBUTE, AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE,
     AX_POSITION_ATTRIBUTE, AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE,
@@ -129,19 +130,31 @@ impl ComputerHarness for MacOsHarness {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
         cache.validate_generation(&key, generation)?;
-        verify_foreground(&resolved)?;
 
         if let Some(index) = element_index {
             let element = cache.element_by_index(&key, generation, index)?.clone();
+            // Prefer an AX press: it activates the control directly without
+            // moving the real cursor or requiring the app to be frontmost, so a
+            // GUI task works even while the user is looking at another window.
+            // Only fall back to a synthetic cursor click (which needs the app in
+            // the foreground) if the control can't be AX-pressed.
+            if press_element_via_ax(resolved.pid, index, &self.config)? {
+                let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
+                return Ok((refreshed, Some(index)));
+            }
+            verify_foreground(&resolved)?;
             click_element(&element)?;
             let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
             return Ok((refreshed, Some(index)));
         }
 
+        // Raw coordinate clicks can only go through the synthetic cursor, which
+        // requires the target app to be frontmost.
         let (px, py) = match (x, y) {
             (Some(x), Some(y)) => (x, y),
             _ => return Err("click requires element_index or both x and y coordinates".to_string()),
         };
+        verify_foreground(&resolved)?;
         click_global_point(px, py)?;
         Ok((capture_app(resolved, &self.config, cache, ctx)?, None))
     }
@@ -412,6 +425,7 @@ struct WalkState {
     started: Instant,
     limits: AxWalkLimits,
     elements: Vec<IndexedElement>,
+    max_depth_seen: u32,
 }
 
 fn walk_tree(root: &AXUIElement, limits: AxWalkLimits) -> (Vec<IndexedElement>, bool) {
@@ -423,12 +437,27 @@ fn walk_tree(root: &AXUIElement, limits: AxWalkLimits) -> (Vec<IndexedElement>, 
         started: Instant::now(),
         limits,
         elements: Vec::new(),
+        max_depth_seen: 0,
     };
     walk_node(root, 0, &mut state);
+    if state.truncated && state.elements.is_empty() {
+        // No interactive controls before the limit. The root role distinguishes
+        // the real failure modes: a degraded/no-access tree shows the app
+        // recursing into itself ("AXWindow" never appears), whereas a genuinely
+        // deep app needs a higher depth/node budget.
+        let root_role = optional_string_attr(root, AX_ROLE_ATTRIBUTE).unwrap_or_default();
+        tracing::warn!(
+            nodes = state.nodes,
+            max_depth_seen = state.max_depth_seen,
+            root_role,
+            "computer_use AX walk truncated with no elements (check Accessibility permission / app depth)"
+        );
+    }
     (state.elements, state.truncated)
 }
 
 fn walk_node(element: &AXUIElement, depth: u32, state: &mut WalkState) {
+    state.max_depth_seen = state.max_depth_seen.max(depth);
     if state.started.elapsed() > state.limits.max_duration
         || state.nodes >= state.limits.max_nodes
         || depth > state.limits.max_depth
@@ -660,6 +689,69 @@ fn activate_app(app: &AppInfo) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ))
     }
+}
+
+/// Try to activate the `target_index`-th interactive control via an AX press
+/// (no cursor movement, no foreground requirement). Returns `Ok(true)` if the
+/// control was pressed, `Ok(false)` if it can't be found or doesn't support a
+/// press (caller falls back to a synthetic cursor click).
+fn press_element_via_ax(
+    pid: i32,
+    target_index: u32,
+    config: &ComputerUseConfig,
+) -> Result<bool, String> {
+    let app_element =
+        AXUIElement::from_pid(pid).ok_or_else(|| format!("No AX element for pid {pid}"))?;
+    let window = focused_or_main_window(&app_element)?;
+    let limits = AxWalkLimits::from_config(config);
+    let started = Instant::now();
+    let mut counter = 0u32;
+    let Some(live) =
+        find_live_interactive(&window, 0, &limits, &started, &mut counter, target_index)
+    else {
+        return Ok(false);
+    };
+    Ok(live.perform_action(AX_PRESS_ACTION).is_ok())
+}
+
+/// Re-resolve the live `AXUIElement` for the `target`-th interactive control,
+/// numbered identically to the snapshot walk (only interactive roles counted,
+/// same depth-first order and passthrough collapsing).
+fn find_live_interactive(
+    element: &AXUIElement,
+    depth: u32,
+    limits: &AxWalkLimits,
+    started: &Instant,
+    counter: &mut u32,
+    target: u32,
+) -> Option<AXUIElement> {
+    if started.elapsed() > limits.max_duration || depth > limits.max_depth {
+        return None;
+    }
+    let role = optional_string_attr(element, AX_ROLE_ATTRIBUTE).unwrap_or_default();
+    if is_interactive_role(&role) {
+        *counter = counter.saturating_add(1);
+        if *counter == target {
+            return Some(element.clone());
+        }
+    }
+    let children = match element.children() {
+        Ok(children) => collapse_passthrough(element, children),
+        Err(_) => return None,
+    };
+    for child in children {
+        if let Some(found) = find_live_interactive(
+            &child,
+            depth.saturating_add(1),
+            limits,
+            started,
+            counter,
+            target,
+        ) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn click_element(element: &IndexedElement) -> Result<(), String> {

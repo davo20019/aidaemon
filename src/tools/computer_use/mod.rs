@@ -4,7 +4,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
-use tracing::warn;
 
 use crate::channels::attachments::save_tool_observation_image;
 use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
@@ -289,6 +288,45 @@ impl ComputerUseTool {
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await
             }
+            ComputerActionKind::Screenshot => {
+                // Capture the app window and deliver the image to the user's
+                // chat (an explicit "send me a screenshot" should arrive), while
+                // also attaching it to the tool result for the model. Unlike
+                // get_app_state this returns no tree — the model just wanted a
+                // picture.
+                let app = required_str(args, "app")?;
+                let resolved = self.resolve_app(&app).await?;
+                self.ensure_action_approvals(
+                    &ctx,
+                    action,
+                    Some(&resolved.bundle_id),
+                    Some(&resolved.name),
+                    ActionClass::Observation,
+                    None,
+                )
+                .await?;
+                let mut cache = self.cache.lock().await;
+                let snapshot = self.harness.get_app_state(&app, &ctx, &mut cache).await?;
+                if !snapshot.png.is_empty() {
+                    let _ = self
+                        .media_tx
+                        .send(MediaMessage {
+                            session_id: ctx.session_id.clone(),
+                            kind: MediaKind::Photo {
+                                data: snapshot.png.clone(),
+                            },
+                            caption: format!("Screenshot of {}", snapshot.app_name),
+                            result_tx: None,
+                        })
+                        .await;
+                }
+                let text = format!(
+                    "Screenshot of {} ({}) captured and sent to the chat.",
+                    snapshot.app_name, snapshot.bundle_id
+                );
+                self.build_outcome(text, Some(&snapshot), &ctx.session_id)
+                    .await
+            }
             ComputerActionKind::ActivateApp => {
                 let app = required_str(args, "app")?;
                 let generation = required_u64(args, "snapshot_generation")?;
@@ -557,6 +595,7 @@ impl Tool for ComputerUseTool {
                         "enum": [
                             "list_apps",
                             "get_app_state",
+                            "screenshot",
                             "activate_app",
                             "click",
                             "type_text",
@@ -607,10 +646,51 @@ impl Tool for ComputerUseTool {
         _status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
-        match self.dispatch(&args).await {
-            Ok(outcome) => Ok(outcome),
+        let started = std::time::Instant::now();
+        let result = self.dispatch(&args).await;
+        // One structured telemetry event per action — consistent, greppable
+        // fields for debugging without raw screenshots or typed text. The
+        // dedicated `computer_use` target lets observability filter/route it.
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        let app = args.get("app").and_then(|v| v.as_str()).unwrap_or("");
+        let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
+        let element_index = args.get("element_index").and_then(|v| v.as_u64());
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(outcome) => {
+                let screenshot_bytes: usize = outcome
+                    .metadata
+                    .attachments
+                    .iter()
+                    .map(|a| a.size_bytes as usize)
+                    .sum();
+                let truncated = outcome.output.contains("TRUNCATED");
+                tracing::info!(
+                    target: "computer_use",
+                    action,
+                    app,
+                    generation,
+                    element_index,
+                    duration_ms,
+                    outcome = "ok",
+                    screenshot_bytes,
+                    truncated,
+                    "computer_use action"
+                );
+                Ok(outcome)
+            }
             Err(err) => {
-                warn!(error = %err, "computer_use action failed");
+                tracing::warn!(
+                    target: "computer_use",
+                    action,
+                    app,
+                    generation,
+                    element_index,
+                    duration_ms,
+                    outcome = "error",
+                    error = %err,
+                    "computer_use action failed"
+                );
                 Ok(ToolCallOutcome::from_output(format!("Error: {err}")))
             }
         }
@@ -626,7 +706,11 @@ impl Tool for ComputerUseTool {
             .and_then(|a| ComputerActionKind::parse(a).ok());
         let observation = matches!(
             action,
-            Some(ComputerActionKind::ListApps | ComputerActionKind::GetAppState)
+            Some(
+                ComputerActionKind::ListApps
+                    | ComputerActionKind::GetAppState
+                    | ComputerActionKind::Screenshot
+            )
         );
         if observation {
             ToolCallSemantics::observation()

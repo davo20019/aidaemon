@@ -57,6 +57,10 @@ fn run_inspect(app: &str) {
     use aidaemon::computer_use::types::format_full_tree;
     use aidaemon::ComputerUseConfig;
 
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
         let harness = MacOsHarness::new(ComputerUseConfig {

@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **computer_use app enumeration race**: `list_apps` no longer aborts with a transient "Invalid index" when the process table changes mid-scan (defensive per-process reads + retry).
 - **computer_use multi-step flows**: the plain-text completion guardrail no longer redirects an in-progress GUI flow back to text, so the agent can carry a desktop task through multiple clicks.
 - **Leaked running-task queue stall**: a task left `Running` past 1 hour (an abnormal channel-handler exit that never finalized it) is now reaped automatically instead of blocking the session's message queue forever — new messages stranded behind a phantom "running" task previously required a daemon restart. The `computer_use` approval wait was also lowered to 120s so it resolves to a clean denial well before the 300s tool-call watchdog, which was the collision that produced the leaked task.
+- **computer_use clicks no longer need the app frontmost**: element clicks now use an AX press (`AXPress`) as the primary method, which activates the control directly without moving the real cursor or requiring the target window to be in the foreground — a GUI task succeeds even while the user is looking at another window. A synthetic cursor click (with the foreground guard) remains the fallback for controls that can't be AX-pressed and for raw coordinate clicks.
+
+- **computer_use `screenshot` action**: a dedicated action that captures the target app window and delivers the image to the user's chat (and attaches it for the model), so an explicit "send me a screenshot" works instead of the model inventing an unknown action. Screenshots still attach automatically to every other action's result.
+
+### Observability
+
+- **Per-action computer_use telemetry**: every `computer_use` action emits one structured event on the `computer_use` tracing target (action, app, snapshot generation, element index, duration, outcome, error, screenshot byte size, truncation) — no raw screenshots or typed text — so GUI-automation issues are greppable instead of needing ad-hoc instrumentation. A truncated-with-no-elements AX walk also logs the root role to distinguish a permission/degraded-tree failure from a genuinely deep app.
 
 ## [0.11.1] - 2026-06-09
 
