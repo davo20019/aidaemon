@@ -126,7 +126,7 @@ impl ComputerHarness for MacOsHarness {
         y: Option<f64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, Option<u32>), String> {
+    ) -> Result<(AppSnapshot, Option<u32>, &'static str), String> {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
         cache.validate_generation(&key, generation)?;
@@ -140,12 +140,12 @@ impl ComputerHarness for MacOsHarness {
             // the foreground) if the control can't be AX-pressed.
             if press_element_via_ax(resolved.pid, index, &self.config)? {
                 let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
-                return Ok((refreshed, Some(index)));
+                return Ok((refreshed, Some(index), "ax_press"));
             }
             verify_foreground(&resolved)?;
             click_element(&element)?;
             let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
-            return Ok((refreshed, Some(index)));
+            return Ok((refreshed, Some(index), "cursor"));
         }
 
         // Raw coordinate clicks can only go through the synthetic cursor, which
@@ -156,7 +156,11 @@ impl ComputerHarness for MacOsHarness {
         };
         verify_foreground(&resolved)?;
         click_global_point(px, py)?;
-        Ok((capture_app(resolved, &self.config, cache, ctx)?, None))
+        Ok((
+            capture_app(resolved, &self.config, cache, ctx)?,
+            None,
+            "coordinate",
+        ))
     }
 
     async fn type_text(

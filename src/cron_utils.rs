@@ -1102,6 +1102,34 @@ pub fn system_timezone_display() -> String {
     Local::now().format("%Z (UTC%:z)").to_string()
 }
 
+/// Render a run time the way a person would say it: "today at 1:46 PM
+/// (in 1 minute)", "tomorrow at 9:00 AM", "Friday at 9:00 AM", or
+/// "on Jul 15 at 9:00 AM" for dates further out.
+pub fn humanize_run_time(dt: DateTime<Local>) -> String {
+    humanize_run_time_from(dt, Local::now())
+}
+
+/// Testable core of [`humanize_run_time`] with an explicit "now".
+pub fn humanize_run_time_from(dt: DateTime<Local>, now: DateTime<Local>) -> String {
+    let time = dt.format("%-I:%M %p").to_string();
+    let days_ahead = (dt.date_naive() - now.date_naive()).num_days();
+    match days_ahead {
+        0 => {
+            let mins = (dt - now).num_minutes();
+            if (1..60).contains(&mins) {
+                let unit = if mins == 1 { "minute" } else { "minutes" };
+                format!("today at {} (in {} {})", time, mins, unit)
+            } else {
+                format!("today at {}", time)
+            }
+        }
+        1 => format!("tomorrow at {}", time),
+        2..=6 => format!("{} at {}", dt.format("%A"), time),
+        _ if dt.year() == now.year() => format!("on {} at {}", dt.format("%b %-d"), time),
+        _ => format!("on {} at {}", dt.format("%b %-d, %Y"), time),
+    }
+}
+
 /// Heuristic: whether a cron expression looks like a one-shot absolute schedule.
 ///
 /// This is intentionally conservative and should only be used as a fallback when
@@ -1120,6 +1148,33 @@ pub fn is_one_shot_schedule(cron_expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_humanize_run_time() {
+        let now = Local.with_ymd_and_hms(2026, 6, 11, 13, 45, 0).unwrap();
+        let in_1m = Local.with_ymd_and_hms(2026, 6, 11, 13, 46, 0).unwrap();
+        assert_eq!(
+            humanize_run_time_from(in_1m, now),
+            "today at 1:46 PM (in 1 minute)"
+        );
+        let later_today = Local.with_ymd_and_hms(2026, 6, 11, 18, 0, 0).unwrap();
+        assert_eq!(humanize_run_time_from(later_today, now), "today at 6:00 PM");
+        let tomorrow = Local.with_ymd_and_hms(2026, 6, 12, 9, 0, 0).unwrap();
+        assert_eq!(humanize_run_time_from(tomorrow, now), "tomorrow at 9:00 AM");
+        // 2026-06-15 is a Monday, 4 days out
+        let monday = Local.with_ymd_and_hms(2026, 6, 15, 9, 0, 0).unwrap();
+        assert_eq!(humanize_run_time_from(monday, now), "Monday at 9:00 AM");
+        let next_month = Local.with_ymd_and_hms(2026, 7, 15, 9, 0, 0).unwrap();
+        assert_eq!(
+            humanize_run_time_from(next_month, now),
+            "on Jul 15 at 9:00 AM"
+        );
+        let next_year = Local.with_ymd_and_hms(2027, 1, 5, 9, 0, 0).unwrap();
+        assert_eq!(
+            humanize_run_time_from(next_year, now),
+            "on Jan 5, 2027 at 9:00 AM"
+        );
+    }
 
     #[test]
     fn test_parse_schedule_keywords() {

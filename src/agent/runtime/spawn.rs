@@ -820,6 +820,7 @@ impl Agent {
             hub,
             self.schedule_approved_sessions.clone(),
             self.billing_failed_models.clone(),
+            self.required_tool_choice_ignored_models.clone(),
             self.record_decision_points,
             self.context_window_config.clone(),
             self.policy_config.clone(),

@@ -56,6 +56,17 @@ fn canonical_error_type(value: &serde_json::Value) -> &str {
     }
 }
 
+/// Lower time bound for `events.created_at` comparisons, formatted the way
+/// the event store writes timestamps (RFC3339, `+00:00` offset).
+///
+/// `events.created_at` must NOT be compared against `datetime('now', ...)`:
+/// SQLite compares TEXT timestamps as strings, and the space-separated
+/// `datetime()` format sorts below the `T` separator, which silently degrades
+/// the filter to calendar-day granularity.
+fn events_cutoff_rfc3339(now: chrono::DateTime<chrono::Utc>, hours: i64) -> String {
+    (now - chrono::Duration::hours(hours)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TelemetryReconciliationCounts {
     correlated: usize,
@@ -113,6 +124,67 @@ fn telemetry_reconciliation_counts(
     }
 }
 
+/// Diagnostic split of `token_only` reconciliation rows: token_usage rows
+/// with a call_id that no usage-bearing `llm_call` event accounts for.
+/// Mirrors the `token_only` definition in `telemetry_reconciliation_counts`
+/// (unique call_ids vs events with `token_usage_present=true`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TokenOnlyBreakdown {
+    /// (session_id, token-only call count) sorted by count descending.
+    by_session: Vec<(String, usize)>,
+    /// call_id has no llm_call event at all — the call never reached the
+    /// event store (e.g. background LLM use outside the agent loop).
+    event_missing: usize,
+    /// llm_call event exists but reported token_usage_present=false.
+    event_usage_flag_false: usize,
+}
+
+fn token_only_breakdown(
+    token_rows: &[(Option<String>, String)],
+    event_rows: &[(Option<String>, bool)],
+) -> TokenOnlyBreakdown {
+    let mut usage_event_ids = std::collections::HashSet::<&str>::new();
+    let mut any_event_ids = std::collections::HashSet::<&str>::new();
+    for (call_id, usage_present) in event_rows {
+        if let Some(call_id) = call_id.as_deref().filter(|call_id| !call_id.is_empty()) {
+            any_event_ids.insert(call_id);
+            if *usage_present {
+                usage_event_ids.insert(call_id);
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::<&str>::new();
+    let mut by_session = std::collections::HashMap::<&str, usize>::new();
+    let mut event_missing = 0usize;
+    let mut event_usage_flag_false = 0usize;
+    for (call_id, session_id) in token_rows {
+        let Some(call_id) = call_id.as_deref().filter(|call_id| !call_id.is_empty()) else {
+            continue;
+        };
+        if usage_event_ids.contains(call_id) || !seen.insert(call_id) {
+            continue;
+        }
+        *by_session.entry(session_id.as_str()).or_insert(0) += 1;
+        if any_event_ids.contains(call_id) {
+            event_usage_flag_false += 1;
+        } else {
+            event_missing += 1;
+        }
+    }
+
+    let mut by_session: Vec<(String, usize)> = by_session
+        .into_iter()
+        .map(|(session, count)| (session.to_string(), count))
+        .collect();
+    by_session.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    TokenOnlyBreakdown {
+        by_session,
+        event_missing,
+        event_usage_flag_false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +216,54 @@ mod tests {
             canonical_error_type(&json!({"error_type": "tool_error"})),
             "tool_error"
         );
+    }
+
+    #[test]
+    fn token_only_breakdown_groups_by_session_and_splits_event_presence() {
+        let token_rows: Vec<(Option<String>, String)> = vec![
+            // correlated — not token-only
+            (Some("call-a".to_string()), "sess-1".to_string()),
+            // event exists but token_usage_present=false
+            (Some("call-b".to_string()), "sess-1".to_string()),
+            // no llm_call event at all
+            (Some("call-c".to_string()), "sess-2".to_string()),
+            (Some("call-d".to_string()), "sess-2".to_string()),
+            // legacy row (no call_id) — not token-only
+            (None, "sess-3".to_string()),
+        ];
+        let event_rows: Vec<(Option<String>, bool)> = vec![
+            (Some("call-a".to_string()), true),
+            (Some("call-b".to_string()), false),
+        ];
+
+        let breakdown = token_only_breakdown(&token_rows, &event_rows);
+        assert_eq!(
+            breakdown.by_session,
+            vec![("sess-2".to_string(), 2), ("sess-1".to_string(), 1)]
+        );
+        assert_eq!(breakdown.event_missing, 2);
+        assert_eq!(breakdown.event_usage_flag_false, 1);
+    }
+
+    #[test]
+    fn events_cutoff_string_compares_correctly_against_rfc3339_timestamps() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-11T15:40:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cutoff = events_cutoff_rfc3339(now, 7);
+
+        // Same-day event older than the window must sort BELOW the cutoff.
+        assert!("2026-06-11T07:00:00.974627+00:00" < cutoff.as_str());
+        // Events inside the window (with and without fractional seconds)
+        // must sort at-or-above it.
+        assert!("2026-06-11T09:00:00+00:00" >= cutoff.as_str());
+        assert!("2026-06-11T08:40:00.000001+00:00" >= cutoff.as_str());
+        // Prior-day events stay excluded.
+        assert!("2026-06-10T23:59:59+00:00" < cutoff.as_str());
+
+        // The legacy space-format bound this replaces wrongly included
+        // same-day events older than the window ('T' > ' ').
+        assert!("2026-06-11T07:00:00.974627+00:00" >= "2026-06-11 08:40:00");
     }
 
     #[test]
@@ -222,12 +342,12 @@ async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> a
         SELECT session_id, task_id, created_at, data
         FROM events
         WHERE event_type = 'task_end'
-          AND created_at >= datetime('now', printf('-%d hours', ?))
+          AND created_at >= ?
           AND json_extract(data, '$.harness_eval') IS NOT NULL
         ORDER BY created_at DESC
         "#,
     )
-    .bind(hours)
+    .bind(events_cutoff_rfc3339(chrono::Utc::now(), hours))
     .fetch_all(pool)
     .await?;
 
@@ -878,16 +998,28 @@ async fn main() -> anyhow::Result<()> {
         "\n== Telemetry Reconciliation (Last {} Hours) ==",
         token_hours
     );
-    let token_call_ids: Vec<Option<String>> = sqlx::query_scalar(
+    let token_rows: Vec<(Option<String>, String)> = sqlx::query(
         r#"
-        SELECT call_id FROM token_usage
+        SELECT call_id, session_id FROM token_usage
         WHERE created_at >= datetime('now', '-' || ? || ' hours')
         "#,
     )
     .bind(token_hours)
     .fetch_all(&pool)
     .await
-    .unwrap_or_default();
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<Option<String>, _>("call_id").unwrap_or(None),
+            row.try_get::<String, _>("session_id").unwrap_or_default(),
+        )
+    })
+    .collect();
+    let token_call_ids: Vec<Option<String>> = token_rows
+        .iter()
+        .map(|(call_id, _)| call_id.clone())
+        .collect();
     let llm_rows = sqlx::query(
         r#"
         SELECT
@@ -895,10 +1027,10 @@ async fn main() -> anyhow::Result<()> {
           json_extract(data, '$.token_usage_present') AS token_usage_present
         FROM events
         WHERE event_type = 'llm_call'
-          AND created_at >= datetime('now', '-' || ? || ' hours')
+          AND created_at >= ?
         "#,
     )
-    .bind(token_hours)
+    .bind(events_cutoff_rfc3339(chrono::Utc::now(), token_hours))
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
@@ -929,6 +1061,20 @@ async fn main() -> anyhow::Result<()> {
         reconciliation.legacy_token_rows,
         reconciliation.legacy_event_rows,
     );
+    if reconciliation.token_only > 0 {
+        let breakdown = token_only_breakdown(&token_rows, &event_rows);
+        println!(
+            "- token_only split: event_missing={} (no llm_call event; likely LLM use outside the agent loop) event_usage_flag_false={}",
+            breakdown.event_missing, breakdown.event_usage_flag_false,
+        );
+        println!("- token_only by session:");
+        for (session, count) in breakdown.by_session.iter().take(10) {
+            println!("  - session={} token_only_calls={}", session, count);
+        }
+        if breakdown.by_session.len() > 10 {
+            println!("  - (+{} more sessions)", breakdown.by_session.len() - 10);
+        }
+    }
 
     println!("\n== Task Outcomes (Last {} Hours) ==", token_hours);
     let task_end_rows = sqlx::query(
@@ -936,10 +1082,10 @@ async fn main() -> anyhow::Result<()> {
         SELECT data
         FROM events
         WHERE event_type = 'task_end'
-          AND created_at >= datetime('now', '-' || ? || ' hours')
+          AND created_at >= ?
         "#,
     )
-    .bind(token_hours)
+    .bind(events_cutoff_rfc3339(chrono::Utc::now(), token_hours))
     .fetch_all(&pool)
     .await
     .unwrap_or_default();
@@ -979,10 +1125,10 @@ async fn main() -> anyhow::Result<()> {
         SELECT data
         FROM events
         WHERE event_type = 'error'
-          AND created_at >= datetime('now', '-' || ? || ' hours')
+          AND created_at >= ?
         "#,
     )
-    .bind(token_hours)
+    .bind(events_cutoff_rfc3339(chrono::Utc::now(), token_hours))
     .fetch_all(&pool)
     .await
     .unwrap_or_default();

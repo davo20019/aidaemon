@@ -288,6 +288,26 @@ impl Agent {
     /// After this window the model is attempted again (credits may have been added).
     const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
+    /// Whether `model` has previously ignored a forced `tool_choice=required`
+    /// call (returned text with zero tool calls), meaning forcing it again
+    /// would only burn tokens — and on some stacks (llama.cpp + Gemma)
+    /// degenerate into a repetition loop until the token limit.
+    pub(in crate::agent) async fn required_tool_choice_ignored(&self, model: &str) -> bool {
+        self.required_tool_choice_ignored_models
+            .read()
+            .await
+            .contains(model)
+    }
+
+    /// Record that `model` ignored a forced `tool_choice=required` call.
+    /// Returns true when the model was newly flagged.
+    pub(in crate::agent) async fn record_required_tool_choice_ignored(&self, model: &str) -> bool {
+        self.required_tool_choice_ignored_models
+            .write()
+            .await
+            .insert(model.to_string())
+    }
+
     /// Attempt an LLM call with error-classified recovery:
     /// - RateLimit → exponential backoff retries, then cascade fallback
     /// - BadRequest/ServerError with vision blocks → text-only strip retry once

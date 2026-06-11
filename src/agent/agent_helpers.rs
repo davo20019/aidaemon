@@ -131,6 +131,23 @@ pub(in crate::agent) fn summarize_tool_args(name: &str, arguments: &str) -> Stri
             }
         }
 
+        // --- Desktop GUI ---
+        "computer_use" => {
+            let action = get_str("action").unwrap_or("");
+            let app = get_str("app").unwrap_or("");
+            let index = val
+                .get("element_index")
+                .and_then(|v| v.as_u64())
+                .map(|i| i.to_string());
+            match (action, app, index) {
+                ("click", app, Some(index)) if !app.is_empty() => {
+                    format!("click {app} #{index}")
+                }
+                (_, app, _) if !app.is_empty() => format!("{action} {app}"),
+                _ => action.to_string(),
+            }
+        }
+
         // --- Git ---
         "git_info" => {
             let include = val.get("include").and_then(|v| v.as_array()).map(|arr| {

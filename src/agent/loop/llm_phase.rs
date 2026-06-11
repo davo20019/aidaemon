@@ -378,16 +378,29 @@ pub(super) async fn run_llm_phase(
         // BUT: after DEFERRED_NO_TOOL_ACCEPT_THRESHOLD retries, stop forcing —
         // the query may genuinely not need tools (greetings, capability questions,
         // jokes, etc.) and forcing tool_choice=required just causes stalls.
-        llm_options.tool_choice = ToolChoiceMode::Required;
-        POLICY_METRICS
-            .deferred_no_tool_forced_required_total
-            .fetch_add(1, Ordering::Relaxed);
-        info!(
-            session_id,
-            iteration,
-            deferred_no_tool_streak,
-            "Deferred/no-tool recovery: forcing tool_choice=required"
-        );
+        // AND: skip models that previously ignored a forced `required` — the
+        // forcing only burns tokens there, and the substantive-text acceptance
+        // path in the completion phase converges without it.
+        if services.agent.required_tool_choice_ignored(model).await {
+            info!(
+                session_id,
+                iteration,
+                deferred_no_tool_streak,
+                model,
+                "Deferred/no-tool recovery: skipping tool_choice=required — model previously ignored it"
+            );
+        } else {
+            llm_options.tool_choice = ToolChoiceMode::Required;
+            POLICY_METRICS
+                .deferred_no_tool_forced_required_total
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                session_id,
+                iteration,
+                deferred_no_tool_streak,
+                "Deferred/no-tool recovery: forcing tool_choice=required"
+            );
+        }
     }
 
     // Always enforce a timeout — never allow unbounded LLM calls.
@@ -990,6 +1003,27 @@ pub(super) async fn run_llm_phase(
         *empty_response_retry_note = None;
         // Reset thinking-truncation counter on any successful response.
         *thinking_truncation_count = 0;
+    }
+
+    // Contract check: a forced `tool_choice=required` call that comes back
+    // with text and zero tool calls means the serving stack ignored the
+    // constraint (llama.cpp + Gemma does this, and generation can degenerate
+    // into a repetition loop until the token limit). Flag the model so the
+    // deferred/no-tool recovery never forces `required` on it again.
+    if matches!(llm_options.tool_choice, ToolChoiceMode::Required)
+        && resp.tool_calls.is_empty()
+        && has_non_empty_content
+        && services
+            .agent
+            .record_required_tool_choice_ignored(&llm_telemetry.final_model)
+            .await
+    {
+        warn!(
+            session_id,
+            iteration,
+            model = %llm_telemetry.final_model,
+            "Forced tool_choice=required returned no tool calls — model flagged, future recovery will not force it"
+        );
     }
 
     // Token-limit truncation recovery: if the response was cut off at the

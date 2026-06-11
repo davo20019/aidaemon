@@ -133,7 +133,6 @@ async fn confirm_scheduled_goal_activation(
     ctx: &mut OrchestrationCtx<'_>,
     goal: &Goal,
     schedule: &crate::traits::GoalSchedule,
-    tz_label: &str,
     completion_note: &str,
 ) -> anyhow::Result<ResponsePhaseOutcome> {
     let activation_msg = match agent.state.activate_goal(&goal.id).await {
@@ -143,16 +142,12 @@ async fn confirm_scheduled_goal_activation(
             }
             let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
                 .ok()
-                .map(|dt| {
-                    dt.with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M %Z")
-                        .to_string()
-                })
+                .map(|dt| crate::cron_utils::humanize_run_time(dt.with_timezone(&chrono::Local)))
                 .unwrap_or_else(|| "n/a".to_string());
             format!(
-                    "Scheduled: {} (next: {}). I'll execute it when the time comes. System timezone: {}.",
-                    goal.description, next_run, tz_label
-                )
+                "✅ Scheduled: {} — next run {}.",
+                goal.description, next_run
+            )
         }
         Ok(false) => {
             "I couldn't activate that scheduled goal because it is no longer pending confirmation."
@@ -198,7 +193,6 @@ async fn confirm_scheduled_goal_activation_batch(
     agent: &Agent,
     ctx: &mut OrchestrationCtx<'_>,
     goals_and_schedules: &[(Goal, crate::traits::GoalSchedule)],
-    tz_label: &str,
     completion_note: &str,
 ) -> anyhow::Result<ResponsePhaseOutcome> {
     let mut activated = Vec::new();
@@ -213,12 +207,10 @@ async fn confirm_scheduled_goal_activation_batch(
                 let next_run = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
                     .ok()
                     .map(|dt| {
-                        dt.with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M %Z")
-                            .to_string()
+                        crate::cron_utils::humanize_run_time(dt.with_timezone(&chrono::Local))
                     })
                     .unwrap_or_else(|| "n/a".to_string());
-                activated.push(format!("{} (next: {})", goal.description, next_run));
+                activated.push(format!("{} (next run {})", goal.description, next_run));
             }
             Ok(false) => {}
             Err(e) => activation_errors.push(e.to_string()),
@@ -227,16 +219,12 @@ async fn confirm_scheduled_goal_activation_batch(
 
     let activation_msg = if !activated.is_empty() && activation_errors.is_empty() {
         if activated.len() == 1 {
-            format!(
-                "Scheduled: {}. I'll execute it when the time comes. System timezone: {}.",
-                activated[0], tz_label
-            )
+            format!("✅ Scheduled: {}.", activated[0])
         } else {
             format!(
-                "Scheduled {} goals:\n- {}\nSystem timezone: {}.",
+                "✅ Scheduled {} goals:\n- {}",
                 activated.len(),
-                activated.join("\n- "),
-                tz_label
+                activated.join("\n- ")
             )
         }
     } else if !activated.is_empty() {
@@ -659,12 +647,12 @@ async fn handle_scheduled_intent(
                 "recurring".to_string()
             };
             let schedule_desc = if actually_one_shot {
-                next_run_local.format("%Y-%m-%d %H:%M %Z").to_string()
+                crate::cron_utils::humanize_run_time(next_run_local)
             } else {
                 format!(
                     "{} (next: {})",
                     segment_schedule_raw,
-                    next_run_local.format("%Y-%m-%d %H:%M %Z")
+                    crate::cron_utils::humanize_run_time(next_run_local)
                 )
             };
             created.push((goal, schedule, schedule_kind, schedule_desc));
@@ -698,7 +686,6 @@ async fn handle_scheduled_intent(
                 agent,
                 ctx,
                 &goals_and_schedules,
-                &tz_label,
                 "Scheduled goals auto-confirmed from prior session approval.",
             )
             .await;
@@ -758,7 +745,6 @@ async fn handle_scheduled_intent(
                         agent,
                         ctx,
                         &goals_and_schedules,
-                        &tz_label,
                         "Scheduled goals confirmed via inline approval.",
                     )
                     .await;
@@ -898,6 +884,19 @@ async fn handle_scheduled_intent(
         goal_description = ctx.user_text.trim().to_string();
     }
 
+    // Reminder-shaped requests: clean_task_description may strip the leading
+    // "remind me to", leaving a bare imperative ("Check logs"). Restore the
+    // canonical reminder form so the auto-confirm fast path below and the
+    // fire-time fast path in heartbeat both recognize it.
+    let user_text_lower = ctx.user_text.to_lowercase();
+    if crate::reminders::parse_reminder(&goal_description).is_none()
+        && (intent_routing::contains_keyword_as_words(&user_text_lower, "remind me")
+            || intent_routing::contains_keyword_as_words(&user_text_lower, "remind us"))
+        && !looks_like_schedule_only_description(&goal_description)
+    {
+        goal_description = crate::reminders::canonical_description(&goal_description);
+    }
+
     // Duplicate detection: check for existing goals with matching description + schedule.
     let target_desc_canonical = goal_description
         .trim()
@@ -986,11 +985,34 @@ async fn handle_scheduled_intent(
     };
     agent.state.create_goal_schedule(&schedule).await?;
 
+    // Plain one-shot reminders are low-risk — the only action at fire time is
+    // a message back to the user — so skip the approval gate entirely and
+    // confirm in a single friendly line. The user can still say "cancel" to
+    // remove it.
+    if actually_one_shot {
+        if let Some(reminder) = crate::reminders::parse_reminder(&goal.description) {
+            if let Ok(true) = agent.state.activate_goal(&goal.id).await {
+                if let Some(ref registry) = agent.goal_token_registry {
+                    registry.register(&goal.id).await;
+                }
+                let when = crate::cron_utils::humanize_run_time(next_run_local);
+                let msg = crate::reminders::confirmation_message(&reminder, &when);
+                return emit_direct_reply(
+                    agent,
+                    ctx,
+                    msg,
+                    "Plain one-shot reminder auto-confirmed (low-risk).",
+                )
+                .await;
+            }
+        }
+    }
+
     let tz_label = crate::cron_utils::system_timezone_display();
     let schedule_desc = if actually_one_shot {
-        next_run_local.format("%Y-%m-%d %H:%M %Z").to_string()
+        crate::cron_utils::humanize_run_time(next_run_local)
     } else {
-        let next_local = next_run_local.format("%Y-%m-%d %H:%M %Z").to_string();
+        let next_local = crate::cron_utils::humanize_run_time(next_run_local);
         format!("{} (next: {})", schedule_raw, next_local)
     };
     let schedule_kind = if actually_one_shot {
@@ -1022,7 +1044,6 @@ async fn handle_scheduled_intent(
             ctx,
             &goal,
             &schedule,
-            &tz_label,
             "Scheduled goal auto-confirmed from prior session approval.",
         )
         .await;
@@ -1078,7 +1099,6 @@ async fn handle_scheduled_intent(
                     ctx,
                     &goal,
                     &schedule,
-                    &tz_label,
                     "Scheduled goal confirmed via inline approval.",
                 )
                 .await;

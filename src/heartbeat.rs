@@ -1063,6 +1063,74 @@ impl HeartbeatCoordinator {
             return Ok(());
         }
 
+        // ── Plain-reminder fast path: the only deliverable is a message back
+        // to the user, so send it now instead of going through task creation
+        // and the task-lead pipeline (which adds a minute-plus of dispatch and
+        // LLM latency). Falls through to the normal pipeline if the message
+        // can't be delivered.
+        if let Some(reminder) = crate::reminders::parse_reminder(&goal.description) {
+            let fire_text = crate::reminders::fire_message(&reminder);
+            let delivered = if let Some(hub_arc) = self.hub.as_ref().and_then(|w| w.upgrade()) {
+                hub_arc
+                    .send_text(&goal.session_id, &fire_text)
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if delivered {
+                // Record a completed task so history/diagnostics show the run.
+                let task = crate::traits::Task {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    goal_id: goal.id.clone(),
+                    description: format!("Deliver reminder: {}", goal.description),
+                    status: "completed".to_string(),
+                    priority: "medium".to_string(),
+                    task_order: 0,
+                    parallel_group: None,
+                    depends_on: None,
+                    agent_id: Some("reminder-fast-path".to_string()),
+                    context: None,
+                    result: Some(fire_text),
+                    error: None,
+                    blocker: None,
+                    idempotent: false,
+                    retry_count: 0,
+                    max_retries: 1,
+                    created_at: now_ts.clone(),
+                    started_at: Some(now_ts.clone()),
+                    completed_at: Some(now_ts.clone()),
+                };
+                let _ = self.state.create_task(&task).await;
+
+                let mut updated = goal.clone();
+                if schedule.is_one_shot {
+                    updated.status = "completed".to_string();
+                    updated.completed_at = Some(now_ts.clone());
+                    // The reminder itself is the notification — suppress the
+                    // generic "Goal completed" follow-up.
+                    updated.notified_at = Some(now_ts.clone());
+                }
+                updated.last_useful_action = Some(now_ts.clone());
+                updated.updated_at = now_ts.clone();
+                let _ = self.state.update_goal(&updated).await;
+
+                if schedule.is_one_shot {
+                    let _ = self.state.delete_goal_schedule(&schedule.id).await;
+                }
+                info!(
+                    goal_id = %goal.id,
+                    one_shot = schedule.is_one_shot,
+                    "Delivered plain reminder via fast path"
+                );
+                return Ok(());
+            }
+            warn!(
+                goal_id = %goal.id,
+                "Reminder fast path could not deliver; falling back to task pipeline"
+            );
+        }
+
         // Create a pending task for this scheduled run.
         let task = crate::traits::Task {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1134,9 +1202,44 @@ impl HeartbeatCoordinator {
                     let _ = hub_arc
                         .send_text(
                             &goal.session_id,
-                            &format!("Running scheduled task: {}", short_desc),
+                            &format!("🔄 Running scheduled task: {}", short_desc),
                         )
                         .await;
+                }
+            }
+        }
+
+        // Dispatch immediately instead of waiting for the orphan-recovery pass
+        // (which only picks up tasks older than 60s, so every scheduled run
+        // used to start at least a minute late). If no agent is available the
+        // orphan dispatcher still picks the task up on a later tick.
+        if let Some(agent_arc) = self.agent.as_ref().and_then(|w| w.upgrade()) {
+            let agent_id = format!("heartbeat-schedule-fire-{}", uuid::Uuid::new_v4());
+            match self.state.claim_task(&task.id, &agent_id).await {
+                Ok(true) => {
+                    if let Some(ref registry) = self.goal_token_registry {
+                        registry.register(&goal.id).await;
+                    }
+                    crate::agent::spawn_background_task_lead(
+                        agent_arc,
+                        goal.clone(),
+                        task.description.clone(),
+                        goal.session_id.clone(),
+                        ChannelContext::internal(),
+                        UserRole::Owner,
+                        self.state.clone(),
+                        self.hub.clone(),
+                        self.goal_token_registry.clone(),
+                        Some(task.id.clone()),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "Failed to claim scheduled task for immediate dispatch"
+                    );
                 }
             }
         }
@@ -1208,6 +1311,157 @@ mod tests {
         );
 
         drop(wake_tx); // Keep sender alive until here
+    }
+
+    async fn reminder_test_setup() -> (
+        Arc<dyn StateStore>,
+        Arc<ChannelHub>,
+        Arc<crate::testing::TestChannel>,
+        HeartbeatCoordinator,
+        tempfile::NamedTempFile,
+    ) {
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let channel = Arc::new(crate::testing::TestChannel::new());
+        let session_map: crate::channels::SessionMap = Arc::new(tokio::sync::RwLock::new(
+            HashMap::from([("test_session".to_string(), "test".to_string())]),
+        ));
+        let hub = Arc::new(ChannelHub::new(
+            vec![channel.clone() as Arc<dyn crate::traits::Channel>],
+            session_map,
+        ));
+        let coordinator = HeartbeatCoordinator::new(
+            state.clone(),
+            1,
+            3,
+            wake_rx,
+            Some(Arc::downgrade(&hub)),
+            None,
+            None,
+        );
+        (state, hub, channel, coordinator, db_file)
+    }
+
+    fn due_schedule(goal_id: &str, cron_expr: &str, is_one_shot: bool) -> GoalSchedule {
+        let now = chrono::Utc::now().to_rfc3339();
+        GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            cron_expr: cron_expr.to_string(),
+            tz: "local".to_string(),
+            original_schedule: None,
+            fire_policy: "coalesce".to_string(),
+            is_one_shot,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reminder_fast_path_one_shot_delivers_and_completes() {
+        let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+        let mut goal = Goal::new_deferred_finite("Remind me to call my daughter", "test_session");
+        goal.status = "active".to_string();
+        state.create_goal(&goal).await.unwrap();
+        let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        // The reminder itself is the only message — no "Running scheduled
+        // task", no progress updates.
+        let msgs = channel.messages_for("test_session").await;
+        assert_eq!(msgs, vec!["⏰ Reminder: call your daughter".to_string()]);
+
+        // Goal completed with notified_at set (suppresses the generic
+        // "Goal completed" notification) and the one-shot schedule removed.
+        let g = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(g.status, "completed");
+        assert!(g.notified_at.is_some());
+        assert!(state
+            .get_schedules_for_goal(&goal.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A completed task records the run; nothing is left pending for the
+        // task-lead pipeline.
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn test_reminder_fast_path_recurring_keeps_goal_active() {
+        let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+        let mut goal =
+            Goal::new_continuous("Remind me to take my meds", "test_session", None, None);
+        goal.status = "active".to_string();
+        state.create_goal(&goal).await.unwrap();
+        let schedule = due_schedule(&goal.id, "0 9 * * *", false);
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        let msgs = channel.messages_for("test_session").await;
+        assert_eq!(msgs, vec!["⏰ Reminder: take your meds".to_string()]);
+
+        // Recurring reminders stay active with their schedule intact.
+        let g = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(g.status, "active");
+        assert_eq!(
+            state.get_schedules_for_goal(&goal.id).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_reminder_schedule_creates_pending_task() {
+        let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+        let mut goal = Goal::new_deferred_finite("Check the deploy status", "test_session");
+        goal.status = "active".to_string();
+        state.create_goal(&goal).await.unwrap();
+        let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        // Non-reminder goals keep the normal pipeline: a task is created and
+        // the user is told the scheduled task is running.
+        let msgs = channel.messages_for("test_session").await;
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].starts_with("🔄 Running scheduled task:"));
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        // No agent wired in this test, so the task stays pending for the
+        // orphan dispatcher.
+        assert_eq!(tasks[0].status, "pending");
     }
 
     #[tokio::test]

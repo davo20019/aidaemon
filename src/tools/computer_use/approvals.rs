@@ -12,6 +12,8 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::types::ApprovalResponse;
 
+use super::telemetry::MutationBudget;
+
 #[derive(Clone, Default)]
 pub struct ApprovalState {
     /// Apps approved for inspect+control in a session, keyed by (session, bundle).
@@ -39,21 +41,38 @@ impl ApprovalState {
             .insert((session_id.to_string(), bundle_id.to_string()));
     }
 
+    pub async fn mutations_used(&self, task_id: &str) -> u32 {
+        self.mutating_actions
+            .lock()
+            .await
+            .get(task_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn mutation_budget(config: &ComputerUseConfig, used: u32) -> MutationBudget {
+        MutationBudget {
+            used,
+            max: config.max_mutating_actions,
+        }
+    }
+
     pub async fn record_mutating_action(
         &self,
         task_id: &str,
         config: &ComputerUseConfig,
-    ) -> Result<(), String> {
+    ) -> Result<MutationBudget, String> {
         let mut counts = self.mutating_actions.lock().await;
         let count = counts.entry(task_id.to_string()).or_insert(0);
         *count = count.saturating_add(1);
+        let budget = Self::mutation_budget(config, *count);
         if *count > config.max_mutating_actions {
             return Err(format!(
                 "computer_use mutating action budget exceeded (max {})",
                 config.max_mutating_actions
             ));
         }
-        Ok(())
+        Ok(budget)
     }
 
     /// Ensure the user has approved aidaemon to operate `app` in this session.

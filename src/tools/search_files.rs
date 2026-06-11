@@ -105,7 +105,24 @@ impl Tool for SearchFilesTool {
             anyhow::bail!("At least one of 'pattern' (content regex) or 'glob' (filename pattern) is required");
         }
 
-        let search_dir = fs_utils::validate_path(path_str)?;
+        let mut search_dir = fs_utils::validate_path(path_str)?;
+        if !search_dir.exists() {
+            // Paths copy-pasted from prose or earlier tool output often carry
+            // trailing punctuation ("…/projects)" from a parenthesized
+            // mention). Only fall back when the literal path is missing and
+            // the trimmed one is a real directory.
+            let trimmed = path_str
+                .trim_end()
+                .trim_end_matches([')', ':', ',', ';', '.'])
+                .trim_end();
+            if trimmed != path_str && !trimmed.is_empty() {
+                if let Ok(candidate) = fs_utils::validate_path(trimmed) {
+                    if candidate.is_dir() {
+                        search_dir = candidate;
+                    }
+                }
+            }
+        }
         if !search_dir.exists() {
             anyhow::bail!("Directory not found: {}", search_dir.display());
         }
@@ -147,8 +164,10 @@ impl Tool for SearchFilesTool {
         });
 
         if results.is_empty() {
+            // The scanned dir must end its line cleanly: models copy-paste it
+            // into later calls, and a glued ")" produces invalid paths.
             let mut output = format!(
-                "No matches found ({} files scanned in {})",
+                "No matches found. {} files scanned in {}",
                 stats.files_scanned,
                 search_dir.display()
             );
@@ -181,7 +200,7 @@ impl Tool for SearchFilesTool {
             output.push_str("\n\n");
         }
         output.push_str(&format!(
-            "Found {} match{} ({} files scanned in {}):\n\n",
+            "Found {} match{}. {} files scanned in {}\n\n",
             results.len(),
             if results.len() == 1 { "" } else { "es" },
             stats.files_scanned,
@@ -531,6 +550,76 @@ mod tests {
 
         assert!(result.contains("No matches found"));
         assert!(!result.contains("~/Downloads"));
+    }
+
+    #[tokio::test]
+    async fn scanned_dir_is_never_glued_to_closing_punctuation() {
+        // Models copy-paste the scanned dir from tool output into their next
+        // call. "(N files scanned in /path)" produced paths like
+        // "/Users/x/projects)" — the dir must end its line cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hit.rs"), "fn main() {}").unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+
+        for glob in ["*zz-no-match-xyz.pdf", "*.rs"] {
+            let args = serde_json::json!({ "glob": glob, "path": dir_str }).to_string();
+            let result = SearchFilesTool.call(&args).await.unwrap();
+            for bad_suffix in [")", "):"] {
+                assert!(
+                    !result.contains(&format!("{}{}", dir_str, bad_suffix)),
+                    "scanned dir must not be followed by {:?}, got: {}",
+                    bad_suffix,
+                    result
+                );
+            }
+            assert!(
+                result.contains("files scanned in "),
+                "scanned-dir marker must survive for project_dir extraction, got: {}",
+                result
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_punctuation_on_missing_path_is_recovered() {
+        // A path copy-pasted from prose/old output may carry trailing ')' or
+        // ':'. When the literal path doesn't exist but the trimmed one does,
+        // search there instead of failing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hit.rs"), "fn main() {}").unwrap();
+
+        for suffix in [")", "):", ","] {
+            let args = serde_json::json!({
+                "glob": "*.rs",
+                "path": format!("{}{}", dir.path().to_str().unwrap(), suffix)
+            })
+            .to_string();
+            let result = SearchFilesTool.call(&args).await.unwrap_or_else(|e| {
+                panic!(
+                    "path with trailing {:?} must recover, got error: {}",
+                    suffix, e
+                )
+            });
+            assert!(result.contains("hit.rs"), "got: {}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_paren_path_that_exists_is_not_trimmed() {
+        // Directories with a literal trailing paren (e.g. "Folder (1)") must
+        // still be searched as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let paren_dir = dir.path().join("Copy (1)");
+        std::fs::create_dir(&paren_dir).unwrap();
+        std::fs::write(paren_dir.join("hit.rs"), "fn main() {}").unwrap();
+
+        let args = serde_json::json!({
+            "glob": "*.rs",
+            "path": paren_dir.to_str().unwrap()
+        })
+        .to_string();
+        let result = SearchFilesTool.call(&args).await.unwrap();
+        assert!(result.contains("hit.rs"), "got: {}", result);
     }
 
     #[test]

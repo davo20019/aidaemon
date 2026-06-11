@@ -955,11 +955,15 @@ async fn test_orchestration_scheduled_single_description_uses_current_turn_task_
         .await
         .unwrap();
     assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].description, "Check logs");
+    // Reminder-shaped requests keep the canonical "Remind me to ..." form so
+    // the fire-time reminder fast path can recognize them.
+    assert_eq!(goals[0].description, "Remind me to check logs");
     assert!(
         !goals[0].description.contains("daily budget"),
         "Description should not include unrelated prior turn text"
     );
+    // Plain one-shot reminders are auto-confirmed (no approval gate).
+    assert_eq!(goals[0].status, "active");
 }
 
 #[tokio::test]

@@ -1686,7 +1686,7 @@ fn default_cu_action_timeout_secs() -> u64 {
     10
 }
 fn default_cu_max_mutating_actions() -> u32 {
-    15
+    40
 }
 fn default_cu_max_consecutive_observations() -> u32 {
     3

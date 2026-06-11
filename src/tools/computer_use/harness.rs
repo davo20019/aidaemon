@@ -39,7 +39,7 @@ pub trait ComputerHarness: Send + Sync {
         y: Option<f64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, Option<u32>), String>;
+    ) -> Result<(AppSnapshot, Option<u32>, &'static str), String>;
 
     async fn type_text(
         &self,

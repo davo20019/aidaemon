@@ -27,6 +27,7 @@ mod plans;
 mod providers;
 mod queue_policy;
 mod queue_telemetry;
+mod reminders;
 mod router;
 mod session;
 mod skills;

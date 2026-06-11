@@ -1736,6 +1736,58 @@ async fn test_explicit_tool_turn_still_forces_required_tool_choice_after_no_tool
     );
 }
 
+/// A serving stack that ignores `tool_choice=required` (observed with
+/// llama.cpp + Gemma: the forced retry returned text and degenerated into a
+/// repetition loop until the token limit) must only get the forced retry
+/// once. After a forced call comes back with text and zero tool calls, the
+/// model is flagged and later turns skip the forcing — the substantive-text
+/// acceptance path converges without the wasted call.
+#[tokio::test]
+async fn test_required_tool_choice_not_reforced_after_model_ignores_it() {
+    let substantive = "The machine reports healthy disks, normal memory pressure, \
+        and no failed services.\nNothing actionable needs fixing right now.";
+    let provider = MockProvider::with_responses(vec![
+        // Turn 1, iter 2: deferral text — blocked, streak=1.
+        MockProvider::text_response("I'll check the system info now."),
+        // Turn 1, iter 3: tool_choice=required forced, but the "model"
+        // ignores it and returns substantive text — accepted at streak=2.
+        MockProvider::text_response(substantive),
+        // Turn 2, iter 2: deferral text — blocked, streak=1.
+        MockProvider::text_response("I'll check the system info now."),
+        // Turn 2, iter 3: the retry must NOT force required anymore.
+        MockProvider::text_response(substantive),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+    for _ in 0..2 {
+        harness
+            .agent
+            .handle_message(
+                "required_tool_choice_ignored",
+                "check the system info on this machine",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(call_log.len(), 4);
+    assert_eq!(
+        call_log[1].options.tool_choice,
+        crate::traits::ToolChoiceMode::Required,
+        "first deferral retry should still escalate to required tool choice"
+    );
+    assert_eq!(
+        call_log[3].options.tool_choice,
+        crate::traits::ToolChoiceMode::Auto,
+        "after the model ignored required once, later turns must not force it again"
+    );
+}
+
 /// Stall detection: agent keeps calling an unknown tool which errors each
 /// iteration. After MAX_STALL_ITERATIONS (3), agent should gracefully stop.
 #[tokio::test]

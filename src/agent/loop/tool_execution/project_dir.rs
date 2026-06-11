@@ -529,6 +529,15 @@ mod tests {
             Some("/tmp/dogs")
         );
         assert!(search_files_result_no_matches(search));
+
+        // Current search_files output keeps the dir at end-of-line (no glued
+        // paren); both formats must extract.
+        let search_current = "No matches found. 0 files scanned in /tmp/dogs";
+        assert_eq!(
+            extract_search_files_scanned_dir(search_current).as_deref(),
+            Some("/tmp/dogs")
+        );
+        assert!(search_files_result_no_matches(search_current));
     }
 
     #[test]

@@ -157,3 +157,56 @@ async fn model_pin_is_set_on_first_gui_action() {
         .expect("expected model pin");
     assert_eq!(pinned, "gpt-4o");
 }
+
+#[tokio::test]
+async fn mutation_budget_blocks_after_limit() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            max_mutating_actions: 1,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let mut inspect = json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-budget"
+    });
+    if let Some(obj) = inspect.as_object_mut() {
+        obj.extend(test_model_args().as_object().unwrap().clone());
+    }
+    tool.call_with_status_outcome(&inspect.to_string(), None)
+        .await
+        .unwrap();
+
+    let click = |generation: u64, index: u32| {
+        let mut args = json!({
+            "action": "click",
+            "app": "Calculator",
+            "snapshot_generation": generation,
+            "element_index": index,
+            "_session_id": "telegram:1",
+            "_task_id": "task-budget"
+        });
+        if let Some(obj) = args.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        args
+    };
+
+    let first = tool
+        .call_with_status_outcome(&click(1, 1).to_string(), None)
+        .await
+        .unwrap();
+    assert!(!first.output.contains("budget exceeded"));
+
+    let second = tool
+        .call_with_status_outcome(&click(2, 2).to_string(), None)
+        .await
+        .unwrap();
+    assert!(second.output.contains("budget exceeded"));
+}

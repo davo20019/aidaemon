@@ -172,10 +172,6 @@ pub fn spawn_background_task_lead(
                         .filter(|t| t.status == "completed" && t.error.is_none())
                         .count();
                     let started = tasks.iter().filter(|t| t.status != "pending").count();
-                    let active_count = tasks
-                        .iter()
-                        .filter(|t| t.status == "claimed" || t.status == "running")
-                        .count();
                     let total = tasks.len();
                     let in_progress: Vec<String> = tasks
                         .iter()
@@ -183,31 +179,26 @@ pub fn spawn_background_task_lead(
                         .take(2)
                         .map(|t| user_facing_task_description(&t.description))
                         .collect();
-                    let progress_msg = if in_progress.is_empty() && completed == total {
-                        format!("⏳ Progress: {}/{} steps completed", completed, total)
-                    } else if active_count > 0 {
+                    let progress_msg = if total == 1 {
+                        // Single-step goals: step-count jargon ("0/1 steps
+                        // completed, 1 in progress") reads as internal state.
+                        // Give the first interval a chance to finish silently,
+                        // then send a plain humane update.
+                        if interval_count < 2 {
+                            continue;
+                        }
+                        "⏳ Still working on it...".to_string()
+                    } else if !in_progress.is_empty() {
                         format!(
-                            "⏳ Progress: {}/{} steps completed ({} in progress, {} started). Working on: {}",
+                            "⏳ Progress: {}/{} steps done — working on: {}",
                             completed,
                             total,
-                            active_count,
-                            started,
                             in_progress.join(", ")
                         )
-                    } else if started > completed {
-                        format!(
-                            "⏳ Progress: {}/{} steps completed ({} started).",
-                            completed, total, started
-                        )
-                    } else if in_progress.is_empty() {
-                        "⏳ Still working on your request...".to_string()
+                    } else if completed == total || started > completed {
+                        format!("⏳ Progress: {}/{} steps done", completed, total)
                     } else {
-                        format!(
-                            "⏳ Progress: {}/{} steps completed. Working on: {}",
-                            completed,
-                            total,
-                            in_progress.join(", ")
-                        )
+                        "⏳ Still working on your request...".to_string()
                     };
 
                     // Dedup key uses only completed|total so we don't spam when

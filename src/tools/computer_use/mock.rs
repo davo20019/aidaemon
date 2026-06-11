@@ -115,14 +115,14 @@ impl ComputerHarness for MockHarness {
         _y: Option<f64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, Option<u32>), String> {
+    ) -> Result<(AppSnapshot, Option<u32>, &'static str), String> {
         let key = snapshot_key(app, ctx)?;
         if let Some(index) = element_index {
             let _el = cache.element_by_index(&key, generation, index)?;
         }
         let mut snap = self.calculator_snapshot(generation);
         snap.window_title = "Calculator (clicked)".to_string();
-        Ok((cache.store(key, snap), element_index))
+        Ok((cache.store(key, snap), element_index, "mock"))
     }
 
     async fn type_text(

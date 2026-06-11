@@ -23,6 +23,7 @@ pub mod macos;
 mod mock;
 pub mod pin_registry;
 mod policy;
+mod telemetry;
 pub mod types;
 
 #[cfg(test)]
@@ -34,9 +35,17 @@ use capability::pick_capable_model;
 use harness::{ComputerHarness, HarnessRequestContext};
 use pin_registry::ComputerUsePinRegistry;
 use policy::{classify_target, is_prohibited_bundle, ActionClass, ComputerActionKind};
-use types::{format_condensed_refresh, format_full_tree, AppSnapshot};
+use telemetry::{ActionLog, ActionRecord, ElementTarget, MutationBudget, SessionTelemetry};
+use types::{format_condensed_refresh, format_full_tree, AppSnapshot, IndexedElement};
 
 const TOOL_NAME: &str = "computer_use";
+
+#[derive(Default)]
+struct PendingActionMeta {
+    mutation_budget: Option<MutationBudget>,
+    element_target: ElementTarget,
+    click_method: Option<String>,
+}
 
 pub struct ComputerUseTool {
     config: ComputerUseConfig,
@@ -48,6 +57,8 @@ pub struct ComputerUseTool {
     approval_state: ApprovalState,
     pins: ComputerUsePinRegistry,
     media_tx: mpsc::Sender<MediaMessage>,
+    session_telemetry: SessionTelemetry,
+    pending_meta: tokio::sync::Mutex<PendingActionMeta>,
 }
 
 impl ComputerUseTool {
@@ -73,6 +84,48 @@ impl ComputerUseTool {
             approval_state: ApprovalState::new(),
             pins: ComputerUsePinRegistry::shared(),
             media_tx,
+            session_telemetry: SessionTelemetry::default(),
+            pending_meta: tokio::sync::Mutex::new(PendingActionMeta::default()),
+        }
+    }
+
+    async fn clear_pending_meta(&self) {
+        *self.pending_meta.lock().await = PendingActionMeta::default();
+    }
+
+    async fn set_element_target(&self, element: Option<&IndexedElement>, index: Option<u32>) {
+        let mut meta = self.pending_meta.lock().await;
+        meta.element_target = element_target_from(element, index);
+    }
+
+    async fn set_click_method(&self, method: &'static str) {
+        self.pending_meta.lock().await.click_method = Some(method.to_string());
+    }
+
+    async fn take_pending_meta(&self) -> PendingActionMeta {
+        std::mem::take(&mut *self.pending_meta.lock().await)
+    }
+
+    async fn resolve_element_target(
+        &self,
+        args: &Value,
+        ctx: &HarnessRequestContext,
+        bundle_id: &str,
+    ) -> ElementTarget {
+        let generation = match args.get("snapshot_generation").and_then(|v| v.as_u64()) {
+            Some(g) => g,
+            None => return ElementTarget::default(),
+        };
+        let index = optional_u32(args, "element_index");
+        let cache = self.cache.lock().await;
+        let key = self.snapshot_key(bundle_id, ctx);
+        match index {
+            Some(index) => cache
+                .element_by_index(&key, generation, index)
+                .ok()
+                .map(|el| element_target_from(Some(el), Some(index)))
+                .unwrap_or_else(|| element_target_from(None, Some(index))),
+            None => ElementTarget::default(),
         }
     }
 
@@ -161,9 +214,11 @@ impl ComputerUseTool {
         }
 
         if !observation {
-            self.approval_state
+            let budget = self
+                .approval_state
                 .record_mutating_action(&ctx.task_id, &self.config)
                 .await?;
+            self.pending_meta.lock().await.mutation_budget = Some(budget);
         }
         Ok(())
     }
@@ -362,6 +417,7 @@ impl ComputerUseTool {
                 let mut summary = None;
                 if let Some(index) = element_index {
                     let element = cache.element_by_index(&key, generation, index)?.clone();
+                    self.set_element_target(Some(&element), Some(index)).await;
                     action_class = classify_target(action, Some(&element), None);
                     if action_class == ActionClass::Prohibited {
                         return Err("Target element is prohibited".to_string());
@@ -379,10 +435,11 @@ impl ComputerUseTool {
                     summary.as_deref(),
                 )
                 .await?;
-                let (snapshot, focus) = self
+                let (snapshot, focus, click_method) = self
                     .harness
                     .click(&app, generation, element_index, x, y, &ctx, &mut cache)
                     .await?;
+                self.set_click_method(click_method).await;
                 let text = format_condensed_refresh(&snapshot, focus);
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await
@@ -444,6 +501,15 @@ impl ComputerUseTool {
                 let direction = required_str(args, "direction")?;
                 let pages = args.get("pages").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let resolved = self.resolve_app(&app).await?;
+                let element = {
+                    let cache = self.cache.lock().await;
+                    let key = self.snapshot_key(&resolved.bundle_id, &ctx);
+                    cache
+                        .element_by_index(&key, generation, element_index)?
+                        .clone()
+                };
+                self.set_element_target(Some(&element), Some(element_index))
+                    .await;
                 self.ensure_action_approvals(
                     &ctx,
                     action,
@@ -482,6 +548,8 @@ impl ComputerUseTool {
                 let element = cache
                     .element_by_index(&key, generation, element_index)?
                     .clone();
+                self.set_element_target(Some(&element), Some(element_index))
+                    .await;
                 let class = classify_target(action, Some(&element), Some(&value));
                 if class == ActionClass::Prohibited {
                     return Err("Target element or value is prohibited".to_string());
@@ -558,6 +626,28 @@ fn required_u32(args: &Value, key: &str) -> Result<u32, String> {
         .and_then(|v| v.as_u64())
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| format!("Missing required parameter: {key}"))
+}
+
+fn element_target_from(element: Option<&IndexedElement>, index: Option<u32>) -> ElementTarget {
+    match element {
+        Some(el) => ElementTarget {
+            index: Some(el.index),
+            title: if el.title.is_empty() {
+                None
+            } else {
+                Some(el.title.clone())
+            },
+            role: if el.role.is_empty() {
+                None
+            } else {
+                Some(el.role.clone())
+            },
+        },
+        None => ElementTarget {
+            index,
+            ..Default::default()
+        },
+    }
 }
 
 fn optional_u32(args: &Value, key: &str) -> Option<u32> {
@@ -645,16 +735,45 @@ impl Tool for ComputerUseTool {
         _status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
+        self.clear_pending_meta().await;
         let started = std::time::Instant::now();
         let result = self.dispatch(&args).await;
-        // One structured telemetry event per action — consistent, greppable
-        // fields for debugging without raw screenshots or typed text. The
-        // dedicated `computer_use` target lets observability filter/route it.
+        let pending = self.take_pending_meta().await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("?");
         let app = args.get("app").and_then(|v| v.as_str()).unwrap_or("");
         let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
-        let element_index = args.get("element_index").and_then(|v| v.as_u64());
-        let duration_ms = started.elapsed().as_millis() as u64;
+        let task_id = args
+            .get("_task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let is_mutation = !matches!(action, "list_apps" | "get_app_state" | "screenshot");
+
+        let mut element_target = pending.element_target;
+        if element_target.index.is_none() {
+            if let Some(index) = optional_u32(&args, "element_index") {
+                element_target.index = Some(index);
+            }
+        }
+        if element_target.title.is_none() && !app.is_empty() {
+            if let Ok(ctx) = Self::parse_context(&args) {
+                if let Ok(bundle_id) = self.resolve_bundle_id(app).await {
+                    let resolved = self.resolve_element_target(&args, &ctx, &bundle_id).await;
+                    if resolved.title.is_some() || resolved.role.is_some() {
+                        element_target = resolved;
+                    }
+                }
+            }
+        }
+
+        let click_method = pending.click_method.as_deref();
+        let mut budget = pending.mutation_budget;
+        if is_mutation && budget.is_none() {
+            let used = self.approval_state.mutations_used(task_id).await;
+            budget = Some(ApprovalState::mutation_budget(&self.config, used));
+        }
+
         match result {
             Ok(outcome) => {
                 let screenshot_bytes: usize = outcome
@@ -663,33 +782,69 @@ impl Tool for ComputerUseTool {
                     .iter()
                     .map(|a| a.size_bytes as usize)
                     .sum();
+                let screenshot_path = outcome
+                    .metadata
+                    .attachments
+                    .first()
+                    .map(|a| a.local_path.as_str());
                 let truncated = outcome.output.contains("TRUNCATED");
-                tracing::info!(
-                    target: "computer_use",
+                telemetry::log_action(&ActionLog {
+                    task_id,
                     action,
                     app,
                     generation,
-                    element_index,
+                    target: Some(&element_target),
+                    click_method,
                     duration_ms,
-                    outcome = "ok",
+                    success: true,
+                    error: None,
                     screenshot_bytes,
+                    screenshot_path,
                     truncated,
-                    "computer_use action"
-                );
+                    budget,
+                    is_mutation,
+                });
+                self.session_telemetry
+                    .record_action(&ActionRecord {
+                        task_id,
+                        action,
+                        app,
+                        is_mutation,
+                        success: true,
+                        budget,
+                        target: Some(&element_target),
+                    })
+                    .await;
                 Ok(outcome)
             }
             Err(err) => {
-                tracing::warn!(
-                    target: "computer_use",
+                telemetry::log_action(&ActionLog {
+                    task_id,
                     action,
                     app,
                     generation,
-                    element_index,
+                    target: Some(&element_target),
+                    click_method,
                     duration_ms,
-                    outcome = "error",
-                    error = %err,
-                    "computer_use action failed"
-                );
+                    success: false,
+                    error: Some(&err),
+                    screenshot_bytes: 0,
+                    screenshot_path: None,
+                    truncated: false,
+                    budget,
+                    is_mutation,
+                });
+                self.session_telemetry
+                    .record_action(&ActionRecord {
+                        task_id,
+                        action,
+                        app,
+                        is_mutation,
+                        success: false,
+                        budget,
+                        target: Some(&element_target),
+                    })
+                    .await;
                 Ok(ToolCallOutcome::from_output(format!("Error: {err}")))
             }
         }
@@ -737,7 +892,10 @@ impl Tool for ComputerUseTool {
         ToolRole::Action
     }
 
-    async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
+    async fn on_task_end(&self, task_id: &str, session_id: &str) -> anyhow::Result<()> {
+        if let Some(summary) = self.session_telemetry.finish_task(task_id).await {
+            telemetry::log_session_end(task_id, session_id, &summary);
+        }
         self.cache.lock().await.clear_task(task_id);
         self.pins.clear_task(task_id).await;
         self.approval_state.clear_task(task_id).await;

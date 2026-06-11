@@ -194,7 +194,6 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
         if is_confirm {
             let mut activated = Vec::new();
             let mut activation_errors = Vec::new();
-            let tz_label = crate::cron_utils::system_timezone_display();
 
             for goal in &pending_goals {
                 match agent.state.activate_goal(&goal.id).await {
@@ -214,12 +213,12 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
                             })
                             .min_by_key(|dt| dt.timestamp())
                             .map(|dt| {
-                                dt.with_timezone(&chrono::Local)
-                                    .format("%Y-%m-%d %H:%M %Z")
-                                    .to_string()
+                                crate::cron_utils::humanize_run_time(
+                                    dt.with_timezone(&chrono::Local),
+                                )
                             })
                             .unwrap_or_else(|| "unscheduled".to_string());
-                        activated.push(format!("{} (next: {})", goal.description, next_run));
+                        activated.push(format!("{} (next run {})", goal.description, next_run));
                     }
                     Ok(false) => {}
                     Err(e) => activation_errors.push(e.to_string()),
@@ -228,16 +227,12 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
 
             let msg = if !activated.is_empty() && activation_errors.is_empty() {
                 if activated.len() == 1 {
-                    format!(
-                        "Scheduled: {}. I'll execute it when the time comes. System timezone: {}.",
-                        activated[0], tz_label
-                    )
+                    format!("✅ Scheduled: {}.", activated[0])
                 } else {
                     format!(
-                        "Scheduled {} goals:\n- {}\nSystem timezone: {}.",
+                        "✅ Scheduled {} goals:\n- {}",
                         activated.len(),
-                        activated.join("\n- "),
-                        tz_label
+                        activated.join("\n- ")
                     )
                 }
             } else if !activated.is_empty() {

@@ -399,6 +399,14 @@ pub struct Agent {
     /// Models that recently returned 402 billing errors. Maps model name → failure time.
     /// Shared across parent/child agents. Entries expire after BILLING_FAIL_CACHE_TTL.
     billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
+    /// Models that ignored a forced `tool_choice=required` call (returned text
+    /// with zero tool calls). Some serving stacks (llama.cpp + Gemma) don't
+    /// enforce `required` and can degenerate into a repetition loop until the
+    /// token limit when it is requested. Once flagged, the deferred/no-tool
+    /// recovery stops forcing `required` for that model and relies on the
+    /// substantive-text acceptance path instead. Shared across parent/child
+    /// agents; in-memory only (re-learned after restart).
+    required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Weak self-reference for background task spawning.
     /// Set after Arc creation via `set_self_ref()`.
     self_ref: RwLock<Option<Weak<Agent>>>,
