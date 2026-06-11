@@ -21,6 +21,24 @@ pub struct AnthropicNativeProvider {
     api_key: String,
     max_tokens: u32,
     extra_headers: HashMap<String, String>,
+    /// Configured extended-thinking effort ("low" | "medium" | "high" | "off").
+    /// None disables thinking. Per-call `reasoning_effort_override` wins.
+    reasoning_effort: Option<String>,
+}
+
+/// Key under `ToolCall.extra_content` carrying the raw thinking blocks
+/// (with signatures) that must be replayed verbatim in the assistant
+/// message when continuing a tool-use turn with thinking enabled.
+const THINKING_BLOCKS_KEY: &str = "anthropic_thinking_blocks";
+
+/// Map a reasoning-effort label to an extended-thinking token budget.
+fn thinking_budget_tokens(effort: &str) -> u32 {
+    match effort {
+        "low" => 2_048,
+        "high" => 16_384,
+        // "medium" and any unrecognized label get the balanced default.
+        _ => 8_192,
+    }
 }
 
 fn normalize_tool_name(name: &str) -> String {
@@ -54,7 +72,13 @@ impl AnthropicNativeProvider {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS),
             extra_headers: extra_headers.unwrap_or_default(),
+            reasoning_effort: None,
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 
     fn with_extra_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -91,6 +115,21 @@ impl AnthropicNativeProvider {
                 "assistant" => {
                     // Split into text content and tool_use blocks
                     let mut content_blocks = Vec::new();
+
+                    // Replay preserved extended-thinking blocks first — the
+                    // API requires them to lead the assistant message when a
+                    // tool-use turn continues with thinking enabled.
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                        for tc in tool_calls {
+                            if let Some(blocks) = tc
+                                .get("extra_content")
+                                .and_then(|e| e.get(THINKING_BLOCKS_KEY))
+                                .and_then(|b| b.as_array())
+                            {
+                                content_blocks.extend(blocks.iter().cloned());
+                            }
+                        }
+                    }
 
                     if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
                         if !text.is_empty() {
@@ -269,12 +308,40 @@ impl AnthropicNativeProvider {
         };
         let anthropic_tools = self.convert_tools(effective_tools);
 
-        let effective_max_tokens = options.max_tokens_override.unwrap_or(self.max_tokens);
+        let mut effective_max_tokens = options.max_tokens_override.unwrap_or(self.max_tokens);
+
+        // Extended thinking: per-call override wins over configured effort;
+        // "off" disables. Anthropic rejects thinking with forced tool_choice
+        // (any/tool), and the loop relies on forced tool choice for contract
+        // retries — forced choice wins.
+        let tool_choice_forced = !effective_tools.is_empty()
+            && matches!(
+                options.tool_choice,
+                ToolChoiceMode::Required | ToolChoiceMode::Specific(_)
+            );
+        let thinking_budget = options
+            .reasoning_effort_override
+            .as_deref()
+            .or(self.reasoning_effort.as_deref())
+            .filter(|effort| *effort != "off" && !tool_choice_forced)
+            .map(thinking_budget_tokens);
+        if let Some(budget) = thinking_budget {
+            // The thinking budget counts against max_tokens; keep headroom
+            // for the visible response.
+            effective_max_tokens = effective_max_tokens.max(budget + 4_096);
+        }
+
         let mut body = json!({
             "model": model,
             "max_tokens": effective_max_tokens,
             "messages": converted_msgs,
         });
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
 
         // Prompt-cache breakpoints (tools tail → system tail → conversation
         // tail). The harness keeps the core prompt and archived history
@@ -324,6 +391,72 @@ impl AnthropicNativeProvider {
         }
 
         body
+    }
+
+    /// Parse a successful Anthropic messages-API response body.
+    fn parse_chat_response(data: &Value, model: &str) -> ProviderResponse {
+        let mut final_text = String::new();
+        let mut thinking_text = String::new();
+        let mut thinking_blocks: Vec<Value> = Vec::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(content_arr) = data["content"].as_array() {
+            for block in content_arr {
+                let btype = block["type"].as_str().unwrap_or("");
+                if btype == "text" {
+                    if let Some(t) = block["text"].as_str() {
+                        final_text.push_str(t);
+                    }
+                } else if btype == "thinking" || btype == "redacted_thinking" {
+                    if let Some(t) = block["thinking"].as_str() {
+                        thinking_text.push_str(t);
+                    }
+                    // Keep the raw block (with signature) for verbatim replay
+                    // on tool-use continuation.
+                    thinking_blocks.push(block.clone());
+                } else if btype == "tool_use" {
+                    let name = normalize_tool_name(block["name"].as_str().unwrap_or(""));
+                    let id = block["id"].as_str().unwrap_or("").to_string();
+                    let input = &block["input"];
+                    let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                        extra_content: None,
+                    });
+                }
+            }
+        }
+
+        // Thinking blocks must be replayed in the assistant message when the
+        // turn continues with tool results. Stash them on the first tool
+        // call so they survive the OpenAI-format history round-trip (same
+        // mechanism as Gemini thought signatures).
+        if !thinking_blocks.is_empty() {
+            if let Some(first_call) = tool_calls.first_mut() {
+                first_call.extra_content = Some(json!({ THINKING_BLOCKS_KEY: thinking_blocks }));
+            }
+        }
+
+        let usage = Self::parse_usage(data, model);
+
+        ProviderResponse {
+            content: if final_text.is_empty() {
+                None
+            } else {
+                Some(final_text)
+            },
+            tool_calls,
+            usage,
+            thinking: if thinking_text.is_empty() {
+                None
+            } else {
+                Some(thinking_text)
+            },
+            response_note: None,
+        }
     }
 
     fn parse_usage(data: &Value, model: &str) -> Option<TokenUsage> {
@@ -437,45 +570,7 @@ impl ModelProvider for AnthropicNativeProvider {
             ))
         })?;
 
-        let mut final_text = String::new();
-        let mut tool_calls = Vec::new();
-
-        if let Some(content_arr) = data["content"].as_array() {
-            for block in content_arr {
-                let btype = block["type"].as_str().unwrap_or("");
-                if btype == "text" {
-                    if let Some(t) = block["text"].as_str() {
-                        final_text.push_str(t);
-                    }
-                } else if btype == "tool_use" {
-                    let name = normalize_tool_name(block["name"].as_str().unwrap_or(""));
-                    let id = block["id"].as_str().unwrap_or("").to_string();
-                    let input = &block["input"];
-                    let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-
-                    tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: args,
-                        extra_content: None,
-                    });
-                }
-            }
-        }
-
-        let usage = Self::parse_usage(&data, model);
-
-        Ok(ProviderResponse {
-            content: if final_text.is_empty() {
-                None
-            } else {
-                Some(final_text)
-            },
-            tool_calls,
-            usage,
-            thinking: None,
-            response_note: None,
-        })
+        Ok(Self::parse_chat_response(&data, model))
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -545,6 +640,119 @@ mod tests {
 
     fn provider() -> AnthropicNativeProvider {
         AnthropicNativeProvider::new("test-key")
+    }
+
+    #[test]
+    fn thinking_param_follows_reasoning_effort() {
+        let p = provider().with_reasoning_effort(Some("medium".to_string()));
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+
+        let body = p.build_request_body("claude-test", &messages, &[], &ChatOptions::default());
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 8192})
+        );
+        // max_tokens must exceed the thinking budget.
+        assert!(body["max_tokens"].as_u64().unwrap() > 8192);
+
+        // Per-call override wins over the configured effort.
+        let low = ChatOptions {
+            reasoning_effort_override: Some("low".to_string()),
+            ..Default::default()
+        };
+        let body = p.build_request_body("claude-test", &messages, &[], &low);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 2048})
+        );
+
+        // "off" disables thinking entirely.
+        let off = ChatOptions {
+            reasoning_effort_override: Some("off".to_string()),
+            ..Default::default()
+        };
+        let body = p.build_request_body("claude-test", &messages, &[], &off);
+        assert!(body.get("thinking").is_none());
+
+        // No configured effort and no override → no thinking param.
+        let plain = provider();
+        let body = plain.build_request_body("claude-test", &messages, &[], &ChatOptions::default());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_disabled_when_tool_choice_is_forced() {
+        // Anthropic rejects thinking together with tool_choice any/tool —
+        // forced tool choice must win (the loop uses it for contract retries).
+        let p = provider().with_reasoning_effort(Some("high".to_string()));
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let tools = vec![json!({"type": "function", "function": {
+            "name": "t", "description": "d", "parameters": {"type": "object"}}})];
+        let required = ChatOptions {
+            tool_choice: ToolChoiceMode::Required,
+            ..Default::default()
+        };
+        let body = p.build_request_body("claude-test", &messages, &tools, &required);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["tool_choice"], json!({"type": "any"}));
+    }
+
+    #[test]
+    fn thinking_blocks_parsed_and_stashed_for_round_trip() {
+        let data = json!({
+            "content": [
+                {"type": "thinking", "thinking": "Let me check the file first.", "signature": "sig123"},
+                {"type": "text", "text": "Checking now."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.txt"}}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let resp = AnthropicNativeProvider::parse_chat_response(&data, "claude-test");
+        assert_eq!(
+            resp.thinking.as_deref(),
+            Some("Let me check the file first.")
+        );
+        assert_eq!(resp.content.as_deref(), Some("Checking now."));
+        assert_eq!(resp.tool_calls.len(), 1);
+        let extra = resp.tool_calls[0].extra_content.as_ref().unwrap();
+        let blocks = extra["anthropic_thinking_blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["signature"], "sig123");
+    }
+
+    #[test]
+    fn thinking_blocks_replayed_first_in_assistant_message() {
+        let p = provider();
+        let thinking_block = json!({
+            "type": "thinking",
+            "thinking": "Let me check the file first.",
+            "signature": "sig123"
+        });
+        let messages = vec![
+            json!({"role": "user", "content": "read a.txt"}),
+            json!({
+                "role": "assistant",
+                "content": "Checking now.",
+                "tool_calls": [{
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+                    "extra_content": {"anthropic_thinking_blocks": [thinking_block.clone()]}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "toolu_1", "content": "file contents"}),
+        ];
+        let (_, converted) = p.convert_messages(&messages);
+        let assistant = converted
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0], thinking_block,
+            "thinking block must lead the assistant content for tool-use continuation"
+        );
+        assert!(blocks.iter().any(|b| b["type"] == "tool_use"));
     }
 
     #[test]

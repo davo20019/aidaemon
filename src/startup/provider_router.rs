@@ -58,14 +58,15 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
                 config.extra_headers.clone(),
             ),
         ),
-        ProviderKind::Anthropic => {
-            Arc::new(crate::providers::AnthropicNativeProvider::new_with_options(
+        ProviderKind::Anthropic => Arc::new(
+            crate::providers::AnthropicNativeProvider::new_with_options(
                 &config.api_key,
                 provider_base_override,
                 config.max_tokens,
                 config.extra_headers.clone(),
-            ))
-        }
+            )
+            .with_reasoning_effort(config.reasoning_effort.clone()),
+        ),
     };
 
     let router = Router::new(config.models.clone());
