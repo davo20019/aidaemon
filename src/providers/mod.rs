@@ -11,6 +11,8 @@ use reqwest::Client;
 use tracing::warn;
 
 pub use anthropic_native::AnthropicNativeProvider;
+#[allow(unused_imports)]
+pub use error::is_provider_infra_error_text;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;
 pub use openai_compatible::OpenAiCompatibleProvider;

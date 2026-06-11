@@ -270,6 +270,40 @@ fn parse_affordable_from_text(text: &str) -> Option<u32> {
     num_str.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
+/// Multi-word markers for provider-infrastructure failures (rate limits,
+/// timeouts, network, server errors, auth, billing, model-unavailable).
+/// These match the strings produced by `user_message()` /
+/// `recovery_failed_message()` above plus common raw provider phrasing.
+/// Multi-word `.contains()` matching is intentional here (see CLAUDE.md
+/// keyword-matching exceptions): each phrase is specific enough to avoid
+/// false positives on task-semantic failures.
+#[allow(dead_code)]
+const PROVIDER_INFRA_ERROR_MARKERS: &[&str] = &[
+    "fallback recovery did not succeed",
+    "remained rate limited during recovery",
+    "kept timing out during recovery",
+    "could not reach the llm provider",
+    "kept returning server errors",
+    "llm api authentication failed",
+    "llm api billing error",
+    "llm request timed out",
+    "rate limited. retrying",
+    "llm provider is experiencing issues",
+    "cannot reach llm provider",
+];
+
+/// True when an error string describes a transient/provider-infrastructure
+/// failure rather than a semantic task failure. Used by the goal dispatch
+/// circuit breaker: infra failures should be retried later, never counted
+/// as goal-level "no progress".
+#[allow(dead_code)]
+pub fn is_provider_infra_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    PROVIDER_INFRA_ERROR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// Truncate a string to at most `max_len` bytes, respecting UTF-8 char boundaries.
 /// Avoids panicking on multi-byte characters.
 fn truncate_body(body: &str) -> String {
@@ -341,5 +375,45 @@ mod tests {
         let body = r#"{"error":{"message":"can only afford 0 tokens","code":402}}"#;
         let err = ProviderError::from_status(402, body);
         assert_eq!(err.affordable_tokens, None);
+    }
+
+    #[test]
+    fn infra_classifier_matches_recovery_failure_strings() {
+        // Exact string observed in production task.error rows (goal 6bfe3a13).
+        assert!(is_provider_infra_error_text(
+            "The configured LLM model could not be used, and fallback recovery did not succeed. Check model settings."
+        ));
+        assert!(is_provider_infra_error_text(
+            "The LLM provider remained rate limited during recovery. Try again shortly."
+        ));
+        assert!(is_provider_infra_error_text(
+            "LLM requests kept timing out during recovery. Try again shortly."
+        ));
+        assert!(is_provider_infra_error_text(
+            "Could not reach the LLM provider during recovery. Check connectivity or try again shortly."
+        ));
+        assert!(is_provider_infra_error_text(
+            "The LLM provider kept returning server errors during recovery. Try again later or switch providers."
+        ));
+        assert!(is_provider_infra_error_text(
+            "LLM API authentication failed. Check your API key in config.toml."
+        ));
+        assert!(is_provider_infra_error_text(
+            "LLM API billing error — your account quota may be exhausted."
+        ));
+    }
+
+    #[test]
+    fn infra_classifier_rejects_semantic_failures() {
+        assert!(!is_provider_infra_error_text(
+            "The file /tmp/report.csv does not exist"
+        ));
+        assert!(!is_provider_infra_error_text(
+            "Verification failed: tweet was not posted"
+        ));
+        assert!(!is_provider_infra_error_text(""));
+        assert!(!is_provider_infra_error_text(
+            "Task cancelled: goal stalled (no progress after 3 dispatch cycles)"
+        ));
     }
 }
