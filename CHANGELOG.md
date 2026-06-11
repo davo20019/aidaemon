@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SSE streaming transport** (`[provider] streaming = true`, OpenAI-compatible): responses stream and are accumulated to the exact buffered shape, so the parse path, token accounting, and tool-call handling are unchanged. A stream that dies or stalls after partial text finalizes as a `length` cutoff, reusing truncation recovery to continue the response instead of losing it.
 - **Anthropic prompt-cache breakpoints**: the native Anthropic provider now sets `cache_control: ephemeral` on the last tool definition, the system prompt block, and the final message's tail content block. Combined with the existing byte-stable core-prompt/archived-history architecture, each agent-loop iteration reuses the previous call's cached prefix instead of re-ingesting it at full input price (cache hits were already parsed from `cache_read_input_tokens` but never produced).
 
+### Fixed
+
+- **Never-exiting background commands dead-ended the conversation**: a tracked background command that never exits on its own (e.g. `npm run dev`) promised a completion notification that could never fire — periodic progress pings stopped after 3 ticks (and were suppressed without new output), the notifier then waited forever on process exit, and the agent never reported back. The user was left in silence, and every retry leaked another dev server squatting the next port. Once periodic pings are exhausted, the notifier now re-engages the agent once with the output so far (a synthetic `[Background command still running]` follow-up, exempted from schedule-extraction heuristics and always classified as a follow-up) so it tells the user the current status — e.g. the URL/port a dev server is listening on — and completes the original task. A friendly fallback notice is queued when the agent path is unavailable or over the re-engagement budget. The process keeps running, and the final completion notification still fires if it ever exits.
+
 ## [0.11.2] - 2026-06-10
 
 ### Added

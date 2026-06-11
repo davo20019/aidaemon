@@ -123,7 +123,9 @@ pub(super) fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool
     // Synthetic follow-up messages from background command completions contain
     // command output that often includes dates (e.g., `find -mmin` timestamps).
     // These are never scheduling requests.
-    if text.starts_with("[Background command completed]") {
+    if text.starts_with("[Background command completed]")
+        || text.starts_with("[Background command still running]")
+    {
         return None;
     }
     if is_schedule_reference_query(text) {

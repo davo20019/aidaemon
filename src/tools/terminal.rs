@@ -1466,6 +1466,11 @@ impl TerminalTool {
                             // Consume the immediate first tick; we want periodic pings only.
                             ping_interval.tick().await;
                             let mut ping_count: u32 = 0;
+                            // One-time notice for processes that outlive all
+                            // periodic pings (dev servers, watchers): without it
+                            // the notifier goes silent waiting for an exit that
+                            // may never come and the conversation dead-ends.
+                            let mut still_running_notice_sent = false;
                             // Last output already shown to the user in a periodic
                             // ping. Used to suppress redundant "still running, no
                             // new output" channel messages (the agent already told
@@ -1598,9 +1603,169 @@ impl TerminalTool {
 
                                         ping_count += 1;
                                         if ping_count > MAX_BACKGROUND_PROGRESS_PINGS {
-                                            // Stop sending periodic pings but keep waiting
-                                            // for completion to send the final notification.
-                                            // (intentionally empty — skip the rest of this branch)
+                                            // Periodic pings are exhausted. A process still
+                                            // alive at this point is likely long-lived (dev
+                                            // server, watcher) and may never exit, so the
+                                            // completion path below may never run. Re-engage
+                                            // the agent ONCE with the output so far so it can
+                                            // report status to the user (e.g. "server is up on
+                                            // port X") and close out the original task; then
+                                            // stay silent and keep waiting for completion.
+                                            if !still_running_notice_sent {
+                                                still_running_notice_sent = true;
+                                                let elapsed_secs =
+                                                    started_at_for_notify.elapsed().as_secs();
+                                                let stdout = String::from_utf8_lossy(
+                                                    &stdout_buf.lock().await,
+                                                )
+                                                .to_string();
+                                                let stderr = String::from_utf8_lossy(
+                                                    &stderr_buf.lock().await,
+                                                )
+                                                .to_string();
+                                                let output = truncate_with_note(
+                                                    &format_output(
+                                                        &stdout,
+                                                        &stderr,
+                                                        max_output_chars,
+                                                    ),
+                                                    2500,
+                                                );
+                                                let reengage_budget_ok = {
+                                                    let mut log =
+                                                        reengagements_for_notify.lock().await;
+                                                    reengagement_allowed(
+                                                        &mut log,
+                                                        &session_for_notify,
+                                                        Instant::now(),
+                                                    )
+                                                };
+                                                let mut delivered = false;
+                                                if !reengage_budget_ok {
+                                                    warn!(
+                                                        pid,
+                                                        session_id = %session_for_notify,
+                                                        command = %command_for_notify,
+                                                        "Still-running re-engagement budget exhausted; delivering fallback notice instead"
+                                                    );
+                                                } else if let Some(ref agent) = agent_for_notify {
+                                                    let followup = format!(
+                                                        "[Background command still running]\n\
+                                                         Command: `{}`\n\
+                                                         Running for: {}\n\
+                                                         Output so far:\n{}\n\n\
+                                                         This process shows no sign of exiting on its own — it is \
+                                                         likely a long-lived process such as a dev server or watcher. \
+                                                         It keeps running in the background (pid={}); use the terminal \
+                                                         tool with action=\"check\" or action=\"kill\" if needed, but \
+                                                         do NOT re-run the command and do NOT wait for it to finish. \
+                                                         This command was part of your previous task: check your \
+                                                         session history for the original user request, tell the user \
+                                                         the current status (for a server, include the URL/port it is \
+                                                         listening on), and complete any remaining steps of that task now.",
+                                                        command_summary,
+                                                        humanize_elapsed(elapsed_secs),
+                                                        output,
+                                                        pid
+                                                    );
+                                                    info!(
+                                                        pid,
+                                                        session_id = %session_for_notify,
+                                                        command = %command_for_notify,
+                                                        "Re-engaging agent loop for long-running background command"
+                                                    );
+                                                    match agent
+                                                        .handle_message(
+                                                            &session_for_notify,
+                                                            &followup,
+                                                            None,
+                                                            crate::types::UserRole::Owner,
+                                                            crate::types::ChannelContext::internal(),
+                                                            None,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(reply) if !reply.trim().is_empty() => {
+                                                            if let Some(ref hub) = hub_for_notify {
+                                                                match hub
+                                                                    .send_text(
+                                                                        &session_for_notify,
+                                                                        &reply,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    Ok(()) => delivered = true,
+                                                                    Err(e) => warn!(
+                                                                        pid,
+                                                                        error = %e,
+                                                                        "Failed to deliver agent still-running follow-up"
+                                                                    ),
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(_) => {}
+                                                        Err(e) => warn!(
+                                                            pid,
+                                                            error = %e,
+                                                            "Agent re-engagement failed for long-running background command"
+                                                        ),
+                                                    }
+                                                }
+                                                if !delivered {
+                                                    let mut combined = stdout;
+                                                    if !stderr.is_empty() {
+                                                        if !combined.is_empty() {
+                                                            combined.push('\n');
+                                                        }
+                                                        combined.push_str(&stderr);
+                                                    }
+                                                    let fallback = format!(
+                                                        "ℹ️ Still running after {} — this looks like a long-lived process (such as a dev server), so it may not finish on its own. It keeps running in the background; I'll send a final update if it stops. Latest output:\n{}",
+                                                        humanize_elapsed(elapsed_secs),
+                                                        summarize_progress_output(&combined)
+                                                    );
+                                                    let mut fallback_delivered = false;
+                                                    if let Some(ref hub) = hub_for_notify {
+                                                        match hub
+                                                            .send_text(
+                                                                &session_for_notify,
+                                                                &fallback,
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(()) => fallback_delivered = true,
+                                                            Err(e) => warn!(
+                                                                pid,
+                                                                error = %e,
+                                                                session_id = %session_for_notify,
+                                                                "Failed to deliver still-running fallback notice"
+                                                            ),
+                                                        }
+                                                    }
+                                                    if !fallback_delivered {
+                                                        if let Some(ref state) = state_for_notify {
+                                                            let entry =
+                                                                crate::traits::NotificationEntry::new(
+                                                                    &goal_id_for_notify,
+                                                                    &session_for_notify,
+                                                                    "progress",
+                                                                    &fallback,
+                                                                );
+                                                            if let Err(e) = state
+                                                                .enqueue_notification(&entry)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    pid,
+                                                                    error = %e,
+                                                                    session_id = %session_for_notify,
+                                                                    "Failed to enqueue still-running fallback notice"
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         } else {
 
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
@@ -3159,6 +3324,79 @@ mod tests {
             saw_completion,
             "completion notification should still arrive"
         );
+    }
+
+    /// A background command that never exits (dev server, watcher) must not
+    /// dead-end the conversation: once periodic pings are exhausted, the
+    /// notifier sends a one-time "still running" notice (via agent
+    /// re-engagement, or the queued fallback when no agent is wired) so the
+    /// user learns the process is long-lived instead of waiting forever for
+    /// a completion notification that never comes.
+    #[tokio::test]
+    async fn test_background_terminal_long_running_emits_still_running_notice() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        // Mimic a dev server: readiness output early, then alive without
+        // new output and without exiting.
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"echo server-ready; sleep 60","_session_id":"sess_server","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+        let pid: u32 = response
+            .split("pid=")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .and_then(|s| s.parse().ok())
+            .expect("pid in background ack");
+
+        let mut saw_still_running_notice = false;
+        for _ in 0..80 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_server"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("long-lived")
+            }) {
+                saw_still_running_notice = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            saw_still_running_notice,
+            "expected a one-time still-running notice after pings are exhausted"
+        );
+
+        // Clean up the fake server.
+        let _ = tool
+            .call(&format!(
+                r#"{{"action":"kill","pid":{},"_session_id":"sess_server","_user_role":"Owner"}}"#,
+                pid
+            ))
+            .await;
     }
 
     #[tokio::test]

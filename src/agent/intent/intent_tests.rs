@@ -605,6 +605,22 @@ fn test_detect_schedule_heuristic_ignores_background_command_completion() {
 }
 
 #[test]
+fn test_detect_schedule_heuristic_ignores_background_command_still_running() {
+    // Still-running notices carry server output that can include timestamps.
+    let detected = detect_schedule_heuristic(
+        "[Background command still running]\n\
+         Command: `cd ~/projects/app && npm run dev`\n\
+         Running for: 2m 20s\n\
+         Output so far:\n✓ Ready in 2.8s (Mar 16 13:22:51 2026)\n\
+         ⚠ Port 3000 is in use, trying 3001 instead.",
+    );
+    assert!(
+        detected.is_none(),
+        "Still-running background output with dates should not trigger schedule"
+    );
+}
+
+#[test]
 fn test_detect_schedule_heuristic_ignores_file_edit_with_dates() {
     // User asks to finish a file that mentions dates in its content scope.
     let detected = detect_schedule_heuristic(

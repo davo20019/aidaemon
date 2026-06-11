@@ -683,7 +683,9 @@ pub(super) fn classify_followup_mode(
 
     // Synthetic re-engagement messages from background command completions
     // must always be follow-ups so the original task context is preserved.
-    if trimmed.starts_with("[Background command completed]") {
+    if trimmed.starts_with("[Background command completed]")
+        || trimmed.starts_with("[Background command still running]")
+    {
         reasons.push(TurnContextReason::ExplicitFollowup);
         return (FollowupMode::Followup, reasons);
     }
@@ -807,6 +809,21 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[test]
+    fn synthetic_background_messages_classify_as_followup() {
+        for prefix in [
+            "[Background command completed]",
+            "[Background command still running]",
+        ] {
+            let msg = format!(
+                "{}\nCommand: `npm run dev`\nOutput so far:\n✓ Ready in 2.8s",
+                prefix
+            );
+            let (mode, reasons) = classify_followup_mode(&msg, None);
+            assert_eq!(mode, FollowupMode::Followup, "prefix: {}", prefix);
+            assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
+        }
+    }
     #[test]
     fn followup_detects_answer_to_clarifying_question() {
         let followup =
