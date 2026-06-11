@@ -39,21 +39,25 @@ fn infer_open_request_scope(text: &str) -> Option<ToolSemanticScope> {
         return None;
     }
 
-    if [
-        "scheduled goal",
-        "scheduled task",
-        "schedule",
-        "scheduled",
-        "scheduler",
-        "recurring",
-        "reminder",
-        "trigger",
-        "triggered",
-        "run history",
-        "goal status",
-    ]
-    .iter()
-    .any(|term| contains_keyword_as_words(&lower, term))
+    let is_scheduled_execution =
+        lower.contains("[system: already scheduled and firing now; do not reschedule.]");
+
+    if !is_scheduled_execution
+        && [
+            "scheduled goal",
+            "scheduled task",
+            "schedule",
+            "scheduled",
+            "scheduler",
+            "recurring",
+            "reminder",
+            "trigger",
+            "triggered",
+            "run history",
+            "goal status",
+        ]
+        .iter()
+        .any(|term| contains_keyword_as_words(&lower, term))
     {
         return Some(ToolSemanticScope::GoalState);
     }
@@ -787,6 +791,26 @@ mod tests {
                 .as_ref()
                 .and_then(|request| request.semantic_scope),
             Some(ToolSemanticScope::GoalState)
+        );
+    }
+
+    #[test]
+    fn scheduled_execution_instruction_does_not_use_goal_state_scope() {
+        let mut state = DialogueState::new("s1");
+        apply_user_message(
+            &mut state,
+            "u1",
+            "Scheduled check: Post daily optimized tweets for the aidaemon Twitter account \
+             [SYSTEM: already scheduled and firing now; do not reschedule.]",
+            &[],
+            Utc::now(),
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .and_then(|request| request.semantic_scope),
+            None
         );
     }
 

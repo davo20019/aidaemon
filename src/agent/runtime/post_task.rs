@@ -831,6 +831,12 @@ fn redact_error_line_for_summary(key_line: &str) -> String {
 /// This avoids the `tool_name(...)` format that `strip_tool_name_references`
 /// would replace with "that".  Output uses "Display Name — args" instead.
 pub(in crate::agent) fn display_tool_call(call: &str) -> String {
+    // Failed entries carry a " [FAILED]" suffix after the closing paren —
+    // strip it before parsing so it doesn't leak into the displayed args.
+    let (call, is_failed) = match call.strip_suffix(" [FAILED]") {
+        Some(stripped) => (stripped, true),
+        None => (call, false),
+    };
     let (name, args) = match call.find('(') {
         Some(idx) => {
             let n = &call[..idx];
@@ -859,11 +865,15 @@ pub(in crate::agent) fn display_tool_call(call: &str) -> String {
         "cli_agent" => "Delegated to agent",
         _ => name,
     };
-    if args.is_empty() {
+    let mut display = if args.is_empty() {
         display_name.to_string()
     } else {
         format!("{} — {}", display_name, args)
+    };
+    if is_failed {
+        display.push_str(" (failed)");
     }
+    display
 }
 
 ///
@@ -1007,6 +1017,30 @@ mod tests {
     fn test_categorize_tool_calls_empty() {
         let result = categorize_tool_calls(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_display_tool_call_strips_failed_suffix() {
+        // Failed entries carry a " [FAILED]" suffix appended after the closing
+        // paren — it must not leak into the displayed args as "...) [FAILED]".
+        assert_eq!(
+            display_tool_call("search_files(davidloor\\.com) [FAILED]"),
+            "Searched files — davidloor\\.com (failed)"
+        );
+        assert_eq!(
+            display_tool_call("terminal(cd '~/projects' && ls -R ~/projects/) [FAILED]"),
+            "Ran command — cd '~/projects' && ls -R ~/projects/ (failed)"
+        );
+        // No-args failed call still gets the marker.
+        assert_eq!(
+            display_tool_call("goal_trace() [FAILED]"),
+            "Checked goal history (failed)"
+        );
+        // Successful entries are unchanged.
+        assert_eq!(
+            display_tool_call("read_file(src/main.rs)"),
+            "Read file — src/main.rs"
+        );
     }
 
     #[test]

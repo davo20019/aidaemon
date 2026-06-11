@@ -1,7 +1,8 @@
 use crate::agent::policy_metrics_snapshot;
 use crate::testing::{
-    setup_full_stack_test_agent_with_extra_tools, setup_test_agent, setup_test_agent_with_models,
-    MockProvider,
+    setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
+    setup_test_agent_root_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
+    MockProvider, MockTool,
 };
 use crate::traits::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata,
@@ -1073,6 +1074,77 @@ async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_cal
             .iter()
             .all(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
         "expected no Required tool-choice for a non-tool-classified user text"
+    );
+}
+
+#[tokio::test]
+async fn failed_specialist_plan_reply_pivots_to_direct_tools() {
+    let incomplete_plan = "I've started breaking down your goal into specific tasks. I've created \
+a plan to first research the 2026 AI job market and then synthesize that into your personalized \
+morning briefing.\n\nI attempted to launch a research specialist, but the request timed out. I'm \
+monitoring the system and will retry the research task as soon as the connection is stable.\n\n\
+Current Plan:\n1. Research Phase: Deep dive into trends, roles, and skills.\n\
+2. Synthesis Phase: Organize findings into a morning briefing.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "spawn_agent",
+            r#"{"mission":"Research AI jobs","task":"Produce current findings"}"#,
+        ),
+        MockProvider::text_response(incomplete_plan),
+        MockProvider::text_response(incomplete_plan),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(
+            "Market Snapshot: applied AI engineering remains the strongest target. \
+Target Roles: GenAI engineer and AI product manager. Interview Edge: prepare concrete \
+examples of evaluation, deployment, and agent reliability work.",
+        ),
+    ]);
+    let spawn_tool: Arc<dyn Tool> = Arc::new(MockTool::new(
+        "spawn_agent",
+        "Mock failed specialist delegation",
+        "Error: specialist timed out after 300 seconds",
+    ));
+    let harness =
+        setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![spawn_tool], None)
+            .await
+            .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "failed_specialist_plan_pivot",
+            "Research the 2026 AI job market and produce my morning briefing.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        reply.contains("Market Snapshot:"),
+        "unexpected reply: {reply}"
+    );
+    assert!(!reply.contains("monitoring the system"));
+    assert!(
+        harness.provider.call_count().await >= 5,
+        "repeated incomplete plans should trigger another tool-backed iteration"
+    );
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls.iter().any(|call| {
+            call.messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("Specialist delegation failed")
+                            && content.contains("available direct tools")
+                    })
+            })
+        }),
+        "failed delegation should inject direct-tool recovery guidance"
     );
 }
 

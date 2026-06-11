@@ -1,6 +1,6 @@
 //! Task outcome derivation from completion evidence at the `emit_task_end` boundary.
 
-use super::completion_contract::CompletionProgress;
+use super::completion_contract::{CompletionContract, CompletionProgress};
 use super::execution_state::ExecutionState;
 use super::goal_dispatch::is_low_signal_task_lead_reply;
 use super::validation_state::ValidationState;
@@ -112,9 +112,9 @@ fn action_key(text: &str) -> String {
 /// Inputs for deriving semantic task outcome once per task end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskOutcomeDerivation {
-    pub response_produced: bool,
     pub response_has_user_value: bool,
     pub required_actions: RequestedActionSummary,
+    pub completion_contract_fulfilled: bool,
     pub has_unrecovered_model_error: bool,
     pub terminal_cause: Option<TaskTerminalCause>,
     /// True when this turn moved a long-running command to the background with a
@@ -127,17 +127,17 @@ impl TaskOutcomeDerivation {
         validation: &ValidationState,
         execution: &ExecutionState,
         completion: &CompletionProgress,
-        response_produced: bool,
+        contract: &CompletionContract,
         response_has_user_value: bool,
         has_unrecovered_model_error: bool,
         terminal_cause: Option<TaskTerminalCause>,
     ) -> Self {
         Self {
-            response_produced,
             response_has_user_value,
             required_actions: RequestedActionSummary::from_completion_state(
                 validation, execution, completion,
             ),
+            completion_contract_fulfilled: completion_contract_is_fulfilled(contract, completion),
             has_unrecovered_model_error,
             terminal_cause,
             deferred_to_background: execution.background_handoff_active,
@@ -157,14 +157,34 @@ impl TaskOutcomeDerivation {
         if self.terminal_cause.is_some() {
             return TaskOutcome::Failed;
         }
-        if !self.response_produced || !self.response_has_user_value {
+        if !self.response_has_user_value {
             return TaskOutcome::Failed;
         }
-        if self.required_actions.unresolved > 0 {
+        if self.required_actions.unresolved > 0 || !self.completion_contract_fulfilled {
             return TaskOutcome::Partial;
         }
         TaskOutcome::Succeeded
     }
+}
+
+fn completion_contract_is_fulfilled(
+    contract: &CompletionContract,
+    progress: &CompletionProgress,
+) -> bool {
+    if contract.requires_observation && progress.observation_count == 0 {
+        return false;
+    }
+    if contract.expects_mutation && progress.mutation_count == 0 {
+        return false;
+    }
+    let verification_required =
+        contract.explicit_verification_requested || contract.requires_reverification_after_mutation;
+    if verification_required
+        && (progress.verification_count == 0 || progress.verification_block_count > 2)
+    {
+        return false;
+    }
+    true
 }
 
 /// Whether accepted, sanitized assistant content has user-visible value.
@@ -279,13 +299,13 @@ mod tests {
 
     fn base_derivation() -> TaskOutcomeDerivation {
         TaskOutcomeDerivation {
-            response_produced: true,
             response_has_user_value: true,
             required_actions: RequestedActionSummary {
                 required: 0,
                 satisfied: 0,
                 unresolved: 0,
             },
+            completion_contract_fulfilled: true,
             has_unrecovered_model_error: false,
             terminal_cause: None,
             deferred_to_background: false,
@@ -307,6 +327,37 @@ mod tests {
             unresolved: 1,
         };
         assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn partial_when_completion_contract_is_unfulfilled() {
+        let mut d = base_derivation();
+        d.completion_contract_fulfilled = false;
+        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn expected_mutation_without_mutation_is_partial() {
+        let validation = ValidationState::default();
+        let execution = empty_execution_state();
+        let completion = CompletionProgress::default();
+        let contract = CompletionContract {
+            expects_mutation: true,
+            ..CompletionContract::default()
+        };
+
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &completion,
+            &contract,
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+
+        assert_eq!(outcome, TaskOutcome::Partial);
     }
 
     #[test]
@@ -386,7 +437,7 @@ mod tests {
             &validation,
             &execution,
             &CompletionProgress::default(),
-            true,
+            &CompletionContract::default(),
             true,
             false,
             None,
@@ -424,7 +475,7 @@ mod tests {
             &validation,
             &execution,
             &CompletionProgress::default(),
-            true,
+            &CompletionContract::default(),
             response_has_user_value("Here is what I found on the homepage.", 2),
             false,
             None,
@@ -609,7 +660,7 @@ mod tests {
             &validation,
             &execution,
             &completion,
-            true,
+            &CompletionContract::default(),
             response_has_user_value("Deployment complete.", 1),
             false,
             None,

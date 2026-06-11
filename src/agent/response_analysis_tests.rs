@@ -276,6 +276,32 @@ fn test_looks_like_deferred_action_response_detects_planning_text() {
 }
 
 #[test]
+fn detects_incomplete_retry_plan_despite_length() {
+    let response = "I've started breaking down your goal into specific tasks. I've created a plan \
+to first research the 2026 AI job market and then synthesize that into your personalized morning \
+briefing.\n\nI attempted to launch a research specialist to begin the first phase, but the request \
+timed out. I'm monitoring the system and will retry the research task as soon as the connection is \
+stable.\n\nCurrent Plan:\n1. Research Phase: Deep dive into trends, roles, and skills.\n\
+2. Synthesis Phase: Organize findings into a morning briefing.";
+    assert!(looks_like_incomplete_retry_plan(response));
+}
+
+#[test]
+fn completed_briefing_with_next_steps_is_not_an_incomplete_retry_plan() {
+    let response = "Market Snapshot: AI hiring is concentrating around applied engineering. \
+Target Roles: GenAI engineer and AI product manager. Interview Edge: prepare concrete evaluation \
+and deployment examples. Next steps: tailor these findings to your experience.";
+    assert!(!looks_like_incomplete_retry_plan(response));
+}
+
+#[test]
+fn queued_background_specialist_ack_is_not_an_incomplete_retry_plan() {
+    let response = "A research specialist is running in the background. The result will be \
+delivered through this session when it completes.";
+    assert!(!looks_like_incomplete_retry_plan(response));
+}
+
+#[test]
 fn test_has_action_promise() {
     // Action verbs
     assert!(has_action_promise("i'll create a script"));

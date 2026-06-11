@@ -816,7 +816,7 @@ pub(super) async fn run_completion_phase(
                     &validation_state,
                     execution_state,
                     ctx.completion_progress,
-                    true,
+                    &turn_context.completion_contract,
                     response_has_user_value(&fallback, total_successful_tool_calls),
                     has_unrecovered_errors,
                     None,
@@ -1276,6 +1276,7 @@ pub(super) async fn run_completion_phase(
         let reply_is_substantive =
             !has_structural_markers && is_substantive_text_response(&reply, 200);
         let incomplete_live_work_summary = looks_like_incomplete_live_work_summary(&reply);
+        let incomplete_retry_plan = looks_like_incomplete_retry_plan(&reply);
         // Fabricated-action guard: a reply that claims a completed side
         // effect ("I have deleted the folder") in a task that made ZERO
         // tool calls cannot be truthful when the completion contract
@@ -1292,10 +1293,12 @@ pub(super) async fn run_completion_phase(
             && !force_text_fast_path_accepted
             && (looks_like_deferred_action_response(&reply)
                 || incomplete_live_work_summary
+                || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation)
             && (!reply_is_substantive
                 || incomplete_live_work_summary
+                || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation)
             // Anti-fabrication triggers (claimed mutation/delegation with zero
@@ -1313,7 +1316,7 @@ pub(super) async fn run_completion_phase(
             // Exception: when force_text is active (tools stripped), a deferred
             // reply like "Let me examine..." is useless — the model can't act.
             // Replace it with an activity summary of what was actually done.
-            if has_tool_attempts && stall_count >= 1 {
+            if has_tool_attempts && stall_count >= 1 && !incomplete_retry_plan {
                 if force_text_response && !learning_ctx.tool_calls.is_empty() {
                     let mut recovered_tool_output = false;
                     let mut needs_synthesis_retry = false;
@@ -1538,7 +1541,7 @@ pub(super) async fn run_completion_phase(
                                 force_text_response = true;
                                 SystemDirective::ToolModeDisabledPlainText
                             }
-                        } else if incomplete_live_work_summary {
+                        } else if incomplete_live_work_summary || incomplete_retry_plan {
                             SystemDirective::LiveWorkPivotRequired
                         } else {
                             SystemDirective::DeferredProvideConcreteResults
@@ -1847,7 +1850,7 @@ pub(super) async fn run_completion_phase(
             &validation_state,
             execution_state,
             ctx.completion_progress,
-            true,
+            &turn_context.completion_contract,
             response_has_user_value(&reply, total_successful_tool_calls),
             has_unrecovered_errors,
             None,

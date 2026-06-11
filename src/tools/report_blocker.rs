@@ -9,7 +9,7 @@ use crate::agent::{
     build_needs_approval_request, persist_executor_result_context, ExecutorStepResult,
     PartialResult, StepValidationOutcome, TaskValidationOutcome,
 };
-use crate::traits::{StateStore, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{StateStore, Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
 
 /// Tool for executors to report they are blocked and cannot proceed.
 ///
@@ -124,6 +124,10 @@ impl Tool for ReportBlockerTool {
             idempotent: false,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        ToolCallSemantics::administrative()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -320,6 +324,19 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("\"executor_result\""));
+    }
+
+    #[tokio::test]
+    async fn report_blocker_has_administrative_semantics() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let tool = ReportBlockerTool::new(task_id, state);
+
+        let semantics = tool.call_semantics(r#"{"reason":"OAuth authorization required"}"#);
+
+        assert_eq!(
+            semantics.effect,
+            crate::traits::ToolCallEffect::Administrative
+        );
     }
 
     #[tokio::test]

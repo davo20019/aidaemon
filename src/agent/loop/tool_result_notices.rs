@@ -29,6 +29,7 @@ pub(in crate::agent) enum ToolResultNotice {
         cooldown_until: usize,
         cooldown_iters: usize,
     },
+    SpecialistFailurePivot,
     BrowserLaunchFallback,
     OffTargetFactStorageRequest,
     MissingGoalIdManageMemories,
@@ -197,6 +198,13 @@ Avoid retrying this tool until iteration {} (cooldown {} iterations). Use anothe
 Only report attempts that were actually executed; do not describe retries that were blocked or skipped.",
                 tool_name, cooldown_until, cooldown_iters
             ),
+            Self::SpecialistFailurePivot => {
+                "[SYSTEM] Specialist delegation failed. Do NOT retry the same delegation unchanged. \
+Continue the original request now with available direct tools. If completion is impossible, report \
+the concrete blocker and verified partial results. Do NOT claim you are monitoring the connection \
+or will retry later unless a real background task or retry was scheduled."
+                    .to_string()
+            }
             Self::BrowserLaunchFallback => {
                 "[SYSTEM] browser launch failed. Do NOT retry browser for this verification step. \
 Use another available approach now: `terminal` with curl/wrangler/HTTP status checks, \
@@ -505,6 +513,15 @@ mod tests {
         assert!(rendered.contains("Detected transient failure for `web_fetch`"));
         assert!(rendered.contains("until iteration 7"));
         assert!(rendered.contains("cooldown 2 iterations"));
+    }
+
+    #[test]
+    fn specialist_failure_pivot_requires_direct_completion_without_future_promises() {
+        let rendered = ToolResultNotice::SpecialistFailurePivot.render();
+        assert!(rendered.contains("direct tools"));
+        assert!(rendered.contains("Do NOT retry the same delegation"));
+        assert!(rendered.contains("Do NOT claim"));
+        assert!(rendered.contains("monitoring"));
     }
 
     #[test]

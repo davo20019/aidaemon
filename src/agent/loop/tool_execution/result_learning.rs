@@ -260,6 +260,9 @@ pub(super) async fn apply_result_learning(
             ),
             Some(ExecutionFailureKind::ToolInvocationFailure) | None => {}
         }
+        if tc.name == "spawn_agent" {
+            append_tool_result_notice(result_text, &ToolResultNotice::SpecialistFailurePivot);
+        }
         if matches!(failure_class, ToolFailureClass::Transient) {
             state.pending_error_solution_ids.clear();
             let transient_count = state

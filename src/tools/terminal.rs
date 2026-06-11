@@ -476,6 +476,32 @@ fn humanize_elapsed(secs: u64) -> String {
     }
 }
 
+/// Condense in-flight background output for a user-facing progress ping.
+/// Chatty commands (e.g. `ls -R`) accumulate thousands of lines; the chat
+/// ping only needs proof of life, so report a line count plus the most
+/// recent lines. The full output still reaches the agent on completion.
+fn summarize_progress_output(output: &str) -> String {
+    const MAX_PING_LINES: usize = 3;
+    const MAX_PING_LINE_CHARS: usize = 160;
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let total = lines.len();
+    let tail = lines
+        .iter()
+        .skip(total.saturating_sub(MAX_PING_LINES))
+        .map(|l| truncate_str(l, MAX_PING_LINE_CHARS))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if total > MAX_PING_LINES {
+        format!("{} lines of output so far. Latest:\n{}", total, tail)
+    } else {
+        tail
+    }
+}
+
 fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
     let mut result = String::new();
     if !stdout.is_empty() {
@@ -1580,10 +1606,17 @@ impl TerminalTool {
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
                                         let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
                                         let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
-                                        let latest_output = truncate_with_note(
-                                            &format_output(&stdout, &stderr, max_output_chars),
-                                            1000,
-                                        );
+                                        let mut combined = stdout;
+                                        if !stderr.is_empty() {
+                                            if !combined.is_empty() {
+                                                combined.push('\n');
+                                            }
+                                            combined.push_str(&stderr);
+                                        }
+                                        // Chat pings get a condensed view (line count + tail),
+                                        // never the raw output — the agent receives the full
+                                        // output via re-engagement on completion.
+                                        let latest_output = summarize_progress_output(&combined);
                                         // Internal progress signal (typing indicator + logs).
                                         // pid and the raw command belong here, not in the chat.
                                         if let Some(ref tx) = status_tx_for_notify {
@@ -1609,7 +1642,6 @@ impl TerminalTool {
                                         // pings are noise. pid and the raw command stay out of chat.
                                         let output_trimmed = latest_output.trim();
                                         let has_new_output = !output_trimmed.is_empty()
-                                            && output_trimmed != "(no output)"
                                             && last_pinged_output.as_deref() != Some(output_trimmed);
                                         if has_new_output {
                                             last_pinged_output = Some(output_trimmed.to_string());
@@ -2755,6 +2787,62 @@ mod tests {
         assert_eq!(humanize_elapsed(3599), "59m 59s");
         assert_eq!(humanize_elapsed(3600), "1h 0m");
         assert_eq!(humanize_elapsed(3725), "1h 2m");
+    }
+
+    #[test]
+    fn test_summarize_progress_output_short_passthrough() {
+        assert_eq!(
+            summarize_progress_output("working-update"),
+            "working-update"
+        );
+        assert_eq!(
+            summarize_progress_output("line one\nline two\nline three"),
+            "line one\nline two\nline three"
+        );
+        assert_eq!(summarize_progress_output(""), "");
+        assert_eq!(summarize_progress_output("  \n \n"), "");
+    }
+
+    #[test]
+    fn test_summarize_progress_output_long_shows_count_and_tail() {
+        // Chatty commands (ls -R) must not dump their full output into chat —
+        // the ping shows a line count plus the most recent lines only.
+        let output = (1..=500)
+            .map(|i| format!("file_{}.txt", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = summarize_progress_output(&output);
+        assert!(
+            summary.contains("500 lines of output so far"),
+            "summary should report total line count: {}",
+            summary
+        );
+        assert!(
+            summary.contains("file_500.txt"),
+            "summary should include the latest line: {}",
+            summary
+        );
+        assert!(
+            !summary.contains("file_1.txt\n"),
+            "summary must not include early output lines: {}",
+            summary
+        );
+        assert!(
+            summary.lines().count() <= 4,
+            "summary should be at most a header plus 3 tail lines: {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_summarize_progress_output_truncates_long_lines() {
+        let long_line = "x".repeat(5000);
+        let summary = summarize_progress_output(&long_line);
+        assert!(
+            summary.chars().count() <= 200,
+            "individual lines must be capped: {} chars",
+            summary.chars().count()
+        );
     }
 
     #[test]

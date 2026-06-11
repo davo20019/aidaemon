@@ -1,3 +1,4 @@
+use super::contains_keyword_as_words;
 use crate::llm_markers::INTENT_GATE_MARKER;
 
 #[cfg(test)]
@@ -71,6 +72,44 @@ pub(super) fn looks_like_deferred_action_response(text: &str) -> bool {
         || lower.contains(&INTENT_GATE_MARKER.to_ascii_lowercase())
         || lower.contains("[tool_use:")
         || lower.contains("[tool_call:")
+}
+
+/// Detect a long status/plan response that reports a failed attempt and promises
+/// unsupported future recovery instead of delivering the requested result.
+pub(super) fn looks_like_incomplete_retry_plan(text: &str) -> bool {
+    let normalized = text
+        .replace(['\u{2018}', '\u{2019}', '`', '\u{02BC}'], "'")
+        .trim()
+        .to_ascii_lowercase();
+
+    let has_failure = [
+        "timed out",
+        "timeout",
+        "failed",
+        "couldn't complete",
+        "could not complete",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(&normalized, phrase));
+    let has_unsupported_future = [
+        "will retry",
+        "i'll retry",
+        "monitoring the system",
+        "when the connection is stable",
+        "as soon as the connection",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(&normalized, phrase));
+    let has_plan_scaffold = [
+        "current plan",
+        "research phase",
+        "synthesis phase",
+        "next phase",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(&normalized, phrase));
+
+    has_failure && has_unsupported_future && has_plan_scaffold
 }
 
 /// Detect a reply that punts file access back to the user ("please upload

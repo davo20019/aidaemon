@@ -787,7 +787,7 @@ impl SpawnAgentTool {
                     Ok(response)
                 }
             }
-            Ok(Err(e)) => Ok(format!("Sub-agent error: {}", e)),
+            Ok(Err(e)) => Ok(format!("Error: specialist failed: {}", e)),
             Err(_) => {
                 if child_role == Some(AgentRole::Executor) {
                     if let Some(task_id) = task_id {
@@ -797,7 +797,7 @@ impl SpawnAgentTool {
                     }
                 }
                 Ok(format!(
-                    "Sub-agent timed out after {} seconds",
+                    "Error: specialist timed out after {} seconds",
                     self.timeout_secs
                 ))
             }

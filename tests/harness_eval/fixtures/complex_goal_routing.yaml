@@ -7,5 +7,9 @@ mock_responses:
   - text: I'll break this into steps and start with inspection.
 expect:
   llm_calls_min: 1
-  outcome: succeeded
+  # Contract-aware outcome derivation: the scripted run announces a plan but
+  # performs no mutations/observations against a change+deploy request, so
+  # the honest outcome is partial. This fixture verifies routing, not
+  # completion semantics.
+  outcome: partial
   overall_min: 0.4

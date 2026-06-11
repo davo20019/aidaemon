@@ -638,6 +638,12 @@ pub(super) fn classify_tool_result_failure_with_context(
             // so file-path errors, "Path is a directory", etc. get proper
             // semantic classification instead of triggering cooldowns.
         }
+        if meta.background_started {
+            // A command moved to background tracking sets timed_out alongside
+            // background_started, but the handoff is not a failure — the
+            // command is still running and its completion is delivered later.
+            return None;
+        }
         if meta.timed_out {
             return Some(ToolFailureClass::Transient);
         }
@@ -939,6 +945,20 @@ mod tool_error_detection_tests {
         let result = "Error: request timed out while connecting to api";
         let classified = classify_tool_result_failure("http_request", result);
         assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn detects_spawn_agent_timeout_as_transient_error() {
+        let result = "Error: specialist timed out after 300 seconds";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn detects_spawn_agent_child_error_as_semantic_error() {
+        let result = "Error: specialist failed: invalid research request";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 
     #[test]
@@ -1249,6 +1269,41 @@ mod tool_error_detection_tests {
             false,
         );
         assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
+    }
+
+    #[test]
+    fn background_handoff_is_not_classified_as_failure() {
+        // A command moved to background sets timed_out=true alongside
+        // background_started=true. The handoff is not a failure — the command
+        // is still running and may well succeed.
+        let metadata = crate::traits::ToolCallMetadata {
+            background_started: true,
+            timed_out: true,
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "terminal",
+            "Command still running after 30s. Moved to background (pid=5822).\n\
+             IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.",
+            None,
+            Some(&metadata),
+        );
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn plain_timeout_without_background_is_still_transient() {
+        let metadata = crate::traits::ToolCallMetadata {
+            timed_out: true,
+            ..Default::default()
+        };
+        let classified = classify_tool_result_failure_with_context(
+            "web_fetch",
+            "request timed out",
+            None,
+            Some(&metadata),
+        );
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
     }
 
     #[test]
