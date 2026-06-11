@@ -139,16 +139,22 @@ impl ApprovalState {
             session_id,
             summary,
             RiskLevel::Critical,
-            vec!["This action may send, delete, purchase, or publish.".to_string()],
+            vec![
+                "This action may send, delete, purchase, or publish.".to_string(),
+                "Persistent allow is not available here — any approval applies to this action \
+                 only."
+                    .to_string(),
+            ],
             Some(task_id),
         )
         .await?;
         match response {
-            ApprovalResponse::AllowOnce => Ok(()),
-            ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways => Err(
-                "Persistent allow is not supported for consequential computer_use actions"
-                    .to_string(),
-            ),
+            // The user said yes — a session/always response is still consent for
+            // this action. Persistent grants are intentionally never stored for
+            // consequential actions, so all allows degrade to one-time.
+            ApprovalResponse::AllowOnce
+            | ApprovalResponse::AllowSession
+            | ApprovalResponse::AllowAlways => Ok(()),
             ApprovalResponse::Deny => {
                 Err("consequential computer_use action denied by user".to_string())
             }

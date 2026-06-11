@@ -325,7 +325,7 @@ impl ComputerUseTool {
 
         match action {
             ComputerActionKind::GetAppState => {
-                let app = required_str(args, "app")?;
+                let app = required_app(args)?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
@@ -348,7 +348,7 @@ impl ComputerUseTool {
                 // also attaching it to the tool result for the model. Unlike
                 // get_app_state this returns no tree — the model just wanted a
                 // picture.
-                let app = required_str(args, "app")?;
+                let app = required_app(args)?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
@@ -382,8 +382,10 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::ActivateApp => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                // Optional: activation has no element target, and it is often
+                // the first action on an app — before any get_app_state.
+                let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
@@ -404,8 +406,8 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::Click => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                let generation = required_generation(args)?;
                 let element_index = optional_u32(args, "element_index");
                 let x = optional_f64(args, "x");
                 let y = optional_f64(args, "y");
@@ -445,8 +447,8 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::TypeText => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                let generation = required_generation(args)?;
                 let text = required_str(args, "text")?;
                 let resolved = self.resolve_app(&app).await?;
                 let class = classify_target(action, None, Some(&text));
@@ -472,8 +474,8 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::PressKey => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                let generation = required_generation(args)?;
                 let key = required_str(args, "key")?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
@@ -495,8 +497,8 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::Scroll => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                let generation = required_generation(args)?;
                 let element_index = required_u32(args, "element_index")?;
                 let direction = required_str(args, "direction")?;
                 let pages = args.get("pages").and_then(|v| v.as_f64()).unwrap_or(1.0);
@@ -537,8 +539,8 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::SetValue => {
-                let app = required_str(args, "app")?;
-                let generation = required_u64(args, "snapshot_generation")?;
+                let app = required_app(args)?;
+                let generation = required_generation(args)?;
                 let element_index = required_u32(args, "element_index")?;
                 let value = required_str(args, "value")?;
                 let resolved = self.resolve_app(&app).await?;
@@ -615,6 +617,30 @@ fn required_str(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Missing required parameter: {key}"))
 }
 
+// Small models recover from validation errors far more reliably when the
+// message states the literal next step instead of just naming the gap.
+fn required_app(args: &Value) -> Result<String, String> {
+    args.get("app")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "Missing required parameter: app — repeat the same call with app set to the \
+             application you are controlling (use the name from your last get_app_state or \
+             list_apps result)"
+                .to_string()
+        })
+}
+
+fn required_generation(args: &Value) -> Result<u64, String> {
+    args.get("snapshot_generation")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            "Missing required parameter: snapshot_generation — call get_app_state for this app \
+             and copy the snapshot_generation value from its result into this call"
+                .to_string()
+        })
+}
+
 fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
     args.get(key)
         .and_then(|v| v.as_u64())
@@ -669,7 +695,9 @@ impl Tool for ComputerUseTool {
     fn description(&self) -> &str {
         "Inspect and control native macOS applications via accessibility trees and screenshots. \
          Call get_app_state before mutating actions; copy the exact snapshot_generation from the \
-         most recent result into every mutation (do not increment or guess it)."
+         most recent result into every mutation (do not increment or guess it). After your final \
+         mutating action, call get_app_state and confirm the visible state matches the goal \
+         before reporting success."
     }
 
     fn schema(&self) -> Value {
@@ -696,11 +724,11 @@ impl Tool for ComputerUseTool {
                     },
                     "app": {
                         "type": "string",
-                        "description": "Application name or bundle id"
+                        "description": "Application name or bundle id. Required for every action except list_apps."
                     },
                     "snapshot_generation": {
                         "type": "integer",
-                        "description": "Generation from the latest get_app_state for this app"
+                        "description": "Generation from the latest get_app_state for this app. Required for mutating actions; optional for activate_app (activation may be your first action on an app)."
                     },
                     "element_index": {
                         "type": "integer",

@@ -95,13 +95,15 @@ impl ComputerHarness for MockHarness {
     async fn activate_app(
         &self,
         app: &str,
-        generation: u64,
+        generation: Option<u64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
         let key = snapshot_key(app, ctx)?;
-        cache.validate_generation(&key, generation)?;
-        let mut snap = self.calculator_snapshot(generation);
+        if let Some(generation) = generation {
+            cache.validate_generation(&key, generation)?;
+        }
+        let mut snap = self.calculator_snapshot(generation.unwrap_or(0));
         snap.window_title = "Calculator (active)".to_string();
         Ok(cache.store(key, snap))
     }

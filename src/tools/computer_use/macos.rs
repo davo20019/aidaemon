@@ -106,13 +106,15 @@ impl ComputerHarness for MacOsHarness {
     async fn activate_app(
         &self,
         app: &str,
-        generation: u64,
+        generation: Option<u64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        cache.validate_generation(&key, generation)?;
+        if let Some(generation) = generation {
+            cache.validate_generation(&key, generation)?;
+        }
         activate_app(&resolved)?;
         capture_app(resolved, &self.config, cache, ctx)
     }

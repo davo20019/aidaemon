@@ -22,10 +22,13 @@ pub trait ComputerHarness: Send + Sync {
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String>;
 
+    /// `generation` is optional: activation has no element target, so a stale
+    /// snapshot can't misdirect it, and activating is often the first action on
+    /// an app (before any get_app_state). When present it is still validated.
     async fn activate_app(
         &self,
         app: &str,
-        generation: u64,
+        generation: Option<u64>,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String>;

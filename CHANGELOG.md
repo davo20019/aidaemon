@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **db_probe event time windows**: harness-eval, telemetry reconciliation, and task-outcome queries use RFC3339 cutoffs instead of SQLite `datetime()` space-format strings, which silently degraded same-day filters to calendar-day granularity. Token-only reconciliation rows now split by session and whether the `llm_call` event is missing vs. present with `token_usage_present=false`.
 - **DuckDuckGo redirect unwrapping**: DDG lite tracking redirects are decoded to real destination URLs so `web_fetch` and the model get usable links instead of protocol-relative `/l/?uddg=…` wrappers.
 - **DuckDuckGo bot-challenge detection**: empty or blocked DDG responses (anomaly modal / bot wall) fail clearly instead of returning misleading "no results".
+- **computer_use consequential approvals**: "Allow Always" / "Allow Session" on a consequential action now proceeds as a one-time allow instead of erroring — persistent grants are still never stored for consequential GUI actions.
+- **computer_use `activate_app` without snapshot**: `snapshot_generation` is optional for `activate_app` (often the first action on an app, before any `get_app_state`); mutating actions still require it with instructional errors when missing.
 
 ## [0.11.2] - 2026-06-10
 
