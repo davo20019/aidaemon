@@ -57,6 +57,20 @@ impl StallTracker {
         }
     }
 
+    /// Fresh runway for an approach pivot: the stall evidence belongs to the
+    /// failed approach and must not immediately re-trigger the stall exit on
+    /// the new one. Clears counters and call-pattern windows; the failure
+    /// itself stays referenced in the pivot directive and in history.
+    pub(in crate::agent) fn reset_for_pivot(&mut self) {
+        self.stall_count = 0;
+        self.consecutive_same_tool = (String::new(), 0);
+        self.consecutive_same_tool_arg_hashes.clear();
+        self.recent_tool_calls.clear();
+        self.recent_tool_names.clear();
+        self.consecutive_clean_iterations = 0;
+        self.last_escalation_iteration = None;
+    }
+
     pub(in crate::agent) fn for_llm_phase(&mut self) -> LlmStallState<'_> {
         LlmStallState {
             stall_count: &mut self.stall_count,

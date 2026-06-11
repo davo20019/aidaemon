@@ -14,6 +14,11 @@ pub(super) enum StoppingPhaseOutcome {
     ContinueLoop,
     Return(anyhow::Result<String>),
     Proceed,
+    /// Stall with a failing approach and pivots remaining: continue the
+    /// loop with a new approach, carrying this record of what failed.
+    PivotApproach {
+        failure_record: String,
+    },
 }
 
 pub(super) struct StoppingPhaseCtx<'a> {
@@ -32,6 +37,7 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub budget_extensions_count: &'a mut usize,
     pub user_role: UserRole,
     pub evidence_gain_count: usize,
+    pub approach_pivots_used: usize,
     pub stall_count: usize,
     pub deferred_no_tool_streak: usize,
     pub consecutive_same_tool: &'a (String, usize),
@@ -104,6 +110,7 @@ pub(super) async fn run_stopping_phase(
     let user_role = ctx.user_role;
     let evidence_gain_count = ctx.evidence_gain_count;
     let stall_count = ctx.stall_count;
+    let approach_pivots_used = ctx.approach_pivots_used;
     let deferred_no_tool_streak = ctx.deferred_no_tool_streak;
     let consecutive_same_tool = ctx.consecutive_same_tool;
     let consecutive_same_tool_arg_hashes = ctx.consecutive_same_tool_arg_hashes;
@@ -1528,6 +1535,51 @@ pub(super) async fn run_stopping_phase(
             .iter()
             .filter(|(_, recovered)| !recovered)
             .count();
+
+        // Approach pivot: a stall while the approach is demonstrably failing
+        // (unrecovered errors, or nothing succeeded at all) does not end the
+        // task while pivots remain. The loop continues with a deterministic
+        // record of what failed and an instruction to try a different method.
+        if crate::agent::approach_pivot::should_pivot_approach(
+            approach_pivots_used,
+            learning_ctx.tool_calls.len(),
+            unrecovered_errors,
+            total_successful_tool_calls,
+        ) {
+            let failure_record = crate::agent::approach_pivot::build_failure_record(
+                approach_pivots_used + 1,
+                &learning_ctx.tool_calls,
+                &learning_ctx.errors,
+                completion_progress.mutation_count,
+            );
+            warn!(
+                session_id,
+                iteration,
+                stall_count = detected_stall_count,
+                unrecovered_errors,
+                pivots_used = approach_pivots_used,
+                "Stall with failing approach: pivoting to a new approach instead of ending the task"
+            );
+            agent
+                .emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::StoppingCondition,
+                    "Approach pivot: retrying with a different approach".to_string(),
+                    json!({
+                        "condition": "approach_pivot",
+                        "attempt": approach_pivots_used + 1,
+                        "stall_count": detected_stall_count,
+                        "unrecovered_errors": unrecovered_errors,
+                        "total_successful_tool_calls": total_successful_tool_calls,
+                    }),
+                )
+                .await;
+            commit_state!();
+            return Ok(StoppingPhaseOutcome::PivotApproach { failure_record });
+        }
+
         let meaningful_progress = (total_successful_tool_calls >= 5 || evidence_gain_count >= 3)
             && total_successful_tool_calls > unrecovered_errors;
         if meaningful_progress {

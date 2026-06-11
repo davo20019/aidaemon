@@ -148,6 +148,8 @@ pub(in crate::agent) use execution_state::{
     ApprovalRequirement, ExecutionBudgetLimit, ExecutionPersistence, ExecutionState,
     StepExecutionOutcome,
 };
+#[path = "loop/approach_pivot.rs"]
+mod approach_pivot;
 #[path = "policy/heuristic_telemetry.rs"]
 pub(crate) mod heuristic_telemetry;
 #[path = "loop/loop_utils.rs"]

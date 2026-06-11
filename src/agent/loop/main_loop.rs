@@ -304,6 +304,7 @@ impl Agent {
         let task_start = Instant::now();
         let mut last_progress_summary = Instant::now();
         const MAX_FORCE_TEXT_ITERATIONS: usize = 3;
+        let mut approach_pivots_used: usize = 0;
         const MAX_BUDGET_EXTENSIONS: usize = 3;
         const HARD_TOKEN_CAP: i64 = 2_000_000;
         const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 12;
@@ -922,6 +923,7 @@ impl Agent {
                     budget_extensions_count: stopping_budget.budget_extensions_count,
                     user_role,
                     evidence_gain_count: stopping_evidence.evidence_gain_count,
+                    approach_pivots_used,
                     stall_count: stopping_stall.stall_count,
                     deferred_no_tool_streak: stopping_counters.deferred_no_tool_streak,
                     consecutive_same_tool: stopping_stall.consecutive_same_tool,
@@ -961,6 +963,26 @@ impl Agent {
             match stopping_outcome {
                 StoppingPhaseOutcome::ContinueLoop => continue,
                 StoppingPhaseOutcome::Return(result) => return result,
+                StoppingPhaseOutcome::PivotApproach { failure_record } => {
+                    approach_pivots_used += 1;
+                    // Fresh runway: the stall evidence belongs to the failed
+                    // approach. The failure stays referenced in the directive
+                    // and verbatim in history — nothing is discarded.
+                    turn_state.stall.reset_for_pivot();
+                    turn_state.directives.push_system_message(
+                        SystemDirective::ApproachPivotRequired {
+                            attempt: approach_pivots_used,
+                            failure_record,
+                        },
+                    );
+                    crate::agent::heuristic_telemetry::global().record(
+                        "approach_pivot",
+                        &model,
+                        self.trust_tier_for_model(&model),
+                        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
+                    );
+                    continue;
+                }
                 StoppingPhaseOutcome::Proceed => {}
             }
 

@@ -15,6 +15,10 @@ pub(in crate::agent) enum SystemDirective {
         truncated_tail: String,
     },
     ToolModeDisabledPlainText,
+    ApproachPivotRequired {
+        attempt: usize,
+        failure_record: String,
+    },
     TaskTokenBudgetWarning {
         used: u64,
         budget: u64,
@@ -211,6 +215,18 @@ impl SystemDirective {
                 truncated_tail
             ),
             Self::ToolModeDisabledPlainText => "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. Do NOT emit tool calls.".to_string(),
+            Self::ApproachPivotRequired {
+                attempt,
+                failure_record,
+            } => format!(
+                "[SYSTEM] Your current approach is not working — do NOT retry it. \
+                 This is approach pivot #{} of this task.\n\n{}\n\
+                 Choose a FUNDAMENTALLY different method to accomplish the user's \
+                 original request: different tools, a different strategy, or a \
+                 different order of operations. Account for the state-changing \
+                 actions already performed — verify before re-doing anything.",
+                attempt, failure_record
+            ),
             Self::TaskTokenBudgetWarning {
                 used,
                 budget,

@@ -404,7 +404,18 @@ async fn test_reflection_full_flow_does_not_verify_stale_signature_after_drift()
             "http_request",
             r#"{"mode":"ok","method":"GET","url":"https://api.example.com/fixed"}"#,
         ),
-        MockProvider::text_response("Finished without verifying a stale reflection."),
+        // The approach-pivot may add post-stall iterations before the task
+        // settles, so the closing text is scripted several times — whichever
+        // tail call ends the task lands on the same sentinel.
+        MockProvider::text_response(
+            "Finished without verifying a stale reflection after the endpoint drifted away.",
+        ),
+        MockProvider::text_response(
+            "Finished without verifying a stale reflection after the endpoint drifted away.",
+        ),
+        MockProvider::text_response(
+            "Finished without verifying a stale reflection after the endpoint drifted away.",
+        ),
     ]);
 
     let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
@@ -428,13 +439,16 @@ async fn test_reflection_full_flow_does_not_verify_stale_signature_after_drift()
         .await
         .unwrap();
 
-    assert_eq!(response, "Finished without verifying a stale reflection.");
+    assert!(
+        response.contains("without verifying a stale reflection"),
+        "got: {response:?}"
+    );
 
     let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(
-        call_log.len(),
-        9,
-        "expected two reflection calls in the real loop"
+    assert!(
+        call_log.len() >= 9,
+        "expected the full retry/reflection flow to run; got {} calls",
+        call_log.len()
     );
     assert!(
         call_log[2].tools.is_empty() && call_log[5].tools.is_empty(),
@@ -2357,6 +2371,95 @@ impl crate::traits::Tool for SlowReadTool {
             high_impact_write: false,
         }
     }
+}
+
+/// Probe tool that fails its first N calls, then succeeds — used to prove
+/// the approach-pivot gives a stalled task fresh runway to recover.
+struct FlakyProbeTool {
+    calls: Arc<AtomicUsize>,
+    successes: Arc<AtomicUsize>,
+    fail_first: usize,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for FlakyProbeTool {
+    fn name(&self) -> &str {
+        "flaky_probe"
+    }
+    fn description(&self) -> &str {
+        "Flaky probe"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "flaky_probe",
+            "description": "Flaky probe",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })
+    }
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if n <= self.fail_first {
+            anyhow::bail!("Error: probe endpoint unreachable (attempt {n})");
+        }
+        self.successes.fetch_add(1, Ordering::SeqCst);
+        Ok("probe data recovered".to_string())
+    }
+}
+
+/// Persistence: a stalled task with a failing approach pivots (failure
+/// record + fresh stall runway) and keeps trying instead of ending at the
+/// first stall. The probe fails 4 times — beyond the repetition-guard
+/// block — and succeeds only because the pivot cleared the pattern window.
+#[tokio::test]
+async fn test_stalled_failing_approach_pivots_and_recovers() {
+    // The mock model stubbornly retries the same call — the worst case the
+    // pivot machinery has to rescue. 30 scripted identical calls >> any
+    // path to success; the task must end via recovery, not script luck.
+    let responses: Vec<_> = (0..30)
+        .map(|_| MockProvider::tool_call_response("flaky_probe", "{}"))
+        .collect();
+    let provider = MockProvider::with_responses(responses);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let successes = Arc::new(AtomicUsize::new(0));
+    let tool = Arc::new(FlakyProbeTool {
+        calls: calls.clone(),
+        successes: successes.clone(),
+        fail_first: 4,
+    });
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "pivot_recovery_session",
+            "probe the flaky endpoint and get the data",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        successes.load(Ordering::SeqCst) >= 1,
+        "the task must persist past the failing approach to a successful call; \
+         calls={} response={response:?}",
+        calls.load(Ordering::SeqCst)
+    );
+    let pivots = crate::agent::heuristic_telemetry::global()
+        .stats_for("approach_pivot", "mock-model")
+        .enforced;
+    assert!(
+        pivots >= 1,
+        "expected at least one approach pivot to be recorded; response={response:?}"
+    );
 }
 
 /// A batch of 2+ distinct read-only tool calls in one assistant message
