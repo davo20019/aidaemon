@@ -109,7 +109,7 @@ fn run_click(app: &str, index: u32) {
             .await
             .expect("get_app_state");
         let generation = snapshot.generation;
-        let (after, _) = harness
+        let (after, _, _) = harness
             .click(app, generation, Some(index), None, None, &ctx, &mut cache)
             .await
             .expect("click");
