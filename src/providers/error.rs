@@ -277,6 +277,10 @@ fn parse_affordable_from_text(text: &str) -> Option<u32> {
 /// Multi-word `.contains()` matching is intentional here (see CLAUDE.md
 /// keyword-matching exceptions): each phrase is specific enough to avoid
 /// false positives on task-semantic failures.
+///
+/// `BadRequest` and `MalformedResponse` are deliberately excluded: they can
+/// indicate persistent prompt/schema bugs rather than transient outages, so
+/// retrying them blindly would loop.
 #[allow(dead_code)]
 const PROVIDER_INFRA_ERROR_MARKERS: &[&str] = &[
     "fallback recovery did not succeed",
@@ -290,6 +294,7 @@ const PROVIDER_INFRA_ERROR_MARKERS: &[&str] = &[
     "rate limited. retrying",
     "llm provider is experiencing issues",
     "cannot reach llm provider",
+    "falling back to previous model",
 ];
 
 /// True when an error string describes a transient/provider-infrastructure
@@ -400,6 +405,9 @@ mod tests {
         ));
         assert!(is_provider_infra_error_text(
             "LLM API billing error — your account quota may be exhausted."
+        ));
+        assert!(is_provider_infra_error_text(
+            "Model not found. Falling back to previous model."
         ));
     }
 
