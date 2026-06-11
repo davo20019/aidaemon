@@ -184,6 +184,51 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         &mut pending_reflection_recoveries,
         iteration,
     );
+    // Concurrent prefetch for provably-safe read-only batches: overlaps the
+    // I/O latency of e.g. several web fetches. The sequential loop below
+    // keeps full ownership of guards/budgets and consumes a prefetched
+    // result only when its computed effective arguments match exactly.
+    let mut prefetched_io = if !restrict_untrusted_external_reference_tools
+        && super::parallel_prefetch::batch_is_prefetch_eligible(
+            &resp.tool_calls,
+            available_capabilities,
+            &unknown_tools,
+            &tool_cooldown_until_iteration,
+            iteration,
+        ) {
+        info!(
+            session_id,
+            iteration,
+            batch_size = resp.tool_calls.len(),
+            "Prefetching read-only tool batch concurrently"
+        );
+        let prefetch_project_scope = (!turn_context.allow_multi_project_scope)
+            .then_some(turn_context.primary_project_scope.as_deref())
+            .flatten();
+        super::parallel_prefetch::prefetch_read_only_batch(
+            agent,
+            &resp.tool_calls,
+            &super::parallel_prefetch::PrefetchCtx {
+                model,
+                idempotency_key: execution_state
+                    .current_step
+                    .as_ref()
+                    .and_then(|step| step.idempotency_key.as_deref()),
+                project_scope: prefetch_project_scope,
+                session_id,
+                task_id,
+                status_tx: &status_tx,
+                channel_ctx,
+                user_role,
+                heartbeat,
+                emitter,
+                policy_bundle,
+            },
+        )
+        .await
+    } else {
+        HashMap::new()
+    };
     for tc in &resp.tool_calls {
         if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
         {
@@ -961,29 +1006,57 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             evidence_state.clear_file_read_evidence();
         }
 
-        let io = super::execution_io::execute_tool_call_io(
-            agent,
-            tc,
-            &ToolExecutionIoCtx {
-                effective_arguments: &effective_arguments,
-                model,
-                idempotency_key: execution_state
-                    .current_step
-                    .as_ref()
-                    .and_then(|step| step.idempotency_key.as_deref()),
-                injected_project_dir: injected_project_dir.as_deref(),
-                project_scope: allowed_project_scope,
-                session_id,
-                task_id,
-                status_tx: &status_tx,
-                channel_ctx,
-                user_role,
-                heartbeat,
-                emitter,
-                policy_bundle,
-            },
-        )
-        .await;
+        let prefetched = match prefetched_io.remove(&tc.id) {
+            Some(entry) if entry.arguments == effective_arguments => Some(entry.io),
+            Some(_) => {
+                // The loop's argument pipeline (e.g. project-dir injection)
+                // diverged from the raw arguments the prefetch used —
+                // discard the spare read-only result and execute live.
+                warn!(
+                    session_id,
+                    tool = %tc.name,
+                    "Discarding prefetched result: effective arguments diverged"
+                );
+                None
+            }
+            None => None,
+        };
+        let io = match prefetched {
+            Some(io) => {
+                info!(
+                    session_id,
+                    tool = %tc.name,
+                    duration_ms = io.tool_duration_ms,
+                    "Using concurrently prefetched tool result"
+                );
+                io
+            }
+            None => {
+                super::execution_io::execute_tool_call_io(
+                    agent,
+                    tc,
+                    &ToolExecutionIoCtx {
+                        effective_arguments: &effective_arguments,
+                        model,
+                        idempotency_key: execution_state
+                            .current_step
+                            .as_ref()
+                            .and_then(|step| step.idempotency_key.as_deref()),
+                        injected_project_dir: injected_project_dir.as_deref(),
+                        project_scope: allowed_project_scope,
+                        session_id,
+                        task_id,
+                        status_tx: &status_tx,
+                        channel_ctx,
+                        user_role,
+                        heartbeat,
+                        emitter,
+                        policy_bundle,
+                    },
+                )
+                .await
+            }
+        };
         execution_state.record_tool_call();
         execution_state.mark_persisted_now();
         let mut result_text = io.result_text;

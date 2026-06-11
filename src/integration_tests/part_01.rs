@@ -2314,6 +2314,98 @@ async fn test_evidence_gate_blocks_blind_edit_on_guided_tier() {
     );
 }
 
+/// Read-only probe tool with a fixed delay, recording each call's
+/// execution window so tests can assert overlap (parallelism).
+struct SlowReadTool {
+    windows: Arc<std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SlowReadTool {
+    fn name(&self) -> &str {
+        "slow_read"
+    }
+    fn description(&self) -> &str {
+        "Slow read-only probe"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "slow_read",
+            "description": "Slow read-only probe",
+            "parameters": {
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "additionalProperties": false
+            }
+        })
+    }
+    async fn call(&self, _args: &str) -> anyhow::Result<String> {
+        let start = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        self.windows
+            .lock()
+            .unwrap()
+            .push((start, std::time::Instant::now()));
+        Ok("slow data".to_string())
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
+/// A batch of 2+ distinct read-only tool calls in one assistant message
+/// executes concurrently (prefetch), not back-to-back: the two 150ms call
+/// windows must overlap.
+#[tokio::test]
+async fn test_read_only_tool_batch_executes_concurrently() {
+    let mut batch = MockProvider::tool_call_response("slow_read", r#"{"q":"alpha"}"#);
+    batch.tool_calls.push(crate::traits::ToolCall {
+        id: "call_slow_beta".to_string(),
+        name: "slow_read".to_string(),
+        arguments: r#"{"q":"beta"}"#.to_string(),
+        extra_content: None,
+    });
+    let provider = MockProvider::with_responses(vec![
+        batch,
+        MockProvider::text_response("Both reads done."),
+    ]);
+
+    let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool = Arc::new(SlowReadTool {
+        windows: windows.clone(),
+    });
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_message(
+            "parallel_batch_session",
+            "fetch alpha and beta",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let windows = windows.lock().unwrap();
+    assert_eq!(windows.len(), 2, "both batch calls must execute");
+    let latest_start = windows.iter().map(|w| w.0).max().unwrap();
+    let earliest_end = windows.iter().map(|w| w.1).min().unwrap();
+    assert!(
+        latest_start < earliest_end,
+        "read-only batch must execute concurrently; windows: {windows:?}"
+    );
+}
+
 /// Trust tier: on an Autonomous-tier model the evidence gate is
 /// telemetry-only — the same blind edit executes immediately.
 #[tokio::test]
