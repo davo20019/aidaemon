@@ -8,8 +8,8 @@ use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads, setup_test_agent_root,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
-    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
-    MockTool,
+    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
+    setup_test_agent_with_models_and_policy, setup_test_agent_with_policy, MockProvider, MockTool,
 };
 use crate::tools::{EditFileTool, ReadFileTool};
 use crate::traits::store_prelude::*;

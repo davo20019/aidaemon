@@ -148,10 +148,14 @@ pub(in crate::agent) use execution_state::{
     ApprovalRequirement, ExecutionBudgetLimit, ExecutionPersistence, ExecutionState,
     StepExecutionOutcome,
 };
+#[path = "policy/heuristic_telemetry.rs"]
+pub(crate) mod heuristic_telemetry;
 #[path = "loop/loop_utils.rs"]
 mod loop_utils;
 #[path = "policy/recall_guardrails.rs"]
 mod recall_guardrails;
+#[path = "policy/trust_tier.rs"]
+pub(crate) mod trust_tier;
 use loop_utils::{
     build_task_boundary_hint, classify_execution_failure_kind,
     classify_tool_result_failure_with_context, extract_command_from_args,
@@ -224,6 +228,7 @@ pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
+pub(in crate::agent) use history::{apply_planned_contract_signals, parse_planned_task_kind};
 #[path = "loop/compaction.rs"]
 mod compaction;
 #[path = "runtime/llm.rs"]

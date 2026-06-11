@@ -326,13 +326,24 @@ pub struct TestHarness {
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, vec![], None, true, true).await
+    setup_test_agent_internal(provider, vec![], None, true, true, None).await
+}
+
+/// Build a test agent with a custom policy config (e.g. trust_tier overrides)
+/// and extra tools.
+#[allow(dead_code)]
+pub async fn setup_test_agent_with_policy(
+    provider: MockProvider,
+    policy_config: crate::config::PolicyConfig,
+    extra_tools: Vec<Arc<dyn Tool>>,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, extra_tools, None, true, true, Some(policy_config)).await
 }
 
 /// Build a root-mode test agent without forcing executor-mode loop behavior.
 #[allow(dead_code)]
 pub async fn setup_test_agent_root(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, vec![], None, false, true).await
+    setup_test_agent_internal(provider, vec![], None, false, true, None).await
 }
 
 /// Build a root-mode test agent with extra tools and an optional per-LLM timeout.
@@ -342,7 +353,15 @@ pub async fn setup_test_agent_root_with_extra_tools_and_llm_timeout(
     extra_tools: Vec<Arc<dyn Tool>>,
     llm_call_timeout_secs: Option<u64>,
 ) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, extra_tools, llm_call_timeout_secs, false, true).await
+    setup_test_agent_internal(
+        provider,
+        extra_tools,
+        llm_call_timeout_secs,
+        false,
+        true,
+        None,
+    )
+    .await
 }
 
 /// Build a root-mode test agent with an exact toolset, without the default
@@ -353,7 +372,7 @@ pub async fn setup_test_agent_root_with_only_tools_and_llm_timeout(
     tools: Vec<Arc<dyn Tool>>,
     llm_call_timeout_secs: Option<u64>,
 ) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, tools, llm_call_timeout_secs, false, false).await
+    setup_test_agent_internal(provider, tools, llm_call_timeout_secs, false, false, None).await
 }
 
 /// Build a test agent with extra tools and an optional per-LLM-call timeout.
@@ -362,7 +381,15 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
     extra_tools: Vec<Arc<dyn Tool>>,
     llm_call_timeout_secs: Option<u64>,
 ) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, extra_tools, llm_call_timeout_secs, true, true).await
+    setup_test_agent_internal(
+        provider,
+        extra_tools,
+        llm_call_timeout_secs,
+        true,
+        true,
+        None,
+    )
+    .await
 }
 
 async fn setup_test_agent_internal(
@@ -371,6 +398,7 @@ async fn setup_test_agent_internal(
     llm_call_timeout_secs: Option<u64>,
     use_test_executor_mode: bool,
     include_default_tools: bool,
+    policy_config: Option<crate::config::PolicyConfig>,
 ) -> anyhow::Result<TestHarness> {
     // Temp file for SQLite (pool needs a real file, not :memory:)
     let db_file = tempfile::NamedTempFile::new()?;
@@ -448,7 +476,7 @@ async fn setup_test_agent_internal(
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
+        policy_config.unwrap_or_default(),
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),
@@ -492,6 +520,24 @@ pub async fn setup_test_agent_with_models(
     provider: MockProvider,
     primary_model: &str,
     smart_model: &str,
+) -> anyhow::Result<TestHarness> {
+    setup_test_agent_with_models_and_policy(
+        provider,
+        primary_model,
+        smart_model,
+        crate::config::PolicyConfig::default(),
+    )
+    .await
+}
+
+/// Like [`setup_test_agent_with_models`] but with a custom policy config
+/// (e.g. trust_tier overrides).
+#[allow(dead_code)]
+pub async fn setup_test_agent_with_models_and_policy(
+    provider: MockProvider,
+    primary_model: &str,
+    smart_model: &str,
+    policy_config: crate::config::PolicyConfig,
 ) -> anyhow::Result<TestHarness> {
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
@@ -554,7 +600,7 @@ pub async fn setup_test_agent_with_models(
             progressive_facts: false,
             ..Default::default()
         },
-        crate::config::PolicyConfig::default(),
+        policy_config,
         crate::config::PathAliasConfig::default(),
         None,
         Arc::new(crate::agent::specialists::SpecialistRegistry::load(None)),

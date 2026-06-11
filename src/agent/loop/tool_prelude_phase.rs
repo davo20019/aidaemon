@@ -838,6 +838,7 @@ pub(super) async fn run_tool_prelude_phase(
         && agent.depth == 0
         && !resp.tool_calls.is_empty()
         && resp.content.as_ref().is_none_or(|c| c.trim().len() < 20)
+        && agent.supervision_gate_enforced("intent_narration_gate", model)
     {
         info!(
             session_id,
@@ -912,6 +913,7 @@ pub(super) async fn run_tool_prelude_phase(
             && !all_side_effecting_are_memory
             && !all_side_effecting_are_lookup
             && text_only_redirect_applies(turn_context, execution_state.tool_calls_used)
+            && agent.supervision_gate_enforced("plain_text_drift_redirect", model)
         {
             validation_state.note_replan();
             learning_ctx.record_replay_note(
@@ -985,7 +987,9 @@ pub(super) async fn run_tool_prelude_phase(
                 tool_call_is_side_effecting(agent, tc, available_capabilities),
             )
         });
-        if has_side_effecting_call {
+        if has_side_effecting_call
+            && agent.supervision_gate_enforced("uncertainty_clarify_gate", model)
+        {
             let clarify = default_clarifying_question(user_text, &[]);
             POLICY_METRICS
                 .uncertainty_clarify_total
@@ -1034,6 +1038,11 @@ pub(super) async fn run_tool_prelude_phase(
         if let Some(violation) =
             assess_pre_execution_evidence_gate(&tc.name, &tc.arguments, evidence_state)
         {
+            if !agent.supervision_gate_enforced("pre_execution_evidence_gate", model) {
+                // Autonomous tier: telemetry only — let the tool run and the
+                // tool's own error surface teach instead of a harness bounce.
+                continue;
+            }
             agent
                 .with_harness_eval(|eval| eval.record_evidence_gate_block())
                 .await;
@@ -1108,7 +1117,9 @@ pub(super) async fn run_tool_prelude_phase(
         && !has_completed_side_effecting_tool_call(learning_ctx, available_capabilities)
     {
         if let Some(first_risky_tool_call) = first_risky_tool_call {
-            if should_run_pre_execution_gating(&first_risky_tool_call) {
+            if should_run_pre_execution_gating(&first_risky_tool_call)
+                && agent.supervision_gate_enforced("pre_execution_planning", model)
+            {
                 let capabilities = available_capabilities
                     .get(&first_risky_tool_call.name)
                     .copied()

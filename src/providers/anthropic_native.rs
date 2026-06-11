@@ -226,6 +226,34 @@ impl AnthropicNativeProvider {
         Some(anthropic_tools)
     }
 
+    /// Mark the tail content block of a message as a prompt-cache breakpoint.
+    /// String content is lifted into block form first; thinking blocks are
+    /// not valid breakpoint targets and are skipped.
+    fn attach_message_tail_breakpoint(message: &mut Value) {
+        let Some(content) = message.get_mut("content") else {
+            return;
+        };
+        if let Some(text) = content.as_str() {
+            if text.is_empty() {
+                return;
+            }
+            let text = text.to_string();
+            *content = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+            return;
+        }
+        if let Some(last_block) = content.as_array_mut().and_then(|blocks| blocks.last_mut()) {
+            let block_type = last_block.get("type").and_then(Value::as_str);
+            if matches!(block_type, Some("thinking") | Some("redacted_thinking")) {
+                return;
+            }
+            last_block["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
+
     fn build_request_body(
         &self,
         model: &str,
@@ -248,11 +276,28 @@ impl AnthropicNativeProvider {
             "messages": converted_msgs,
         });
 
+        // Prompt-cache breakpoints (tools tail → system tail → conversation
+        // tail). The harness keeps the core prompt and archived history
+        // byte-stable across iterations (Pillar A), so each breakpoint lets
+        // the API reuse the previous call's prefix instead of re-ingesting it.
         if let Some(sys) = system {
-            body["system"] = json!(sys);
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
-        if let Some(at) = anthropic_tools {
+        if let Some(mut at) = anthropic_tools {
+            if let Some(last_tool) = at.last_mut() {
+                last_tool["cache_control"] = json!({"type": "ephemeral"});
+            }
             body["tools"] = json!(at);
+        }
+        if let Some(last_msg) = body["messages"]
+            .as_array_mut()
+            .and_then(|msgs| msgs.last_mut())
+        {
+            Self::attach_message_tail_breakpoint(last_msg);
         }
 
         if !effective_tools.is_empty() {
@@ -500,6 +545,72 @@ mod tests {
 
     fn provider() -> AnthropicNativeProvider {
         AnthropicNativeProvider::new("test-key")
+    }
+
+    #[test]
+    fn cache_breakpoints_set_on_tools_system_and_last_message() {
+        let p = provider();
+        let messages = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "assistant", "content": "Hi! How can I help?"}),
+            json!({"role": "user", "content": "List my files"}),
+        ];
+        let tools = vec![
+            json!({"type": "function", "function": {
+                "name": "tool_a", "description": "A", "parameters": {"type": "object"}}}),
+            json!({"type": "function", "function": {
+                "name": "tool_b", "description": "B", "parameters": {"type": "object"}}}),
+        ];
+
+        let body = p.build_request_body("claude-test", &messages, &tools, &ChatOptions::default());
+
+        // Tools: last tool carries the breakpoint, earlier tools do not.
+        let body_tools = body["tools"].as_array().unwrap();
+        assert!(body_tools[0].get("cache_control").is_none());
+        assert_eq!(
+            body_tools.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+
+        // System: block form with a breakpoint on the last block.
+        let system_blocks = body["system"].as_array().unwrap();
+        let last_system = system_blocks.last().unwrap();
+        assert_eq!(last_system["type"], "text");
+        assert_eq!(last_system["text"], "You are helpful.");
+        assert_eq!(last_system["cache_control"], json!({"type": "ephemeral"}));
+
+        // Conversation tail: last message's last content block carries the
+        // breakpoint so each iteration reuses the previous iteration's prefix.
+        let body_msgs = body["messages"].as_array().unwrap();
+        let last_msg = body_msgs.last().unwrap();
+        let content_blocks = last_msg["content"].as_array().unwrap();
+        let last_block = content_blocks.last().unwrap();
+        assert_eq!(last_block["text"], "List my files");
+        assert_eq!(last_block["cache_control"], json!({"type": "ephemeral"}));
+        // Earlier messages are untouched (no breakpoint churn mid-history).
+        assert!(
+            body_msgs[0]["content"].is_string() || {
+                let blocks = body_msgs[0]["content"].as_array().unwrap();
+                blocks.iter().all(|b| b.get("cache_control").is_none())
+            }
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_skip_empty_surfaces() {
+        let p = provider();
+        // No system, no tools, single message — body must stay valid.
+        let messages = vec![json!({"role": "user", "content": "Hello"})];
+        let body = p.build_request_body("claude-test", &messages, &[], &ChatOptions::default());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("system").is_none());
+        let body_msgs = body["messages"].as_array().unwrap();
+        let blocks = body_msgs[0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
+        );
     }
 
     #[test]

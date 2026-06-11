@@ -348,6 +348,15 @@ health_port = 8080
 # autotune_shadow = true             # log auto-tune adjustments
 # autotune_enforce = true            # apply auto-tune adjustments
 # uncertainty_clarify_threshold = 0.55
+# trust_tier = "auto"                # "auto" | "guided" | "autonomous"
+#   Model trust tier. "auto" classifies by model id: frontier families
+#   (claude-*, gpt-4/5, o-series, gemini-2.5+, grok-3/4) run with a thin loop —
+#   supervision gates (narration/evidence/planning/critique/uncertainty,
+#   deferred-action blocking) become telemetry-only and per-tool budgets
+#   scale 3x — while small/local models (gemma, llama, qwen, ...) keep the
+#   full supervision scaffolding. Hard safety caps (iteration/token/wall-clock,
+#   repetition guards, anti-fabrication checks) apply on every tier.
+#   Gate fires are logged under the `heuristic_telemetry` tracing target.
 #
 # [policy.write_consistency]
 # # Guardrail thresholds for dual-write drift checks.

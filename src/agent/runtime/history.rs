@@ -12,8 +12,9 @@
 //! same names through `history::`.
 
 pub(super) use super::completion_contract::{
-    infer_completion_contract, CompletionContract, CompletionProgress, CompletionTaskKind,
-    VerificationTarget, VerificationTargetKind,
+    apply_planned_contract_signals, infer_completion_contract, parse_planned_task_kind,
+    CompletionContract, CompletionProgress, CompletionTaskKind, VerificationTarget,
+    VerificationTargetKind,
 };
 pub(super) use super::followup::{
     assistant_message_looks_like_clarifying_question,

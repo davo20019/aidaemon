@@ -59,6 +59,52 @@ impl CompletionContract {
     }
 }
 
+/// Map a planner-supplied task-kind string to the enum. Unknown values map
+/// to None so a hallucinated kind never overrides the keyword inference.
+pub(super) fn parse_planned_task_kind(value: &str) -> Option<CompletionTaskKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "conversational" => Some(CompletionTaskKind::Conversational),
+        "answer" => Some(CompletionTaskKind::Answer),
+        "check" => Some(CompletionTaskKind::Check),
+        "find" => Some(CompletionTaskKind::Find),
+        "change" => Some(CompletionTaskKind::Change),
+        "deliver" => Some(CompletionTaskKind::Deliver),
+        "schedule" => Some(CompletionTaskKind::Schedule),
+        "monitor" => Some(CompletionTaskKind::Monitor),
+        "diagnose" => Some(CompletionTaskKind::Diagnose),
+        _ => None,
+    }
+}
+
+/// Refine a keyword-inferred contract with the planning LLM's classification.
+/// The planner read the actual request (any language), so its signals win —
+/// with one exception: an explicit user verification request ("verify it",
+/// "make sure") is never relaxed by a planner saying observation isn't needed.
+pub(super) fn apply_planned_contract_signals(
+    contract: &mut CompletionContract,
+    expects_mutation: Option<bool>,
+    requires_observation: Option<bool>,
+    task_kind: Option<CompletionTaskKind>,
+) {
+    if let Some(kind) = task_kind {
+        contract.task_kind = kind;
+    }
+    if let Some(mutation) = expects_mutation {
+        contract.expects_mutation = mutation;
+        if !mutation {
+            // No mutation expected → nothing to re-verify after one.
+            contract.requires_reverification_after_mutation = false;
+        }
+    }
+    if let Some(observation) = requires_observation {
+        if observation {
+            contract.requires_observation = true;
+        } else if !contract.explicit_verification_requested {
+            contract.requires_observation = false;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionProgress {
     pub observation_count: usize,
@@ -1046,5 +1092,96 @@ mod tests {
         let contract =
             infer_completion_contract("Remove west.txt and execute tally.py once more.", &[]);
         assert!(contract.expects_mutation);
+    }
+
+    #[test]
+    fn planned_task_kind_parses_all_variants_and_rejects_garbage() {
+        for (s, expected) in [
+            ("conversational", CompletionTaskKind::Conversational),
+            ("answer", CompletionTaskKind::Answer),
+            ("check", CompletionTaskKind::Check),
+            ("find", CompletionTaskKind::Find),
+            ("change", CompletionTaskKind::Change),
+            ("deliver", CompletionTaskKind::Deliver),
+            ("schedule", CompletionTaskKind::Schedule),
+            ("monitor", CompletionTaskKind::Monitor),
+            ("diagnose", CompletionTaskKind::Diagnose),
+        ] {
+            assert_eq!(parse_planned_task_kind(s), Some(expected), "kind {s}");
+        }
+        assert_eq!(
+            parse_planned_task_kind(" Change "),
+            Some(CompletionTaskKind::Change)
+        );
+        assert_eq!(parse_planned_task_kind("destroy_everything"), None);
+        assert_eq!(parse_planned_task_kind(""), None);
+    }
+
+    #[test]
+    fn planned_signals_override_keyword_inference() {
+        // "Escribe un script en deploy.sh" — Spanish; keyword inference sees
+        // nothing and produces a conversational no-mutation contract.
+        let mut contract = CompletionContract::default();
+        assert!(!contract.expects_mutation);
+
+        apply_planned_contract_signals(
+            &mut contract,
+            Some(true),
+            Some(true),
+            Some(CompletionTaskKind::Change),
+        );
+        assert!(contract.expects_mutation);
+        assert!(contract.requires_observation);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+    }
+
+    #[test]
+    fn planned_mutation_false_clears_reverification() {
+        // Keyword false positive: "write a tweet about rust" infers a file
+        // mutation. The planner classifying it as pure text generation must
+        // clear both the mutation expectation and the dependent re-verify.
+        let mut contract = CompletionContract {
+            expects_mutation: true,
+            requires_reverification_after_mutation: true,
+            ..Default::default()
+        };
+        apply_planned_contract_signals(&mut contract, Some(false), None, None);
+        assert!(!contract.expects_mutation);
+        assert!(!contract.requires_reverification_after_mutation);
+    }
+
+    #[test]
+    fn explicit_verification_request_is_never_relaxed() {
+        let mut contract = CompletionContract {
+            requires_observation: true,
+            explicit_verification_requested: true,
+            ..Default::default()
+        };
+        apply_planned_contract_signals(&mut contract, None, Some(false), None);
+        assert!(
+            contract.requires_observation,
+            "user's explicit 'verify it' must survive planner relaxation"
+        );
+
+        // Without the explicit request, the planner may relax it.
+        let mut contract = CompletionContract {
+            requires_observation: true,
+            ..Default::default()
+        };
+        apply_planned_contract_signals(&mut contract, None, Some(false), None);
+        assert!(!contract.requires_observation);
+    }
+
+    #[test]
+    fn absent_signals_leave_contract_untouched() {
+        let mut contract = CompletionContract {
+            task_kind: CompletionTaskKind::Find,
+            expects_mutation: true,
+            requires_observation: true,
+            ..Default::default()
+        };
+        let before = contract.clone();
+        apply_planned_contract_signals(&mut contract, None, None, None);
+        assert_eq!(contract, before);
     }
 }

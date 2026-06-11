@@ -2252,6 +2252,114 @@ async fn test_intent_gate_forces_narration() {
     assert_eq!(harness.provider.call_count().await, 3);
 }
 
+/// Trust tier baseline: on the default (Guided) tier, the pre-execution
+/// evidence gate blocks a blind edit_file (no prior read_file on the path).
+/// The file on disk is the ground-truth discriminator.
+#[tokio::test]
+async fn test_evidence_gate_blocks_blind_edit_on_guided_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("notes.txt");
+    std::fs::write(&file_path, "hello world").unwrap();
+    let args = json!({
+        "path": file_path.to_str().unwrap(),
+        "old_text": "hello",
+        "new_text": "goodbye",
+    })
+    .to_string();
+
+    let provider = MockProvider::with_responses(vec![
+        // Iter 1: blind edit (no read_file evidence) -> evidence gate blocks
+        MockProvider::tool_call_response("edit_file", &args),
+        // Iter 2: model gives up and answers in text
+        MockProvider::text_response("I need to read the file first."),
+    ]);
+
+    let harness = setup_test_agent_with_policy(
+        provider,
+        crate::config::PolicyConfig::default(),
+        vec![Arc::new(EditFileTool)],
+    )
+    .await
+    .unwrap();
+    harness
+        .agent
+        .handle_message(
+            "guided_evidence_session",
+            "replace hello with goodbye in notes.txt",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "hello world",
+        "guided tier must block the blind edit"
+    );
+    let history = harness
+        .state
+        .get_history("guided_evidence_session", 20)
+        .await
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .any(|c| c.contains("Evidence gate blocked")),
+        "expected the evidence-gate bounce in tool results"
+    );
+}
+
+/// Trust tier: on an Autonomous-tier model the evidence gate is
+/// telemetry-only — the same blind edit executes immediately.
+#[tokio::test]
+async fn test_evidence_gate_shadow_skipped_on_autonomous_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("notes.txt");
+    std::fs::write(&file_path, "hello world").unwrap();
+    let args = json!({
+        "path": file_path.to_str().unwrap(),
+        "old_text": "hello",
+        "new_text": "goodbye",
+    })
+    .to_string();
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("edit_file", &args),
+        MockProvider::text_response("Replaced hello with goodbye."),
+    ]);
+
+    let policy = crate::config::PolicyConfig {
+        trust_tier: "autonomous".to_string(),
+        ..Default::default()
+    };
+    let harness = setup_test_agent_with_policy(provider, policy, vec![Arc::new(EditFileTool)])
+        .await
+        .unwrap();
+    harness
+        .agent
+        .handle_message(
+            "autonomous_evidence_session",
+            "replace hello with goodbye in notes.txt",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "goodbye world",
+        "autonomous tier must let the edit execute (gate is telemetry-only)"
+    );
+}
+
 /// Scheduler simulation: messages from scheduled tasks use special session IDs.
 /// The agent treats `scheduler_trigger_*` sessions as untrusted.
 #[tokio::test]

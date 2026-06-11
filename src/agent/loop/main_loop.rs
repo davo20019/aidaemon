@@ -189,7 +189,7 @@ impl Agent {
             BootstrapOutcome::Return(result) => return result,
             BootstrapOutcome::Continue(data) => *data,
         };
-        let turn_context = self
+        let mut turn_context = self
             .build_turn_context_from_recent_history(session_id, user_text)
             .await;
         let followup_mode = turn_context
@@ -405,6 +405,34 @@ impl Agent {
                     None
                 };
                 if let Some(plan) = plan_opt {
+                    // The planner read the actual request (any language), so
+                    // its contract classification refines the English-keyword
+                    // inference. Explicit user verification requests are
+                    // never relaxed (enforced inside apply).
+                    if let Some(ref signals) = plan.contract {
+                        let planned_kind = signals
+                            .task_kind
+                            .as_deref()
+                            .and_then(crate::agent::parse_planned_task_kind);
+                        let before = turn_context.completion_contract.clone();
+                        crate::agent::apply_planned_contract_signals(
+                            &mut turn_context.completion_contract,
+                            signals.expects_mutation,
+                            signals.requires_observation,
+                            planned_kind,
+                        );
+                        if turn_context.completion_contract != before {
+                            info!(
+                                session_id,
+                                task_kind = ?turn_context.completion_contract.task_kind,
+                                expects_mutation =
+                                    turn_context.completion_contract.expects_mutation,
+                                requires_observation =
+                                    turn_context.completion_contract.requires_observation,
+                                "Completion contract refined by planner classification"
+                            );
+                        }
+                    }
                     let linear_steps: Vec<LinearIntentStep> = plan
                         .steps
                         .iter()

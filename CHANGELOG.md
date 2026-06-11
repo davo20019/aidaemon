@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Model trust tiers** (`[policy] trust_tier = "auto" | "guided" | "autonomous"`): the agent loop now adapts its supervision scaffolding to the model's capability. Frontier models (claude-*, gpt-4/5, o-series, gemini-2.5+, grok-3/4 — or any model with `trust_tier = "autonomous"`) run a thin loop: the intent-narration gate, plain-text drift redirect, uncertainty clarification gate, pre-execution evidence/planning/critique gates, and deferred-action text blocking become telemetry-only instead of bouncing the model, and per-tool budget caps scale 3× to research volume (e.g. web_search 5 → 15 per task). Small/local models keep the full supervision harness unchanged. Hard safety caps (iteration/token/wall-clock limits, repetition guards) and ledger-verified anti-fabrication checks (claimed mutations with zero tool calls, structural protocol markers) stay enforced on every tier.
+- **Heuristic fire telemetry**: every supervision gate now records (heuristic, model, tier, enforced/shadow-skipped) to an in-process registry and emits a structured tracing event under the `heuristic_telemetry` target, so gate false-positive rates can be tuned per model from data instead of anecdote.
+- **Anthropic prompt-cache breakpoints**: the native Anthropic provider now sets `cache_control: ephemeral` on the last tool definition, the system prompt block, and the final message's tail content block. Combined with the existing byte-stable core-prompt/archived-history architecture, each agent-loop iteration reuses the previous call's cached prefix instead of re-ingesting it at full input price (cache hits were already parsed from `cache_read_input_tokens` but never produced).
+
 ## [0.11.2] - 2026-06-10
 
 ### Added

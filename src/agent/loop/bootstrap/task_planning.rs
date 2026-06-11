@@ -14,6 +14,20 @@ pub(crate) struct TaskPlanStep {
     pub tool_hint: Option<String>,
 }
 
+/// Completion-contract signals classified by the planning LLM. Unlike the
+/// keyword-based contract inference (English-only), these come from the
+/// model reading the actual request in any language. All fields optional —
+/// absent fields leave the keyword-inferred contract untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PlannedContractSignals {
+    #[serde(default)]
+    pub expects_mutation: Option<bool>,
+    #[serde(default)]
+    pub requires_observation: Option<bool>,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+}
+
 /// Raw response from the planning LLM call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskPlanResponse {
@@ -21,6 +35,8 @@ struct TaskPlanResponse {
     steps: Vec<TaskPlanStep>,
     #[serde(default)]
     success_criteria: Vec<String>,
+    #[serde(default)]
+    contract: Option<PlannedContractSignals>,
 }
 
 /// Result of the task-start planning call.
@@ -30,6 +46,7 @@ pub(crate) struct TaskPlan {
     pub goal: String,
     pub steps: Vec<TaskPlanStep>,
     pub success_criteria: Vec<String>,
+    pub contract: Option<PlannedContractSignals>,
 }
 
 const MAX_PLAN_STEPS: usize = 7;
@@ -70,7 +87,12 @@ pub(crate) async fn generate_task_plan(
            ],\n  \
            \"success_criteria\": [\n    \
              \"concrete criterion for task completion\"\n  \
-           ]\n\
+           ],\n  \
+           \"contract\": {{\n    \
+             \"task_kind\": \"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\n    \
+             \"expects_mutation\": true,\n    \
+             \"requires_observation\": true\n  \
+           }}\n\
          }}\n\n\
          Rules:\n\
          - 2-7 steps. Simple questions that need one lookup: 2 steps.\n\
@@ -78,6 +100,15 @@ pub(crate) async fn generate_task_plan(
            (\"search memory for twitter schedule\" not \"investigate\")\n\
          - tool_hint is advisory — helps understand step type\n\
          - success_criteria: what does \"done\" look like?\n\
+         - contract.task_kind: what KIND of request this is (judge the user's \
+           intent in whatever language they wrote it).\n\
+         - contract.expects_mutation: true only if completing the request \
+           requires creating/modifying files or external state. Generating \
+           text INTO THE REPLY (a tweet, a poem, an explanation) is NOT a \
+           mutation.\n\
+         - contract.requires_observation: true if answering requires reading \
+           live data first (files, command output, web, APIs) rather than \
+           general knowledge.\n\
          - IMPORTANT: When the request contains MULTIPLE distinct actions \
            (create + run, write + execute + fix, build + deploy + verify), \
            each action MUST be its own step. Never collapse \"create X then run it\" \
@@ -179,6 +210,7 @@ pub(crate) async fn generate_task_plan(
         goal: parsed.goal,
         steps,
         success_criteria: parsed.success_criteria,
+        contract: parsed.contract,
     })
 }
 
@@ -453,6 +485,43 @@ mod tests {
         assert_eq!(parsed.steps.len(), 3);
         assert_eq!(parsed.goal, "Find how Twitter task was removed");
         assert_eq!(parsed.success_criteria.len(), 1);
+        assert!(parsed.contract.is_none(), "contract is optional");
+    }
+
+    #[test]
+    fn test_parse_plan_response_with_contract_signals() {
+        let json = r#"{
+            "goal": "Update the deploy script",
+            "steps": [
+                {"description": "Read deploy.sh", "tool_hint": "read_file"},
+                {"description": "Edit the retry flag", "tool_hint": "edit_file"}
+            ],
+            "success_criteria": ["deploy.sh contains the retry flag"],
+            "contract": {
+                "expects_mutation": true,
+                "requires_observation": true,
+                "task_kind": "change"
+            }
+        }"#;
+
+        let parsed: TaskPlanResponse = serde_json::from_str(json).unwrap();
+        let contract = parsed.contract.unwrap();
+        assert_eq!(contract.expects_mutation, Some(true));
+        assert_eq!(contract.requires_observation, Some(true));
+        assert_eq!(contract.task_kind.as_deref(), Some("change"));
+    }
+
+    #[test]
+    fn test_parse_plan_response_with_partial_contract() {
+        let json = r#"{
+            "goal": "g",
+            "steps": [{"description": "s", "tool_hint": null}],
+            "contract": {"task_kind": "answer"}
+        }"#;
+        let parsed: TaskPlanResponse = serde_json::from_str(json).unwrap();
+        let contract = parsed.contract.unwrap();
+        assert_eq!(contract.expects_mutation, None);
+        assert_eq!(contract.task_kind.as_deref(), Some("answer"));
     }
 
     #[test]

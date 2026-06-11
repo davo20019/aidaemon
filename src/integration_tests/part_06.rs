@@ -335,6 +335,59 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     );
 }
 
+/// Trust tier: on an Autonomous-tier model the deferred-action / tools-
+/// required text blocks are telemetry-only. The same deferred narration that
+/// the Guided test above bounces is accepted as the final reply.
+#[tokio::test]
+async fn test_deferred_action_text_accepted_on_autonomous_tier() {
+    let deferred_text =
+        "I'll find your resume and send it over right away.\nStarting the send-resume workflow...";
+    let provider = MockProvider::with_responses(vec![
+        // 1) First call (with tools) → INTENT_GATE classification: tools required
+        MockProvider::text_response(
+            "I'll check and send it over.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
+        ),
+        // 2) Execution loop: deferred-action text, no tool calls — on the
+        //    autonomous tier this is delivered to the user instead of bounced.
+        MockProvider::text_response(deferred_text),
+        // 3) Never reached on autonomous tier; present so a regression to
+        //    guided-style blocking fails the call-count assert, not the mock.
+        MockProvider::text_response("Found it and sent it."),
+    ]);
+
+    let policy = crate::config::PolicyConfig {
+        trust_tier: "autonomous".to_string(),
+        ..Default::default()
+    };
+    let harness =
+        setup_test_agent_with_models_and_policy(provider, "primary-model", "smart-model", policy)
+            .await
+            .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "autonomous_deferred_session",
+            "send me my resume",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("find your resume"),
+        "autonomous tier must deliver the model's text instead of bouncing it; got: {response:?}"
+    );
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "no retry loop expected on autonomous tier"
+    );
+}
+
 /// Regression: even after some successful tool calls, a deferred-action
 /// narration ("I'll send it over") must not be treated as final completion.
 #[tokio::test]

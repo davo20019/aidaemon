@@ -2733,6 +2733,9 @@ fn default_autotune_enforce() -> bool {
 fn default_uncertainty_threshold() -> f32 {
     0.55
 }
+fn default_trust_tier() -> String {
+    "auto".to_string()
+}
 fn default_write_consistency_max_abs_global_delta() -> u64 {
     3
 }
@@ -2980,6 +2983,11 @@ pub struct PolicyConfig {
     pub autotune_enforce: bool,
     #[serde(default = "default_uncertainty_threshold")]
     pub uncertainty_clarify_threshold: f32,
+    /// Model trust tier override: "auto" (classify by model id), "guided"
+    /// (always enforce full supervision scaffolding), or "autonomous"
+    /// (supervision gates become telemetry-only). Default: "auto".
+    #[serde(default = "default_trust_tier")]
+    pub trust_tier: String,
     #[serde(default)]
     pub write_consistency: WriteConsistencyConfig,
 }
@@ -2996,6 +3004,7 @@ impl Default for PolicyConfig {
             autotune_shadow: default_autotune_shadow(),
             autotune_enforce: default_autotune_enforce(),
             uncertainty_clarify_threshold: default_uncertainty_threshold(),
+            trust_tier: default_trust_tier(),
             write_consistency: WriteConsistencyConfig::default(),
         }
     }

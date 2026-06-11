@@ -1,5 +1,86 @@
+use crate::agent::trust_tier::ModelTrustTier;
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
+
+/// Per-task tool-call budget caps. These are runaway backstops, not pacing:
+/// the repetition guards (same-call hash, consecutive same-tool) catch true
+/// loops on every tier. Autonomous-tier models get research-scale caps —
+/// twenty distinct web searches is investigation, not a loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolBudgetCaps {
+    pub web_search: usize,
+    pub web_fetch: usize,
+    pub combined_web: usize,
+    pub spawn_agent: usize,
+    pub http_request: usize,
+    pub computer_use: usize,
+    pub generic: usize,
+}
+
+pub(crate) fn tool_budget_caps(tier: ModelTrustTier) -> ToolBudgetCaps {
+    let guided = ToolBudgetCaps {
+        web_search: 5,
+        web_fetch: 6,
+        combined_web: 10,
+        spawn_agent: 15,
+        http_request: 15,
+        computer_use: 40,
+        generic: 8,
+    };
+    match tier {
+        ModelTrustTier::Guided => guided,
+        ModelTrustTier::Autonomous => ToolBudgetCaps {
+            web_search: guided.web_search * 3,
+            web_fetch: guided.web_fetch * 3,
+            combined_web: guided.combined_web * 3,
+            spawn_agent: guided.spawn_agent * 3,
+            http_request: guided.http_request * 3,
+            computer_use: guided.computer_use * 3,
+            generic: guided.generic * 3,
+        },
+    }
+}
+
+#[cfg(test)]
+mod caps_tests {
+    use super::*;
+
+    #[test]
+    fn guided_caps_match_legacy_constants() {
+        let caps = tool_budget_caps(ModelTrustTier::Guided);
+        assert_eq!(caps.web_search, 5);
+        assert_eq!(caps.web_fetch, 6);
+        assert_eq!(caps.combined_web, 10);
+        assert_eq!(caps.spawn_agent, 15);
+        assert_eq!(caps.http_request, 15);
+        assert_eq!(caps.computer_use, 40);
+        assert_eq!(caps.generic, 8);
+    }
+
+    #[test]
+    fn autonomous_caps_scale_to_research_volume() {
+        let guided = tool_budget_caps(ModelTrustTier::Guided);
+        let auto = tool_budget_caps(ModelTrustTier::Autonomous);
+        assert_eq!(auto.web_search, 15);
+        assert_eq!(auto.web_fetch, 18);
+        assert_eq!(auto.combined_web, 30);
+        assert_eq!(auto.spawn_agent, 45);
+        assert_eq!(auto.http_request, 45);
+        assert_eq!(auto.computer_use, 120);
+        assert_eq!(auto.generic, 24);
+        for (a, g) in [
+            (auto.web_search, guided.web_search),
+            (auto.web_fetch, guided.web_fetch),
+            (auto.combined_web, guided.combined_web),
+            (auto.spawn_agent, guided.spawn_agent),
+            (auto.http_request, guided.http_request),
+            (auto.computer_use, guided.computer_use),
+            (auto.generic, guided.generic),
+        ] {
+            assert!(a > g, "every autonomous cap must exceed its guided cap");
+        }
+    }
+}
 
 /// Distinguishes temporary blocks (cooldown) from permanent blocks (budget/limit).
 /// Cooldown blocks should NOT trigger force_text_response — the tool will be
@@ -18,6 +99,7 @@ pub(super) struct ToolBudgetBlockCtx<'a> {
     pub emitter: &'a crate::events::EventEmitter,
     pub task_id: &'a str,
     pub session_id: &'a str,
+    pub model: &'a str,
     pub iteration: usize,
     pub tool_failure_count: &'a HashMap<String, usize>,
     pub tool_transient_failure_count: &'a HashMap<String, usize>,
@@ -98,6 +180,8 @@ pub(super) async fn maybe_block_tool_by_budget(
     let web_fetch_calls = ctx.tool_call_count.get("web_fetch").copied().unwrap_or(0);
     let combined_web_calls = web_search_calls + web_fetch_calls;
 
+    let trust_tier = agent.trust_tier_for_model(ctx.model);
+    let caps = tool_budget_caps(trust_tier);
     let failure_limit = semantic_failure_limit(&tc.name);
     let blocked = if ctx.unknown_tools.contains(&tc.name) {
         // Tool doesn't exist — block immediately, no retries.
@@ -116,18 +200,20 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if tc.name == "web_search" && prior_calls >= 5 {
+    } else if tc.name == "web_search" && prior_calls >= caps.web_search {
         Some(ToolResultNotice::WebSearchBudgetBlocked { prior_calls }.render())
-    } else if (tc.name == "web_search" || tc.name == "web_fetch") && combined_web_calls >= 10 {
+    } else if (tc.name == "web_search" || tc.name == "web_fetch")
+        && combined_web_calls >= caps.combined_web
+    {
         Some(ToolResultNotice::CombinedWebBudgetBlocked { combined_web_calls }.render())
-    } else if tc.name == "web_fetch" && prior_calls >= 6 {
+    } else if tc.name == "web_fetch" && prior_calls >= caps.web_fetch {
         Some(ToolResultNotice::WebFetchBudgetBlocked { prior_calls }.render())
-    } else if tc.name == "spawn_agent" && prior_calls >= 15 {
+    } else if tc.name == "spawn_agent" && prior_calls >= caps.spawn_agent {
         // spawn_agent gets a higher cap than generic tools since task leads
         // legitimately spawn many executors, but it must still be bounded
         // to prevent runaway LLM agent spawns.
         Some(ToolResultNotice::SpawnAgentBudgetBlocked { prior_calls }.render())
-    } else if tc.name == "http_request" && prior_calls >= 15 {
+    } else if tc.name == "http_request" && prior_calls >= caps.http_request {
         // http_request gets a higher cap than generic tools because
         // multi-step API workflows (posting threads, paginated APIs,
         // auth checks + retries) legitimately need many sequential calls.
@@ -138,7 +224,7 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if tc.name == "computer_use" && prior_calls >= 40 {
+    } else if tc.name == "computer_use" && prior_calls >= caps.computer_use {
         // computer_use drives multi-step GUI flows where each step is a separate
         // call (get_app_state observation + click/type mutation), so a healthy
         // 5–15 step task legitimately makes dozens of calls. The tool enforces
@@ -152,7 +238,7 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if prior_calls >= 8
+    } else if prior_calls >= caps.generic
         && !matches!(
             tc.name.as_str(),
             "terminal"
@@ -190,6 +276,13 @@ pub(super) async fn maybe_block_tool_by_budget(
     let Some(result_text) = blocked else {
         return Ok(ToolBlockKind::NotBlocked);
     };
+
+    crate::agent::heuristic_telemetry::global().record(
+        "tool_budget_block",
+        ctx.model,
+        trust_tier,
+        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
+    );
 
     warn!(
         session_id = %ctx.session_id,

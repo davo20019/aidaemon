@@ -733,6 +733,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 emitter,
                 task_id,
                 session_id,
+                model,
                 iteration,
                 tool_failure_count: &tool_failure_count,
                 tool_transient_failure_count: &tool_transient_failure_count,
