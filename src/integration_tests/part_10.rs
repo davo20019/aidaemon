@@ -889,17 +889,20 @@ async fn test_compaction_fires_on_window_overflow() {
                     .is_some_and(|s| s.contains("[Session Summary]"))
         })
     });
-    let turn8_call = call_log.last().expect("should have Turn 8 call");
     assert!(
         has_summary,
         "Turn 8's LLM context should include [Session Summary] from compaction"
     );
 
-    // Verify: Turn 8 should have a [Current Task] boundary marker.
-    let has_boundary = turn8_call.messages.iter().any(|m| {
-        m.get("content")
-            .and_then(|c| c.as_str())
-            .is_some_and(|s| s.contains("[Current Task]"))
+    // Verify: Turn 8 should have a [Current Task] boundary marker. Like the
+    // summary check above, scan the tail of Turn 8's calls — compaction may
+    // land last and its system prompt won't carry the boundary marker.
+    let has_boundary = call_log[tail_start..].iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Current Task]"))
+        })
     });
     assert!(
         has_boundary,
