@@ -1997,12 +1997,32 @@ pub struct CliToolConfig {
     pub max_output_chars: Option<usize>,
 }
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 pub struct SearchConfig {
     #[serde(default)]
     pub backend: SearchBackendKind,
     #[serde(default)]
     pub api_key: String,
+    /// Base URL of a self-hosted SearxNG instance, wherever the user hosts it
+    /// (e.g. "http://localhost:8080" for the default Docker setup).
+    /// When set, SearxNG becomes available as a search backend.
+    #[serde(default)]
+    pub searxng_url: String,
+    /// When true (default), web_search queries every configured backend in
+    /// parallel and merges the results. When false, only `backend` is used.
+    #[serde(default = "default_true")]
+    pub parallel: bool,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            backend: SearchBackendKind::default(),
+            api_key: String::new(),
+            searxng_url: String::new(),
+            parallel: true,
+        }
+    }
 }
 
 impl fmt::Debug for SearchConfig {
@@ -2010,16 +2030,20 @@ impl fmt::Debug for SearchConfig {
         f.debug_struct("SearchConfig")
             .field("backend", &self.backend)
             .field("api_key", &redact(&self.api_key))
+            .field("searxng_url", &self.searxng_url)
+            .field("parallel", &self.parallel)
             .finish()
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchBackendKind {
     #[default]
+    #[serde(alias = "duckduckgo")]
     DuckDuckGo,
     Brave,
+    Searxng,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

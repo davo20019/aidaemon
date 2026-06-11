@@ -252,9 +252,11 @@ health_port = 8080
 # folder = "INBOX"
 
 # [search]
-# backend = "brave"
+# backend = "brave"   # duckduckgo | brave | searxng
 # api_key = "keychain"
 # # api_key = "${AIDAEMON_SEARCH_API_KEY}"
+# # searxng_url = "http://localhost:8080"  # self-hosted SearxNG (enable JSON in search.formats)
+# # parallel = true     # fan out to every configured backend and merge (default: true)
 
 # [subagents]
 # enabled = true

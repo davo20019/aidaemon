@@ -6,9 +6,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::config::{SearchBackendKind, SearchConfig};
+use crate::config::SearchConfig;
 use crate::oauth::{OAuthGateway, SharedHttpProfiles};
-use crate::tools::web_search::{BraveBackend, DuckDuckGoBackend, SearchBackend, SearchResult};
+use crate::tools::web_search::{SearchBackend, SearchResult};
 use crate::tools::ApprovalBroker;
 use crate::tools::{HttpRequestTool, ManageHttpAuthTool, ManageOAuthTool, ManageSkillsTool};
 use crate::traits::{StateStore, Tool, ToolCapabilities};
@@ -80,10 +80,8 @@ impl ManageApiTool {
                 .with_http_profiles(profiles.clone())
                 .with_registries(skill_registry_urls)
         });
-        let search_backend: Box<dyn SearchBackend> = match search_config.backend {
-            SearchBackendKind::Brave => Box::new(BraveBackend::new(&search_config.api_key)),
-            SearchBackendKind::DuckDuckGo => Box::new(DuckDuckGoBackend::new()),
-        };
+        let search_backend =
+            crate::tools::web_search::build_backend(&search_config.backend, &search_config);
 
         Self {
             manage_http_auth: ManageHttpAuthTool::new(
@@ -331,7 +329,7 @@ impl ManageApiTool {
         );
         let results = self
             .search_backend
-            .search(&query, 8)
+            .search(&query, 8, None)
             .await
             .unwrap_or_default();
 
@@ -341,6 +339,7 @@ impl ManageApiTool {
             url,
             title,
             snippet,
+            ..
         } in results
         {
             if !Self::result_host_matches_target(&url, target_host) {

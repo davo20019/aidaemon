@@ -446,7 +446,9 @@ Do NOT repeat the same call. Change approach, reduce scope, or tell the user wha
                      When the user provides a Brave API key, use manage_config to:\n\
                      - set search.backend to '\"brave\"'\n\
                      - set search.api_key to '\"THEIR_KEY\"'\n\
-                     Then tell them to type /reload to apply the changes.",
+                     Then tell them to type /reload to apply the changes.\n\
+                     Alternatively, if they run a self-hosted SearxNG instance, ask them for \
+                     its base URL and set search.searxng_url to it.",
                 prior_calls
             ),
             Self::ProjectInspectBudgetBlocked { prior_calls } => format!(

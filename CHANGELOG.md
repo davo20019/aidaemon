@@ -22,11 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Immediate scheduled-task dispatch**: heartbeat claims and dispatches due scheduled tasks on the same tick instead of waiting for the 60s orphan-recovery pass, so recurring checks start on time.
 - **computer_use session telemetry**: per-task action log with mutation budget, element targets, click method, and session summary for post-mortems (complements existing per-action tracing events).
 - **computer_use status pings**: DM status pings show readable summaries ("click Calculator #12") instead of raw JSON.
+- **Parallel multi-backend web search**: `web_search` fans out to every configured backend in parallel (primary first, then Brave when `search.api_key` is set, SearxNG when `search.searxng_url` is set, and DuckDuckGo as a free supplementary source) and merges results with reciprocal-rank fusion. URLs are deduplicated; results appearing in multiple backends rank higher; snippets and publication age are preserved when known. Per-backend 12s timeouts prevent one slow source from stalling the whole search. Disable fan-out with `[search] parallel = false`.
+- **SearxNG search backend**: self-hosted SearxNG instances are supported via `[search] backend = "searxng"` and `search.searxng_url` (no API key required).
+- **Web search freshness filter**: `web_search` gains an optional `freshness` parameter (`day`/`week`/`month`/`year`) mapped to each backend's native recency parameter for time-sensitive queries.
 
 ### Changed
 
 - **Scheduled goal progress copy**: single-step goals get humane "Still working on it…" updates instead of "0/1 steps completed, 1 in progress" jargon; multi-step goals use simpler "X/Y steps done" wording.
 - **computer_use mutating-action budget default**: raised from 15 to 40 in `config.toml.example` (dense UIs like Calculator need more clicks).
+- **Web search result limits**: default merged results raised to 8 (max 20).
 
 ### Fixed
 
@@ -36,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Models ignoring forced `tool_choice=required`**: serving stacks that return text with zero tool calls despite `tool_choice=required` (observed: llama.cpp + Gemma → repetition loop until token limit) are flagged in-memory after one strike; deferred/no-tool recovery stops re-forcing `required` and converges via substantive-text acceptance instead.
 - **search_files path copy-paste failures**: trailing punctuation from prose (`/projects)`, `/path:`) is stripped when the literal path doesn't exist; output format no longer glues the scanned directory to a closing parenthesis, preventing invalid paths on the model's next call.
 - **db_probe event time windows**: harness-eval, telemetry reconciliation, and task-outcome queries use RFC3339 cutoffs instead of SQLite `datetime()` space-format strings, which silently degraded same-day filters to calendar-day granularity. Token-only reconciliation rows now split by session and whether the `llm_call` event is missing vs. present with `token_usage_present=false`.
+- **DuckDuckGo redirect unwrapping**: DDG lite tracking redirects are decoded to real destination URLs so `web_fetch` and the model get usable links instead of protocol-relative `/l/?uddg=…` wrappers.
+- **DuckDuckGo bot-challenge detection**: empty or blocked DDG responses (anomaly modal / bot wall) fail clearly instead of returning misleading "no results".
 
 ## [0.11.2] - 2026-06-10
 
