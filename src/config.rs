@@ -424,6 +424,12 @@ pub struct ProviderConfig {
     /// Values: "low", "medium", "high"
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Opt-in SSE streaming transport (OpenAI-compatible providers).
+    /// Responses are accumulated to the same shape as buffered calls; a
+    /// stream that dies after partial text is recovered via the
+    /// truncation-recovery path instead of failing the whole call.
+    #[serde(default)]
+    pub streaming: bool,
     #[serde(default)]
     pub models: ModelsConfig,
     /// Ordered cross-provider fallback chain.

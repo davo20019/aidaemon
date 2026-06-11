@@ -3,6 +3,7 @@ mod error;
 mod google_genai;
 pub(crate) mod multimodal;
 mod openai_compatible;
+pub(crate) mod streaming;
 mod xai_native;
 
 use std::time::Duration;

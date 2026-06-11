@@ -30,6 +30,11 @@ pub struct OpenAiCompatibleProvider {
     /// `id_slot` field: the per-call override when present, else `background_slot`.
     /// When disabled, `id_slot` is never emitted (cloud-API safe).
     slot_routing: SlotRoutingConfig,
+    /// Opt-in SSE streaming transport. Deltas are accumulated into the same
+    /// response shape as a non-streaming call; a stream that dies after
+    /// partial text is reported as a `length` cutoff so truncation recovery
+    /// continues it instead of losing the response.
+    streaming: bool,
 }
 
 impl Drop for OpenAiCompatibleProvider {
@@ -142,6 +147,7 @@ impl OpenAiCompatibleProvider {
             max_tokens,
             reasoning_effort: None,
             slot_routing: SlotRoutingConfig::default(),
+            streaming: false,
         })
     }
 
@@ -156,6 +162,199 @@ impl OpenAiCompatibleProvider {
     pub fn with_slot_routing(mut self, slot_routing: SlotRoutingConfig) -> Self {
         self.slot_routing = slot_routing;
         self
+    }
+
+    /// Enable SSE streaming transport (off by default).
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    /// Parse a chat-completions response body (shared by the buffered and
+    /// streaming transports — the stream accumulator reconstructs this
+    /// exact shape).
+    fn parse_chat_response_body(data: &Value, model: &str) -> anyhow::Result<ProviderResponse> {
+        let choice = data["choices"].get(0).ok_or_else(|| {
+            error!("Provider response missing choices[0]");
+            ProviderError::malformed_shape(
+                "Malformed response from LLM provider (missing choices[0])",
+            )
+        })?;
+        let message = choice.get("message").ok_or_else(|| {
+            error!("Provider response missing choices[0].message");
+            ProviderError::malformed_shape(
+                "Malformed response from LLM provider (missing choices[0].message)",
+            )
+        })?;
+
+        let content = message
+            .get("content")
+            .and_then(crate::agent::vision::content_value_as_text);
+
+        let mut tool_calls = Vec::new();
+        if let Some(tcs) = message["tool_calls"].as_array() {
+            debug!(
+                "Raw tool_calls from provider: {}",
+                serde_json::to_string(tcs).unwrap_or_default()
+            );
+            for tc in tcs {
+                let extra_content = tc.get("extra_content").filter(|v| !v.is_null()).cloned();
+
+                tool_calls.push(ToolCall {
+                    id: tc["id"].as_str().unwrap_or("").to_string(),
+                    name: normalize_tool_name(tc["function"]["name"].as_str().unwrap_or("")),
+                    arguments: tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
+                    extra_content,
+                });
+            }
+        }
+
+        let usage = data.get("usage").and_then(|u| {
+            Some(TokenUsage {
+                input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
+                output_tokens: u.get("completion_tokens")?.as_u64()? as u32,
+                cached_input_tokens: Self::cached_input_tokens_from_usage(u),
+                cache_creation_input_tokens: None,
+                model: model.to_string(),
+            })
+        });
+
+        // Detect token-limit truncation: when finish_reason is "length", the
+        // model hit its max_tokens ceiling and the response was cut off
+        // mid-generation.  Surface this so the agent loop can retry or degrade
+        // gracefully instead of treating the empty/broken output as intentional.
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let response_note = if finish_reason == "length" {
+            warn!(
+                model,
+                output_tokens = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
+                "LLM response truncated at token limit (finish_reason=length)"
+            );
+            Some(
+                "Response was truncated because it hit the model's maximum output token limit. \
+                  The output may be incomplete or missing tool calls."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // Extract reasoning/thinking tokens from the response.
+        // OpenRouter returns reasoning as `message.reasoning` (string) or
+        // `message.reasoning_details` (array of objects with `text` field).
+        let thinking = message
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                message
+                    .get("reasoning_details")
+                    .and_then(|v| v.as_array())
+                    .map(|details| {
+                        details
+                            .iter()
+                            .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+            });
+
+        if thinking.is_some() {
+            info!(
+                model,
+                thinking_len = thinking.as_ref().map(|t| t.len()).unwrap_or(0),
+                "Reasoning tokens received from provider"
+            );
+        }
+
+        Ok(ProviderResponse {
+            content,
+            tool_calls,
+            usage,
+            thinking,
+            response_note,
+        })
+    }
+
+    /// Send the request with SSE streaming and accumulate deltas into a
+    /// non-streaming-shaped body. A stream that dies or stalls after
+    /// partial text is finalized as a `length` cutoff so the agent loop's
+    /// truncation recovery continues the response instead of losing it.
+    async fn execute_streaming_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        model: &str,
+        hard_timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        use futures::StreamExt;
+        // Max silence between chunks before declaring the stream stalled.
+        const STREAM_CHUNK_GAP_TIMEOUT: Duration = Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + hard_timeout;
+
+        let resp = request.send().await.map_err(|e| {
+            error!("HTTP request failed: {}", e);
+            anyhow::Error::from(ProviderError::network(&e))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            error!(status = %status, "Provider API error: {}", text);
+            return Err(ProviderError::from_status(status.as_u16(), &text).into());
+        }
+
+        let mut framer = crate::providers::streaming::SseFramer::default();
+        let mut acc = crate::providers::streaming::StreamAccumulator::default();
+        let mut stream = resp.bytes_stream();
+        let interrupted = 'consume: loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let gap = STREAM_CHUNK_GAP_TIMEOUT.min(remaining);
+            if gap.is_zero() {
+                break 'consume true;
+            }
+            match tokio::time::timeout(gap, stream.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    for payload in framer.feed(&bytes) {
+                        if !acc.apply_payload(&payload) {
+                            break 'consume false; // [DONE]
+                        }
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    if !acc.has_partial_output() {
+                        error!(model, "Stream error before any output: {}", e);
+                        return Err(ProviderError::network(&e).into());
+                    }
+                    warn!(
+                        model,
+                        error = %e,
+                        "Stream died mid-response; recovering partial output as length cutoff"
+                    );
+                    break 'consume true;
+                }
+                Ok(None) => break 'consume false, // graceful end without [DONE]
+                Err(_elapsed) => {
+                    if !acc.has_partial_output() {
+                        return Err(ProviderError::timeout_msg(
+                            "LLM streaming call timed out with no output",
+                        )
+                        .into());
+                    }
+                    warn!(
+                        model,
+                        "Stream stalled; recovering partial output as length cutoff"
+                    );
+                    break 'consume true;
+                }
+            }
+        };
+        Ok(acc.finalize(interrupted))
     }
 
     fn with_auth_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -303,6 +502,13 @@ impl OpenAiCompatibleProvider {
             body["id_slot"] = json!(options.id_slot.unwrap_or(self.slot_routing.background_slot));
         }
 
+        if self.streaming {
+            body["stream"] = json!(true);
+            // Ask for usage on the final chunk so token accounting (budgets,
+            // billing-aware retries) keeps working under streaming.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+
         // OpenAI audio models require `modalities` when `input_audio` blocks are present.
         // Text-only agent responses: modalities = ["text"] only (no audio output).
         // If a provider rejects this, it may also require `audio: { voice, format }` —
@@ -390,6 +596,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
         // cap ensures we never block the agent loop indefinitely.
         const LLM_CALL_HARD_TIMEOUT: Duration = Duration::from_secs(360);
 
+        if self.streaming {
+            let data = self
+                .execute_streaming_request(request, model, LLM_CALL_HARD_TIMEOUT)
+                .await?;
+            return Self::parse_chat_response_body(&data, model);
+        }
+
         let (resp, text) = match tokio::time::timeout(LLM_CALL_HARD_TIMEOUT, async {
             let resp = request.send().await.map_err(|e| {
                 error!("HTTP request failed: {}", e);
@@ -449,113 +662,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 e
             ))
         })?;
-        let choice = data["choices"].get(0).ok_or_else(|| {
-            error!("Provider response missing choices[0]");
-            ProviderError::malformed_shape(
-                "Malformed response from LLM provider (missing choices[0])",
-            )
-        })?;
-        let message = choice.get("message").ok_or_else(|| {
-            error!("Provider response missing choices[0].message");
-            ProviderError::malformed_shape(
-                "Malformed response from LLM provider (missing choices[0].message)",
-            )
-        })?;
-
-        let content = message
-            .get("content")
-            .and_then(crate::agent::vision::content_value_as_text);
-
-        let mut tool_calls = Vec::new();
-        if let Some(tcs) = message["tool_calls"].as_array() {
-            debug!(
-                "Raw tool_calls from provider: {}",
-                serde_json::to_string(tcs).unwrap_or_default()
-            );
-            for tc in tcs {
-                let extra_content = tc.get("extra_content").filter(|v| !v.is_null()).cloned();
-
-                tool_calls.push(ToolCall {
-                    id: tc["id"].as_str().unwrap_or("").to_string(),
-                    name: normalize_tool_name(tc["function"]["name"].as_str().unwrap_or("")),
-                    arguments: tc["function"]["arguments"]
-                        .as_str()
-                        .unwrap_or("{}")
-                        .to_string(),
-                    extra_content,
-                });
-            }
-        }
-
-        let usage = data.get("usage").and_then(|u| {
-            Some(TokenUsage {
-                input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
-                output_tokens: u.get("completion_tokens")?.as_u64()? as u32,
-                cached_input_tokens: Self::cached_input_tokens_from_usage(u),
-                cache_creation_input_tokens: None,
-                model: model.to_string(),
-            })
-        });
-
-        // Detect token-limit truncation: when finish_reason is "length", the
-        // model hit its max_tokens ceiling and the response was cut off
-        // mid-generation.  Surface this so the agent loop can retry or degrade
-        // gracefully instead of treating the empty/broken output as intentional.
-        let finish_reason = choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let response_note = if finish_reason == "length" {
-            warn!(
-                model,
-                output_tokens = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
-                "LLM response truncated at token limit (finish_reason=length)"
-            );
-            Some(
-                "Response was truncated because it hit the model's maximum output token limit. \
-                  The output may be incomplete or missing tool calls."
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-
-        // Extract reasoning/thinking tokens from the response.
-        // OpenRouter returns reasoning as `message.reasoning` (string) or
-        // `message.reasoning_details` (array of objects with `text` field).
-        let thinking = message
-            .get("reasoning")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                message
-                    .get("reasoning_details")
-                    .and_then(|v| v.as_array())
-                    .map(|details| {
-                        details
-                            .iter()
-                            .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .filter(|s| !s.is_empty())
-            });
-
-        if thinking.is_some() {
-            info!(
-                model,
-                thinking_len = thinking.as_ref().map(|t| t.len()).unwrap_or(0),
-                "Reasoning tokens received from provider"
-            );
-        }
-
-        Ok(ProviderResponse {
-            content,
-            tool_calls,
-            usage,
-            thinking,
-            response_note,
-        })
+        Self::parse_chat_response_body(&data, model)
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
