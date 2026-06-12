@@ -461,7 +461,6 @@ async fn handle_scheduled_intent(
     agent: &Agent,
     ctx: &mut OrchestrationCtx<'_>,
     mut schedule_raw: String,
-    schedule_cron: Option<String>,
     is_one_shot: bool,
 ) -> anyhow::Result<ResponsePhaseOutcome> {
     if ctx.user_role != UserRole::Owner {
@@ -812,24 +811,7 @@ async fn handle_scheduled_intent(
         .await;
     }
 
-    let mut cron_expr = schedule_cron
-        .as_ref()
-        .filter(|candidate| {
-            let parts: Vec<&str> = candidate.split_whitespace().collect();
-            parts.len() == 5
-        })
-        .and_then(|candidate| candidate.parse::<Cron>().ok().map(|_| candidate.clone()))
-        .or_else(|| {
-            if schedule_cron.is_some() {
-                warn!(
-                    ctx.session_id,
-                    schedule_raw = %schedule_raw,
-                    schedule_cron = ?schedule_cron,
-                    "INTENT_GATE provided invalid schedule_cron; falling back to parser"
-                );
-            }
-            crate::cron_utils::parse_schedule(&schedule_raw).ok()
-        });
+    let mut cron_expr = crate::cron_utils::parse_schedule(&schedule_raw).ok();
 
     // E2E guardrail: if the model provided a malformed schedule string
     // (e.g. "2 minutes" instead of "in 2 minutes"), retry parsing using
@@ -1137,20 +1119,6 @@ async fn handle_scheduled_intent(
         "Scheduled goal awaiting text confirmation.",
     )
     .await
-}
-
-async fn handle_knowledge_intent(
-    agent: &Agent,
-    ctx: &mut OrchestrationCtx<'_>,
-) -> anyhow::Result<ResponsePhaseOutcome> {
-    ensure_orchestrator_tools_loaded(agent, ctx).await?;
-    ctx.pending_system_messages
-        .push(SystemDirective::KnowledgeIntentDirectAnswer);
-    info!(
-        ctx.session_id,
-        "Knowledge intent — classifier-only pass; continuing to execution loop"
-    );
-    Ok(fallthrough())
 }
 
 async fn handle_simple_intent(
@@ -1550,11 +1518,8 @@ pub(super) async fn route_orchestration_complexity(
         }
         IntentComplexity::Scheduled {
             schedule_raw,
-            schedule_cron,
             is_one_shot,
-            schedule_type_explicit: _,
-        } => handle_scheduled_intent(agent, ctx, schedule_raw, schedule_cron, is_one_shot).await,
-        IntentComplexity::Knowledge => handle_knowledge_intent(agent, ctx).await,
+        } => handle_scheduled_intent(agent, ctx, schedule_raw, is_one_shot).await,
         IntentComplexity::Simple => handle_simple_intent(agent, ctx).await,
         IntentComplexity::Complex => handle_complex_intent(agent, ctx).await,
     }

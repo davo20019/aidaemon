@@ -59,57 +59,17 @@ fn user_text_references_file_ignores_plain_chat() {
 }
 
 #[test]
-fn test_extract_intent_gate_single_line_json() {
-    let input = "Answer first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[\"deployment_url\"]}";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "Answer first.");
-    let gate = gate.expect("expected parsed intent gate");
-    assert_eq!(gate.can_answer_now, Some(false));
-    assert_eq!(gate.needs_tools, Some(true));
-    assert_eq!(gate.needs_clarification, Some(false));
-    assert_eq!(gate.missing_info, vec!["deployment_url".to_string()]);
-}
-
-#[test]
-fn test_extract_intent_gate_two_line_json() {
-    let input = "Answer first.\n[INTENT_GATE]\n{\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "Answer first.");
-    let gate = gate.expect("expected parsed intent gate");
-    assert_eq!(gate.can_answer_now, Some(true));
-    assert_eq!(gate.needs_tools, Some(false));
-}
-
-#[test]
-fn test_extract_intent_gate_trailing_json_braces_in_strings() {
-    // Fallback path: no [INTENT_GATE] marker, trailing JSON in a code fence.
-    // The JSON contains a '{' inside a string, which breaks naive brace-counting.
-    let input = "Answer here.\n\n```json\n{\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":true,\"clarifying_question\":\"contains { brace\",\"missing_info\":[\"deployment_url\"],\"complexity\":\"simple\"}\n```";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "Answer here.");
-    let gate = gate.expect("expected parsed intent gate");
-    assert_eq!(gate.can_answer_now, Some(false));
-    assert_eq!(gate.needs_tools, Some(true));
-    assert_eq!(gate.needs_clarification, Some(true));
-    assert_eq!(gate.missing_info, vec!["deployment_url".to_string()]);
-}
-
-#[test]
 fn test_infer_intent_gate_no_textual_fallback_inference() {
-    // With lexical fallback inference disabled, missing model fields remain None.
+    // With lexical fallback inference disabled, an unarmed turn stays None.
     let gate = infer_intent_gate("check the site", "I can look it up.");
-    assert_eq!(gate.can_answer_now, None);
     assert_eq!(gate.needs_tools, None);
-    assert_eq!(gate.needs_clarification, None);
 }
 
 #[test]
 fn test_infer_intent_gate_path_still_forces_tools() {
-    // Deterministic fallback: filesystem paths always require tools.
+    // Deterministic rule: filesystem paths always require tools.
     let gate = infer_intent_gate("check /tmp/app.log", "I can look it up.");
-    assert_eq!(gate.can_answer_now, Some(false));
     assert_eq!(gate.needs_tools, Some(true));
-    assert_eq!(gate.needs_clarification, Some(false));
 }
 
 #[test]
@@ -153,19 +113,6 @@ fn test_user_explicitly_requests_local_file_inspection_does_not_flag_api_only_tu
     assert!(!user_explicitly_requests_local_file_inspection(
         "Check the connected API status"
     ));
-}
-
-#[test]
-fn test_infer_intent_gate_does_not_guess_clarification_from_text() {
-    let gate = infer_intent_gate("update the site", "Could you clarify which site you mean?");
-    assert_eq!(gate.needs_clarification, None);
-}
-
-#[test]
-fn test_infer_intent_gate_does_not_infer_schedule_from_user_text() {
-    let gate = infer_intent_gate("send me a reminder in 2h", "Let me do that.");
-    assert!(gate.schedule.is_none());
-    assert!(gate.schedule_type.is_none());
 }
 
 #[test]
@@ -379,52 +326,6 @@ fn test_sanitize_response_analysis_strips_consultation_heading() {
         "I don't have the URL yet.\n\n[Consultation]\nTo find it I'd inspect wrangler.toml.";
     let out = sanitize_response_analysis(input);
     assert!(!out.contains("[Consultation]"));
-}
-
-#[test]
-fn test_extract_intent_gate_bare_json_without_marker() {
-    let input = "The capital of France is Paris.\n{\"complexity\":\"knowledge\"}";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "The capital of France is Paris.");
-    let gate = gate.expect("expected parsed intent gate from bare JSON");
-    assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
-}
-
-#[test]
-fn test_extract_intent_gate_code_fenced_json() {
-    let input = "The capital of France is Paris.\n```json\n{\"complexity\":\"knowledge\"}\n```";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "The capital of France is Paris.");
-    let gate = gate.expect("expected parsed intent gate from fenced JSON");
-    assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
-}
-
-#[test]
-fn test_extract_intent_gate_bare_json_with_spaces() {
-    let input = "Answer here.\n\n{ \"complexity\": \"simple\", \"can_answer_now\": false, \"needs_tools\": true }";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert!(!cleaned.contains("complexity"));
-    let gate = gate.expect("expected parsed intent gate");
-    assert_eq!(gate.complexity.as_deref(), Some("simple"));
-    assert_eq!(gate.can_answer_now, Some(false));
-}
-
-#[test]
-fn test_extract_intent_gate_multiline_bare_json() {
-    let input = "The largest planet is Jupiter.\n\n{\n  \"complexity\": \"knowledge\"\n}";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert_eq!(cleaned, "The largest planet is Jupiter.");
-    let gate = gate.expect("expected parsed intent gate from multi-line JSON");
-    assert_eq!(gate.complexity.as_deref(), Some("knowledge"));
-}
-
-#[test]
-fn test_extract_intent_gate_bare_json_does_not_strip_unrelated_json() {
-    // JSON that doesn't contain intent gate fields should NOT be stripped
-    let input = "Here is the data:\n{\"name\":\"Alice\",\"age\":30}";
-    let (cleaned, gate) = extract_intent_gate(input);
-    assert!(gate.is_none());
-    assert!(cleaned.contains("{\"name\":\"Alice\""));
 }
 
 #[test]

@@ -842,11 +842,11 @@ Rules: no invented event IDs; confidence 0..1.",
         ];
 
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let fast_model = runtime_snapshot.fast_model();
+        let model = runtime_snapshot.primary_model();
         let call_start = std::time::Instant::now();
         let resp: ProviderResponse = match runtime_snapshot
             .provider()
-            .chat(&fast_model, &messages, &[])
+            .chat(&model, &messages, &[])
             .await
         {
             Ok(r) => r,
@@ -857,7 +857,7 @@ Rules: no invented event IDs; confidence 0..1.",
             self.state.as_ref(),
             "background:diagnose",
             "diagnose",
-            &fast_model,
+            &model,
             &resp,
             call_start.elapsed(),
         )

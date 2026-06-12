@@ -6,7 +6,6 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use croner::Cron;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
@@ -77,13 +76,6 @@ const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minut
 /// scheduled goal" meta-queries to avoid accidental schedule creation.
 const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 
-#[cfg(test)]
-#[path = "intent/intent_gate.rs"]
-mod intent_gate;
-#[cfg(test)]
-use intent_gate::extract_intent_gate;
-#[cfg(test)]
-use intent_gate::parse_intent_gate_json;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]

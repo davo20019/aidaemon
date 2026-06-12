@@ -88,7 +88,7 @@ pub(in crate::agent) async fn run_orchestration_phase(
     }
 
     // Orchestration routing (always-on).
-    let (complexity, _) = classify_intent_complexity(ctx.user_text, ctx.intent_gate);
+    let complexity = classify_intent_complexity(ctx.user_text);
     let (route, tools_required) = orchestration_route_label(&complexity);
     if agent.harness_eval_enabled() {
         agent
@@ -104,7 +104,6 @@ fn orchestration_route_label(complexity: &IntentComplexity) -> (&'static str, bo
     match complexity {
         IntentComplexity::ScheduledMissingTiming => ("clarification_required", false),
         IntentComplexity::Scheduled { .. } => ("direct_reply", false),
-        IntentComplexity::Knowledge => ("default_continue", false),
         IntentComplexity::Simple => ("default_continue", false),
         IntentComplexity::Complex => ("tools_required", true),
     }

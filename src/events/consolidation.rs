@@ -797,7 +797,7 @@ impl Consolidator {
         let runtime = self.llm_runtime.as_ref()?;
         let runtime_snapshot = runtime.snapshot();
         let provider = runtime_snapshot.provider();
-        let fast_model = runtime_snapshot.fast_model();
+        let model = runtime_snapshot.primary_model();
 
         let step_count = proc.steps.len();
         let duration_str = proc
@@ -833,7 +833,7 @@ impl Consolidator {
         ];
 
         let call_start = std::time::Instant::now();
-        let response = match provider.chat(&fast_model, &llm_messages, &[]).await {
+        let response = match provider.chat(&model, &llm_messages, &[]).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("LLM enhancement failed for procedure: {}", e);
@@ -847,7 +847,7 @@ impl Consolidator {
                 state.as_ref(),
                 "background:consolidation",
                 "consolidation",
-                &fast_model,
+                &model,
                 &response,
                 call_start.elapsed(),
             )

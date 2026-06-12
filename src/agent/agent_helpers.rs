@@ -300,27 +300,22 @@ pub(in crate::agent) fn summarize_tool_args(name: &str, arguments: &str) -> Stri
     }
 }
 
+/// Per-turn intent decision, populated only by deterministic heuristics
+/// (`infer_intent_gate` keyword rules, deterministic cancel detection in
+/// `main_loop.rs`). The model-populated `[INTENT_GATE]` protocol that once
+/// filled additional fields was removed with the consultant system in
+/// v0.9.21.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub(in crate::agent) struct IntentGateDecision {
-    pub(in crate::agent) can_answer_now: Option<bool>,
+    /// Heuristics armed the tool requirement: the request references the
+    /// filesystem, local execution, auth/integration management, or a
+    /// connected API and cannot be satisfied by a text-only reply.
     pub(in crate::agent) needs_tools: Option<bool>,
-    pub(in crate::agent) needs_clarification: Option<bool>,
-    pub(in crate::agent) clarifying_question: Option<String>,
-    pub(in crate::agent) missing_info: Vec<String>,
-    pub(in crate::agent) complexity: Option<String>,
-    /// LLM-classified: true when user explicitly asks to cancel active work.
+    /// True when the user explicitly asks to cancel active work.
     pub(in crate::agent) cancel_intent: Option<bool>,
-    /// LLM-classified cancel scope: "generic" (broad cancel) or
-    /// "targeted" (specific goal/task).
+    /// Cancel scope: "generic" (broad cancel) or "targeted" (specific
+    /// goal/task).
     pub(in crate::agent) cancel_scope: Option<String>,
-    /// LLM-classified: true when the user's message is a pure conversational
-    /// acknowledgment with no embedded request (works across all languages).
-    pub(in crate::agent) is_acknowledgment: Option<bool>,
-    pub(in crate::agent) schedule: Option<String>,
-    pub(in crate::agent) schedule_type: Option<String>,
-    pub(in crate::agent) schedule_cron: Option<String>,
-    pub(in crate::agent) domains: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -745,39 +740,6 @@ pub(in crate::agent) fn filter_tool_defs_for_untrusted_external_reference(
         })
         .cloned()
         .collect()
-}
-
-#[allow(dead_code)]
-fn merge_intent_gate_decision(
-    model_decision: Option<IntentGateDecision>,
-    inferred: IntentGateDecision,
-) -> IntentGateDecision {
-    let Some(model) = model_decision else {
-        return inferred;
-    };
-    IntentGateDecision {
-        can_answer_now: model.can_answer_now.or(inferred.can_answer_now),
-        needs_tools: model.needs_tools.or(inferred.needs_tools),
-        needs_clarification: model.needs_clarification.or(inferred.needs_clarification),
-        clarifying_question: model.clarifying_question.or(inferred.clarifying_question),
-        missing_info: if model.missing_info.is_empty() {
-            inferred.missing_info
-        } else {
-            model.missing_info
-        },
-        complexity: model.complexity.or(inferred.complexity),
-        cancel_intent: model.cancel_intent.or(inferred.cancel_intent),
-        cancel_scope: model.cancel_scope.or(inferred.cancel_scope),
-        is_acknowledgment: model.is_acknowledgment.or(inferred.is_acknowledgment),
-        schedule: model.schedule.or(inferred.schedule),
-        schedule_type: model.schedule_type.or(inferred.schedule_type),
-        schedule_cron: model.schedule_cron.or(inferred.schedule_cron),
-        domains: if model.domains.is_empty() {
-            inferred.domains
-        } else {
-            model.domains
-        },
-    }
 }
 
 #[cfg(test)]

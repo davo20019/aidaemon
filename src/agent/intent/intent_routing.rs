@@ -5,8 +5,6 @@ use super::{IntentGateDecision, ENABLE_SCHEDULE_HEURISTICS};
 /// Complexity classification for orchestration routing.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum IntentComplexity {
-    /// Answer from memory/knowledge, no executor needed.
-    Knowledge,
     /// Simple task — falls through to full agent loop.
     Simple,
     /// Multi-step complex task, create a goal and fall through to current agent loop.
@@ -16,9 +14,7 @@ pub(super) enum IntentComplexity {
     /// Scheduled task intent requiring deferred/recurring goal creation.
     Scheduled {
         schedule_raw: String,
-        schedule_cron: Option<String>,
         is_one_shot: bool,
-        schedule_type_explicit: bool,
     },
 }
 
@@ -371,46 +367,20 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
     //    - connected API writes
     //
     // These requests cannot be satisfied by a text-only first-pass response and
-    // must run through the tool loop, regardless of model intent-gate output.
+    // must run through the tool loop.
     if super::user_text_references_filesystem_path(&user_text)
         || user_text_requires_local_tool_execution(&user_text)
         || user_text_requests_auth_or_integration_management(&user_text)
         || classify_connected_api_intent(&user_text).is_some()
     {
         return IntentGateDecision {
-            can_answer_now: Some(false),
             needs_tools: Some(true),
-            needs_clarification: Some(false),
-            clarifying_question: None,
-            missing_info: Vec::new(),
-            complexity: None,
-            cancel_intent: None,
-            cancel_scope: None,
-            is_acknowledgment: None,
-            schedule: None,
-            schedule_type: None,
-            schedule_cron: None,
-            domains: Vec::new(),
+            ..Default::default()
         };
     }
 
-    // No lexical guessing fallback: rely on explicit model intent-gate fields.
-    // Missing fields simply stay None.
-    IntentGateDecision {
-        can_answer_now: None,
-        needs_tools: None,
-        needs_clarification: None,
-        clarifying_question: None,
-        missing_info: Vec::new(),
-        complexity: None,
-        cancel_intent: None,
-        cancel_scope: None,
-        is_acknowledgment: None,
-        schedule: None,
-        schedule_type: None,
-        schedule_cron: None,
-        domains: Vec::new(),
-    }
+    // No lexical guessing fallback: missing signals simply stay None.
+    IntentGateDecision::default()
 }
 
 fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
@@ -1150,97 +1120,38 @@ pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<Connected
 
 /// Classify user intent complexity for orchestration routing.
 ///
-/// Uses the LLM-provided `complexity` field from the `[INTENT_GATE]` JSON.
-/// Falls back to `Simple` when the field is absent or unrecognized.
-///
-/// Guardrails override the LLM's "complex" classification for messages that
-/// are clearly simple — the first-pass classifier over-classifies short
-/// commands, acknowledgments, and single-action requests as complex.
-pub(super) fn classify_intent_complexity(
-    user_text: &str,
-    intent_gate: &IntentGateDecision,
-) -> (IntentComplexity, Vec<String>) {
-    // Heuristic schedule extraction: if the model omitted schedule fields but the
-    // user message contains a concrete schedule phrase, treat it as scheduled
-    // rather than falling back into the tool loop (which can spiral).
-    if ENABLE_SCHEDULE_HEURISTICS
-        && intent_gate.schedule.is_none()
-        && intent_gate.schedule_cron.is_none()
-    {
+/// Fully deterministic: schedule extraction, recurring-without-timing
+/// detection, and a complex-request fallback for obviously cross-project
+/// multi-step requests. Everything else routes as `Simple` (full agent
+/// loop). The LLM-provided `complexity` field this once consumed died with
+/// the `[INTENT_GATE]` protocol in v0.9.21.
+pub(super) fn classify_intent_complexity(user_text: &str) -> IntentComplexity {
+    // Heuristic schedule extraction: if the user message contains a concrete
+    // schedule phrase, treat it as scheduled rather than falling into the
+    // tool loop (which can spiral).
+    if ENABLE_SCHEDULE_HEURISTICS {
         if let Some((schedule_raw, is_one_shot)) = detect_schedule_heuristic(user_text) {
-            return (
-                IntentComplexity::Scheduled {
-                    schedule_raw,
-                    schedule_cron: None,
-                    is_one_shot,
-                    schedule_type_explicit: false,
-                },
-                vec![],
-            );
+            return IntentComplexity::Scheduled {
+                schedule_raw,
+                is_one_shot,
+            };
+        }
+
+        // If user clearly wants recurring behavior but no timing could be
+        // extracted, ask for schedule details instead of silently creating a
+        // non-recurring goal.
+        if looks_like_recurring_intent_without_timing(user_text) {
+            return IntentComplexity::ScheduledMissingTiming;
         }
     }
 
-    // If user clearly wants recurring behavior but no timing could be extracted,
-    // ask for schedule details instead of silently creating a non-recurring goal.
-    if ENABLE_SCHEDULE_HEURISTICS
-        && intent_gate.schedule.is_none()
-        && intent_gate.schedule_cron.is_none()
-        && looks_like_recurring_intent_without_timing(user_text)
-    {
-        return (IntentComplexity::ScheduledMissingTiming, vec![]);
+    // Promote obviously cross-project / multi-question, multi-step requests
+    // to Complex.
+    if looks_like_complex_request_fallback(user_text) {
+        return IntentComplexity::Complex;
     }
 
-    // Schedule takes priority over all other classifications.
-    if let Some(ref schedule_raw) = intent_gate.schedule {
-        let schedule_type_explicit = intent_gate.schedule_type.is_some();
-        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
-        return (
-            IntentComplexity::Scheduled {
-                schedule_raw: schedule_raw.clone(),
-                schedule_cron: intent_gate.schedule_cron.clone(),
-                is_one_shot,
-                schedule_type_explicit,
-            },
-            vec![],
-        );
-    }
-    if let Some(ref schedule_cron) = intent_gate.schedule_cron {
-        let schedule_type_explicit = intent_gate.schedule_type.is_some();
-        let is_one_shot = intent_gate.schedule_type.as_deref() == Some("one_shot");
-        return (
-            IntentComplexity::Scheduled {
-                schedule_raw: schedule_cron.clone(),
-                schedule_cron: Some(schedule_cron.clone()),
-                is_one_shot,
-                schedule_type_explicit,
-            },
-            vec![],
-        );
-    }
-
-    if intent_gate.can_answer_now.unwrap_or(false) && !intent_gate.needs_tools.unwrap_or(false) {
-        return (IntentComplexity::Knowledge, vec![]);
-    }
-
-    // Consultant-empty fallback: when the model omits `complexity`, promote
-    // obviously cross-project / multi-question, multi-step requests to Complex.
-    if intent_gate.complexity.is_none() && looks_like_complex_request_fallback(user_text) {
-        return (IntentComplexity::Complex, vec![]);
-    }
-
-    // When can_answer_now=false, don't classify as Knowledge even if
-    // complexity="knowledge" — the model can't answer, so we should
-    // try tools (memory search, manage_people, etc.) as Simple.
-    match intent_gate.complexity.as_deref() {
-        Some("knowledge") => (IntentComplexity::Simple, vec![]),
-        Some("read_only_investigation") => (IntentComplexity::Simple, vec![]),
-        Some("scoped_modification") => (IntentComplexity::Simple, vec![]),
-        Some("unscoped_modification") => (IntentComplexity::Complex, vec![]),
-        Some("deployment_or_external_write") => (IntentComplexity::Complex, vec![]),
-        Some("scheduled_action") => (IntentComplexity::Complex, vec![]),
-        Some("complex") => (IntentComplexity::Complex, vec![]),
-        _ => (IntentComplexity::Simple, vec![]),
-    }
+    IntentComplexity::Simple
 }
 
 fn looks_like_complex_request_fallback(user_text: &str) -> bool {
@@ -1365,7 +1276,6 @@ mod intent_routing_path_override_tests {
     fn infer_intent_gate_forces_tools_for_local_installed_version_query() {
         let d = infer_intent_gate("What version of rustc is installed on this machine?", "");
         assert_eq!(d.needs_tools, Some(true));
-        assert_eq!(d.can_answer_now, Some(false));
     }
 
     #[test]
@@ -1375,7 +1285,6 @@ mod intent_routing_path_override_tests {
             "",
         );
         assert_eq!(d.needs_tools, Some(true));
-        assert_eq!(d.can_answer_now, Some(false));
     }
 
     #[test]
@@ -1402,7 +1311,6 @@ mod intent_routing_path_override_tests {
     fn infer_intent_gate_forces_tools_for_runtime_capability_validation() {
         let d = infer_intent_gate("Can you check if you can post to Twitter right now?", "");
         assert_eq!(d.needs_tools, Some(true));
-        assert_eq!(d.can_answer_now, Some(false));
     }
 
     #[test]
@@ -1412,14 +1320,12 @@ mod intent_routing_path_override_tests {
             "",
         );
         assert_eq!(d.needs_tools, Some(true));
-        assert_eq!(d.can_answer_now, Some(false));
     }
 
     #[test]
     fn infer_intent_gate_forces_tools_for_auth_management_request() {
         let d = infer_intent_gate("Connect my Twitter account so you can post for me.", "");
         assert_eq!(d.needs_tools, Some(true));
-        assert_eq!(d.can_answer_now, Some(false));
     }
 
     #[test]

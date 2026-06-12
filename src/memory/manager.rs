@@ -652,13 +652,13 @@ impl MemoryManager {
                 json!({"role": "user", "content": conversation}),
             ];
 
-            // Call LLM with fast model, no tools
+            // Background LLM call, no tools
             let runtime_snapshot = self.llm_runtime.snapshot();
-            let fast_model = runtime_snapshot.fast_model();
+            let model = runtime_snapshot.primary_model();
             let call_start = std::time::Instant::now();
             match runtime_snapshot
                 .provider()
-                .chat(&fast_model, &llm_messages, &[])
+                .chat(&model, &llm_messages, &[])
                 .await
             {
                 Ok(response) => {
@@ -668,7 +668,7 @@ impl MemoryManager {
                             state.as_ref(),
                             "background:memory_consolidation",
                             "memory_consolidation",
-                            &fast_model,
+                            &model,
                             &response,
                             call_start.elapsed(),
                         )
@@ -1299,11 +1299,11 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         ];
 
         let runtime_snapshot = self.llm_runtime.snapshot();
-        let fast_model = runtime_snapshot.fast_model();
+        let model = runtime_snapshot.primary_model();
         let call_start = std::time::Instant::now();
         let response = runtime_snapshot
             .provider()
-            .chat(&fast_model, &llm_messages, &[])
+            .chat(&model, &llm_messages, &[])
             .await?;
 
         if let (Some(event_store), Some(state)) = (&self.event_store, &self.state) {
@@ -1312,7 +1312,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                 state.as_ref(),
                 "background:episode_creation",
                 "episode_creation",
-                &fast_model,
+                &model,
                 &response,
                 call_start.elapsed(),
             )

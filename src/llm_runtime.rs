@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::config::{ModelsConfig, ProviderKind};
-use crate::router::{Router, Tier};
+use crate::router::Router;
 use crate::traits::ModelProvider;
 
 #[derive(Clone)]
@@ -82,12 +82,6 @@ impl LlmRuntimeSnapshot {
         self.failover_targets.clone()
     }
 
-    pub fn fast_model(&self) -> String {
-        self.router
-            .as_ref()
-            .map(|r| r.select(Tier::Fast).to_string())
-            .unwrap_or_else(|| self.primary_model.clone())
-    }
 }
 
 #[derive(Clone)]
