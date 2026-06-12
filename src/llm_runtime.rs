@@ -81,7 +81,6 @@ impl LlmRuntimeSnapshot {
     pub fn failover_targets(&self) -> Vec<ProviderRuntimeTarget> {
         self.failover_targets.clone()
     }
-
 }
 
 #[derive(Clone)]
