@@ -26,6 +26,9 @@ pub struct OpenAiCompatibleProvider {
     /// thinking/reasoning tokens (supported by OpenRouter, Anthropic, etc.).
     /// Values: "low", "medium", "high", "xhigh"
     pub reasoning_effort: Option<String>,
+    /// Opt-in llama.cpp chat-template thinking. Disabled by default because
+    /// cloud OpenAI-compatible APIs may reject these llama.cpp-only fields.
+    llama_cpp_thinking: bool,
     /// Opt-in llama.cpp slot routing. When `enabled`, every request carries an
     /// `id_slot` field: the per-call override when present, else `background_slot`.
     /// When disabled, `id_slot` is never emitted (cloud-API safe).
@@ -146,6 +149,7 @@ impl OpenAiCompatibleProvider {
             extra_headers: extra_headers.unwrap_or_default(),
             max_tokens,
             reasoning_effort: None,
+            llama_cpp_thinking: false,
             slot_routing: SlotRoutingConfig::default(),
             streaming: false,
         })
@@ -154,6 +158,12 @@ impl OpenAiCompatibleProvider {
     /// Enable reasoning/thinking tokens with the given effort level.
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Enable llama.cpp chat-template thinking controls.
+    pub fn with_llama_cpp_thinking(mut self, enabled: bool) -> Self {
+        self.llama_cpp_thinking = enabled;
         self
     }
 
@@ -252,6 +262,12 @@ impl OpenAiCompatibleProvider {
             .get("reasoning")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+            .or_else(|| {
+                message
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .or_else(|| {
                 message
                     .get("reasoning_details")
@@ -492,6 +508,13 @@ impl OpenAiCompatibleProvider {
                 });
             }
             // else: "off" → omit reasoning param to disable thinking entirely
+        }
+
+        if self.llama_cpp_thinking && effective_reasoning != Some("off") {
+            body["chat_template_kwargs"] = json!({
+                "enable_thinking": true,
+            });
+            body["reasoning_format"] = json!("deepseek");
         }
 
         // llama.cpp KV-cache slot pinning. Only emitted when explicitly enabled
@@ -895,6 +918,71 @@ mod tests {
             body.get("id_slot").is_none(),
             "id_slot must be omitted entirely when slot routing is disabled"
         );
+    }
+
+    #[test]
+    fn llama_cpp_thinking_disabled_preserves_request_shape() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080/v1", "test-key")
+            .expect("provider should initialize");
+        let messages = vec![json!({"role":"user","content":"hi"})];
+
+        let body =
+            provider.build_request_body("gemma-4-26b", &messages, &[], &ChatOptions::default());
+
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("reasoning_format").is_none());
+    }
+
+    #[test]
+    fn llama_cpp_thinking_enabled_adds_template_controls() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080/v1", "test-key")
+            .expect("provider should initialize")
+            .with_llama_cpp_thinking(true);
+        let messages = vec![json!({"role":"user","content":"hi"})];
+
+        let body =
+            provider.build_request_body("gemma-4-26b", &messages, &[], &ChatOptions::default());
+
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["reasoning_format"], "deepseek");
+    }
+
+    #[test]
+    fn llama_cpp_thinking_off_override_restores_disabled_request_shape() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080/v1", "test-key")
+            .expect("provider should initialize")
+            .with_llama_cpp_thinking(true);
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let options = ChatOptions {
+            reasoning_effort_override: Some("off".to_string()),
+            ..ChatOptions::default()
+        };
+
+        let body = provider.build_request_body("gemma-4-26b", &messages, &[], &options);
+
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("reasoning_format").is_none());
+    }
+
+    #[test]
+    fn reasoning_content_is_private_and_separate_from_final_content() {
+        let response = OpenAiCompatibleProvider::parse_chat_response_body(
+            &json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "final answer",
+                        "reasoning_content": "private trace"
+                    }
+                }]
+            }),
+            "gemma-4-26b",
+        )
+        .expect("response should parse");
+
+        assert_eq!(response.thinking.as_deref(), Some("private trace"));
+        assert_eq!(response.content.as_deref(), Some("final answer"));
     }
 
     #[test]

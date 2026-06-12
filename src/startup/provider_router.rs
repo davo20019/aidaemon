@@ -40,6 +40,7 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?
             .with_reasoning_effort(config.reasoning_effort.clone())
+            .with_llama_cpp_thinking(config.llama_cpp_thinking)
             .with_slot_routing(config.slot_routing.clone())
             .with_streaming(config.streaming),
         ),

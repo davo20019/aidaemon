@@ -424,6 +424,11 @@ pub struct ProviderConfig {
     /// Values: "low", "medium", "high"
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Enable llama.cpp chat-template thinking for models such as Gemma.
+    /// Disabled by default so other OpenAI-compatible providers receive the
+    /// same request shape used before this option was introduced.
+    #[serde(default)]
+    pub llama_cpp_thinking: bool,
     /// Opt-in SSE streaming transport (OpenAI-compatible providers).
     /// Responses are accumulated to the same shape as buffered calls; a
     /// stream that dies after partial text is recovered via the
@@ -3716,6 +3721,35 @@ primary = "claude-sonnet-4-20250514"
 "#;
         let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
         assert_eq!(cfg.provider.max_tokens, Some(32768));
+    }
+
+    #[test]
+    fn provider_llama_cpp_thinking_defaults_to_disabled() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gemma-4-26b"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert!(!cfg.provider.llama_cpp_thinking);
+    }
+
+    #[test]
+    fn provider_llama_cpp_thinking_parses_when_enabled() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+llama_cpp_thinking = true
+
+[provider.models]
+primary = "gemma-4-26b"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert!(cfg.provider.llama_cpp_thinking);
     }
 
     #[test]
