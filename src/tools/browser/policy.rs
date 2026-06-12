@@ -9,7 +9,7 @@
 //!
 //! | Class            | Actions                                 | Notes                                   |
 //! |------------------|-----------------------------------------|-----------------------------------------|
-//! | `Observation`    | get_text, screenshot, wait, list_tabs   | Read-only; no page mutations            |
+//! | `Observation`    | get_text, screenshot, scroll, wait, list_tabs | Read-only; no page mutations       |
 //! | `Navigation`     | navigate, new_tab, switch_tab           | Changes current URL / active tab        |
 //! | `Mutation`       | click, fill, execute_js                 | Alters page state; `execute_js` always sensitive |
 //! | `Administrative` | close, close_tab, set_mode              | Lifecycle ops; not in the plan's 3 buckets but needed for completeness |
@@ -170,7 +170,7 @@ fn is_consequential(text: &str) -> bool {
 pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> BrowserActionRisk {
     match action {
         // ── Observation ───────────────────────────────────────────────────────
-        "get_text" | "screenshot" | "wait" | "list_tabs" | "get_console_logs"
+        "get_text" | "screenshot" | "scroll" | "wait" | "list_tabs" | "get_console_logs"
         | "get_network_errors" => BrowserActionRisk {
             class: BrowserRiskClass::Observation,
             sensitive: false,
@@ -235,6 +235,7 @@ mod tests {
         for action in &[
             "get_text",
             "screenshot",
+            "scroll",
             "wait",
             "list_tabs",
             "get_console_logs",

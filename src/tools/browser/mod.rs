@@ -1144,6 +1144,30 @@ impl BrowserTool {
         Ok(text)
     }
 
+    async fn action_scroll(&self, args: &Value, session_id: &str) -> Result<String, String> {
+        let direction = args
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .unwrap_or("down");
+        let amount = args
+            .get("amount")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(700);
+        if !(1..=5000).contains(&amount) {
+            return Err("Parameter 'amount' must be between 1 and 5000 pixels".to_string());
+        }
+
+        let delta_y = match direction {
+            "down" => amount,
+            "up" => -amount,
+            _ => return Err("Parameter 'direction' must be 'up' or 'down'".to_string()),
+        };
+
+        let (page, _guard) = self.page_for(session_id).await?;
+        page.scroll_by(delta_y).await?;
+        Ok(format!("Scrolled {direction} {amount} pixels"))
+    }
+
     async fn action_execute_js(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let script = args
             .get("script")
@@ -1345,6 +1369,10 @@ impl BrowserTool {
                 .action_get_text(args, session_id)
                 .await
                 .map(DispatchResult::text_only),
+            "scroll" => self
+                .action_scroll(args, session_id)
+                .await
+                .map(DispatchResult::text_only),
             "execute_js" => self
                 .action_execute_js(args, session_id)
                 .await
@@ -1383,7 +1411,7 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "close" => self.action_close().await.map(DispatchResult::text_only),
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
         }
@@ -1747,19 +1775,19 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a browser to navigate pages, click elements, fill forms, take screenshots, extract text, and execute JavaScript. Supports headless and visible modes."
+        "Control a browser to navigate pages, click elements, fill forms, scroll, take screenshots, extract text, and execute JavaScript. Supports headless and visible modes."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
+            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), scroll (move the active page up or down), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
+                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "scroll", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
                         "description": "The browser action to perform"
                     },
                     "url": {
@@ -1777,6 +1805,17 @@ impl Tool for BrowserTool {
                     "value": {
                         "type": "string",
                         "description": "Text to type (for 'fill') or mode to set (for 'set_mode': 'visible' or 'headless')"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down"],
+                        "description": "Direction for 'scroll' (default: down)"
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "description": "Distance in pixels for 'scroll' (default: 700)"
                     },
                     "script": {
                         "type": "string",
@@ -1855,6 +1894,7 @@ impl Tool for BrowserTool {
             }
             Some("get_text") => ToolCallSemantics::observation()
                 .with_verification_mode(ToolVerificationMode::ResultContent),
+            Some("scroll") => ToolCallSemantics::observation(),
             Some("wait") => ToolCallSemantics::observation()
                 .with_verification_mode(ToolVerificationMode::ResultContent),
             Some("screenshot") => ToolCallSemantics::observation(),

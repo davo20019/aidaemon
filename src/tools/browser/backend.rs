@@ -97,6 +97,9 @@ pub trait PageHandle: Send + Sync {
     /// `document.body.innerText` of the page.
     async fn body_text(&self) -> Result<String, String>;
 
+    /// Scroll the page vertically by a bounded pixel delta.
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String>;
+
     /// Capture a screenshot. When `selector` is `Some`, screenshots that
     /// element (and `full_page` is ignored — the element bounds define the
     /// capture). When `selector` is `None`, captures the VIEWPORT by default
@@ -1012,6 +1015,14 @@ impl PageHandle for ChromiumoxidePage {
             .unwrap_or_else(|_| "(could not extract text)".to_string()))
     }
 
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String> {
+        self.page
+            .evaluate(format!("window.scrollBy(0, {delta_y})"))
+            .await
+            .map_err(|e| format!("Failed to scroll page: {}", e))?;
+        Ok(())
+    }
+
     async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {
         if let Some(selector) = selector {
             // Element capture: the element's bounds define the image; full_page
@@ -1135,6 +1146,7 @@ pub enum MockCall {
     Evaluate(String),
     InnerText(String),
     BodyText,
+    Scroll(i64),
     /// Recorded by `screenshot`. Fields: (selector, full_page) — lets tests
     /// assert the viewport default (`full_page=false`) vs. explicit full-page.
     Screenshot(Option<String>, bool),
@@ -1647,6 +1659,11 @@ impl PageHandle for MockPage {
             return Err(err);
         }
         Ok(self.text_result.clone())
+    }
+
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String> {
+        self.record(MockCall::Scroll(delta_y)).await;
+        Ok(())
     }
 
     async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {

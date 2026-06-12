@@ -104,6 +104,43 @@ async fn dispatch_observation_navigate_routes_through_backend() {
 }
 
 #[tokio::test]
+async fn dispatch_observation_scroll_routes_without_approval() {
+    let (tool, backend, _rx) = no_channel_tool(MockBackend::new());
+
+    let args = json!({
+        "action": "scroll",
+        "direction": "down",
+        "tab_id": "0",
+        "_session_id": "sess-a"
+    });
+    let out = tool.call(&args.to_string()).await.unwrap();
+    assert_eq!(out, "Scrolled down 700 pixels");
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(
+        calls.contains(&MockCall::Scroll(700)),
+        "scroll must route through the bounded backend primitive: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn schema_exposes_scroll_direction_and_amount() {
+    let (tool, _backend, _rx) = mock_tool();
+    let schema = tool.schema();
+    let properties = &schema["parameters"]["properties"];
+    let actions = properties["action"]["enum"].as_array().unwrap();
+
+    assert!(actions.iter().any(|action| action == "scroll"));
+    assert_eq!(
+        properties["direction"]["enum"],
+        json!(["up", "down"]),
+        "scroll direction must use the model's conventional up/down shape"
+    );
+    assert_eq!(properties["amount"]["type"], "integer");
+}
+
+#[tokio::test]
 async fn dispatch_mutation_click_routes_through_backend() {
     let (tool, backend, _rx) = mock_tool();
 
