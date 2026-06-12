@@ -168,6 +168,20 @@ pub(in crate::agent) enum SystemDirective {
     LocateFileInsteadOfAsking {
         user_text_hint: String,
     },
+    /// The candidate final reply enumerates name-like list entries that
+    /// appear in no tool output (and not in the user's message) this turn —
+    /// the signature of fabricated list content (e.g. invented roster
+    /// members). Injected once per turn to force a grounded rewrite.
+    UngroundedListEntities {
+        entities: Vec<String>,
+    },
+    /// The candidate final reply is an enumeration answer built from web
+    /// research, but fewer than two source pages were successfully read
+    /// (0 = snippets only). Injected once per turn: fetch a second
+    /// independent source, or explicitly caveat the single-sourcing.
+    SingleSourceEnumeration {
+        sources_read: usize,
+    },
     /// N consecutive tool calls returned nothing. The search term is likely
     /// wrong — reorient instead of repeating or concluding absence.
     EmptyResultStreakVaryTerms {
@@ -535,6 +549,37 @@ impl SystemDirective {
                  Your proposal: \"{}\"",
                 proposal
             ),
+            Self::SingleSourceEnumeration { sources_read } => {
+                let basis = if *sources_read == 0 {
+                    "search snippets only — no source page was successfully read"
+                } else {
+                    "a single source page"
+                };
+                format!(
+                    "[SYSTEM] CORROBORATION CHECK: your enumerated answer rests on {}. \
+                     Before finalizing, do ONE of the following: (a) fetch one more \
+                     independent source page with web_fetch — pick a different domain \
+                     from your search results — and confirm the entries; or (b) state \
+                     explicitly in your reply that the answer is based on {} and may be \
+                     incomplete, naming the source(s) you used. Do not present an \
+                     uncorroborated enumeration as definitive.",
+                    basis,
+                    if *sources_read == 0 {
+                        "search snippets only"
+                    } else {
+                        "a single source"
+                    },
+                )
+            }
+            Self::UngroundedListEntities { entities } => format!(
+                "[SYSTEM] GROUNDING CHECK FAILED: your draft reply lists entries that do not \
+                 appear in ANY tool output from this task: {}. Inventing list entries is a \
+                 critical error. Rewrite your answer using ONLY items literally present in \
+                 the tool results you received. If the data you gathered does not contain \
+                 the complete list, fetch a source page with web_fetch first, or state \
+                 exactly which part you could not verify instead of filling the gaps.",
+                entities.join(", ")
+            ),
             Self::LocateFileInsteadOfAsking { user_text_hint } => format!(
                 "[SYSTEM] The user referenced a file by name. Do NOT ask the user to upload it or \
                  provide a path — you have tools to locate it yourself. \
@@ -794,5 +839,22 @@ mod tests {
             assert!(!rendered.contains("MUST use `write_file`"));
             assert!(!rendered.contains("Write the corrected code"));
         }
+    }
+}
+
+#[cfg(test)]
+mod corroboration_tests {
+    use super::*;
+
+    #[test]
+    fn single_source_enumeration_directive_demands_second_source_or_caveat() {
+        let zero = SystemDirective::SingleSourceEnumeration { sources_read: 0 }.render();
+        assert!(zero.contains("CORROBORATION CHECK"));
+        assert!(zero.contains("search snippets only"));
+        assert!(zero.contains("web_fetch"));
+
+        let one = SystemDirective::SingleSourceEnumeration { sources_read: 1 }.render();
+        assert!(one.contains("a single source"));
+        assert!(one.contains("different domain"));
     }
 }

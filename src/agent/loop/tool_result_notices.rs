@@ -34,6 +34,13 @@ pub(in crate::agent) enum ToolResultNotice {
     OffTargetFactStorageRequest,
     MissingGoalIdManageMemories,
     MissingGoalIdGeneric,
+    /// A page read failed (HTTP error, timeout, navigation failure). The
+    /// model must pivot to a different source URL instead of retrying the
+    /// same one (observed: same unreadable URL re-fetched 4x, then give-up).
+    FetchFailedTryDifferentSource {
+        tool_name: String,
+        url: String,
+    },
     WriteFileJsonRecovery {
         path: String,
     },
@@ -229,6 +236,14 @@ Do NOT retry the same call. If this is scheduled-goal run forensics, first call 
 If the user is asking to store facts, use `remember_fact` instead."
                     .to_string()
             }
+            Self::FetchFailedTryDifferentSource { tool_name, url } => format!(
+                "[SYSTEM] `{}` could not read {} (blocked, timed out, or unreadable). \
+Do NOT retry the same URL — the result will not change. Pick a DIFFERENT URL from your \
+most recent web_search results (the next-best result covering the same topic) and fetch \
+that instead. If several sources fail, answer with what you verified and name the \
+sources you could not reach.",
+                tool_name, url
+            ),
             Self::WriteFileJsonRecovery { path } => format!(
                 "[SYSTEM] write_file recovery: The file content has characters that broke \
 JSON encoding in the tool call arguments (backslashes, quotes, etc.). \
@@ -577,5 +592,24 @@ mod tests {
         assert!(overlap.contains("1-9, 21-30"));
         assert!(overlap.contains("search_files"));
         assert!(overlap.contains("non-overlapping"));
+    }
+}
+
+#[cfg(test)]
+mod fetch_pivot_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_failure_notice_pivots_to_a_different_source() {
+        let rendered = ToolResultNotice::FetchFailedTryDifferentSource {
+            tool_name: "web_fetch".to_string(),
+            url: "https://www.olympics.com/squad".to_string(),
+        }
+        .render();
+        assert!(rendered.contains("web_fetch"));
+        assert!(rendered.contains("https://www.olympics.com/squad"));
+        assert!(rendered.contains("Do NOT retry"));
+        assert!(rendered.contains("DIFFERENT URL"));
+        assert!(rendered.contains("web_search results"));
     }
 }

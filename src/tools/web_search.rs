@@ -616,7 +616,7 @@ impl Tool for WebSearchTool {
     fn schema(&self) -> Value {
         json!({
             "name": "web_search",
-            "description": "Search the web. Queries all configured search backends in parallel and returns merged, deduplicated results (titles, URLs, snippets, publication age when known). Use to find current information, research topics, check facts. One focused search is almost always enough; for factual lookups do NOT re-search with rephrased queries — synthesize promptly. Set 'freshness' for time-sensitive queries (news, prices, releases). If results are consistently empty, the search backend may be blocked — suggest the user set up Brave Search via manage_config (search.backend = 'brave' + search.api_key) or a self-hosted SearxNG instance (search.searxng_url).",
+            "description": "Search the web. Queries all configured search backends in parallel and returns merged, deduplicated results (titles, URLs, snippets, publication age when known). Use to find current information, research topics, check facts. One focused search is almost always enough; for single-fact lookups do NOT re-search with rephrased queries — synthesize promptly. Results are snippet previews, NOT full pages: never assemble complete lists, rosters, or enumerations from snippets — fetch a source page with web_fetch and answer from its text. Set 'freshness' for time-sensitive queries (news, prices, releases). If results are consistently empty, the search backend may be blocked — suggest the user set up Brave Search via manage_config (search.backend = 'brave' + search.api_key) or a self-hosted SearxNG instance (search.searxng_url).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -708,38 +708,63 @@ impl Tool for WebSearchTool {
         }
 
         let multi_source = self.backends.len() > 1;
-        let formatted: Vec<String> = merged
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let mut entry = format!("{}. [{}]({})", i + 1, r.title, r.url);
-                if !r.snippet.is_empty() {
-                    entry.push_str(&format!("\n   {}", r.snippet));
-                }
-                let mut meta = Vec::new();
-                if let Some(age) = &r.age {
-                    meta.push(age.clone());
-                }
-                if multi_source {
-                    meta.push(format!("via {}", r.sources.join(", ")));
-                }
-                if !meta.is_empty() {
-                    entry.push_str(&format!("\n   ({})", meta.join(" — ")));
-                }
-                entry
-            })
-            .collect();
-
-        let mut output = formatted.join("\n\n");
-        if !failures.is_empty() {
-            output.push_str(&format!(
-                "\n\n(Note: some backends were unavailable — {})",
-                failures.join("; ")
-            ));
-        }
-
-        Ok(output)
+        Ok(format_search_output(&merged, multi_source, &failures))
     }
+}
+
+/// Appended to every non-empty result set. Snippets are previews — without an
+/// explicit guard the model assembles "complete" enumerations (rosters, member
+/// lists, counts) out of 8 partial snippets, inventing the entries it cannot
+/// see. Same failure mode as passive truncation markers (see
+/// `utils::truncation_notice`).
+const SNIPPET_GUARD_FOOTER: &str = "[⚠ SNIPPETS ONLY — the entries above are search-result \
+     previews, not full page content. Do NOT enumerate lists, rosters, members, or counts \
+     assembled from snippets, and do NOT present a \"complete\" answer built from them — \
+     inventing entries that are not literally visible is an error. For enumeration or \
+     list-type questions, fetch a source page with web_fetch and answer only from text you \
+     can see; corroborate factual answers with a second independent source when possible, \
+     and name the sources you used. If a fetch fails, try the next result URL — do not \
+     retry the same one. If no fetched page contains the full answer, say it is incomplete \
+     instead of filling the gaps.]";
+
+fn format_search_output(
+    merged: &[MergedResult],
+    multi_source: bool,
+    failures: &[String],
+) -> String {
+    let formatted: Vec<String> = merged
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut entry = format!("{}. [{}]({})", i + 1, r.title, r.url);
+            if !r.snippet.is_empty() {
+                entry.push_str(&format!("\n   {}", r.snippet));
+            }
+            let mut meta = Vec::new();
+            if let Some(age) = &r.age {
+                meta.push(age.clone());
+            }
+            if multi_source {
+                meta.push(format!("via {}", r.sources.join(", ")));
+            }
+            if !meta.is_empty() {
+                entry.push_str(&format!("\n   ({})", meta.join(" — ")));
+            }
+            entry
+        })
+        .collect();
+
+    let mut output = formatted.join("\n\n");
+    if !failures.is_empty() {
+        output.push_str(&format!(
+            "\n\n(Note: some backends were unavailable — {})",
+            failures.join("; ")
+        ));
+    }
+    output.push_str("\n\n");
+    output.push_str(SNIPPET_GUARD_FOOTER);
+
+    output
 }
 
 #[cfg(test)]
@@ -923,5 +948,54 @@ mod tests {
         };
         let names: Vec<&str> = configured_backends(&cfg).iter().map(|b| b.name()).collect();
         assert_eq!(names, vec!["duckduckgo", "brave", "searxng"]);
+    }
+}
+
+#[cfg(test)]
+mod format_output_tests {
+    use super::*;
+
+    fn merged(title: &str, snippet: &str) -> MergedResult {
+        MergedResult {
+            title: title.to_string(),
+            url: format!("https://example.com/{}", title),
+            snippet: snippet.to_string(),
+            age: None,
+            sources: vec!["duckduckgo"],
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn search_output_carries_snippet_honesty_guard() {
+        let results = vec![merged("squad", "Ecuador announced its 26-man roster...")];
+        let out = format_search_output(&results, false, &[]);
+        assert!(out.contains("Ecuador announced"));
+        // Snippets are previews — the model must not assemble "complete"
+        // enumerations (rosters, lists, counts) out of them.
+        assert!(out.contains("SNIPPETS ONLY"));
+        assert!(out.contains("Do NOT enumerate"));
+        assert!(out.contains("web_fetch"));
+        // Factual answers should be corroborated, not single-sourced.
+        assert!(out.contains("second independent source"));
+        assert!(out.contains("name the sources"));
+    }
+
+    #[test]
+    fn backend_failures_still_noted_in_output() {
+        let results = vec![merged("a", "snippet a")];
+        let out = format_search_output(&results, false, &["brave: timeout".to_string()]);
+        assert!(out.contains("some backends were unavailable"));
+        assert!(out.contains("brave: timeout"));
+    }
+
+    #[test]
+    fn schema_description_scopes_synthesis_to_non_enumeration() {
+        let tool = WebSearchTool { backends: vec![] };
+        let schema = tool.schema();
+        let desc = schema["description"].as_str().unwrap();
+        // "synthesize promptly" must not invite assembling full lists from snippets.
+        assert!(desc.contains("previews"));
+        assert!(desc.contains("web_fetch"));
     }
 }

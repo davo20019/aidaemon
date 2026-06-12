@@ -513,35 +513,137 @@ impl Tool for WebFetchTool {
         }
         let html = resp.text().await?;
 
-        // Try readability extraction first
-        let parsed_url = reqwest::Url::parse(url)
-            .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
-        let text = {
-            let mut cursor = Cursor::new(html.as_bytes());
-            match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
-                Ok(product) if !product.text.trim().is_empty() => product.text,
-                _ => {
-                    // Fallback: convert raw HTML to markdown
-                    htmd::convert(&html).unwrap_or_else(|_| html.clone())
-                }
-            }
-        };
-
-        let mut result = format!("Content from {}:\n\n", url);
-        if text.len() > max_chars {
-            // Find a valid UTF-8 char boundary at or before max_chars
-            let mut end = max_chars;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            result.push_str(&text[..end]);
-            result.push_str("\n\n[Truncated]");
-        } else {
-            result.push_str(&text);
-        }
-
-        Ok(result)
+        Ok(build_fetch_reply(url, &html, max_chars))
     }
+}
+
+/// Extracted text shorter than this (on a large page) means extraction
+/// failed, not that the page is thin.
+const MIN_EXTRACTED_CHARS: usize = 200;
+/// Only pages at least this large trigger the extraction-failure check —
+/// genuinely tiny pages legitimately yield little text.
+const MIN_HTML_FOR_EXTRACTION_CHECK: usize = 10_000;
+
+/// Full fetch-reply pipeline: strip non-visible blocks, extract readable
+/// text, detect failed extraction, format with truncation honesty.
+fn build_fetch_reply(url: &str, html: &str, max_chars: usize) -> String {
+    let text = extract_page_text(html, url);
+    let trimmed = text.trim();
+    if trimmed.chars().count() < MIN_EXTRACTED_CHARS && html.len() >= MIN_HTML_FOR_EXTRACTION_CHECK
+    {
+        // A large page that yields almost no readable text is the signature
+        // of a JavaScript-rendered (or bot-walled) page. Without this notice
+        // the model treats the empty result as the page's actual content —
+        // or worse, re-fetches the same URL expecting a different outcome.
+        return format!(
+            "Content from {}:\n\n{}\n\n[⚠ EXTRACTION FAILED — this {} KB page yielded only {} \
+             characters of readable text; it is likely JavaScript-rendered or blocking \
+             non-browser clients. Do NOT treat this as the page's content, and do NOT re-fetch \
+             this same URL — the result will not change. Fetch a different source URL from your \
+             search results, or use a browser-based tool on this URL if one is available.]",
+            url,
+            trimmed,
+            html.len() / 1024,
+            trimmed.chars().count(),
+        );
+    }
+    format_fetch_result(url, &text, max_chars)
+}
+
+/// Extract readable page text: readability first, raw-HTML-to-markdown
+/// fallback. `<script>`/`<style>`/`<noscript>` blocks are stripped FIRST —
+/// both paths can leak inline script bodies into the "text" (observed:
+/// Wikipedia fetches returning JS soup that consumed the whole max_chars
+/// window before any article content).
+fn extract_page_text(html: &str, url: &str) -> String {
+    let cleaned = strip_nonvisible_blocks(html);
+    let parsed_url = reqwest::Url::parse(url)
+        .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
+    let mut cursor = Cursor::new(cleaned.as_bytes());
+    match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
+        Ok(product) if !product.text.trim().is_empty() => product.text,
+        _ => htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone()),
+    }
+}
+
+/// Remove `<script>`, `<style>`, and `<noscript>` blocks (case-insensitive,
+/// unclosed blocks dropped to end-of-input).
+fn strip_nonvisible_blocks(html: &str) -> String {
+    let mut out = html.to_string();
+    for tag in ["script", "style", "noscript"] {
+        out = strip_tag_blocks(&out, tag);
+    }
+    out
+}
+
+fn strip_tag_blocks(html: &str, tag: &str) -> String {
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0;
+    while let Some(start) = find_ascii_ci(bytes, open.as_bytes(), pos) {
+        // The byte after "<tag" must terminate the tag name, else "<scriptx"
+        // or a "<style-like" element would match.
+        let after = bytes.get(start + open.len());
+        if !matches!(
+            after,
+            Some(b' ') | Some(b'>') | Some(b'\t') | Some(b'\n') | Some(b'/')
+        ) {
+            out.push_str(&html[pos..start + open.len()]);
+            pos = start + open.len();
+            continue;
+        }
+        out.push_str(&html[pos..start]);
+        match find_ascii_ci(bytes, close.as_bytes(), start) {
+            Some(end) => pos = end + close.len(),
+            None => {
+                pos = html.len();
+                break;
+            }
+        }
+    }
+    out.push_str(&html[pos..]);
+    out
+}
+
+/// ASCII-case-insensitive substring search from `from`. Byte positions are
+/// safe to slice with because the needles are pure ASCII.
+fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from >= haystack.len() || needle.is_empty() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+        .map(|i| i + from)
+}
+
+/// Format extracted page text, truncating to `max_chars` (bytes, floored to a
+/// char boundary). A truncated result carries an instructional notice — a
+/// passive "[Truncated]" marker is routinely ignored and the model fabricates
+/// the omitted content (e.g. inventing the rest of a roster).
+fn format_fetch_result(url: &str, text: &str, max_chars: usize) -> String {
+    let mut result = format!("Content from {}:\n\n", url);
+    if text.len() > max_chars {
+        // Find a valid UTF-8 char boundary at or before max_chars
+        let mut end = max_chars;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.push_str(&text[..end]);
+        result.push_str("\n\n");
+        result.push_str(&crate::utils::truncation_notice_with_hint(
+            text[..end].chars().count(),
+            text.chars().count(),
+            "If the answer may be in the omitted part, re-fetch with a larger max_chars \
+             (up to 50000) or fetch a more specific page; if the full content is still \
+             not visible, tell the user the page was longer than you could read.",
+        ));
+    } else {
+        result.push_str(text);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -711,5 +813,116 @@ mod ssrf_policy_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_fetch_carries_instructional_notice() {
+        let text = "a".repeat(120);
+        let out = format_fetch_result("https://example.com/page", &text, 50);
+        assert!(out.contains("Content from https://example.com/page"));
+        // Instructional notice, not a passive marker the model ignores.
+        assert!(out.contains("OUTPUT TRUNCATED"));
+        assert!(out.contains("Do NOT enumerate"));
+        // Remediation hint must be fetch-flavored, not terminal-flavored.
+        assert!(out.contains("max_chars"));
+        assert!(!out.contains("wc -l"));
+        assert!(!out.contains("[Truncated]"));
+    }
+
+    #[test]
+    fn untruncated_fetch_has_no_notice() {
+        let out = format_fetch_result("https://example.com", "short content", 1000);
+        assert!(out.contains("short content"));
+        assert!(!out.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // 4-byte emoji straddling the cap must not panic.
+        let text = format!("{}🦀🦀🦀", "x".repeat(49));
+        let out = format_fetch_result("https://example.com", &text, 51);
+        assert!(out.contains("OUTPUT TRUNCATED"));
+    }
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+
+    /// Mimics the observed Wikipedia failure: a large inline <script> block
+    /// ahead of the real content leaked into the "extracted" text and
+    /// consumed the whole max_chars window.
+    fn script_heavy_page() -> String {
+        format!(
+            "<html><head><title>Ecuador national football team - Wikipedia</title>\
+             <script>(function(){{var className=\"client-js vector-feature-language-{}\";}})();</script>\
+             <style>.mw-parser{{display:none}}{}</style></head>\
+             <body><h1>Squad</h1><p>{}</p>\
+             <table><tr><td>Willian Pacho</td></tr><tr><td>Moises Caicedo</td></tr></table>\
+             </body></html>",
+            "x".repeat(8_000),
+            "y".repeat(8_000),
+            "The current squad was announced ahead of the tournament. ".repeat(20),
+        )
+    }
+
+    #[test]
+    fn script_and_style_blocks_never_reach_the_model() {
+        let reply = build_fetch_reply(
+            "https://en.wikipedia.org/wiki/X",
+            &script_heavy_page(),
+            2_000,
+        );
+        assert!(
+            !reply.contains("var className"),
+            "script body leaked: {}",
+            reply
+        );
+        assert!(
+            !reply.contains("display:none"),
+            "style body leaked: {}",
+            reply
+        );
+        assert!(reply.contains("Willian Pacho") || reply.contains("current squad"));
+    }
+
+    #[test]
+    fn near_empty_extraction_gets_instructional_notice() {
+        // Big page, no readable text — the JS-rendered-page signature.
+        let html = format!(
+            "<html><head><script>{}</script></head><body><div id=\"root\"></div></body></html>",
+            "z".repeat(20_000)
+        );
+        let reply = build_fetch_reply("https://spa.example.com", &html, 20_000);
+        assert!(
+            reply.contains("EXTRACTION FAILED"),
+            "missing notice: {}",
+            reply
+        );
+        assert!(reply.contains("different source"));
+        // Must not pretend the page was read.
+        assert!(!reply.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn normal_page_has_no_extraction_notice() {
+        let reply = build_fetch_reply("https://example.com", &script_heavy_page(), 20_000);
+        assert!(!reply.contains("EXTRACTION FAILED"));
+    }
+
+    #[test]
+    fn small_thin_pages_are_not_flagged() {
+        // A genuinely tiny page is not an extraction failure.
+        let reply = build_fetch_reply(
+            "https://example.com",
+            "<html><body><p>hi</p></body></html>",
+            20_000,
+        );
+        assert!(!reply.contains("EXTRACTION FAILED"));
     }
 }

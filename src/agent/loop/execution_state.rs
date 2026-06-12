@@ -298,6 +298,23 @@ pub struct ExecutionState {
     /// excluded from the wall-clock budget check.
     #[serde(default)]
     pub provider_timeout_ms: u64,
+    /// Raw tool output accumulated this turn, used by the answer-grounding
+    /// gate to verify enumerated list entities were actually observed.
+    /// In-memory only — never serialized into events or persisted state.
+    #[serde(skip)]
+    pub tool_output_evidence: String,
+    /// True once the evidence buffer hit its cap. The grounding gate must
+    /// skip when set — missing evidence would read as fabrication.
+    #[serde(skip)]
+    pub tool_output_evidence_overflow: bool,
+    /// True once web_search was called this turn — marks the turn as web
+    /// research for the corroboration gate.
+    #[serde(skip)]
+    pub web_search_used: bool,
+    /// Distinct domains of source pages successfully READ this turn
+    /// (web_fetch/browser with substantive content). Snippets don't count.
+    #[serde(skip)]
+    pub web_source_domains: std::collections::HashSet<String>,
 }
 
 impl ExecutionState {
@@ -329,7 +346,67 @@ impl ExecutionState {
             outcome_ledger: Vec::new(),
             active_linear_intent_plan: None,
             provider_timeout_ms: 0,
+            tool_output_evidence: String::new(),
+            tool_output_evidence_overflow: false,
+            web_search_used: false,
+            web_source_domains: std::collections::HashSet::new(),
         }
+    }
+
+    /// Track web research provenance for the corroboration gate: which
+    /// distinct domains were successfully read this turn. A "read" requires
+    /// substantive content — errors, near-empty extractions, and
+    /// extraction-failure notices don't count as having consulted a source.
+    pub fn record_web_source(
+        &mut self,
+        tool_name: &str,
+        arguments: &str,
+        result_text: &str,
+        is_error: bool,
+    ) {
+        // Minimum content for a fetch to count as a successfully read source.
+        const MIN_SOURCE_CONTENT_CHARS: usize = 500;
+        match tool_name {
+            "web_search" if !is_error => {
+                self.web_search_used = true;
+            }
+            "web_fetch" | "browser" => {
+                if is_error
+                    || result_text.len() < MIN_SOURCE_CONTENT_CHARS
+                    || result_text.contains("⚠ EXTRACTION FAILED")
+                {
+                    return;
+                }
+                let Some(domain) = serde_json::from_str::<serde_json::Value>(arguments)
+                    .ok()
+                    .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from))
+                    .and_then(|u| reqwest::Url::parse(&u).ok())
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                else {
+                    return;
+                };
+                self.web_source_domains
+                    .insert(domain.trim_start_matches("www.").to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Accumulate raw tool output for the answer-grounding gate. Bounded:
+    /// once the cap is reached the buffer stops growing and the overflow flag
+    /// disables the gate for the rest of the turn (incomplete evidence would
+    /// flag legitimately-observed entries as fabricated).
+    pub fn record_tool_output_evidence(&mut self, output: &str) {
+        const EVIDENCE_TOTAL_CAP: usize = 512 * 1024;
+        if self.tool_output_evidence_overflow {
+            return;
+        }
+        if self.tool_output_evidence.len() + output.len() > EVIDENCE_TOTAL_CAP {
+            self.tool_output_evidence_overflow = true;
+            return;
+        }
+        self.tool_output_evidence.push_str(output);
+        self.tool_output_evidence.push('\n');
     }
 
     pub fn promote_persistence(&mut self, persistence: ExecutionPersistence) {

@@ -1066,3 +1066,69 @@ fn plan_format_with_progress_shows_markers() {
     assert!(formatted.contains("Found 12 posts"));
     assert!(formatted.contains("[CURRENT] Create post 1"));
 }
+
+#[test]
+fn web_source_tracking_counts_distinct_successful_domains() {
+    let mut state = test_execution_state();
+    assert!(!state.web_search_used);
+    assert!(state.web_source_domains.is_empty());
+
+    state.record_web_source("web_search", r#"{"query":"x"}"#, "1. result...", false);
+    assert!(state.web_search_used);
+    assert!(
+        state.web_source_domains.is_empty(),
+        "search is not a read source"
+    );
+
+    let page = "x".repeat(600);
+    state.record_web_source(
+        "web_fetch",
+        r#"{"url":"https://en.wikipedia.org/wiki/X"}"#,
+        &page,
+        false,
+    );
+    state.record_web_source(
+        "web_fetch",
+        r#"{"url":"https://en.wikipedia.org/wiki/Y"}"#,
+        &page,
+        false,
+    );
+    assert_eq!(state.web_source_domains.len(), 1, "same domain dedups");
+
+    state.record_web_source(
+        "browser",
+        r#"{"url":"https://espn.com/squad"}"#,
+        &page,
+        false,
+    );
+    assert_eq!(state.web_source_domains.len(), 2);
+
+    // Failures and junk extractions don't count as read sources.
+    state.record_web_source(
+        "web_fetch",
+        r#"{"url":"https://blocked.example.com/a"}"#,
+        "Error fetching: HTTP 403",
+        true,
+    );
+    let junk = format!(
+        "Content from x:\n\nhi\n\n[⚠ EXTRACTION FAILED — junk]{}",
+        "p".repeat(600)
+    );
+    state.record_web_source(
+        "web_fetch",
+        r#"{"url":"https://spa.example.com/b"}"#,
+        &junk,
+        false,
+    );
+    state.record_web_source(
+        "web_fetch",
+        r#"{"url":"https://thin.example.com/c"}"#,
+        "tiny",
+        false,
+    );
+    assert_eq!(state.web_source_domains.len(), 2);
+
+    // Non-web tools are ignored entirely.
+    state.record_web_source("terminal", r#"{"command":"ls"}"#, &"z".repeat(600), false);
+    assert_eq!(state.web_source_domains.len(), 2);
+}

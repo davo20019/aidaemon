@@ -1791,11 +1791,14 @@ pub(super) async fn run_completion_phase(
         // Force one retry with an explicit lookup directive instead of
         // accepting the punt. Fires once per turn to prevent loops.
         if total_successful_tool_calls == 0
-            && ctx.completion_progress.file_access_retry_count == 0
+            && completion_progress.file_access_retry_count == 0
             && crate::agent::response_analysis::reply_defers_file_access(&reply)
             && crate::agent::response_analysis::user_text_references_file(user_text)
         {
-            ctx.completion_progress.file_access_retry_count += 1;
+            // Increment the LOCAL copy — commit_state! writes the local back
+            // over ctx, so a direct ctx increment would be clobbered and the
+            // "fires once" guarantee silently lost.
+            completion_progress.file_access_retry_count += 1;
             let hint = user_text.chars().take(300).collect::<String>();
             pending_system_messages.push(SystemDirective::LocateFileInsteadOfAsking {
                 user_text_hint: hint,
@@ -1826,9 +1829,10 @@ pub(super) async fn run_completion_phase(
         let is_canned_with_work = is_canned_ack_reply && total_successful_tool_calls >= 3;
         let is_plain_text_tool_call = response_looks_like_plain_text_tool_call(&reply);
         if (is_canned_with_work || is_low_quality_multipart || is_plain_text_tool_call)
-            && ctx.completion_progress.quality_nudge_count == 0
+            && completion_progress.quality_nudge_count == 0
         {
-            ctx.completion_progress.quality_nudge_count += 1;
+            // Local copy, not ctx — see file_access_retry_count above.
+            completion_progress.quality_nudge_count += 1;
             let hint = user_text.chars().take(300).collect::<String>();
             pending_system_messages.push(SystemDirective::ResponseQualityNudge {
                 user_text_hint: hint,
@@ -1841,6 +1845,63 @@ pub(super) async fn run_completion_phase(
                 is_plain_text_tool_call,
                 "Response quality too low for multi-part request — nudging for better response"
             );
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
+
+        // Grounding guard: a reply that enumerates name-like list entries
+        // absent from every tool output this turn is fabricating list content
+        // (e.g. inventing roster members that search snippets never showed).
+        // The user's own message also counts as evidence. Fires once per turn;
+        // skipped when the evidence buffer overflowed (incomplete evidence
+        // would flag legitimately-observed entries).
+        if completion_progress.grounding_nudge_count == 0
+            && total_successful_tool_calls > 0
+            && !execution_state.tool_output_evidence_overflow
+            && !execution_state.tool_output_evidence.is_empty()
+        {
+            let ungrounded = super::answer_grounding::find_ungrounded_list_entities(
+                &reply,
+                &[execution_state.tool_output_evidence.as_str(), user_text],
+            );
+            if !ungrounded.is_empty() {
+                completion_progress.grounding_nudge_count += 1;
+                warn!(
+                    session_id,
+                    iteration,
+                    ungrounded_count = ungrounded.len(),
+                    ungrounded_preview = %ungrounded.join(", "),
+                    "Final reply enumerates entities absent from all tool outputs — forcing grounded rewrite"
+                );
+                pending_system_messages.push(SystemDirective::UngroundedListEntities {
+                    entities: ungrounded,
+                });
+                commit_state!();
+                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+            }
+        }
+
+        // Corroboration guard: an enumeration-style answer produced from web
+        // research must rest on at least two successfully read source pages —
+        // snippets-only or single-page answers get one chance to fetch a
+        // second independent source or explicitly caveat the single-sourcing.
+        // Fires once per turn.
+        if completion_progress.corroboration_nudge_count == 0
+            && execution_state.web_search_used
+            && execution_state.web_source_domains.len() < 2
+            && super::answer_grounding::count_list_name_entities(&reply)
+                >= super::answer_grounding::MIN_LIST_ENTITIES
+        {
+            completion_progress.corroboration_nudge_count += 1;
+            warn!(
+                session_id,
+                iteration,
+                sources_read = execution_state.web_source_domains.len(),
+                "Enumeration answer rests on <2 read sources — requesting corroboration or explicit caveat"
+            );
+            pending_system_messages.push(SystemDirective::SingleSourceEnumeration {
+                sources_read: execution_state.web_source_domains.len(),
+            });
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }

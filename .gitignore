@@ -70,6 +70,9 @@ docs/
 # Claude Code local state
 .claude/
 
+# Cursor local state
+.cursor/
+
 # Scratch/exploration directories
 crates-explorer/
 

@@ -128,6 +128,13 @@ pub(super) struct CompletionProgress {
     /// Count of times the locate-file retry nudge has been injected (model
     /// asked the user to upload a file it could find itself). Fires once.
     pub file_access_retry_count: usize,
+    /// Count of times the answer-grounding nudge has been injected (final
+    /// reply enumerated entities absent from all tool outputs). Fires once.
+    pub grounding_nudge_count: usize,
+    /// Count of times the single-source corroboration nudge has been
+    /// injected (enumeration answer from web research with <2 source pages
+    /// read). Fires once.
+    pub corroboration_nudge_count: usize,
 }
 
 impl CompletionProgress {

@@ -85,16 +85,32 @@ fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
 /// the omitted content (e.g. inventing the rest of a user list). This notice
 /// states how much is missing and forbids enumerating what isn't visible.
 pub fn truncation_notice(shown_chars: usize, total_chars: usize) -> String {
+    truncation_notice_with_hint(
+        shown_chars,
+        total_chars,
+        "If the user needs the full result, tell them it is longer than you can see \
+         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.",
+    )
+}
+
+/// Like [`truncation_notice`], but with a tool-specific remediation sentence —
+/// the right next step differs per tool (re-run with `wc -l` for terminal,
+/// re-fetch with a larger `max_chars` for web_fetch, etc.).
+pub fn truncation_notice_with_hint(
+    shown_chars: usize,
+    total_chars: usize,
+    remediation_hint: &str,
+) -> String {
     let omitted = total_chars.saturating_sub(shown_chars);
     format!(
         "[⚠ OUTPUT TRUNCATED — {shown} of {total} characters shown; {omitted} omitted and \
          NOT visible to you. Do NOT enumerate, list, count, or quote any item that is not \
          literally present in the text you can see — inventing the omitted content is an \
-         error. If the user needs the full result, tell them it is longer than you can see \
-         and re-run with a narrower filter, a count (e.g. `wc -l`), or pagination.]",
+         error. {hint}]",
         shown = shown_chars,
         total = total_chars,
         omitted = omitted,
+        hint = remediation_hint,
     )
 }
 
@@ -163,6 +179,17 @@ mod tests {
         // Defensive: shown > total must not underflow.
         let notice = truncation_notice(300, 250);
         assert!(notice.contains("0 omitted"));
+    }
+
+    #[test]
+    fn test_truncation_notice_with_hint_uses_custom_remediation() {
+        let notice = truncation_notice_with_hint(100, 250, "Re-fetch with a larger max_chars.");
+        assert!(notice.contains("OUTPUT TRUNCATED"));
+        assert!(notice.contains("100 of 250"));
+        assert!(notice.contains("Do NOT enumerate"));
+        assert!(notice.contains("Re-fetch with a larger max_chars."));
+        // The terminal-flavored default hint must not leak into custom-hint notices.
+        assert!(!notice.contains("wc -l"));
     }
 
     #[test]

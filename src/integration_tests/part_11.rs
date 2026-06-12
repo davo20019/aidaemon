@@ -1525,3 +1525,185 @@ async fn test_no_router_auto_mode_uses_runtime_primary_over_stale_model_field() 
         "top-level no-router auto mode should use runtime primary model, not stale self.model"
     );
 }
+
+// ==================== Answer Grounding Gate Tests ====================
+
+/// A final reply that enumerates name-like list entries absent from every
+/// tool output must be rejected once with a grounding directive, and the
+/// model's corrected follow-up accepted. Guards against fabricated
+/// enumerations assembled from partial data (e.g. invented roster members).
+#[tokio::test]
+async fn test_ungrounded_list_reply_is_rejected_then_corrected() {
+    let fabricated = "Here is the full squad:\n\
+         • Denis Segovia (LDU Quito)\n\
+         • Alex Granda (Emelec)\n\
+         • Yholen Pichenda (Independiente)\n\
+         • Jackson Falconi (Barcelona SC)\n\
+         • Richard Releve (Aucas)\n\
+         • Pedro Bolivar (Orense)\n";
+    let corrected =
+        "I could not verify the full roster from the data I gathered; here is what I confirmed.";
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(fabricated),
+        MockProvider::text_response(corrected),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "grounding_session",
+            "Look up the system and then give me the full squad list",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response.contains("Yholen Pichenda"),
+        "fabricated entries must not reach the user: {}",
+        response
+    );
+    assert!(
+        response.contains("could not verify"),
+        "corrected reply should be the final response: {}",
+        response
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    let grounding_directive_sent = calls.iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("GROUNDING CHECK FAILED"))
+        })
+    });
+    assert!(
+        grounding_directive_sent,
+        "grounding directive should have been injected into a follow-up LLM call"
+    );
+}
+
+/// A list reply whose entries all appear in tool output must NOT trigger the
+/// grounding gate — no extra LLM round-trip.
+#[tokio::test]
+async fn test_grounded_list_reply_is_accepted_without_nudge() {
+    // setup_test_agent's system_info output contains os/hostname details; a
+    // grounded reply quotes nothing fabricated — use prose bullets that the
+    // entity extractor must ignore.
+    let grounded = "Summary:\n\
+         - Checked the system info\n\
+         - The host details are above\n";
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(grounded),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "grounding_session_ok",
+            "Check the system info and summarize",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(!response.is_empty());
+    let calls = harness.provider.call_log.lock().await;
+    let grounding_directive_sent = calls.iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("GROUNDING CHECK FAILED"))
+        })
+    });
+    assert!(
+        !grounding_directive_sent,
+        "grounded reply must not trigger the grounding directive"
+    );
+}
+
+// ==================== Corroboration Gate Tests ====================
+
+/// An enumeration answer built from search snippets alone (no source page
+/// read) must be challenged once with a corroboration directive; the model's
+/// caveated follow-up is then accepted.
+#[tokio::test]
+async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
+    // Snippet text grounds the names so the grounding gate passes — this
+    // test isolates the corroboration gate (sources read = 0).
+    let snippets = "1. [Squad news](https://news.example.com/squad)\n   \
+         Willian Pacho, Moises Caicedo, Enner Valencia, Kendry Paez and \
+         Piero Hincapie were all named in the squad.";
+    let enumeration = "Confirmed squad members:\n\
+         • Willian Pacho\n\
+         • Moises Caicedo\n\
+         • Enner Valencia\n\
+         • Kendry Paez\n\
+         • Piero Hincapie\n";
+    let caveated = "Based on search snippets only (may be incomplete): \
+         Pacho, Caicedo, Valencia, Paez, Hincapie.";
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("web_search", r#"{"query":"squad"}"#),
+        MockProvider::text_response(enumeration),
+        MockProvider::text_response(caveated),
+    ]);
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(crate::testing::MockTool::new(
+            "web_search",
+            "search the web",
+            snippets,
+        ))],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "corroboration_session",
+            "Search the web and list the squad members",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        response.contains("snippets only"),
+        "caveated reply should be final: {}",
+        response
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    let corroboration_calls = calls
+        .iter()
+        .filter(|call| {
+            call.messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("CORROBORATION CHECK"))
+            })
+        })
+        .count();
+    assert!(
+        corroboration_calls >= 1,
+        "corroboration directive should have been injected"
+    );
+}

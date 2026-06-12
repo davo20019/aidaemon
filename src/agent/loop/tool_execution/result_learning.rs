@@ -333,6 +333,23 @@ pub(super) async fn apply_result_learning(
                 append_tool_result_notice(result_text, &coach);
             }
 
+            // Fetch failure pivot: a failed page read (403, timeout,
+            // navigation error) must redirect the model to the NEXT search
+            // result, not a retry of the same URL.
+            if tc.name == "web_fetch" || tc.name == "browser" {
+                let url = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    .ok()
+                    .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<the same URL>".to_string());
+                append_tool_result_notice(
+                    result_text,
+                    &ToolResultNotice::FetchFailedTryDifferentSource {
+                        tool_name: tc.name.clone(),
+                        url,
+                    },
+                );
+            }
+
             // write_file JSON escaping recovery: when write_file fails with
             // JSON parsing errors, the LLM's tool call JSON had improperly escaped
             // content (common with code containing backslashes like JSON parsers,

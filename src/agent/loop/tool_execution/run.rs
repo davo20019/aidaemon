@@ -1302,6 +1302,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             if !is_error && planned_step.is_some() {
                 execution_state.advance_linear_intent_step_after_external_success();
             }
+            // Retain raw output for the answer-grounding gate (completion
+            // phase checks enumerated entities against what was observed).
+            execution_state.record_tool_output_evidence(&result_text);
+            // Track web research provenance for the corroboration gate.
+            execution_state.record_web_source(
+                &tc.name,
+                &effective_arguments,
+                &result_text,
+                is_error,
+            );
         }
 
         agent
