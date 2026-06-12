@@ -3,15 +3,12 @@
 // ---------------------------------------------------------------------------
 
 /// With non-uniform models, iteration 1 runs with tools available (no separate
-/// text-only pre-pass). The INTENT_GATE in the response is still parsed
-/// and the execution loop produces the user-visible answer.
+/// text-only pre-pass). A deferral first reply is bounced by the completion
+/// gates and the retry produces the user-visible answer.
 #[tokio::test]
 async fn test_initial_routing_call_classifies_then_executor_answers_questions() {
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE]\n\
-             {\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
-        ),
+        MockProvider::text_response("I'll look that up and get back to you."),
         MockProvider::text_response(
             "Your website is deployed to Cloudflare Workers at your-site.workers.dev.",
         ),
@@ -289,10 +286,9 @@ async fn test_initial_routing_call_continues_for_actions() {
 #[tokio::test]
 async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     let provider = MockProvider::with_responses(vec![
-        // 1) First call (with tools) → INTENT_GATE classification
-        MockProvider::text_response(
-            "I'll check and send it over.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
-        ),
+        // 1) First call (with tools): deferral text, bounced by the
+        //    deferred-action gate
+        MockProvider::text_response("I'll check and send it over."),
         // 2) Execution loop (bad): deferred action text, no tool calls
         MockProvider::text_response(
             "I'll find your resume and send it over right away.\nStarting the send-resume workflow...",
@@ -343,14 +339,10 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
     let deferred_text =
         "I'll find your resume and send it over right away.\nStarting the send-resume workflow...";
     let provider = MockProvider::with_responses(vec![
-        // 1) First call (with tools) → INTENT_GATE classification: tools required
-        MockProvider::text_response(
-            "I'll check and send it over.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
-        ),
-        // 2) Execution loop: deferred-action text, no tool calls — on the
+        // 1) First call: deferred-action text, no tool calls — on the
         //    autonomous tier this is delivered to the user instead of bounced.
         MockProvider::text_response(deferred_text),
-        // 3) Never reached on autonomous tier; present so a regression to
+        // 2) Never reached on autonomous tier; present so a regression to
         //    guided-style blocking fails the call-count assert, not the mock.
         MockProvider::text_response("Found it and sent it."),
     ]);
@@ -383,7 +375,7 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
     );
     assert_eq!(
         harness.provider.call_count().await,
-        2,
+        1,
         "no retry loop expected on autonomous tier"
     );
 }
@@ -393,11 +385,9 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
 #[tokio::test]
 async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
     let provider = MockProvider::with_responses(vec![
-        // 1) First call: INTENT_GATE classification
-        MockProvider::text_response(
-            "I'll find it for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"simple\"}",
-        ),
-        // 2) Tool prelude forces a tool call after text-only INTENT_GATE
+        // 1) First call: deferral text, bounced by the deferred-action gate
+        MockProvider::text_response("I'll find it for you."),
+        // 2) Deferred-action retry produces a real tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // 3) Execution loop (bad): deferred narration instead of results
         MockProvider::text_response(
@@ -432,8 +422,8 @@ async fn test_deferred_action_after_tool_progress_does_not_complete_task() {
         response,
         "I couldn't find a matching SOW PDF in the project files."
     );
-    // Call count varies due to tool prelude (forces tool use after text-only
-    // INTENT_GATE) and mutation-contract nudges.
+    // Call count varies due to deferred-action retries and mutation-contract
+    // nudges.
     let call_count = harness.provider.call_count().await;
     assert!(
         (4..=7).contains(&call_count),
@@ -790,21 +780,18 @@ async fn test_initial_routing_call_drops_hallucinated_tool_calls() {
     );
 }
 
-/// Regression: if first-pass analysis sanitizes to empty but intent gate says
-/// acknowledgment + needs_tools=true (e.g. "Yes, do it."), we must NOT return
-/// an empty direct reply. The turn should fall through to execution.
+/// Regression: a reply that is only pseudo-tool-call markup (a model
+/// narrating "[tool_use: terminal]" as text) must NOT be returned as the
+/// final answer. The turn falls through to execution.
 #[tokio::test]
 async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "[tool_use: terminal]\n\
              cmd: read_file project/plan.md\n\
-             args: {\"path\":\"project/plan.md\"}\n\
-             \n\
-             [INTENT_GATE]\n\
-             {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"is_acknowledgment\":true}",
+             args: {\"path\":\"project/plan.md\"}",
         ),
-        // needs_tools=true blocks text-only responses, so executor must use a tool call
+        // Structural-marker text is never final; the loop retries with a real tool call
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Proceeding with the requested changes."),
     ]);
@@ -834,9 +821,10 @@ async fn test_acknowledgment_with_needs_tools_and_empty_analysis_falls_through()
     );
 }
 
-/// With default+fallback routing (text-only pre-pass disabled), an LLM response
-/// containing only INTENT_GATE metadata is treated as deferred action text
-/// (structural marker detected) and the agent loops to get a real response.
+/// Defensive: the [INTENT_GATE] text protocol was removed in v0.9.21, but a
+/// model may still emit it (training data, stale history). A response
+/// containing only that metadata is structural-marker text — never delivered
+/// to the user — and the agent loops to get a real response.
 #[tokio::test]
 async fn test_acknowledgment_with_empty_analysis_returns_default_reply() {
     let provider = MockProvider::with_responses(vec![
@@ -870,9 +858,8 @@ async fn test_acknowledgment_with_empty_analysis_returns_default_reply() {
     assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// With default+fallback routing (text-only pre-pass disabled), an LLM response
-/// containing only INTENT_GATE metadata is treated as deferred action text
-/// and the agent loops to get a real response for corrections too.
+/// Defensive: a legacy [INTENT_GATE]-only reply is structural-marker text and
+/// the agent loops to get a real response for corrections too.
 #[tokio::test]
 async fn test_short_correction_with_empty_analysis_returns_default_reply() {
     let provider = MockProvider::with_responses(vec![
@@ -906,12 +893,11 @@ async fn test_short_correction_with_empty_analysis_returns_default_reply() {
     assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// With default+fallback routing (text-only pre-pass disabled), intent_gate
-/// decision points are not emitted for direct replies. The LLM response
-/// with INTENT_GATE metadata is treated as deferred action text and the
-/// agent loops to produce a real response.
+/// The removed routing phase must not emit intent_gate route_reason decision
+/// points for direct replies; a legacy [INTENT_GATE]-only reply is treated as
+/// structural-marker text and the agent loops to produce a real response.
 #[tokio::test]
-async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_reply() {
+async fn test_no_intent_gate_route_reason_decision_for_direct_reply() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "[INTENT_GATE]\n\
@@ -973,12 +959,11 @@ async fn test_intent_gate_decision_metadata_includes_route_reason_for_direct_rep
     );
 }
 
-/// With default+fallback routing (text-only pre-pass disabled), intent_gate
-/// decision points from the removed decision phase are not emitted.
-/// The LLM response with INTENT_GATE metadata is treated as deferred action
-/// text, and the agent continues looping with tools available.
+/// The removed routing phase must not emit intent_gate route_reason decision
+/// points; a legacy [INTENT_GATE]-only reply is structural-marker text and the
+/// agent continues looping with tools available.
 #[tokio::test]
-async fn test_intent_gate_decision_metadata_includes_route_reason_for_continue() {
+async fn test_no_intent_gate_route_reason_decision_for_continue() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "[INTENT_GATE]\n\

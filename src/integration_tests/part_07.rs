@@ -29,13 +29,10 @@ async fn test_orchestration_uniform_models_no_routing() {
 
 #[tokio::test]
 async fn test_orchestration_simple_falls_through_to_full_loop() {
-    // Orchestration enabled, non-uniform models -> first routing pass activates.
-    // Routing says "needs tools" (not can_answer_now), simple task -> full agent loop
+    // Deterministic routing classifies this as a simple task -> full agent loop.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: first routing pass -> analysis that triggers needs_tools
-        MockProvider::text_response(
-            "I'll help you check the system info.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
+        // 1st call: deferral text, bounced by the deferred-action gate
+        MockProvider::text_response("I'll check the system info and get back to you."),
         // 2nd call: full agent loop — tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // 3rd call: full agent loop — final response
@@ -155,11 +152,9 @@ async fn test_orchestration_simple_stall_detection_in_full_loop() {
     // Simple tasks now go through full agent loop which has its own stall detection.
     // After the first routing pass, repeated identical tool calls should be detected.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: first routing pass
-        MockProvider::text_response(
-            "I'll run a command for you.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
-        // 2nd call: intent gate narration (full loop requires narration on first tool iteration)
+        // 1st call: deferral text, bounced by the deferred-action gate
+        MockProvider::text_response("I'll run a command for you."),
+        // 2nd call: real tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // Repeated identical tool calls — stall detection should kick in
         MockProvider::tool_call_response("system_info", "{}"),
@@ -197,11 +192,9 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
-        // 1st call: first routing pass (INTENT_GATE classification)
-        MockProvider::text_response(
-            "I'll help with that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
-        // 2nd call: tool prelude forces tool use after text-only INTENT_GATE
+        // 1st call: deferral text, bounced by the deferred-action gate
+        MockProvider::text_response("I'll run the diagnostics and get back to you."),
+        // 2nd call: deferred-action retry produces a real tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // 3rd-5th calls: final response, repeated to survive mutation-contract
         // nudges ("run" triggers expects_mutation=true → up to 2 extra iterations
@@ -231,9 +224,8 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
 #[tokio::test]
 async fn test_personal_recall_challenge_scopes_tools_and_reaffirms() {
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "Let me verify memory first.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[]}",
-        ),
+        // Recall turns accept substantive text replies readily, so the first
+        // response is the out-of-scope tool call this test is about.
         {
             let mut resp = MockProvider::tool_call_response(
                 "browser",
@@ -467,9 +459,8 @@ async fn test_compound_message_with_challenge_keyword_skips_reaffirmation_anchor
 
 #[tokio::test]
 async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
-    )]);
+    // Deterministic schedule heuristics route before any LLM call.
+    let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -509,11 +500,9 @@ async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
 
 #[tokio::test]
 async fn test_orchestration_scheduled_malformed_schedule_recovers_from_user_text() {
-    // E2E regression: LLM sometimes emits schedule="2 minutes" while the user
-    // said "in 2 minutes". The scheduler path should still be taken.
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "Sure.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"2 minutes\",\"schedule_type\":\"one_shot\"}",
-    )]);
+    // The schedule phrase is extracted from the user text by the deterministic
+    // heuristic; no LLM call is needed to take the scheduler path.
+    let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -552,9 +541,8 @@ async fn test_orchestration_scheduled_malformed_schedule_recovers_from_user_text
 
 #[tokio::test]
 async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "I'll schedule recurring monitoring.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"every 6h\",\"schedule_type\":\"recurring\"}",
-    )]);
+    // Deterministic schedule heuristics route before any LLM call.
+    let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -1017,9 +1005,9 @@ async fn test_orchestration_schedule_confirm_activates_goal() {
 
 #[tokio::test]
 async fn test_orchestration_schedule_cancel_removes_goal() {
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
-    )]);
+    // Deterministic schedule heuristics route turn 1, and the deterministic
+    // cancel shortcut handles turn 2 — no LLM calls needed.
+    let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let _ = harness
@@ -1061,10 +1049,11 @@ async fn test_orchestration_schedule_cancel_removes_goal() {
 #[tokio::test]
 async fn test_orchestration_targeted_cancel_text_does_not_auto_cancel_session_goal() {
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "Understood.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"cancel_intent\":true,\"cancel_scope\":\"targeted\",\"complexity\":\"simple\"}",
-        ),
-        // needs_tools=true blocks text-only responses, so executor must use a tool call
+        // Deterministic cancel detection classifies this as a targeted cancel,
+        // which falls through to the normal loop instead of auto-cancelling.
+        // The deferral below is bounced by the deferred-action gate.
+        MockProvider::text_response("I'll look into which goal you mean."),
+        // Deferred-action retry produces a real tool call
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Please share the goal ID to cancel that specific goal."),
     ]);
@@ -1128,12 +1117,11 @@ async fn test_orchestration_targeted_cancel_text_does_not_auto_cancel_session_go
 #[tokio::test]
 async fn test_orchestration_schedule_new_message_cancels_pending() {
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "I'll schedule that.\n[INTENT_GATE] {\"can_answer_now\":false,\"needs_tools\":true,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"schedule\":\"in 2h\",\"schedule_type\":\"one_shot\"}",
-        ),
-        MockProvider::text_response(
-            "[INTENT_GATE] {\"can_answer_now\":true,\"needs_tools\":false,\"needs_clarification\":false,\"clarifying_question\":\"\",\"missing_info\":[],\"complexity\":\"knowledge\"}",
-        ),
+        // Turn 1 ("deploy in 2 hours") routes via the deterministic schedule
+        // heuristic without an LLM call. Turn 2 ("what is rust?") consumes
+        // these; the answer is repeated in case the first short reply is
+        // bounced as non-substantive.
+        MockProvider::text_response("Rust is a systems programming language."),
         MockProvider::text_response("Rust is a systems programming language."),
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();

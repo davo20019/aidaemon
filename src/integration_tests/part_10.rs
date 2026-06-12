@@ -10,14 +10,11 @@
 #[tokio::test]
 async fn test_task_boundary_injected_between_turns() {
     let provider = MockProvider::with_responses(vec![
-        // Turn 1: first routing call -> can answer now
+        // Turn 1: direct text answer
         MockProvider::text_response(
-            "[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
+            "Because the previous step required it — happy to elaborate if useful.",
         ),
-        // Turn 2: first routing call -> needs tools, then tool call, then answer
-        MockProvider::text_response(
-            "[INTENT_GATE] {\"complexity\":\"simple\",\"can_answer_now\":false,\"needs_tools\":true}",
-        ),
+        // Turn 2: tool call, then answer
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Found the Spanish resume."),
     ]);
@@ -340,14 +337,13 @@ async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
 
 #[tokio::test]
 async fn test_orchestrator_knowledge_flow() {
-    // Knowledge flow: iteration 1 emits INTENT_GATE with can_answer_now=true,
-    // then the execution loop answers without tool use. With default+fallback
-    // routing, tools ARE present in the first call (no tool-stripping), but
-    // the model chooses not to use them for simple knowledge answers.
+    // Knowledge flow: the first reply is a short deferral, bounced by the
+    // deferred-action gate; the retry answers without tool use. With
+    // default+fallback routing, tools ARE present in the first call (no
+    // tool-stripping), but the model chooses not to use them for simple
+    // knowledge answers.
     let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE]\n{\"complexity\": \"knowledge\", \"can_answer_now\": true, \"needs_tools\": false}",
-        ),
+        MockProvider::text_response("Let me check my memory first."),
         MockProvider::text_response("The capital of France is Paris."),
     ]);
 
@@ -369,7 +365,7 @@ async fn test_orchestrator_knowledge_flow() {
     assert_eq!(response, "The capital of France is Paris.");
 
     let call_count = harness.provider.call_count().await;
-    assert_eq!(call_count, 2, "Expected intent gate classifier + executor answer");
+    assert_eq!(call_count, 2, "Expected bounced deferral + executor answer");
 
     // Tools are present in the first call (no tool-stripping in the new architecture)
     let calls = harness.provider.call_log.lock().await;
@@ -504,16 +500,14 @@ async fn test_synthesized_done_persisted() {
     // The mock tool_call_response triggers hallucinated-tool detection which
     // forces needs_tools=true → Simple intent → tools loaded → loop continues.
     let provider = MockProvider::with_responses(vec![
-        // Turn 1, iteration 1 (first routing call): tool_call forces needs_tools=true
+        // Turn 1, iteration 1: tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // Turn 1, iteration 2 (tools available): tool call is executed
         MockProvider::tool_call_response("system_info", "{}"),
         // Turn 1, iteration 3: empty response → "Done" synthesis at depth=0
         MockProvider::text_response(""),
-        // Turn 2, iteration 1 (first routing call): classifier output
-        MockProvider::text_response(
-            "I can answer this from memory.\n[INTENT_GATE] {\"complexity\":\"knowledge\",\"can_answer_now\":true,\"needs_tools\":false}",
-        ),
+        // Turn 2, iteration 1: short deferral, bounced by the deferred-action gate
+        MockProvider::text_response("Let me check my memory first."),
         // Turn 2, iteration 2 (execution): final user-visible answer
         MockProvider::text_response("Weather is sunny."),
     ]);
