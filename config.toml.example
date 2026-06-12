@@ -366,6 +366,15 @@ health_port = 8080
 #   repetition guards, anti-fabrication checks) apply on every tier.
 #   Gate fires are logged under the `heuristic_telemetry` tracing target.
 #
+#   The auto list matches known frontier families only. If you run a capable
+#   open model it doesn't recognize (e.g. kimi-k2.5, large qwen/deepseek
+#   variants), set trust_tier = "autonomous" to skip the supervision gates —
+#   a gate misfire on a supervised model costs at least one extra LLM call
+#   (30-120s of stall on a slow model) before the answer is accepted.
+#   This override is GLOBAL: it applies to every configured model including
+#   fallbacks. Keep "auto" if your fallback chain mixes a strong cloud model
+#   with a small local one.
+#
 # [policy.write_consistency]
 # # Guardrail thresholds for dual-write drift checks.
 # max_abs_global_delta = 3
