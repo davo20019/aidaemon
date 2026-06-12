@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-06-12
+
+### Added
+
+- **Opt-in Gemma / llama.cpp thinking** (`[provider] llama_cpp_thinking = true`): OpenAI-compatible providers can enable llama.cpp chat-template thinking for models such as Gemma without changing the default request shape for other backends.
+- **Web answer grounding**: enumeration-style replies (long bullet/numbered lists of name-like entities) are checked against tool outputs and the user's message before delivery; multiple ungrounded entries trigger a rewrite directive instead of shipping fabricated rosters. `web_fetch` and `web_search` also retain richer snippet/metadata for corroboration.
+- **Browser scroll action**: the `browser` tool supports `scroll` with `direction` (`up`/`down`) and `amount` (pixels), routed as a bounded observation primitive without approval.
+
+### Changed
+
+- **Intent gate cleanup**: removed the dead Layer-2 `[INTENT_GATE]` model self-report protocol (unused since v0.9.21). Enforcement remains a single deterministic keyword gate plus trust-tiered supervision at completion sites; defensive marker stripping is unchanged. `LlmRuntimeSnapshot::fast_model()` removed — background callers now use `primary_model()` (behavior-identical; `Router::select` already ignored the tier).
+
+### Fixed
+
+- **Browser scroll**: previously missing from the browser tool schema and dispatch path.
+
+### Documentation
+
+- **`trust_tier` override**: README now documents setting `[policy] trust_tier = "autonomous"` for capable open models the auto list doesn't recognize, including what stays enforced on every tier.
+- **Intent gate architecture**: CLAUDE.md/AGENTS.md updated to describe the actual single-layer design and unwired classifier scaffolding.
+
 ## [0.11.3] - 2026-06-11
 
 ### Added
