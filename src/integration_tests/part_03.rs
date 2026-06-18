@@ -381,6 +381,7 @@ async fn test_privacy_upgrade() {
             10,
             Some("slack:C_OTHER"),
             ChannelVisibility::Public,
+            true,
         )
         .await
         .unwrap();
@@ -403,6 +404,7 @@ async fn test_privacy_upgrade() {
             10,
             Some("slack:C_OTHER"),
             ChannelVisibility::Public,
+            true,
         )
         .await
         .unwrap();

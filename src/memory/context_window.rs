@@ -785,6 +785,76 @@ pub(crate) fn identity_fact_lacks_user_evidence(
     !user_text.to_lowercase().contains(&value_norm)
 }
 
+/// Normalize a fact key for cross-category comparison: lowercase, every run of
+/// non-alphanumeric characters collapses to a single `_`, trimmed. So `db_port`,
+/// `DB Port` and `db-port` all compare equal.
+fn normalize_fact_key_for_match(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut last_sep = false;
+    for ch in key.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_sep = false;
+        } else if !last_sep {
+            out.push('_');
+            last_sep = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// True when an extracted fact is merely the assistant recalling/restating a
+/// fact we already store — not new information the user provided this turn.
+///
+/// Progressive extraction is fed the assistant's reply as well as the user's
+/// message, so on a recall turn ("what's my DB port?" → "You prefer port 54329")
+/// it would otherwise re-extract `54329` and persist it AGAIN — often under a
+/// different category than the original — duplicating the fact and letting
+/// "forgotten" facts resurface every time they're recalled.
+///
+/// Fires when the value is absent from the user's message (so it came from the
+/// assistant, not the user) AND an active fact already holds that exact value,
+/// under EITHER the same canonical key OR — for a distinctive multi-word value —
+/// any key. The second case catches recall duplication where the extractor
+/// invents a fresh key for a value it just recalled (e.g. "yerba mate" recalled
+/// as `late_night_coding_beverage` / `beverage` when it's already stored as
+/// `programming_beverage`).
+///
+/// The distinctive-value gate (≥2 word tokens) keeps this safe: a common
+/// single-word value like "blue" or "daily" re-appearing under a new key is left
+/// alone, since it may legitimately describe a different attribute. Corrections
+/// (the value differs) and user-stated values are never dropped.
+fn is_redundant_recall_fact(
+    fact_key: &str,
+    fact_value: &str,
+    user_message: &str,
+    existing: &[crate::traits::Fact],
+) -> bool {
+    let value_norm = fact_value.trim().to_lowercase();
+    if value_norm.is_empty() {
+        return false;
+    }
+    // If the user actually stated the value this turn, treat it as new/affirmed.
+    if user_message.to_lowercase().contains(&value_norm) {
+        return false;
+    }
+    let key_norm = normalize_fact_key_for_match(fact_key);
+    let value_is_distinctive = value_norm
+        .split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .count()
+        >= 2;
+    existing.iter().any(|f| {
+        if f.superseded_at.is_some() {
+            return false;
+        }
+        if f.value.trim().to_lowercase() != value_norm {
+            return false;
+        }
+        normalize_fact_key_for_match(&f.key) == key_norm || value_is_distinctive
+    })
+}
+
 /// Run progressive fact extraction in the background.
 /// Spawns a tokio task that extracts facts and stores them immediately.
 #[allow(clippy::too_many_arguments)]
@@ -820,6 +890,9 @@ pub fn spawn_progressive_extraction(
             Ok(facts) if !facts.is_empty() => {
                 let source_excerpt = crate::utils::truncate_str(&user_text, 200);
                 let first_seen_at = chrono::Utc::now();
+                // Snapshot active facts once so we can suppress recall-restatement
+                // re-writes (the assistant recalling a fact we already store).
+                let existing_facts = state.get_facts(None).await.unwrap_or_default();
                 let mut written: Vec<serde_json::Value> = Vec::new();
                 for fact in facts {
                     // Identity facts (user.name etc.) must be evidenced by the
@@ -835,6 +908,18 @@ pub fn spawn_progressive_extraction(
                             key = fact.key,
                             value = fact.value,
                             "Skipping user identity fact without evidence in the user's message"
+                        );
+                        continue;
+                    }
+                    // Don't re-persist a fact the assistant is merely recalling —
+                    // it duplicates the fact (often under a new category) and lets
+                    // "forgotten" facts resurface on every recall.
+                    if is_redundant_recall_fact(&fact.key, &fact.value, &user_text, &existing_facts)
+                    {
+                        debug!(
+                            key = fact.key,
+                            value = fact.value,
+                            "Skipping recall-restatement of a fact already in memory"
                         );
                         continue;
                     }
@@ -986,6 +1071,129 @@ pub fn spawn_incremental_summarization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_fact(category: &str, key: &str, value: &str) -> crate::traits::Fact {
+        let now = chrono::Utc::now();
+        crate::traits::Fact {
+            id: 1,
+            category: category.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+            superseded_at: None,
+            recall_count: 0,
+            last_recalled_at: None,
+            channel_id: None,
+            privacy: crate::types::FactPrivacy::Global,
+            first_seen_at: None,
+            source_excerpt: None,
+        }
+    }
+
+    #[test]
+    fn normalize_fact_key_matches_across_separators() {
+        assert_eq!(
+            normalize_fact_key_for_match("local_dev_db_port"),
+            "local_dev_db_port"
+        );
+        assert_eq!(normalize_fact_key_for_match("DB Port"), "db_port");
+        assert_eq!(normalize_fact_key_for_match("db-port"), "db_port");
+    }
+
+    #[test]
+    fn redundant_recall_fact_blocks_restatement_of_known_fact() {
+        // The live bug: recalling the port ("You prefer port 54329") must NOT
+        // re-store it, especially under a different category.
+        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
+        assert!(is_redundant_recall_fact(
+            "local_dev_db_port",
+            "54329",
+            "what database port did I tell you I prefer?",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_allows_user_stated_value() {
+        // User states the value this turn → legitimately new/affirmed, keep it.
+        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
+        assert!(!is_redundant_recall_fact(
+            "local_dev_db_port",
+            "54329",
+            "my local dev db port is 54329",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_allows_correction_to_new_value() {
+        // Different value (a correction) is never suppressed, even if the user
+        // didn't restate it verbatim.
+        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
+        assert!(!is_redundant_recall_fact(
+            "local_dev_db_port",
+            "9090",
+            "actually change my dev db port",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_blocks_distinctive_value_under_new_key() {
+        // The yerba-mate case: recalled value re-extracted under a fresh key.
+        // "yerba mate" is distinctive (2 words) → suppress the duplicate.
+        let existing = vec![active_fact(
+            "preference",
+            "programming_beverage",
+            "yerba mate",
+        )];
+        assert!(is_redundant_recall_fact(
+            "late_night_coding_beverage",
+            "yerba mate",
+            "what do I sip on during late-night coding sessions?",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_allows_common_value_under_new_key() {
+        // A common single-word value ("blue") under a different key may describe a
+        // genuinely different attribute → must NOT be suppressed.
+        let existing = vec![active_fact("user", "car_color", "blue")];
+        assert!(!is_redundant_recall_fact(
+            "laptop_color",
+            "blue",
+            "my laptop matches my car",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_allows_genuinely_new_fact() {
+        // No existing fact with this key → it's new information.
+        let existing = vec![active_fact("preference", "ui_theme", "dark")];
+        assert!(!is_redundant_recall_fact(
+            "local_dev_db_port",
+            "54329",
+            "the assistant mentioned a port",
+            &existing,
+        ));
+    }
+
+    #[test]
+    fn redundant_recall_fact_ignores_superseded_existing() {
+        // A superseded duplicate must not anchor the guard.
+        let mut superseded = active_fact("preference", "local_dev_db_port", "54329");
+        superseded.superseded_at = Some(chrono::Utc::now());
+        assert!(!is_redundant_recall_fact(
+            "local_dev_db_port",
+            "54329",
+            "what is my port?",
+            &[superseded],
+        ));
+    }
 
     #[test]
     fn identity_guard_blocks_unevidenced_user_name() {

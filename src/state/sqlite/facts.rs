@@ -1,6 +1,19 @@
 use super::*;
 
 const FACT_SEMANTIC_MIN_SCORE: f32 = 0.3;
+/// Recall-oriented threshold for the EXPLICIT, user-initiated memory-search tool
+/// (`search_facts_semantic`), lower than the passive-injection cutoff above.
+/// Explicit search is owner-only, deliberately requested, and merged AFTER the
+/// high-precision lexical pass, so favouring recall is safe here. The gap matters
+/// for near-synonyms the small embedding model rates just under 0.3 — e.g. "spouse"
+/// (~0.28) / "wife" (~0.23) against a stored `partner` fact — which would otherwise
+/// be missed on the search path even though the fact is plainly relevant.
+const EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE: f32 = 0.22;
+/// Bi-encoder candidate-pool size handed to the cross-encoder reranker in
+/// explicit search. Deep enough to contain a weakly-scoring correct fact
+/// (measured rank ~30 for "spouse"→partner_name) while keeping reranking — a
+/// per-candidate cross-encoder pass — bounded in latency.
+const EXPLICIT_SEARCH_CANDIDATE_POOL: usize = 50;
 const FACT_LEXICAL_MIN_SCORE: f32 = 0.3;
 const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
 const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
@@ -926,21 +939,139 @@ impl crate::traits::FactStore for SqliteStateStore {
         Ok(relevant)
     }
 
+    async fn search_facts_semantic(
+        &self,
+        query: &str,
+        max: usize,
+    ) -> anyhow::Result<Vec<(Fact, f32)>> {
+        if query.trim().is_empty() || max == 0 {
+            return Ok(vec![]);
+        }
+
+        // Embed the query; if embedding is unavailable, there is no semantic
+        // signal to contribute (the caller still has its lexical results).
+        let query_vec = match self.embedding_service.embed(query.to_string()).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Semantic fact search: embedding failed: {}", e);
+                return Ok(vec![]);
+            }
+        };
+
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, embedding, first_seen_at, source_excerpt
+             FROM facts WHERE superseded_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Stage 1 — bi-encoder candidate retrieval. Keep everything above the
+        // recall-oriented cutoff so near-synonyms ("spouse"→"partner", ~0.28)
+        // enter the candidate pool, then cap the pool by cosine so reranking
+        // stays bounded. The pool must be deep enough that a weakly-scoring but
+        // correct fact (measured: the answer can sit ~rank 30) isn't dropped.
+        let mut scored: Vec<(Fact, f32)> = Vec::new();
+        for row in &rows {
+            let embedding: Option<Vec<u8>> = row.get("embedding");
+            let Some(blob) = embedding else { continue };
+            let Ok(vec) = decode_embedding(&blob) else {
+                continue;
+            };
+            let semantic = crate::memory::math::cosine_similarity(&query_vec, &vec);
+            if semantic > EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE {
+                scored.push((Self::row_to_fact(row), semantic));
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(EXPLICIT_SEARCH_CANDIDATE_POOL);
+
+        if scored.len() <= 1 {
+            scored.truncate(max);
+            return Ok(scored);
+        }
+
+        // Stage 2 — cross-encoder rerank. The bi-encoder ranks attribute facts
+        // ("wife covers insurance") above the answer-bearing identity fact
+        // ("partner name: Aracely") for queries like "spouse"; a cross-encoder
+        // reads (query, fact) together and reorders correctly. On any reranker
+        // error (e.g. model unavailable offline), fall back to the bi-encoder
+        // order so search still works.
+        let pool_size = scored.len();
+        let cosine_top_id = scored.first().map(|(f, _)| f.id);
+        let docs: Vec<String> = scored
+            .iter()
+            .map(|(f, _)| build_fact_embedding_text(&f.category, &f.key, &f.value))
+            .collect();
+        let started = std::time::Instant::now();
+        match self.embedding_service.rerank(query.to_string(), docs).await {
+            Ok(ranked) => {
+                let mut out: Vec<(Fact, f32)> = Vec::with_capacity(max);
+                for (idx, score) in ranked.into_iter().take(max) {
+                    if let Some((fact, _)) = scored.get(idx) {
+                        out.push((fact.clone(), score));
+                    }
+                }
+                // Telemetry: reranker cost (latency), impact (did it change the top
+                // result vs the bi-encoder), and the top results with scores — so
+                // recall quality is observable without ad-hoc measurement.
+                let reordered = out.first().map(|(f, _)| f.id) != cosine_top_id;
+                let top = out
+                    .iter()
+                    .take(3)
+                    .map(|(f, s)| format!("{}={:.3}", f.key, s))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!(
+                    target: "memory_recall",
+                    candidate_pool = pool_size,
+                    returned = out.len(),
+                    rerank_ms = started.elapsed().as_millis() as u64,
+                    reordered,
+                    fallback = false,
+                    top = %top,
+                    "explicit fact search reranked"
+                );
+                Ok(out)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "memory_recall",
+                    candidate_pool = pool_size,
+                    rerank_ms = started.elapsed().as_millis() as u64,
+                    fallback = true,
+                    error = %e,
+                    "explicit fact search rerank unavailable; using bi-encoder order"
+                );
+                scored.truncate(max);
+                Ok(scored)
+            }
+        }
+    }
+
     async fn get_relevant_facts_for_channel(
         &self,
         query: &str,
         max: usize,
         channel_id: Option<&str>,
         visibility: ChannelVisibility,
+        requester_is_owner: bool,
     ) -> anyhow::Result<Vec<Fact>> {
         // In DM/Internal contexts, use semantic relevance search so that only
         // facts related to the current query are injected into the prompt.
         // Previously this called get_facts(None) which returned ALL facts
         // without filtering, causing unrelated facts to bleed into context.
-        if matches!(
-            visibility,
-            ChannelVisibility::Private | ChannelVisibility::Internal
-        ) {
+        //
+        // SECURITY: only the OWNER gets the unfiltered graph in a DM. A non-owner
+        // (allowlisted Guest) DMing the bot must NOT receive Private or
+        // other-channel facts — fall through to the privacy filter below, same as
+        // a group channel. Without this gate, a guest's prompt would be injected
+        // with the owner's private memory.
+        if requester_is_owner
+            && matches!(
+                visibility,
+                ChannelVisibility::Private | ChannelVisibility::Internal
+            )
+        {
             return self.get_relevant_facts(query, max).await;
         }
 

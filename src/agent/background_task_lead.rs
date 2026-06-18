@@ -22,6 +22,17 @@ use super::{
     strip_leading_wait, truncate_goal_result_text, user_facing_task_description, Agent,
 };
 
+/// Progress-heartbeat wait schedule: quick early updates, then exponential
+/// backoff settling at 15 minutes. Replaces the old hard cap of 4 messages,
+/// which left long-running goals completely silent after ~2 minutes.
+fn heartbeat_wait_secs(interval_count: u32) -> u64 {
+    const SCHEDULE: [u64; 6] = [15, 30, 60, 120, 300, 600];
+    SCHEDULE
+        .get(interval_count as usize)
+        .copied()
+        .unwrap_or(900)
+}
+
 /// Spawn a task lead in the background (free function to satisfy Send requirements).
 /// This runs `spawn_child` on the given agent with TaskLead role, then updates
 /// the goal and notifies the user when complete.
@@ -128,13 +139,12 @@ pub fn spawn_background_task_lead(
             }
             let mut interval_count = 0u32;
             let mut last_progress_key: Option<String> = None;
-            let mut repeated_progress = 0u32;
             let mut planning_msg_count = 0u32;
-            let mut total_progress_emitted = 0u32;
-            const MAX_PROGRESS_MESSAGES: u32 = 4;
             loop {
-                // First update after 15s, then every 30s
-                let wait_secs = if interval_count == 0 { 15 } else { 30 };
+                // Backoff schedule: 15s, 30s, 1m, 2m, 5m, 10m, then every 15m.
+                // Long-running goals keep emitting (no message cap) — the
+                // growing interval is what prevents spam.
+                let wait_secs = heartbeat_wait_secs(interval_count);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {},
                     _ = &mut heartbeat_cancel_rx => break,
@@ -147,13 +157,12 @@ pub fn spawn_background_task_lead(
                     .await
                     .unwrap_or_default();
                 if tasks.is_empty() {
-                    // Tasks not yet created — send one planning message only.
-                    // Previously sent at count 1 and 5, causing repeated spam.
-                    // Now: send only on the first empty-tasks heartbeat, then
-                    // stay silent until tasks are actually created.
+                    // Tasks not yet created — send one planning message on the
+                    // first empty-tasks heartbeat. If planning is still running
+                    // by the 1-minute tick, resume pinging on the backoff
+                    // schedule so a hung planning phase is never silent.
                     planning_msg_count += 1;
-                    if planning_msg_count == 1 && total_progress_emitted < MAX_PROGRESS_MESSAGES {
-                        total_progress_emitted += 1;
+                    if planning_msg_count == 1 || interval_count >= 3 {
                         if let Some(hub_weak) = &heartbeat_hub {
                             if let Some(hub_arc) = hub_weak.upgrade() {
                                 let _ = hub_arc
@@ -203,22 +212,17 @@ pub fn spawn_background_task_lead(
 
                     // Dedup key uses only completed|total so we don't spam when
                     // sub-tasks change status without any step actually completing.
+                    // The early fast ticks (15s/30s apart) only report actual
+                    // progress; from the 1-minute tick onward every tick emits,
+                    // so long-running goals are never silent.
                     let progress_key = format!("{}|{}", completed, total);
-                    let should_emit = if last_progress_key.as_deref() == Some(progress_key.as_str())
-                    {
-                        repeated_progress = repeated_progress.saturating_add(1);
-                        // Reduce spam for long-running tasks with unchanged state:
-                        // emit every 4th repeat (i.e. roughly every 2 minutes).
-                        repeated_progress.is_multiple_of(4)
-                    } else {
+                    let state_changed = last_progress_key.as_deref() != Some(progress_key.as_str());
+                    if state_changed {
                         last_progress_key = Some(progress_key);
-                        repeated_progress = 0;
-                        true
-                    };
-                    if !should_emit || total_progress_emitted >= MAX_PROGRESS_MESSAGES {
+                    }
+                    if !state_changed && interval_count < 3 {
                         continue;
                     }
-                    total_progress_emitted += 1;
                     if let Some(hub_weak) = &heartbeat_hub {
                         if let Some(hub_arc) = hub_weak.upgrade() {
                             let _ = hub_arc.send_text(&heartbeat_session, &progress_msg).await;
@@ -1128,7 +1132,7 @@ pub fn spawn_background_task_lead(
                                     total,
                                     failed,
                                     blocked,
-                                    task_results_summary.chars().take(3500).collect::<String>()
+                                    task_results_summary.chars().take(4000).collect::<String>()
                                 ),
                             )
                         } else {
@@ -1240,4 +1244,24 @@ pub fn spawn_background_task_lead(
             registry.remove(&goal_id).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_backoff_starts_fast_then_grows() {
+        // Quick early updates...
+        assert_eq!(heartbeat_wait_secs(0), 15);
+        assert_eq!(heartbeat_wait_secs(1), 30);
+        // ...then exponential backoff...
+        assert_eq!(heartbeat_wait_secs(2), 60);
+        assert_eq!(heartbeat_wait_secs(3), 120);
+        assert_eq!(heartbeat_wait_secs(4), 300);
+        assert_eq!(heartbeat_wait_secs(5), 600);
+        // ...settling at 15 minutes forever: long goals never go silent.
+        assert_eq!(heartbeat_wait_secs(6), 900);
+        assert_eq!(heartbeat_wait_secs(100), 900);
+    }
 }

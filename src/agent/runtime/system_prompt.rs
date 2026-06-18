@@ -275,6 +275,7 @@ impl Agent {
                 self.limits.max_facts,
                 channel_ctx.channel_id.as_deref(),
                 channel_ctx.visibility,
+                user_role == UserRole::Owner,
             )
             .await?;
 
@@ -472,7 +473,14 @@ impl Agent {
                     "error_solutions_count": error_solutions.len(),
                     "expertise_count": expertise.len(),
                     "people_count": people.len(),
-                    "current_person_facts_count": current_person_facts.len()
+                    "current_person_facts_count": current_person_facts.len(),
+                    // Which facts were actually injected this turn — makes a missed
+                    // recall debuggable (what was/wasn't surfaced) without re-running.
+                    "top_facts": facts
+                        .iter()
+                        .take(8)
+                        .map(|f| format!("{}/{}", f.category, f.key))
+                        .collect::<Vec<_>>()
                 }),
             )
             .await;

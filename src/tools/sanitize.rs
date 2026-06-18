@@ -651,6 +651,7 @@ fn memory_action_is_read(action: &str) -> bool {
     matches!(
         action,
         "search"
+            | "search_episodes"
             | "list"
             | "view"
             | "recall"
@@ -1123,7 +1124,14 @@ mod tests {
         // Rendered as the channel would: clean, no contradictory verb.
         assert_eq!(format!("Using {label}..."), "Using checking memory...");
 
-        for read in ["list", "list_goals", "list_scheduled", "diagnose_scheduled"] {
+        for read in [
+            "search",
+            "search_episodes",
+            "list",
+            "list_goals",
+            "list_scheduled",
+            "diagnose_scheduled",
+        ] {
             let (label, _) =
                 user_facing_tool_activity("manage_memories", read, ChannelVisibility::Private);
             assert_eq!(label, "checking memory", "action {read} should read");

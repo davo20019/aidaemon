@@ -840,7 +840,7 @@ impl HeartbeatCoordinator {
                                 total,
                                 failed,
                                 blocked,
-                                task_results_summary.chars().take(3500).collect::<String>()
+                                task_results_summary.chars().take(4000).collect::<String>()
                             ),
                         )
                     } else if crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished(&task_results_summary) {

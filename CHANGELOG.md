@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.5] - 2026-06-18
+
+### Added
+
+- **Active episodic recall** (`manage_memories` action `search_episodes`): the agent can now recall past conversations on demand — semantic search with a `query`, or a recent-conversations browse without one. Results carry relative timestamps, topics, and outcomes. Previously episodic memory was only reachable via passive top-3 injection, so the agent couldn't answer "what did we work on earlier / last time we discussed X". Owner-only (tool roster is empty for non-owners), so it inherits the owner's history scope with no new privacy surface.
+- **Memory-recall telemetry**: the `MemoryRetrieval` decision-point event now records the top injected fact keys (`top_facts`), and explicit reranked search emits a `memory_recall`-target log with candidate-pool size, rerank latency, whether the reranker reordered the top result, fallback status, and the top results with scores — so recall quality and reranker cost/benefit are observable without ad-hoc measurement.
+- **Hybrid fact search**: `manage_memories action='search'` now combines word-boundary keyword matching with a pure-semantic vector pass (`FactStore::search_facts_semantic`, thresholded, no recency padding), merged and deduped by fact id, so conceptually-related facts the keyword pass misses still surface (semantic-only matches are tagged in the output).
+- **Cross-encoder reranking on explicit search**: `search_facts_semantic` now does retrieve-then-rerank — the top bi-encoder candidates are re-scored by a lazily-loaded multilingual cross-encoder reranker (JINA reranker v2). A small bi-encoder rates *attribute* facts about an entity ("wife covers insurance") above the *answer-bearing identity* fact ("partner name: Aracely") for queries like "spouse" — measured rank ~31; the cross-encoder reads (query, fact) together and reorders so the answer surfaces. Scoped to explicit, owner-initiated search; falls back to bi-encoder order if the reranker is unavailable (offline/load failure). Multilingual model chosen for the owner's mixed EN/ES memory.
+
+### Changed
+
+- **Long-running goal progress heartbeats**: replaced the hard 4-message cap (which left goals silent after ~2 minutes) with an exponential backoff schedule (15s, 30s, 1m, 2m, 5m, 10m, then every 15m). Long goals keep emitting progress; the growing interval prevents spam, and a still-running planning phase no longer goes silent.
+- **Deliverable-first goal summaries**: substantive task results now lead the goal wrap-up, with generated activity recaps ("Commands run: …") ordered after and given a smaller truncation budget, so the user sees what they actually asked for first.
+- **Memory search recency**: `search` results now include when each fact was learned (`learned: <age>`, from `first_seen_at`/`created_at`), so temporal questions ("when did I tell you X?") can be answered from the results directly instead of resorting to the wrong tool.
+- **Generic tool-call budget**: `manage_goal_tasks` is now exempt from the generic per-turn budget (task-lead bookkeeping legitimately needs list + claim/complete calls per task), alongside the existing local-work and MCP tool exemptions.
+
+### Fixed
+
+- **Memory search missed exact facts**: keyword matching was substring-based, so `"port"` matched `report`/`portfolio`/`important` and buried the canonical fact (`local_dev_db_port`) past the result limit. Switched to word-boundary token matching over structured keys with key-field weighting; the canonical fact now ranks first.
+- **Near-synonym recall missed under the threshold**: common synonyms the small embedding model rates just below the `0.30` passive-injection cutoff — e.g. `"spouse"`/`"wife"` (~0.28/0.23) against a stored `partner_name` fact — were missed on the search path. `search_facts_semantic` now uses a recall-oriented `0.22` cutoff (explicit, owner-only search merged after the precise keyword pass), so these resolve reliably; passive context injection keeps the stricter `0.30` to avoid prompt bloat.
+- **Recalled facts re-stored as duplicates**: progressive extraction was fed the assistant's reply, so on a recall turn it re-persisted facts the assistant merely recalled — often under a new category — duplicating them and letting "forgotten" facts resurface. Added a recall-restatement guard (suppresses a recalled value already stored under the same canonical key, or a distinctive multi-word value under any key; user-stated values and corrections are never dropped).
+- **Executor blockers surfaced late**: when an executor calls `report_blocker`, it is now a terminal outcome — the loop ends with the structured blocker summary and the blocker is pushed to the user immediately, instead of being buried in the goal wrap-up.
+- **Spawn-timeout discarded completed work**: when a child executor persisted a terminal outcome (e.g. a reported blocker) just before the parent's spawn timeout cancelled its future, that richer outcome is now salvaged and delivered instead of a generic timeout error.
+- **Specialist mis-routing on "report"**: ops tasks phrased as "report success" / "report the error" (verb) are no longer routed to the artifact-writer specialist; "a report" (noun) still is.
+- **Memory tool status mislabel**: the *completion* status ping for `manage_memories`/`manage_people` derived its read-vs-write label from the result text (which starts with formatting like `══ Stored facts…`), so every operation — including reads — completed as `updating memory`. It now uses the action (matching the start ping), and `search_episodes` is registered as a read; reads now correctly show `checking memory`.
+- **Terminal-bridge log spam**: routine WebSocket reconnects (idle/proxy resets — `ResetWithoutClosingHandshake`, peer reset / broken-pipe / EOF) were logged at `ERROR`, thousands of lines that drowned real errors. They are now classified as transient and logged at `WARN` ("disconnected (transient), reconnecting"); genuine connection failures stay `ERROR`.
+
+### Security
+
+- **Private-fact leak to non-owner DMs**: system-prompt fact injection keyed the DM "full graph" short-circuit on channel visibility rather than sender role, so an allowlisted non-owner ("Guest") DMing the bot could receive the owner's Private and other-channel facts. `FactStore::get_relevant_facts_for_channel` now takes `requester_is_owner`: only the owner gets the unfiltered DM graph; a non-owner DM is filtered exactly like a group channel (Global + same-channel facts only, never Private or other-channel). Not exploitable in single-owner deployments, but latent in any multi-user/allowlisted setup.
+
 ## [0.11.4] - 2026-06-12
 
 ### Added

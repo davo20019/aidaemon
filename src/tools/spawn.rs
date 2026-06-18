@@ -683,13 +683,35 @@ impl Tool for SpawnAgentTool {
                         mission, e
                     ),
                 ),
-                Err(_) => (
-                    "failed",
-                    format!(
-                        "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
-                        mission, timeout_secs
-                    ),
-                ),
+                Err(_) => {
+                    // The child may have persisted a terminal outcome before
+                    // the timeout cancelled it — deliver that instead of a
+                    // generic timeout failure.
+                    let salvaged = match task_id_ref.as_deref() {
+                        Some(task_id) => {
+                            agent
+                                .salvage_executor_task_outcome(task_id, timeout_secs)
+                                .await
+                        }
+                        None => None,
+                    };
+                    match salvaged {
+                        Some(outcome) => (
+                            "completed",
+                            format!(
+                                "\u{2705} Background task finished\nMission: {}\n\n{}",
+                                mission, outcome
+                            ),
+                        ),
+                        None => (
+                            "failed",
+                            format!(
+                                "\u{23f1} Background task timed out\nMission: {}\nTimed out after {}s",
+                                mission, timeout_secs
+                            ),
+                        ),
+                    }
+                }
             };
             let delivered = match agent
                 .deliver_parent_text_result(
@@ -789,8 +811,17 @@ impl SpawnAgentTool {
             }
             Ok(Err(e)) => Ok(format!("Error: specialist failed: {}", e)),
             Err(_) => {
-                if child_role == Some(AgentRole::Executor) {
-                    if let Some(task_id) = task_id {
+                if let Some(task_id) = task_id {
+                    // The child may have persisted a terminal outcome (e.g.
+                    // report_blocker) before the timeout cancelled it — use
+                    // that instead of discarding the work.
+                    if let Some(salvaged) = agent
+                        .salvage_executor_task_outcome(task_id, self.timeout_secs)
+                        .await
+                    {
+                        return Ok(salvaged);
+                    }
+                    if child_role == Some(AgentRole::Executor) {
                         agent
                             .mark_executor_task_timeout(task_id, self.timeout_secs)
                             .await;

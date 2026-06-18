@@ -3710,11 +3710,19 @@ impl TerminalBridge {
                     );
                 }
                 Err(err) => {
-                    error!(
-                        error = %err,
-                        ran_for_secs = started.elapsed().as_secs(),
-                        "Terminal bridge connection failed"
-                    );
+                    if Self::is_expected_disconnect(&err) {
+                        warn!(
+                            error = %err,
+                            ran_for_secs = started.elapsed().as_secs(),
+                            "Terminal bridge disconnected (transient), reconnecting"
+                        );
+                    } else {
+                        error!(
+                            error = %err,
+                            ran_for_secs = started.elapsed().as_secs(),
+                            "Terminal bridge connection failed"
+                        );
+                    }
                 }
             }
             let ran_for = started.elapsed();
@@ -3745,6 +3753,29 @@ impl TerminalBridge {
         current
             .saturating_mul(2)
             .clamp(RECONNECT_INITIAL_MS, RECONNECT_MAX_MS)
+    }
+
+    /// Classifies a disconnect as routine for a long-lived broker connection: an idle/proxy
+    /// reset, a peer reset, or a normal close. The reconnect loop recovers from all of these
+    /// automatically, so they are logged at WARN instead of ERROR to avoid drowning the logs
+    /// in false alarms (the broker resets long-lived sockets every few minutes by design).
+    fn is_expected_disconnect(err: &anyhow::Error) -> bool {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+        use tokio_tungstenite::tungstenite::Error as WsError;
+        match err.downcast_ref::<WsError>() {
+            Some(WsError::ConnectionClosed)
+            | Some(WsError::AlreadyClosed)
+            | Some(WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => true,
+            Some(WsError::Io(io)) => matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            ),
+            _ => false,
+        }
     }
 
     async fn connect_once(&mut self) -> anyhow::Result<()> {
@@ -6504,6 +6535,40 @@ mod tests {
             TerminalBridge::next_reconnect_backoff_ms(0),
             RECONNECT_INITIAL_MS
         );
+    }
+
+    #[test]
+    fn test_is_expected_disconnect_classifies_routine_resets() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+        use tokio_tungstenite::tungstenite::Error as WsError;
+
+        // Routine disconnects that the reconnect loop recovers from automatically.
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+        )));
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::ConnectionClosed
+        )));
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::AlreadyClosed
+        )));
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::Io(std::io::ErrorKind::ConnectionReset.into())
+        )));
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::Io(std::io::ErrorKind::BrokenPipe.into())
+        )));
+        assert!(TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::Io(std::io::ErrorKind::UnexpectedEof.into())
+        )));
+
+        // Genuine failures must remain ERROR-worthy.
+        assert!(!TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            "authentication failed: 401 unauthorized"
+        )));
+        assert!(!TerminalBridge::is_expected_disconnect(&anyhow::anyhow!(
+            WsError::Io(std::io::ErrorKind::PermissionDenied.into())
+        )));
     }
 
     #[test]

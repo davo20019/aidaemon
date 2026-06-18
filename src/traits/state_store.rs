@@ -101,12 +101,19 @@ pub trait FactStore: Send + Sync {
     }
 
     /// Get facts for a specific channel context, respecting privacy levels.
+    ///
+    /// `requester_is_owner` controls the DM short-circuit: only the owner sees the
+    /// full unfiltered graph (incl. Private + other-channel facts) in a 1:1 DM. A
+    /// non-owner (an allowlisted Guest) gets the same privacy filtering as a group
+    /// channel — Global + same-channel facts only, never Private or other-channel —
+    /// so owner secrets can't leak into a guest's prompt context.
     async fn get_relevant_facts_for_channel(
         &self,
         query: &str,
         max: usize,
         _channel_id: Option<&str>,
         _visibility: ChannelVisibility,
+        _requester_is_owner: bool,
     ) -> anyhow::Result<Vec<super::Fact>> {
         self.get_relevant_facts(query, max).await
     }
@@ -143,6 +150,21 @@ pub trait FactStore: Send + Sync {
     /// Get all active facts with provenance info for memory management display.
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<super::Fact>> {
         self.get_facts(None).await
+    }
+
+    /// Pure semantic (vector) search over active facts: returns `(fact, score)`
+    /// pairs whose embedding similarity clears the relevance threshold, ranked by
+    /// score, with NO recency padding. Unlike [`get_relevant_facts`] (which is
+    /// tuned for context injection and pads sparse results with recent facts),
+    /// this returns only genuine matches — suitable for supplementing the
+    /// keyword-based memory search tool. Default returns empty (stores without an
+    /// embedding index simply contribute nothing).
+    async fn search_facts_semantic(
+        &self,
+        _query: &str,
+        _max: usize,
+    ) -> anyhow::Result<Vec<(super::Fact, f32)>> {
+        Ok(vec![])
     }
 }
 

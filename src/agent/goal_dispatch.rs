@@ -654,9 +654,19 @@ pub(crate) fn build_goal_failure_summary(
 
 /// Build a user-facing summary from successful task results.
 /// Includes recent completed tasks (bounded) instead of only the last one.
+/// Generated activity recaps ("Activity summary: - Commands run: ...") are
+/// bookkeeping, not deliverables — order them after substantive results.
+fn is_activity_summary_result(task: &Task) -> bool {
+    task.result
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|r| r.starts_with("Activity summary:"))
+}
+
 pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) -> String {
     const MAX_INCLUDED_TASK_RESULTS: usize = 3;
     const MAX_CHARS_PER_TASK_RESULT: usize = 800;
+    const MAX_CHARS_PRIMARY_RESULT: usize = 2500;
 
     let mut successful: Vec<&Task> = tasks
         .iter()
@@ -685,14 +695,29 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         .collect();
     selected.reverse();
 
+    // Deliverable-first ordering: substantive results lead, generated
+    // activity recaps follow. The first section is usually what the user
+    // actually asked for, so it gets a larger truncation budget.
+    let (mut ordered, bookkeeping): (Vec<&Task>, Vec<&Task>) = selected
+        .into_iter()
+        .partition(|t| !is_activity_summary_result(t));
+    ordered.extend(bookkeeping);
+    let selected = ordered;
+
     let sections: Vec<String> = selected
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(idx, t)| {
             let result = t.result.as_deref().unwrap_or("");
+            let cap = if idx == 0 {
+                MAX_CHARS_PRIMARY_RESULT
+            } else {
+                MAX_CHARS_PER_TASK_RESULT
+            };
             format!(
                 "**{}**\n{}",
                 t.description,
-                truncate_goal_result_text(result, MAX_CHARS_PER_TASK_RESULT)
+                truncate_goal_result_text(result, cap)
             )
         })
         .collect();
@@ -720,4 +745,68 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         ));
     }
     summary
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn completed_task(id: &str, order: i32, completed_at: &str, result: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            goal_id: "goal-1".to_string(),
+            description: format!("Task {id}"),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+            task_order: order,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some(result.to_string()),
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: "2026-06-12T13:00:00Z".to_string(),
+            started_at: None,
+            completed_at: Some(completed_at.to_string()),
+        }
+    }
+
+    #[test]
+    fn goal_summary_leads_with_deliverable_not_activity_summary() {
+        let bookkeeping = completed_task(
+            "locate",
+            1,
+            "2026-06-12T13:05:00Z",
+            "Activity summary:\n- Commands run: `cd '~/projects' && ls`",
+        );
+        // A substantive deliverable larger than the old 800-char per-task cap.
+        let module_rows: String = (0..60)
+            .map(|i| format!("| drupal/module_{i} | 2.{i}.0 |\n"))
+            .collect();
+        let deliverable_text = format!(
+            "### Current Drupal Modules\n| Module | Version |\n|---|---|\n{module_rows}END_OF_MODULE_LIST"
+        );
+        let deliverable = completed_task("modules", 2, "2026-06-12T13:10:00Z", &deliverable_text);
+
+        let summary = build_goal_task_results_summary(&[bookkeeping, deliverable], "fallback text");
+
+        let deliverable_pos = summary
+            .find("Current Drupal Modules")
+            .expect("deliverable must be included");
+        let bookkeeping_pos = summary
+            .find("Activity summary:")
+            .expect("bookkeeping may follow the deliverable");
+        assert!(
+            deliverable_pos < bookkeeping_pos,
+            "deliverable must come before activity-summary bookkeeping:\n{summary}"
+        );
+        assert!(
+            summary.contains("END_OF_MODULE_LIST"),
+            "the primary deliverable must not be cut at the old 800-char cap:\n{summary}"
+        );
+    }
 }

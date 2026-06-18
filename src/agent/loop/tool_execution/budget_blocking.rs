@@ -41,6 +41,26 @@ pub(crate) fn tool_budget_caps(tier: ModelTrustTier) -> ToolBudgetCaps {
     }
 }
 
+/// Tools exempt from the generic per-turn call budget: high-frequency local
+/// work tools, MCP tools (`prefix__name`), and `manage_goal_tasks` — task-lead
+/// bookkeeping that legitimately needs list + claim/complete calls per task.
+fn generic_budget_exempt(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "terminal"
+            | "cli_agent"
+            | "computer_use"
+            | "read_file"
+            | "edit_file"
+            | "write_file"
+            | "search_files"
+            | "remember_fact"
+            | "manage_memories"
+            | "web_fetch"
+            | "manage_goal_tasks"
+    ) || tool_name.contains("__")
+}
+
 #[cfg(test)]
 mod caps_tests {
     use super::*;
@@ -238,23 +258,7 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if prior_calls >= caps.generic
-        && !matches!(
-            tc.name.as_str(),
-            "terminal"
-                | "cli_agent"
-                | "computer_use"
-                | "read_file"
-                | "edit_file"
-                | "write_file"
-                | "search_files"
-                | "remember_fact"
-                | "manage_memories"
-                | "web_fetch"
-        )
-        && !tc.name.contains("__")
-    // MCP tools (prefix__name)
-    {
+    } else if prior_calls >= caps.generic && !generic_budget_exempt(&tc.name) {
         if tc.name == "web_search" && prior_signature_failures == 0 {
             Some(ToolResultNotice::WebSearchBackendSetupHint { prior_calls }.render())
         } else if tc.name == "project_inspect" {
@@ -447,4 +451,42 @@ pub(super) async fn maybe_handle_duplicate_send_file_noop(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod exemption_tests {
+    use super::*;
+
+    #[test]
+    fn task_lead_bookkeeping_tool_is_exempt_from_generic_budget() {
+        // A task lead managing several tasks legitimately needs more than
+        // the generic 8 calls (list + claim/complete per task).
+        assert!(generic_budget_exempt("manage_goal_tasks"));
+    }
+
+    #[test]
+    fn ordinary_tools_still_hit_the_generic_budget() {
+        assert!(!generic_budget_exempt("manage_people"));
+        assert!(!generic_budget_exempt("project_inspect"));
+    }
+
+    #[test]
+    fn legacy_exemptions_preserved() {
+        for tool in [
+            "terminal",
+            "cli_agent",
+            "computer_use",
+            "read_file",
+            "edit_file",
+            "write_file",
+            "search_files",
+            "remember_fact",
+            "manage_memories",
+            "web_fetch",
+        ] {
+            assert!(generic_budget_exempt(tool), "{tool} must stay exempt");
+        }
+        // MCP tools (prefix__name) are exempt too.
+        assert!(generic_budget_exempt("github__list_issues"));
+    }
 }

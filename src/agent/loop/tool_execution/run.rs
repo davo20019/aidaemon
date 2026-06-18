@@ -229,6 +229,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     } else {
         HashMap::new()
     };
+    // Set when an executor successfully reports a blocker this iteration.
+    // A declared blocker is a terminal outcome: the structured summary is the
+    // deliverable for the task lead, so the loop ends after this batch instead
+    // of running reconciliation/verification iterations against it.
+    let mut executor_blocker_summary: Option<String> = None;
     for tc in &resp.tool_calls {
         if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
         {
@@ -1470,10 +1475,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             // productive multi-step runs are never artificially stopped.
             execution_state.extend_budget_on_progress();
 
+            // `manage_memories`/`manage_people` encode read-vs-write in the ACTION
+            // arg, and `user_facing_tool_activity` infers the "checking" vs
+            // "updating memory" label from the first word of the summary. The
+            // result text starts with formatting (e.g. "══ Stored facts…"), so
+            // passing it here mislabeled every completion as "updating memory".
+            // Use the action (like the start ping) for these tools.
+            let complete_summary_src =
+                if matches!(tc.name.as_str(), "manage_memories" | "manage_people") {
+                    summarize_tool_args(&tc.name, &effective_arguments)
+                } else {
+                    summarize_completed_tool_result(&result_text)
+                };
             let (complete_label, complete_summary) =
                 crate::tools::sanitize::user_facing_tool_activity(
                     &tc.name,
-                    &summarize_completed_tool_result(&result_text),
+                    &complete_summary_src,
                     channel_ctx.visibility,
                 );
             send_status(
@@ -1633,6 +1650,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             )
             .await?;
 
+        if !is_error && tc.name == "report_blocker" && agent.task_id.is_some() {
+            // Capture the raw structured summary — the untrusted-data wrapper
+            // would be stripped by reply sanitization, leaving an empty reply.
+            executor_blocker_summary = Some(
+                crate::agent::completion_checks::strip_untrusted_wrapper(&result_text).to_string(),
+            );
+        }
+
         let direct_response = if !is_error
             && agent.depth == 0
             && resp.tool_calls.len() == 1
@@ -1727,6 +1752,37 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             );
             break;
         }
+    }
+
+    if let Some(blocker_summary) = executor_blocker_summary {
+        info!(
+            session_id,
+            iteration, "Executor reported a blocker; ending loop with the structured summary"
+        );
+        agent
+            .emit_task_end(
+                emitter,
+                task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Partial,
+                task_start,
+                iteration,
+                learning_ctx.tool_calls.len(),
+                None,
+                Some(blocker_summary.chars().take(200).collect()),
+            )
+            .await;
+        learning_ctx.completed_naturally = true;
+        learning_ctx.task_outcome = Some(TaskOutcome::Partial);
+        let learning_ctx_for_task = learning_ctx.clone();
+        let state = agent.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                warn!("Learning failed: {}", e);
+            }
+        });
+        commit_state!();
+        return Ok(ToolExecutionOutcome::Return(Ok(blocker_summary)));
     }
 
     info!(

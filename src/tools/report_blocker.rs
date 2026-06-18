@@ -227,6 +227,30 @@ impl Tool for ReportBlockerTool {
             task.completed_at = Some(chrono::Utc::now().to_rfc3339());
             let _ = self.state.update_task(&task).await;
             info!(task_id = %self.task_id, reason = %args.reason, "Executor reported blocker");
+
+            // Surface the blocker to the user right away through the
+            // notification queue (delivered on the next heartbeat tick)
+            // instead of waiting for the goal wrap-up summary. A blocker is
+            // usually actionable by the user (start a service, grant access),
+            // so minutes of silence here cost real wall-clock time.
+            if let Ok(Some(goal)) = self.state.get_goal(&task.goal_id).await {
+                let mut message = format!(
+                    "\u{26a0}\u{fe0f} A step is blocked: {}\nStep: {}",
+                    args.reason, task.description
+                );
+                if let Some(need) = &exact_need {
+                    message.push_str(&format!("\nNeeded to continue: {}", need));
+                }
+                let entry = crate::traits::NotificationEntry::new(
+                    &goal.id,
+                    &goal.session_id,
+                    "escalation",
+                    &message,
+                );
+                if let Err(e) = self.state.enqueue_notification(&entry).await {
+                    info!(task_id = %self.task_id, error = %e, "Failed to enqueue blocker notification");
+                }
+            }
         }
 
         Ok(executor_result.render_task_lead_summary())
@@ -324,6 +348,34 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("\"executor_result\""));
+    }
+
+    #[tokio::test]
+    async fn test_report_blocker_enqueues_user_notification() {
+        let (state, goal_id, task_id) = setup_test_state().await;
+        let tool = ReportBlockerTool::new(task_id.clone(), state.clone());
+
+        tool.call(
+            &json!({
+                "reason": "Docker daemon is not reachable",
+                "exact_need": "Start Docker, then ask me to retry."
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let pending = state.get_pending_notifications(10).await.unwrap();
+        let entry = pending
+            .iter()
+            .find(|n| n.goal_id == goal_id)
+            .expect("blocker should queue an immediate user notification");
+        assert_eq!(entry.session_id, "test-session");
+        assert_eq!(entry.notification_type, "escalation");
+        assert!(entry.message.contains("Docker daemon is not reachable"));
+        assert!(entry
+            .message
+            .contains("Start Docker, then ask me to retry."));
     }
 
     #[tokio::test]

@@ -56,7 +56,11 @@ impl Agent {
         if has_marker(&[".md", "write-up"])
             || has_word(&[
                 "markdown",
-                "report",
+                // "a report" (noun), not bare "report": ops tasks routinely
+                // say "report success" / "report the error" (verb) and must
+                // not be routed to the artifact writer.
+                "a report",
+                "the report",
                 "document",
                 "writeup",
                 "save it as",
@@ -632,6 +636,34 @@ impl Agent {
         let task_lead_summary = structured.render_task_lead_summary();
 
         if let Some(mut task) = latest_task {
+            // An already-terminal task means the executor persisted its own
+            // outcome (e.g. report_blocker → "blocked") before this failure
+            // path ran. Keep that richer outcome instead of clobbering it
+            // with a generic failure (the parent timeout cancelling a child
+            // that already finished is the common case).
+            let already_terminal = matches!(task.status.as_str(), "blocked" | "completed");
+            if error.is_some() && already_terminal {
+                let _ = self
+                    .state
+                    .log_task_activity(&crate::traits::TaskActivity {
+                        id: 0,
+                        task_id: task_id.to_string(),
+                        activity_type: "step_validation".to_string(),
+                        tool_name: None,
+                        tool_args: None,
+                        result: Some(format!(
+                            "Late executor failure ignored; task already terminal with status '{}': {}",
+                            task.status,
+                            error.unwrap_or_default()
+                        )),
+                        success: Some(false),
+                        tokens_used: None,
+                        created_at: now.clone(),
+                    })
+                    .await;
+                return;
+            }
+
             if let Ok(context) =
                 persist_executor_result_context(task.context.as_deref(), &structured)
             {
@@ -744,6 +776,32 @@ impl Agent {
         let error = format!("Executor timed out after {timeout_secs} seconds");
         self.finalize_executor_task_outcome(task_id, None, Some(&error), &session_id)
             .await;
+    }
+
+    /// If the executor already persisted a terminal outcome on its task
+    /// (e.g. via `report_blocker`) before the parent's spawn timeout
+    /// cancelled its future, return that outcome so the caller can use it
+    /// instead of discarding the work as a generic timeout error.
+    pub(crate) async fn salvage_executor_task_outcome(
+        &self,
+        task_id: &str,
+        timeout_secs: u64,
+    ) -> Option<String> {
+        let task = self.state.get_task(task_id).await.ok().flatten()?;
+        if !matches!(task.status.as_str(), "blocked" | "completed" | "failed") {
+            return None;
+        }
+        let summary = task
+            .result
+            .as_deref()
+            .or(task.blocker.as_deref())
+            .or(task.error.as_deref())
+            .unwrap_or("(no summary recorded)");
+        Some(format!(
+            "Executor for task {} finished with status '{}' before the {}s spawn timeout \
+             was handled; its persisted outcome:\n\n{}",
+            task_id, task.status, timeout_secs, summary
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1785,6 +1843,30 @@ mod tests {
             AgentRole::Executor,
             "Compile and format morning AI job preparation tips report",
             "Create a markdown report and save it as ~/morning_ai_job_preparation_tips_report.md",
+        );
+        assert_eq!(kind, SpecialistKind::ArtifactWriter);
+    }
+
+    #[test]
+    fn specialist_kind_ops_task_with_report_verb_is_not_artifact_writer() {
+        // "report success" / "report the error" is reporting back, not
+        // writing a document — must not select ArtifactWriter for ops work.
+        let kind = Agent::select_specialist_kind(
+            AgentRole::Executor,
+            "Run ddev composer update for the Drupal site",
+            "1. Navigate to the project. 2. Run `ddev composer update`. \
+             3. Monitor the output for errors. 4. If successful, report success. \
+             If it fails, report the error.",
+        );
+        assert_ne!(kind, SpecialistKind::ArtifactWriter);
+    }
+
+    #[test]
+    fn specialist_kind_written_report_noun_still_artifact_writer() {
+        let kind = Agent::select_specialist_kind(
+            AgentRole::Executor,
+            "Summarize the benchmark findings",
+            "Write a report of the benchmark results for the team",
         );
         assert_eq!(kind, SpecialistKind::ArtifactWriter);
     }

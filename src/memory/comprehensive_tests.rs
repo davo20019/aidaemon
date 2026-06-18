@@ -500,7 +500,13 @@ async fn test_global_fact_accessible_everywhere() {
 
     // Should be retrievable with any channel context
     let facts_no_channel = store
-        .get_relevant_facts_for_channel("name", 10, None, crate::types::ChannelVisibility::Private)
+        .get_relevant_facts_for_channel(
+            "name",
+            10,
+            None,
+            crate::types::ChannelVisibility::Private,
+            true,
+        )
         .await
         .unwrap();
 
@@ -510,6 +516,7 @@ async fn test_global_fact_accessible_everywhere() {
             10,
             Some("telegram:123"),
             crate::types::ChannelVisibility::Private,
+            true,
         )
         .await
         .unwrap();
@@ -545,6 +552,7 @@ async fn test_private_fact_dm_only() {
             10,
             Some("telegram:owner"),
             crate::types::ChannelVisibility::Private,
+            true,
         )
         .await
         .unwrap();
@@ -556,6 +564,7 @@ async fn test_private_fact_dm_only() {
             10,
             Some("telegram:group"),
             crate::types::ChannelVisibility::PublicExternal,
+            false,
         )
         .await
         .unwrap();
@@ -568,6 +577,58 @@ async fn test_private_fact_dm_only() {
     assert!(
         !has_ssn_public,
         "Private fact should NOT be accessible in PublicExternal"
+    );
+}
+
+/// Security regression: a non-owner (allowlisted Guest) DMing the bot must NOT
+/// receive the owner's Private facts, even though a DM is `Private` visibility.
+/// Only the owner gets the unfiltered graph in a DM.
+#[tokio::test]
+async fn test_private_fact_hidden_from_non_owner_dm() {
+    let (store, _db) = setup_test_store().await;
+
+    store
+        .upsert_fact(
+            "user",
+            "ssn",
+            "123-45-6789",
+            "test",
+            Some("telegram:owner"),
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+
+    // Owner DM still sees the private fact (behavior preserved).
+    let owner_dm = store
+        .get_relevant_facts_for_channel(
+            "ssn",
+            10,
+            Some("telegram:owner"),
+            crate::types::ChannelVisibility::Private,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        owner_dm.iter().any(|f| f.key == "ssn"),
+        "owner DM should still see their private fact"
+    );
+
+    // Non-owner DM (Guest) must NOT see the owner's private fact.
+    let guest_dm = store
+        .get_relevant_facts_for_channel(
+            "ssn",
+            10,
+            Some("telegram:guest"),
+            crate::types::ChannelVisibility::Private,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !guest_dm.iter().any(|f| f.key == "ssn"),
+        "SECURITY: guest DM must NOT receive the owner's Private fact"
     );
 }
 
@@ -598,6 +659,34 @@ async fn test_null_channel_legacy_facts() {
 }
 
 // ==================== E. Fact Retrieval & Search Edge Cases ====================
+
+/// Regression: explicit semantic search must surface a near-synonym match that
+/// falls just under the passive-injection threshold. "spouse" embeds at ~0.28
+/// against a stored `partner_name` fact — below the 0.30 passive cutoff but above
+/// the 0.22 explicit-search cutoff — so `search_facts_semantic` (the user-initiated
+/// tool path) must return it, even though passive injection might not.
+#[tokio::test]
+async fn test_explicit_search_catches_near_threshold_synonym() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "user",
+            "partner_name",
+            "Aracely Zambrano",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let hits = store.search_facts_semantic("spouse", 10).await.unwrap();
+    assert!(
+        hits.iter().any(|(f, _)| f.key == "partner_name"),
+        "explicit semantic search should surface the partner fact for the synonym 'spouse'; got {:?}",
+        hits.iter().map(|(f, _)| f.key.as_str()).collect::<Vec<_>>()
+    );
+}
 
 /// Verify search with zero results doesn't crash.
 #[tokio::test]

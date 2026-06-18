@@ -182,7 +182,7 @@ pub(super) fn looks_like_recovery_message_with_trivial_content(text: &str) -> bo
 /// Strip the `[UNTRUSTED EXTERNAL DATA ...]...[END UNTRUSTED EXTERNAL DATA]`
 /// wrapper that the tool execution framework adds to tool results. The raw content
 /// is needed for trivial-output detection, since the wrapper obscures the actual output.
-fn strip_untrusted_wrapper(s: &str) -> &str {
+pub(in crate::agent) fn strip_untrusted_wrapper(s: &str) -> &str {
     let trimmed = s.trim();
     if !trimmed.starts_with("[UNTRUSTED EXTERNAL DATA") {
         return trimmed;
