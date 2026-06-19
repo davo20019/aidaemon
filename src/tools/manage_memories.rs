@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{ModelProvider, StateStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalKind, FactPrivacy};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
@@ -118,6 +118,10 @@ fn merge_search_results(
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
     approval_tx: Option<ApprovalBroker>,
+    /// Optional LLM dependency for relational-intent classification during
+    /// `search`. When absent, the relational expansion step is skipped and
+    /// the tool behaves exactly as before (fail-open by default).
+    llm_dep: Option<(Arc<dyn ModelProvider>, String)>,
 }
 
 impl ManageMemoriesTool {
@@ -125,11 +129,20 @@ impl ManageMemoriesTool {
         Self {
             state,
             approval_tx: None,
+            llm_dep: None,
         }
     }
 
     pub fn with_approval_tx(mut self, tx: ApprovalBroker) -> Self {
         self.approval_tx = Some(tx);
+        self
+    }
+
+    /// Inject an LLM provider + fast model name so the `search` action can
+    /// run the relational-intent classifier and append a neighborhood block.
+    /// The dependency is optional — the tool works correctly without it.
+    pub fn with_llm_dep(mut self, provider: Arc<dyn ModelProvider>, fast_model: String) -> Self {
+        self.llm_dep = Some((provider, fast_model));
         self
     }
 
@@ -609,6 +622,10 @@ impl Tool for ManageMemoriesTool {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
 
+                // Collect initial fact IDs (lexical + semantic) for neighborhood dedup.
+                let initial_ids: std::collections::HashSet<i64> =
+                    merged.iter().map(|(f, _)| f.id).collect();
+
                 let mut output = format!(
                     "══ Stored facts matching '{}' ({} of {} matches) ══\n\
                      IMPORTANT: Use these EXACT values when answering — do not substitute or infer.\n\n",
@@ -630,6 +647,55 @@ impl Tool for ManageMemoriesTool {
                         f.category, f.key, f.value, privacy_label, channel_label, learned, marker
                     ));
                 }
+
+                // Relational neighborhood expansion — fail-open on any error.
+                // Skipped when no LLM dep is wired (e.g. in unit tests, non-owner flows).
+                if crate::agent::relational_prefilter::should_run_relational_classifier(
+                    query, false,
+                ) {
+                    if let Some((provider, fast_model)) = &self.llm_dep {
+                        let t0 = std::time::Instant::now();
+                        let rel =
+                            crate::agent::llm_classifier::classify_relational_intent(
+                                provider.as_ref(),
+                                fast_model,
+                                query,
+                            )
+                            .await;
+                        let classifier_ms = t0.elapsed().as_millis() as u64;
+                        if !rel.entities.is_empty() {
+                            let t1 = std::time::Instant::now();
+                            if let Ok(neighborhood) = self
+                                .state
+                                .assemble_neighborhood(&rel.entities, &initial_ids)
+                                .await
+                            {
+                                let assembly_ms = t1.elapsed().as_millis() as u64;
+                                let added = neighborhood.len();
+                                if added > 0 {
+                                    tracing::info!(
+                                        target: "memory_recall",
+                                        classifier_ms,
+                                        assembly_ms,
+                                        entities = rel.entities.len(),
+                                        added,
+                                        "neighborhood expansion"
+                                    );
+                                    output.push_str(
+                                        "\n── Related context (connected facts) ──\n",
+                                    );
+                                    for f in neighborhood.iter().take(16) {
+                                        output.push_str(&format!(
+                                            "• [{}] {} → \"{}\"\n",
+                                            f.category, f.key, f.value
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Ok(output)
             }
             "search_episodes" => {
@@ -1927,6 +1993,8 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::MockProvider;
+    use crate::traits::store_prelude::FactStore;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     #[test]
@@ -1942,6 +2010,74 @@ mod tests {
         assert!(
             bytes <= 1250,
             "manage_memories schema is {bytes} bytes, budget is 1250"
+        );
+    }
+
+    /// TDD: search action appends the relational neighborhood when an LLM dep is wired
+    /// and the query is a named-person relational query (e.g. "who is conchi's spouse?").
+    ///
+    /// Test design:
+    ///   - Seed: mother_name=Consuelo, father_name=Galo Loor (both in "user" category).
+    ///   - Query "consuelo's mother" with limit=1 → only the top-ranked mother_name
+    ///     fact is displayed; father_name is NOT in `initial_ids`.
+    ///   - MockProvider returns {"intent":"relational","entities":["Consuelo"]}.
+    ///   - assemble_neighborhood(["Consuelo"], {mother_id}) flips owner_relationship=true
+    ///     because mother_name is a relationship key, then pulls in father_name
+    ///     (also a relationship key) from the remaining facts.
+    ///   - Final output must contain "Galo" under the "Related context" header.
+    #[tokio::test]
+    async fn test_search_relational_expansion() {
+        let state = setup_state().await;
+
+        state
+            .upsert_fact(
+                "user",
+                "mother_name",
+                "Consuelo",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        state
+            .upsert_fact(
+                "user",
+                "father_name",
+                "Galo Loor",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // MockProvider scripted to return the relational-intent JSON the
+        // classifier would produce for "who is conchi's spouse?".
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(r#"{"intent":"relational","entities":["Consuelo"]}"#),
+        ]));
+
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+
+        // limit=1 keeps only the top-ranked initial hit (mother_name) so
+        // initial_ids does NOT contain father_name. The neighborhood expansion
+        // is then the only path that can surface "Galo".
+        let out = tool
+            .call(
+                &json!({"action": "search", "query": "consuelo's mother", "limit": 1}).to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("Galo"),
+            "neighborhood expansion should surface father_name fact; got:\n{out}"
+        );
+        assert!(
+            out.contains("Related context"),
+            "output should have a neighborhood header; got:\n{out}"
         );
     }
 

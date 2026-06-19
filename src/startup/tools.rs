@@ -29,7 +29,7 @@ use crate::tools::{
     WebSearchTool, WriteFileTool,
 };
 use crate::traits::store_prelude::*;
-use crate::traits::Tool;
+use crate::traits::{ModelProvider, Tool};
 use crate::types::MediaMessage;
 
 pub struct BaseToolsBundle {
@@ -394,6 +394,7 @@ pub async fn build_base_tools(
     event_store: Arc<EventStore>,
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
+    llm_dep: Option<(Arc<dyn ModelProvider>, String)>,
 ) -> anyhow::Result<BaseToolsBundle> {
     let (approval_tx, approval_rx) = mpsc::channel(approval_queue_capacity);
     let approval_tx = ApprovalBroker::new(approval_tx);
@@ -417,6 +418,7 @@ pub async fn build_base_tools(
             state.clone(),
             event_store.clone(),
             approval_tx.clone(),
+            llm_dep.clone(),
         )
         .await?;
         info!(
@@ -816,6 +818,7 @@ async fn build_base_tool(
     state: Arc<SqliteStateStore>,
     event_store: Arc<EventStore>,
     approval_tx: ApprovalBroker,
+    llm_dep: Option<(Arc<dyn ModelProvider>, String)>,
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
         BaseToolId::SystemInfo => BuiltBaseTool {
@@ -849,10 +852,16 @@ async fn build_base_tool(
             tool: Arc::new(ShareMemoryTool::new(state, approval_tx)),
             terminal_tool: None,
         },
-        BaseToolId::ManageMemories => BuiltBaseTool {
-            tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
-            terminal_tool: None,
-        },
+        BaseToolId::ManageMemories => {
+            let mut tool = ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone());
+            if let Some((provider, fast_model)) = llm_dep.clone() {
+                tool = tool.with_llm_dep(provider, fast_model);
+            }
+            BuiltBaseTool {
+                tool: Arc::new(tool),
+                terminal_tool: None,
+            }
+        }
         BaseToolId::ScheduledGoalRuns => BuiltBaseTool {
             tool: Arc::new(ScheduledGoalRunsTool::new(state)),
             terminal_tool: None,
@@ -978,6 +987,7 @@ mod tests {
         let event_store = Arc::new(EventStore::new(state.pool()).await?);
         let config_file = NamedTempFile::new()?;
 
+        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
         let mut bundle = build_base_tools(
             &config,
             config_file.path().to_path_buf(),
@@ -985,9 +995,9 @@ mod tests {
             event_store.clone(),
             32,
             8,
+            None,
         )
         .await?;
-        let model_provider = Arc::new(MockProvider::new()) as Arc<dyn ModelProvider>;
         let llm_runtime = SharedLlmRuntime::new(
             model_provider,
             router_from_models(config.provider.models.clone()),
@@ -1289,6 +1299,7 @@ mod tests {
             event_store,
             8,
             8,
+            None,
         )
         .await
         .unwrap();

@@ -462,6 +462,10 @@ async fn setup_tools_phase(
         event_store.clone(),
         approval_capacity,
         media_capacity,
+        {
+            let snap = llm_runtime.snapshot();
+            Some((snap.provider(), snap.primary_model()))
+        },
     )
     .await?;
 
