@@ -825,6 +825,45 @@ fn redact_error_line_for_summary(key_line: &str) -> String {
     crate::tools::sanitize::redact_secrets(&windows_summarized)
 }
 
+/// User-facing message shown when a tool's work is moved to the background
+/// (a long-running command, CLI agent, or sub-agent). Warm, plain-language,
+/// and free of internals: NO pid, NO raw shell commands, NO failed-probe
+/// noise, NO "moved to background / notifications enabled" jargon — those
+/// belong in logs, not chat. A short "Working on" gist, derived from the
+/// user's own request, gives a little transparency without exposing commands.
+///
+/// `user_request` is the user's original message. The gist line is omitted
+/// when it is empty or itself an internal/synthetic re-engagement prompt
+/// (so we never echo `[Background command …]` machinery back to the user).
+pub(in crate::agent) fn build_friendly_background_handoff(user_request: &str) -> String {
+    let mut msg = String::from(
+        "⏳ Still on it — this is taking a bit longer, so it's running in the background now. \
+         I'll send the result the moment it's ready.",
+    );
+    if let Some(gist) = friendly_request_gist(user_request) {
+        msg.push_str("\n\nWorking on: \"");
+        msg.push_str(&gist);
+        msg.push('"');
+    }
+    msg
+}
+
+/// First-line, length-capped echo of the user's request for the handoff
+/// "Working on" line. Returns `None` for empty or synthetic/internal prompts.
+fn friendly_request_gist(user_request: &str) -> Option<String> {
+    let trimmed = user_request.trim();
+    // Skip synthetic re-engagement prompts and other bracketed control text —
+    // these are internal machinery, not something to quote back to the user.
+    if trimmed.is_empty() || trimmed.starts_with('[') {
+        return None;
+    }
+    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(crate::utils::truncate_str(first_line, 140))
+}
+
 /// Categorize tool calls into a human-readable activity summary.
 /// Convert a raw `"tool_name(args)"` entry into a user-friendly display string.
 ///
@@ -988,6 +1027,49 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::StateStore;
     use std::sync::Arc;
+
+    #[test]
+    fn test_friendly_background_handoff_is_warm_and_internal_free() {
+        let msg =
+            build_friendly_background_handoff("How many PDF files are in my projects folder?");
+        // Warm reassurance + a quoted gist of the user's own request.
+        assert!(msg.contains("running in the background"));
+        assert!(msg.contains("I'll send the result the moment it's ready"));
+        assert!(msg.contains("Working on: \"How many PDF files are in my projects folder?\""));
+        // No internals leaked into chat.
+        assert!(!msg.contains("pid="));
+        assert!(!msg.contains("Moved to background"));
+        assert!(!msg.contains("Completion notifications"));
+        assert!(!msg.contains("find "));
+        assert!(!msg.to_lowercase().contains("failed"));
+        assert!(!msg.contains("Here's what I did"));
+    }
+
+    #[test]
+    fn test_friendly_background_handoff_omits_gist_for_internal_prompts() {
+        // Synthetic re-engagement prompts must not be quoted back to the user.
+        let synthetic = build_friendly_background_handoff(
+            "[Background command completed]\nCommand: `ls`\nOutput:\n5",
+        );
+        assert!(!synthetic.contains("Working on:"));
+        assert!(synthetic.contains("running in the background"));
+
+        // Empty request → no gist line either.
+        let empty = build_friendly_background_handoff("   ");
+        assert!(!empty.contains("Working on:"));
+    }
+
+    #[test]
+    fn test_friendly_request_gist_truncates_long_requests() {
+        let long = "a".repeat(500);
+        let gist = friendly_request_gist(&long).expect("gist for long request");
+        assert!(gist.chars().count() <= 140);
+        // Multi-line requests collapse to the first line.
+        assert_eq!(
+            friendly_request_gist("count the files\nthen email me").as_deref(),
+            Some("count the files")
+        );
+    }
 
     #[test]
     fn test_categorize_tool_calls_groups_correctly() {

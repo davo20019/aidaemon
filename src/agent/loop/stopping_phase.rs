@@ -419,7 +419,7 @@ pub(super) async fn run_stopping_phase(
     }
 
     if agent.depth == 0 {
-        if let Some(background_ack) = pending_background_ack.take() {
+        if let Some(_background_ack) = pending_background_ack.take() {
             // Detect multi-step user requests that imply work beyond just
             // launching a background process.  When the user's message
             // contains sequencing markers ("and then", "test it", etc.)
@@ -557,28 +557,14 @@ pub(super) async fn run_stopping_phase(
                     )
                     .await;
 
-                // Build a richer response that includes an activity summary
-                // so the user knows what was accomplished before the background
-                // task was started, not just the technical "moved to background" text.
-                // NOTE: We use display_tool_call() to convert "tool_name(args)" to
-                // a user-friendly format that won't be stripped by
-                // strip_tool_name_references() (which replaces raw tool_name(...)
-                // patterns with "that").
-                let reply = if learning_ctx.tool_calls.is_empty() {
-                    background_ack.clone()
-                } else {
-                    let mut summary =
-                        String::from("Here's what I did before the background task started:\n");
-                    for (i, call) in learning_ctx.tool_calls.iter().enumerate() {
-                        summary.push_str(&format!(
-                            "{}. {}\n",
-                            i + 1,
-                            post_task::display_tool_call(call)
-                        ));
-                    }
-                    summary.push_str(&format!("\n{}", background_ack));
-                    summary
-                };
+                // User-facing handoff: warm, plain-language, and free of
+                // internals. The old version listed raw shell commands (with
+                // flags and failed probes) and appended the technical ack with
+                // the pid — all of which belong in logs, not chat. Instead we
+                // send a short reassurance plus a "Working on" gist derived from
+                // the user's own request. The full interpreted answer follows
+                // when the background work finishes.
+                let reply = post_task::build_friendly_background_handoff(user_text);
 
                 let assistant_msg = Message {
                     id: Uuid::new_v4().to_string(),

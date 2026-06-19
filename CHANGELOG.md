@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-06-19
+
+### Fixed
+
+- **Backgrounded commands with short results no longer drop the answer**: a long-running command that finished with a short output (a `wc -l` count, a path, a one-word status) used to deliver only a bare "✅ Background command finished" ping with no result. The completion path classified any output under 5 characters as "trivial" and skipped delivery entirely — so e.g. "how many resumes?" → the count never reached the user. Now only genuinely empty output is treated as trivial.
+- **No more duplicate "background command finished" notices / re-run churn**: short results were re-fed into the full agent loop, where small local models tended to *re-run* the (slow) command, re-detaching to the background and re-engaging repeatedly — emitting a "finished" ping per re-run. Short results are no longer routed back through the loop.
+
 ### Added
 
+- **Tool-less interpretation of short background results**: when a backgrounded command finishes with a short, complete result, it is now turned into one plain-language sentence via a single LLM call made with **no tools** — the model can only reply in text, so it physically cannot re-run the command (which was the source of the churn). Falls back to delivering the raw value if the call is unavailable, so the answer is never lost. Example: instead of `Result: 160`, you get "There are 160 PDF files in your projects folder, though this count only includes files that match that specific extension."
 - **Searched-but-denied observation telemetry**: a `memory_recall`-target log fires when the model denies a named-person relational query *after* a memory search returned non-empty results — a possible "reasoning miss" where connecting facts were present but unused. Observation-only (no behavior change); it lets us measure whether this failure mode actually occurs before deciding to build a gate for it.
+
+### Changed
+
+- **Friendlier "moved to background" handoff message**: the message shown when a command is moved to the background no longer exposes internals (raw shell commands with flags, failed probe attempts, the process id, and "completion notifications are enabled" jargon — these belong in logs, not chat). It now reads as a short, warm reassurance plus a `Working on: "<your request>"` gist derived from the user's own message.
 
 ## [0.11.6] - 2026-06-19
 
