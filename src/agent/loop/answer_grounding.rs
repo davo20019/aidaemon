@@ -204,6 +204,39 @@ fn is_leading_stopword(w: &str) -> bool {
     )
 }
 
+/// Entities the `reply` makes a claim/denial about that appear nowhere in
+/// `evidence` (tool outputs + user message). The classifier supplies the
+/// candidate `entities`; this confirms the reply actually addresses them and
+/// that they were not grounded this turn. Substring (folded) match, like the
+/// list gate — errs toward NOT flagging.
+#[allow(dead_code)]
+pub(in crate::agent) fn find_unsearched_denials(
+    reply: &str,
+    entities: &[String],
+    evidence: &[&str],
+) -> Vec<String> {
+    if entities.is_empty() {
+        return Vec::new();
+    }
+    let reply_f = fold_for_match(reply);
+    let corpus = fold_for_match(&evidence.join("\n"));
+    entities
+        .iter()
+        .filter(|e| {
+            let ef = fold_for_match(e);
+            // The reply addresses the entity, but evidence does not contain it.
+            ef.split_whitespace()
+                .filter(|w| w.chars().count() >= 3)
+                .any(|w| reply_f.contains(w))
+                && !ef
+                    .split_whitespace()
+                    .filter(|w| w.chars().count() >= 3)
+                    .all(|w| corpus.contains(w))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Lowercase and fold common Latin diacritics to ASCII so accent differences
 /// between the model's spelling and the source text don't read as misses.
 fn fold_for_match(s: &str) -> String {
@@ -321,5 +354,27 @@ mod tests {
     fn bold_markers_are_stripped_from_items() {
         let reply = "• **Enner Valencia** (Captain)\n";
         assert_eq!(extract_list_name_entities(reply), vec!["Enner Valencia"]);
+    }
+
+    #[test]
+    fn flags_denial_of_unsearched_entity() {
+        let reply = "I don't have information about Conchi's spouse.";
+        let entities = vec!["Conchi".to_string()];
+        let evidence = vec!["partner_name: Aracely Zambrano"]; // Conchi absent
+        let out = find_unsearched_denials(reply, &entities, &evidence);
+        assert_eq!(out, vec!["Conchi".to_string()]);
+    }
+
+    #[test]
+    fn does_not_flag_when_entity_is_in_evidence() {
+        let reply = "I don't have Conchi's phone number.";
+        let entities = vec!["Conchi".to_string()];
+        let evidence = vec!["mother_name: Consuelo (Conchi) Montesdeoca"]; // present
+        assert!(find_unsearched_denials(reply, &entities, &evidence).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_when_no_entities() {
+        assert!(find_unsearched_denials("anything", &[], &["x"]).is_empty());
     }
 }
