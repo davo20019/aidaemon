@@ -1330,4 +1330,152 @@ impl crate::traits::FactStore for SqliteStateStore {
 
         Ok(rows.iter().map(Self::row_to_fact).collect())
     }
+
+    async fn assemble_neighborhood(
+        &self,
+        entities: &[String],
+        initial_ids: &std::collections::HashSet<i64>,
+    ) -> anyhow::Result<Vec<Fact>> {
+        use crate::memory::neighborhood::{
+            is_relationship_key, select_neighborhood_facts, NeighborhoodCaps,
+        };
+        use crate::traits::PeopleStore;
+
+        if entities.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let all = self
+            .get_all_facts_with_provenance()
+            .await
+            .unwrap_or_default();
+        let people = PeopleStore::get_all_people(self).await.unwrap_or_default();
+
+        let folded = |s: &str| s.to_ascii_lowercase();
+        let mut resolved: Vec<String> = Vec::new();
+        let mut owner_relationship = false;
+
+        // If any seed fact (from the initial embedding hit) has a relationship key,
+        // the search context is already family/relationship-oriented — enable the
+        // owner-relationship cluster so all co-relations travel together.
+        if all
+            .iter()
+            .filter(|f| initial_ids.contains(&f.id))
+            .any(|f| is_relationship_key(&f.key))
+        {
+            owner_relationship = true;
+        }
+
+        for ent in entities {
+            let ef = folded(ent);
+            if let Some(p) = people.iter().find(|p| {
+                folded(&p.name).contains(&ef) || p.aliases.iter().any(|a| folded(a).contains(&ef))
+            }) {
+                resolved.push(p.name.clone());
+                // A resolved person that has a relationship role flips on the
+                // owner-relationship cluster rule so co-relations travel together.
+                if p.relationship.is_some() {
+                    owner_relationship = true;
+                }
+            } else {
+                resolved.push(ent.clone());
+            }
+            // If the entity name itself matches a relationship word (e.g. "mom",
+            // "partner"), also enable the owner cluster.
+            if is_relationship_key(&ef) {
+                owner_relationship = true;
+            }
+        }
+
+        Ok(select_neighborhood_facts(
+            &all,
+            &resolved,
+            owner_relationship,
+            initial_ids,
+            NeighborhoodCaps::default(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod assemble_neighborhood_tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::traits::FactStore;
+    use crate::types::FactPrivacy;
+    use std::sync::Arc;
+
+    async fn setup_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(
+            db_file.path().to_str().unwrap(),
+            100,
+            None,
+            embedding_service,
+        )
+        .await
+        .unwrap();
+        (store, db_file)
+    }
+
+    #[tokio::test]
+    async fn assemble_neighborhood_pulls_owner_family_cluster() {
+        let (store, _db) = setup_store().await;
+
+        store
+            .upsert_fact(
+                "user",
+                "mother_name",
+                "Consuelo Montesdeoca",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                "user",
+                "father",
+                "Galo Loor",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                "user",
+                "partner_name",
+                "Aracely Zambrano",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // Pretend the search already matched the mother fact (id resolved below).
+        let mother = store
+            .get_facts(Some("user"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.key == "mother_name")
+            .unwrap();
+        let initial: std::collections::HashSet<i64> = [mother.id].into_iter().collect();
+
+        let out = store
+            .assemble_neighborhood(&["Consuelo".to_string()], &initial)
+            .await
+            .unwrap();
+        let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
+        assert!(
+            values.iter().any(|v| v.contains("Galo")),
+            "father pulled into cluster: {:?}",
+            values
+        );
+    }
 }

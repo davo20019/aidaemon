@@ -166,6 +166,21 @@ pub trait FactStore: Send + Sync {
     ) -> anyhow::Result<Vec<(super::Fact, f32)>> {
         Ok(vec![])
     }
+
+    /// Assemble the neighborhood of facts for the given resolved entity names and
+    /// initial seed fact IDs (e.g. from an embedding search hit). Expands the set
+    /// via namespace, co-mention, and owner-relationship cluster rules.
+    ///
+    /// The default no-op keeps non-SQLite stores compiling without change.
+    /// Wired into production in Task 6 (`get_relevant_facts`).
+    #[allow(dead_code)]
+    async fn assemble_neighborhood(
+        &self,
+        _entities: &[String],
+        _initial_ids: &std::collections::HashSet<i64>,
+    ) -> anyhow::Result<Vec<super::Fact>> {
+        Ok(vec![])
+    }
 }
 
 /// Episodic memory storage and retrieval.
