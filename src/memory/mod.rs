@@ -5,6 +5,7 @@ pub mod embeddings;
 pub mod expertise;
 pub mod manager;
 pub mod math;
+pub mod neighborhood;
 pub mod people_intelligence;
 pub mod proactive;
 pub mod procedures;
