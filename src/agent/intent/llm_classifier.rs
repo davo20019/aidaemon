@@ -181,6 +181,67 @@ pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
     RelationalIntent { kind, entities }
 }
 
+/// Build the messages array for a relational-intent classification call.
+/// Kept separate from `classify_relational_intent` so the prompt can be
+/// unit-tested without a provider.
+#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
+fn build_relational_classifier_messages(user_text: &str) -> Vec<Value> {
+    let system = "You classify a user message about their personal memory. \
+Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", \"entities\": [..]}. \
+\"relational\" = a question about a relationship/connection between entities (e.g. \"who is Conchi's spouse?\", \"who is my kid's mom?\", \"what tools does project X use?\"). \
+\"recall\" = a direct fact lookup about one entity (e.g. \"what's my dog's name?\"). \
+\"none\" = anything else (general knowledge, chit-chat, actions). \
+\"entities\" = the people/projects/things the question is about, as named (resolve possessives to the owned entity: \"my mom\" -> \"my mom\"). Keep it short.";
+    vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": user_text}),
+    ]
+}
+
+/// Classify a message for relational/recall intent and extract its entities.
+/// Fail-open: empty input, provider error, or timeout yields `RelationalKind::None`.
+#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
+pub async fn classify_relational_intent(
+    provider: &dyn ModelProvider,
+    fast_model: &str,
+    user_text: &str,
+) -> RelationalIntent {
+    let trimmed = user_text.trim();
+    if trimmed.is_empty() {
+        return RelationalIntent {
+            kind: RelationalKind::None,
+            entities: Vec::new(),
+        };
+    }
+    let messages = build_relational_classifier_messages(trimmed);
+    let options = ChatOptions {
+        max_tokens_override: Some(120),
+        ..ChatOptions::default()
+    };
+    let call = provider.chat_with_options(fast_model, &messages, &[], &options);
+    let response = match tokio::time::timeout(CLASSIFIER_TIMEOUT, call).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(err)) => {
+            debug!(?err, "relational classifier call failed; failing open");
+            return RelationalIntent {
+                kind: RelationalKind::None,
+                entities: Vec::new(),
+            };
+        }
+        Err(_) => {
+            debug!(
+                timeout_s = CLASSIFIER_TIMEOUT.as_secs(),
+                "relational classifier timeout"
+            );
+            return RelationalIntent {
+                kind: RelationalKind::None,
+                entities: Vec::new(),
+            };
+        }
+    };
+    parse_relational_intent(response.content.as_deref().unwrap_or(""))
+}
+
 /// Build the messages array for a classification call. Kept separate from
 /// `classify_intent` so the prompt can be unit-tested without a provider.
 pub(crate) fn build_classifier_messages(user_text: &str) -> Vec<Value> {
@@ -447,5 +508,25 @@ mod tests {
         let r = parse_relational_intent("not json at all");
         assert_eq!(r.kind, RelationalKind::None);
         assert!(r.entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn classify_relational_intent_parses_provider_json() {
+        let provider = crate::testing::MockProvider::with_responses(vec![
+            crate::testing::MockProvider::text_response(
+                r#"{"intent":"relational","entities":["Conchi"]}"#,
+            ),
+        ]);
+        let r =
+            classify_relational_intent(&provider, "fast-model", "who is conchi's spouse?").await;
+        assert_eq!(r.kind, RelationalKind::Relational);
+        assert_eq!(r.entities, vec!["Conchi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn classify_relational_intent_fails_open_on_empty_input() {
+        let provider = crate::testing::MockProvider::new();
+        let r = classify_relational_intent(&provider, "fast-model", "   ").await;
+        assert_eq!(r.kind, RelationalKind::None);
     }
 }
