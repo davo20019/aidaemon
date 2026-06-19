@@ -1881,6 +1881,72 @@ pub(super) async fn run_completion_phase(
             }
         }
 
+        // Search-before-deny gate: the reply denies or asserts a specific
+        // personal fact about an entity the user named, but no memory lookup
+        // grounded it this turn. Classifier-gated and owner-DM-gated; bounded
+        // to one fire per turn so it can never loop indefinitely.
+        // Only fires in private DMs (owner 1-on-1) — never in public channels,
+        // group chats, or sub-agent internal sessions.
+        let is_owner_dm = user_role == UserRole::Owner
+            && channel_ctx.visibility == crate::types::ChannelVisibility::Private;
+        if completion_progress.denial_gate_count == 0
+            && is_owner_dm
+            && !execution_state.tool_output_evidence_overflow
+            && super::answer_grounding::reply_contains_unsearched_denial_phrase(&reply)
+        {
+            let memory_lookup_fired_this_turn = learning_ctx.tool_calls.iter().any(|call| {
+                call.starts_with("manage_memories(") || call.starts_with("manage_people(")
+            });
+            // Use the narrower named-person relational check (possessive + relational noun)
+            // rather than the broader `should_run_relational_classifier` which also matches
+            // ego-centric recall questions ("what about pets?"). The denial gate is scoped
+            // to specific named-person queries ("who is Conchi's spouse?") where a search
+            // failure is unambiguous; generic recall queries are handled by other paths.
+            if !memory_lookup_fired_this_turn
+                && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
+                    user_text,
+                )
+            {
+                let fast_model_for_denial = llm_router
+                    .as_ref()
+                    .map(|r| r.select(crate::router::Tier::Fast).to_string())
+                    .unwrap_or_else(|| model.clone());
+                let intent = crate::agent::llm_classifier::classify_relational_intent(
+                    llm_provider.as_ref(),
+                    &fast_model_for_denial,
+                    user_text,
+                )
+                .await;
+                if !intent.entities.is_empty() {
+                    // Pass only tool output as evidence — NOT user_text.
+                    // Including user_text would cause entity names from the
+                    // user's own question to appear "grounded" even though no
+                    // memory search was done. We only want to flag entities
+                    // that were not found in actual memory lookup results.
+                    let unsearched = super::answer_grounding::find_unsearched_denials(
+                        &reply,
+                        &intent.entities,
+                        &[execution_state.tool_output_evidence.as_str()],
+                    );
+                    if !unsearched.is_empty() {
+                        completion_progress.denial_gate_count += 1;
+                        warn!(
+                            target: "memory_recall",
+                            session_id,
+                            iteration,
+                            entities = %unsearched.join(", "),
+                            "Reply denies/asserts an unsearched entity — forcing a memory lookup"
+                        );
+                        pending_system_messages.push(SystemDirective::UnsearchedEntityDenial {
+                            entities: unsearched,
+                        });
+                        commit_state!();
+                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                    }
+                }
+            }
+        }
+
         // Corroboration guard: an enumeration-style answer produced from web
         // research must rest on at least two successfully read source pages —
         // snippets-only or single-page answers get one chance to fetch a

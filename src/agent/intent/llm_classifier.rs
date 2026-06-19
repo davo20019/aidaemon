@@ -200,7 +200,6 @@ Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", 
 
 /// Classify a message for relational/recall intent and extract its entities.
 /// Fail-open: empty input, provider error, or timeout yields `RelationalKind::None`.
-#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 pub async fn classify_relational_intent(
     provider: &dyn ModelProvider,
     fast_model: &str,

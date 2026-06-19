@@ -135,6 +135,10 @@ pub(super) struct CompletionProgress {
     /// injected (enumeration answer from web research with <2 source pages
     /// read). Fires once.
     pub corroboration_nudge_count: usize,
+    /// Count of times the search-before-deny gate has fired (reply denies/
+    /// asserts a personal fact about an entity that was not looked up in
+    /// memory this turn). Bounded to 1 to prevent infinite loops.
+    pub denial_gate_count: u32,
 }
 
 impl CompletionProgress {

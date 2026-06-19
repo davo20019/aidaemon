@@ -1707,3 +1707,110 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
         "corroboration directive should have been injected"
     );
 }
+
+// ==================== Search-Before-Deny Gate Tests ====================
+
+/// A final reply that denies knowledge of a named entity (e.g. "I don't have
+/// information about Conchi's spouse") without first searching memory must be
+/// intercepted by the search-before-deny gate.  The gate calls the relational
+/// classifier (consuming a scripted provider response), injects an
+/// UnsearchedEntityDenial directive, and continues the loop so the model can
+/// search before answering.  The corrected follow-up is accepted as the final
+/// response.
+///
+/// MockProvider call order:
+///   1) First LLM call → denial text (no tool call)
+///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Conchi"]}`
+///   3) Second LLM call (with directive injected) → corrected answer
+#[tokio::test]
+async fn test_relational_denial_is_blocked_then_corrected() {
+    let denial =
+        "I don't have information about Conchi's spouse. I don't know who that person is.";
+    let corrected = "Based on the memory search, Conchi's spouse is Galo Loor.";
+    // The classifier must return a JSON object with relational intent and the entity name.
+    let classifier_json = r#"{"intent":"relational","entities":["Conchi"]}"#;
+
+    let provider = MockProvider::with_responses(vec![
+        // Call 1: First LLM call — model denies knowledge without searching.
+        MockProvider::text_response(denial),
+        // Call 2: Classifier call inside completion_phase — consumed by
+        // classify_relational_intent; returns relational intent with "Conchi".
+        MockProvider::text_response(classifier_json),
+        // Call 3: Second LLM call — model has the UnsearchedEntityDenial directive
+        // injected and produces the correct answer.
+        MockProvider::text_response(corrected),
+    ]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Seed facts so memory could answer this (gate only checks whether lookup
+    // happened, not whether the facts exist — but seeding them makes the test
+    // semantically coherent with the scenario in the brief).
+    harness
+        .state
+        .upsert_fact(
+            "family",
+            "mother",
+            "Consuelo (Conchi)",
+            "test",
+            None,
+            crate::types::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    harness
+        .state
+        .upsert_fact(
+            "family",
+            "father",
+            "Galo Loor",
+            "test",
+            None,
+            crate::types::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "denial_gate_session",
+            "Who is Conchi's spouse?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The denial must not reach the user — the gate must block it.
+    assert!(
+        !response.to_ascii_lowercase().contains("don't have information"),
+        "denial must not reach the user; final response was: {}",
+        response
+    );
+
+    // The corrected answer (naming Galo) should be the final response.
+    assert!(
+        response.contains("Galo") || response.contains("Conchi"),
+        "corrected reply should be the final response; got: {}",
+        response
+    );
+
+    // The UnsearchedEntityDenial directive ("did not search memory") must have
+    // been injected into a follow-up LLM call — mirroring how the grounding
+    // test checks for "GROUNDING CHECK FAILED".
+    let calls = harness.provider.call_log.lock().await;
+    let denial_directive_sent = calls.iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("did not search memory"))
+        })
+    });
+    assert!(
+        denial_directive_sent,
+        "UnsearchedEntityDenial directive should have been injected into a follow-up LLM call"
+    );
+}

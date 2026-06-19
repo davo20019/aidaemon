@@ -209,7 +209,6 @@ fn is_leading_stopword(w: &str) -> bool {
 /// candidate `entities`; this confirms the reply actually addresses them and
 /// that they were not grounded this turn. Substring (folded) match, like the
 /// list gate — errs toward NOT flagging.
-#[allow(dead_code)]
 pub(in crate::agent) fn find_unsearched_denials(
     reply: &str,
     entities: &[String],
@@ -235,6 +234,42 @@ pub(in crate::agent) fn find_unsearched_denials(
         })
         .cloned()
         .collect()
+}
+
+/// True when the reply contains a phrase that directly denies or expresses
+/// uncertainty about a personal fact — a necessary pre-condition before
+/// calling the more expensive relational classifier. Errs toward inclusion
+/// so a genuine unsearched denial is never silently dropped; caller is still
+/// responsible for the entity-level `find_unsearched_denials` check.
+pub(in crate::agent) fn reply_contains_unsearched_denial_phrase(reply: &str) -> bool {
+    const DENIAL_PHRASES: &[&str] = &[
+        "don't have information",
+        "do not have information",
+        "don't have any information",
+        "do not have any information",
+        "don't have that information",
+        "do not have that information",
+        "i don't know",
+        "i do not know",
+        "i have no information",
+        "no information about",
+        "couldn't find information",
+        "could not find information",
+        "i'm not sure",
+        "i am not sure",
+        "i don't have",
+        "i do not have",
+        "i'm unable to",
+        "i am unable to",
+        "i couldn't find",
+        "i could not find",
+        "no record of",
+        "not in my memory",
+        "not in my records",
+        "unable to locate",
+    ];
+    let lower = reply.trim().to_ascii_lowercase();
+    DENIAL_PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
 /// Lowercase and fold common Latin diacritics to ASCII so accent differences

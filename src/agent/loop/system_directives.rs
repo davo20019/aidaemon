@@ -177,7 +177,6 @@ pub(in crate::agent) enum SystemDirective {
     /// The candidate reply denies or asserts a specific personal fact about an
     /// entity the user named, but no memory lookup for that entity grounded this
     /// turn. Force a search before the denial/assertion is allowed through.
-    #[allow(dead_code)]
     UnsearchedEntityDenial {
         entities: Vec<String>,
     },
