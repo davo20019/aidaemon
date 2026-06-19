@@ -1945,6 +1945,27 @@ pub(super) async fn run_completion_phase(
                         return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     }
                 }
+            } else if memory_lookup_fired_this_turn
+                && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
+                    user_text,
+                )
+                && !execution_state.tool_output_evidence.is_empty()
+            {
+                // Observation only (no intervention): the model DID search memory
+                // and got non-empty results, yet still denied a named-person
+                // relational query — a possible "searched-but-denied" reasoning
+                // miss (the connecting facts may have been present in the results
+                // but not used). Logged, not acted on, so we can measure whether
+                // this failure mode actually occurs before deciding to build a
+                // gate for it. See CHANGELOG / the relational-recall design notes.
+                tracing::info!(
+                    target: "memory_recall",
+                    session_id,
+                    iteration,
+                    query = %crate::utils::truncate_str(user_text, 120),
+                    evidence_len = execution_state.tool_output_evidence.len(),
+                    "relational denial despite memory results (possible reasoning miss; observation only)"
+                );
             }
         }
 

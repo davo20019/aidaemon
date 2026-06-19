@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Searched-but-denied observation telemetry**: a `memory_recall`-target log fires when the model denies a named-person relational query *after* a memory search returned non-empty results — a possible "reasoning miss" where connecting facts were present but unused. Observation-only (no behavior change); it lets us measure whether this failure mode actually occurs before deciding to build a gate for it.
+
 ## [0.11.6] - 2026-06-19
 
 ### Added

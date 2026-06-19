@@ -531,6 +531,34 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
     result
 }
 
+/// Upper bound (chars / lines) on a background command's output that is
+/// delivered to the user *directly* instead of through the agent
+/// re-engagement loop. Short, complete results — a `wc -l` count, a path, a
+/// one-line status — are the whole answer; re-engaging adds no summarization
+/// value and, with small local models, tends to make the model RE-RUN the
+/// command, re-detaching to the background and emitting duplicate "finished"
+/// pings. Direct delivery guarantees the answer with no churn.
+const SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS: usize = 200;
+const SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES: usize = 4;
+
+/// True when a (non-empty) background result is short and self-contained
+/// enough to deliver directly rather than re-feed into the agent loop.
+/// The caller must already have excluded empty / "(no output)" results.
+fn is_short_complete_output(output_trimmed: &str) -> bool {
+    output_trimmed.chars().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS
+        && output_trimmed.lines().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES
+}
+
+/// Friendly, pid-free delivery message for a short background result. Inline
+/// code for a one-liner (e.g. a count); a fenced block for a few lines.
+fn format_short_background_result(output_trimmed: &str) -> String {
+    if output_trimmed.contains('\n') {
+        format!("Result:\n```\n{}\n```", output_trimmed)
+    } else {
+        format!("Result: `{}`", output_trimmed)
+    }
+}
+
 impl TerminalTool {
     pub async fn new(
         allowed_prefixes: Vec<String>,
@@ -1891,14 +1919,92 @@ impl TerminalTool {
                             // command finishes long after the user's original request.
                             if let Some(output) = completion_output_for_agent {
                                 let output_trimmed = output.trim();
-                                let is_trivial = output_trimmed.is_empty()
-                                    || output_trimmed == "(no output)"
-                                    || output_trimmed.len() < 5;
+                                // Only genuinely empty output is trivial. A short
+                                // result is often the whole answer — a `wc -l` count,
+                                // a numeric total, a one-word status — so it must NOT
+                                // be dropped here (length is not a proxy for value).
+                                let is_trivial =
+                                    output_trimmed.is_empty() || output_trimmed == "(no output)";
                                 if is_trivial {
                                     info!(
                                         pid,
                                         "Skipping agent re-engagement: trivial background command output"
                                     );
+                                } else if is_short_complete_output(output_trimmed) {
+                                    // SHORT, complete result (a `wc -l` count, a path, a
+                                    // one-line status). Do NOT re-enter the full agent loop:
+                                    // with small models it tends to RE-RUN the command,
+                                    // re-detaching to the background and emitting duplicate
+                                    // "finished" pings. Instead, ask the model for a one-line
+                                    // interpretation via a TOOL-LESS call (it can only reply
+                                    // in text — it cannot re-run anything), so the user gets a
+                                    // contextual answer ("345 raw matches, not files") with no
+                                    // churn. If that call is unavailable, fall back to the raw
+                                    // result so the answer is never lost.
+                                    let interpreted = match agent_for_notify {
+                                        Some(ref agent) => {
+                                            agent
+                                                .interpret_background_result(
+                                                    &command_for_notify,
+                                                    output_trimmed,
+                                                )
+                                                .await
+                                        }
+                                        None => None,
+                                    };
+                                    let message = match interpreted {
+                                        Some(text) => {
+                                            info!(
+                                                pid,
+                                                session_id = %session_for_notify,
+                                                "Delivered short background output via tool-less LLM interpretation (no re-engagement)"
+                                            );
+                                            text
+                                        }
+                                        None => {
+                                            info!(
+                                                pid,
+                                                session_id = %session_for_notify,
+                                                "Delivering short background output as raw result (interpretation unavailable)"
+                                            );
+                                            format_short_background_result(output_trimmed)
+                                        }
+                                    };
+                                    let mut delivered = false;
+                                    if let Some(ref hub) = hub_for_notify {
+                                        if let Err(e) =
+                                            hub.send_text(&session_for_notify, &message).await
+                                        {
+                                            warn!(
+                                                pid,
+                                                error = %e,
+                                                session_id = %session_for_notify,
+                                                "Failed to deliver short background command output"
+                                            );
+                                        } else {
+                                            delivered = true;
+                                        }
+                                    }
+                                    if !delivered {
+                                        if let Some(ref state) = state_for_notify {
+                                            let entry = crate::traits::NotificationEntry::new(
+                                                &goal_id_for_notify,
+                                                &session_for_notify,
+                                                "progress",
+                                                &message,
+                                            );
+                                            if let Err(e) = state.enqueue_notification(&entry).await
+                                            {
+                                                warn!(
+                                                    pid,
+                                                    error = %e,
+                                                    session_id = %session_for_notify,
+                                                    goal_id = %goal_id_for_notify,
+                                                    "Failed to enqueue short background command output"
+                                                );
+                                            }
+                                        }
+                                    }
                                 } else {
                                     // Preferred path: feed the output back through the agent so the
                                     // user gets a formatted, summarized reply instead of raw stdout.
@@ -3342,6 +3448,103 @@ mod tests {
         assert!(
             saw_completion,
             "completion notification should still arrive"
+        );
+    }
+
+    #[test]
+    fn test_is_short_complete_output_classification() {
+        // Short, self-contained results → delivered directly.
+        assert!(is_short_complete_output("42"));
+        assert!(is_short_complete_output("207"));
+        assert!(is_short_complete_output(
+            "/Users/davidloor/projects/resume/google"
+        ));
+        assert!(is_short_complete_output("Build complete"));
+        assert!(is_short_complete_output("a\nb\nc")); // 3 lines, tiny
+
+        // Long / multi-line output → still routed through re-engagement.
+        let long_line = "x".repeat(SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS + 1);
+        assert!(!is_short_complete_output(&long_line));
+        let many_lines = "l\n".repeat(SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES + 1);
+        assert!(!is_short_complete_output(&many_lines));
+    }
+
+    #[test]
+    fn test_format_short_background_result_message() {
+        // One-liner → inline code, no pid, no raw command.
+        let one = format_short_background_result("207");
+        assert_eq!(one, "Result: `207`");
+        assert!(!one.contains("pid"));
+        assert!(!one.contains("find"));
+
+        // Multi-line → fenced block.
+        let multi = format_short_background_result("a\nb");
+        assert!(multi.contains("```"));
+        assert!(multi.contains("a\nb"));
+    }
+
+    /// A background command whose answer is a short string (a `wc -l` count, a
+    /// numeric total, a one-word status) must still deliver that answer to the
+    /// user. Regression test for the bug where outputs under 5 chars were
+    /// classified as "trivial" and silently dropped — the user asked "how many
+    /// resumes?", the count came back short, and only the bare "finished" ping
+    /// reached the chat with no number. The short result is delivered directly
+    /// (as `Result: ...`), never re-fed into the agent loop.
+    #[tokio::test]
+    async fn test_background_terminal_short_output_is_delivered() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        // Output "42" (2 chars) — the command text contains 40 and 2 but not 42,
+        // so finding "42" in a notification proves the OUTPUT was delivered.
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 2; echo $((40 + 2))","_session_id":"sess_short","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        let mut saw_output = false;
+        for _ in 0..60 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_short"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("42")
+                    // Delivered directly as a short result, NOT via the
+                    // re-engagement verbatim fallback (which exposes the raw
+                    // command) and NOT dropped as trivial.
+                    && entry.message.contains("Result:")
+                    && !entry.message.contains("Output from")
+            }) {
+                saw_output = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            saw_output,
+            "short background command output (the count the user asked for) must be delivered directly as a short result, not dropped or re-engaged"
         );
     }
 

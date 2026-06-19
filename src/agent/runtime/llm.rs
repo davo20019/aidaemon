@@ -766,6 +766,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interpret_background_result_returns_model_summary() {
+        // The tool-less interpretation returns the model's one-line summary so
+        // the notifier can deliver a contextual answer instead of a bare value.
+        let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+            "That's 345 lines matching \"resume\" — a raw text-match count, not a file count.",
+        )]);
+        let harness = setup_test_agent(provider)
+            .await
+            .expect("build test harness");
+
+        let summary = harness
+            .agent
+            .interpret_background_result("ls -R ~/projects | grep -i resume | wc -l", "345")
+            .await;
+
+        assert_eq!(
+            summary.as_deref(),
+            Some(
+                "That's 345 lines matching \"resume\" — a raw text-match count, not a file count."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn interpret_background_result_falls_back_to_none_on_empty() {
+        // Empty model output → None, so the caller falls back to the raw result
+        // and the answer is never lost.
+        let provider = MockProvider::with_responses(vec![MockProvider::text_response("   ")]);
+        let harness = setup_test_agent(provider)
+            .await
+            .expect("build test harness");
+
+        let summary = harness
+            .agent
+            .interpret_background_result("echo done", "done")
+            .await;
+
+        assert!(summary.is_none());
+    }
+
+    #[tokio::test]
     async fn recovery_can_failover_to_another_provider() {
         let harness = setup_test_agent(MockProvider::new())
             .await
