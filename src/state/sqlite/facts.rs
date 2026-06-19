@@ -1337,7 +1337,8 @@ impl crate::traits::FactStore for SqliteStateStore {
         initial_ids: &std::collections::HashSet<i64>,
     ) -> anyhow::Result<Vec<Fact>> {
         use crate::memory::neighborhood::{
-            is_relationship_key, select_neighborhood_facts, NeighborhoodCaps,
+            entity_mentioned_as_words, is_relationship_key, select_neighborhood_facts,
+            NeighborhoodCaps,
         };
         use crate::traits::PeopleStore;
 
@@ -1369,7 +1370,8 @@ impl crate::traits::FactStore for SqliteStateStore {
         for ent in entities {
             let ef = folded(ent);
             if let Some(p) = people.iter().find(|p| {
-                folded(&p.name).contains(&ef) || p.aliases.iter().any(|a| folded(a).contains(&ef))
+                entity_mentioned_as_words(&p.name, ent)
+                    || p.aliases.iter().any(|a| entity_mentioned_as_words(a, ent))
             }) {
                 resolved.push(p.name.clone());
                 // A resolved person that has a relationship role flips on the
@@ -1401,7 +1403,7 @@ impl crate::traits::FactStore for SqliteStateStore {
 mod assemble_neighborhood_tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
-    use crate::traits::FactStore;
+    use crate::traits::{FactStore, PeopleStore};
     use crate::types::FactPrivacy;
     use std::sync::Arc;
 
@@ -1476,6 +1478,138 @@ mod assemble_neighborhood_tests {
             values.iter().any(|v| v.contains("Galo")),
             "father pulled into cluster: {:?}",
             values
+        );
+    }
+
+    /// Tests the *primary* person-resolution path: entity name → resolved Person
+    /// with a `relationship` role → `owner_relationship = true` → cluster pulls
+    /// in co-relations.
+    ///
+    /// Critically, `initial_ids` is EMPTY so the fallback "initial-match has a
+    /// relationship key" trigger cannot fire.  Only the Person-record path can
+    /// enable the owner cluster here.
+    #[tokio::test]
+    async fn assemble_neighborhood_resolves_person_relationship() {
+        let (store, _db) = setup_store().await;
+
+        // Seed a Person record with a relationship role.
+        let person = crate::traits::Person {
+            id: 0,
+            name: "Consuelo Montesdeoca".to_string(),
+            aliases: vec![],
+            relationship: Some("mother".to_string()),
+            platform_ids: std::collections::HashMap::new(),
+            notes: None,
+            communication_style: None,
+            language_preference: None,
+            last_interaction_at: None,
+            interaction_count: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.upsert_person(&person).await.unwrap();
+
+        // Seed flat facts that belong to the owner-relationship cluster.
+        store
+            .upsert_fact(
+                "user",
+                "father",
+                "Galo Loor",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                "user",
+                "partner_name",
+                "Aracely Zambrano",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // Empty initial_ids — the fallback trigger (initial fact has relationship
+        // key) CANNOT fire.  Only the Person-record resolution path can enable
+        // the owner cluster.
+        let initial: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        let out = store
+            .assemble_neighborhood(&["Consuelo".to_string()], &initial)
+            .await
+            .unwrap();
+        let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
+        assert!(
+            values.iter().any(|v| v.contains("Galo")),
+            "father should be pulled into cluster via person-resolution path: {:?}",
+            values
+        );
+    }
+
+    /// Word-boundary guard: entity "Ana" must NOT resolve the person "Banana Doe".
+    #[tokio::test]
+    async fn assemble_neighborhood_person_match_is_word_boundary() {
+        let (store, _db) = setup_store().await;
+
+        // "Banana Doe" — contains "ana" as a substring but NOT as a whole word.
+        let person = crate::traits::Person {
+            id: 0,
+            name: "Banana Doe".to_string(),
+            aliases: vec![],
+            relationship: Some("friend".to_string()),
+            platform_ids: std::collections::HashMap::new(),
+            notes: None,
+            communication_style: None,
+            language_preference: None,
+            last_interaction_at: None,
+            interaction_count: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.upsert_person(&person).await.unwrap();
+
+        // A fact whose value would only appear if the person cluster were enabled.
+        store
+            .upsert_fact(
+                "user",
+                "best_friend",
+                "Banana Doe",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_fact(
+                "user",
+                "hobby",
+                "gardening",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // Search for "Ana" — should NOT match "Banana Doe" via word-boundary.
+        let initial: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let out = store
+            .assemble_neighborhood(&["Ana".to_string()], &initial)
+            .await
+            .unwrap();
+        // The owner cluster must NOT be triggered by false substring match.
+        // "hobby" fact is unrelated; if "Ana" matched "Banana Doe", the friend's
+        // relationship role would enable the cluster and pull in all relationship
+        // facts.  Assert the result is empty (no initial hits, no cluster).
+        assert!(
+            out.is_empty(),
+            "entity 'Ana' must not resolve person 'Banana Doe' via substring: {:?}",
+            out
         );
     }
 }

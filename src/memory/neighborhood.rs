@@ -88,7 +88,7 @@ fn word_tokens(s: &str) -> Vec<String> {
 ///
 /// "Significant" words are those with at least 2 characters, so short
 /// connectives don't produce spurious matches.
-fn entity_mentioned_as_words(haystack: &str, entity: &str) -> bool {
+pub(crate) fn entity_mentioned_as_words(haystack: &str, entity: &str) -> bool {
     let haystack_tokens: HashSet<String> = word_tokens(haystack).into_iter().collect();
     let entity_words: Vec<String> = word_tokens(entity);
     // Require at least one meaningful word to match.
