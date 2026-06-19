@@ -116,6 +116,71 @@ impl LlmIntentClass {
     }
 }
 
+/// Coarse relational-recall classification used by neighborhood assembly and
+/// the search-before-deny gate. Separate from `LlmIntentClass` because both
+/// consumers need the *entities* the query names, which the coarse class lacks.
+#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationalKind {
+    /// A question about a relationship/connection between entities
+    /// ("who is Conchi's spouse?", "what tools does project X use?").
+    Relational,
+    /// A direct personal-fact recall ("what's my dog's name?").
+    Recall,
+    /// Neither — do nothing.
+    None,
+}
+
+#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalIntent {
+    pub kind: RelationalKind,
+    /// Entities the query is about, as the model named them. Possibly empty.
+    pub entities: Vec<String>,
+}
+
+impl RelationalIntent {
+    fn none() -> Self {
+        Self {
+            kind: RelationalKind::None,
+            entities: Vec::new(),
+        }
+    }
+}
+
+/// Parse the classifier's JSON reply. Fail-open: any malformed input yields
+/// `RelationalKind::None` with no entities (caller then does nothing).
+#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
+pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
+    // Extract the first {...} span so ```json fences / prose don't break parsing.
+    let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else {
+        return RelationalIntent::none();
+    };
+    if end < start {
+        return RelationalIntent::none();
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+        return RelationalIntent::none();
+    };
+    let kind = match v.get("intent").and_then(|i| i.as_str()).unwrap_or("none") {
+        "relational" => RelationalKind::Relational,
+        "recall" => RelationalKind::Recall,
+        _ => RelationalKind::None,
+    };
+    let entities = v
+        .get("entities")
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    RelationalIntent { kind, entities }
+}
+
 /// Build the messages array for a classification call. Kept separate from
 /// `classify_intent` so the prompt can be unit-tested without a provider.
 pub(crate) fn build_classifier_messages(user_text: &str) -> Vec<Value> {
@@ -358,5 +423,29 @@ mod tests {
         // cases. Smoke test for the early-return branches.
         log_intent_disagreement("do something", "action", LlmIntentClass::Action);
         log_intent_disagreement("anything", "action", LlmIntentClass::Unknown);
+    }
+
+    #[test]
+    fn parse_relational_intent_reads_json() {
+        let r = parse_relational_intent(r#"{"intent":"relational","entities":["Conchi","Galo"]}"#);
+        assert_eq!(r.kind, RelationalKind::Relational);
+        assert_eq!(r.entities, vec!["Conchi".to_string(), "Galo".to_string()]);
+    }
+
+    #[test]
+    fn parse_relational_intent_tolerates_fencing_and_prose() {
+        // Models often wrap JSON in ```json fences or add a sentence.
+        let r = parse_relational_intent(
+            "Sure!\n```json\n{\"intent\":\"recall\",\"entities\":[\"my dog\"]}\n```",
+        );
+        assert_eq!(r.kind, RelationalKind::Recall);
+        assert_eq!(r.entities, vec!["my dog".to_string()]);
+    }
+
+    #[test]
+    fn parse_relational_intent_fails_open_on_garbage() {
+        let r = parse_relational_intent("not json at all");
+        assert_eq!(r.kind, RelationalKind::None);
+        assert!(r.entities.is_empty());
     }
 }
