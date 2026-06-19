@@ -95,6 +95,8 @@ mod intent_keywords;
 mod intent_routing;
 #[path = "intent/llm_classifier.rs"]
 pub mod llm_classifier;
+#[path = "intent/relational_prefilter.rs"]
+pub mod relational_prefilter;
 use intent_routing::{
     classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
     is_internal_maintenance_intent, IntentComplexity,
