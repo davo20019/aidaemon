@@ -66,16 +66,37 @@ pub fn is_relationship_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     RELATIONSHIP_ROOTS.iter().any(|root| {
         lower == *root
-            || lower.starts_with(&format!("{root}_"))
-            || lower.ends_with(&format!("_{root}"))
-            || lower == format!("{root}_name")
+            || lower.starts_with(&format!("{root}_")) // e.g. "mother_name", "partner_name"
+            || lower.ends_with(&format!("_{root}")) // e.g. "step_mother", "half_brother"
     })
 }
 
-fn folded_contains(haystack: &str, needle: &str) -> bool {
-    haystack
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
+/// Tokenise a string for word-boundary matching.
+///
+/// Underscores and hyphens in fact KEYS (e.g. `"partner_name"`) act as word
+/// separators just like spaces, so `"partner"` is a whole word inside
+/// `"partner_name"`.  All tokens are lowercased.
+fn word_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// True if every significant word of `entity` appears as a whole word in
+/// `haystack` (case-insensitive, `_`/`-` treated as word boundaries).
+///
+/// "Significant" words are those with at least 2 characters, so short
+/// connectives don't produce spurious matches.
+fn entity_mentioned_as_words(haystack: &str, entity: &str) -> bool {
+    let haystack_tokens: HashSet<String> = word_tokens(haystack).into_iter().collect();
+    let entity_words: Vec<String> = word_tokens(entity);
+    // Require at least one meaningful word to match.
+    let significant: Vec<&String> = entity_words.iter().filter(|w| w.len() >= 2).collect();
+    if significant.is_empty() {
+        return false;
+    }
+    significant.iter().all(|w| haystack_tokens.contains(*w))
 }
 
 /// Salience used to rank additions when over the cap. Higher = keep.
@@ -112,10 +133,10 @@ pub fn select_neighborhood_facts(
             let ns_hit = fact_namespace(&f.key)
                 .map(|ns| target_ns.contains(&ns.to_ascii_lowercase()))
                 .unwrap_or(false);
-            // Rule 2 — co-mention (entity name in key or value).
-            let mention_hit = names
-                .iter()
-                .any(|n| folded_contains(&f.key, n) || folded_contains(&f.value, n));
+            // Rule 2 — co-mention (entity name as whole words in key or value).
+            let mention_hit = names.iter().any(|n| {
+                entity_mentioned_as_words(&f.key, n) || entity_mentioned_as_words(&f.value, n)
+            });
             // Rule 3 — owner relationship cluster.
             let rel_hit = owner_relationship && is_relationship_key(&f.key);
             ns_hit || mention_hit || rel_hit
@@ -227,10 +248,63 @@ mod tests {
     }
 
     #[test]
-    fn caps_are_respected_and_nothing_resolves_is_empty() {
+    fn empty_resolved_names_returns_empty() {
         let all = vec![fact(1, "user", "partner_name", "Aracely")];
         let empty: HashSet<i64> = HashSet::new();
         let out = select_neighborhood_facts(&all, &[], false, &empty, NeighborhoodCaps::default());
         assert!(out.is_empty(), "no resolved entities -> no expansion");
+    }
+
+    #[test]
+    fn cap_is_enforced() {
+        // Seed 20 facts that all qualify as relationship facts (owner_relationship=true).
+        let all: Vec<Fact> = (1..=20)
+            .map(|i| fact(i, "user", "partner_name", &format!("Person {i}")))
+            .collect();
+        // None of them are in initial_ids so all 20 are candidates.
+        let empty: HashSet<i64> = HashSet::new();
+        let caps = NeighborhoodCaps::default(); // max_facts = 16
+        let out = select_neighborhood_facts(&all, &["someone".into()], true, &empty, caps);
+        assert_eq!(
+            out.len(),
+            caps.max_facts,
+            "output must be capped at max_facts even when more facts qualify"
+        );
+    }
+
+    #[test]
+    fn co_mention_is_word_boundary_not_substring() {
+        // "Ana" must NOT match a value containing "banana".
+        let banana_fact = fact(1, "food", "preference", "I like banana bread");
+        // "Galo" MUST match a value that is exactly "Galo Loor".
+        let galo_fact = fact(2, "user", "father", "Galo Loor");
+
+        let empty: HashSet<i64> = HashSet::new();
+
+        // Test: "Ana" should not pull the banana fact.
+        let out_ana = select_neighborhood_facts(
+            &[banana_fact.clone()],
+            &["Ana".into()],
+            false,
+            &empty,
+            NeighborhoodCaps::default(),
+        );
+        assert!(
+            out_ana.is_empty(),
+            "'Ana' must not match 'banana' via substring — word boundary required"
+        );
+
+        // Test: "Galo" should pull the galo fact.
+        let out_galo = select_neighborhood_facts(
+            &[galo_fact.clone()],
+            &["Galo".into()],
+            false,
+            &empty,
+            NeighborhoodCaps::default(),
+        );
+        assert!(
+            out_galo.iter().any(|f| f.id == 2),
+            "'Galo' must match 'Galo Loor' as a whole word"
+        );
     }
 }
