@@ -1813,4 +1813,202 @@ async fn test_relational_denial_is_blocked_then_corrected() {
         denial_directive_sent,
         "UnsearchedEntityDenial directive should have been injected into a follow-up LLM call"
     );
+
+    // Task 10 C: the gate must have fired exactly once.
+    // Call order: denial (1) + classifier (1) + corrected (1) = 3 total.
+    assert_eq!(
+        calls.len(),
+        3,
+        "denial gate must fire exactly once: expected 3 LLM calls (denial + classifier + corrected), got {}",
+        calls.len()
+    );
+}
+
+/// Grounded-partial answers must NOT be blocked by the denial gate.
+///
+/// A reply like "I don't have Juan's phone number, but he's your coworker"
+/// contains a denial phrase ("i don't have") but the entity ("Juan") is
+/// present in tool-output evidence — so `find_unsearched_denials` returns an
+/// empty list and the gate passes the reply through without firing ContinueLoop.
+///
+/// MockProvider call order:
+///   1) First LLM call → tool call to "find_coworker" (returns "Juan is a coworker")
+///   2) Second LLM call → grounded partial reply (entity present in evidence)
+///   3) Classifier call inside completion_phase → {"intent":"relational","entities":["Juan"]}
+///      (consumed because the pre-filter fires; find_unsearched_denials then returns
+///      empty since Juan IS in evidence → gate does NOT fire ContinueLoop)
+///   Total: 3 calls, but no denial directive is injected (gate short-circuits after
+///   find_unsearched_denials returns empty).
+#[tokio::test]
+async fn grounded_partial_answer_is_not_blocked() {
+    use crate::traits::ToolRole;
+
+    // The grounded partial reply: contains "i don't have" but "Juan" is in evidence.
+    let grounded_reply =
+        "I don't have Juan's phone number, but he's your coworker at the company.";
+
+    // MockTool named "find_coworker" returns evidence that contains "Juan".
+    let coworker_tool = Arc::new(MockTool::new(
+        "find_coworker",
+        "Find coworker information",
+        "Juan is a coworker at the company. He sits next to you.",
+    ).with_role(ToolRole::Universal));
+
+    let provider = MockProvider::with_responses(vec![
+        // Call 1: LLM calls the find_coworker tool → tool output contains "Juan".
+        MockProvider::tool_call_response("find_coworker", "{}"),
+        // Call 2: LLM sees evidence (Juan in tool output) and gives grounded partial.
+        MockProvider::text_response(grounded_reply),
+        // Call 3: Classifier inside the denial-gate pre-filter. Returns Juan as the
+        // entity. The gate then calls find_unsearched_denials: Juan IS in evidence
+        // → empty return → gate does NOT fire ContinueLoop; reply passes through.
+        MockProvider::text_response(r#"{"intent":"relational","entities":["Juan"]}"#),
+    ]);
+
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![coworker_tool as Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "grounded_partial_session",
+            "What is Juan's phone number?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The grounded partial answer must pass through — the gate must NOT block it.
+    // Since Juan was in tool output evidence after the find_coworker call,
+    // find_unsearched_denials returns empty → gate does not inject denial directive.
+    assert!(
+        response.to_ascii_lowercase().contains("juan"),
+        "grounded partial answer should pass through; got: {}",
+        response
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    // Total calls: tool call (1) + final answer (1) + classifier (1) = 3.
+    // The classifier fires but find_unsearched_denials returns empty → no 4th call.
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected exactly 3 calls (tool + answer + classifier, no 4th retry); got {}",
+        calls.len()
+    );
+    // The denial directive must NOT have been injected.
+    let denial_directive_sent = calls.iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("did not search memory"))
+        })
+    });
+    assert!(
+        !denial_directive_sent,
+        "denial gate must NOT fire for a grounded partial answer (entity was in tool output evidence)"
+    );
+}
+
+/// When the coreference gate already fired for this turn (a pronoun-referent
+/// follow-up that was anchored to the prior exchange), the denial gate must
+/// NOT also fire — coreference takes precedence.
+///
+/// Setup:
+///   - Seed a prior exchange: user asked about "Maria", agent answered with
+///     context about her.  This provides the anchor for the coreference gate.
+///   - Current user message: "Where is she from?" — pronoun referent, short,
+///     triggers `looks_like_pronoun_referent_followup`.
+///   - Model reply: contains "i don't have information" phrasing.
+///
+/// Because the coreference gate fires at turn-init (before the loop), the
+/// denial gate condition `!completion_progress.coreference_fired` is false
+/// and the denial gate is skipped entirely — only one LLM call is needed.
+#[tokio::test]
+async fn denial_gate_skipped_when_coreference_fired() {
+    use crate::traits::Message;
+
+    // A reply that would ordinarily trip the denial pre-filter.
+    let reply =
+        "I don't have information about where she is from. She might be from Spain.";
+
+    // Only one LLM call: the coreference gate fires at turn-init,
+    // the denial gate is suppressed, and the reply passes through.
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(reply)]);
+
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    // Seed a prior exchange so `resolve_reaffirmation_anchor` finds an anchor.
+    // We write two messages: user "Tell me about Maria" + assistant answer.
+    let session_id = "coreference_gate_session";
+    let prior_user = Message {
+        id: "prior-user-1".to_string(),
+        session_id: session_id.to_string(),
+        role: "user".to_string(),
+        content: Some("Tell me about Maria, my neighbor.".to_string()),
+        created_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+        importance: 0.5,
+        ..Message::runtime_defaults()
+    };
+    let prior_assistant = Message {
+        id: "prior-asst-1".to_string(),
+        session_id: session_id.to_string(),
+        role: "assistant".to_string(),
+        content: Some("Maria is your neighbor. She lives next door to you.".to_string()),
+        created_at: chrono::Utc::now() - chrono::Duration::seconds(60),
+        importance: 0.5,
+        ..Message::runtime_defaults()
+    };
+    harness.state.append_message(&prior_user).await.unwrap();
+    harness.state.append_message(&prior_assistant).await.unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "Where is she from?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The reply must pass through — the coreference gate handled this turn,
+    // and the denial gate must not have fired (no extra LLM call).
+    let calls = harness.provider.call_log.lock().await;
+    // Only 1 LLM call: the main loop call. No classifier call from denial gate.
+    assert_eq!(
+        calls.len(),
+        1,
+        "denial gate must be skipped when coreference fired; expected 1 LLM call, got {}: {}",
+        calls.len(),
+        response
+    );
+    // The denial directive must NOT have been injected.
+    let denial_directive_sent = calls.iter().any(|call| {
+        call.messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("did not search memory"))
+        })
+    });
+    assert!(
+        !denial_directive_sent,
+        "denial gate must not fire when coreference gate already fired this turn"
+    );
+    // The final response must contain something — not an empty reply.
+    assert!(
+        !response.trim().is_empty(),
+        "response must not be empty; coreference gate should pass reply through"
+    );
 }

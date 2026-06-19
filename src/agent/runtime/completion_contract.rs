@@ -138,7 +138,12 @@ pub(super) struct CompletionProgress {
     /// Count of times the search-before-deny gate has fired (reply denies/
     /// asserts a personal fact about an entity that was not looked up in
     /// memory this turn). Bounded to 1 to prevent infinite loops.
-    pub denial_gate_count: u32,
+    pub denial_gate_count: usize,
+    /// True when the coreference grounding gate already fired this turn
+    /// (a pronoun-referent follow-up that was anchored to the prior exchange).
+    /// When set, the denial gate must NOT also fire — coreference gate takes
+    /// precedence and the denial would be a false positive.
+    pub coreference_fired: bool,
 }
 
 impl CompletionProgress {

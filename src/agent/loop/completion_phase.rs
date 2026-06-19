@@ -1891,6 +1891,7 @@ pub(super) async fn run_completion_phase(
             && channel_ctx.visibility == crate::types::ChannelVisibility::Private;
         if completion_progress.denial_gate_count == 0
             && is_owner_dm
+            && !completion_progress.coreference_fired
             && !execution_state.tool_output_evidence_overflow
             && super::answer_grounding::reply_contains_unsearched_denial_phrase(&reply)
         {

@@ -536,6 +536,11 @@ impl Agent {
                             prior_assistant_reply: anchor.prior_assistant_reply,
                         },
                     );
+                    // Signal the denial gate: coreference fired first this turn.
+                    // The two gates are mutually exclusive — coreference takes
+                    // precedence so the denial gate must not also fire and
+                    // inject a second, contradictory directive.
+                    completion_progress.coreference_fired = true;
                 }
             }
         }
