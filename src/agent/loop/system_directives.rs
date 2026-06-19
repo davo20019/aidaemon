@@ -174,6 +174,13 @@ pub(in crate::agent) enum SystemDirective {
     UngroundedListEntities {
         entities: Vec<String>,
     },
+    /// The candidate reply denies or asserts a specific personal fact about an
+    /// entity the user named, but no memory lookup for that entity grounded this
+    /// turn. Force a search before the denial/assertion is allowed through.
+    #[allow(dead_code)]
+    UnsearchedEntityDenial {
+        entities: Vec<String>,
+    },
     /// The candidate final reply is an enumeration answer built from web
     /// research, but fewer than two source pages were successfully read
     /// (0 = snippets only). Injected once per turn: fetch a second
@@ -578,6 +585,16 @@ impl SystemDirective {
                  exactly which part you could not verify instead of filling the gaps.",
                 entities.join(", ")
             ),
+            Self::UnsearchedEntityDenial { entities } => format!(
+                "[SYSTEM] GROUNDING CHECK: your draft answers a question about {} but you did \
+                 not search memory for it this turn. Call manage_memories (and manage_people if \
+                 available) for {} BEFORE answering. If you genuinely find nothing after \
+                 searching, say so plainly — do not assert or deny a relationship you did not \
+                 look up, and never assume a partner is a child's biological parent; phrase any \
+                 such inference tentatively.",
+                entities.join(", "),
+                entities.join(", ")
+            ),
             Self::LocateFileInsteadOfAsking { user_text_hint } => format!(
                 "[SYSTEM] The user referenced a file by name. Do NOT ask the user to upload it or \
                  provide a path — you have tools to locate it yourself. \
@@ -837,6 +854,21 @@ mod tests {
             assert!(!rendered.contains("MUST use `write_file`"));
             assert!(!rendered.contains("Write the corrected code"));
         }
+    }
+}
+
+#[cfg(test)]
+mod unsearched_entity_tests {
+    use super::*;
+
+    #[test]
+    fn renders_unsearched_entity_denial() {
+        let d = SystemDirective::UnsearchedEntityDenial {
+            entities: vec!["Conchi".into()],
+        };
+        let msg = d.render();
+        assert!(msg.contains("Conchi"));
+        assert!(msg.to_lowercase().contains("search"));
     }
 }
 
