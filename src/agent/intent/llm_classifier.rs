@@ -208,10 +208,7 @@ pub async fn classify_relational_intent(
 ) -> RelationalIntent {
     let trimmed = user_text.trim();
     if trimmed.is_empty() {
-        return RelationalIntent {
-            kind: RelationalKind::None,
-            entities: Vec::new(),
-        };
+        return RelationalIntent::none();
     }
     let messages = build_relational_classifier_messages(trimmed);
     let options = ChatOptions {
@@ -223,20 +220,14 @@ pub async fn classify_relational_intent(
         Ok(Ok(r)) => r,
         Ok(Err(err)) => {
             debug!(?err, "relational classifier call failed; failing open");
-            return RelationalIntent {
-                kind: RelationalKind::None,
-                entities: Vec::new(),
-            };
+            return RelationalIntent::none();
         }
         Err(_) => {
             debug!(
                 timeout_s = CLASSIFIER_TIMEOUT.as_secs(),
                 "relational classifier timeout"
             );
-            return RelationalIntent {
-                kind: RelationalKind::None,
-                entities: Vec::new(),
-            };
+            return RelationalIntent::none();
         }
     };
     parse_relational_intent(response.content.as_deref().unwrap_or(""))
