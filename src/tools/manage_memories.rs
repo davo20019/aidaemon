@@ -650,9 +650,26 @@ impl Tool for ManageMemoriesTool {
 
                 // Relational neighborhood expansion — fail-open on any error.
                 // Skipped when no LLM dep is wired (e.g. in unit tests, non-owner flows).
-                if crate::agent::relational_prefilter::should_run_relational_classifier(
-                    query, false,
-                ) {
+                //
+                // Trigger condition: ANY of —
+                //   (a) query is question-shaped (possessive + relational noun, or recall
+                //       phrasing) — handles "who is Conchi's spouse?" style queries.
+                //   (b) any matched fact has a relationship-typed key (mother_name, father,
+                //       spouse, …) — handles keyword queries like "conchi" that matched a
+                //       relationship fact during Pass 1/2.
+                //   (c) any matched fact is namespaced (X:attr) — signals a concept cluster.
+                //
+                // (b)/(c) are cheap key checks over already-fetched results — no LLM cost
+                // on unrelated searches.
+                let results_signal_relational = merged.iter().any(|(f, _)| {
+                    crate::memory::neighborhood::is_relationship_key(&f.key)
+                        || crate::memory::neighborhood::fact_namespace(&f.key).is_some()
+                });
+                let should_expand = results_signal_relational
+                    || crate::agent::relational_prefilter::should_run_relational_classifier(
+                        query, false,
+                    );
+                if should_expand {
                     if let Some((provider, fast_model)) = &self.llm_dep {
                         let t0 = std::time::Instant::now();
                         let rel =
@@ -2093,6 +2110,91 @@ mod tests {
         assert!(
             out.contains("Galo"),
             "neighborhood expansion should surface father_name fact; got:\n{out}"
+        );
+        assert!(
+            out.contains("Related context"),
+            "output should have a neighborhood header; got:\n{out}"
+        );
+    }
+
+    /// Regression test for the keyword-query trigger fix.
+    ///
+    /// Previously, `should_run_relational_classifier("consuelo", false)` returned
+    /// false (no possessive / no recall phrasing) so neighborhood expansion never
+    /// fired for bare keyword queries even when the search MATCHED a relationship
+    /// fact. The fix adds a result-signal trigger: if any matched fact has a
+    /// relationship-typed key the classifier runs regardless of query shape.
+    ///
+    /// Test design:
+    ///   - Seed: mother_name=Consuelo, father_name=Galo (both in "user" category).
+    ///   - Query is the bare keyword "consuelo" — NOT a question shape; this
+    ///     MUST fail `should_run_relational_classifier` but PASS the result-signal
+    ///     trigger because mother_name is a relationship key.
+    ///   - MockProvider returns {"intent":"relational","entities":["Consuelo"]}.
+    ///   - Neighborhood assembler pulls in father_name because it is also a
+    ///     relationship key.
+    ///   - Output must contain "Galo" under "Related context".
+    #[tokio::test]
+    async fn test_search_keyword_query_triggers_neighborhood_via_result_signal() {
+        let state = setup_state().await;
+
+        state
+            .upsert_fact(
+                "user",
+                "mother_name",
+                "Consuelo",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        state
+            .upsert_fact(
+                "user",
+                "father_name",
+                "Galo",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // Confirm the bare keyword "consuelo" would NOT pass the old
+        // question-shaped gate — this is what the bug was.
+        assert!(
+            !crate::agent::relational_prefilter::should_run_relational_classifier(
+                "consuelo", false
+            ),
+            "pre-condition: 'consuelo' is NOT question-shaped; \
+             if this fails the bug reproducer is invalid"
+        );
+
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(r#"{"intent":"relational","entities":["Consuelo"]}"#),
+        ]));
+
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+
+        // limit=1 so only the top-ranked initial hit is in the base results;
+        // neighborhood expansion is the only path that can surface "Galo".
+        let out = tool
+            .call(&json!({"action": "search", "query": "consuelo", "limit": 1}).to_string())
+            .await
+            .unwrap();
+
+        // Guard: Galo must NOT be in the primary block.
+        let split = out.find("Related context").unwrap_or(out.len());
+        assert!(
+            !out[..split].contains("Galo"),
+            "Galo must NOT be in primary results; output:\n{out}"
+        );
+
+        assert!(
+            out.contains("Galo"),
+            "keyword-query neighborhood expansion should surface father_name; got:\n{out}"
         );
         assert!(
             out.contains("Related context"),
