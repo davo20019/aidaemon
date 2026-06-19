@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{ModelProvider, StateStore, Tool, ToolCapabilities};
+use crate::traits::{StateStore, Tool, ToolCapabilities};
 use crate::types::{ApprovalKind, FactPrivacy};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
@@ -118,10 +118,6 @@ fn merge_search_results(
 pub struct ManageMemoriesTool {
     state: Arc<dyn StateStore>,
     approval_tx: Option<ApprovalBroker>,
-    /// Optional LLM dependency for relational-intent classification during
-    /// `search`. When absent, the relational expansion step is skipped and
-    /// the tool behaves exactly as before (fail-open by default).
-    llm_dep: Option<(Arc<dyn ModelProvider>, String)>,
 }
 
 impl ManageMemoriesTool {
@@ -129,20 +125,11 @@ impl ManageMemoriesTool {
         Self {
             state,
             approval_tx: None,
-            llm_dep: None,
         }
     }
 
     pub fn with_approval_tx(mut self, tx: ApprovalBroker) -> Self {
         self.approval_tx = Some(tx);
-        self
-    }
-
-    /// Inject an LLM provider + fast model name so the `search` action can
-    /// run the relational-intent classifier and append a neighborhood block.
-    /// The dependency is optional — the tool works correctly without it.
-    pub fn with_llm_dep(mut self, provider: Arc<dyn ModelProvider>, fast_model: String) -> Self {
-        self.llm_dep = Some((provider, fast_model));
         self
     }
 
@@ -649,126 +636,73 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 // Relational neighborhood expansion — fail-open on any error.
-                // Skipped when no LLM dep is wired (e.g. in unit tests, non-owner flows).
                 //
-                // Trigger condition: ANY of —
-                //   (a) query is question-shaped (possessive + relational noun, or recall
-                //       phrasing) — handles "who is Conchi's spouse?" style queries.
-                //   (b) any matched fact has a relationship-typed key (mother_name, father,
-                //       spouse, …) — handles keyword queries like "conchi" that matched a
-                //       relationship fact during Pass 1/2.
-                //   (c) any matched fact is namespaced (X:attr) — signals a concept cluster.
+                // Trigger condition: any matched fact has a relationship-typed key
+                // (mother_name, father, spouse, …) or a namespaced key (X:attr) —
+                // these are cheap key checks over already-fetched results with zero
+                // LLM cost on unrelated searches.
                 //
-                // (b)/(c) are cheap key checks over already-fetched results — no LLM cost
-                // on unrelated searches.
+                // Entity candidates are derived SOLELY from the matched results:
+                //   1. Relationship key → fact.value is a person name
+                //      (e.g. mother_name="Consuelo Montesdeoca" → "Consuelo Montesdeoca")
+                //   2. Namespaced key   → namespace prefix is the concept/subject
+                //      (e.g. "LearnEnglishSounds:path" → "LearnEnglishSounds")
+                //
+                // Deduped by lowercased value, capped at 6.
                 let results_signal_relational = merged.iter().any(|(f, _)| {
                     crate::memory::neighborhood::is_relationship_key(&f.key)
                         || crate::memory::neighborhood::fact_namespace(&f.key).is_some()
                 });
-                let should_expand = results_signal_relational
-                    || crate::agent::relational_prefilter::should_run_relational_classifier(
-                        query, false,
-                    );
-                if should_expand {
-                    if let Some((provider, fast_model)) = &self.llm_dep {
-                        let t0 = std::time::Instant::now();
-                        let rel =
-                            crate::agent::llm_classifier::classify_relational_intent(
-                                provider.as_ref(),
-                                fast_model,
-                                query,
-                            )
-                            .await;
-                        let classifier_ms = t0.elapsed().as_millis() as u64;
-
-                        // Derive candidate entity names from the MATCHED RESULTS —
-                        // not just from the classifier. The classifier is fed the
-                        // raw keyword query (e.g. "conchi"), which often yields no
-                        // entities, even though the matched facts clearly resolve to
-                        // a person or concept.
-                        //
-                        // Rules:
-                        //   1. Relationship key  → fact.value is a person name
-                        //      (e.g. mother_name="Consuelo Montesdeoca" → "Consuelo Montesdeoca")
-                        //   2. Namespaced key     → namespace prefix is the concept/subject
-                        //      (e.g. "LearnEnglishSounds:path" → "LearnEnglishSounds")
-                        //
-                        // We union these with whatever the classifier returned, dedupe,
-                        // and cap at 6 — so classifier entities still help when present.
-                        let mut result_entities: Vec<String> = merged
-                            .iter()
-                            .flat_map(|(f, _)| {
-                                let mut names: Vec<String> = Vec::new();
-                                if crate::memory::neighborhood::is_relationship_key(&f.key) {
-                                    // Value is the person's name.
-                                    let v = f.value.trim();
-                                    if !v.is_empty() {
-                                        names.push(v.to_string());
-                                    }
+                if results_signal_relational {
+                    let mut seen_lower: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let mut candidates: Vec<String> = Vec::new();
+                    for (f, _) in &merged {
+                        if crate::memory::neighborhood::is_relationship_key(&f.key) {
+                            let v = f.value.trim();
+                            if !v.is_empty() {
+                                let lower = v.to_ascii_lowercase();
+                                if seen_lower.insert(lower) {
+                                    candidates.push(v.to_string());
                                 }
-                                if let Some(ns) =
-                                    crate::memory::neighborhood::fact_namespace(&f.key)
-                                {
-                                    names.push(ns.to_string());
-                                }
-                                names
-                            })
-                            .collect();
-
-                        // Union with classifier entities (classifier wins on duplicates
-                        // because we add them first below, then dedupe by lowercased value).
-                        let mut seen_lower: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        let mut candidates: Vec<String> = Vec::new();
-                        for e in rel.entities.iter().chain(result_entities.iter()) {
-                            let lower = e.to_ascii_lowercase();
-                            if seen_lower.insert(lower) {
-                                candidates.push(e.clone());
                             }
                         }
-                        // Drain result_entities so the borrow ends before we use candidates.
-                        result_entities.clear();
-                        candidates.truncate(6);
-
-                        if !candidates.is_empty() {
-                            let t1 = std::time::Instant::now();
-                            if let Ok(neighborhood) = self
-                                .state
-                                .assemble_neighborhood(&candidates, &initial_ids)
-                                .await
-                            {
-                                let assembly_ms = t1.elapsed().as_millis() as u64;
-                                let added = neighborhood.len();
-                                tracing::info!(
-                                    target: "memory_recall",
-                                    classifier_ms,
-                                    assembly_ms,
-                                    entities = candidates.len(),
-                                    added,
-                                    "neighborhood expansion"
-                                );
-                                if added > 0 {
-                                    output.push_str(
-                                        "\n── Related context (connected facts) ──\n",
-                                    );
-                                    for f in neighborhood.iter().take(16) {
-                                        output.push_str(&format!(
-                                            "• [{}] {} → \"{}\"\n",
-                                            f.category, f.key, f.value
-                                        ));
-                                    }
-                                }
+                        if let Some(ns) = crate::memory::neighborhood::fact_namespace(&f.key) {
+                            let lower = ns.to_ascii_lowercase();
+                            if seen_lower.insert(lower) {
+                                candidates.push(ns.to_string());
                             }
-                        } else {
-                            // Neither the classifier NOR the result-derived candidates
-                            // produced any entity names — still log the latency so
-                            // no-op paths are measurable.
+                        }
+                    }
+                    candidates.truncate(6);
+
+                    if !candidates.is_empty() {
+                        let t0 = std::time::Instant::now();
+                        if let Ok(neighborhood) = self
+                            .state
+                            .assemble_neighborhood(&candidates, &initial_ids)
+                            .await
+                        {
+                            let assembly_ms = t0.elapsed().as_millis() as u64;
+                            let added = neighborhood.len();
                             tracing::info!(
                                 target: "memory_recall",
-                                classifier_ms,
-                                entities = 0,
-                                "neighborhood expansion (no entities)"
+                                assembly_ms,
+                                entities = candidates.len(),
+                                added,
+                                "neighborhood expansion"
                             );
+                            if added > 0 {
+                                output.push_str(
+                                    "\n── Related context (connected facts) ──\n",
+                                );
+                                for f in neighborhood.iter().take(16) {
+                                    output.push_str(&format!(
+                                        "• [{}] {} → \"{}\"\n",
+                                        f.category, f.key, f.value
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -2070,7 +2004,6 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::testing::MockProvider;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     #[test]
@@ -2089,18 +2022,14 @@ mod tests {
         );
     }
 
-    /// TDD: search action appends the relational neighborhood when an LLM dep is wired
-    /// and the query is a named-person relational query (e.g. "who is conchi's spouse?").
+    /// Search action appends the relational neighborhood when results contain a
+    /// relationship-typed key. No LLM/MockProvider needed — entities are derived
+    /// purely from matched result values.
     ///
-    /// Test design:
-    ///   - Seed: mother_name=Consuelo, father_name=Galo Loor (both in "user" category).
-    ///   - Query "consuelo's mother" with limit=1 → only the top-ranked mother_name
-    ///     fact is displayed; father_name is NOT in `initial_ids`.
-    ///   - MockProvider returns {"intent":"relational","entities":["Consuelo"]}.
-    ///   - assemble_neighborhood(["Consuelo"], {mother_id}) flips owner_relationship=true
-    ///     because mother_name is a relationship key, then pulls in father_name
-    ///     (also a relationship key) from the remaining facts.
-    ///   - Final output must contain "Galo" under the "Related context" header.
+    /// Seed: mother_name=Consuelo, father_name=Galo Loor.
+    /// Query "consuelo's mother" with limit=1 → only mother_name in initial_ids.
+    /// Expansion derives "Consuelo" from mother_name value, assembles neighborhood,
+    /// and surfaces father_name under "Related context".
     #[tokio::test]
     async fn test_search_relational_expansion() {
         let state = setup_state().await;
@@ -2128,14 +2057,8 @@ mod tests {
             .await
             .unwrap();
 
-        // MockProvider scripted to return the relational-intent JSON the
-        // classifier would produce for "who is conchi's spouse?".
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(r#"{"intent":"relational","entities":["Consuelo"]}"#),
-        ]));
-
-        let tool = ManageMemoriesTool::new(state.clone())
-            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+        // No MockProvider needed — expansion is driven purely by result entities.
+        let tool = ManageMemoriesTool::new(state.clone());
 
         // limit=1 keeps only the top-ranked initial hit (mother_name) so
         // initial_ids does NOT contain father_name. The neighborhood expansion
@@ -2148,9 +2071,6 @@ mod tests {
             .unwrap();
 
         // Guard: "Galo" must NOT appear in the primary (pre-neighborhood) results.
-        // If the embedding model ever surfaces father_name in the base search, this
-        // test would silently pass via a different path — this assertion makes it
-        // fail loudly so the test remains an honest expansion-isolation check.
         let split = out.find("Related context").unwrap_or(out.len());
         assert!(
             !out[..split].contains("Galo"),
@@ -2167,23 +2087,13 @@ mod tests {
         );
     }
 
-    /// Regression test for the keyword-query trigger fix.
+    /// Regression: keyword query (no possessive/recall phrasing) still triggers
+    /// neighborhood expansion via the result-signal path.
     ///
-    /// Previously, `should_run_relational_classifier("consuelo", false)` returned
-    /// false (no possessive / no recall phrasing) so neighborhood expansion never
-    /// fired for bare keyword queries even when the search MATCHED a relationship
-    /// fact. The fix adds a result-signal trigger: if any matched fact has a
-    /// relationship-typed key the classifier runs regardless of query shape.
-    ///
-    /// Test design:
-    ///   - Seed: mother_name=Consuelo, father_name=Galo (both in "user" category).
-    ///   - Query is the bare keyword "consuelo" — NOT a question shape; this
-    ///     MUST fail `should_run_relational_classifier` but PASS the result-signal
-    ///     trigger because mother_name is a relationship key.
-    ///   - MockProvider returns {"intent":"relational","entities":["Consuelo"]}.
-    ///   - Neighborhood assembler pulls in father_name because it is also a
-    ///     relationship key.
-    ///   - Output must contain "Galo" under "Related context".
+    /// Seed: mother_name=Consuelo, father_name=Galo.
+    /// Query "consuelo" (bare keyword) matches mother_name. Expansion fires
+    /// because mother_name is a relationship key in the matched results.
+    /// No MockProvider needed — classifier is no longer invoked.
     #[tokio::test]
     async fn test_search_keyword_query_triggers_neighborhood_via_result_signal() {
         let state = setup_state().await;
@@ -2211,22 +2121,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Confirm the bare keyword "consuelo" would NOT pass the old
-        // question-shaped gate — this is what the bug was.
-        assert!(
-            !crate::agent::relational_prefilter::should_run_relational_classifier(
-                "consuelo", false
-            ),
-            "pre-condition: 'consuelo' is NOT question-shaped; \
-             if this fails the bug reproducer is invalid"
-        );
-
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(r#"{"intent":"relational","entities":["Consuelo"]}"#),
-        ]));
-
-        let tool = ManageMemoriesTool::new(state.clone())
-            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+        // No MockProvider — result-signal is sufficient.
+        let tool = ManageMemoriesTool::new(state.clone());
 
         // limit=1 so only the top-ranked initial hit is in the base results;
         // neighborhood expansion is the only path that can surface "Galo".
@@ -2252,22 +2148,12 @@ mod tests {
         );
     }
 
-    /// Regression test: result-derived entities work even when the classifier
-    /// returns EMPTY entities.
+    /// Expansion works with multi-word values (the common production case where
+    /// mother_name="Consuelo Montesdeoca" and father="Galo Loor").
     ///
-    /// This is the core production bug: the classifier is fed the raw keyword
-    /// (e.g. "conchi"), which yields no entities, so `rel.entities` is empty and
-    /// the old code skipped `assemble_neighborhood` entirely.
-    ///
-    /// Test design:
-    ///   - Seed: mother_name=Consuelo Montesdeoca, father=Galo Loor.
-    ///   - Query "consuelo" — keyword, not question-shaped.
-    ///   - MockProvider returns `{"intent":"none","entities":[]}` (empty classifier).
-    ///   - `mother_name` is a relationship key → its VALUE "Consuelo Montesdeoca"
-    ///     is a result-derived candidate entity.
-    ///   - `assemble_neighborhood(["Consuelo Montesdeoca"], {mother_id})` must pull
-    ///     in `father=Galo Loor` via the owner-relationship cluster rule.
-    ///   - Output MUST contain "Galo" under "── Related context ──".
+    /// Previously, the classifier was needed because a bare keyword query yielded
+    /// no entities from the LLM. Now the value of the matched relationship-key
+    /// fact IS the candidate entity — no classifier call at all.
     #[tokio::test]
     async fn test_search_neighborhood_from_result_entities_when_classifier_empty() {
         let state = setup_state().await;
@@ -2295,14 +2181,8 @@ mod tests {
             .await
             .unwrap();
 
-        // MockProvider returns EMPTY entities — simulating the production bug where
-        // the classifier is fed the keyword "consuelo" and extracts nothing.
-        let provider = Arc::new(MockProvider::with_responses(vec![
-            MockProvider::text_response(r#"{"intent":"none","entities":[]}"#),
-        ]));
-
-        let tool = ManageMemoriesTool::new(state.clone())
-            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+        // No MockProvider — the result-derived entity path is the only path.
+        let tool = ManageMemoriesTool::new(state.clone());
 
         // limit=1 ensures only the top-ranked initial hit (mother_name) is in the
         // primary block; neighborhood expansion is the ONLY path that can surface Galo.
@@ -2320,7 +2200,7 @@ mod tests {
 
         assert!(
             out.contains("Galo"),
-            "result-derived entity path must surface father=Galo even when classifier is empty; got:\n{out}"
+            "result-derived entity path must surface father=Galo even without a classifier; got:\n{out}"
         );
         assert!(
             out.contains("Related context"),

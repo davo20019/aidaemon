@@ -85,6 +85,7 @@ pub fn user_text_is_named_person_relational_query(user_text: &str) -> bool {
 /// True when a relational classifier call is worth making. Recall-biased:
 /// fires on personal-recall-shaped messages and named-person relational
 /// queries, and only when no memory lookup already grounded the turn.
+#[allow(dead_code)]
 pub fn should_run_relational_classifier(user_text: &str, memory_lookup_fired: bool) -> bool {
     if memory_lookup_fired {
         return false;
