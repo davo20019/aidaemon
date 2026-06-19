@@ -1925,20 +1925,36 @@ async fn grounded_partial_answer_is_not_blocked() {
 /// Setup:
 ///   - Seed a prior exchange: user asked about "Maria", agent answered with
 ///     context about her.  This provides the anchor for the coreference gate.
-///   - Current user message: "Where is she from?" — pronoun referent, short,
-///     triggers `looks_like_pronoun_referent_followup`.
-///   - Model reply: contains "i don't have information" phrasing.
+///   - Current user message: "What do you know about where she works?" —
+///     this passes BOTH guards that matter:
+///       (a) `looks_like_pronoun_referent_followup`: has pronoun "she" AND
+///           the keyword phrase "what do you know", so the coreference gate
+///           fires and sets `completion_progress.coreference_fired = true`.
+///       (b) `user_text_is_named_person_relational_query`: has "where" AND
+///           "works" (the `where` + `work/works` branch), so WITHOUT the
+///           `!coreference_fired` guard the denial gate's pre-condition would
+///           also pass — making the guard the deciding factor.
+///   - Model reply: contains "i don't have information" phrasing (a denial
+///     phrase that would normally arm the denial gate's chain).
 ///
 /// Because the coreference gate fires at turn-init (before the loop), the
 /// denial gate condition `!completion_progress.coreference_fired` is false
 /// and the denial gate is skipped entirely — only one LLM call is needed.
+/// If the `&& !coreference_fired` guard were removed, all other denial-gate
+/// conditions would be satisfied (owner DM, denial phrase in reply, no memory
+/// lookup called, relational pre-filter passes) and the gate WOULD fire,
+/// causing a second LLM call; the `assert_eq!(calls.len(), 1)` would then
+/// fail — proving the guard is the discriminating factor.
 #[tokio::test]
 async fn denial_gate_skipped_when_coreference_fired() {
     use crate::traits::Message;
 
     // A reply that would ordinarily trip the denial pre-filter.
+    // "don't have information" is in DENIAL_PHRASES checked by
+    // `reply_contains_unsearched_denial_phrase`, so this reply would arm the
+    // denial gate if `coreference_fired` were not set.
     let reply =
-        "I don't have information about where she is from. She might be from Spain.";
+        "I don't have information about where she works. She might work nearby.";
 
     // Only one LLM call: the coreference gate fires at turn-init,
     // the denial gate is suppressed, and the reply passes through.
@@ -1974,7 +1990,11 @@ async fn denial_gate_skipped_when_coreference_fired() {
         .agent
         .handle_message(
             session_id,
-            "Where is she from?",
+            // Passes user_text_is_named_person_relational_query (where + works).
+            // Passes looks_like_pronoun_referent_followup (she + "what do you know").
+            // Both pre-conditions for denial gate AND coreference gate are met;
+            // only the `!coreference_fired` guard decides which fires.
+            "What do you know about where she works?",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
