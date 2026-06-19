@@ -663,6 +663,7 @@ impl Tool for ManageMemoriesTool {
                             )
                             .await;
                         let classifier_ms = t0.elapsed().as_millis() as u64;
+                        let entities_count = rel.entities.len();
                         if !rel.entities.is_empty() {
                             let t1 = std::time::Instant::now();
                             if let Ok(neighborhood) = self
@@ -672,15 +673,15 @@ impl Tool for ManageMemoriesTool {
                             {
                                 let assembly_ms = t1.elapsed().as_millis() as u64;
                                 let added = neighborhood.len();
+                                tracing::info!(
+                                    target: "memory_recall",
+                                    classifier_ms,
+                                    assembly_ms,
+                                    entities = entities_count,
+                                    added,
+                                    "neighborhood expansion"
+                                );
                                 if added > 0 {
-                                    tracing::info!(
-                                        target: "memory_recall",
-                                        classifier_ms,
-                                        assembly_ms,
-                                        entities = rel.entities.len(),
-                                        added,
-                                        "neighborhood expansion"
-                                    );
                                     output.push_str(
                                         "\n── Related context (connected facts) ──\n",
                                     );
@@ -692,6 +693,15 @@ impl Tool for ManageMemoriesTool {
                                     }
                                 }
                             }
+                        } else {
+                            // Classifier ran but found no entities — still log the latency
+                            // so no-op paths are measurable (matches reranker telemetry).
+                            tracing::info!(
+                                target: "memory_recall",
+                                classifier_ms,
+                                entities = 0,
+                                "neighborhood expansion (no entities)"
+                            );
                         }
                     }
                 }
@@ -2070,6 +2080,16 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // Guard: "Galo" must NOT appear in the primary (pre-neighborhood) results.
+        // If the embedding model ever surfaces father_name in the base search, this
+        // test would silently pass via a different path — this assertion makes it
+        // fail loudly so the test remains an honest expansion-isolation check.
+        let split = out.find("Related context").unwrap_or(out.len());
+        assert!(
+            !out[..split].contains("Galo"),
+            "Galo must NOT be in primary results for the expansion-isolation test to be meaningful; output:\n{out}"
+        );
 
         assert!(
             out.contains("Galo"),
