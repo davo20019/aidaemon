@@ -680,12 +680,61 @@ impl Tool for ManageMemoriesTool {
                             )
                             .await;
                         let classifier_ms = t0.elapsed().as_millis() as u64;
-                        let entities_count = rel.entities.len();
-                        if !rel.entities.is_empty() {
+
+                        // Derive candidate entity names from the MATCHED RESULTS —
+                        // not just from the classifier. The classifier is fed the
+                        // raw keyword query (e.g. "conchi"), which often yields no
+                        // entities, even though the matched facts clearly resolve to
+                        // a person or concept.
+                        //
+                        // Rules:
+                        //   1. Relationship key  → fact.value is a person name
+                        //      (e.g. mother_name="Consuelo Montesdeoca" → "Consuelo Montesdeoca")
+                        //   2. Namespaced key     → namespace prefix is the concept/subject
+                        //      (e.g. "LearnEnglishSounds:path" → "LearnEnglishSounds")
+                        //
+                        // We union these with whatever the classifier returned, dedupe,
+                        // and cap at 6 — so classifier entities still help when present.
+                        let mut result_entities: Vec<String> = merged
+                            .iter()
+                            .flat_map(|(f, _)| {
+                                let mut names: Vec<String> = Vec::new();
+                                if crate::memory::neighborhood::is_relationship_key(&f.key) {
+                                    // Value is the person's name.
+                                    let v = f.value.trim();
+                                    if !v.is_empty() {
+                                        names.push(v.to_string());
+                                    }
+                                }
+                                if let Some(ns) =
+                                    crate::memory::neighborhood::fact_namespace(&f.key)
+                                {
+                                    names.push(ns.to_string());
+                                }
+                                names
+                            })
+                            .collect();
+
+                        // Union with classifier entities (classifier wins on duplicates
+                        // because we add them first below, then dedupe by lowercased value).
+                        let mut seen_lower: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        let mut candidates: Vec<String> = Vec::new();
+                        for e in rel.entities.iter().chain(result_entities.iter()) {
+                            let lower = e.to_ascii_lowercase();
+                            if seen_lower.insert(lower) {
+                                candidates.push(e.clone());
+                            }
+                        }
+                        // Drain result_entities so the borrow ends before we use candidates.
+                        result_entities.clear();
+                        candidates.truncate(6);
+
+                        if !candidates.is_empty() {
                             let t1 = std::time::Instant::now();
                             if let Ok(neighborhood) = self
                                 .state
-                                .assemble_neighborhood(&rel.entities, &initial_ids)
+                                .assemble_neighborhood(&candidates, &initial_ids)
                                 .await
                             {
                                 let assembly_ms = t1.elapsed().as_millis() as u64;
@@ -694,7 +743,7 @@ impl Tool for ManageMemoriesTool {
                                     target: "memory_recall",
                                     classifier_ms,
                                     assembly_ms,
-                                    entities = entities_count,
+                                    entities = candidates.len(),
                                     added,
                                     "neighborhood expansion"
                                 );
@@ -711,8 +760,9 @@ impl Tool for ManageMemoriesTool {
                                 }
                             }
                         } else {
-                            // Classifier ran but found no entities — still log the latency
-                            // so no-op paths are measurable (matches reranker telemetry).
+                            // Neither the classifier NOR the result-derived candidates
+                            // produced any entity names — still log the latency so
+                            // no-op paths are measurable.
                             tracing::info!(
                                 target: "memory_recall",
                                 classifier_ms,
@@ -2195,6 +2245,82 @@ mod tests {
         assert!(
             out.contains("Galo"),
             "keyword-query neighborhood expansion should surface father_name; got:\n{out}"
+        );
+        assert!(
+            out.contains("Related context"),
+            "output should have a neighborhood header; got:\n{out}"
+        );
+    }
+
+    /// Regression test: result-derived entities work even when the classifier
+    /// returns EMPTY entities.
+    ///
+    /// This is the core production bug: the classifier is fed the raw keyword
+    /// (e.g. "conchi"), which yields no entities, so `rel.entities` is empty and
+    /// the old code skipped `assemble_neighborhood` entirely.
+    ///
+    /// Test design:
+    ///   - Seed: mother_name=Consuelo Montesdeoca, father=Galo Loor.
+    ///   - Query "consuelo" — keyword, not question-shaped.
+    ///   - MockProvider returns `{"intent":"none","entities":[]}` (empty classifier).
+    ///   - `mother_name` is a relationship key → its VALUE "Consuelo Montesdeoca"
+    ///     is a result-derived candidate entity.
+    ///   - `assemble_neighborhood(["Consuelo Montesdeoca"], {mother_id})` must pull
+    ///     in `father=Galo Loor` via the owner-relationship cluster rule.
+    ///   - Output MUST contain "Galo" under "── Related context ──".
+    #[tokio::test]
+    async fn test_search_neighborhood_from_result_entities_when_classifier_empty() {
+        let state = setup_state().await;
+
+        state
+            .upsert_fact(
+                "user",
+                "mother_name",
+                "Consuelo Montesdeoca",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        state
+            .upsert_fact(
+                "user",
+                "father",
+                "Galo Loor",
+                "test",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+
+        // MockProvider returns EMPTY entities — simulating the production bug where
+        // the classifier is fed the keyword "consuelo" and extracts nothing.
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(r#"{"intent":"none","entities":[]}"#),
+        ]));
+
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_llm_dep(provider as Arc<dyn ModelProvider>, "fast-model".to_string());
+
+        // limit=1 ensures only the top-ranked initial hit (mother_name) is in the
+        // primary block; neighborhood expansion is the ONLY path that can surface Galo.
+        let out = tool
+            .call(&json!({"action": "search", "query": "consuelo", "limit": 1}).to_string())
+            .await
+            .unwrap();
+
+        // Guard: Galo must NOT appear before the "Related context" separator.
+        let split = out.find("Related context").unwrap_or(out.len());
+        assert!(
+            !out[..split].contains("Galo"),
+            "Galo must NOT be in primary results — expansion-isolation; output:\n{out}"
+        );
+
+        assert!(
+            out.contains("Galo"),
+            "result-derived entity path must surface father=Galo even when classifier is empty; got:\n{out}"
         );
         assert!(
             out.contains("Related context"),
