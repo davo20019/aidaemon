@@ -119,7 +119,6 @@ impl LlmIntentClass {
 /// Coarse relational-recall classification used by neighborhood assembly and
 /// the search-before-deny gate. Separate from `LlmIntentClass` because both
 /// consumers need the *entities* the query names, which the coarse class lacks.
-#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationalKind {
     /// A question about a relationship/connection between entities
@@ -131,7 +130,6 @@ pub enum RelationalKind {
     None,
 }
 
-#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalIntent {
     pub kind: RelationalKind,
@@ -150,7 +148,6 @@ impl RelationalIntent {
 
 /// Parse the classifier's JSON reply. Fail-open: any malformed input yields
 /// `RelationalKind::None` with no entities (caller then does nothing).
-#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
     // Extract the first {...} span so ```json fences / prose don't break parsing.
     let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else {
@@ -184,7 +181,6 @@ pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
 /// Build the messages array for a relational-intent classification call.
 /// Kept separate from `classify_relational_intent` so the prompt can be
 /// unit-tested without a provider.
-#[allow(dead_code)] // shadow scaffolding — wired in a follow-up release
 fn build_relational_classifier_messages(user_text: &str) -> Vec<Value> {
     let system = "You classify a user message about their personal memory. \
 Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", \"entities\": [..]}. \

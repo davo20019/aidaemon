@@ -2004,7 +2004,6 @@ mod tests {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::testing::MockProvider;
-    use crate::traits::store_prelude::FactStore;
     use crate::traits::{Goal, GoalSchedule, Task, TaskActivity};
 
     #[test]

@@ -868,6 +868,7 @@ mod unsearched_entity_tests {
         let msg = d.render();
         assert!(msg.contains("Conchi"));
         assert!(msg.to_lowercase().contains("search"));
+        assert!(msg.contains("biological"), "honesty clause must be present");
     }
 }
 
