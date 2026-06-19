@@ -494,12 +494,12 @@ async fn test_upsert_fact_with_provenance_round_trips() {
         .upsert_fact_with_provenance(
             "identity",
             "partner",
-            "Aracely Zambrano",
+            "Alice Rivera",
             "user_stated",
             None,
             FactPrivacy::Global,
             Some(first_seen),
-            Some("my wife is Aracely Zambrano"),
+            Some("my wife is Alice Rivera"),
         )
         .await
         .unwrap();
@@ -512,7 +512,7 @@ async fn test_upsert_fact_with_provenance_round_trips() {
     assert_eq!(facts[0].first_seen_at, Some(first_seen));
     assert_eq!(
         facts[0].source_excerpt.as_deref(),
-        Some("my wife is Aracely Zambrano")
+        Some("my wife is Alice Rivera")
     );
 
     // The plain upsert_fact default leaves provenance unset (default is NOT

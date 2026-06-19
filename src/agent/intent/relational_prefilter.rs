@@ -45,7 +45,7 @@ const RELATIONAL_NOUNS: &[&str] = &[
 ];
 
 /// Returns true when the text looks like a relational query about a named
-/// person known to the agent (e.g., "who is conchi's spouse?", "where does
+/// person known to the agent (e.g., "who is caro's spouse?", "where does
 /// María work?").  Identified by the possessive `'s` pattern combined with
 /// a relational noun, or by interrogative+verb patterns about persons.
 fn looks_like_named_person_relational_query(lower: &str) -> bool {
@@ -74,29 +74,11 @@ fn looks_like_named_person_relational_query(lower: &str) -> bool {
 }
 
 /// True when the text is specifically a named-person relational query
-/// (e.g., "who is Conchi's spouse?") as opposed to a generic recall question
+/// (e.g., "who is Caro's spouse?") as opposed to a generic recall question
 /// ("what about pets?"). Used by the completion-phase denial gate to scope
 /// the check to cases where a specific named entity was not looked up.
 pub fn user_text_is_named_person_relational_query(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
-    looks_like_named_person_relational_query(&lower)
-}
-
-/// True when a relational classifier call is worth making. Recall-biased:
-/// fires on personal-recall-shaped messages and named-person relational
-/// queries, and only when no memory lookup already grounded the turn.
-#[allow(dead_code)]
-pub fn should_run_relational_classifier(user_text: &str, memory_lookup_fired: bool) -> bool {
-    if memory_lookup_fired {
-        return false;
-    }
-    let lower = user_text.trim().to_ascii_lowercase();
-    // Ego-centric personal-memory recall patterns.
-    if crate::agent::recall_guardrails::looks_like_personal_memory_recall_question(user_text) {
-        return true;
-    }
-    // Named-person relational queries that the ego-centric recall function
-    // misses (e.g., "who is conchi's spouse?").
     looks_like_named_person_relational_query(&lower)
 }
 
@@ -105,26 +87,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fires_for_personal_recall_without_lookup() {
-        assert!(should_run_relational_classifier(
-            "who is conchi's spouse?",
-            false
+    fn fires_for_named_person_possessive_query() {
+        assert!(user_text_is_named_person_relational_query(
+            "who is caro's spouse?"
         ));
     }
 
     #[test]
-    fn skips_when_a_lookup_already_fired() {
-        assert!(!should_run_relational_classifier(
-            "who is conchi's spouse?",
-            true
+    fn fires_for_where_does_x_work() {
+        assert!(user_text_is_named_person_relational_query(
+            "where does María work?"
         ));
     }
 
     #[test]
     fn skips_general_knowledge() {
-        assert!(!should_run_relational_classifier(
-            "who is the president of france?",
-            false
+        assert!(!user_text_is_named_person_relational_query(
+            "who is the president of france?"
         ));
     }
 }

@@ -644,7 +644,7 @@ impl Tool for ManageMemoriesTool {
                 //
                 // Entity candidates are derived SOLELY from the matched results:
                 //   1. Relationship key → fact.value is a person name
-                //      (e.g. mother_name="Consuelo Montesdeoca" → "Consuelo Montesdeoca")
+                //      (e.g. mother_name="Carol Mendez" → "Carol Mendez")
                 //   2. Namespaced key   → namespace prefix is the concept/subject
                 //      (e.g. "LearnEnglishSounds:path" → "LearnEnglishSounds")
                 //
@@ -2026,9 +2026,9 @@ mod tests {
     /// relationship-typed key. No LLM/MockProvider needed — entities are derived
     /// purely from matched result values.
     ///
-    /// Seed: mother_name=Consuelo, father_name=Galo Loor.
-    /// Query "consuelo's mother" with limit=1 → only mother_name in initial_ids.
-    /// Expansion derives "Consuelo" from mother_name value, assembles neighborhood,
+    /// Seed: mother_name=Carol, father_name=Frank Mendez.
+    /// Query "carol's mother" with limit=1 → only mother_name in initial_ids.
+    /// Expansion derives "Carol" from mother_name value, assembles neighborhood,
     /// and surfaces father_name under "Related context".
     #[tokio::test]
     async fn test_search_relational_expansion() {
@@ -2038,7 +2038,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "mother_name",
-                "Consuelo",
+                "Carol",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2049,7 +2049,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "father_name",
-                "Galo Loor",
+                "Frank Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2062,23 +2062,21 @@ mod tests {
 
         // limit=1 keeps only the top-ranked initial hit (mother_name) so
         // initial_ids does NOT contain father_name. The neighborhood expansion
-        // is then the only path that can surface "Galo".
+        // is then the only path that can surface "Frank".
         let out = tool
-            .call(
-                &json!({"action": "search", "query": "consuelo's mother", "limit": 1}).to_string(),
-            )
+            .call(&json!({"action": "search", "query": "carol's mother", "limit": 1}).to_string())
             .await
             .unwrap();
 
-        // Guard: "Galo" must NOT appear in the primary (pre-neighborhood) results.
+        // Guard: "Frank" must NOT appear in the primary (pre-neighborhood) results.
         let split = out.find("Related context").unwrap_or(out.len());
         assert!(
-            !out[..split].contains("Galo"),
-            "Galo must NOT be in primary results for the expansion-isolation test to be meaningful; output:\n{out}"
+            !out[..split].contains("Frank"),
+            "Frank must NOT be in primary results for the expansion-isolation test to be meaningful; output:\n{out}"
         );
 
         assert!(
-            out.contains("Galo"),
+            out.contains("Frank"),
             "neighborhood expansion should surface father_name fact; got:\n{out}"
         );
         assert!(
@@ -2090,8 +2088,8 @@ mod tests {
     /// Regression: keyword query (no possessive/recall phrasing) still triggers
     /// neighborhood expansion via the result-signal path.
     ///
-    /// Seed: mother_name=Consuelo, father_name=Galo.
-    /// Query "consuelo" (bare keyword) matches mother_name. Expansion fires
+    /// Seed: mother_name=Carol, father_name=Frank.
+    /// Query "carol" (bare keyword) matches mother_name. Expansion fires
     /// because mother_name is a relationship key in the matched results.
     /// No MockProvider needed — classifier is no longer invoked.
     #[tokio::test]
@@ -2102,7 +2100,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "mother_name",
-                "Consuelo",
+                "Carol",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2113,7 +2111,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "father_name",
-                "Galo",
+                "Frank",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2125,21 +2123,21 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         // limit=1 so only the top-ranked initial hit is in the base results;
-        // neighborhood expansion is the only path that can surface "Galo".
+        // neighborhood expansion is the only path that can surface "Frank".
         let out = tool
-            .call(&json!({"action": "search", "query": "consuelo", "limit": 1}).to_string())
+            .call(&json!({"action": "search", "query": "carol", "limit": 1}).to_string())
             .await
             .unwrap();
 
-        // Guard: Galo must NOT be in the primary block.
+        // Guard: Frank must NOT be in the primary block.
         let split = out.find("Related context").unwrap_or(out.len());
         assert!(
-            !out[..split].contains("Galo"),
-            "Galo must NOT be in primary results; output:\n{out}"
+            !out[..split].contains("Frank"),
+            "Frank must NOT be in primary results; output:\n{out}"
         );
 
         assert!(
-            out.contains("Galo"),
+            out.contains("Frank"),
             "keyword-query neighborhood expansion should surface father_name; got:\n{out}"
         );
         assert!(
@@ -2149,7 +2147,7 @@ mod tests {
     }
 
     /// Expansion works with multi-word values (the common production case where
-    /// mother_name="Consuelo Montesdeoca" and father="Galo Loor").
+    /// mother_name="Carol Mendez" and father="Frank Mendez").
     ///
     /// Previously, the classifier was needed because a bare keyword query yielded
     /// no entities from the LLM. Now the value of the matched relationship-key
@@ -2162,7 +2160,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "mother_name",
-                "Consuelo Montesdeoca",
+                "Carol Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2173,7 +2171,7 @@ mod tests {
             .upsert_fact(
                 "user",
                 "father",
-                "Galo Loor",
+                "Frank Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -2185,22 +2183,22 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         // limit=1 ensures only the top-ranked initial hit (mother_name) is in the
-        // primary block; neighborhood expansion is the ONLY path that can surface Galo.
+        // primary block; neighborhood expansion is the ONLY path that can surface Frank.
         let out = tool
-            .call(&json!({"action": "search", "query": "consuelo", "limit": 1}).to_string())
+            .call(&json!({"action": "search", "query": "carol", "limit": 1}).to_string())
             .await
             .unwrap();
 
-        // Guard: Galo must NOT appear before the "Related context" separator.
+        // Guard: Frank must NOT appear before the "Related context" separator.
         let split = out.find("Related context").unwrap_or(out.len());
         assert!(
-            !out[..split].contains("Galo"),
-            "Galo must NOT be in primary results — expansion-isolation; output:\n{out}"
+            !out[..split].contains("Frank"),
+            "Frank must NOT be in primary results — expansion-isolation; output:\n{out}"
         );
 
         assert!(
-            out.contains("Galo"),
-            "result-derived entity path must surface father=Galo even without a classifier; got:\n{out}"
+            out.contains("Frank"),
+            "result-derived entity path must surface father=Frank even without a classifier; got:\n{out}"
         );
         assert!(
             out.contains("Related context"),

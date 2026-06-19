@@ -175,6 +175,14 @@ contains_keyword_as_words("I'll check the report", "i'll check") // true ✓
 
 Keyring crate uses platform-native backends: `apple-native` (macOS), `sync-secret-service` (Linux), `windows-native` (Windows). These are selected via `[target.'cfg(...)'.dependencies]` in Cargo.toml.
 
+### Test & Fixture Data Hygiene (IMPORTANT)
+
+aidaemon is **open source and published** (crates.io + GitHub). NEVER put **real personal data** into the repository — real people's names (including the owner's family, friends, colleagues), addresses, phone numbers, emails, employers, birthdays, or any other PII — in tests, fixtures, doc examples, specs, plans, or comments. Use clearly-synthetic placeholders (e.g. `Alice Rivera`, `Acme Corp`, `partner_name = "Jordan Lee"`, daughters `Mia`/`Zoe`).
+
+This matters most when working from **live examples**: if a task's data comes from the running daemon's real memory (e.g. debugging a recall bug with the owner's actual family), **substitute synthetic equivalents before writing anything into the repo or design docs.** Any relationship/logic a test needs can be expressed with fictional entities — the assertions don't care whether the name is real.
+
+This binds subagents and generated code too: if a brief you hand a subagent contains real PII as an example, replace it with synthetic data in the brief first. (Real PII already committed in git history is a separate cleanup decision — scrubbing the working tree does not remove it from past commits.)
+
 ### Testing
 
 Tests are spread across 40+ files as `#[cfg(test)]` modules, totaling 1300+ tests. Key test areas:

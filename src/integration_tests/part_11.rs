@@ -217,7 +217,7 @@ async fn test_should_extract_facts_filtering() {
 
     // Meaningful messages should pass through
     assert!(should_extract_facts(
-        "My dog's name is Bella and she's 3 years old"
+        "My dog's name is Mia and she's 3 years old"
     ));
     assert!(should_extract_facts(
         "I work at Acme Corp as a senior engineer"
@@ -1711,7 +1711,7 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 // ==================== Search-Before-Deny Gate Tests ====================
 
 /// A final reply that denies knowledge of a named entity (e.g. "I don't have
-/// information about Conchi's spouse") without first searching memory must be
+/// information about Caro's spouse") without first searching memory must be
 /// intercepted by the search-before-deny gate.  The gate calls the relational
 /// classifier (consuming a scripted provider response), injects an
 /// UnsearchedEntityDenial directive, and continues the loop so the model can
@@ -1720,21 +1720,21 @@ async fn test_snippet_only_enumeration_gets_corroboration_nudge_once() {
 ///
 /// MockProvider call order:
 ///   1) First LLM call → denial text (no tool call)
-///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Conchi"]}`
+///   2) Classifier call inside completion_phase → `{"intent":"relational","entities":["Caro"]}`
 ///   3) Second LLM call (with directive injected) → corrected answer
 #[tokio::test]
 async fn test_relational_denial_is_blocked_then_corrected() {
     let denial =
-        "I don't have information about Conchi's spouse. I don't know who that person is.";
-    let corrected = "Based on the memory search, Conchi's spouse is Galo Loor.";
+        "I don't have information about Caro's spouse. I don't know who that person is.";
+    let corrected = "Based on the memory search, Caro's spouse is Frank Mendez.";
     // The classifier must return a JSON object with relational intent and the entity name.
-    let classifier_json = r#"{"intent":"relational","entities":["Conchi"]}"#;
+    let classifier_json = r#"{"intent":"relational","entities":["Caro"]}"#;
 
     let provider = MockProvider::with_responses(vec![
         // Call 1: First LLM call — model denies knowledge without searching.
         MockProvider::text_response(denial),
         // Call 2: Classifier call inside completion_phase — consumed by
-        // classify_relational_intent; returns relational intent with "Conchi".
+        // classify_relational_intent; returns relational intent with "Caro".
         MockProvider::text_response(classifier_json),
         // Call 3: Second LLM call — model has the UnsearchedEntityDenial directive
         // injected and produces the correct answer.
@@ -1751,7 +1751,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
         .upsert_fact(
             "family",
             "mother",
-            "Consuelo (Conchi)",
+            "Carol (Caro)",
             "test",
             None,
             crate::types::FactPrivacy::Global,
@@ -1763,7 +1763,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
         .upsert_fact(
             "family",
             "father",
-            "Galo Loor",
+            "Frank Mendez",
             "test",
             None,
             crate::types::FactPrivacy::Global,
@@ -1775,7 +1775,7 @@ async fn test_relational_denial_is_blocked_then_corrected() {
         .agent
         .handle_message(
             "denial_gate_session",
-            "Who is Conchi's spouse?",
+            "Who is Caro's spouse?",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -1791,9 +1791,9 @@ async fn test_relational_denial_is_blocked_then_corrected() {
         response
     );
 
-    // The corrected answer (naming Galo) should be the final response.
+    // The corrected answer (naming Frank) should be the final response.
     assert!(
-        response.contains("Galo") || response.contains("Conchi"),
+        response.contains("Frank") || response.contains("Caro"),
         "corrected reply should be the final response; got: {}",
         response
     );

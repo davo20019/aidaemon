@@ -4,7 +4,7 @@
 //! clusters so the model can derive relational answers. Three rules:
 //! namespace (`X:*`), co-mention (entity name appears in key/value), and the
 //! owner-relationship cluster (relationship-typed facts travel together —
-//! this is what connects `Conchi` to `Galo`, who never co-occur in one fact).
+//! this is what connects `Caro` to `Frank`, who never co-occur in one fact).
 //! Pure and synchronous so it is unit-testable without a DB.
 
 // Not yet called by production code — wired in Task 5.
@@ -198,18 +198,18 @@ mod tests {
 
     #[test]
     fn owner_relationship_query_pulls_the_whole_family_cluster() {
-        // The Conchi/Galo shape: query resolved to "Conchi"; Galo never co-occurs
-        // with Conchi, but is in the owner's relationship set.
+        // The Caro/Frank shape: query resolved to "Caro"; Frank never co-occurs
+        // with Caro, but is in the owner's relationship set.
         let all = vec![
-            fact(1, "user", "mother_name", "Consuelo Montesdeoca"), // initial match
-            fact(2, "user", "father", "Galo Loor"),
-            fact(3, "user", "partner_name", "Aracely Zambrano"),
+            fact(1, "user", "mother_name", "Carol Mendez"), // initial match
+            fact(2, "user", "father", "Frank Mendez"),
+            fact(3, "user", "partner_name", "Alice Rivera"),
             fact(4, "project", "LearnEnglishSounds:path", "~/projects/LES"),
         ];
         let initial: HashSet<i64> = [1].into_iter().collect();
         let out = select_neighborhood_facts(
             &all,
-            &["Consuelo".into()],
+            &["Carol".into()],
             true, // owner_relationship
             &initial,
             NeighborhoodCaps::default(),
@@ -217,7 +217,7 @@ mod tests {
         let ids: HashSet<i64> = out.iter().map(|f| f.id).collect();
         assert!(
             ids.contains(&2),
-            "father=Galo must be pulled into the cluster"
+            "father=Frank must be pulled into the cluster"
         );
         assert!(
             ids.contains(&3),
@@ -232,7 +232,7 @@ mod tests {
         let all = vec![
             fact(10, "project", "LearnEnglishSounds:path", "~/p/LES"),
             fact(11, "technical", "LearnEnglishSounds:tech_stack", "Next.js"),
-            fact(12, "user", "partner_name", "Aracely"),
+            fact(12, "user", "partner_name", "Alice"),
         ];
         let initial: HashSet<i64> = [10].into_iter().collect();
         let out = select_neighborhood_facts(
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn empty_resolved_names_returns_empty() {
-        let all = vec![fact(1, "user", "partner_name", "Aracely")];
+        let all = vec![fact(1, "user", "partner_name", "Alice")];
         let empty: HashSet<i64> = HashSet::new();
         let out = select_neighborhood_facts(&all, &[], false, &empty, NeighborhoodCaps::default());
         assert!(out.is_empty(), "no resolved entities -> no expansion");
@@ -276,8 +276,8 @@ mod tests {
     fn co_mention_is_word_boundary_not_substring() {
         // "Ana" must NOT match a value containing "banana".
         let banana_fact = fact(1, "food", "preference", "I like banana bread");
-        // "Galo" MUST match a value that is exactly "Galo Loor".
-        let galo_fact = fact(2, "user", "father", "Galo Loor");
+        // "Frank" MUST match a value that is exactly "Frank Mendez".
+        let frank_fact = fact(2, "user", "father", "Frank Mendez");
 
         let empty: HashSet<i64> = HashSet::new();
 
@@ -294,17 +294,17 @@ mod tests {
             "'Ana' must not match 'banana' via substring — word boundary required"
         );
 
-        // Test: "Galo" should pull the galo fact.
-        let out_galo = select_neighborhood_facts(
-            &[galo_fact.clone()],
-            &["Galo".into()],
+        // Test: "Frank" should pull the frank fact.
+        let out_frank = select_neighborhood_facts(
+            &[frank_fact.clone()],
+            &["Frank".into()],
             false,
             &empty,
             NeighborhoodCaps::default(),
         );
         assert!(
-            out_galo.iter().any(|f| f.id == 2),
-            "'Galo' must match 'Galo Loor' as a whole word"
+            out_frank.iter().any(|f| f.id == 2),
+            "'Frank' must match 'Frank Mendez' as a whole word"
         );
     }
 }

@@ -393,18 +393,18 @@ mod tests {
 
     #[test]
     fn flags_denial_of_unsearched_entity() {
-        let reply = "I don't have information about Conchi's spouse.";
-        let entities = vec!["Conchi".to_string()];
-        let evidence = vec!["partner_name: Aracely Zambrano"]; // Conchi absent
+        let reply = "I don't have information about Caro's spouse.";
+        let entities = vec!["Caro".to_string()];
+        let evidence = vec!["partner_name: Alice Rivera"]; // Caro absent
         let out = find_unsearched_denials(reply, &entities, &evidence);
-        assert_eq!(out, vec!["Conchi".to_string()]);
+        assert_eq!(out, vec!["Caro".to_string()]);
     }
 
     #[test]
     fn does_not_flag_when_entity_is_in_evidence() {
-        let reply = "I don't have Conchi's phone number.";
-        let entities = vec!["Conchi".to_string()];
-        let evidence = vec!["mother_name: Consuelo (Conchi) Montesdeoca"]; // present
+        let reply = "I don't have Caro's phone number.";
+        let entities = vec!["Caro".to_string()];
+        let evidence = vec!["mother_name: Carol (Caro) Mendez"]; // present
         assert!(find_unsearched_denials(reply, &entities, &evidence).is_empty());
     }
 

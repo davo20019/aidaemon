@@ -825,13 +825,13 @@ mod tests {
     fn coreference_grounding_render_anchors_pronoun_and_forces_lookup() {
         let rendered = SystemDirective::CoreferenceGroundingRequired {
             prior_user_request: Some("Where is my mom from?".to_string()),
-            prior_assistant_reply: "I don't have info about Consuelo Montesdeoca.".to_string(),
+            prior_assistant_reply: "I don't have info about Carol Mendez.".to_string(),
         }
         .render();
 
         assert!(rendered.contains("PRONOUN REFERENT"));
         assert!(rendered.contains("Where is my mom from?"));
-        assert!(rendered.contains("Consuelo Montesdeoca"));
+        assert!(rendered.contains("Carol Mendez"));
         // Must steer away from the pinned partner and toward a lookup.
         assert!(rendered.contains("NOT"));
         assert!(rendered.contains("manage_memories"));
@@ -863,10 +863,10 @@ mod unsearched_entity_tests {
     #[test]
     fn renders_unsearched_entity_denial() {
         let d = SystemDirective::UnsearchedEntityDenial {
-            entities: vec!["Conchi".into()],
+            entities: vec!["Caro".into()],
         };
         let msg = d.render();
-        assert!(msg.contains("Conchi"));
+        assert!(msg.contains("Caro"));
         assert!(msg.to_lowercase().contains("search"));
         assert!(msg.contains("biological"), "honesty clause must be present");
     }

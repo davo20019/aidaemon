@@ -599,13 +599,13 @@ impl MemoryManager {
             - Recurring workflows or action sequences\n\
             - Types of tasks frequently delegated\n\n\
             For \"people\", extract:\n\
-            - Names and relationships mentioned (e.g., \"my wife Aracely\", \"coworker Juan\")\n\
+            - Names and relationships mentioned (e.g., \"my wife Alice\", \"coworker Juan\")\n\
             - Personal details about others (birthdays, preferences, interests, jobs)\n\
             - Important dates related to people\n\
-            - Format the key as \"person_name:detail_type\" (e.g., \"aracely:birthday\", \"juan:job\")\n\
+            - Format the key as \"person_name:detail_type\" (e.g., \"alice:birthday\", \"juan:job\")\n\
             - Include a \"person_name\" field with just the person's name\n\
             - NEVER extract health info, financial details, political opinions, or religious beliefs about people\n\
-            Example: {\"category\": \"people\", \"key\": \"aracely:birthday\", \"value\": \"March 15\", \"privacy\": \"private\", \"person_name\": \"Aracely\"}\n\n\
+            Example: {\"category\": \"people\", \"key\": \"alice:birthday\", \"value\": \"March 15\", \"privacy\": \"private\", \"person_name\": \"Alice\"}\n\n\
             Also classify each fact's privacy:\n\
             - \"global\": General facts useful anywhere (name, job, timezone, tech preferences)\n\
             - \"channel\": Context-specific facts from this conversation\n\
@@ -2331,7 +2331,7 @@ mod tests {
 
         let session_id = "slack:D_non_owner";
         let user_data = serde_json::json!({
-            "content": "My name is Aracely",
+            "content": "My name is Alice",
             "message_id": "msg-1",
             "has_attachments": false,
             "user_role": "public",

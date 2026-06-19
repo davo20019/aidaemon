@@ -1658,7 +1658,7 @@ mod stuck_fallback_tests {
         // A request with an actual subject should not be treated as query-less;
         // it falls through to the generic rephrase message.
         let msg = build_stuck_no_output_fallback(
-            "search the web for what Conchi is a nickname for and summarize the top results",
+            "search the web for what Caro is a nickname for and summarize the top results",
         );
         assert!(msg.contains("rephrase"));
     }

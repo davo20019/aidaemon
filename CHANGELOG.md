@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.6] - 2026-06-19
+
+### Added
+
+- **Read-time neighborhood retrieval (relational memory recall)**: when a memory search matches a relationship-typed or namespaced fact, the connected *neighborhood* — the entity's fact cluster plus the facts of co-occurring entities — is assembled into the search results, so the model can *derive* relational answers it cannot look up directly. Fixes cases like "who is Conchi's spouse?" → Galo Loor (derived from separately-stored mother/father facts) and "who is my daughter Bella's mother?" → Aracely Zambrano, which previously deflected or denied. Entity resolution is semantic (read from the embedding-matched results, word-boundary matched — never query token-matching); the path is fully deterministic with no per-search LLM call.
+- **Search-before-deny gate**: the completion phase blocks a relational *denial* about a named entity the model never searched for, injecting a directive to look it up first (bounded retry, owner-DM scoped, fail-open, and it never asserts that a partner is a child's biological parent). Precedence across the relational interventions: coreference grounding → neighborhood assembly → denial gate.
+- **Neighborhood telemetry**: a `memory_recall`-target log records neighborhood assembly latency (`assembly_ms`), entities resolved, and facts added.
+
+### Changed
+
+- The relational-intent classifier in `agent/intent/llm_classifier.rs` is now wired into production (for the search-before-deny gate); it was previously shadow-only scaffolding.
+
 ## [0.11.5] - 2026-06-18
 
 ### Added

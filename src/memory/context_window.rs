@@ -676,8 +676,8 @@ pub async fn extract_inline_facts(
                         identity key like 'name'. When the user talks about someone else, do not extract a 'user' fact from it.\n\n\
                         If nothing is worth remembering, return an empty array: []\n\n\
                         Examples:\n\
-                        - \"My dog's name is Bella\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Bella\"}]\n\
-                        - \"Actually my dog's name is Max, not Bella\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\"}]\n\
+                        - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\"}]\n\
+                        - \"Actually my dog's name is Max, not Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\"}]\n\
                         - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"dark mode\"}]\n\
                         - \"My sister lives in Tokyo, not Paris\" → [{\"category\":\"user\",\"key\":\"sister_location\",\"value\":\"Tokyo\"}]\n\
                         - \"How's the weather?\" → []\n\n\
@@ -1229,7 +1229,7 @@ mod tests {
         assert!(!identity_fact_lacks_user_evidence(
             "user",
             "dog_name",
-            "Bella",
+            "Mia",
             "what's the weather?"
         ));
         // Non-user categories are never gated.
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn test_should_extract_facts_meaningful() {
         assert!(should_extract_facts(
-            "My dog's name is Bella and she's a golden retriever"
+            "My dog's name is Mia and she's a golden retriever"
         ));
         assert!(should_extract_facts(
             "I work at Acme Corp in the engineering department"
@@ -1545,12 +1545,12 @@ mod tests {
 
     #[test]
     fn test_inline_fact_deserialization() {
-        let json = r#"[{"category":"user","key":"dog_name","value":"Bella"}]"#;
+        let json = r#"[{"category":"user","key":"dog_name","value":"Mia"}]"#;
         let facts: Vec<InlineFact> = serde_json::from_str(json).unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].category, "user");
         assert_eq!(facts[0].key, "dog_name");
-        assert_eq!(facts[0].value, "Bella");
+        assert_eq!(facts[0].value, "Mia");
     }
 
     #[test]

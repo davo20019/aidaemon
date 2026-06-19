@@ -1898,11 +1898,11 @@ pub(super) async fn run_completion_phase(
             let memory_lookup_fired_this_turn = learning_ctx.tool_calls.iter().any(|call| {
                 call.starts_with("manage_memories(") || call.starts_with("manage_people(")
             });
-            // Use the narrower named-person relational check (possessive + relational noun)
-            // rather than the broader `should_run_relational_classifier` which also matches
-            // ego-centric recall questions ("what about pets?"). The denial gate is scoped
-            // to specific named-person queries ("who is Conchi's spouse?") where a search
-            // failure is unambiguous; generic recall queries are handled by other paths.
+            // Scope the denial gate with the named-person relational check
+            // (possessive + relational noun), not generic ego-centric recall
+            // ("what about pets?"): the gate is for specific named-person queries
+            // ("who is Caro's spouse?") where a no-search denial is unambiguous;
+            // generic recall queries are handled by other paths.
             if !memory_lookup_fired_this_turn
                 && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
                     user_text,

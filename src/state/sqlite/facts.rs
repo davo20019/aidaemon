@@ -992,7 +992,7 @@ impl crate::traits::FactStore for SqliteStateStore {
 
         // Stage 2 — cross-encoder rerank. The bi-encoder ranks attribute facts
         // ("wife covers insurance") above the answer-bearing identity fact
-        // ("partner name: Aracely") for queries like "spouse"; a cross-encoder
+        // ("partner name: Alice") for queries like "spouse"; a cross-encoder
         // reads (query, fact) together and reorders correctly. On any reranker
         // error (e.g. model unavailable offline), fall back to the bi-encoder
         // order so search still works.
@@ -1429,7 +1429,7 @@ mod assemble_neighborhood_tests {
             .upsert_fact(
                 "user",
                 "mother_name",
-                "Consuelo Montesdeoca",
+                "Carol Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -1440,7 +1440,7 @@ mod assemble_neighborhood_tests {
             .upsert_fact(
                 "user",
                 "father",
-                "Galo Loor",
+                "Frank Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -1451,7 +1451,7 @@ mod assemble_neighborhood_tests {
             .upsert_fact(
                 "user",
                 "partner_name",
-                "Aracely Zambrano",
+                "Alice Rivera",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -1470,12 +1470,12 @@ mod assemble_neighborhood_tests {
         let initial: std::collections::HashSet<i64> = [mother.id].into_iter().collect();
 
         let out = store
-            .assemble_neighborhood(&["Consuelo".to_string()], &initial)
+            .assemble_neighborhood(&["Carol".to_string()], &initial)
             .await
             .unwrap();
         let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
         assert!(
-            values.iter().any(|v| v.contains("Galo")),
+            values.iter().any(|v| v.contains("Frank")),
             "father pulled into cluster: {:?}",
             values
         );
@@ -1495,7 +1495,7 @@ mod assemble_neighborhood_tests {
         // Seed a Person record with a relationship role.
         let person = crate::traits::Person {
             id: 0,
-            name: "Consuelo Montesdeoca".to_string(),
+            name: "Carol Mendez".to_string(),
             aliases: vec![],
             relationship: Some("mother".to_string()),
             platform_ids: std::collections::HashMap::new(),
@@ -1514,7 +1514,7 @@ mod assemble_neighborhood_tests {
             .upsert_fact(
                 "user",
                 "father",
-                "Galo Loor",
+                "Frank Mendez",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -1525,7 +1525,7 @@ mod assemble_neighborhood_tests {
             .upsert_fact(
                 "user",
                 "partner_name",
-                "Aracely Zambrano",
+                "Alice Rivera",
                 "test",
                 None,
                 FactPrivacy::Global,
@@ -1539,12 +1539,12 @@ mod assemble_neighborhood_tests {
         let initial: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         let out = store
-            .assemble_neighborhood(&["Consuelo".to_string()], &initial)
+            .assemble_neighborhood(&["Carol".to_string()], &initial)
             .await
             .unwrap();
         let values: Vec<String> = out.iter().map(|f| f.value.clone()).collect();
         assert!(
-            values.iter().any(|v| v.contains("Galo")),
+            values.iter().any(|v| v.contains("Frank")),
             "father should be pulled into cluster via person-resolution path: {:?}",
             values
         );

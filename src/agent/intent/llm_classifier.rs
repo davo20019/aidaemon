@@ -122,7 +122,7 @@ impl LlmIntentClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationalKind {
     /// A question about a relationship/connection between entities
-    /// ("who is Conchi's spouse?", "what tools does project X use?").
+    /// ("who is Caro's spouse?", "what tools does project X use?").
     Relational,
     /// A direct personal-fact recall ("what's my dog's name?").
     Recall,
@@ -184,7 +184,7 @@ pub fn parse_relational_intent(raw: &str) -> RelationalIntent {
 fn build_relational_classifier_messages(user_text: &str) -> Vec<Value> {
     let system = "You classify a user message about their personal memory. \
 Reply with ONLY a JSON object: {\"intent\": \"relational\"|\"recall\"|\"none\", \"entities\": [..]}. \
-\"relational\" = a question about a relationship/connection between entities (e.g. \"who is Conchi's spouse?\", \"who is my kid's mom?\", \"what tools does project X use?\"). \
+\"relational\" = a question about a relationship/connection between entities (e.g. \"who is Caro's spouse?\", \"who is my kid's mom?\", \"what tools does project X use?\"). \
 \"recall\" = a direct fact lookup about one entity (e.g. \"what's my dog's name?\"). \
 \"none\" = anything else (general knowledge, chit-chat, actions). \
 \"entities\" = the people/projects/things the question is about, as named (resolve possessives to the owned entity: \"my mom\" -> \"my mom\"). Keep it short.";
@@ -474,9 +474,9 @@ mod tests {
 
     #[test]
     fn parse_relational_intent_reads_json() {
-        let r = parse_relational_intent(r#"{"intent":"relational","entities":["Conchi","Galo"]}"#);
+        let r = parse_relational_intent(r#"{"intent":"relational","entities":["Caro","Frank"]}"#);
         assert_eq!(r.kind, RelationalKind::Relational);
-        assert_eq!(r.entities, vec!["Conchi".to_string(), "Galo".to_string()]);
+        assert_eq!(r.entities, vec!["Caro".to_string(), "Frank".to_string()]);
     }
 
     #[test]
@@ -500,13 +500,12 @@ mod tests {
     async fn classify_relational_intent_parses_provider_json() {
         let provider = crate::testing::MockProvider::with_responses(vec![
             crate::testing::MockProvider::text_response(
-                r#"{"intent":"relational","entities":["Conchi"]}"#,
+                r#"{"intent":"relational","entities":["Caro"]}"#,
             ),
         ]);
-        let r =
-            classify_relational_intent(&provider, "fast-model", "who is conchi's spouse?").await;
+        let r = classify_relational_intent(&provider, "fast-model", "who is caro's spouse?").await;
         assert_eq!(r.kind, RelationalKind::Relational);
-        assert_eq!(r.entities, vec!["Conchi".to_string()]);
+        assert_eq!(r.entities, vec!["Caro".to_string()]);
     }
 
     #[tokio::test]

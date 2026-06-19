@@ -417,7 +417,7 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response("Your system has 16GB RAM and an M1 chip."),
         // Turn 2: direct text response (different topic)
-        MockProvider::text_response("Bella is your cat."),
+        MockProvider::text_response("Mia is your cat."),
     ]);
 
     let harness = setup_test_agent(provider).await.unwrap();
@@ -442,7 +442,7 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         .agent
         .handle_message(
             "collapse_test",
-            "Who is bella?",
+            "Who is mia?",
             None,
             UserRole::Owner,
             ChannelContext::private("telegram"),
@@ -450,7 +450,7 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         )
         .await
         .unwrap();
-    assert_eq!(r2, "Bella is your cat.");
+    assert_eq!(r2, "Mia is your cat.");
 
     // Verify Turn 2's messages: Prior 1 tool results should be summarized (not
     // dropped) by age-based clearing. Prior 2+ tool results would be dropped.

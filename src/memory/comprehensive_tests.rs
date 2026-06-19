@@ -48,14 +48,7 @@ async fn test_canonical_key_prevents_duplicates() {
 
     // Insert with "Dog Name"
     store
-        .upsert_fact(
-            "user",
-            "Dog Name",
-            "Bella",
-            "test",
-            None,
-            FactPrivacy::Global,
-        )
+        .upsert_fact("user", "Dog Name", "Mia", "test", None, FactPrivacy::Global)
         .await
         .unwrap();
 
@@ -115,7 +108,7 @@ async fn test_canonical_key_punctuation_normalization() {
         .upsert_fact(
             "user",
             "my-dog's-name",
-            "Bella",
+            "Mia",
             "test",
             None,
             FactPrivacy::Global,
@@ -672,7 +665,7 @@ async fn test_explicit_search_catches_near_threshold_synonym() {
         .upsert_fact(
             "user",
             "partner_name",
-            "Aracely Zambrano",
+            "Alice Rivera",
             "test",
             None,
             FactPrivacy::Global,
@@ -2436,7 +2429,7 @@ async fn test_should_extract_facts_filtering() {
 
     // Meaningful messages should pass
     assert!(should_extract_facts(
-        "My dog's name is Bella and she's a golden retriever"
+        "My dog's name is Mia and she's a golden retriever"
     ));
     assert!(should_extract_facts(
         "I work at Acme Corp in the engineering department"
