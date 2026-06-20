@@ -208,11 +208,34 @@ pub(super) async fn execute_tool_call_io(
                 }
             }
         } else {
-            result_text = crate::memory::context_window::compress_tool_result(
-                &tc.name,
-                &result_text,
-                max_chars,
-            );
+            // Oversized successful results are spilled to a temp file when the
+            // model has a filesystem recovery path (read_file or terminal): it
+            // then pages / jq / greps the full data instead of losing the
+            // middle to lossy head+tail compression. No recovery path → fall
+            // back to lossy compression. Errors are never spilled.
+            let over_cap = result_text.chars().count() > max_chars;
+            let has_fs_recovery = agent
+                .tools
+                .iter()
+                .any(|t| matches!(t.name(), "read_file" | "terminal") && t.is_available());
+            let spilled = if over_cap && !result_is_err && has_fs_recovery {
+                crate::tools::result_spill::build_spilled_preview(
+                    &tc.name,
+                    ctx.session_id,
+                    &result_text,
+                    max_chars,
+                )
+            } else {
+                None
+            };
+            result_text = match spilled {
+                Some(preview) => preview,
+                None => crate::memory::context_window::compress_tool_result(
+                    &tc.name,
+                    &result_text,
+                    max_chars,
+                ),
+            };
         }
     }
 
