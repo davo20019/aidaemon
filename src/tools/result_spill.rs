@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 /// Base directory for spilled tool results, under the OS temp dir
 /// (`std::env::temp_dir()` honors `TMPDIR`/`%TEMP%`, cross-platform). Spilled
@@ -150,9 +151,112 @@ fn spill_notice(shown_chars: usize, total_chars: usize, abs_path: &str) -> Strin
     )
 }
 
+/// Spilled files older than this are pruned.
+pub const SPILL_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// Total spill-dir size cap; oldest files are evicted past this.
+pub const SPILL_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Pure eviction decision over `(path, modified_time, size_bytes)` entries:
+/// first evict everything older than `max_age`, then evict oldest-first until
+/// the survivors' total size is under `max_total_bytes`.
+fn files_to_evict(
+    mut entries: Vec<(PathBuf, SystemTime, u64)>,
+    now: SystemTime,
+    max_age: Duration,
+    max_total_bytes: u64,
+) -> Vec<PathBuf> {
+    let mut evicted = Vec::new();
+    entries.retain(|(path, mtime, _)| {
+        let too_old = now
+            .duration_since(*mtime)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if too_old {
+            evicted.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    entries.sort_by_key(|(_, mtime, _)| *mtime); // oldest first
+    let mut total: u64 = entries.iter().map(|(_, _, size)| *size).sum();
+    let mut i = 0;
+    while total > max_total_bytes && i < entries.len() {
+        total = total.saturating_sub(entries[i].2);
+        evicted.push(entries[i].0.clone());
+        i += 1;
+    }
+    evicted
+}
+
+/// Walk `<temp_dir>/aidaemon/tool_results/<session>/*` and delete evicted files.
+pub fn prune_spill_dir() {
+    let Some(root) = spill_dir() else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    if let Ok(sessions) = std::fs::read_dir(&root) {
+        for session in sessions.flatten() {
+            let Ok(files) = std::fs::read_dir(session.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                if let Ok(meta) = file.metadata() {
+                    if meta.is_file() {
+                        let mtime = meta.modified().unwrap_or(now);
+                        entries.push((file.path(), mtime, meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    for path in files_to_evict(entries, now, SPILL_MAX_AGE, SPILL_MAX_TOTAL_BYTES) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evicts_files_older_than_max_age() {
+        let now = SystemTime::now();
+        let fresh = now - Duration::from_secs(60);
+        let stale = now - Duration::from_secs(48 * 3600);
+        let entries = vec![
+            (PathBuf::from("/tmp/fresh.json"), fresh, 10),
+            (PathBuf::from("/tmp/stale.json"), stale, 10),
+        ];
+        let evicted = files_to_evict(entries, now, Duration::from_secs(24 * 3600), u64::MAX);
+        assert_eq!(evicted, vec![PathBuf::from("/tmp/stale.json")]);
+    }
+
+    #[test]
+    fn evicts_oldest_until_under_size_cap() {
+        let now = SystemTime::now();
+        let entries = vec![
+            (
+                PathBuf::from("/tmp/a.json"),
+                now - Duration::from_secs(300),
+                100,
+            ), // oldest
+            (
+                PathBuf::from("/tmp/b.json"),
+                now - Duration::from_secs(200),
+                100,
+            ),
+            (
+                PathBuf::from("/tmp/c.json"),
+                now - Duration::from_secs(100),
+                100,
+            ), // newest
+        ];
+        // Cap 250 -> total 300, evict oldest (a) -> 200 <= 250, stop.
+        let evicted = files_to_evict(entries, now, Duration::from_secs(24 * 3600), 250);
+        assert_eq!(evicted, vec![PathBuf::from("/tmp/a.json")]);
+    }
 
     #[test]
     fn json_result_spills_full_body_and_preview_points_to_file() {
