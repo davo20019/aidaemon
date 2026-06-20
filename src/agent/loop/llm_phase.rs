@@ -4,6 +4,37 @@ use super::*;
 use crate::events::TaskOutcome;
 use crate::traits::ProviderResponse;
 
+/// A JoinHandle wrapper that aborts the spawned task when dropped.
+/// Mirrors the identical type in `tool_execution/types.rs`; defined here so
+/// `llm_phase` (which lives at the `crate::agent` level) can use it without
+/// widening the visibility of the tool_execution-private copy.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Touch the heartbeat every 30 s while held, so the channel stale-watchdog
+/// does not cancel a slow-but-progressing LLM generation.  Auto-aborted on
+/// drop (bounded in practice by the LLM call's own timeout).  No-op when
+/// `heartbeat` is None.
+fn spawn_heartbeat_keeper(heartbeat: &Option<Arc<AtomicU64>>) -> Option<AbortOnDrop> {
+    heartbeat.as_ref().map(|hb| {
+        let hb = Arc::clone(hb);
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                hb.store(now, Ordering::Relaxed);
+            }
+        }))
+    })
+}
+
 /// Check if the continuation text has significant word overlap with the prefix,
 /// indicating the LLM re-started from scratch instead of continuing.
 fn has_significant_overlap(prefix: &str, continuation: &str) -> bool {
@@ -492,6 +523,10 @@ pub(super) async fn run_llm_phase(
     let effective_model = pin_model.as_deref().unwrap_or(model);
     #[cfg(not(feature = "computer_use"))]
     let effective_model = model;
+    // Keep the heartbeat alive for the duration of the LLM call so the
+    // channel stale-watchdog does not cancel a slow-but-progressing
+    // generation.  Auto-aborted on drop; bounded by the LLM timeout.
+    let _llm_heartbeat_keeper = spawn_heartbeat_keeper(heartbeat);
     let mut resp = match tokio::time::timeout(
         timeout_dur,
         services.agent.call_llm_with_recovery(
@@ -560,6 +595,7 @@ pub(super) async fn run_llm_phase(
             return Ok(LlmPhaseOutcome::ContinueLoop);
         }
     };
+    drop(_llm_heartbeat_keeper);
     touch_heartbeat(heartbeat);
 
     // Per-call observability: latency, actual-vs-estimated tokens, and fallback
@@ -1176,6 +1212,21 @@ fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeper_advances_during_long_await() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let hb = Arc::new(AtomicU64::new(0));
+        let keeper = spawn_heartbeat_keeper(&Some(hb.clone()));
+        // Simulate a long LLM call.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert!(
+            hb.load(Ordering::Relaxed) > 0,
+            "heartbeat should advance during the await"
+        );
+        drop(keeper);
+    }
 
     #[test]
     fn force_text_keeps_tool_defs_for_prefix_stability() {
