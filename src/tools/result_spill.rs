@@ -4,10 +4,8 @@
 //! result; the returned preview is a bounded head + structural summary + an
 //! anti-fabrication pointer to the file.
 //!
-//! The public API (`build_spilled_preview`, `spill_dir`) is wired into the
-//! agent loop in a later commit; `#![allow(dead_code)]` suppresses spurious
-//! "never used" lints until that wiring lands.
-#![allow(dead_code)]
+//! The public API (`build_spilled_preview`, `spill_dir`, `prune_spill_dir`) is
+//! fully wired into the agent loop and background cleanup job.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};

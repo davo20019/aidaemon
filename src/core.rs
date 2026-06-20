@@ -720,6 +720,16 @@ async fn init_heartbeat_coordinator(
             });
         }
 
+        // Spilled tool-result cleanup (hourly): prune by age + total-size cap.
+        heartbeat.register_job(
+            "tool_result_cleanup",
+            Duration::from_secs(3600),
+            move || async move {
+                crate::tools::result_spill::prune_spill_dir();
+                Ok(())
+            },
+        );
+
         // Daily token budget reset for active goals
         let state_for_budget = state.clone();
         heartbeat.register_job(
