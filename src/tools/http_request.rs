@@ -31,6 +31,11 @@ const DEFAULT_MAX_RESPONSE_BYTES: u64 = 10_485_760;
 /// Absolute maximum response size (50 MB).
 const ABSOLUTE_MAX_RESPONSE_BYTES: u64 = 52_428_800;
 
+/// JSON bodies at or below this size are pretty-printed for readability; larger
+/// bodies are returned raw/compact so they stay valid for `jq` over the spilled
+/// file and avoid the size blow-up of `to_string_pretty`.
+const PRETTY_PRINT_MAX_BYTES: usize = 65_536;
+
 /// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
@@ -486,11 +491,20 @@ impl HttpRequestTool {
         }
 
         let value = serde_json::from_str::<Value>(text).ok()?;
-        let pretty = serde_json::to_string_pretty(&value).ok()?;
-        let body = if let Some(summary) = Self::summarize_json_value(&value) {
-            format!("JSON summary:\n{}\n\n{}", summary, pretty)
+        let summary = Self::summarize_json_value(&value);
+        let body = if text.len() > PRETTY_PRINT_MAX_BYTES {
+            // Large body: do NOT expand via to_string_pretty. Keep the raw compact
+            // JSON (valid for jq over the spilled file), prefixed by the cheap summary.
+            match summary {
+                Some(summary) => format!("JSON summary:\n{}\n\n{}", summary, text),
+                None => text.to_string(),
+            }
         } else {
-            pretty
+            let pretty = serde_json::to_string_pretty(&value).ok()?;
+            match summary {
+                Some(summary) => format!("JSON summary:\n{}\n\n{}", summary, pretty),
+                None => pretty,
+            }
         };
 
         if truncated {
@@ -2302,5 +2316,57 @@ mod tests {
         );
         // The default sits at or below the absolute ceiling.
         assert!(DEFAULT_MAX_RESPONSE_BYTES <= ABSOLUTE_MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn test_small_json_body_is_pretty_printed() {
+        let text = r#"{"a":1,"b":2}"#;
+        let out = HttpRequestTool::format_json_response_body(
+            text,
+            "application/json",
+            DEFAULT_MAX_RESPONSE_BYTES,
+            false,
+        )
+        .expect("should format JSON");
+        // Pretty-printing introduces indented newlines.
+        assert!(
+            out.contains("\n  \"a\""),
+            "small body should be pretty-printed: {out}"
+        );
+    }
+
+    #[test]
+    fn test_large_json_body_is_compact_and_valid() {
+        // Build a compact JSON body larger than the 64 KB pretty threshold.
+        let items: Vec<serde_json::Value> = (0..5000)
+            .map(|i| json!({"id": i, "name": format!("study-{i}")}))
+            .collect();
+        let value = json!({ "studies": items });
+        let text = serde_json::to_string(&value).expect("serialize");
+        assert!(
+            text.len() > PRETTY_PRINT_MAX_BYTES,
+            "fixture must exceed threshold"
+        );
+
+        let out = HttpRequestTool::format_json_response_body(
+            &text,
+            "application/json",
+            DEFAULT_MAX_RESPONSE_BYTES,
+            false,
+        )
+        .expect("should format JSON");
+
+        // Still summarized for the model...
+        assert!(out.contains("JSON summary"), "summary should be present");
+        // ...but the body is the RAW compact JSON verbatim (NOT pretty-expanded).
+        assert!(
+            out.contains(&text),
+            "large body must be included compact/verbatim"
+        );
+        // And the raw body alone parses as valid JSON (spill file will be jq-able).
+        assert!(
+            serde_json::from_str::<Value>(&text).is_ok(),
+            "raw body must be valid JSON"
+        );
     }
 }
