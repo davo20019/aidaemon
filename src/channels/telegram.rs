@@ -4346,6 +4346,22 @@ impl TelegramChannel {
         // until the message handler returns, but the message handler is waiting
         // for that callback.
         if text.starts_with('/') {
+            // Slash commands `return` before the message dedup gate below, so a
+            // duplicate Telegram delivery of the same update (same message id)
+            // would execute the command twice — e.g. two "Context cleared."
+            // replies, a double `/cancel`. Apply the same msg.id-keyed dedup
+            // here. Distinct sends (different message ids) are never deduped, so
+            // intentional repeats still work.
+            let cmd_session_id = self.session_id(msg.chat.id.0).await;
+            let cmd_dedup_key = msg.id.0.to_string();
+            if !self
+                .task_registry
+                .mark_seen(&cmd_session_id, &text, Some(&cmd_dedup_key))
+                .await
+            {
+                debug!(session_id = %cmd_session_id, "Dropped duplicate slash command");
+                return;
+            }
             let is_setup = {
                 let cmd = text.split_whitespace().next().unwrap_or("");
                 let cmd = cmd.split('@').next().unwrap_or(cmd);

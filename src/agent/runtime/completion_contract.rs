@@ -686,15 +686,51 @@ fn infer_completion_task_kind(signals: &CompletionSignals) -> CompletionTaskKind
     CompletionTaskKind::Conversational
 }
 
+/// Extract the current-turn request from text that may have been enriched with
+/// the prior request. `turn_context` enriches follow-ups as
+/// "Original request:\n…\n\nCurrent request:\n…", then `sanitize_carryover_blocks`
+/// strips the "Original request:" / "Assistant asked:" / "Follow-up:" labels
+/// (but NOT "Current request:") before this contract is inferred. So the
+/// surviving "Current request:" marker — not "Original request:", which is gone
+/// by the time we run — is what reliably delimits the current turn.
+///
+/// The completion contract must reflect what THIS turn asks: an observational
+/// follow-up ("what's in that file?") after a prior mutation ("create a file …")
+/// must not inherit the prior request's task-kind and `expects_mutation=true`,
+/// which would block completion for extra iterations and score the turn failed.
+/// Returns the full text unchanged when no marker is present (the common,
+/// non-enriched case → byte-identical behavior).
+fn current_request_segment(text: &str) -> &str {
+    let segment_start = ["Current request:", "Follow-up:"]
+        .iter()
+        .filter_map(|marker| text.rfind(marker).map(|idx| idx + marker.len()))
+        .max();
+    if let Some(start) = segment_start {
+        let segment = text[start..].trim();
+        if !segment.is_empty() {
+            return segment;
+        }
+    }
+    text
+}
+
 pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return CompletionContract::default();
     }
 
+    // Derive the task-kind and mutation expectation from the CURRENT request
+    // when the text was enriched with a prior request (see
+    // `current_request_segment`). Verification targets are still taken from the
+    // full text so prior URLs/paths the follow-up refers back to remain
+    // observable.
+    let current = current_request_segment(trimmed);
+    let lower = current.to_ascii_lowercase();
+
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&lower, &verification_targets);
-    let connected_content_mode = super::intent_routing::classify_connected_content_mode(text);
+    let connected_content_mode = super::intent_routing::classify_connected_content_mode(current);
     let task_kind = infer_completion_task_kind(&signals);
     // DraftOnly used to override task_kind to Compose and force
     // expects_mutation=false, but this caused false tool disablement
@@ -865,6 +901,63 @@ mod tests {
         let contract = infer_completion_contract("What do you think of this idea?", &[]);
         assert!(!contract.requires_observation);
         assert!(!contract.expects_mutation);
+    }
+    #[test]
+    fn observational_followup_does_not_inherit_prior_request_mutation() {
+        // Regression: the completion contract is inferred from `goal_user_text`,
+        // which prepends the prior request ("Original request:\n…\n\nCurrent
+        // request:\n…"). An observational follow-up after a prior mutation
+        // request inherited expects_mutation=true and was blocked for extra
+        // iterations, then scored failed/partial.
+        let enriched = "Original request:\nCreate a python script that pings davidloor.com \
+             every 5 seconds and logs the latency.\n\nCurrent request:\nHow stable is the latency?";
+        let contract = infer_completion_contract(enriched, &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Answer);
+        assert!(
+            !contract.expects_mutation,
+            "observational follow-up must not inherit the prior request's mutation expectation"
+        );
+    }
+    #[test]
+    fn observational_screenshot_followup_is_answer_not_mutation() {
+        let enriched = "Original request:\nOpen davidloor.com in the browser and take a \
+             screenshot.\n\nCurrent request:\nWhat did you see in the screenshot?";
+        let contract = infer_completion_contract(enriched, &[]);
+        assert!(
+            !contract.expects_mutation,
+            "asking what was seen is observational, not a mutation"
+        );
+    }
+    #[test]
+    fn sanitized_enriched_followup_uses_current_request_not_prior_mutation() {
+        // Regression (live-confirmed): turn_context enriches a follow-up as
+        // "Original request:\n…\n\nCurrent request:\n…", but sanitize_carryover_blocks
+        // strips the "Original request:" label BEFORE the contract is inferred,
+        // leaving the prior mutation text bare at the start with only "Current
+        // request:" surviving. The contract must still key off "Current request:"
+        // so the observational follow-up is not classified as the prior mutation.
+        let sanitized = "Create a file at /tmp/aidaemon_probe2.txt containing the word hello.\
+             \n\nCurrent request:\nWhat's in that file?";
+        let c = infer_completion_contract(sanitized, &[]);
+        assert_eq!(
+            c.task_kind,
+            CompletionTaskKind::Answer,
+            "sanitized follow-up should classify by the current request"
+        );
+        assert!(
+            !c.expects_mutation,
+            "observational follow-up must not inherit the prior request's mutation expectation"
+        );
+    }
+    #[test]
+    fn enriched_current_request_mutation_still_expects_mutation() {
+        // The fix must not suppress a mutation expressed in the CURRENT request.
+        let enriched =
+            "Original request:\nWhat files are in ~/projects?\n\nCurrent request:\nCreate a \
+             README in that folder.";
+        let contract = infer_completion_contract(enriched, &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+        assert!(contract.expects_mutation);
     }
     #[test]
     fn generic_check_request_does_not_force_verification_without_target() {

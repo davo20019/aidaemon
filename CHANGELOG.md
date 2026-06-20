@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-06-20
+
+### Fixed
+
+- **Observational follow-ups after a mutation are no longer mis-scored or blocked**: a question that simply observes the result of a prior task — e.g. "what's in that file?" after "create that file", or "what does that script do?" after "create the script" — was inheriting the *previous* request's mutation expectation. The completion contract is inferred from the enriched `goal_user_text` (which prepends the prior request), and `sanitize_carryover_blocks` strips the `"Original request:"` label but leaves `"Current request:"`, so the contract logic keyed off the wrong marker and classified the follow-up as the prior mutation. The turn then hit `expects_mutation=true` with no mutation tool called, got blocked for extra iterations, and was scored `failed`/`partial` despite returning a correct answer (polluting learning signals and feeding spurious failure telemetry). `current_request_segment()` now keys off the surviving `"Current request:"` / `"Follow-up:"` marker so the contract reflects what the *current* turn asks. Verified live before/after (two `mutation_contract_block` events + `partial` → zero blocks + `succeeded`).
+- **Duplicate slash-command deliveries no longer execute twice**: slash commands (`/clear`, `/cancel`, …) returned before the message dedup gate, so a duplicate Telegram delivery of the same update (same message id) ran the command twice — e.g. two "Context cleared." replies, a double `/cancel`. Commands now pass through the same `msg.id`-keyed dedup as regular messages; intentional repeats (distinct message ids) are unaffected.
+
 ## [0.11.7] - 2026-06-19
 
 ### Fixed
