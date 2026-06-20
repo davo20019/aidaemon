@@ -25,11 +25,11 @@ const APPROVAL_TIMEOUT_SECS: u64 = 300;
 /// Maximum number of redirect hops to follow.
 const MAX_REDIRECTS: usize = 5;
 
-/// Default maximum response size (1 MB).
-const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1_048_576;
+/// Default maximum response size (10 MB).
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 10_485_760;
 
-/// Absolute maximum response size (5 MB).
-const ABSOLUTE_MAX_RESPONSE_BYTES: u64 = 5_242_880;
+/// Absolute maximum response size (50 MB).
+const ABSOLUTE_MAX_RESPONSE_BYTES: u64 = 52_428_800;
 
 /// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -1517,7 +1517,7 @@ impl Tool for HttpRequestTool {
                     },
                     "max_response_bytes": {
                         "type": "integer",
-                        "description": "Maximum response size in bytes (default 1MB, max 5MB)"
+                        "description": "Maximum response size in bytes (default 10MB, max 50MB). Large responses are saved to a file you can read/jq; you do not need to lower this."
                     }
                 },
                 "required": ["method", "url"],
@@ -2288,5 +2288,19 @@ mod tests {
         let call_result = tool1.call(args).await.unwrap();
         let outcome_result = tool2.call_with_status_outcome(args, None).await.unwrap();
         assert_eq!(call_result, outcome_result.output);
+    }
+
+    #[test]
+    fn test_response_caps_raised_and_clamp_semantics() {
+        // New ceilings: 10 MB default, 50 MB absolute.
+        assert_eq!(DEFAULT_MAX_RESPONSE_BYTES, 10 * 1024 * 1024);
+        assert_eq!(ABSOLUTE_MAX_RESPONSE_BYTES, 50 * 1024 * 1024);
+        // A caller asking for more than the absolute max is clamped down to it.
+        assert_eq!(
+            100_000_000u64.min(ABSOLUTE_MAX_RESPONSE_BYTES),
+            ABSOLUTE_MAX_RESPONSE_BYTES
+        );
+        // The default sits at or below the absolute ceiling.
+        assert!(DEFAULT_MAX_RESPONSE_BYTES <= ABSOLUTE_MAX_RESPONSE_BYTES);
     }
 }
