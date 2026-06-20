@@ -323,6 +323,35 @@ mod tests {
     }
 
     #[test]
+    fn aged_out_file_not_counted_toward_size_cap() {
+        let now = SystemTime::now();
+        // One stale + large file, plus two fresh files whose combined size is under cap.
+        // The stale file must be age-evicted and NOT counted toward the size total,
+        // so the two fresh files survive (no size eviction).
+        let entries = vec![
+            (
+                PathBuf::from("/tmp/stale_big.json"),
+                now - Duration::from_secs(48 * 3600),
+                1000,
+            ),
+            (
+                PathBuf::from("/tmp/fresh_a.json"),
+                now - Duration::from_secs(200),
+                100,
+            ),
+            (
+                PathBuf::from("/tmp/fresh_b.json"),
+                now - Duration::from_secs(100),
+                100,
+            ),
+        ];
+        // Cap 250: if the stale 1000-byte file were counted, the size pass would
+        // wrongly evict the fresh files too. Correct behavior: only the stale file is evicted.
+        let evicted = files_to_evict(entries, now, Duration::from_secs(24 * 3600), 250);
+        assert_eq!(evicted, vec![PathBuf::from("/tmp/stale_big.json")]);
+    }
+
+    #[test]
     fn non_json_result_spills_as_txt() {
         let dir = tempfile::tempdir().unwrap();
         let full = "line\n".repeat(5000);
