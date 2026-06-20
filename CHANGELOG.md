@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-06-20
+
+### Fixed
+
+- **Large tool results no longer lose their middle to silent truncation**: an oversized tool result (e.g. a multi-hundred-KB `http_request` response, a long `terminal` dump) was squeezed to the per-model character cap by the generic compressor, which keeps a head + tail and **drops everything in between**. For an enumeration request — "give me the full list of locations" — the dropped middle was exactly the data the user wanted, so the model answered from a partial view and reported things like "the full list is too massive to retrieve in one go." The full data is now preserved and recoverable (see below), so the model can answer completely instead of from a truncated slice.
+
+### Added
+
+- **Spill-to-file recovery for oversized tool results**: when a non-`read_file` tool returns a successful result larger than the per-model cap and a filesystem tool (`read_file` or `terminal`) is available, the **full, untruncated** result is written to `<temp_dir>/aidaemon/tool_results/<session>/` and the model receives a bounded preview (head + a JSON structural summary when the body parses) plus an explicit, anti-fabrication pointer to the file. The model then recovers the rest with `read_file` paging or `grep`/`jq`/`wc` over the saved path, instead of guessing or apologizing. JSON bodies that parse as a whole are pretty-printed and saved as `.json` (with a `jq` hint); wrapped/mixed bodies are saved verbatim as `.txt` and the `jq` hint is withheld so the model is never pointed at a command that cannot run. Pure-no-filesystem deployments fall back to the previous lossy compression. Verified live end-to-end: a 963-location clinical-trials response (~620 KB) spilled to disk with all entries intact and the model returned the complete, correct list.
+- **Hourly cleanup of spilled tool-result files**: a background job prunes the spill directory by age (24 h) and total size (256 MB, oldest-first), so scratch files from large fetches don't accumulate across a long-running daemon.
+
 ## [0.11.8] - 2026-06-20
 
 ### Fixed
