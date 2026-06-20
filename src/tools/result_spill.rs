@@ -39,7 +39,8 @@ fn sanitize_session_id(session_id: &str) -> String {
         .collect()
 }
 
-/// Public entry: spill under `<temp_dir>/aidaemon/tool_results`.
+/// Public entry: spill under `<temp_dir>/aidaemon/tool_results` where
+/// `<temp_dir>` is `std::env::temp_dir()` (honors `TMPDIR`/`%TEMP%`).
 pub fn build_spilled_preview(
     tool_name: &str,
     session_id: &str,
@@ -81,7 +82,10 @@ fn build_spilled_preview_in(
     let abs_path = path.to_string_lossy().into_owned();
 
     let total_chars = stored_text.chars().count();
-    let head_chars = max_chars.saturating_sub(SPILL_ANNOTATION_RESERVE).max(256);
+    let head_chars = max_chars
+        .saturating_sub(SPILL_ANNOTATION_RESERVE)
+        .max(256)
+        .min(max_chars);
     let head: String = stored_text.chars().take(head_chars).collect();
     let shown_chars = head.chars().count();
 
@@ -196,6 +200,22 @@ mod tests {
         assert!(on_disk.contains("Fairfax"));
         // ...but NOT in the bounded preview.
         assert!(!preview.contains("Fairfax"));
+    }
+
+    #[test]
+    fn preview_head_does_not_exceed_small_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = "x".repeat(10_000);
+        let preview =
+            build_spilled_preview_in(dir.path().to_path_buf(), "terminal", "s:1", &full, 300)
+                .unwrap();
+        // The head is everything before the notice block; it must not exceed the cap.
+        let head = preview.split("[⚠ LARGE RESULT").next().unwrap();
+        assert!(
+            head.chars().count() <= 300,
+            "head was {} chars",
+            head.chars().count()
+        );
     }
 
     #[test]
