@@ -195,7 +195,9 @@ fn spill_notice(shown_chars: usize, total_chars: usize, abs_path: &str, pure_jso
         "[⚠ LARGE RESULT — full {total} chars saved to {path}. Only the first {shown} chars are \
          shown above; {omitted} chars are NOT visible to you here. To get the rest: {hints}. \
          Do NOT enumerate, list, count, or quote items that are not literally shown above — \
-         inventing the omitted content is an error.]",
+         inventing the omitted content is an error. To deliver the full data to the user, do NOT \
+         paste it inline — extract or format the part they need into a clean file with a tool, then \
+         send it with the send_file tool.]",
         total = total_chars,
         path = abs_path,
         shown = shown_chars,
@@ -519,6 +521,38 @@ mod tests {
             preview.contains("Do NOT enumerate"),
             "anti-fabrication sentence must be present"
         );
+    }
+
+    #[test]
+    fn spill_notice_includes_send_file_delivery_hint() {
+        // pure-JSON spill
+        let json = build_spilled_preview_in(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            "http_request",
+            "s:1",
+            "{\"items\":[1,2,3]}",
+            120,
+        )
+        .unwrap();
+        assert!(
+            json.contains("send_file"),
+            "pure-json notice must mention send_file"
+        );
+
+        // wrapped/.txt spill must mention send_file but NOT jq (jq-gating invariant)
+        let wrapped = build_spilled_preview_in(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            "terminal",
+            "s:2",
+            &"line\n".repeat(400),
+            120,
+        )
+        .unwrap();
+        assert!(
+            wrapped.contains("send_file"),
+            "txt notice must mention send_file"
+        );
+        assert!(!wrapped.contains("jq"), "txt notice must not mention jq");
     }
 
     /// Pure JSON (no wrapper) must still get .json extension, jq advice, and [JSON summary.
