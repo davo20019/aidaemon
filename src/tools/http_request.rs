@@ -2397,7 +2397,7 @@ mod tests {
         assert!(
             result.contains("HTTP 200"),
             "expected HTTP 200, got: {}",
-            &result[..result.len().min(400)]
+            crate::utils::truncate_str(&result, 400)
         );
         // The corruption-regression assertions:
         assert!(
