@@ -37,6 +37,11 @@ impl Tool for WriteFileTool {
                     "create_dirs": {
                         "type": "boolean",
                         "description": "Create parent directories if they don't exist (default: true)"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "append"],
+                        "description": "Write mode. \"overwrite\" (default) replaces the file (a backup is kept). \"append\" adds to the end of the file without a backup — use it to build a large file in chunks across multiple calls instead of emitting everything in one call (which can exceed the output token limit)."
                     }
                 },
                 "required": ["path", "content"],
@@ -122,6 +127,41 @@ impl Tool for WriteFileTool {
                     parent.display()
                 );
             }
+        }
+
+        // Write mode: "overwrite" (default, replaces with backup) or "append"
+        // (additive, no backup — lets the model build a large file in chunks
+        // instead of one oversized generation).
+        let mode = args["mode"].as_str().unwrap_or("overwrite");
+        if mode != "overwrite" && mode != "append" {
+            anyhow::bail!(
+                "Invalid mode: \"{}\" (expected \"overwrite\" or \"append\")",
+                mode
+            );
+        }
+
+        if mode == "append" {
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await?;
+            file.write_all(content.as_bytes()).await?;
+            file.flush().await?;
+
+            let appended = content.len();
+            let appended_lines = content.lines().count();
+            let total = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            return Ok(format!(
+                "Appended {} bytes ({} lines) to {} (now {} bytes total). \
+                 To add more, call write_file again with mode=\"append\". \
+                 When the file is complete, deliver it with send_file instead of pasting it inline.",
+                appended, appended_lines, path_str, total
+            ));
         }
 
         // Backup existing file
@@ -290,5 +330,82 @@ mod tests {
             "write_file is documented as a dedicated file tool that does not require approval"
         );
         assert!(!caps.high_impact_write);
+    }
+
+    #[tokio::test]
+    async fn test_append_creates_new_file_with_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("appended.txt");
+        let args = json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "chunk one\n",
+            "mode": "append"
+        })
+        .to_string();
+
+        let result = WriteFileTool.call(&args).await.unwrap();
+        assert!(result.contains("Appended"), "result was: {result}");
+        // Continuation hint must tell the model how to add more.
+        assert!(result.contains("mode=\"append\""), "result was: {result}");
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "chunk one\n");
+    }
+
+    #[tokio::test]
+    async fn test_append_preserves_existing_and_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("doc.txt");
+        tokio::fs::write(&file_path, "first\n").await.unwrap();
+
+        let args = json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "second\n",
+            "mode": "append"
+        })
+        .to_string();
+        WriteFileTool.call(&args).await.unwrap();
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "first\nsecond\n");
+
+        // Append must NOT create a backup (it is additive).
+        let backup = file_path.with_extension("txt.bak");
+        assert!(!backup.exists(), "append must not create a backup");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_mode_errors_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("untouched.txt");
+        let args = json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "x",
+            "mode": "garbage"
+        })
+        .to_string();
+
+        let result = WriteFileTool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid mode"));
+        assert!(!file_path.exists(), "invalid mode must not write the file");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_overwrite_mode_matches_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("ow.txt");
+        tokio::fs::write(&file_path, "old").await.unwrap();
+        let args = json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "new",
+            "mode": "overwrite"
+        })
+        .to_string();
+
+        let result = WriteFileTool.call(&args).await.unwrap();
+        assert!(result.contains("Updated"));
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "new");
     }
 }
