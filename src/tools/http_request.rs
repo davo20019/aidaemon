@@ -2369,4 +2369,49 @@ mod tests {
             "raw body must be valid JSON"
         );
     }
+
+    // Live network test — hits the real, free, open clinicaltrials.gov v2 API.
+    // Ignored so CI never depends on the network; run on demand with:
+    //   cargo test --lib http_request_live_clinical_trials_not_truncated -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live network: clinicaltrials.gov"]
+    async fn http_request_live_clinical_trials_not_truncated() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(tx),
+        );
+
+        // pageSize=1000 returns ~15 MB — well past the OLD 5 MB cap that used to
+        // truncate it into invalid JSON. _trusted_session skips the approval prompt.
+        // We request 50 MB max to ensure the full response is captured.
+        let args = r#"{
+        "method": "GET",
+        "url": "https://clinicaltrials.gov/api/v2/studies?pageSize=1000",
+        "max_response_bytes": 52428800,
+        "_trusted_session": true
+    }"#;
+
+        let result = tool.call(args).await.expect("request should succeed");
+
+        assert!(
+            result.contains("HTTP 200"),
+            "expected HTTP 200, got: {}",
+            &result[..result.len().min(400)]
+        );
+        // The corruption-regression assertions:
+        assert!(
+            !result.contains("[Truncated:"),
+            "response must NOT be truncated at the cap"
+        );
+        assert!(
+            result.len() > 5 * 1024 * 1024,
+            "body should exceed the old 5MB cap (was {} bytes)",
+            result.len()
+        );
+        assert!(
+            result.contains("studies"),
+            "expected a studies array in the payload"
+        );
+    }
 }
