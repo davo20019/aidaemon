@@ -142,6 +142,10 @@ impl Tool for WriteFileTool {
 
         if mode == "append" {
             use tokio::io::AsyncWriteExt;
+            let existing_size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -152,10 +156,7 @@ impl Tool for WriteFileTool {
 
             let appended = content.len();
             let appended_lines = content.lines().count();
-            let total = tokio::fs::metadata(&path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let total = existing_size + appended as u64;
             return Ok(format!(
                 "Appended {} bytes ({} lines) to {} (now {} bytes total). \
                  To add more, call write_file again with mode=\"append\". \
@@ -389,6 +390,20 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid mode"));
         assert!(!file_path.exists(), "invalid mode must not write the file");
+    }
+
+    #[tokio::test]
+    async fn test_append_sensitive_path_blocked() {
+        let args = json!({
+            "path": "/tmp/.ssh/test_key",
+            "content": "secret",
+            "mode": "append"
+        })
+        .to_string();
+
+        let result = WriteFileTool.call(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
 
     #[tokio::test]
