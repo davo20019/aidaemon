@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-06-20
+
+### Added
+
+- **`write_file` append mode for chunked large-file writes**: `write_file` now accepts an optional `mode: "overwrite" | "append"` (default `"overwrite"`, fully backward compatible). `"append"` adds to the end of a file without a backup and returns a continuation hint, so large *model-authored* content can be built across several bounded calls instead of one oversized generation that hits the output token limit.
+
+### Changed
+
+- **Large output is steered to file delivery instead of inline-dumping**: the result-spill notice now also tells the model to deliver large data via `send_file` (after extracting a clean file with a tool), a new system-prompt rule discourages pasting large lists/datasets into chat, and the token-limit truncation-recovery nudge now branches by data source — existing data → `send_file`; model-authored → `write_file` append chunks. This addresses cases where the model tried to emit a very large list inline (slow, exceeds the output token limit, overflows chat message limits).
+- **Shared `core_behavioral_rules()` single source**: the agent-agnostic behavioral rules (anti-fabrication, capability honesty, test honesty, file-tool usage, large-output delivery, data-integrity, credential protection) are factored into one function consumed by the prompt builder. Content-preserving refactor — no rule text changed — that makes future rule changes single-source.
+
+### Fixed
+
+- **Heartbeat stays alive during long LLM calls**: a generation that ran longer than the channel stale-watchdog threshold (300s) could be auto-cancelled mid-flight, because the heartbeat was only touched *after* the LLM call returned. A keeper now touches the heartbeat every 30s during the call (bounded by the existing LLM timeout), so the watchdog cancels genuine hangs but not slow-but-progressing generations.
+
 ## [0.11.9] - 2026-06-20
 
 ### Fixed
