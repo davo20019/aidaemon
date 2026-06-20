@@ -16,6 +16,7 @@ mod manage_memories;
 mod manage_people;
 pub(crate) mod memory;
 mod policy_metrics;
+pub mod result_spill;
 pub mod sanitize;
 mod scheduled_goal_runs;
 mod send_file;
