@@ -224,7 +224,7 @@ impl SystemDirective {
             Self::RouteFailsafeActive => "[SYSTEM] Route fail-safe is active for this session. Use explicit tools/results, avoid direct-return shortcuts, and prioritize concrete execution evidence.".to_string(),
             Self::FreshConversationContext => "This is a fresh conversation context. There are no previous tasks. Focus exclusively on the current user request. Do not reference or repeat tool calls from any prior context.".to_string(),
             Self::EmptyResponseRetry => "[SYSTEM] Your previous reply was empty (no text and no tool calls). This retry is running with reduced conversation history to recover. You MUST either (1) call the required tools, or (2) reply with a concrete blocker and the missing info. Do NOT return an empty response.".to_string(),
-            Self::TruncationRecoveryUseWriteFile => "[SYSTEM] Your previous response was cut off because it exceeded the maximum output token limit. Do NOT generate long content inline. Instead, use the write_file tool to save long content (articles, code, etc.) to a file, then summarize what you wrote in a short reply. Keep your direct response brief.".to_string(),
+            Self::TruncationRecoveryUseWriteFile => "[SYSTEM] Your previous response was cut off because it exceeded the maximum output token limit. Do NOT generate long content inline. Choose by where the content lives: (1) If the content already exists in a file (e.g. a spilled tool result or fetched data), do NOT regenerate it — extract or format the part the user needs into a clean file with a tool (terminal/grep), then deliver it with the send_file tool. (2) If you must author the content yourself (a long report, a large code file), write it in chunks: call write_file with the first chunk, then call write_file with mode=\"append\" for each additional chunk. Keep your direct reply to the user brief.".to_string(),
             Self::TruncationRecoveryTextContinuation { truncated_tail } => format!(
                 "[SYSTEM] Your previous text response was cut off mid-sentence due to output token limits. \
                  The partial response has been saved. Continue your response from EXACTLY where it was cut off. \
@@ -835,6 +835,18 @@ mod tests {
         // Must steer away from the pinned partner and toward a lookup.
         assert!(rendered.contains("NOT"));
         assert!(rendered.contains("manage_memories"));
+    }
+
+    #[test]
+    fn truncation_recovery_directive_covers_both_branches() {
+        let text = SystemDirective::TruncationRecoveryUseWriteFile.render();
+        // existing-file branch → deliver via send_file, don't regenerate
+        assert!(text.contains("send_file"), "must mention send_file");
+        // model-authored branch → append chunks
+        assert!(
+            text.contains("mode=\"append\""),
+            "must mention append chunks"
+        );
     }
 
     #[test]

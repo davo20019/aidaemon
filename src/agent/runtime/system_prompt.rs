@@ -1061,7 +1061,14 @@ impl Agent {
              Stored facts describe YOUR USER and YOU — they do NOT apply to other entities. \
              If the question's subject is a person, company, or thing from the current conversation \
              (e.g. \"the owner\" right after discussing a company means that company's owner), \
-             resolve it against the conversation, not against stored facts.",
+             resolve it against the conversation, not against stored facts.\n\
+             12. **Deliver large output as an attachment, not inline.** \
+             When the user wants a large list or dataset in full, do NOT paste it into the chat reply — \
+             inline-dumping is slow, can exceed the output token limit, and overflows chat message limits. \
+             If the data already exists in a file (e.g. a spilled tool result), extract or format the needed \
+             part into a clean file with a tool and deliver it with the `send_file` tool, then give a short \
+             inline summary. If you must author long content yourself, write it with `write_file` using \
+             `mode=\"append\"` in chunks rather than one oversized call.",
         );
 
         rules
