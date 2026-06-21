@@ -13,6 +13,44 @@ use crate::traits::{
 const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_MAX_CHARS: usize = 50_000;
 
+/// Hard cap on response-body bytes buffered from a web fetch/search. The
+/// model-facing output is already bounded (extracted-text char limit / result
+/// count); this only bounds *transient memory* against a pathologically large
+/// or mislabeled response that `.text()`/`.json()` would otherwise buffer whole.
+pub(crate) const MAX_FETCH_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Append `chunk` to `buf` without exceeding `max_bytes`. Returns true if the
+/// chunk was (partially) dropped because the cap was reached. Truncation is on a
+/// raw byte boundary, so callers must decode with `from_utf8_lossy`.
+pub(crate) fn append_capped(buf: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    let remaining = max_bytes.saturating_sub(buf.len());
+    if chunk.len() > remaining {
+        buf.extend_from_slice(&chunk[..remaining]);
+        true
+    } else {
+        buf.extend_from_slice(chunk);
+        false
+    }
+}
+
+/// Stream a response body into memory, capping at `max_bytes` to avoid unbounded
+/// allocation. Returns the collected bytes and whether the body was truncated.
+pub(crate) async fn read_body_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> reqwest::Result<(Vec<u8>, bool)> {
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp.chunk().await? {
+        if append_capped(&mut buf, &chunk, max_bytes) {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((buf, truncated))
+}
+
 /// Validates a URL for SSRF vulnerabilities.
 /// Returns Ok(()) if the URL is safe to fetch, Err with a message otherwise.
 pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
@@ -511,7 +549,8 @@ impl Tool for WebFetchTool {
         if !resp.status().is_success() {
             return Ok(format!("Error fetching {}: HTTP {}", url, resp.status()));
         }
-        let html = resp.text().await?;
+        let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
+        let html = String::from_utf8_lossy(&body).into_owned();
 
         Ok(build_fetch_reply(url, &html, max_chars))
     }
@@ -924,5 +963,39 @@ mod extraction_tests {
             20_000,
         );
         assert!(!reply.contains("EXTRACTION FAILED"));
+    }
+
+    #[test]
+    fn append_capped_respects_byte_ceiling() {
+        // Under the cap: whole chunk appended, not truncated.
+        let mut buf = Vec::new();
+        assert!(!append_capped(&mut buf, b"hello", 100));
+        assert_eq!(buf, b"hello");
+
+        // Exactly at the cap: still appended fully, not truncated.
+        let mut buf = vec![0u8; 8];
+        assert!(!append_capped(&mut buf, &[1u8, 2u8], 10));
+        assert_eq!(buf.len(), 10);
+
+        // Over the cap: partial copy up to the ceiling, truncated reported.
+        let mut buf = vec![0u8; 8];
+        assert!(append_capped(&mut buf, &[1, 2, 3, 4], 10));
+        assert_eq!(buf.len(), 10);
+
+        // Already full: nothing copied, truncation reported.
+        let mut buf = vec![0u8; 10];
+        assert!(append_capped(&mut buf, b"x", 10));
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn append_capped_truncation_is_utf8_safe() {
+        // "€" is 3 bytes (E2 82 AC); capping at 3 keeps "ab" + 1 byte of it.
+        // Decoding the capped bytes with from_utf8_lossy must not panic.
+        let mut buf = Vec::new();
+        assert!(append_capped(&mut buf, "ab€".as_bytes(), 3));
+        assert_eq!(buf.len(), 3);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.starts_with("ab"));
     }
 }

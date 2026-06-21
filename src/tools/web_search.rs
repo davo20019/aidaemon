@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::config::{SearchBackendKind, SearchConfig};
 use crate::traits::{Tool, ToolCapabilities};
 
-use super::web_fetch::build_browser_client;
+use super::web_fetch::{build_browser_client, read_body_capped, MAX_FETCH_BODY_BYTES};
 
 const DEFAULT_MAX_RESULTS: usize = 8;
 const MAX_MAX_RESULTS: usize = 20;
@@ -166,7 +166,8 @@ impl SearchBackend for DuckDuckGoBackend {
         .to_string();
         let resp = self.client.get(&url).send().await?;
         let status = resp.status();
-        let html = resp.text().await?;
+        let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
+        let html = String::from_utf8_lossy(&body).into_owned();
 
         if !status.is_success() {
             anyhow::bail!("DuckDuckGo returned HTTP {}", status);
@@ -382,7 +383,8 @@ impl SearchBackend for BraveBackend {
             last_status = resp.status();
 
             if resp.status().is_success() {
-                let data: Value = resp.json().await?;
+                let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
+                let data: Value = serde_json::from_slice(&body)?;
                 let empty = vec![];
                 let web_results = data["web"]["results"].as_array().unwrap_or(&empty);
 
@@ -484,7 +486,8 @@ impl SearchBackend for SearxngBackend {
             "SearxNG returned HTTP {} (ensure 'json' is in search.formats in the SearxNG settings)",
             resp.status()
         );
-        let data: Value = resp.json().await?;
+        let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
+        let data: Value = serde_json::from_slice(&body)?;
         let empty = vec![];
         let results = data["results"]
             .as_array()
