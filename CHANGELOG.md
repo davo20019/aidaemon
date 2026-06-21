@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-06-21
+
+### Added
+
+- **Per-turn intent-classification telemetry**: every turn records the intent-gate result (needs-tools), the classified complexity, and the chosen orchestration route as a `DecisionType::IntentGate` decision point, so routing decisions are queryable from the event store.
+- **Inline-dump observation telemetry (measure-first)**: an `inline_dump` event fires when the model hits the output token limit while answering inline (no tool call), paired with an `inline_dump_spill` marker when a large result was spilled that turn. `scripts/inline-dump-stats.sh` counts these and the "fixable" subset (turns that spilled) — input for deciding whether a hard output-cap is worth building. Observation-only; no behavior change.
+
+### Changed
+
+- **`http_request` response caps raised** to 10 MB default / 50 MB maximum, with large JSON bodies kept **compact** (no pretty-printing) so big API responses stay within token/memory budgets instead of being inflated by whitespace.
+
+### Fixed
+
+- **Background-task scaffolding no longer leaks into replies**: a backgrounded command's reply could echo internal machinery into the user-facing message — the terminal control hint (`Use action="check" pid=… to stop`) and the background-task system directive (which survived once `[SYSTEM]` was rewritten to `[CONTENT FILTERED]`). Both are now stripped by `strip_diagnostic_blocks`.
+- **`web_fetch`/`web_search` response bodies are capped** to bound memory on very large pages.
+
+### Performance
+
+- **Prompt-cache stability**: moved `core_profile` from the cacheable CORE block to the per-task TAIL, so owner-profile changes no longer invalidate the session-static core prompt.
+
 ## [0.11.10] - 2026-06-20
 
 ### Added
