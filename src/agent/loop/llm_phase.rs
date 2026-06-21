@@ -35,6 +35,13 @@ fn spawn_heartbeat_keeper(heartbeat: &Option<Arc<AtomicU64>>) -> Option<AbortOnD
     })
 }
 
+/// Observation-only predicate: the model hit the output token limit
+/// (`finish_reason=length`) while answering inline (no tool call). Used to
+/// emit `inline_dump` telemetry — does NOT change behavior.
+fn should_observe_inline_dump(is_truncated: bool, has_tool_calls: bool) -> bool {
+    is_truncated && !has_tool_calls
+}
+
 /// Check if the continuation text has significant word overlap with the prefix,
 /// indicating the LLM re-started from scratch instead of continuing.
 fn has_significant_overlap(prefix: &str, continuation: &str) -> bool {
@@ -1069,6 +1076,20 @@ pub(super) async fn run_llm_phase(
         .response_note
         .as_ref()
         .is_some_and(|n| n.contains("truncated"));
+    if should_observe_inline_dump(is_truncated, !resp.tool_calls.is_empty()) {
+        let reply_chars = resp.content.as_deref().unwrap_or("").chars().count();
+        let output_tokens = resp.usage.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+        tracing::info!(
+            target: "inline_dump",
+            session_id,
+            iteration,
+            model = %llm_telemetry.final_model,
+            depth = services.agent.depth,
+            output_tokens,
+            reply_chars,
+            "Model hit the output token limit answering inline (no tool call)"
+        );
+    }
     if is_truncated && resp.tool_calls.is_empty() && !has_non_empty_content {
         *thinking_truncation_count = thinking_truncation_count.saturating_add(1);
         warn!(
@@ -1296,5 +1317,16 @@ mod tests {
     fn overlap_short_inputs() {
         assert!(!has_significant_overlap("hi", "hi"));
         assert!(!has_significant_overlap("a b", "a b"));
+    }
+
+    #[test]
+    fn observes_inline_dump_only_when_truncated_and_no_tool_call() {
+        // truncated, no tool call → observe
+        assert!(should_observe_inline_dump(true, false));
+        // truncated but the model DID call a tool → not an inline dump
+        assert!(!should_observe_inline_dump(true, true));
+        // not truncated → nothing to observe
+        assert!(!should_observe_inline_dump(false, false));
+        assert!(!should_observe_inline_dump(false, true));
     }
 }

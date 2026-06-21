@@ -229,7 +229,14 @@ pub(super) async fn execute_tool_call_io(
                 None
             };
             result_text = match spilled {
-                Some(preview) => preview,
+                Some(preview) => {
+                    tracing::info!(
+                        target: "inline_dump_spill",
+                        tool = %tc.name,
+                        "Large tool result spilled to file this turn"
+                    );
+                    preview
+                }
                 None => crate::memory::context_window::compress_tool_result(
                     &tc.name,
                     &result_text,
