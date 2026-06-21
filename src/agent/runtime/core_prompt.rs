@@ -39,6 +39,7 @@ pub(crate) struct CoreInputs {
     /// of either field is reflected in component-attributed invalidation without
     /// requiring a schema change.
     pub persona: String,
+    pub core_profile: String,
 }
 
 /// Component hashes for a [`CoreInputs`], one entry per logical component in a
@@ -51,7 +52,7 @@ pub(crate) struct ComponentHashes {
 }
 
 impl ComponentHashes {
-    const COMPONENT_COUNT: usize = 6;
+    const COMPONENT_COUNT: usize = 7;
 
     /// Aggregate hash = hash of the concatenated component hashes (in fixed
     /// order). Adding a field forces a new component entry, so attribution can
@@ -97,6 +98,7 @@ impl CoreInputs {
                 ("specialists", hash_canonical(&json!(specialists))),
                 ("channel_rules", hash_canonical(&json!(self.channel_rules))),
                 ("persona", hash_canonical(&json!(self.persona))),
+                ("core_profile", hash_canonical(&json!(self.core_profile))),
             ],
         }
     }
@@ -269,6 +271,11 @@ pub(crate) fn render_core_prompt(inputs: &CoreInputs) -> String {
         out.push_str(&inputs.channel_rules);
     }
 
+    if !inputs.core_profile.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&inputs.core_profile);
+    }
+
     if !inputs.skills_catalog.is_empty() {
         let mut skills_catalog = inputs.skills_catalog.clone();
         skills_catalog.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -321,6 +328,7 @@ pub(crate) fn assemble_core_inputs(
     skills_catalog: Vec<(String, String, bool)>,
     specialists: Vec<(String, String)>,
     channel_rules: String,
+    core_profile: String,
 ) -> CoreInputs {
     // Specialists are role-typed and never surfaced on the minimal PublicExternal
     // prompt (legacy build site suppresses the splice there).
@@ -342,6 +350,7 @@ pub(crate) fn assemble_core_inputs(
         specialists,
         channel_rules,
         persona,
+        core_profile,
     }
 }
 
@@ -357,6 +366,7 @@ pub(crate) fn test_core_inputs() -> CoreInputs {
         specialists: vec![("x".into(), "dx".into()), ("a".into(), "da".into())],
         channel_rules: "R".into(),
         persona: "P".into(),
+        core_profile: "CP".into(),
     }
 }
 
@@ -405,21 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn core_profile_is_not_a_core_component() {
-        // core_profile is empirically volatile (per-turn salience/recency churn),
-        // so it lives in the TAIL, never the cached CORE. The core must not carry
-        // a core_profile component or its hash would flip every turn (cache bust).
-        let names: Vec<&str> = test_core_inputs()
-            .component_hashes()
-            .entries
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert!(
-            !names.contains(&"core_profile"),
-            "core_profile must NOT be a CORE component (it belongs in the tail); got {names:?}"
+    fn core_profile_changes_aggregate_hash() {
+        let a = test_core_inputs();
+        let mut b = a.clone();
+        b.core_profile = "New CP".into();
+        assert_ne!(a.aggregate_hash(), b.aggregate_hash());
+        assert_eq!(
+            a.component_hashes().diff(&b.component_hashes()),
+            vec!["core_profile"]
         );
-        assert_eq!(names.len(), 6, "expected 6 core components, got {names:?}");
     }
 
     #[test]
@@ -443,6 +447,7 @@ mod tests {
             specialists: vec![],
             channel_rules: String::new(),
             persona: "P".into(),
+            core_profile: String::new(),
         };
         let out = render_core_prompt(&inputs);
         assert!(
@@ -464,6 +469,7 @@ mod tests {
             specialists: vec![("researcher".into(), "Deep research tasks".into())],
             channel_rules: String::new(),
             persona: "P".into(),
+            core_profile: String::new(),
         };
         let out = render_core_prompt(&inputs);
         let specialists_pos = out
@@ -547,6 +553,7 @@ mod tests {
         let skills_catalog = vec![("s1".to_string(), "d1".to_string(), true)];
         let specialists = vec![("researcher".to_string(), "Deep research".to_string())];
         let channel_rules = "rules".to_string();
+        let core_profile = "profile".to_string();
 
         // "Query A" assembly.
         let inputs_a = assemble_core_inputs(
@@ -557,6 +564,7 @@ mod tests {
             skills_catalog.clone(),
             specialists.clone(),
             channel_rules.clone(),
+            core_profile.clone(),
         );
         // "Query B" assembly — identical session-static inputs (the point: the
         // assembler has no user_text param, so a different query cannot perturb
@@ -570,6 +578,7 @@ mod tests {
             skills_catalog,
             specialists,
             channel_rules,
+            core_profile,
         );
 
         assert_eq!(

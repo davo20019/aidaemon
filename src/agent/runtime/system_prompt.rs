@@ -620,6 +620,7 @@ impl Agent {
                 .map(|(name, desc)| (name.to_string(), desc))
                 .collect(),
             channel_rules,
+            core_profile_str,
         );
         // Pillar A Task 7: per-session core cache. On a HIT (aggregate hash
         // unchanged since this session's last task) the rendered bytes are reused
@@ -679,7 +680,6 @@ impl Agent {
 
         let tail = Self::build_context_tail(
             critical_facts_block.as_deref(),
-            &core_profile_str,
             &memory_section,
             channel_ctx.sender_name.as_deref(),
             session_summary,
@@ -1127,7 +1127,6 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     fn build_context_tail(
         critical_facts_block: Option<&str>,
-        core_profile: &str,
         memory_section: &str,
         sender_name: Option<&str>,
         session_summary: Option<&crate::traits::ConversationSummary>,
@@ -1140,15 +1139,6 @@ impl Agent {
         if let Some(block) = critical_facts_block {
             tail.push_str("\n\n");
             tail.push_str(block);
-        }
-
-        // Core profile (owner background): MOVED here from the CORE. It is
-        // effectively volatile (per-turn salience/recency + mutable person/fact
-        // rows), so keeping it in message zero busted the prompt cache at token 0
-        // every turn. In the tail it no longer perturbs the byte-stable core.
-        if !core_profile.trim().is_empty() {
-            tail.push_str("\n\n");
-            tail.push_str(core_profile);
         }
 
         if !memory_section.trim().is_empty() {
@@ -1235,6 +1225,7 @@ mod tests {
                 .into_iter()
                 .map(|(n, d)| (n.to_string(), d))
                 .collect(),
+            String::new(),
             String::new(),
         );
         let rendered = render_core_prompt(&core_inputs);
@@ -1326,7 +1317,6 @@ mod tests {
         let tail = Agent::build_context_tail(
             None,
             "",
-            "",
             None,
             None,
             "",
@@ -1349,7 +1339,6 @@ mod tests {
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
         let tail = Agent::build_context_tail(
             None,
-            "",
             "",
             None,
             None,
@@ -1432,7 +1421,6 @@ mod tests {
         let tail = Agent::build_context_tail(
             None,
             "",
-            "",
             None,
             Some(&summary),
             "",
@@ -1442,34 +1430,5 @@ mod tests {
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
         assert!(tail.contains("[Session Summary]"));
         assert!(tail.contains("black coffee"));
-    }
-
-    /// core_profile MOVED from the core to the tail: assert it renders into the
-    /// tail and is ABSENT from the core (the core is now byte-stable across turns).
-    #[test]
-    fn core_profile_renders_into_tail_not_core() {
-        use crate::agent::core_prompt::{render_core_prompt, test_core_inputs};
-
-        let profile = "## Core Profile\nThe owner's partner is Jordan Lee.";
-        let tail = Agent::build_context_tail(
-            None,
-            profile,
-            "",
-            None,
-            None,
-            "",
-            "Monday, June 1, 2026 12:00 UTC",
-            None,
-        );
-        assert!(
-            tail.contains("## Core Profile") && tail.contains("Jordan Lee"),
-            "core_profile must render into the tail"
-        );
-
-        let core = render_core_prompt(&test_core_inputs());
-        assert!(
-            !core.contains("## Core Profile"),
-            "core_profile must be ABSENT from the core prompt"
-        );
     }
 }
