@@ -90,6 +90,27 @@ pub(in crate::agent) async fn run_orchestration_phase(
     // Orchestration routing (always-on).
     let complexity = classify_intent_complexity(ctx.user_text);
     let (route, tools_required) = orchestration_route_label(&complexity);
+
+    // Per-turn intent-classification telemetry: record the gate result + complexity
+    // + route for every (non-cancel) turn so the determination is queryable via the
+    // event store. Gated internally by `record_decision_points`; severity Info.
+    let (intent_summary, intent_metadata) = intent_decision_telemetry(
+        ctx.intent_gate.needs_tools.unwrap_or(false),
+        &complexity,
+        route,
+        ctx.user_text.chars().count(),
+    );
+    agent
+        .emit_decision_point(
+            ctx.emitter,
+            ctx.task_id,
+            ctx.iteration,
+            crate::events::DecisionType::IntentGate,
+            intent_summary,
+            intent_metadata,
+        )
+        .await;
+
     if agent.harness_eval_enabled() {
         agent
             .with_harness_eval(|eval| eval.record_orchestration_route(route, tools_required))
@@ -98,6 +119,34 @@ pub(in crate::agent) async fn run_orchestration_phase(
     let outcome = super::routes::route_orchestration_complexity(agent, ctx, complexity).await?;
     record_orchestration_direct_return(agent, &outcome).await;
     Ok(Some(outcome))
+}
+
+/// Build the per-turn intent-classification telemetry (summary + metadata) for a
+/// `DecisionType::IntentGate` decision point. Pure formatting so it is unit-testable;
+/// the emission itself is gated by `record_decision_points` inside `emit_decision_point`.
+fn intent_decision_telemetry(
+    needs_tools: bool,
+    complexity: &IntentComplexity,
+    route: &str,
+    user_text_len: usize,
+) -> (String, Value) {
+    let complexity_label = match complexity {
+        IntentComplexity::Simple => "simple",
+        IntentComplexity::Complex => "complex",
+        IntentComplexity::Scheduled { .. } => "scheduled",
+        IntentComplexity::ScheduledMissingTiming => "scheduled_missing_timing",
+    };
+    let summary = format!(
+        "Intent classified: needs_tools={needs_tools} complexity={complexity_label} route={route}"
+    );
+    let metadata = json!({
+        "condition": "intent_classification",
+        "needs_tools": needs_tools,
+        "complexity": complexity_label,
+        "route": route,
+        "user_text_len": user_text_len,
+    });
+    (summary, metadata)
 }
 
 fn orchestration_route_label(complexity: &IntentComplexity) -> (&'static str, bool) {
@@ -117,5 +166,50 @@ async fn record_orchestration_direct_return(agent: &Agent, outcome: &ResponsePha
         agent
             .with_harness_eval(|eval| eval.record_direct_return(true, result.is_ok()))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod intent_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn intent_telemetry_maps_fields_and_summary() {
+        let (summary, meta) =
+            intent_decision_telemetry(true, &IntentComplexity::Complex, "tools_required", 42);
+        assert!(summary.contains("needs_tools=true"), "summary: {summary}");
+        assert!(summary.contains("complexity=complex"), "summary: {summary}");
+        assert!(
+            summary.contains("route=tools_required"),
+            "summary: {summary}"
+        );
+        assert_eq!(meta["condition"], "intent_classification");
+        assert_eq!(meta["needs_tools"], true);
+        assert_eq!(meta["complexity"], "complex");
+        assert_eq!(meta["route"], "tools_required");
+        assert_eq!(meta["user_text_len"], 42);
+    }
+
+    #[test]
+    fn intent_telemetry_labels_each_complexity_variant() {
+        let cases = [
+            (IntentComplexity::Simple, "simple"),
+            (IntentComplexity::Complex, "complex"),
+            (
+                IntentComplexity::ScheduledMissingTiming,
+                "scheduled_missing_timing",
+            ),
+            (
+                IntentComplexity::Scheduled {
+                    schedule_raw: "daily".into(),
+                    is_one_shot: false,
+                },
+                "scheduled",
+            ),
+        ];
+        for (complexity, label) in cases {
+            let (_s, meta) = intent_decision_telemetry(false, &complexity, "default_continue", 0);
+            assert_eq!(meta["complexity"], label, "variant should map to {label}");
+        }
     }
 }
