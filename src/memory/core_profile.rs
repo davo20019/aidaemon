@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::traits::{Fact, StateStore};
@@ -70,7 +70,9 @@ pub async fn build_core_profile(
     }
 
     let flat_facts = state.get_facts(None).await.unwrap_or_default();
-    let mut flat_groups: HashMap<String, Vec<Fact>> = HashMap::new();
+    // BTreeMap (not HashMap) so group iteration order is deterministic — combined
+    // with `order_entities` before render, the same data yields byte-identical output.
+    let mut flat_groups: BTreeMap<String, Vec<Fact>> = BTreeMap::new();
 
     for fact in flat_facts {
         let key = fact.key.trim().to_ascii_lowercase();
@@ -206,11 +208,7 @@ pub async fn build_core_profile(
             }
         }
     } else {
-        entities.sort_by(|a, b| {
-            b.salience
-                .partial_cmp(&a.salience)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        order_entities(&mut entities);
         let top_n = entities.into_iter().take(20).collect::<Vec<_>>();
 
         let ids: Vec<String> = top_n.iter().map(|e| e.id.clone()).collect();
@@ -221,6 +219,11 @@ pub async fn build_core_profile(
     if selected_entities.is_empty() {
         return Ok((String::new(), new_cache));
     }
+
+    // Render in a deterministic order regardless of how the cached/ranked path
+    // assembled `selected_entities` (the cached path preserves upstream
+    // HashMap/SQL order). Stable bytes → the core prompt no longer busts the cache.
+    order_entities(&mut selected_entities);
 
     let mut out = String::from(
         "## Core Profile\n\
@@ -238,4 +241,48 @@ pub async fn build_core_profile(
     }
 
     Ok((out.trim_end().to_string(), new_cache))
+}
+
+/// Deterministic total order for rendered entities: salience descending, then
+/// `id` ascending as a stable tie-break. Applied before selection AND before
+/// rendering so the same data always produces byte-identical output regardless
+/// of upstream `HashMap`/SQL iteration order (otherwise the core prompt's bytes
+/// shuffle every turn and bust the prompt cache at token 0).
+fn order_entities(entities: &mut [RankedEntity]) {
+    entities.sort_by(|a, b| {
+        b.salience
+            .partial_cmp(&a.salience)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(id: &str, salience: f32) -> RankedEntity {
+        RankedEntity {
+            id: id.to_string(),
+            lines: vec![format!("line-{id}")],
+            salience,
+        }
+    }
+
+    #[test]
+    fn order_entities_is_deterministic_regardless_of_input_order() {
+        // Same set, different input orders (simulating HashMap iteration churn).
+        let mut a = vec![mk("c", 1.0), mk("a", 2.0), mk("b", 2.0)];
+        let mut b = vec![mk("b", 2.0), mk("c", 1.0), mk("a", 2.0)];
+        order_entities(&mut a);
+        order_entities(&mut b);
+        let ids = |v: &[RankedEntity]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&a),
+            ids(&b),
+            "identical entities must order identically regardless of input order"
+        );
+        // salience desc, then id asc for the a/b tie at 2.0.
+        assert_eq!(ids(&a), vec!["a", "b", "c"]);
+    }
 }
