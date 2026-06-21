@@ -85,6 +85,14 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
             r"(?m)\[CONTENT FILTERED\]\s*(?:This request|Do not call|Write the requested)[^\n]*",
         )
         .unwrap(),
+        // Terminal background-process control hint (pid + action="check"/"kill") —
+        // internal scaffolding appended to the tool result (terminal.rs); the model
+        // sometimes echoes the whole result, so strip the entire hint line.
+        Regex::new(r#"(?m)^[^\n]*Use action="check"[^\n]*$"#).unwrap(),
+        // Background-task system directive (system_directives.rs) the model echoes
+        // verbatim — strip the whole line regardless of tag, including after
+        // [SYSTEM] was rewritten to [CONTENT FILTERED] by the input sanitizer.
+        Regex::new(r"(?m)^[^\n]*A background task (?:is now running|was moved)[^\n]*$").unwrap(),
         // [UNTRUSTED EXTERNAL DATA ...] block through [END UNTRUSTED ...]
         Regex::new(
             r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*",
@@ -1709,6 +1717,37 @@ mod tests {
         assert!(
             !result.contains("[CONTENT FILTERED]"),
             "CONTENT FILTERED tag leaked: {result}"
+        );
+    }
+
+    #[test]
+    fn test_strip_background_task_scaffolding_leak() {
+        // Regression: a backgrounded command's reply echoed internal scaffolding —
+        // the terminal control hint (pid + action=check/kill) and the background-task
+        // system directive — and the sanitizer left both in the user-facing text.
+        // Directive B arrives here with its [SYSTEM] tag already rewritten to
+        // [CONTENT FILTERED] by sanitize_output's input patterns, which defeats the
+        // [SYSTEM] block rule and is missed by the narrow [CONTENT FILTERED] defense.
+        let input = "Here's the command output:\n\nUse action=\"check\" pid=81335 to check again, or action=\"kill\" pid=81335 to stop.\n\n[CONTENT FILTERED] A background task is now running and completion notifications are enabled. Do NOT call additional tools or poll status in this turn. Reply to the user now that work continues in background and results will be sent automatically.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("action=\"check\""),
+            "terminal control hint leaked: {result}"
+        );
+        assert!(
+            !result.contains("A background task is now running"),
+            "background-task directive leaked: {result}"
+        );
+        assert!(
+            !result.contains("Do NOT call additional tools"),
+            "background-task directive leaked: {result}"
+        );
+        // The [SYSTEM]-tagged form (system_directives.rs) must also be stripped.
+        let sys = "[SYSTEM] A background task was moved to the background. Do NOT call additional tools or poll status in this turn. Reply to the user now with the current status.";
+        let sys_result = strip_diagnostic_blocks(sys);
+        assert!(
+            !sys_result.contains("A background task was moved"),
+            "system-tagged directive leaked: {sys_result}"
         );
     }
 
