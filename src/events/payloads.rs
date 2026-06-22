@@ -454,6 +454,7 @@ pub enum DecisionType {
     InstructionsSnapshot,
     BudgetAutoExtension,
     LlmEfficiencyAlert,
+    CoreProfileSelection,
 }
 
 impl DecisionType {
@@ -462,6 +463,7 @@ impl DecisionType {
             DecisionType::SkillMatch => "skill_match",
             DecisionType::MemoryRetrieval => "memory_retrieval",
             DecisionType::IntentGate => "intent_gate",
+            DecisionType::CoreProfileSelection => "core_profile_selection",
             DecisionType::ExecutionPlanningGate => "execution_planning_gate",
             DecisionType::ExecutionCritiquePass => "execution_critique_pass",
             DecisionType::ExecutionBudgetSelection => "execution_budget_selection",

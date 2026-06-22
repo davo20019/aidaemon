@@ -578,32 +578,59 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
-        let core_profile_str = if inject_personal && user_role == UserRole::Owner && self.depth == 0
-        {
-            let cached_ids = self
-                .session_core_profile_ids
-                .read()
-                .await
-                .get(session_id)
-                .cloned();
-            let (profile_str, new_ids) = crate::memory::core_profile::build_core_profile(
-                &self.state,
-                cached_ids,
-                people_enabled,
-            )
-            .await
-            .unwrap_or_default();
-
-            if let Some(ids) = new_ids {
-                self.session_core_profile_ids
-                    .write()
+        let (core_profile_str, core_profile_digest) =
+            if inject_personal && user_role == UserRole::Owner && self.depth == 0 {
+                let cached_ids = self
+                    .session_core_profile_ids
+                    .read()
                     .await
-                    .insert(session_id.to_string(), ids);
-            }
-            profile_str
-        } else {
-            String::new()
-        };
+                    .get(session_id)
+                    .cloned();
+                let (profile_str, new_ids, digest) =
+                    crate::memory::core_profile::build_core_profile(
+                        &self.state,
+                        cached_ids,
+                        people_enabled,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                if let Some(ids) = new_ids {
+                    self.session_core_profile_ids
+                        .write()
+                        .await
+                        .insert(session_id.to_string(), ids);
+                }
+                (profile_str, digest)
+            } else {
+                (String::new(), Vec::new())
+            };
+
+        // Per-render core_profile selection digest (id + content hash per entity).
+        // Emitted as telemetry so a future core_profile churn self-explains: diffing
+        // consecutive digests shows exactly which entity's content changed or whether
+        // the selected set shifted — closing the "why did the core bust?" gap.
+        if self.record_decision_points && !core_profile_digest.is_empty() {
+            self.emit_decision_point(
+                emitter,
+                task_id,
+                0,
+                DecisionType::CoreProfileSelection,
+                format!(
+                    "Core profile selection: {} entities",
+                    core_profile_digest.len()
+                ),
+                json!({
+                    "code": "core_profile_digest",
+                    "count": core_profile_digest.len(),
+                    "entities": core_profile_digest
+                        .iter()
+                        .map(|(id, h)| json!({ "id": id, "h": h }))
+                        .collect::<Vec<_>>(),
+                }),
+            )
+            .await;
+        }
 
         let core_inputs = core_prompt::assemble_core_inputs(
             user_role,

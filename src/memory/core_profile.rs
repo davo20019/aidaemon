@@ -17,7 +17,7 @@ pub async fn build_core_profile(
     state: &Arc<dyn StateStore>,
     cached_ids: Option<Vec<String>>,
     people_enabled: bool,
-) -> anyhow::Result<(String, Option<Vec<String>>)> {
+) -> anyhow::Result<(String, Option<Vec<String>>, Vec<(String, String)>)> {
     let now = Utc::now();
     let mut entities = Vec::new();
 
@@ -217,13 +217,22 @@ pub async fn build_core_profile(
     }
 
     if selected_entities.is_empty() {
-        return Ok((String::new(), new_cache));
+        return Ok((String::new(), new_cache, Vec::new()));
     }
 
     // Render in a deterministic order regardless of how the cached/ranked path
     // assembled `selected_entities` (the cached path preserves upstream
     // HashMap/SQL order). Stable bytes → the core prompt no longer busts the cache.
     order_entities(&mut selected_entities);
+
+    // Per-render digest: (entity id, content hash) in render order. The caller
+    // emits this as telemetry so any future core_profile churn self-explains —
+    // a diff of consecutive digests shows exactly which entity's content changed
+    // or whether the selected set shifted, instead of just "the hash flipped".
+    let digest: Vec<(String, String)> = selected_entities
+        .iter()
+        .map(|e| (e.id.clone(), entity_content_hash(&e.lines)))
+        .collect();
 
     let mut out = String::from(
         "## Core Profile\n\
@@ -240,7 +249,18 @@ pub async fn build_core_profile(
         }
     }
 
-    Ok((out.trim_end().to_string(), new_cache))
+    Ok((out.trim_end().to_string(), new_cache, digest))
+}
+
+/// Short content hash of an entity's rendered lines — used only for churn
+/// diagnostics (detecting that content changed), not for any logic. Process-local
+/// (`DefaultHasher`); stable within a running binary, which is all turn-to-turn
+/// churn comparison needs.
+fn entity_content_hash(lines: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
 }
 
 /// Deterministic total order for rendered entities: salience descending, then
@@ -284,5 +304,15 @@ mod tests {
         );
         // salience desc, then id asc for the a/b tie at 2.0.
         assert_eq!(ids(&a), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn entity_content_hash_detects_content_change() {
+        let a = entity_content_hash(&["Your partner: Jordan Lee".to_string()]);
+        let a2 = entity_content_hash(&["Your partner: Jordan Lee".to_string()]);
+        let b = entity_content_hash(&["Your partner: Alex Kim".to_string()]);
+        assert_eq!(a, a2, "identical content must hash identically");
+        assert_ne!(a, b, "changed content must change the hash");
+        assert_eq!(a.len(), 8, "short 8-hex digest");
     }
 }
