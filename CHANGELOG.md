@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hung background terminal commands are now auto-stopped**: a disowned background command that produces no new output for 5 minutes (e.g. a whole-disk `du -ah ~ | sort | head` or unbounded `find ~`, which can run for hours without exiting) is now stopped by a heartbeat-driven idle reaper, and the user is told it was stopped and why. Previously the per-process notifier only delivered on process *exit*, so a command that never exited would pin a notifier task and disk I/O indefinitely (observed: a `du` scan still alive ~11 hours later, with one orphan leaked per attempt). Only `notifier_active && !detached` processes are eligible; any process that keeps streaming output resets its idle clock and is never reaped, and detached processes (e.g. dev servers started with `detach=true`) are exempt.
+
 ## [0.11.12] - 2026-06-22
 
 ### Fixed

@@ -41,6 +41,31 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
 /// Prevents notification spam for long-running processes (servers, daemons).
 const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 
+/// A disowned background process (notifier-active, non-detached) that produces
+/// no new output for this long is treated as hung and auto-stopped by the
+/// heartbeat reaper. Sized well above the notifier's still-running re-engagement
+/// (~105s) so a genuinely-progressing-but-quiet command gets a fair chance.
+/// The observed failure: a whole-disk `du -ah ~ | sort | head` that emitted zero
+/// bytes and ran for ~11 hours without exiting. Detached processes (dev servers
+/// started with `detach=true`) are exempt, and any process that keeps streaming
+/// output is never reaped because each new byte resets its idle clock.
+pub const BACKGROUND_IDLE_REAP_SECS: u64 = 300;
+
+/// Pure decision: should a tracked background process be idle-reaped?
+///
+/// Reaped only when it is notifier-active (the user was promised a result),
+/// not detached (detached = "survives, requires explicit kill"), and its output
+/// has not grown for at least `threshold`. Kept as a free function so the policy
+/// is unit-testable without spawning real processes.
+fn should_idle_reap(
+    notifier_active: bool,
+    detached: bool,
+    idle: Duration,
+    threshold: Duration,
+) -> bool {
+    notifier_active && !detached && idle >= threshold
+}
+
 /// A request sent to the ChannelHub for command approval.
 pub struct ApprovalRequest {
     pub command: String,
@@ -75,6 +100,18 @@ struct RunningProcess {
     /// and is actively monitoring this process for completion/progress delivery.
     /// Used by `cleanup_task_processes` to decide whether to kill or disown.
     notifier_active: bool,
+    /// Session/goal that launched this command, captured so the idle-reaper can
+    /// notify the user when it auto-stops a hung background process. Empty for
+    /// task-owned processes that never enter the notifier path.
+    notify_session_id: String,
+    notify_goal_id: String,
+    /// Idle-reap bookkeeping: total output bytes observed at the last sweep and
+    /// the instant that count last grew. A notifier-active, non-detached process
+    /// whose output stops growing for [`BACKGROUND_IDLE_REAP_SECS`] is treated as
+    /// hung (e.g. a whole-disk `du`/`find` scan) and stopped by the heartbeat
+    /// reaper. Streaming processes keep resetting `last_progress_at` and survive.
+    last_progress_len: usize,
+    last_progress_at: Instant,
 }
 
 /// Finalized background process output retained briefly so `action="check"`
@@ -1297,6 +1334,138 @@ impl TerminalTool {
         }
     }
 
+    /// Stop disowned background processes that have gone idle (no new output for
+    /// `idle_threshold`). Driven by the heartbeat so there is a single, observable
+    /// owner for this resource-leak class — the per-process notifier only delivers
+    /// on *exit*, so a command that never exits (e.g. a whole-disk `du`/`find`
+    /// scan) would otherwise pin a notifier task and disk I/O indefinitely.
+    ///
+    /// Only `notifier_active && !detached` processes are eligible. Any process
+    /// still streaming output keeps resetting its idle clock and is never reaped;
+    /// detached processes (dev servers) are exempt entirely. Returns the number of
+    /// processes stopped.
+    pub async fn reap_stale_background_processes(&self, idle_threshold: Duration) -> usize {
+        // Phase 1: snapshot eligible candidates under the `running` lock. Clone the
+        // buffer Arcs so Phase 2 can measure output WITHOUT holding `running`
+        // (lock-order discipline: never hold `running` while locking a buffer).
+        struct Candidate {
+            pid: u32,
+            stdout_buf: Arc<Mutex<Vec<u8>>>,
+            stderr_buf: Arc<Mutex<Vec<u8>>>,
+            last_progress_len: usize,
+            last_progress_at: Instant,
+        }
+        let candidates: Vec<Candidate> = {
+            let running = self.running.lock().await;
+            running
+                .iter()
+                .filter(|(_, p)| p.notifier_active && !p.detached)
+                .map(|(pid, p)| Candidate {
+                    pid: *pid,
+                    stdout_buf: p.stdout_buf.clone(),
+                    stderr_buf: p.stderr_buf.clone(),
+                    last_progress_len: p.last_progress_len,
+                    last_progress_at: p.last_progress_at,
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Phase 2: measure current output (no `running` lock held). Growing output
+        // refreshes the idle clock; quiescent output past the threshold is stale.
+        let mut to_grow: Vec<(u32, usize)> = Vec::new();
+        let mut to_reap: Vec<u32> = Vec::new();
+        for c in candidates {
+            let len = c.stdout_buf.lock().await.len() + c.stderr_buf.lock().await.len();
+            if len > c.last_progress_len {
+                to_grow.push((c.pid, len));
+            } else if should_idle_reap(true, false, c.last_progress_at.elapsed(), idle_threshold) {
+                to_reap.push(c.pid);
+            }
+        }
+
+        // Phase 3a: refresh idle bookkeeping for processes that produced new output.
+        if !to_grow.is_empty() {
+            let now = Instant::now();
+            let mut running = self.running.lock().await;
+            for (pid, len) in to_grow {
+                if let Some(proc) = running.get_mut(&pid) {
+                    proc.last_progress_len = len;
+                    proc.last_progress_at = now;
+                }
+            }
+        }
+
+        // Phase 3b: stop the stale ones. Mirror `handle_kill`: remove from `running`,
+        // drop indexes, notify the user (the notifier is suppressed by
+        // `terminate_running_process`, so the reaper owns delivery), then terminate.
+        let mut reaped = 0usize;
+        for pid in to_reap {
+            let proc = {
+                let mut running = self.running.lock().await;
+                running.remove(&pid)
+            };
+            let Some(proc) = proc else { continue };
+            self.remove_indexes_for_process(pid, &proc).await;
+            self.completed.lock().await.remove(&pid);
+
+            let session_id = proc.notify_session_id.clone();
+            let goal_id = proc.notify_goal_id.clone();
+            let command_summary = truncate_str(&proc.command, 160);
+            let idle_secs = proc.last_progress_at.elapsed().as_secs();
+
+            warn!(
+                pid,
+                command = %proc.command,
+                idle_secs,
+                "Idle-reaping hung background process (no new output past threshold)"
+            );
+
+            if let Err(e) = self
+                .terminate_running_process(pid, proc, "idle: no output")
+                .await
+            {
+                warn!(pid, error = %e, "Failed to terminate idle background process");
+            }
+
+            // Close the loop with the user: the screenshot's failure was the bot
+            // silently waiting forever. Tell them it was stopped and why.
+            if !session_id.is_empty() {
+                let message = format!(
+                    "⚠️ I stopped a background command that was taking too long with no results \
+                     (no output for {}): `{}`. Whole-disk scans are very slow — if you still \
+                     need this, try narrowing the search (a specific folder, a size filter, or a \
+                     depth limit).",
+                    humanize_elapsed(idle_secs),
+                    command_summary
+                );
+                let mut delivered = false;
+                if let Some(hub) = self.get_hub() {
+                    if hub.send_text(&session_id, &message).await.is_ok() {
+                        delivered = true;
+                    }
+                }
+                if !delivered {
+                    if let Some(ref state) = self.state {
+                        let entry = crate::traits::NotificationEntry::new(
+                            &goal_id,
+                            &session_id,
+                            "progress",
+                            &message,
+                        );
+                        if let Err(e) = state.enqueue_notification(&entry).await {
+                            warn!(pid, error = %e, "Failed to enqueue idle-reap notice");
+                        }
+                    }
+                }
+            }
+            reaped += 1;
+        }
+        reaped
+    }
+
     /// Run a command: spawn, wait up to initial_timeout, return output or move to background.
     async fn handle_run(
         &self,
@@ -1442,6 +1611,10 @@ impl TerminalTool {
                     child_id: pid,
                     notify_on_completion: notify_on_completion.clone(),
                     notifier_active: false,
+                    notify_session_id: notify_session_id.trim().to_string(),
+                    notify_goal_id: notify_goal_id.unwrap_or("").to_string(),
+                    last_progress_len: 0,
+                    last_progress_at: Instant::now(),
                 };
 
                 self.running.lock().await.insert(pid, proc);
@@ -3458,6 +3631,180 @@ mod tests {
             saw_completion,
             "completion notification should still arrive"
         );
+    }
+
+    #[test]
+    fn test_should_idle_reap_policy() {
+        let threshold = Duration::from_secs(300);
+        // Notifier-active, non-detached, past threshold → reap.
+        assert!(should_idle_reap(
+            true,
+            false,
+            Duration::from_secs(301),
+            threshold
+        ));
+        // Exactly at threshold → reap (>=).
+        assert!(should_idle_reap(
+            true,
+            false,
+            Duration::from_secs(300),
+            threshold
+        ));
+        // Below threshold → keep.
+        assert!(!should_idle_reap(
+            true,
+            false,
+            Duration::from_secs(299),
+            threshold
+        ));
+        // Detached (dev server) → never reaped, even when long idle.
+        assert!(!should_idle_reap(
+            true,
+            true,
+            Duration::from_secs(100_000),
+            threshold
+        ));
+        // Not notifier-active (task-owned, no promise to deliver) → not reaped here.
+        assert!(!should_idle_reap(
+            false,
+            false,
+            Duration::from_secs(100_000),
+            threshold
+        ));
+    }
+
+    /// A disowned, no-output background command (the `du -ah ~` failure mode) is
+    /// stopped by the idle reaper, removed from tracking, and the user is told.
+    #[tokio::test]
+    async fn test_idle_reap_stops_hung_background_process() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        // No-output, long-running command — stands in for a whole-disk scan that
+        // never exits. It is moved to background after the 1s initial timeout.
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        // Threshold near-zero: the process produced no output, so the reaper sees
+        // it as immediately idle and stops it.
+        let mut reaped = 0;
+        for _ in 0..40 {
+            reaped = tool
+                .reap_stale_background_processes(Duration::from_millis(1))
+                .await;
+            if reaped > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            reaped, 1,
+            "expected the hung background process to be reaped"
+        );
+
+        // It must be gone from the tracking map (no leak).
+        assert!(
+            tool.running.lock().await.is_empty(),
+            "reaped process should be removed from the running map"
+        );
+
+        // The user must be told why it stopped (the screenshot's failure was the
+        // bot waiting forever in silence).
+        let mut saw_notice = false;
+        for _ in 0..20 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_reap"
+                    && entry.message.contains("stopped a background command")
+            }) {
+                saw_notice = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            saw_notice,
+            "expected a user-facing notice that the hung command was stopped"
+        );
+    }
+
+    /// A background command that keeps streaming output is NOT reaped: each new
+    /// byte refreshes its idle clock, so a healthy long-running process survives.
+    #[tokio::test]
+    async fn test_idle_reap_spares_streaming_process() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        // Emits a line roughly every 0.2s for a while — a stand-in for a dev server
+        // or a scan that is genuinely making progress.
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"for i in $(seq 1 50); do echo line-$i; sleep 0.2; done","_session_id":"sess_stream","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        // Prime the baseline, then sweep again after fresh output has arrived. With
+        // a 1s threshold and ~0.2s output cadence, the idle clock keeps resetting,
+        // so nothing is reaped.
+        let _ = tool
+            .reap_stale_background_processes(Duration::from_secs(1))
+            .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let reaped = tool
+            .reap_stale_background_processes(Duration::from_secs(1))
+            .await;
+        assert_eq!(reaped, 0, "a streaming process must not be idle-reaped");
+
+        // Clean up the still-running process.
+        let pids: Vec<u32> = tool.running.lock().await.keys().copied().collect();
+        for pid in pids {
+            let _ = tool.handle_kill(pid).await;
+        }
     }
 
     #[test]

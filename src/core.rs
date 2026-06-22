@@ -282,6 +282,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         oauth_gateway.clone(),
         watchdog_stale_threshold_secs,
         goal_token_registry.clone(),
+        terminal_tool.clone(),
     )
     .await;
 
@@ -551,6 +552,7 @@ async fn init_heartbeat_coordinator(
     oauth_gateway: Option<crate::oauth::OAuthGateway>,
     watchdog_stale_threshold_secs: u64,
     goal_token_registry: crate::goal_tokens::GoalTokenRegistry,
+    terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
 ) -> HeartbeatSetup {
     let mut heartbeat_telemetry: Option<Arc<crate::heartbeat::HeartbeatTelemetry>> = None;
     let mut heartbeat_opt: Option<crate::heartbeat::HeartbeatCoordinator> = None;
@@ -570,6 +572,30 @@ async fn init_heartbeat_coordinator(
 
         // Register memory manager jobs
         memory_manager.register_heartbeat_jobs(&mut heartbeat);
+
+        // Idle-reap hung background terminal commands (e.g. whole-disk `du`/`find`
+        // scans that emit no output and never exit). The per-process notifier only
+        // delivers on exit, so without this sweep such processes pin a notifier task
+        // and disk I/O indefinitely. Heartbeat-owned so there is one observable place
+        // for the policy, alongside the other stale-resource cleanups below.
+        if let Some(ref terminal) = terminal_tool {
+            let terminal_weak = Arc::downgrade(terminal);
+            heartbeat.register_job("terminal_idle_reap", Duration::from_secs(60), move || {
+                let terminal_weak = terminal_weak.clone();
+                async move {
+                    let Some(terminal) = terminal_weak.upgrade() else {
+                        return Ok(());
+                    };
+                    let idle =
+                        Duration::from_secs(crate::tools::terminal::BACKGROUND_IDLE_REAP_SECS);
+                    let reaped = terminal.reap_stale_background_processes(idle).await;
+                    if reaped > 0 {
+                        info!(reaped, "Idle-reaped hung background terminal commands");
+                    }
+                    Ok(())
+                }
+            });
+        }
 
         // Event pruning (daily)
         let pruner_hb = pruner;
