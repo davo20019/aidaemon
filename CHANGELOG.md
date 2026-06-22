@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-06-22
+
+### Fixed
+
+- **Background short-output delivery is now sanitized**: a backgrounded command's tool-less-LLM interpretation was delivered straight to the user without the agent loop's reply sanitizer, so internal scaffolding the model echoed — terminal control hints (`Use action="check" pid=…`) and `[SYSTEM]`/`[CONTENT FILTERED]` directives — could leak into the chat. The short-output path now runs `sanitize_user_facing_reply` before delivery/enqueue. (The re-engaged path was already sanitized; the raw-output fallback stays verbatim.)
+- **Deterministic `core_profile` rendering**: the owner-profile block now renders from a `BTreeMap` with a stable sort, so it is byte-identical across renders.
+
+### Changed
+
+- **`core_profile` restored to the cached CORE prompt block** (safe now that its rendering is deterministic), improving prompt-cache hit rate versus the per-task TAIL placement introduced in 0.11.11.
+
+### Added
+
+- **Per-render `core_profile` selection-digest telemetry** to diagnose prompt-cache stability.
+
 ## [0.11.11] - 2026-06-21
 
 ### Added
