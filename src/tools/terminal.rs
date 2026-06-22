@@ -1970,6 +1970,15 @@ impl TerminalTool {
                                             format_short_background_result(output_trimmed)
                                         }
                                     };
+                                    // Background deliveries bypass the agent loop's
+                                    // completion sanitizer, so run the same user-facing
+                                    // reply sanitization here — the tool-less LLM
+                                    // interpretation can echo internal scaffolding
+                                    // (control hints, [SYSTEM]/[CONTENT FILTERED] directives).
+                                    let message =
+                                        crate::tools::sanitize::sanitize_user_facing_reply(
+                                            &message,
+                                        );
                                     let mut delivered = false;
                                     if let Some(ref hub) = hub_for_notify {
                                         if let Err(e) =
