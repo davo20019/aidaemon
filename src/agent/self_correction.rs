@@ -493,4 +493,49 @@ mod tests {
             AttemptDecision::StopBudget
         );
     }
+
+    #[tokio::test]
+    async fn pivot_lifecycle_proceeds_twice_then_exhausts_and_reports() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3); // MAX_APPROACH_PIVOTS + 1
+        let k = crate::traits::SelfCorrectionSubjectKind::Task;
+        let task = "loop-task-1";
+
+        // Simulate three failing approaches with distinct signatures, checking the
+        // budget gate the way stopping_phase will: record_failure then pivot_budget.
+        let sig1 = approach_signature(&["terminal(du -ah ~)".to_string()]);
+        ctrl.record_failure(task, k, &sig1, 1, None).await.unwrap();
+        assert!(matches!(
+            ctrl.pivot_budget(task).await.unwrap(),
+            AttemptDecision::Proceed { .. }
+        ));
+
+        let sig2 = approach_signature(&["terminal(find ~ -size +500M)".to_string()]);
+        ctrl.record_failure(task, k, &sig2, 2, None).await.unwrap();
+        assert!(matches!(
+            ctrl.pivot_budget(task).await.unwrap(),
+            AttemptDecision::Proceed { .. }
+        ));
+
+        let sig3 = approach_signature(&["terminal(du -x -d2 ~)".to_string()]);
+        ctrl.record_failure(task, k, &sig3, 3, None).await.unwrap();
+        // Three distinct failures → budget exhausted.
+        assert_eq!(
+            ctrl.pivot_budget(task).await.unwrap(),
+            AttemptDecision::StopBudget
+        );
+
+        // The give-up report enumerates all three approaches and is idempotent.
+        let report = ctrl.give_up_report(task).await.unwrap().unwrap();
+        assert!(report.contains("du -ah ~"));
+        assert!(report.contains("find ~ -size +500M"));
+        assert!(report.contains("du -x -d2 ~"));
+
+        // A separate task has its own fresh budget (per-task isolation == per-turn
+        // reset for interactive, durable for scheduled).
+        assert_eq!(
+            ctrl.pivot_budget("loop-task-2").await.unwrap(),
+            AttemptDecision::Proceed { attempt_index: 1 }
+        );
+    }
 }
