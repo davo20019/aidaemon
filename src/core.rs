@@ -252,6 +252,11 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await;
 
+    // Merge persisted runtime-learned "ignores tool_choice=required" models into
+    // the config-seeded in-memory set, so a model that melted down once stays
+    // flagged across restarts (the 264s gemma meltdown never re-arms).
+    agent.load_required_tool_choice_ignored().await;
+
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers

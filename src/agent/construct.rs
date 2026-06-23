@@ -134,7 +134,17 @@ impl Agent {
             hub: RwLock::new(hub),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            required_tool_choice_ignored_models: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            // Seed the in-memory ignore-set from config so a fresh start never
+            // forces `tool_choice=required` on a known-bad model. Persisted
+            // runtime-learned entries are merged in later via
+            // `load_required_tool_choice_ignored()` (async, post-construction).
+            required_tool_choice_ignored_models: Arc::new(tokio::sync::RwLock::new(
+                policy_config
+                    .required_tool_choice_ignored_models
+                    .iter()
+                    .cloned()
+                    .collect(),
+            )),
             self_ref: RwLock::new(None),
             context_window_config,
             policy_config,
