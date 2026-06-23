@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
@@ -153,7 +153,17 @@ impl SqliteStateStore {
         let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // synchronous=NORMAL is the recommended pairing with WAL: durable across
+            // app crashes, only loses the very last transaction on an OS/power crash,
+            // and avoids an fsync on every commit (the dominant write cost under FULL).
+            .synchronous(SqliteSynchronous::Normal)
+            // Larger page cache (negative = KiB, so 64 MiB) keeps hot tables resident.
+            .pragma("cache_size", "-65536")
+            // Memory-mapped reads (256 MiB) cut syscall overhead on read-heavy paths.
+            .pragma("mmap_size", "268435456")
+            // Keep temp B-trees (ORDER BY / GROUP BY spills) in RAM instead of on disk.
+            .pragma("temp_store", "MEMORY");
 
         // SQLCipher: set encryption key via connect options so it applies to
         // every connection in the pool (PRAGMA key must be the first statement).
