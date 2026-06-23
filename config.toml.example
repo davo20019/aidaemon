@@ -389,3 +389,9 @@ enabled = false
 record_decision_points = true
 max_events = 200
 include_raw_tool_args = false
+
+# [self_correction]
+# Controls the agent self-correction gate. All flags default to false (safe-off).
+# enabled = false                  # master switch — enables the correction retry loop
+# correction_bypass_enabled = false # allow trusted sessions to skip the correction gate
+# max_attempts = 3                 # maximum correction retries per task

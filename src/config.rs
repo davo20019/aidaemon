@@ -393,6 +393,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub people: PeopleConfig,
     #[serde(default)]
+    // Used by subsequent plan tasks (3b P2+) that wire correction gate controllers.
+    #[allow(dead_code)]
+    pub self_correction: SelfCorrectionConfig,
+    #[serde(default)]
     pub oauth: OAuthConfig,
     #[serde(default)]
     pub http_auth: HashMap<String, HttpAuthProfile>,
@@ -2508,6 +2512,32 @@ pub struct OAuthProviderConfig {
     pub allowed_domains: Vec<String>,
 }
 
+/// Self-correction gate configuration.
+///
+/// Controls whether the agent is allowed to retry failed outputs through
+/// a correction loop. All flags default to `false` (safe-off) so existing
+/// deployments are unaffected until explicitly opted in.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct SelfCorrectionConfig {
+    /// Master switch. When `false` the correction loop is skipped entirely.
+    pub enabled: bool,
+    /// Allow the correction gate to be bypassed for trusted sessions.
+    pub correction_bypass_enabled: bool,
+    /// Maximum number of correction attempts per task (default: 3).
+    pub max_attempts: usize,
+}
+
+impl Default for SelfCorrectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            correction_bypass_enabled: false,
+            max_attempts: 3,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct PeopleConfig {
     #[serde(default)]
@@ -4438,5 +4468,52 @@ session_isolation = "incognito"
         let cfg = BrowserConfig::default();
         assert_eq!(cfg.session_isolation, None);
         assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+    }
+
+    #[test]
+    fn test_self_correction_config_defaults_are_safe() {
+        let cfg = SelfCorrectionConfig::default();
+        assert!(!cfg.enabled, "enabled must default to false (safe-off)");
+        assert!(
+            !cfg.correction_bypass_enabled,
+            "correction_bypass_enabled must default to false (safe-off)"
+        );
+        assert_eq!(cfg.max_attempts, 3, "max_attempts must default to 3");
+
+        // A config without [self_correction] section must still load and use defaults.
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+"#;
+        let app: AppConfig =
+            toml::from_str(toml).expect("parse app config without self_correction");
+        assert!(!app.self_correction.enabled);
+        assert!(!app.self_correction.correction_bypass_enabled);
+        assert_eq!(app.self_correction.max_attempts, 3);
+    }
+
+    #[test]
+    fn test_self_correction_config_parses_enabled_flags() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+
+[self_correction]
+enabled = true
+correction_bypass_enabled = true
+max_attempts = 5
+"#;
+        let app: AppConfig = toml::from_str(toml).expect("parse app config with self_correction");
+        assert!(app.self_correction.enabled);
+        assert!(app.self_correction.correction_bypass_enabled);
+        assert_eq!(app.self_correction.max_attempts, 5);
     }
 }
