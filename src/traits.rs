@@ -12,6 +12,7 @@ mod goals;
 mod memory;
 mod people;
 mod provider;
+mod self_correction;
 mod tools;
 mod trigger_event;
 
@@ -42,6 +43,8 @@ pub use provider::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, TokenUsageRecord,
     ToolChoiceMode,
 };
+#[allow(unused_imports)]
+pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
     AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
