@@ -209,6 +209,15 @@ pub fn extract_proposed_action(
             }
         }
 
+        "git_info" | "project_inspect" => {
+            // Both tools accept a `"path"` arg pointing to a local directory.
+            // Populate local_paths so classify_action's check_local_path_scope
+            // can enforce the working_dir boundary (same as read_file).
+            if let Some(path) = json_str(&args, "path") {
+                action.local_paths.push(path.to_string());
+            }
+        }
+
         "search_files" => {
             // Support several possible field names used across versions.
             for key in &["path", "directory", "dir"] {
@@ -390,8 +399,14 @@ pub fn classify_action(action: &ProposedAction, ctx: &CorrectionSubjectContext) 
         return classify_run_command_action(action, ctx);
     }
 
-    // (10) read_file / search_files — local read-only, path scope enforced.
-    if matches!(tool, "read_file" | "search_files") {
+    // (10) read_file / search_files / git_info / project_inspect — local read-only,
+    //      path scope enforced.  git_info and project_inspect accept a `"path"` arg
+    //      (extracted into local_paths by extract_proposed_action); scope-checking
+    //      reuses the same check_local_path_scope gate as read_file.
+    if matches!(
+        tool,
+        "read_file" | "search_files" | "git_info" | "project_inspect"
+    ) {
         // Check local paths for scope and sensitivity.
         for path_str in &action.local_paths {
             if let Err(reason) = check_local_path_scope(path_str, ctx) {
@@ -2465,6 +2480,101 @@ mod tests {
             classify_action(&a, &ctx),
             ActionVerdict::Allowed,
             "ls .. should be allowed (`..` alone is excluded from dotfile path-shaped rule)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P3a.1 tests — read-only tool path operands: git_info + project_inspect
+    // scope-checking via extract_proposed_action → local_paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_git_info_path_outside_working_dir_blocked() {
+        // git_info with an absolute path outside working_dir must be Blocked.
+        let a = extract_proposed_action(
+            "git_info",
+            r#"{"path":"/outside/repo"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+                                    // Confirm path was extracted.
+        assert_eq!(
+            a.local_paths,
+            vec!["/outside/repo".to_string()],
+            "git_info path must be in local_paths"
+        );
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "git_info with out-of-scope path should be Blocked"
+        );
+    }
+
+    #[test]
+    fn test_project_inspect_path_outside_working_dir_blocked() {
+        // project_inspect with an absolute path outside working_dir must be Blocked.
+        let a = extract_proposed_action(
+            "project_inspect",
+            r#"{"path":"/other/project"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            a.local_paths,
+            vec!["/other/project".to_string()],
+            "project_inspect path must be in local_paths"
+        );
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "project_inspect with out-of-scope path should be Blocked"
+        );
+    }
+
+    #[test]
+    fn test_readonly_tool_path_in_scope_allowed() {
+        // git_info and project_inspect with paths inside working_dir must be Allowed.
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+
+        let git_a = extract_proposed_action(
+            "git_info",
+            r#"{"path":"/tmp/test-workdir/myrepo"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        assert_eq!(
+            classify_action(&git_a, &ctx),
+            ActionVerdict::Allowed,
+            "git_info with in-scope path should be Allowed"
+        );
+
+        let proj_a = extract_proposed_action(
+            "project_inspect",
+            r#"{"path":"/tmp/test-workdir/myrepo"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        assert_eq!(
+            classify_action(&proj_a, &ctx),
+            ActionVerdict::Allowed,
+            "project_inspect with in-scope path should be Allowed"
+        );
+    }
+
+    #[test]
+    fn test_git_info_sensitive_path_blocked() {
+        // git_info pointing at a .env file inside working_dir must be Blocked
+        // (sensitive-file rule even within scope).
+        let a = extract_proposed_action(
+            "git_info",
+            r#"{"path":"/tmp/test-workdir/.env"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "git_info with sensitive path inside working_dir should be Blocked"
         );
     }
 

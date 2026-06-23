@@ -2526,6 +2526,11 @@ pub struct SelfCorrectionConfig {
     pub correction_bypass_enabled: bool,
     /// Maximum number of correction attempts per task (default: 3).
     pub max_attempts: usize,
+    /// Shadow-first activation. When `true` (default) the correction bridge
+    /// reconstructs intent, builds the context, and runs the gate but LOGS the
+    /// would-be remediation instead of executing/dispatching it. Full autonomous
+    /// execution requires a deliberate flip to `false` after observing shadow logs.
+    pub shadow_mode: bool,
 }
 
 impl Default for SelfCorrectionConfig {
@@ -2534,6 +2539,7 @@ impl Default for SelfCorrectionConfig {
             enabled: false,
             correction_bypass_enabled: false,
             max_attempts: 3,
+            shadow_mode: true,
         }
     }
 }
@@ -4479,6 +4485,10 @@ session_isolation = "incognito"
             "correction_bypass_enabled must default to false (safe-off)"
         );
         assert_eq!(cfg.max_attempts, 3, "max_attempts must default to 3");
+        assert!(
+            cfg.shadow_mode,
+            "shadow_mode must default to true (shadow-first activation)"
+        );
 
         // A config without [self_correction] section must still load and use defaults.
         let toml = r#"
@@ -4494,6 +4504,27 @@ primary = "gpt-4o"
         assert!(!app.self_correction.enabled);
         assert!(!app.self_correction.correction_bypass_enabled);
         assert_eq!(app.self_correction.max_attempts, 3);
+        assert!(app.self_correction.shadow_mode);
+
+        // shadow_mode = false parses (the deliberate full-autonomy flip).
+        let toml_live = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gpt-4o"
+
+[self_correction]
+enabled = true
+correction_bypass_enabled = true
+shadow_mode = false
+"#;
+        let app_live: AppConfig =
+            toml::from_str(toml_live).expect("parse app config with shadow_mode=false");
+        assert!(app_live.self_correction.enabled);
+        assert!(app_live.self_correction.correction_bypass_enabled);
+        assert!(!app_live.self_correction.shadow_mode);
     }
 
     #[test]
