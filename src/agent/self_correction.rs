@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::traits::{attempt_status, SelfCorrectionAttempt, SelfCorrectionSubjectKind, StateStore};
 
 /// Outcome of asking the controller whether a correction attempt may proceed.
-#[allow(dead_code)] // Used in Task 5+; integration into agent loop pending
 #[derive(Debug, PartialEq, Eq)]
 pub enum AttemptDecision {
     /// Proceed; this is attempt number `attempt_index` (1-based) for the subject.
@@ -16,7 +15,7 @@ pub enum AttemptDecision {
 
 /// Pure attempt policy. See module docs: repeat-block known-bad approaches,
 /// then enforce the K distinct-failure budget, else proceed.
-#[allow(dead_code)] // Used in Task 5+; integration into agent loop pending
+#[allow(dead_code)] // Used in Task 5+
 pub fn decide_attempt(
     prior: &[SelfCorrectionAttempt],
     signature: &str,
@@ -48,7 +47,6 @@ pub fn decide_attempt(
 /// `"tool_name(summary)"` calls). Used to identify a failed approach in the
 /// durable ledger. Order-independent so a re-ordered-but-equivalent attempt
 /// hashes the same; bounded so it stays a compact ledger key.
-#[allow(dead_code)] // Used in Task 2+; integration into agent loop pending
 pub fn approach_signature(tool_calls: &[String]) -> String {
     let mut parts: Vec<&str> = tool_calls
         .iter()
@@ -82,13 +80,11 @@ pub fn decide_pivot_budget(prior: &[SelfCorrectionAttempt], k: usize) -> Attempt
 /// Bounded, durable policy engine for self-correction. Library only: it decides
 /// whether an attempt may proceed and persists attempt outcomes; it never spawns
 /// or executes anything.
-#[allow(dead_code)] // Used in future plans; integration into agent loop pending
 pub struct SelfCorrectionController {
     state: Arc<dyn StateStore>,
     max_attempts: usize,
 }
 
-#[allow(dead_code)] // Used in future plans; integration into agent loop pending
 impl SelfCorrectionController {
     pub fn new(state: Arc<dyn StateStore>, max_attempts: usize) -> Self {
         Self {
@@ -99,6 +95,7 @@ impl SelfCorrectionController {
 
     /// Decide whether a correction attempt with `signature` may proceed for the
     /// subject. Pure policy applied over the durable attempt history.
+    #[allow(dead_code)] // Used in Task 5+
     pub async fn attempt(
         &self,
         subject_id: &str,
@@ -154,6 +151,7 @@ impl SelfCorrectionController {
         .await
     }
 
+    #[allow(dead_code)] // Used in Task 5+
     pub async fn record_success(
         &self,
         subject_id: &str,

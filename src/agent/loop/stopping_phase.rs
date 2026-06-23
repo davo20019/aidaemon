@@ -1522,48 +1522,108 @@ pub(super) async fn run_stopping_phase(
             .filter(|(_, recovered)| !recovered)
             .count();
 
-        // Approach pivot: a stall while the approach is demonstrably failing
-        // (unrecovered errors, or nothing succeeded at all) does not end the
-        // task while pivots remain. The loop continues with a deterministic
-        // record of what failed and an instruction to try a different method.
-        if crate::agent::approach_pivot::should_pivot_approach(
-            approach_pivots_used,
+        // Approach pivot: a stall while the approach is demonstrably failing does
+        // not end the task while pivot budget remains. The "is this approach
+        // failing?" judgment stays in-loop; the "may I pivot again?" budget moves
+        // to the durable SelfCorrectionController (restart-safe, per task_id).
+        if crate::agent::approach_pivot::approach_is_failing(
             learning_ctx.tool_calls.len(),
             unrecovered_errors,
             total_successful_tool_calls,
         ) {
-            let failure_record = crate::agent::approach_pivot::build_failure_record(
-                approach_pivots_used + 1,
-                &learning_ctx.tool_calls,
-                &learning_ctx.errors,
-                completion_progress.mutation_count,
+            let controller = crate::agent::self_correction::SelfCorrectionController::new(
+                agent.state.clone(),
+                crate::agent::approach_pivot::MAX_APPROACH_PIVOTS + 1,
             );
-            warn!(
-                session_id,
-                iteration,
-                stall_count = detected_stall_count,
-                unrecovered_errors,
-                pivots_used = approach_pivots_used,
-                "Stall with failing approach: pivoting to a new approach instead of ending the task"
-            );
-            agent
-                .emit_warning_decision_point(
-                    emitter,
+            let signature =
+                crate::agent::self_correction::approach_signature(&learning_ctx.tool_calls);
+
+            // Durably record the approach that just failed (best-effort: a DB
+            // error must not change loop behavior).
+            if let Err(e) = controller
+                .record_failure(
                     task_id,
-                    iteration,
-                    DecisionType::StoppingCondition,
-                    "Approach pivot: retrying with a different approach".to_string(),
-                    json!({
-                        "condition": "approach_pivot",
-                        "attempt": approach_pivots_used + 1,
-                        "stall_count": detected_stall_count,
-                        "unrecovered_errors": unrecovered_errors,
-                        "total_successful_tool_calls": total_successful_tool_calls,
-                    }),
+                    crate::traits::SelfCorrectionSubjectKind::Task,
+                    &signature,
+                    approach_pivots_used + 1,
+                    None,
                 )
-                .await;
-            commit_state!();
-            return Ok(StoppingPhaseOutcome::PivotApproach { failure_record });
+                .await
+            {
+                warn!(session_id, task_id, error = %e, "self-correction: record_failure failed (continuing)");
+            }
+
+            // Budget decision with graceful fallback to the in-memory counter.
+            let may_pivot = match controller.pivot_budget(task_id).await {
+                Ok(crate::agent::self_correction::AttemptDecision::Proceed { .. }) => true,
+                Ok(crate::agent::self_correction::AttemptDecision::StopBudget) => false,
+                Ok(crate::agent::self_correction::AttemptDecision::StopRepeat) => false,
+                Err(e) => {
+                    warn!(session_id, task_id, error = %e, "self-correction: pivot_budget failed; falling back to in-memory counter");
+                    approach_pivots_used < crate::agent::approach_pivot::MAX_APPROACH_PIVOTS
+                }
+            };
+
+            if may_pivot {
+                let failure_record = crate::agent::approach_pivot::build_failure_record(
+                    approach_pivots_used + 1,
+                    &learning_ctx.tool_calls,
+                    &learning_ctx.errors,
+                    completion_progress.mutation_count,
+                );
+                warn!(
+                    session_id,
+                    iteration,
+                    stall_count = detected_stall_count,
+                    unrecovered_errors,
+                    pivots_used = approach_pivots_used,
+                    "Stall with failing approach: pivoting to a new approach instead of ending the task"
+                );
+                agent
+                    .emit_warning_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Approach pivot: retrying with a different approach".to_string(),
+                        json!({
+                            "condition": "approach_pivot",
+                            "attempt": approach_pivots_used + 1,
+                            "stall_count": detected_stall_count,
+                            "unrecovered_errors": unrecovered_errors,
+                            "total_successful_tool_calls": total_successful_tool_calls,
+                        }),
+                    )
+                    .await;
+                commit_state!();
+                return Ok(StoppingPhaseOutcome::PivotApproach { failure_record });
+            }
+
+            // Budget exhausted: persist an honest give-up summary (terminal
+            // ledger marker + telemetry); fall through to the existing graceful
+            // exits below, which compose the user-facing message unchanged.
+            match controller.give_up_report(task_id).await {
+                Ok(Some(report)) => {
+                    warn!(
+                        session_id,
+                        task_id, "self-correction: pivot budget exhausted; {}", report
+                    );
+                    agent
+                        .emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::StoppingCondition,
+                            "Approach pivot budget exhausted".to_string(),
+                            json!({ "condition": "approach_pivot_exhausted", "report": report }),
+                        )
+                        .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(session_id, task_id, error = %e, "self-correction: give_up_report failed")
+                }
+            }
         }
 
         let meaningful_progress = (total_successful_tool_calls >= 5 || evidence_gain_count >= 3)

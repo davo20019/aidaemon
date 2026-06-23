@@ -35,22 +35,6 @@ pub(in crate::agent) fn approach_is_failing(
     tool_attempts > 0 && (unrecovered_errors > 0 || total_successful_tool_calls == 0)
 }
 
-/// Back-compat wrapper retained for `stopping_phase.rs` until Task 3 rewrites
-/// that call site. Combines the pivot-count cap with `approach_is_failing`.
-pub(in crate::agent) fn should_pivot_approach(
-    pivots_used: usize,
-    tool_attempts: usize,
-    unrecovered_errors: usize,
-    total_successful_tool_calls: usize,
-) -> bool {
-    pivots_used < MAX_APPROACH_PIVOTS
-        && approach_is_failing(
-            tool_attempts,
-            unrecovered_errors,
-            total_successful_tool_calls,
-        )
-}
-
 /// Build the deterministic failure record for the pivot directive.
 ///
 /// Includes: attempt number, the tool calls tried, every unrecovered error
