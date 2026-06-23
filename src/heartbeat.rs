@@ -26,6 +26,32 @@ fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+/// Seconds since a task's most recent activity (or its `started_at` when it has
+/// no activity rows). Used to tag stuck-task interrupts so the inactivity
+/// threshold can be tuned from data. Returns 0 if no timestamp parses (never
+/// panics). Both inputs are RFC3339 or SQLite-datetime strings.
+fn task_inactivity_secs(
+    last_activity: Option<&str>,
+    started_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|nd| nd.and_utc())
+            })
+    };
+    let reference = last_activity.and_then(parse).or_else(|| parse(started_at));
+    match reference {
+        Some(ts) => (now - ts).num_seconds().max(0),
+        None => 0,
+    }
+}
+
 /// Runtime snapshot of a heartbeat background job.
 #[derive(Debug, Clone, Serialize)]
 pub struct HeartbeatJobSnapshot {
@@ -506,7 +532,23 @@ impl HeartbeatCoordinator {
             }
         };
         for task in &stuck {
-            warn!(task_id = %task.id, goal_id = %task.goal_id, "Marking stuck task as interrupted");
+            let last_activity = self
+                .state
+                .get_task_activities(&task.id)
+                .await
+                .ok()
+                .and_then(|acts| acts.last().map(|a| a.created_at.clone()));
+            let inactivity_secs = task_inactivity_secs(
+                last_activity.as_deref(),
+                task.started_at.as_deref().unwrap_or(&task.created_at),
+                chrono::Utc::now(),
+            );
+            warn!(
+                task_id = %task.id,
+                goal_id = %task.goal_id,
+                inactivity_secs,
+                "Marking stuck task as interrupted"
+            );
             if let Err(e) = self.state.mark_task_interrupted(&task.id).await {
                 error!(task_id = %task.id, error = %e, "Failed to mark stuck task");
             }
@@ -1931,6 +1973,22 @@ mod tests {
     async fn test_deferred_finite_goal_fires() {
         // Deprecated: deferred finite goals are now represented as one-shot goal_schedules.
         // This behavior is covered by test_due_one_shot_schedule_creates_task_and_deletes_schedule().
+    }
+
+    #[test]
+    fn task_inactivity_secs_uses_last_activity_then_started_at() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-23T00:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Last activity 2 min ago → 120s.
+        assert_eq!(
+            task_inactivity_secs(Some("2026-06-23T00:08:00Z"), "2026-06-23T00:00:00Z", now),
+            120
+        );
+        // No activity → falls back to started_at (10 min ago → 600s).
+        assert_eq!(task_inactivity_secs(None, "2026-06-23T00:00:00Z", now), 600);
+        // Unparseable inputs → 0 (never panics).
+        assert_eq!(task_inactivity_secs(Some("garbage"), "garbage", now), 0);
     }
 
     #[tokio::test]
