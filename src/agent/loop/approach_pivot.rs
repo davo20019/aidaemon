@@ -21,22 +21,34 @@
 /// Maximum approach pivots per task (total approaches = pivots + 1).
 pub(in crate::agent) const MAX_APPROACH_PIVOTS: usize = 2;
 
-/// Whether a stalled task should pivot to a new approach instead of ending.
-///
-/// Pivot only when there is something to pivot *from* (at least one tool
-/// attempt) and the approach is failing (unrecovered errors, or zero
-/// successful calls). A stall after clean meaningful progress is a
-/// summarization problem, not an approach problem — no pivot.
+/// Whether the current approach is demonstrably failing and worth pivoting away
+/// from. Pivot only when there is something to pivot *from* (at least one tool
+/// attempt) and the approach is failing (unrecovered errors, or zero successful
+/// calls). A stall after clean meaningful progress is a summarization problem,
+/// not an approach problem — no pivot. The pivot *budget* (how many pivots are
+/// allowed) is enforced separately by `SelfCorrectionController`.
+pub(in crate::agent) fn approach_is_failing(
+    tool_attempts: usize,
+    unrecovered_errors: usize,
+    total_successful_tool_calls: usize,
+) -> bool {
+    tool_attempts > 0 && (unrecovered_errors > 0 || total_successful_tool_calls == 0)
+}
+
+/// Back-compat wrapper retained for `stopping_phase.rs` until Task 3 rewrites
+/// that call site. Combines the pivot-count cap with `approach_is_failing`.
 pub(in crate::agent) fn should_pivot_approach(
     pivots_used: usize,
     tool_attempts: usize,
     unrecovered_errors: usize,
     total_successful_tool_calls: usize,
 ) -> bool {
-    if pivots_used >= MAX_APPROACH_PIVOTS || tool_attempts == 0 {
-        return false;
-    }
-    unrecovered_errors > 0 || total_successful_tool_calls == 0
+    pivots_used < MAX_APPROACH_PIVOTS
+        && approach_is_failing(
+            tool_attempts,
+            unrecovered_errors,
+            total_successful_tool_calls,
+        )
 }
 
 /// Build the deterministic failure record for the pivot directive.
@@ -109,22 +121,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pivots_when_errors_and_attempts_remain() {
-        assert!(should_pivot_approach(0, 4, 3, 1));
-        assert!(should_pivot_approach(1, 4, 3, 1));
+    fn failing_when_errors_or_zero_success_and_something_tried() {
+        // Unrecovered errors with attempts → failing.
+        assert!(approach_is_failing(4, 3, 1));
         // Zero successes also qualifies even without recorded errors
         // (e.g. every call was guard-blocked).
-        assert!(should_pivot_approach(0, 2, 0, 0));
+        assert!(approach_is_failing(2, 0, 0));
     }
 
     #[test]
-    fn no_pivot_when_exhausted_or_nothing_to_reference() {
-        // Pivots used up.
-        assert!(!should_pivot_approach(MAX_APPROACH_PIVOTS, 4, 3, 1));
+    fn not_failing_when_nothing_tried_or_clean_progress() {
         // No tool attempts at all — nothing to pivot from.
-        assert!(!should_pivot_approach(0, 0, 0, 0));
+        assert!(!approach_is_failing(0, 0, 0));
         // Clean progress, no unrecovered errors — summarize, don't pivot.
-        assert!(!should_pivot_approach(0, 6, 0, 6));
+        assert!(!approach_is_failing(6, 0, 6));
     }
 
     #[test]
