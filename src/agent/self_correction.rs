@@ -112,4 +112,24 @@ mod tests {
             AttemptDecision::Proceed { attempt_index: 4 }
         );
     }
+
+    #[test]
+    fn blocked_signature_is_repeat_blocked() {
+        let prior = vec![attempt("x", attempt_status::BLOCKED)];
+        assert_eq!(decide_attempt(&prior, "x", 3), AttemptDecision::StopRepeat);
+    }
+
+    #[test]
+    fn gave_up_rows_do_not_count_toward_budget_or_repeat() {
+        let prior = vec![
+            attempt("a", attempt_status::GAVE_UP),
+            attempt("b", attempt_status::GAVE_UP),
+            attempt("c", attempt_status::GAVE_UP),
+        ];
+        // gave_up rows are neither failures nor successes → budget intact, retrying "a" is fine.
+        assert_eq!(
+            decide_attempt(&prior, "a", 3),
+            AttemptDecision::Proceed { attempt_index: 4 }
+        );
+    }
 }
