@@ -44,6 +44,41 @@ pub fn decide_attempt(
     }
 }
 
+/// Deterministic, order-independent fingerprint of an approach (its set of
+/// `"tool_name(summary)"` calls). Used to identify a failed approach in the
+/// durable ledger. Order-independent so a re-ordered-but-equivalent attempt
+/// hashes the same; bounded so it stays a compact ledger key.
+#[allow(dead_code)] // Used in Task 2+; integration into agent loop pending
+pub fn approach_signature(tool_calls: &[String]) -> String {
+    let mut parts: Vec<&str> = tool_calls
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    let joined = parts.join("|");
+    crate::utils::truncate_str(&joined, 500)
+}
+
+/// Budget-only pivot decision: may the loop pivot to *another* approach? Unlike
+/// `decide_attempt`, there is no prospective signature, so this never blocks a
+/// repeat — it only enforces the K distinct-failure budget.
+pub fn decide_pivot_budget(prior: &[SelfCorrectionAttempt], k: usize) -> AttemptDecision {
+    let is_failed = |s: &str| s == attempt_status::FAILED || s == attempt_status::BLOCKED;
+    let mut distinct = std::collections::HashSet::new();
+    for a in prior.iter().filter(|a| is_failed(&a.status)) {
+        distinct.insert(a.approach_signature.as_str());
+    }
+    if distinct.len() >= k {
+        AttemptDecision::StopBudget
+    } else {
+        AttemptDecision::Proceed {
+            attempt_index: distinct.len() + 1,
+        }
+    }
+}
+
 /// Bounded, durable policy engine for self-correction. Library only: it decides
 /// whether an attempt may proceed and persists attempt outcomes; it never spawns
 /// or executes anything.
@@ -136,6 +171,12 @@ impl SelfCorrectionController {
             None,
         )
         .await
+    }
+
+    /// Budget check for an in-loop approach pivot: may the loop pivot again?
+    pub async fn pivot_budget(&self, subject_id: &str) -> anyhow::Result<AttemptDecision> {
+        let prior = self.state.get_self_correction_attempts(subject_id).await?;
+        Ok(decide_pivot_budget(&prior, self.max_attempts))
     }
 
     /// Honest summary of what was tried, or `None` if nothing failed. Persists a
@@ -383,6 +424,75 @@ mod tests {
         assert_eq!(
             decide_attempt(&prior, "a", 3),
             AttemptDecision::Proceed { attempt_index: 4 }
+        );
+    }
+
+    #[test]
+    fn approach_signature_is_deterministic_and_order_independent() {
+        let a = vec!["terminal(du -ah ~)".to_string(), "read_file(x)".to_string()];
+        let b = vec!["read_file(x)".to_string(), "terminal(du -ah ~)".to_string()];
+        // Same set of calls → same signature regardless of order; non-empty.
+        assert_eq!(approach_signature(&a), approach_signature(&b));
+        assert!(!approach_signature(&a).is_empty());
+        // Different approaches → different signatures.
+        let c = vec!["terminal(find ~ -size +500M)".to_string()];
+        assert_ne!(approach_signature(&a), approach_signature(&c));
+    }
+
+    #[test]
+    fn approach_signature_empty_is_stable() {
+        assert_eq!(approach_signature(&[]), approach_signature(&[]));
+    }
+
+    #[test]
+    fn decide_pivot_budget_proceeds_until_k_then_stops() {
+        let mk = |sig: &str| SelfCorrectionAttempt {
+            id: 0,
+            subject_id: "t".to_string(),
+            subject_kind: "task".to_string(),
+            approach_signature: sig.to_string(),
+            attempt_index: 1,
+            status: attempt_status::FAILED.to_string(),
+            blocked_reason: None,
+            evidence_ref: None,
+            created_at: "2026-06-23 00:00:00".to_string(),
+        };
+        // 0 failures → proceed (attempt 1).
+        assert_eq!(
+            decide_pivot_budget(&[], 3),
+            AttemptDecision::Proceed { attempt_index: 1 }
+        );
+        // 2 distinct failures, k=3 → proceed (attempt 3).
+        let two = vec![mk("a"), mk("b")];
+        assert_eq!(
+            decide_pivot_budget(&two, 3),
+            AttemptDecision::Proceed { attempt_index: 3 }
+        );
+        // 3 distinct failures → StopBudget.
+        let three = vec![mk("a"), mk("b"), mk("c")];
+        assert_eq!(decide_pivot_budget(&three, 3), AttemptDecision::StopBudget);
+        // Duplicate failed signatures count once (still under budget).
+        let dup = vec![mk("a"), mk("a"), mk("a")];
+        assert_eq!(
+            decide_pivot_budget(&dup, 3),
+            AttemptDecision::Proceed { attempt_index: 2 }
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_budget_reads_durable_failures() {
+        let ctrl = SelfCorrectionController::new(temp_state().await, 3);
+        let k = crate::traits::SelfCorrectionSubjectKind::Task;
+        assert_eq!(
+            ctrl.pivot_budget("tp").await.unwrap(),
+            AttemptDecision::Proceed { attempt_index: 1 }
+        );
+        ctrl.record_failure("tp", k, "a", 1, None).await.unwrap();
+        ctrl.record_failure("tp", k, "b", 2, None).await.unwrap();
+        ctrl.record_failure("tp", k, "c", 3, None).await.unwrap();
+        assert_eq!(
+            ctrl.pivot_budget("tp").await.unwrap(),
+            AttemptDecision::StopBudget
         );
     }
 }
