@@ -1268,6 +1268,11 @@ pub struct WatchdogConfig {
     /// Per-LLM-call timeout in seconds (default: 300 = 5 min).
     #[serde(default = "default_llm_call_timeout_secs")]
     pub llm_call_timeout_secs: u64,
+    /// Seconds of no task activity (tool or LLM call) before an orchestration
+    /// task is considered hung. Distinct from `stale_threshold_secs`, which
+    /// drives channel stale-watchdog behavior. Default: 300 = 5 min.
+    #[serde(default = "default_task_inactivity_timeout_secs")]
+    pub task_inactivity_timeout_secs: u64,
 }
 
 impl Default for WatchdogConfig {
@@ -1276,6 +1281,7 @@ impl Default for WatchdogConfig {
             enabled: default_watchdog_enabled(),
             stale_threshold_secs: default_watchdog_stale_secs(),
             llm_call_timeout_secs: default_llm_call_timeout_secs(),
+            task_inactivity_timeout_secs: default_task_inactivity_timeout_secs(),
         }
     }
 }
@@ -1287,6 +1293,9 @@ fn default_watchdog_stale_secs() -> u64 {
     300
 }
 fn default_llm_call_timeout_secs() -> u64 {
+    300
+}
+fn default_task_inactivity_timeout_secs() -> u64 {
     300
 }
 
@@ -3236,6 +3245,12 @@ impl AppConfig {
 mod tests {
     use super::*;
     use once_cell::sync::Lazy;
+
+    #[test]
+    fn watchdog_task_inactivity_timeout_defaults_to_300() {
+        let cfg = WatchdogConfig::default();
+        assert_eq!(cfg.task_inactivity_timeout_secs, 300);
+    }
 
     #[test]
     fn tool_result_chars_for_unknown_model_uses_global_default() {
