@@ -3631,3 +3631,16 @@ async fn prompt_snapshot_roundtrip_and_dedup() {
     );
     assert_eq!(store.get_prompt_snapshot("missing").await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn self_correction_attempts_table_exists_after_migration() {
+    let (store, _file) = setup_test_store().await;
+    // sqlite_master lists user tables; the migration runs on store open.
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='self_correction_attempts'",
+    )
+    .fetch_optional(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(name.as_deref(), Some("self_correction_attempts"));
+}
