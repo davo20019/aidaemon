@@ -49,8 +49,8 @@ pub use self_correction::*;
 pub use tools::{
     AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
     ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode,
+    ToolExecutionContext, ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
 };
 pub use trigger_event::TriggerEvent;
 

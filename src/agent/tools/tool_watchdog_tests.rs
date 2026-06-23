@@ -113,6 +113,8 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 project_scope: None,
                 trusted: false,
                 user_role: UserRole::Owner,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await;
@@ -147,6 +149,8 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 project_scope: None,
                 trusted: false,
                 user_role: UserRole::Owner,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await
@@ -178,6 +182,8 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 project_scope: None,
                 trusted: false,
                 user_role: UserRole::Owner,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await
@@ -210,6 +216,8 @@ async fn execute_tool_watchdog_injects_project_scope_into_spawn_agent() {
                 project_scope: Some("/Users/davidloor/Library/Logs/aidaemon"),
                 trusted: false,
                 user_role: UserRole::Owner,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await

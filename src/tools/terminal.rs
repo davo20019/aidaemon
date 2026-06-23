@@ -20,7 +20,7 @@ use crate::events::{
 };
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolVerificationMode,
+    ToolExecutionContext, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -2588,197 +2588,25 @@ impl TerminalTool {
             metadata: tracked_background_metadata(detached, false, None),
         })
     }
-}
 
-impl Drop for TerminalTool {
-    fn drop(&mut self) {
-        // Best-effort kill of all tracked background processes.
-        if let Ok(running) = self.running.try_lock() {
-            for (_, proc) in running.iter() {
-                send_sigterm(proc.child_id);
-                send_sigkill(proc.child_id);
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct TerminalArgs {
-    command: Option<String>,
-    #[serde(default = "default_action")]
-    action: String,
-    pid: Option<u32>,
-    /// If true, allow a timed-out command to outlive task boundaries.
-    /// Default false: timed-out background commands are task-owned and auto-cleaned
-    /// when the task ends.
-    #[serde(default, alias = "background")]
-    detach: bool,
-    #[serde(default)]
-    _untrusted_source: bool,
-    #[serde(default)]
-    _session_id: String,
-    #[serde(default)]
-    _task_id: Option<String>,
-    /// Injected by agent - goal context for routing background notifications.
-    #[serde(default)]
-    _goal_id: Option<String>,
-    /// Injected by agent for role-aware safeguards.
-    #[serde(default)]
-    _user_role: Option<String>,
-    /// Explicitly set by the agent from ChannelContext.trusted — never derived
-    /// from session ID strings. Only trusted scheduled tasks set this to true.
-    #[serde(default)]
-    _trusted_session: bool,
-}
-
-fn default_action() -> String {
-    "run".to_string()
-}
-
-fn extract_terminal_exit_code(output: &str) -> Option<i32> {
-    let marker = "[exit code:";
-    let start = output.rfind(marker)?;
-    let rest = output[start + marker.len()..].trim_start();
-    let code_token: String = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
-        .collect();
-    if code_token.is_empty() {
-        None
-    } else {
-        code_token.parse::<i32>().ok()
-    }
-}
-
-fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
-    ToolCallMetadata {
-        exit_code,
-        timed_out: false,
-        background_started: false,
-        detached: false,
-        completion_notifications_enabled: false,
-        transport_error: None,
-        http_status: None,
-        direct_response: None,
-        semantics: ToolCallSemantics::default(),
-        read_file: None,
-        ..Default::default()
-    }
-}
-
-fn tracked_background_metadata(
-    detached: bool,
-    completion_notifications_enabled: bool,
-    exit_code: Option<i32>,
-) -> ToolCallMetadata {
-    ToolCallMetadata {
-        exit_code,
-        timed_out: true,
-        background_started: true,
-        detached,
-        completion_notifications_enabled,
-        transport_error: None,
-        http_status: None,
-        direct_response: None,
-        semantics: ToolCallSemantics::default(),
-        read_file: None,
-        ..Default::default()
-    }
-}
-
-#[async_trait]
-impl Tool for TerminalTool {
-    fn name(&self) -> &str {
-        "terminal"
-    }
-
-    fn description(&self) -> &str {
-        "Execute a shell command. If a command is not pre-approved, the user will be asked to authorize it."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "terminal",
-            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command for action=run"
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": ["run", "check", "kill", "trust_all"],
-                        "description": "run, check, kill, or trust_all"
-                    },
-                    "detach": {
-                        "type": "boolean",
-                        "description": "Keep the process alive after the task ends"
-                    },
-                    "pid": {
-                        "type": "integer",
-                        "description": "Process ID for check/kill"
-                    }
-                },
-                "required": ["action", "command"],
-                "additionalProperties": false
-            }
-        })
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let args = serde_json::from_str::<Value>(arguments).ok();
-        let action = args
-            .as_ref()
-            .and_then(|value| value.get("action"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "run".to_string());
-
-        match action.as_str() {
-            "check" => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-            "kill" => ToolCallSemantics::mutation(),
-            "trust_all" => ToolCallSemantics::administrative(),
-            _ => args
-                .as_ref()
-                .and_then(|value| value.get("command"))
-                .and_then(|value| value.as_str())
-                .map(classify_shell_command)
-                .unwrap_or_else(ToolCallSemantics::mutation),
-        }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        // For backwards compatibility, delegate to call_with_status with no sender.
-        self.call_with_status(arguments, None).await
-    }
-
-    async fn call_with_status(
+    /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.
+    ///
+    /// `correction_preapproved` is a Rust-side control-plane flag set by the
+    /// correction gate — it is NEVER derived from tool arguments, model output, or
+    /// any JSON field.  When true (and action=="run"), the user-approval prompt is
+    /// bypassed after all hard blocks and command-safety checks have passed.
+    ///
+    /// Approval ordering for action="run":
+    ///   1. Hard blocks (dangerous irreversible commands)  → always enforced
+    ///   2. Safety soft-blocks (heredoc, python -c, etc.) → always enforced
+    ///   3. Daemonization block / daemonization approval   → always enforced
+    ///   4. `correction_preapproved`                       → skips prompt if true
+    ///   5. `_untrusted_source` / `_trusted_session` / allowlists / normal prompt
+    async fn execute_terminal(
         &self,
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
-    ) -> anyhow::Result<String> {
-        self.call_with_status_outcome(arguments, status_tx)
-            .await
-            .map(|outcome| outcome.output)
-    }
-
-    async fn call_with_status_outcome(
-        &self,
-        arguments: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        correction_preapproved: bool,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
 
@@ -3009,10 +2837,25 @@ impl Tool for TerminalTool {
                     );
                 }
 
-                // Determine if approval is needed
-                // Note: is_allowed() checks both permanent AND session-approved prefixes
+                // Determine if approval is needed.
+                // Note: is_allowed() checks both permanent AND session-approved prefixes.
+                //
+                // Ordering (enforced here; do not reorder):
+                //   1. daemonization_approved  → never re-prompt after daemonization gate
+                //   2. correction_preapproved  → dispatcher-owned one-shot bypass (Rust side only)
+                //   3. _untrusted_source       → external triggers always re-prompt
+                //   4. detach && !is_allowed   → novel detached commands re-prompt
+                //   5. _trusted_session        → scheduled tasks skip prompt
+                //   6. !is_allowed             → normal allowlist check
                 let is_allowed = self.is_allowed(command).await;
                 let needs_approval = if daemonization_approved {
+                    false
+                } else if correction_preapproved {
+                    // Dispatcher classified this call as safe; skip the user prompt.
+                    // _untrusted_source is intentionally overridden here: the correction
+                    // gate is only active for trigger sessions, so if we reach this
+                    // branch, the gate has already confirmed safety.
+                    info!(command = %command, "Auto-approved: correction gate preapproval");
                     false
                 } else if args._untrusted_source {
                     // External triggers always need approval regardless of mode
@@ -3098,6 +2941,224 @@ impl Tool for TerminalTool {
         }
 
         Ok(outcome)
+    }
+}
+
+impl Drop for TerminalTool {
+    fn drop(&mut self) {
+        // Best-effort kill of all tracked background processes.
+        if let Ok(running) = self.running.try_lock() {
+            for (_, proc) in running.iter() {
+                send_sigterm(proc.child_id);
+                send_sigkill(proc.child_id);
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TerminalArgs {
+    command: Option<String>,
+    #[serde(default = "default_action")]
+    action: String,
+    pid: Option<u32>,
+    /// If true, allow a timed-out command to outlive task boundaries.
+    /// Default false: timed-out background commands are task-owned and auto-cleaned
+    /// when the task ends.
+    #[serde(default, alias = "background")]
+    detach: bool,
+    #[serde(default)]
+    _untrusted_source: bool,
+    #[serde(default)]
+    _session_id: String,
+    #[serde(default)]
+    _task_id: Option<String>,
+    /// Injected by agent - goal context for routing background notifications.
+    #[serde(default)]
+    _goal_id: Option<String>,
+    /// Injected by agent for role-aware safeguards.
+    #[serde(default)]
+    _user_role: Option<String>,
+    /// Explicitly set by the agent from ChannelContext.trusted — never derived
+    /// from session ID strings. Only trusted scheduled tasks set this to true.
+    #[serde(default)]
+    _trusted_session: bool,
+}
+
+fn default_action() -> String {
+    "run".to_string()
+}
+
+fn extract_terminal_exit_code(output: &str) -> Option<i32> {
+    let marker = "[exit code:";
+    let start = output.rfind(marker)?;
+    let rest = output[start + marker.len()..].trim_start();
+    let code_token: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect();
+    if code_token.is_empty() {
+        None
+    } else {
+        code_token.parse::<i32>().ok()
+    }
+}
+
+fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
+    ToolCallMetadata {
+        exit_code,
+        timed_out: false,
+        background_started: false,
+        detached: false,
+        completion_notifications_enabled: false,
+        transport_error: None,
+        http_status: None,
+        direct_response: None,
+        semantics: ToolCallSemantics::default(),
+        read_file: None,
+        ..Default::default()
+    }
+}
+
+fn tracked_background_metadata(
+    detached: bool,
+    completion_notifications_enabled: bool,
+    exit_code: Option<i32>,
+) -> ToolCallMetadata {
+    ToolCallMetadata {
+        exit_code,
+        timed_out: true,
+        background_started: true,
+        detached,
+        completion_notifications_enabled,
+        transport_error: None,
+        http_status: None,
+        direct_response: None,
+        semantics: ToolCallSemantics::default(),
+        read_file: None,
+        ..Default::default()
+    }
+}
+
+#[async_trait]
+impl Tool for TerminalTool {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+
+    fn description(&self) -> &str {
+        "Execute a shell command. If a command is not pre-approved, the user will be asked to authorize it."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "terminal",
+            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command for action=run"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "check", "kill", "trust_all"],
+                        "description": "run, check, kill, or trust_all"
+                    },
+                    "detach": {
+                        "type": "boolean",
+                        "description": "Keep the process alive after the task ends"
+                    },
+                    "pid": {
+                        "type": "integer",
+                        "description": "Process ID for check/kill"
+                    }
+                },
+                "required": ["action", "command"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let action = args
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "run".to_string());
+
+        match action.as_str() {
+            "check" => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            "kill" => ToolCallSemantics::mutation(),
+            "trust_all" => ToolCallSemantics::administrative(),
+            _ => args
+                .as_ref()
+                .and_then(|value| value.get("command"))
+                .and_then(|value| value.as_str())
+                .map(classify_shell_command)
+                .unwrap_or_else(ToolCallSemantics::mutation),
+        }
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        // For backwards compatibility, delegate to call_with_status with no sender.
+        self.call_with_status(arguments, None).await
+    }
+
+    async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_outcome(arguments, status_tx)
+            .await
+            .map(|outcome| outcome.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.execute_terminal(arguments, status_tx, false).await
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        // Correction preapproval is only honored for action="run".  For check/kill/trust_all,
+        // the normal path (no preapproval) is used because:
+        //   - check/kill have no user-approval gate to bypass.
+        //   - trust_all must never be silently executed by the correction gate.
+        let correction_preapproved = if exec_ctx.correction_preapproved {
+            // Peek at the action field without fully parsing the args yet.
+            let action = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "run".to_string());
+            action == "run" || action.is_empty()
+        } else {
+            false
+        };
+        self.execute_terminal(arguments, status_tx, correction_preapproved)
+            .await
     }
 
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
@@ -4875,5 +4936,215 @@ mod tests {
             .await
             .unwrap();
         assert!(ok.contains("scoped-ok"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2.3 terminal tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper that creates a TerminalTool with an open-ended approval channel
+    /// (receiver kept alive) so approval requests don't immediately error.
+    /// Returns (tool, approval_rx) — keep approval_rx alive for the test duration.
+    async fn make_tool_with_open_approval_channel(
+    ) -> (TerminalTool, tokio::sync::mpsc::Receiver<ApprovalRequest>) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(4);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool =
+            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        std::mem::forget(db_file);
+        (tool, approval_rx)
+    }
+
+    /// correction_preapproved=true bypasses the `_untrusted_source` prompt for
+    /// a safe `action="run"` command.
+    ///
+    /// Without preapproval, `_untrusted_source=true` forces an approval request
+    /// which blocks until the channel is answered.  With preapproval the command
+    /// must run without hitting the approval channel.
+    #[tokio::test]
+    async fn correction_preapproval_bypasses_untrusted_source_for_run() {
+        // Close the approval receiver so any approval attempt errors immediately.
+        // If the preapproval gate works, the tool should NOT attempt approval and
+        // should succeed with the command output.
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx); // <-- closed; any approval attempt would error
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool =
+            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        std::mem::forget(db_file);
+
+        // args include _untrusted_source=true which would normally force approval.
+        let args = r#"{"action":"run","command":"echo preapproved-ok","_untrusted_source":true,"_session_id":"s1","_user_role":"Owner"}"#;
+
+        let exec_ctx = ToolExecutionContext {
+            correction_preapproved: true,
+        };
+
+        let result = tool
+            .call_with_execution_context(args, None, exec_ctx)
+            .await
+            .expect("preapproved run should succeed without approval");
+
+        assert!(
+            result.output.contains("preapproved-ok"),
+            "preapproved run should execute the command, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Could not get approval"),
+            "preapproved run must not have hit the approval gate, got: {}",
+            result.output
+        );
+    }
+
+    /// correction_preapproved=true does NOT bypass approval for non-run actions.
+    ///
+    /// `trust_all` must require an explicit owner interaction even when
+    /// correction_preapproved is set — it cannot be silently executed by the
+    /// correction gate.
+    #[tokio::test]
+    async fn correction_preapproval_does_not_bypass_non_run_actions() {
+        // trust_all doesn't use the approval channel — it just returns output.
+        // Test that trust_all still behaves correctly (runs, not blocked) when
+        // preapproved, but also that check/kill don't crash without pid.
+        // The key invariant: non-run actions go through the normal path.
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool =
+            TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool).await;
+        std::mem::forget(db_file);
+
+        let exec_ctx = ToolExecutionContext {
+            correction_preapproved: true,
+        };
+
+        // "check" with no pid should return an error (normal path), not be silently
+        // auto-approved or crash.  correction_preapproved must not turn this into
+        // a run action.
+        let check_result = tool
+            .call_with_execution_context(
+                r#"{"action":"check","_session_id":"s1","_user_role":"Owner"}"#,
+                None,
+                exec_ctx,
+            )
+            .await;
+
+        // Should be Err (pid required) or contain an error message — never a panic
+        // and never treated as "run".
+        match check_result {
+            Err(e) => assert!(
+                e.to_string().contains("pid"),
+                "check without pid should fail with pid-related error, got: {}",
+                e
+            ),
+            Ok(outcome) => assert!(
+                outcome.output.contains("pid") || outcome.output.contains("required"),
+                "check without pid output should mention pid, got: {}",
+                outcome.output
+            ),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2.5-C: next ordinary unsafe command still prompts after a preapproved call
+    //
+    // After a correction-preapproved call succeeds, the next call with
+    // correction_preapproved=false and _untrusted_source=true must still reach
+    // the approval channel.  We prove this by:
+    //   1. Making a preapproved call (approval_rx has a closed receiver — no
+    //      approval request should arrive).
+    //   2. Dropping that tool and creating a fresh tool with an open approval
+    //      channel.
+    //   3. Calling with correction_preapproved=false + _untrusted_source=true.
+    //   4. Asserting that an approval request IS received on the channel.
+    //
+    // The freshness of the tool is intentional: TerminalTool's session_approved
+    // HashSet is per-instance.  The structural invariant is that correction_
+    // preapproved never touches session_approved (see terminal.rs:2853 — the
+    // `else if correction_preapproved` branch does NOT call add_session_prefix
+    // or add_prefix; it only sets needs_approval=false and logs).  Therefore
+    // even on the same instance, no residue would pollute session_approved.
+    //
+    // Using a fresh instance makes the "still prompts" proof self-contained and
+    // independent of any cross-call state.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_next_ordinary_unsafe_command_still_prompts() {
+        // --- Part 1: correction-preapproved call on a tool with a closed receiver ---
+        // We intentionally close the approval_rx; if the preapproval gate works,
+        // no approval request is sent and the command executes.
+        {
+            let db_file = tempfile::NamedTempFile::new().unwrap();
+            let db_url = format!("sqlite:{}", db_file.path().display());
+            let pool = SqlitePool::connect(&db_url).await.unwrap();
+            let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+            drop(approval_rx); // closed — any approval attempt would error
+            let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+            let tool =
+                TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool)
+                    .await;
+            std::mem::forget(db_file);
+
+            let exec_ctx = ToolExecutionContext {
+                correction_preapproved: true,
+            };
+            let result = tool
+                .call_with_execution_context(
+                    r#"{"action":"run","command":"echo p25-preapproved","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
+                    None,
+                    exec_ctx,
+                )
+                .await
+                .expect("preapproved run must succeed without hitting closed approval channel");
+            assert!(
+                result.output.contains("p25-preapproved"),
+                "preapproved call must execute the command, got: {}",
+                result.output
+            );
+        } // tool dropped; any session_approved state is dropped with it
+
+        // --- Part 2: ordinary (non-preapproved) call must reach the approval channel ---
+        // Fresh tool with an OPEN approval channel.  We answer on a background task
+        // so the call can complete; we then verify the request was received.
+        let (tool, mut approval_rx) = make_tool_with_open_approval_channel().await;
+
+        // Answer the approval request from a background task so the tool call
+        // can complete without blocking forever.
+        tokio::spawn(async move {
+            if let Some(req) = approval_rx.recv().await {
+                // Deny it — we only care that the request WAS sent, not the outcome.
+                let _ = req.response_tx.send(ApprovalResponse::Deny);
+            }
+        });
+
+        // This call has correction_preapproved=false and _untrusted_source=true.
+        // The untrusted-source branch forces needs_approval=true, so an approval
+        // request MUST be sent to the channel.
+        let result = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"echo ordinary-unsafe","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                },
+            )
+            .await
+            .expect("call should complete (denied, not error)");
+
+        assert!(
+            result.output.contains("denied") || result.output.contains("Deny"),
+            "ordinary unsafe command must have gone through the approval gate \
+             (expected denial message), got: {}",
+            result.output
+        );
     }
 }

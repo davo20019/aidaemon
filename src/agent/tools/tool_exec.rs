@@ -9,6 +9,14 @@ pub(super) struct ToolExecCtx<'a> {
     pub project_scope: Option<&'a str>,
     pub trusted: bool,
     pub user_role: UserRole,
+    /// Set by the correction gate when this specific tool call has already
+    /// been classified as allowed for unattended execution.
+    /// False on all normal (non-correction) paths.
+    pub correction_preapproved: bool,
+    /// When true, the `_trusted_session` enrichment flag must NOT be injected
+    /// into tool args (the correction sandbox overrides trusted-session semantics).
+    /// False on all normal paths.
+    pub suppress_trusted_session: bool,
 }
 
 // impl-Agent justification: tool dispatch with watchdog over tools/state/event_store/verification_tracker.
@@ -70,28 +78,38 @@ impl Agent {
         let task_id = ctx.task_id;
         let channel_visibility = ctx.channel_visibility;
         let channel_id = ctx.channel_id;
-        let trusted = ctx.trusted
-            || if let Some(goal_id) = self.goal_id.as_deref() {
-                // Scheduled goal runs are user-confirmed automation, so treat
-                // their tool calls as trusted even when the execution context
-                // was recreated later by heartbeat/orphan dispatch.
-                goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await
-            } else if let Some(executor_task_id) = self.task_id.as_deref() {
-                if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
-                    goal_has_scheduled_provenance(
-                        &self.state,
-                        &task.goal_id,
-                        Some(executor_task_id),
-                    )
-                    .await
+        // Trust suppression: when the correction gate sets suppress_trusted_session,
+        // we must NOT inject `_trusted_session` even if ChannelContext.trusted is true
+        // or scheduled provenance would ordinarily authorize it.  Setting ctx.trusted=false
+        // alone is insufficient because the OR below would still pick up scheduled
+        // provenance; the entire expression must short-circuit to false.
+        let trusted = if ctx.suppress_trusted_session {
+            false
+        } else {
+            ctx.trusted
+                || if let Some(goal_id) = self.goal_id.as_deref() {
+                    // Scheduled goal runs are user-confirmed automation, so treat
+                    // their tool calls as trusted even when the execution context
+                    // was recreated later by heartbeat/orphan dispatch.
+                    goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref())
+                        .await
+                } else if let Some(executor_task_id) = self.task_id.as_deref() {
+                    if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
+                        goal_has_scheduled_provenance(
+                            &self.state,
+                            &task.goal_id,
+                            Some(executor_task_id),
+                        )
+                        .await
+                    } else {
+                        task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
+                    }
+                } else if let Some(task_id) = task_id {
+                    task_has_scheduled_provenance(&self.state, Some(task_id)).await
                 } else {
-                    task_has_scheduled_provenance(&self.state, Some(executor_task_id)).await
+                    false
                 }
-            } else if let Some(task_id) = task_id {
-                task_has_scheduled_provenance(&self.state, Some(task_id)).await
-            } else {
-                false
-            };
+        };
         let user_role = ctx.user_role;
 
         if user_role != UserRole::Owner {
@@ -195,8 +213,11 @@ impl Agent {
 
         for tool in &self.tools {
             if tool.name() == name {
+                let exec_ctx = crate::traits::ToolExecutionContext {
+                    correction_preapproved: ctx.correction_preapproved,
+                };
                 let result = tool
-                    .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
+                    .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
                     .await
                     .map(|mut outcome| {
                         let fallback = tool.call_semantics(&enriched_args);
@@ -227,11 +248,16 @@ impl Agent {
             }
         }
 
-        // Search MCP registry for dynamically registered tools
+        // Search MCP registry for dynamically registered tools.
+        // MCP tools are never correction-preapproved in 3b; they receive the
+        // default exec_ctx (correction_preapproved=false).
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
+                let exec_ctx = crate::traits::ToolExecutionContext {
+                    correction_preapproved: false,
+                };
                 return tool
-                    .call_with_status_outcome(&enriched_args, ctx.status_tx.clone())
+                    .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
                     .await
                     .map(|mut outcome| {
                         let fallback = tool.call_semantics(&enriched_args);
@@ -258,3 +284,7 @@ impl Agent {
 #[cfg(test)]
 #[path = "tool_watchdog_tests.rs"]
 mod tool_watchdog_tests;
+
+#[cfg(test)]
+#[path = "correction_preapproval_tests.rs"]
+mod correction_preapproval_tests;
