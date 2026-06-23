@@ -77,8 +77,12 @@ pub const MUTATING_HTTP_METHODS: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
 /// Pure correction-mode action classifier. See module docs + Plan 2b for policy.
 #[allow(dead_code)]
 pub fn classify_action(action: &ProposedAction, ctx: &CorrectionSubjectContext) -> ActionVerdict {
+    // Normalize tool name once so all comparisons below are case-insensitive.
+    let tool = action.tool_name.to_ascii_lowercase();
+    let tool = tool.as_str();
+
     // (1) Destructive terminal commands.
-    if matches!(action.tool_name, "terminal" | "run_command") {
+    if matches!(tool, "terminal" | "run_command") {
         if let Some(cmd) = action.terminal_command {
             if let Some(reason) = crate::tools::command_risk::hard_block_reason(cmd) {
                 return ActionVerdict::Blocked(format!("destructive command: {reason}"));
@@ -87,15 +91,15 @@ pub fn classify_action(action: &ProposedAction, ctx: &CorrectionSubjectContext) 
     }
 
     // (2) Credential / config management.
-    if CREDENTIAL_TOOLS.contains(&action.tool_name) {
+    if CREDENTIAL_TOOLS.contains(&tool) {
         return ActionVerdict::Blocked(
             "credential/config management is not allowed during autonomous correction".to_string(),
         );
     }
 
     // (3) Mutating external writes — allowed only for an intended account/target.
-    let is_mutating_external = MUTATING_EXTERNAL_TOOLS.contains(&action.tool_name)
-        || (matches!(action.tool_name, "http_request" | "web_fetch")
+    let is_mutating_external = MUTATING_EXTERNAL_TOOLS.contains(&tool)
+        || (matches!(tool, "http_request" | "web_fetch")
             && action
                 .http_method
                 .map(|m| MUTATING_HTTP_METHODS.contains(&m.to_uppercase().as_str()))
@@ -254,5 +258,44 @@ mod tests {
             classify_action(&action("read_file"), &ctx_with(vec![])),
             ActionVerdict::Allowed
         );
+    }
+
+    #[test]
+    fn mutating_external_blocked_for_present_but_nonmatching_target() {
+        let mut a = action("http_request");
+        a.http_method = Some("POST");
+        a.external_target = Some("evil.com");
+        let ctx = ctx_with(vec![IntendedAccount {
+            provider: "twitter".to_string(),
+            account_id: "acct-123".to_string(),
+            account_label: "AcmeBot".to_string(),
+        }]);
+        // Target matches neither account_id, provider, nor allowed_external_targets.
+        assert!(matches!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn mutating_method_check_is_case_insensitive() {
+        let mut a = action("http_request");
+        a.http_method = Some("post"); // lowercase must still count as mutating
+        a.external_target = Some("api.example.com");
+        assert!(matches!(
+            classify_action(&a, &ctx_with(vec![])),
+            ActionVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn tool_name_matching_is_case_insensitive() {
+        // A non-canonical casing must not evade the destructive-terminal block.
+        let mut a = action("Terminal");
+        a.terminal_command = Some("rm -rf /");
+        assert!(matches!(
+            classify_action(&a, &ctx_with(vec![])),
+            ActionVerdict::Blocked(_)
+        ));
     }
 }
