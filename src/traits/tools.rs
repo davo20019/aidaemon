@@ -631,6 +631,20 @@ fn default_semantics_from_identity(
     semantics
 }
 
+/// Dispatcher-owned execution context passed to tools via the trait method.
+///
+/// This is a Rust-side control-plane type — it is NEVER serialized, never appears
+/// in model-visible JSON, tool schemas, logs, or persisted tool arguments.
+/// Do NOT add fields here that duplicate information already in the enriched args.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolExecutionContext {
+    /// When true, the dispatcher has already classified this specific tool call
+    /// as safe for unattended execution.  Tools that honor this (currently
+    /// `terminal` and `http_request`) may skip their user-approval prompt.
+    /// Hard blocks, command-safety checks, and all other validations still run.
+    pub correction_preapproved: bool,
+}
+
 /// Tool trait — system tools, terminal, MCP-proxied tools.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -664,6 +678,26 @@ pub trait Tool: Send + Sync {
     ) -> anyhow::Result<ToolCallOutcome> {
         let output = self.call_with_status(arguments, status_tx).await?;
         Ok(ToolCallOutcome::from_output(output))
+    }
+
+    /// Context-aware execution path used by the agent loop for correction-gate calls.
+    ///
+    /// The default implementation discards `exec_ctx` and delegates to
+    /// `call_with_status_outcome`, so existing tools are completely unaffected.
+    /// Tools that support correction preapproval (`terminal`, `http_request`) override
+    /// this method and inspect `exec_ctx.correction_preapproved` to decide whether to
+    /// skip the user-approval prompt.
+    ///
+    /// **Security invariant:** `exec_ctx` is a Rust-side control-plane value — it must
+    /// never be serialized, logged at info level, or reflected back into tool args.
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = exec_ctx;
+        self.call_with_status_outcome(arguments, status_tx).await
     }
 
     /// Task lifecycle callback fired after the agent emits `TaskEnd`.

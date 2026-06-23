@@ -15,7 +15,7 @@ use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolTargetHintKind, ToolVerificationMode,
+    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -1022,9 +1022,18 @@ impl HttpRequestTool {
         Ok((response, redirect_count))
     }
 
-    /// Core implementation shared by `call()` and `call_with_status_outcome()`.
+    /// Core implementation shared by `call()`, `call_with_status_outcome()`, and
+    /// `call_with_execution_context()`.
     /// Returns the formatted output string and the HTTP status code (if one was observed).
-    async fn execute(&self, arguments: &str) -> anyhow::Result<(String, Option<u16>)> {
+    ///
+    /// `correction_preapproved` is a Rust-side control-plane flag — it must never be
+    /// derived from tool arguments or model output.  When true, the user-approval prompt
+    /// is bypassed after all safety checks (SSRF, secret detection, etc.) have passed.
+    async fn execute(
+        &self,
+        arguments: &str,
+        correction_preapproved: bool,
+    ) -> anyhow::Result<(String, Option<u16>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
         // Parse parameters
@@ -1159,7 +1168,12 @@ impl HttpRequestTool {
             ));
         }
 
-        // Step 8: Classify risk and request approval
+        // Step 8: Classify risk and request approval.
+        //
+        // Approval is skipped when:
+        //   a) correction_preapproved=true (Rust-side gate, never from JSON args), OR
+        //   b) request is session-approved, OR
+        //   c) is_trusted_session (scheduled task context)
         let risk = Self::classify_risk(&method, profile.is_some());
         let session_id = args["_session_id"].as_str().unwrap_or("unknown");
         let is_trusted_session = args["_trusted_session"].as_bool().unwrap_or(false);
@@ -1170,11 +1184,13 @@ impl HttpRequestTool {
             content_type.as_deref(),
         );
 
-        if Self::requires_runtime_approval(
-            risk,
-            self.is_session_approved(session_id, &approval_key).await,
-            is_trusted_session,
-        ) {
+        if !correction_preapproved
+            && Self::requires_runtime_approval(
+                risk,
+                self.is_session_approved(session_id, &approval_key).await,
+                is_trusted_session,
+            )
+        {
             let mut desc = format!("{} {}", method, url);
             if let Some(name) = auth_profile_name {
                 desc.push_str(&format!(" [auth: {}]", name));
@@ -1541,7 +1557,9 @@ impl Tool for HttpRequestTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments).await.map(|(output, _)| output)
+        self.execute(arguments, false)
+            .await
+            .map(|(output, _)| output)
     }
 
     async fn call_with_status_outcome(
@@ -1550,7 +1568,26 @@ impl Tool for HttpRequestTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, http_status) = self.execute(arguments).await?;
+        let (output, http_status) = self.execute(arguments, false).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                http_status,
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, http_status) = self
+            .execute(arguments, exec_ctx.correction_preapproved)
+            .await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {

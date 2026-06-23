@@ -25,14 +25,13 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     pub heartbeat: &'a Option<Arc<AtomicU64>>,
     pub emitter: &'a crate::events::EventEmitter,
     pub policy_bundle: &'a PolicyBundle,
-    /// Set by the P2.4 sandbox gate when this specific tool call has already
-    /// been classified as allowed. False on all normal (non-correction) paths.
-    #[allow(dead_code)]
+    /// Set by the correction gate when this specific tool call has already
+    /// been classified as allowed for unattended execution.
+    /// False on all normal (non-correction) paths.
     pub correction_preapproved: bool,
     /// When true, the `_trusted_session` enrichment flag must NOT be injected
     /// into tool args (the correction sandbox overrides trusted-session semantics).
     /// False on all normal paths.
-    #[allow(dead_code)]
     pub suppress_trusted_session: bool,
 }
 
@@ -265,6 +264,10 @@ pub(super) async fn execute_tool_call_io(
     }
 }
 
+// NOTE (3b): `edit_file` retry calls here bypass the correction gate because
+// this is an internal deterministic recovery path, not a model-directed retry.
+// Future specs that allow model-directed mutating retries MUST route through
+// the correction gate in `execute_tool_call_io` — not through this function.
 async fn maybe_retry_edit_file_not_found_recovery(
     agent: &Agent,
     arguments: &str,
