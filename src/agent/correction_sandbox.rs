@@ -566,9 +566,24 @@ fn classify_run_command_action(
         )));
     }
 
-    // Note: run_command SAFE_PREFIXES are broader (includes cargo build/test, etc.)
-    // We allow run_command's whitelist without the is_correction_safe_local_command gate
-    // because the tool itself enforces a safe whitelist with no shell metacharacters.
+    // Finding 1 + 2 (re-review): apply path-operand scope check to run_command
+    // path operands.  `is_run_command_safe` whitelists the base command but never
+    // checked path-like arguments, so `tail /var/log/x` or
+    // `cargo test --manifest-path /outside/Cargo.toml` would have been Allowed.
+    // grep/rg skip their pattern argument; all others have no skip.
+    // Build/test commands (cargo test, pytest, go test, npm test) that have NO
+    // path operand pass through fine — only explicit out-of-scope paths are blocked.
+    let base_cmd = {
+        let tok = cmd.split_whitespace().next().unwrap_or("");
+        std::path::Path::new(tok)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(tok)
+    };
+    let skip_pattern = matches!(base_cmd, "grep" | "rg");
+    if let Err(reason) = command_path_operands_in_scope(cmd, &ctx.working_dir, skip_pattern) {
+        return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&reason));
+    }
 
     // Check any local_paths for path scope.
     for path_str in &action.local_paths {
@@ -578,6 +593,107 @@ fn classify_run_command_action(
     }
 
     ActionVerdict::Allowed
+}
+
+/// Shared path-operand scope checker used by both `is_correction_safe_local_command`
+/// (terminal) and `classify_run_command_action` (run_command).
+///
+/// Extracts "path-looking" operands from `cmd` (skipping the base command at
+/// position 0, flags, and — for grep/rg — the pattern argument) and validates
+/// each one:
+///
+/// 1. **~/$HOME rejection**: any operand starting with `~` (tilde home shorthand)
+///    or containing `$` (env expansion) is rejected outright.  The classifier
+///    cannot determine where these resolve at shell-expansion time, so blocking
+///    them is the only safe choice.
+///
+/// 2. **Working-dir scope**: the remaining operands must resolve (lexically,
+///    without I/O) to a path under `working_dir`.
+///
+/// 3. **Sensitive-file check**: even in-scope paths are blocked if they match
+///    known secret/credential patterns (`.env`, `.ssh/`, `.aws/`, etc.).
+///
+/// A token is treated as a path operand if it:
+/// - starts with `/`, `~`, `.`, or `$`; OR
+/// - contains `/` (looks like a path segment).
+///
+/// Plain words (`foo`, `--package`, `test`, `--features`) are not path operands
+/// and are ignored, so `cargo test --features foo` passes without issue.
+///
+/// The `skip_first_non_flag` parameter skips the first non-flag argument
+/// (used for grep/rg where that argument is the pattern, not a path).
+fn command_path_operands_in_scope(
+    cmd: &str,
+    working_dir: &std::path::Path,
+    skip_first_non_flag: bool,
+) -> Result<(), String> {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    // tokens[0] is the base command itself; start from index 1.
+    let mut non_flag_args: Vec<&str> = tokens
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .filter(|t| !t.starts_with('-'))
+        .collect();
+
+    if skip_first_non_flag && !non_flag_args.is_empty() {
+        non_flag_args.remove(0);
+    }
+
+    for token in &non_flag_args {
+        // Only examine tokens that look like paths.
+        let looks_like_path = token.starts_with('/')
+            || token.starts_with('~')
+            || token.starts_with('.')
+            || token.starts_with('$')
+            || token.contains('/');
+        if !looks_like_path {
+            continue;
+        }
+
+        // Finding 2: reject ~/ and bare ~ (tilde expansion) and $VAR forms.
+        // The shell expands these at runtime but the classifier sees only the
+        // literal text — there is no safe way to scope-check them here.
+        if token.starts_with('~') {
+            return Err(format!(
+                "command path operand '{}' uses tilde expansion (~) which cannot be \
+                 safely scoped in correction mode",
+                token
+            ));
+        }
+        if token.contains('$') {
+            return Err(format!(
+                "command path operand '{}' uses shell variable expansion ($) which \
+                 cannot be safely scoped in correction mode",
+                token
+            ));
+        }
+
+        // Resolve and scope-check.
+        let path = std::path::Path::new(token);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_dir.join(path)
+        };
+        let normalized = normalize_path_lexical(&resolved);
+        if !normalized.starts_with(working_dir) {
+            return Err(format!(
+                "command path '{}' is outside the allowed working directory",
+                token
+            ));
+        }
+        if is_sensitive_file_path(&normalized) {
+            return Err(format!(
+                "command path '{}' matches a sensitive/secret file pattern and cannot \
+                 be read in correction mode",
+                token
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Correction-safe local command allowlist.
@@ -783,43 +899,12 @@ fn is_correction_safe_local_command(
         return Ok(());
     }
 
-    // C1: For all other allowed commands (non-find, non-pwd), extract path operands
-    // and validate they are within working_dir and not sensitive.
+    // For all other allowed commands (non-find, non-pwd), use the shared
+    // path-operand scope checker (Finding 1 + Finding 2 from the re-review).
+    // grep/rg: skip first non-flag arg (the pattern).
     if base_cmd != "pwd" {
-        let tokens: Vec<&str> = cmd.split_whitespace().collect();
-        // tokens[0] is the base_cmd; collect remaining non-flag args.
-        let mut non_flag_args: Vec<&str> = tokens[1..]
-            .iter()
-            .copied()
-            .filter(|t| !t.starts_with('-'))
-            .collect();
-
-        // For grep/rg: first non-flag arg is the pattern, not a path.
-        if matches!(base_cmd, "grep" | "rg") && !non_flag_args.is_empty() {
-            non_flag_args.remove(0);
-        }
-
-        for path_str in &non_flag_args {
-            let path = std::path::Path::new(path_str);
-            let resolved = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                working_dir.join(path)
-            };
-            let normalized = normalize_path_lexical(&resolved);
-            if !normalized.starts_with(working_dir) {
-                return Err(format!(
-                    "command path '{}' is outside the allowed working directory",
-                    path_str
-                ));
-            }
-            if is_sensitive_file_path(&normalized) {
-                return Err(format!(
-                    "command path '{}' matches a sensitive/secret file pattern and cannot be read in correction mode",
-                    path_str
-                ));
-            }
-        }
+        let skip_pattern = matches!(base_cmd, "grep" | "rg");
+        command_path_operands_in_scope(cmd, working_dir, skip_pattern)?;
     }
 
     Ok(())
@@ -1901,6 +1986,224 @@ mod tests {
             classify_action(&a, &ctx),
             ActionVerdict::Allowed,
             "find within working_dir should be allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-review security fix tests: Finding 1 (run_command path scope) +
+    // Finding 2 (~/$HOME operand rejection) — through extract_proposed_action
+    // -----------------------------------------------------------------------
+
+    // --- Finding 1: run_command path scope ---
+
+    #[test]
+    fn test_run_command_tail_out_of_scope_blocked() {
+        // Finding 1: tail with out-of-scope absolute path → Blocked
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"tail /var/log/system.log"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command tail /var/log/system.log should be blocked (out-of-scope path)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_ls_other_user_blocked() {
+        // Finding 1: ls with out-of-scope path → Blocked
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"ls /Users/other"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command ls /Users/other should be blocked (out-of-scope path)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_head_bash_history_blocked() {
+        // Finding 1: head with out-of-scope path → Blocked
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"head /Users/other/.bash_history"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command head /Users/other/.bash_history should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cargo_test_no_path_allowed() {
+        // Owner decision: build/test commands with no path operand → Allowed
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "run_command cargo test (no path operand) should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cargo_test_manifest_out_of_scope_blocked() {
+        // Finding 1: cargo test --manifest-path with out-of-scope path → Blocked
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --manifest-path /outside/Cargo.toml"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command cargo test --manifest-path /outside/Cargo.toml should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_run_command_tail_in_scope_allowed() {
+        // Finding 1: tail with in-scope path → Allowed
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"tail /tmp/test-workdir/log.txt"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "run_command tail of in-scope log file should be allowed"
+        );
+    }
+
+    // --- Finding 2: ~/$HOME operand rejection ---
+
+    #[test]
+    fn test_terminal_cat_tilde_home_blocked() {
+        // Finding 2: cat ~/somefile — tilde expands to real home dir at runtime
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat ~/somefile"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "terminal cat ~/somefile should be blocked (tilde expansion)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_head_dollar_home_blocked() {
+        // Finding 2: head $HOME/.bash_history — env expansion cannot be safely scoped
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"head $HOME/.bash_history"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command head $HOME/.bash_history should be blocked ($HOME expansion)"
+        );
+    }
+
+    #[test]
+    fn test_terminal_ls_tilde_blocked() {
+        // Finding 2: ls ~ — bare tilde is home dir
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"ls ~"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "terminal ls ~ should be blocked (tilde expansion)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cat_tilde_file_blocked() {
+        // Finding 2: cat ~/somefile via run_command → Blocked
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cat ~/somefile"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+                                    // Note: "cat" is not in run_command SAFE_PREFIXES, so this would be blocked
+                                    // by is_run_command_safe first. Use wc instead (which is in SAFE_PREFIXES).
+        let a2 = extract_proposed_action(
+            "run_command",
+            r#"{"command":"wc ~/somefile"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        assert!(
+            matches!(classify_action(&a2, &ctx), ActionVerdict::Blocked(_)),
+            "run_command wc ~/somefile should be blocked (tilde expansion)"
+        );
+        // Also verify the original cat version is blocked (by prefix list, not scope)
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command cat ~/somefile should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_terminal_cat_in_scope_still_allowed() {
+        // Regression: in-scope paths are still allowed after the ~/$HOME fix
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /tmp/test-workdir/src/main.rs"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "terminal cat of in-scope file should remain allowed after security fixes"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cargo_test_in_scope_manifest_allowed() {
+        // In-scope --manifest-path → Allowed (build/test command, path within working_dir)
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --manifest-path /tmp/test-workdir/Cargo.toml"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "run_command cargo test with in-scope manifest path should be allowed"
         );
     }
 }
