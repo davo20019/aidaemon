@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **In-loop approach-pivot budget is now durable and per-task.** The stall-driven "try a different approach" retry previously counted pivots in an in-memory counter that reset every turn. The pivot *budget* now lives in the `SelfCorrectionController`'s durable ledger keyed on `task_id`: failed approaches are recorded, the budget is restart-safe (a scheduled task that pivoted, crashed, and resumed no longer gets a fresh budget), and an honest give-up summary is persisted when the budget is exhausted. Any DB error degrades gracefully to the prior in-memory behavior, so the loop is never broken by storage hiccups. No change to which tools require approval.
 - **Stuck-task watchdog now reaps on inactivity, not total runtime.** `detect_stuck_tasks` previously marked any running/claimed task older than 5 minutes as `interrupted`, falsely killing legitimately long tasks (observed: a goal had 3 tasks interrupted in a 7-minute window). It now compares each task's latest `task_activity` (tool or LLM call) against a configurable `daemon.watchdog.task_inactivity_timeout_secs` (default 300s), so active tasks survive and only genuinely inactive ones are interrupted. `task_activity.created_at` is normalized to a single UTC format with a new `(task_id, created_at)` index to serve the per-task `MAX(created_at)` lookup.
 
 ## [0.11.13] - 2026-06-22
