@@ -139,14 +139,16 @@ impl SelfCorrectionController {
         attempt_index: usize,
         evidence_ref: Option<&str>,
     ) -> anyhow::Result<()> {
+        let sig = crate::tools::sanitize::redact_secrets(signature);
+        let eref = evidence_ref.map(crate::tools::sanitize::redact_secrets);
         self.record(
             subject_id,
             kind,
-            signature,
+            &sig,
             attempt_index,
             attempt_status::FAILED,
             None,
-            evidence_ref,
+            eref.as_deref(),
         )
         .await
     }
@@ -159,14 +161,61 @@ impl SelfCorrectionController {
         signature: &str,
         attempt_index: usize,
     ) -> anyhow::Result<()> {
+        let sig = crate::tools::sanitize::redact_secrets(signature);
         self.record(
             subject_id,
             kind,
-            signature,
+            &sig,
             attempt_index,
             attempt_status::VERIFIED_SUCCESS,
             None,
             None,
+        )
+        .await
+    }
+
+    #[allow(dead_code)] // Used in Task 5+
+    pub async fn record_blocked(
+        &self,
+        subject_id: &str,
+        kind: SelfCorrectionSubjectKind,
+        signature: &str,
+        attempt_index: usize,
+        blocked_reason: &str,
+    ) -> anyhow::Result<()> {
+        let sig = crate::tools::sanitize::redact_secrets(signature);
+        let reason = crate::tools::sanitize::redact_secrets(blocked_reason);
+        self.record(
+            subject_id,
+            kind,
+            &sig,
+            attempt_index,
+            attempt_status::BLOCKED,
+            Some(&reason),
+            None,
+        )
+        .await
+    }
+
+    #[allow(dead_code)] // Used in Task 5+
+    pub async fn record_executed(
+        &self,
+        subject_id: &str,
+        kind: SelfCorrectionSubjectKind,
+        signature: &str,
+        attempt_index: usize,
+        evidence_ref: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let sig = crate::tools::sanitize::redact_secrets(signature);
+        let eref = evidence_ref.map(crate::tools::sanitize::redact_secrets);
+        self.record(
+            subject_id,
+            kind,
+            &sig,
+            attempt_index,
+            attempt_status::EXECUTED,
+            None,
+            eref.as_deref(),
         )
         .await
     }
@@ -578,6 +627,155 @@ mod tests {
         assert_eq!(
             ctrl.pivot_budget("loop-task-2").await.unwrap(),
             AttemptDecision::Proceed { attempt_index: 1 }
+        );
+    }
+
+    // ── P1.3 tests ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_record_blocked_persists_blocked_status_and_reason() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        ctrl.record_blocked("b1", k, "sig-blocked", 1, "policy denied")
+            .await
+            .unwrap();
+
+        let rows = state.get_self_correction_attempts("b1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::traits::attempt_status::BLOCKED);
+        assert_eq!(
+            rows[0].blocked_reason.as_deref(),
+            Some("policy denied"),
+            "blocked_reason must be persisted"
+        );
+        assert_eq!(rows[0].approach_signature, "sig-blocked");
+    }
+
+    #[tokio::test]
+    async fn test_record_executed_advances_attempt_index_without_counting_as_failure() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        ctrl.record_executed("e1", k, "sig-exec", 1, Some("evt-42"))
+            .await
+            .unwrap();
+
+        let rows = state.get_self_correction_attempts("e1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, crate::traits::attempt_status::EXECUTED);
+        assert_eq!(rows[0].evidence_ref.as_deref(), Some("evt-42"));
+
+        // The EXECUTED row must not count as a failure: budget is still intact.
+        let decision = ctrl.attempt("e1", k, "sig-new").await.unwrap();
+        assert_eq!(
+            decision,
+            AttemptDecision::Proceed { attempt_index: 2 },
+            "EXECUTED must not consume the failure budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_executed_same_signature_does_not_stop_repeat() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        // Record an EXECUTED row for sig-exec.
+        ctrl.record_executed("e2", k, "sig-exec", 1, None)
+            .await
+            .unwrap();
+
+        // Attempting the same signature again must NOT trigger StopRepeat.
+        let decision = ctrl.attempt("e2", k, "sig-exec").await.unwrap();
+        assert_eq!(
+            decision,
+            AttemptDecision::Proceed { attempt_index: 2 },
+            "EXECUTED must not trigger StopRepeat on the same signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_executed_does_not_increment_distinct_failure_budget() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 2);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        // Fill budget with one real failure plus one EXECUTED — should NOT exhaust.
+        ctrl.record_failure("e3", k, "sig-fail", 1, None)
+            .await
+            .unwrap();
+        ctrl.record_executed("e3", k, "sig-exec", 2, None)
+            .await
+            .unwrap();
+
+        // With k=2 and only 1 distinct failure, the budget is not exhausted.
+        let decision = ctrl.attempt("e3", k, "sig-new").await.unwrap();
+        assert_eq!(
+            decision,
+            AttemptDecision::Proceed { attempt_index: 3 },
+            "EXECUTED must not count toward the distinct-failure budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_give_up_report_omits_executed_attempts() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        // One real failure and one executed — only the failure appears in the report.
+        ctrl.record_failure("e4", k, "sig-fail", 1, None)
+            .await
+            .unwrap();
+        ctrl.record_executed("e4", k, "sig-exec-only", 2, None)
+            .await
+            .unwrap();
+
+        let report = ctrl.give_up_report("e4").await.unwrap().unwrap();
+        assert!(
+            report.contains("sig-fail"),
+            "failed approach must appear in give-up report"
+        );
+        assert!(
+            !report.contains("sig-exec-only"),
+            "EXECUTED approach must not appear in give-up report"
+        );
+        // Report says "1 different approach", not 2.
+        assert!(
+            report.contains("1 different approach"),
+            "give_up_report must count only failures: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocked_reason_redacts_secrets() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+
+        // A blocked_reason containing an API-key-shaped secret.
+        ctrl.record_blocked(
+            "r1",
+            k,
+            "sig-redact",
+            1,
+            "blocked because token=sk-ABCDEF1234567890abcdef leaked",
+        )
+        .await
+        .unwrap();
+
+        let rows = state.get_self_correction_attempts("r1").await.unwrap();
+        let reason = rows[0].blocked_reason.as_deref().unwrap_or("");
+        assert!(
+            !reason.contains("sk-ABCDEF1234567890abcdef"),
+            "secret must be redacted in persisted blocked_reason: {reason}"
+        );
+        assert!(
+            reason.contains("[REDACTED:API key]"),
+            "expected [REDACTED:API key] in persisted reason: {reason}"
         );
     }
 }

@@ -35,6 +35,8 @@ pub mod attempt_status {
     #[allow(dead_code)] // Used in Task 2+; StateStore methods and SQLite impl pending
     pub const BLOCKED: &str = "blocked";
     #[allow(dead_code)] // Used in Task 2+; StateStore methods and SQLite impl pending
+    pub const EXECUTED: &str = "executed";
+    #[allow(dead_code)] // Used in Task 2+; StateStore methods and SQLite impl pending
     pub const FAILED: &str = "failed";
     #[allow(dead_code)] // Used in Task 2+; StateStore methods and SQLite impl pending
     pub const VERIFIED_SUCCESS: &str = "verified_success";
