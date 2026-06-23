@@ -97,7 +97,7 @@ mod search_files;
 pub use search_files::SearchFilesTool;
 mod project_inspect;
 pub use project_inspect::ProjectInspectTool;
-mod run_command;
+pub(crate) mod run_command;
 pub use run_command::RunCommandTool;
 mod git_info;
 pub(crate) mod process_control;
