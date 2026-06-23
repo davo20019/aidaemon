@@ -231,15 +231,32 @@ impl SelfCorrectionController {
 /// Wrap the controller's give-up report into a user-facing reply: the honest
 /// enumeration of what was tried, plus one invitation to narrow scope. Used as
 /// the last-resort message when the in-loop pivot budget is exhausted.
-#[allow(dead_code)] // Used in Task 5+
 pub fn compose_give_up_reply(report: &str) -> String {
-    let trimmed = report.trim_end();
+    let redacted = crate::tools::sanitize::redact_secrets(report);
+    let trimmed = redacted.trim_end();
     format!("{trimmed}\n\nWant me to try a narrower scope or a different angle?")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_give_up_reply_redacts_secrets_in_signatures() {
+        // A failing approach signature can contain a non-terminal tool's raw args,
+        // e.g. an http_request URL with an API key. The give-up reply must not leak it.
+        // Token shape: sk-[a-zA-Z0-9]{20,} matches the API key pattern in SECRET_PATTERNS.
+        let report = "I tried 1 different approach and none worked:\n- http_request(https://api.example.com/x?api_key=sk-ABCDEF1234567890abcdef)\n";
+        let reply = compose_give_up_reply(report);
+        assert!(
+            !reply.contains("sk-ABCDEF1234567890abcdef"),
+            "secret token leaked into give-up reply: {reply}"
+        );
+        assert!(
+            reply.contains("[REDACTED:API key]"),
+            "expected [REDACTED:API key] placeholder in reply: {reply}"
+        );
+    }
 
     #[test]
     fn compose_give_up_reply_keeps_report_and_adds_followup() {
