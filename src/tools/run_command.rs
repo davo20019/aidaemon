@@ -216,6 +216,12 @@ impl Tool for RunCommandTool {
 }
 
 fn is_safe_command(cmd: &str) -> bool {
+    is_run_command_safe(cmd)
+}
+
+/// Public (crate-visible) alias used by the correction-sandbox classifier.
+/// Returns true if `cmd` matches one of run_command's safe prefixes.
+pub(crate) fn is_run_command_safe(cmd: &str) -> bool {
     SAFE_PREFIXES.iter().any(|prefix| {
         cmd == *prefix
             || cmd.starts_with(&format!("{} ", prefix))
