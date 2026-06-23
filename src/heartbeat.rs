@@ -150,6 +150,10 @@ pub struct HeartbeatCoordinator {
     agent: Option<Weak<Agent>>,
     db_healthy: bool,
     last_stale_goal_cleanup: Option<Instant>,
+    /// Seconds of no task activity before `detect_stuck_tasks` interrupts a
+    /// running/claimed task. Defaults to 300; overridden from config via
+    /// `set_task_inactivity_timeout`.
+    task_inactivity_timeout_secs: i64,
 }
 
 impl HeartbeatCoordinator {
@@ -174,7 +178,14 @@ impl HeartbeatCoordinator {
             agent: None,
             db_healthy: true,
             last_stale_goal_cleanup: None,
+            task_inactivity_timeout_secs: 300,
         }
+    }
+
+    /// Override the stuck-task inactivity timeout (deferred, since the value
+    /// comes from config resolved after construction). Mirrors `set_hub`/`set_agent`.
+    pub fn set_task_inactivity_timeout(&mut self, secs: u64) {
+        self.task_inactivity_timeout_secs = secs as i64;
     }
 
     /// Set the hub reference (deferred, since hub is created after heartbeat).
@@ -483,7 +494,11 @@ impl HeartbeatCoordinator {
 
     /// Detect tasks that have been running/claimed longer than the timeout and mark them interrupted.
     async fn detect_stuck_tasks(&self) {
-        let stuck = match self.state.get_stuck_tasks(300).await {
+        let stuck = match self
+            .state
+            .get_stuck_tasks(self.task_inactivity_timeout_secs)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 error!(error = %e, "Failed to get stuck tasks");
@@ -1255,6 +1270,38 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, Task};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn test_state_store() -> Arc<dyn StateStore> {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn coordinator_defaults_task_inactivity_timeout_to_300() {
+        let (_tx, rx) = mpsc::channel::<()>(1);
+        let state = test_state_store().await;
+        let hb = HeartbeatCoordinator::new(state, 5, 2, rx, None, None, None);
+        assert_eq!(hb.task_inactivity_timeout_secs, 300);
+    }
+
+    #[tokio::test]
+    async fn coordinator_set_task_inactivity_timeout_updates_field() {
+        let (_tx, rx) = mpsc::channel::<()>(1);
+        let state = test_state_store().await;
+        let mut hb = HeartbeatCoordinator::new(state, 5, 2, rx, None, None, None);
+        hb.set_task_inactivity_timeout(777);
+        assert_eq!(hb.task_inactivity_timeout_secs, 777);
+    }
 
     #[tokio::test]
     async fn test_new_continuous_goal() {

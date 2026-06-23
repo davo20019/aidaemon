@@ -569,6 +569,7 @@ async fn init_heartbeat_coordinator(
             Some(goal_token_registry),
             Some(telemetry.clone()),
         );
+        heartbeat.set_task_inactivity_timeout(config.daemon.watchdog.task_inactivity_timeout_secs);
 
         // Register memory manager jobs
         memory_manager.register_heartbeat_jobs(&mut heartbeat);
