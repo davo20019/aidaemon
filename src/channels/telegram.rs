@@ -1975,135 +1975,6 @@ impl TelegramChannel {
         ))
     }
 
-    /// Auto-send file attachments referenced as absolute paths in a reply.
-    async fn send_referenced_files_from_reply(
-        agent: &Agent,
-        session_id: &str,
-        bot: &Bot,
-        chat_id: ChatId,
-        reply: &str,
-        files_enabled: bool,
-    ) {
-        let candidate_paths = extract_candidate_file_paths(reply);
-        if candidate_paths.is_empty() {
-            return;
-        }
-
-        if !files_enabled {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    "I found file path(s) in my response, but file attachments are disabled in config.",
-                )
-                .await;
-            return;
-        }
-
-        const MAX_FILES_PER_REPLY: usize = 3;
-
-        // If the reply mentions many file paths, it's a search result or directory
-        // listing — not a "here's the file I created" scenario.  Skip auto-send
-        // to avoid spamming the chat with unrelated file uploads.
-        const AUTO_SEND_SKIP_THRESHOLD: usize = 8;
-        if candidate_paths.len() > AUTO_SEND_SKIP_THRESHOLD {
-            debug!(
-                count = candidate_paths.len(),
-                "Skipping auto-file-send: too many candidate paths (likely a listing)"
-            );
-            return;
-        }
-
-        let sendable_paths: HashSet<String> = crate::agent::extract_file_paths_from_text(reply)
-            .into_iter()
-            .collect();
-        let mut seen = HashSet::new();
-        let mut sent = 0usize;
-        let mut skipped = 0usize;
-        let mut delivered_files: Vec<(String, String)> = Vec::new();
-
-        for path in candidate_paths {
-            if sent >= MAX_FILES_PER_REPLY {
-                skipped += 1;
-                continue;
-            }
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-
-            if !sendable_paths.contains(&path) {
-                debug!(
-                    file = %path,
-                    "Skipping non-sendable auto-detected file path from reply"
-                );
-                continue;
-            }
-
-            let file_name = std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string());
-
-            let doc = InputFile::file(std::path::PathBuf::from(&path)).file_name(file_name.clone());
-            match bot
-                .send_document(chat_id, doc)
-                .caption(format!("📎 {}", file_name))
-                .await
-            {
-                Ok(_) => {
-                    sent += 1;
-                    delivered_files.push((file_name, path));
-                }
-                Err(e) => {
-                    warn!(file = %path, error = %e, "Failed to send referenced file");
-                    let _ = bot
-                        .send_message(
-                            chat_id,
-                            format!("I found `{}` but couldn't upload it: {}.", file_name, e),
-                        )
-                        .await;
-                }
-            }
-        }
-
-        if let Some(summary) = format_attachment_delivery_summary(&delivered_files) {
-            if let Err(err) = agent
-                .record_auxiliary_assistant_note(session_id, &summary)
-                .await
-            {
-                warn!(
-                    session_id,
-                    error = %err,
-                    "Failed to persist Telegram attachment delivery summary"
-                );
-            }
-        }
-
-        if skipped > 0 {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    format!(
-                        "I found additional files but only sent the first {} attachments.",
-                        MAX_FILES_PER_REPLY
-                    ),
-                )
-                .await;
-        }
-
-        if sent > 0 {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    format!(
-                        "Sent {} file attachment{}.",
-                        sent,
-                        if sent == 1 { "" } else { "s" }
-                    ),
-                )
-                .await;
-        }
-    }
-
     /// Handle /setup command for owner-only operational setup workflows.
     /// Usage:
     ///   /setup lowlatency status
@@ -4927,15 +4798,6 @@ impl TelegramChannel {
                             {
                                 warn!("Failed to send Telegram message: {}", e);
                             }
-                            TelegramChannel::send_referenced_files_from_reply(
-                                agent.as_ref(),
-                                &session_id,
-                                &bot,
-                                chat_id,
-                                &reply,
-                                files_enabled,
-                            )
-                            .await;
                         }
                     }
                     Err(e) => {
@@ -5518,45 +5380,6 @@ pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
     }
 }
 
-fn extract_candidate_file_paths(text: &str) -> Vec<String> {
-    static PATH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(/[\w./-]+\.\w{1,10})").unwrap());
-    let mut out = Vec::new();
-    for cap in PATH_RE.captures_iter(text) {
-        let token = cap[1].trim_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | ':' | '!' | '?')
-        });
-        if token.starts_with('/') && token.contains('.') {
-            out.push(token.to_string());
-        }
-    }
-    out
-}
-
-fn format_attachment_delivery_summary(delivered_files: &[(String, String)]) -> Option<String> {
-    if delivered_files.is_empty() {
-        return None;
-    }
-
-    if delivered_files.len() == 1 {
-        let (filename, path) = &delivered_files[0];
-        return Some(format!(
-            "Delivery note: I sent the attachment {} in chat. Local copy: {}",
-            filename, path
-        ));
-    }
-
-    let files = delivered_files
-        .iter()
-        .map(|(filename, path)| format!("{} ({})", filename, path))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(format!(
-        "Delivery note: I sent {} attachments in chat. Local copies: {}",
-        delivered_files.len(),
-        files
-    ))
-}
-
 fn is_indicator_only_status(update: &StatusUpdate) -> bool {
     matches!(update, StatusUpdate::Thinking(_))
 }
@@ -5597,29 +5420,6 @@ mod tests {
             crate::normalize_terminal_agent_permission_aliases(Some("codex"), args.clone());
         assert!(!rewrote);
         assert_eq!(normalized, args);
-    }
-
-    #[test]
-    fn attachment_delivery_summary_includes_single_file_path() {
-        let summary = format_attachment_delivery_summary(&[(
-            "studies.json".to_string(),
-            "/tmp/studies.json".to_string(),
-        )])
-        .expect("summary");
-        assert!(summary.contains("studies.json"));
-        assert!(summary.contains("/tmp/studies.json"));
-    }
-
-    #[test]
-    fn attachment_delivery_summary_handles_multiple_files() {
-        let summary = format_attachment_delivery_summary(&[
-            ("a.json".to_string(), "/tmp/a.json".to_string()),
-            ("b.json".to_string(), "/tmp/b.json".to_string()),
-        ])
-        .expect("summary");
-        assert!(summary.contains("2 attachments"));
-        assert!(summary.contains("a.json"));
-        assert!(summary.contains("b.json"));
     }
 
     // --- check_auth ---
@@ -5761,23 +5561,6 @@ mod tests {
     fn parse_web_app_action_rejects_unknown_payload() {
         let payload = r#"{"type":"unknown","text":"hello"}"#;
         assert!(TelegramChannel::parse_web_app_action(payload).is_none());
-    }
-
-    #[test]
-    fn extract_candidate_file_paths_handles_trailing_punctuation() {
-        let text = "I found it at /tmp/test-docs/sample-resume.pdf.";
-        let paths = extract_candidate_file_paths(text);
-        assert_eq!(paths, vec!["/tmp/test-docs/sample-resume.pdf"]);
-    }
-
-    #[test]
-    fn extract_candidate_file_paths_extracts_multiple_paths() {
-        let text = "Primary: `/tmp/aidaemon/report.md` and backup: /tmp/aidaemon/report.csv, done.";
-        let paths = extract_candidate_file_paths(text);
-        assert_eq!(
-            paths,
-            vec!["/tmp/aidaemon/report.md", "/tmp/aidaemon/report.csv"]
-        );
     }
 
     #[test]
