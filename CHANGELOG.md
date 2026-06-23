@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Durable self-correction ledger and controller (internal).** New `self_correction_attempts` table and `SelfCorrectionController` provide bounded, restart-safe attempt policy — repeat-blocking of known-bad approaches, a K=3 distinct-failure budget, and an honest give-up report. Not yet wired into the agent loop (foundation for in-loop self-correction).
+- **Correction-mode sandbox classifier (internal).** New `classify_action` + `CorrectionSubjectContext` decide whether an action may run during autonomous self-correction: destructive terminal commands, credential/config-management tools, and external-account mutations outside the explicitly intended accounts are blocked; read-only external calls and (by owner policy) delegation tools are allowed. Pure policy, not yet wired (the consumer is the out-of-band idle-reap bridge). Note: allowing delegation tools means the sandbox cannot inspect actions taken inside a delegated agent — an accepted tradeoff that becomes load-bearing when the approval-bypass execution context lands.
 
 ### Changed
 
