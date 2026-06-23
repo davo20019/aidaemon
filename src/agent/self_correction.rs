@@ -778,4 +778,65 @@ mod tests {
             "expected [REDACTED:API key] in persisted reason: {reason}"
         );
     }
+
+    // ── P2.4 carry-forward redaction test ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_secret_bearing_repeat_triggers_stop_repeat() {
+        // Prove that like-for-like redacted comparison fires StopRepeat even when
+        // the raw signature going in on both sides contains a secret.
+        //
+        // Real gate flow (P2.4):
+        //   1. Gate calls `normalized_attempt_signature(&action)` → redacted string.
+        //   2. Gate calls `controller.attempt(subject, kind, &redacted)` — attempt()
+        //      receives an *already-redacted* prospective signature and compares it
+        //      against stored rows unchanged.
+        //   3. On failure: gate calls `controller.record_failure(subject, kind, raw_sig, ...)`
+        //      — record_failure redacts before storing.
+        //
+        // This test replicates that exact flow:
+        //   - "raw" prospective sig has the secret; we redact it with `redact_secrets`
+        //     (mirroring what `normalized_attempt_signature` does) before passing to
+        //     `attempt()`.
+        //   - `record_failure` receives the raw sig and redacts it before storing.
+        //   - Both stored and prospective strings are "[REDACTED:API key]"-bearing, so
+        //     they compare equal → StopRepeat fires.
+        //
+        // This is NOT a tautology: if `record_failure` forgot to redact the stored sig
+        // (storing the raw value), the comparison with the pre-redacted prospective sig
+        // would produce a *mismatch* and StopRepeat would never fire — the secret-bearing
+        // approach could be retried indefinitely.
+        let ctrl = SelfCorrectionController::new(temp_state().await, 3);
+        let k = SelfCorrectionSubjectKind::Task;
+        let subject = "p2-4-test";
+
+        // The raw signature the gate would produce for a terminal command embedding
+        // an API key (sk- prefix, ≥20 alphanum chars → matches SECRET_PATTERNS).
+        let raw_sig =
+            "tool=terminal cmd=curl -H Authorization: Bearer sk-ABCDEF1234567890XYZ0 https://api.example.com method= host=api.example.com auth_profile=false auth_header=false detach=false path_scope=none mutating=false external=false high_impact=false";
+
+        // Step 1: gate pre-redacts (mirrors normalized_attempt_signature's redact_secrets call).
+        let prospective = crate::tools::sanitize::redact_secrets(raw_sig);
+
+        // First attempt must Proceed (no prior failures yet).
+        assert_eq!(
+            ctrl.attempt(subject, k, &prospective).await.unwrap(),
+            AttemptDecision::Proceed { attempt_index: 1 },
+            "first attempt must Proceed"
+        );
+
+        // Step 2: record_failure with the raw sig — internally it redacts before storing.
+        ctrl.record_failure(subject, k, raw_sig, 1, None)
+            .await
+            .unwrap();
+
+        // Step 3: second attempt with the same pre-redacted prospective sig must trigger
+        // StopRepeat, proving stored-redacted == prospective-redacted comparison holds.
+        assert_eq!(
+            ctrl.attempt(subject, k, &prospective).await.unwrap(),
+            AttemptDecision::StopRepeat,
+            "secret-bearing approach must trigger StopRepeat on second attempt (redacted \
+             comparison is like-for-like)"
+        );
+    }
 }

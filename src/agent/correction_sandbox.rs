@@ -2467,4 +2467,40 @@ mod tests {
             "ls .. should be allowed (`..` alone is excluded from dotfile path-shaped rule)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // P2.4 carry-forward redaction test: normalized_attempt_signature redacts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalized_attempt_signature_redacts_secrets() {
+        // Build a ProposedAction for a terminal `run` command that embeds an
+        // API-key-shaped secret. `normalized_attempt_signature` must call
+        // `redact_secrets` on the terminal_command field — the raw key must NOT
+        // appear in the returned string, and a [REDACTED:...] marker must be present.
+        //
+        // This is not a tautology: we construct the action directly with a known
+        // raw secret value and assert on the *output* of the function under test.
+        // If `normalized_attempt_signature` were to skip `redact_secrets` the raw
+        // key would appear verbatim, the first assertion would fail.
+        let raw_command =
+            r#"curl -H "Authorization: Bearer sk-ABCDEF1234567890XYZ0" https://api.example.com"#;
+        let action = ProposedAction {
+            tool_name: "terminal".to_string(),
+            terminal_action: Some("run".to_string()),
+            terminal_command: Some(raw_command.to_string()),
+            ..ProposedAction::default()
+        };
+
+        let sig = normalized_attempt_signature(&action);
+
+        assert!(
+            !sig.contains("sk-ABCDEF1234567890XYZ0"),
+            "normalized_attempt_signature must not expose the raw API key in the signature: {sig}"
+        );
+        assert!(
+            sig.contains("[REDACTED"),
+            "normalized_attempt_signature must contain a [REDACTED...] marker: {sig}"
+        );
+    }
 }
