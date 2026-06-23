@@ -78,3 +78,6 @@ crates-explorer/
 
 # Misc scratch files
 hello_world.php
+
+# Machine-local cargo build tuning (disk-constrained dev box) — not for CI/contributors
+.cargo/
