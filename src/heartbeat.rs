@@ -1989,6 +1989,12 @@ mod tests {
         assert_eq!(task_inactivity_secs(None, "2026-06-23T00:00:00Z", now), 600);
         // Unparseable inputs → 0 (never panics).
         assert_eq!(task_inactivity_secs(Some("garbage"), "garbage", now), 0);
+        // SQLite-datetime format ('YYYY-MM-DD HH:MM:SS', the stored task_activity format)
+        // must parse identically — last activity 5 min ago → 300s.
+        assert_eq!(
+            task_inactivity_secs(Some("2026-06-23 00:05:00"), "2026-06-23 00:00:00", now),
+            300
+        );
     }
 
     #[tokio::test]
