@@ -228,9 +228,34 @@ impl SelfCorrectionController {
     }
 }
 
+/// Wrap the controller's give-up report into a user-facing reply: the honest
+/// enumeration of what was tried, plus one invitation to narrow scope. Used as
+/// the last-resort message when the in-loop pivot budget is exhausted.
+#[allow(dead_code)] // Used in Task 5+
+pub fn compose_give_up_reply(report: &str) -> String {
+    let trimmed = report.trim_end();
+    format!("{trimmed}\n\nWant me to try a narrower scope or a different angle?")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_give_up_reply_keeps_report_and_adds_followup() {
+        let report = "I tried 2 different approaches and none worked:\n- terminal(du -ah ~)\n- terminal(find ~ -size +500M)\n";
+        let reply = compose_give_up_reply(report);
+        // The original report content is preserved verbatim.
+        assert!(reply.contains("I tried 2 different approaches"));
+        assert!(reply.contains("terminal(du -ah ~)"));
+        // A single friendly follow-up invitation is appended.
+        assert!(
+            reply.to_lowercase().contains("narrower")
+                || reply.to_lowercase().contains("different angle")
+        );
+        // Non-empty and ends without trailing whitespace runaway.
+        assert!(!reply.trim().is_empty());
+    }
     use crate::traits::SelfCorrectionSubjectKind;
     use std::sync::Arc;
 
