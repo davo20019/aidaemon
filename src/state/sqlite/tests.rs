@@ -2556,6 +2556,94 @@ async fn test_task_activity_log() {
     assert_eq!(activities[0].tokens_used, Some(42));
 }
 
+// --- Activity-based watchdog (Component A) test helpers ---
+
+/// Create a fresh goal + a `running` task with `started_at` set `started_secs_ago`
+/// seconds in the past. Each call makes its own goal (FK parent).
+async fn wd_create_running_task(store: &SqliteStateStore, task_id: &str, started_secs_ago: i64) {
+    let goal = crate::traits::Goal::new_finite("wd-goal", "wd-sess");
+    store.create_goal(&goal).await.unwrap();
+    let started = (chrono::Utc::now() - chrono::Duration::seconds(started_secs_ago)).to_rfc3339();
+    let task = crate::traits::Task {
+        id: task_id.to_string(),
+        goal_id: goal.id.clone(),
+        description: "wd".to_string(),
+        status: "running".to_string(),
+        priority: "medium".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: Some(started),
+        completed_at: None,
+    };
+    store.create_task(&task).await.unwrap();
+}
+
+#[tokio::test]
+async fn log_task_activity_normalizes_created_at_to_sqlite_datetime() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-norm", 0).await;
+
+    let activity = crate::traits::TaskActivity {
+        id: 0,
+        task_id: "t-norm".to_string(),
+        activity_type: "tool".to_string(),
+        tool_name: Some("terminal".to_string()),
+        tool_args: None,
+        result: None,
+        success: Some(true),
+        tokens_used: None,
+        created_at: "2026-06-22T16:05:27Z".to_string(), // RFC3339 input
+    };
+    store.log_task_activity(&activity).await.unwrap();
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT created_at FROM task_activity WHERE task_id = 't-norm' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, "2026-06-22 16:05:27"); // normalized, no 'T'/'Z'
+}
+
+#[tokio::test]
+async fn migration_normalizes_legacy_rfc3339_task_activity_rows() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-legacy", 0).await;
+
+    // Simulate a legacy RFC3339 row written before normalization (raw INSERT
+    // bypasses the datetime(?) write path).
+    sqlx::query(
+        "INSERT INTO task_activity (task_id, activity_type, created_at) VALUES (?, 'tool', ?)",
+    )
+    .bind("t-legacy")
+    .bind("2026-06-22T16:05:27Z")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    super::migrations::migrate_state(&store.pool())
+        .await
+        .unwrap();
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT created_at FROM task_activity WHERE task_id = 't-legacy' AND activity_type = 'tool' LIMIT 1",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, "2026-06-22 16:05:27");
+}
+
 // --- Notification Queue Tests ---
 
 #[tokio::test]

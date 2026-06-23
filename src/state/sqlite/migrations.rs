@@ -1594,6 +1594,21 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await;
+    // Self-correcting-resilience Component A: the inactivity watchdog does a
+    // lexical MAX(created_at) per task, so all rows must share one sortable UTC
+    // format. Normalize any legacy RFC3339 rows ('...T...Z') to SQLite datetime,
+    // and add a composite index to serve the correlated per-task MAX.
+    let _ = sqlx::query(
+        "UPDATE task_activity SET created_at = datetime(created_at) WHERE created_at LIKE '%T%'",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_activity_task_created_at \
+         ON task_activity(task_id, created_at)",
+    )
+    .execute(pool)
+    .await;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_goal_schedules_goal ON goal_schedules(goal_id)",
     )

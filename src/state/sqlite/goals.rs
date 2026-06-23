@@ -643,7 +643,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
         sqlx::query(
             "INSERT INTO task_activity (task_id, activity_type, tool_name, tool_args,
              result, success, tokens_used, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime(?))",
         )
         .bind(&activity.task_id)
         .bind(&activity.activity_type)
