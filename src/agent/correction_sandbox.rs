@@ -584,7 +584,7 @@ fn classify_run_command_action(
 /// Returns Ok(()) if allowed, Err(reason) if blocked.
 fn is_correction_safe_local_command(
     cmd: &str,
-    _working_dir: &std::path::Path,
+    working_dir: &std::path::Path,
 ) -> Result<(), String> {
     // Reject shell metacharacters / escape forms.
     let meta_chars = ['|', '>', '<', ';', '`'];
@@ -685,29 +685,138 @@ fn is_correction_safe_local_command(
         ));
     }
 
-    // `find` must not use -exec, -delete, -ok, -printf, or broad root scans.
+    // `find` must not use -exec, -delete, -ok, -printf, -fprintf, -fls, -fprint,
+    // and must not scan broad/out-of-scope roots (I1 + I2).
     if base_cmd == "find" {
+        // I2: reject file-writing find actions.
         for token in cmd.split_whitespace() {
-            if matches!(token, "-exec" | "-delete" | "-ok" | "-printf") {
+            if matches!(
+                token,
+                "-exec" | "-delete" | "-ok" | "-printf" | "-fprintf" | "-fls" | "-fprint"
+            ) {
                 return Err(format!(
                     "find with '{}' is not allowed in correction mode",
                     token
                 ));
             }
         }
-        // Reject broad roots: / or ~ or /etc, /home, /Users, /root etc.
+        // I1: extract ALL non-flag path tokens from the full command.
+        // `find` accepts global options before roots (-L, -H, -P are one-char flags).
+        // We collect every token that doesn't start with '-'; all of these are
+        // potential path roots or predicate arguments.  Rather than trying to
+        // distinguish roots from predicate arguments (e.g. `-name foo` → `foo`
+        // is not a root), we conservatively treat ANY non-flag token as a
+        // candidate root when it looks like an absolute path or home-dir
+        // reference that would escape the working directory — if it appears
+        // as a path argument to a predicate like `-name` that's a false
+        // positive that is fine (over-blocking is safe).
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.len() > 1 {
-            let root = parts[1];
-            // Block absolute paths that aren't under working_dir
-            if root.starts_with('/')
-                || root == "~"
-                || root.starts_with("~/")
-                || root.starts_with("$HOME")
-            {
+        let mut find_roots: Vec<&str> = Vec::new();
+        let mut i = 1; // skip 'find' itself
+        while i < parts.len() {
+            let tok = parts[i];
+            if tok.starts_with('-') {
+                // Skip this flag token; also skip its argument if it is a
+                // known single-argument predicate so we don't misidentify
+                // the argument as a root.
+                const SINGLE_ARG_PREDICATES: &[&str] = &[
+                    "-name",
+                    "-iname",
+                    "-type",
+                    "-maxdepth",
+                    "-mindepth",
+                    "-size",
+                    "-newer",
+                    "-user",
+                    "-group",
+                    "-perm",
+                    "-mtime",
+                    "-atime",
+                    "-ctime",
+                    "-path",
+                    "-ipath",
+                    "-regex",
+                    "-iregex",
+                ];
+                if SINGLE_ARG_PREDICATES.contains(&tok) {
+                    i += 2; // skip flag + its argument
+                } else {
+                    i += 1; // skip flag only
+                }
+            } else {
+                find_roots.push(tok);
+                i += 1;
+            }
+        }
+        // Check each candidate root.
+        for root in &find_roots {
+            let is_broad =
+                *root == "/" || *root == "~" || root.starts_with("~/") || root.starts_with("$HOME");
+            if is_broad {
                 return Err(format!(
                     "find with broad root '{}' is not allowed in correction mode",
                     root
+                ));
+            }
+            // Scope check: root must be within working_dir.
+            let path = std::path::Path::new(root);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                working_dir.join(path)
+            };
+            let normalized = normalize_path_lexical(&resolved);
+            if !normalized.starts_with(working_dir) {
+                return Err(format!(
+                    "find root '{}' is outside the allowed working directory",
+                    root
+                ));
+            }
+            if is_sensitive_file_path(&normalized) {
+                return Err(format!(
+                    "find root '{}' matches a sensitive/secret file pattern",
+                    root
+                ));
+            }
+        }
+        // No roots given → implicit "." which is scoped; allowed.
+        return Ok(());
+    }
+
+    // C1: For all other allowed commands (non-find, non-pwd), extract path operands
+    // and validate they are within working_dir and not sensitive.
+    if base_cmd != "pwd" {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        // tokens[0] is the base_cmd; collect remaining non-flag args.
+        let mut non_flag_args: Vec<&str> = tokens[1..]
+            .iter()
+            .copied()
+            .filter(|t| !t.starts_with('-'))
+            .collect();
+
+        // For grep/rg: first non-flag arg is the pattern, not a path.
+        if matches!(base_cmd, "grep" | "rg") && !non_flag_args.is_empty() {
+            non_flag_args.remove(0);
+        }
+
+        for path_str in &non_flag_args {
+            let path = std::path::Path::new(path_str);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                working_dir.join(path)
+            };
+            let normalized = normalize_path_lexical(&resolved);
+            if !normalized.starts_with(working_dir) {
+                return Err(format!(
+                    "command path '{}' is outside the allowed working directory",
+                    path_str
+                ));
+            }
+            if is_sensitive_file_path(&normalized) {
+                return Err(format!(
+                    "command path '{}' matches a sensitive/secret file pattern and cannot be read in correction mode",
+                    path_str
                 ));
             }
         }
@@ -1445,11 +1554,13 @@ mod tests {
 
     #[test]
     fn test_terminal_sensitive_path_read_blocked() {
-        // cat .env — classify_command already marks it Critical, so it's blocked
-        let mut a = action("terminal");
-        a.terminal_action = Some("run".to_string());
-        a.terminal_command = Some("cat .env".to_string());
-        a.local_paths = vec![".env".to_string()];
+        // cat .env — blocked by sensitive file check in is_correction_safe_local_command
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat .env"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
         assert!(matches!(
             classify_action(&a, &ctx_with(vec![])),
             ActionVerdict::Blocked(_)
@@ -1458,11 +1569,13 @@ mod tests {
 
     #[test]
     fn test_terminal_path_outside_working_dir_blocked() {
-        // cat /etc/hosts — absolute path outside working_dir
-        let mut a = action("terminal");
-        a.terminal_action = Some("run".to_string());
-        a.terminal_command = Some("cat /etc/hosts".to_string());
-        a.local_paths = vec!["/etc/hosts".to_string()];
+        // cat /etc/hosts — absolute path outside working_dir; blocked by scope check
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /etc/hosts"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
         let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
         assert!(matches!(
             classify_action(&a, &ctx),
@@ -1670,6 +1783,124 @@ mod tests {
         assert_eq!(
             classify_action(&a, &ctx_with(vec![])),
             ActionVerdict::Allowed
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1.2 security fix tests: C1 (path scope) + I1 (find roots) + I2 (find actions)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_terminal_cat_absolute_outside_workdir_blocked() {
+        // C1: cat with absolute path outside working_dir → Blocked
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /tmp/outside.txt"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "cat /tmp/outside.txt should be blocked (outside working_dir)"
+        );
+    }
+
+    #[test]
+    fn test_terminal_cat_relative_escape_blocked() {
+        // C1: cat with path traversal escaping working_dir → Blocked
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat ../../../etc/passwd"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "cat ../../../etc/passwd should be blocked (path traversal outside working_dir)"
+        );
+    }
+
+    #[test]
+    fn test_terminal_cat_env_in_workdir_blocked() {
+        // C1: cat .env inside working_dir → Blocked (sensitive file)
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /tmp/test-workdir/.env"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "cat /tmp/test-workdir/.env should be blocked (sensitive file inside working_dir)"
+        );
+    }
+
+    #[test]
+    fn test_terminal_cat_legit_file_allowed() {
+        // C1: cat of a legitimate source file inside working_dir → Allowed
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /tmp/test-workdir/src/main.rs"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "cat of legitimate file in working_dir should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_find_broad_root_after_flag_blocked() {
+        // I1: find -L / -name foo — the broad root '/' comes after a flag, must still be caught
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find -L / -name foo"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "find -L / -name foo should be blocked (broad root after flag)"
+        );
+    }
+
+    #[test]
+    fn test_find_fprintf_blocked() {
+        // I2: find with -fprintf writes output to a file — must be blocked
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find . -fprintf /tmp/x %p"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "find . -fprintf /tmp/x %p should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_scoped_allowed() {
+        // find within working_dir with no dangerous actions → Allowed
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find /tmp/test-workdir -name '*.rs'"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "find within working_dir should be allowed"
         );
     }
 }
