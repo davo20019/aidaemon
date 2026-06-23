@@ -527,6 +527,11 @@ fn detect_unbounded_disk_scan_segment(segment: &str) -> Option<(String, String)>
             if has_maxdepth {
                 return None;
             }
+            // `-delete` is caught by the irreversible-delete hard-blocker;
+            // let it pass through so the right message fires.
+            if tokens.iter().any(|t| t == "-delete") {
+                return None;
+            }
             let root = tokens
                 .iter()
                 .skip(1)
@@ -540,7 +545,6 @@ fn detect_unbounded_disk_scan_segment(segment: &str) -> Option<(String, String)>
 
 /// Scan the whole command (including chained `&&`/`|`/`;` segments) for an
 /// unbounded whole-disk/whole-home scan.
-#[allow(dead_code)]
 fn detect_unbounded_disk_scan(command: &str) -> Option<(String, String)> {
     for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
         if let Some(hit) = detect_unbounded_disk_scan_segment(&segment) {
@@ -551,7 +555,6 @@ fn detect_unbounded_disk_scan(command: &str) -> Option<(String, String)> {
 }
 
 /// Guidance returned to the model when an unbounded scan is blocked pre-spawn.
-#[allow(dead_code)]
 fn unbounded_scan_block_message(tool: &str, root: &str) -> String {
     format!(
         "Blocked: `{tool}` rooted at `{root}` scans the entire {} and is pathologically slow \
@@ -2826,6 +2829,12 @@ impl Tool for TerminalTool {
                     )));
                 }
 
+                if let Some((tool_name, root)) = detect_unbounded_disk_scan(command) {
+                    return Ok(ToolCallOutcome::from_output(unbounded_scan_block_message(
+                        &tool_name, &root,
+                    )));
+                }
+
                 // Soft-block large heredoc file creation: redirects to write_file
                 // which writes atomically without shell quoting issues.
                 // Allow quoted heredoc delimiters (<<'EOF' or << 'EOF') since they
@@ -4815,5 +4824,56 @@ mod tests {
             "untrusted-source command must force approval even when allowlisted, got: {}",
             response
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_blocks_unbounded_disk_scan_without_spawning() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+
+        let resp = tool
+            .call(r#"{"action":"run","command":"du -a / 2>/dev/null | sort -rn | head -n 10","_session_id":"s","_user_role":"Owner"}"#)
+            .await
+            .unwrap();
+        assert!(
+            resp.to_lowercase().contains("scoped")
+                || resp.to_lowercase().contains("narrower")
+                || resp.contains("Blocked"),
+            "expected scan guidance, got: {resp}"
+        );
+        // It must NOT have spawned/backgrounded a process.
+        assert!(
+            !resp.contains("Moved to background"),
+            "guard must block before spawning"
+        );
+
+        // A scoped command is NOT blocked by this guard (it may still run/echo).
+        let ok = tool
+            .call(r#"{"action":"run","command":"echo scoped-ok","_session_id":"s","_user_role":"Owner"}"#)
+            .await
+            .unwrap();
+        assert!(ok.contains("scoped-ok"));
     }
 }
