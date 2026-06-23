@@ -598,30 +598,40 @@ fn classify_run_command_action(
 /// Shared path-operand scope checker used by both `is_correction_safe_local_command`
 /// (terminal) and `classify_run_command_action` (run_command).
 ///
-/// Extracts "path-looking" operands from `cmd` (skipping the base command at
-/// position 0, flags, and — for grep/rg — the pattern argument) and validates
-/// each one:
+/// Scans every whitespace-separated token after the base command (index 0) and
+/// scope-checks **every path-shaped value** regardless of whether it is a
+/// positional operand or a flag value — including `=`-attached flag values like
+/// `--manifest-path=/outside/Cargo.toml`.
 ///
-/// 1. **~/$HOME rejection**: any operand starting with `~` (tilde home shorthand)
-///    or containing `$` (env expansion) is rejected outright.  The classifier
-///    cannot determine where these resolve at shell-expansion time, so blocking
-///    them is the only safe choice.
+/// For each token the candidate value is determined as:
+/// - If the token contains `=` (e.g. `--manifest-path=/foo`), the substring
+///   **after** the first `=` is the candidate.
+/// - Otherwise the token itself is the candidate.
 ///
-/// 2. **Working-dir scope**: the remaining operands must resolve (lexically,
+/// A candidate is "path-shaped" (and therefore subject to scope checking) when it:
+/// - contains `/`; OR
+/// - starts with `~`; OR
+/// - contains `$`.
+///
+/// Bare words (`foo`, `--package`, `-n`, `5`, `test`) are not path-shaped and
+/// are silently skipped, so `cargo test --package foo` passes without issue.
+///
+/// Scope-checking rules (applied to every path-shaped candidate):
+///
+/// 1. **~/$HOME rejection**: any candidate starting with `~` or containing `$`
+///    is rejected outright.  The classifier cannot determine where these resolve
+///    at shell-expansion time, so blocking them is the only safe choice.
+///
+/// 2. **Working-dir scope**: the remaining candidates must resolve (lexically,
 ///    without I/O) to a path under `working_dir`.
 ///
 /// 3. **Sensitive-file check**: even in-scope paths are blocked if they match
 ///    known secret/credential patterns (`.env`, `.ssh/`, `.aws/`, etc.).
 ///
-/// A token is treated as a path operand if it:
-/// - starts with `/`, `~`, `.`, or `$`; OR
-/// - contains `/` (looks like a path segment).
-///
-/// Plain words (`foo`, `--package`, `test`, `--features`) are not path operands
-/// and are ignored, so `cargo test --features foo` passes without issue.
-///
-/// The `skip_first_non_flag` parameter skips the first non-flag argument
-/// (used for grep/rg where that argument is the pattern, not a path).
+/// The `skip_first_non_flag` parameter skips the first positional non-flag
+/// argument (used for grep/rg where that argument is the pattern, not a path).
+/// Note: only positional (non-`-`-prefixed) tokens without `=` are counted
+/// toward the skip; flag-value candidates extracted via `=` are always checked.
 fn command_path_operands_in_scope(
     cmd: &str,
     working_dir: &std::path::Path,
@@ -629,49 +639,57 @@ fn command_path_operands_in_scope(
 ) -> Result<(), String> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     // tokens[0] is the base command itself; start from index 1.
-    let mut non_flag_args: Vec<&str> = tokens
-        .get(1..)
-        .unwrap_or(&[])
-        .iter()
-        .copied()
-        .filter(|t| !t.starts_with('-'))
-        .collect();
+    let rest = tokens.get(1..).unwrap_or(&[]);
 
-    if skip_first_non_flag && !non_flag_args.is_empty() {
-        non_flag_args.remove(0);
-    }
+    // Track how many positional (non-flag) operands we have seen so we can
+    // honour skip_first_non_flag for grep/rg pattern skipping.
+    let mut positional_seen: usize = 0;
 
-    for token in &non_flag_args {
-        // Only examine tokens that look like paths.
-        let looks_like_path = token.starts_with('/')
-            || token.starts_with('~')
-            || token.starts_with('.')
-            || token.starts_with('$')
-            || token.contains('/');
+    for &token in rest {
+        // Determine the candidate value and whether this is a positional token.
+        let (candidate, is_positional) = if let Some(eq_pos) = token.find('=') {
+            // `--flag=value` form: candidate is the part after the first `=`.
+            (&token[eq_pos + 1..], false)
+        } else {
+            // Plain token: either a positional operand or a bare flag.
+            (token, !token.starts_with('-'))
+        };
+
+        // For positional tokens (no `-` prefix, no `=`), apply the skip logic.
+        if is_positional {
+            positional_seen += 1;
+            if skip_first_non_flag && positional_seen == 1 {
+                // First positional is the pattern (grep/rg); skip it.
+                continue;
+            }
+        }
+
+        // Only examine candidates that look like paths.
+        let looks_like_path =
+            candidate.contains('/') || candidate.starts_with('~') || candidate.contains('$');
         if !looks_like_path {
             continue;
         }
 
-        // Finding 2: reject ~/ and bare ~ (tilde expansion) and $VAR forms.
-        // The shell expands these at runtime but the classifier sees only the
-        // literal text — there is no safe way to scope-check them here.
-        if token.starts_with('~') {
+        // Reject tilde expansion and shell variable expansion — the classifier
+        // cannot determine where these resolve at shell-expansion time.
+        if candidate.starts_with('~') {
             return Err(format!(
                 "command path operand '{}' uses tilde expansion (~) which cannot be \
                  safely scoped in correction mode",
-                token
+                candidate
             ));
         }
-        if token.contains('$') {
+        if candidate.contains('$') {
             return Err(format!(
                 "command path operand '{}' uses shell variable expansion ($) which \
                  cannot be safely scoped in correction mode",
-                token
+                candidate
             ));
         }
 
         // Resolve and scope-check.
-        let path = std::path::Path::new(token);
+        let path = std::path::Path::new(candidate);
         let resolved = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -681,14 +699,14 @@ fn command_path_operands_in_scope(
         if !normalized.starts_with(working_dir) {
             return Err(format!(
                 "command path '{}' is outside the allowed working directory",
-                token
+                candidate
             ));
         }
         if is_sensitive_file_path(&normalized) {
             return Err(format!(
                 "command path '{}' matches a sensitive/secret file pattern and cannot \
                  be read in correction mode",
-                token
+                candidate
             ));
         }
     }
@@ -2204,6 +2222,114 @@ mod tests {
             classify_action(&a, &ctx),
             ActionVerdict::Allowed,
             "run_command cargo test with in-scope manifest path should be allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // = -attached flag path escape fix (3b P1.2) — the `--flag=value` form
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_command_manifest_path_eq_out_of_scope_blocked() {
+        // The = form of --manifest-path pointing outside working_dir must be blocked.
+        // Previously this escaped scope checking because the whole token starts with `-`
+        // and was filtered out before any path analysis.
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --manifest-path=/outside/Cargo.toml"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command cargo test --manifest-path=/outside/Cargo.toml should be blocked (= form, out-of-scope)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_manifest_path_space_out_of_scope_blocked_regression() {
+        // Regression guard: the space form must still be blocked.
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --manifest-path /outside/Cargo.toml"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "run_command cargo test --manifest-path /outside/Cargo.toml should be blocked (space form, regression)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_manifest_path_eq_in_scope_allowed() {
+        // The = form pointing inside working_dir must be allowed.
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --manifest-path=/tmp/test-workdir/Cargo.toml"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "run_command cargo test --manifest-path=/tmp/test-workdir/Cargo.toml should be allowed (= form, in-scope)"
+        );
+    }
+
+    #[test]
+    fn test_generic_grep_file_eq_out_of_scope_blocked() {
+        // grep --file=/etc/passwd . — the = form of a path flag on a read command must block.
+        // Note: grep is in the terminal allowlist (not run_command), and skip_first_non_flag=true
+        // means the first positional token (`.`) is the pattern and is skipped.
+        // The path-shaped value /etc/passwd comes from `--file=/etc/passwd` and must be blocked.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"grep --file=/etc/passwd ."}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "terminal grep --file=/etc/passwd . should be blocked (= form path on grep)"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cargo_test_no_path_shaped_token_allowed() {
+        // `cargo test` with no path-shaped token at all → Allowed (baseline).
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "cargo test (no path token) must remain Allowed"
+        );
+    }
+
+    #[test]
+    fn test_run_command_cargo_test_package_flag_allowed() {
+        // `cargo test --package foo` — `foo` is not path-shaped → Allowed.
+        let a = extract_proposed_action(
+            "run_command",
+            r#"{"command":"cargo test --package foo"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "cargo test --package foo (bare word value, not path-shaped) must be Allowed"
         );
     }
 }
