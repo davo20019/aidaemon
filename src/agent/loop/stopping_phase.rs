@@ -1522,6 +1522,11 @@ pub(super) async fn run_stopping_phase(
             .filter(|(_, recovered)| !recovered)
             .count();
 
+        // Carries the controller's honest give-up summary from the pivot-budget
+        // exhaustion arm to the final stall fallback, where it replaces the
+        // generic "couldn't complete" message. None unless pivots were exhausted.
+        let mut give_up_message: Option<String> = None;
+
         // Approach pivot: a stall while the approach is demonstrably failing does
         // not end the task while pivot budget remains. The "is this approach
         // failing?" judgment stays in-loop; the "may I pivot again?" budget moves
@@ -1618,6 +1623,9 @@ pub(super) async fn run_stopping_phase(
                             json!({ "condition": "approach_pivot_exhausted", "report": report }),
                         )
                         .await;
+                    give_up_message = Some(crate::agent::self_correction::compose_give_up_reply(
+                        &report,
+                    ));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1914,15 +1922,23 @@ pub(super) async fn run_stopping_phase(
                 })
                 .await;
         }
-        let result = agent
-            .graceful_stall_response(
-                emitter,
+        let result = if let Some(reply) = give_up_message.take() {
+            info!(
                 session_id,
-                learning_ctx,
-                !successful_send_file_keys.is_empty(),
-                tool_failure_count,
-            )
-            .await;
+                task_id, "self-correction: surfacing give-up report as final reply"
+            );
+            Ok(reply)
+        } else {
+            agent
+                .graceful_stall_response(
+                    emitter,
+                    session_id,
+                    learning_ctx,
+                    !successful_send_file_keys.is_empty(),
+                    tool_failure_count,
+                )
+                .await
+        };
         let (status, error, summary) = match &result {
             Ok(reply) => (
                 TaskStatus::Failed,
