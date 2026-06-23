@@ -9,6 +9,15 @@ pub(super) struct ToolExecCtx<'a> {
     pub project_scope: Option<&'a str>,
     pub trusted: bool,
     pub user_role: UserRole,
+    /// Set by the P2.4 sandbox gate when this specific tool call has already
+    /// been classified as allowed. False on all normal (non-correction) paths.
+    #[allow(dead_code)]
+    pub correction_preapproved: bool,
+    /// When true, the `_trusted_session` enrichment flag must NOT be injected
+    /// into tool args (the correction sandbox overrides trusted-session semantics).
+    /// False on all normal paths.
+    #[allow(dead_code)]
+    pub suppress_trusted_session: bool,
 }
 
 // impl-Agent justification: tool dispatch with watchdog over tools/state/event_store/verification_tracker.

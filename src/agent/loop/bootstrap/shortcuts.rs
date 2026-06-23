@@ -46,6 +46,8 @@ pub(super) async fn maybe_handle_stop_command(
                 project_scope: None,
                 trusted: channel_ctx.trusted,
                 user_role,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await;
@@ -130,6 +132,8 @@ pub(super) async fn maybe_cancel_work_for_mid_task_pivot(
                 project_scope: None,
                 trusted: channel_ctx.trusted,
                 user_role,
+                correction_preapproved: false,
+                suppress_trusted_session: false,
             },
         )
         .await;

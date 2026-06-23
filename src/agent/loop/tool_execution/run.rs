@@ -1057,6 +1057,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         heartbeat,
                         emitter,
                         policy_bundle,
+                        correction_preapproved: false,
+                        suppress_trusted_session: false,
                     },
                 )
                 .await
@@ -1085,6 +1087,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             project_scope: allowed_project_scope,
                             trusted: channel_ctx.trusted,
                             user_role,
+                            correction_preapproved: false,
+                            suppress_trusted_session: false,
                         },
                     )
                     .await;

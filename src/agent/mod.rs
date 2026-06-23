@@ -536,6 +536,7 @@ pub(crate) use goal_dispatch::{
 mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
 
+pub mod correction_execution;
 pub mod correction_sandbox;
 pub mod self_correction;
 

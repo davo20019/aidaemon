@@ -95,4 +95,9 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     /// Used to replay read_file/search_files content when the repetitive
     /// redirect fires, so the model retains data lost to context truncation.
     pub tool_result_cache: &'a mut HashMap<u64, String>,
+    /// Correction context for this task. `None` on all normal/user-initiated
+    /// paths. The P2.4 sandbox gate reads this to apply the default-deny policy.
+    #[allow(dead_code)]
+    pub correction:
+        Option<std::sync::Arc<crate::agent::correction_execution::CorrectionExecutionContext>>,
 }

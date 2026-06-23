@@ -93,6 +93,8 @@ pub(super) async fn prefetch_read_only_batch(
             heartbeat: ctx.heartbeat,
             emitter: ctx.emitter,
             policy_bundle: ctx.policy_bundle,
+            correction_preapproved: false,
+            suppress_trusted_session: false,
         };
         let io = execute_tool_call_io(agent, tc, &io_ctx).await;
         (
