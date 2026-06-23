@@ -264,6 +264,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn give_up_report_is_idempotent_writes_single_gave_up_row() {
+        let state = temp_state().await;
+        let ctrl = SelfCorrectionController::new(state.clone(), 3);
+        let k = SelfCorrectionSubjectKind::Task;
+        ctrl.record_failure("t4", k, "a", 1, None).await.unwrap();
+        ctrl.record_failure("t4", k, "b", 2, None).await.unwrap();
+
+        // Two give-up calls must each return a summary but write only ONE gave_up row.
+        assert!(ctrl.give_up_report("t4").await.unwrap().is_some());
+        assert!(ctrl.give_up_report("t4").await.unwrap().is_some());
+
+        let rows = state.get_self_correction_attempts("t4").await.unwrap();
+        let gave_up_count = rows
+            .iter()
+            .filter(|r| r.status == crate::traits::attempt_status::GAVE_UP)
+            .count();
+        assert_eq!(
+            gave_up_count, 1,
+            "give_up_report must write exactly one gave_up row"
+        );
+    }
+
+    #[tokio::test]
     async fn record_success_does_not_count_as_failure() {
         let ctrl = SelfCorrectionController::new(temp_state().await, 3);
         let k = SelfCorrectionSubjectKind::Task;
