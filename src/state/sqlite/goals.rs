@@ -684,6 +684,60 @@ impl crate::traits::TaskStore for SqliteStateStore {
             })
             .collect())
     }
+
+    async fn record_self_correction_attempt(
+        &self,
+        attempt: &crate::traits::SelfCorrectionAttempt,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO self_correction_attempts
+             (subject_id, subject_kind, approach_signature, attempt_index, status,
+              blocked_reason, evidence_ref, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime(?))",
+        )
+        .bind(&attempt.subject_id)
+        .bind(&attempt.subject_kind)
+        .bind(&attempt.approach_signature)
+        .bind(attempt.attempt_index)
+        .bind(&attempt.status)
+        .bind(&attempt.blocked_reason)
+        .bind(&attempt.evidence_ref)
+        .bind(&attempt.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_self_correction_attempts(
+        &self,
+        subject_id: &str,
+    ) -> anyhow::Result<Vec<crate::traits::SelfCorrectionAttempt>> {
+        let rows = sqlx::query(
+            "SELECT id, subject_id, subject_kind, approach_signature, attempt_index,
+                    status, blocked_reason, evidence_ref, created_at
+             FROM self_correction_attempts
+             WHERE subject_id = ?
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::traits::SelfCorrectionAttempt {
+                id: r.get("id"),
+                subject_id: r.get("subject_id"),
+                subject_kind: r.get("subject_kind"),
+                approach_signature: r.get("approach_signature"),
+                attempt_index: r.get("attempt_index"),
+                status: r.get("status"),
+                blocked_reason: r.get("blocked_reason"),
+                evidence_ref: r.get("evidence_ref"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
 }
 
 #[async_trait]

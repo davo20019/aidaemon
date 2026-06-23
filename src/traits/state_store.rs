@@ -849,6 +849,24 @@ pub trait TaskStore: Send + Sync {
     ) -> anyhow::Result<Vec<super::TaskActivity>> {
         Ok(vec![])
     }
+
+    /// Record a self-correction attempt (durable audit + repeat/K bookkeeping).
+    #[allow(dead_code)] // Used in Phase 2
+    async fn record_self_correction_attempt(
+        &self,
+        _attempt: &super::SelfCorrectionAttempt,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// All self-correction attempts for a subject, oldest first.
+    #[allow(dead_code)] // Used in Phase 2
+    async fn get_self_correction_attempts(
+        &self,
+        _subject_id: &str,
+    ) -> anyhow::Result<Vec<super::SelfCorrectionAttempt>> {
+        Ok(vec![])
+    }
 }
 
 /// Goal schedule and scheduled-run persistence.
