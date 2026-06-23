@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Durable self-correction ledger and controller (internal).** New `self_correction_attempts` table and `SelfCorrectionController` provide bounded, restart-safe attempt policy — repeat-blocking of known-bad approaches, a K=3 distinct-failure budget, and an honest give-up report. Not yet wired into the agent loop (foundation for in-loop self-correction).
+
 ### Changed
 
 - **Stuck-task watchdog now reaps on inactivity, not total runtime.** `detect_stuck_tasks` previously marked any running/claimed task older than 5 minutes as `interrupted`, falsely killing legitimately long tasks (observed: a goal had 3 tasks interrupted in a 7-minute window). It now compares each task's latest `task_activity` (tool or LLM call) against a configurable `daemon.watchdog.task_inactivity_timeout_secs` (default 300s), so active tasks survive and only genuinely inactive ones are interrupted. `task_activity.created_at` is normalized to a single UTC format with a new `(task_id, created_at)` index to serve the per-task `MAX(created_at)` lookup.
