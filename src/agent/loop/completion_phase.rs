@@ -47,6 +47,63 @@ pub(super) struct CompletionCtx<'a> {
     pub validation_state: &'a mut ValidationState,
 }
 
+fn build_final_sanitization_gate_telemetry(
+    original_chars: usize,
+    final_chars: usize,
+    collapsed_repetition: bool,
+    gutted_by_sanitization: bool,
+) -> (String, Value) {
+    let changed = original_chars != final_chars || collapsed_repetition || gutted_by_sanitization;
+    let action = if gutted_by_sanitization {
+        "recovered_from_gutted"
+    } else if changed {
+        "sanitized"
+    } else {
+        "passed"
+    };
+    let summary = if changed {
+        format!(
+            "Final sanitization gate changed final reply: {original_chars} -> {final_chars} chars"
+        )
+    } else {
+        format!("Final sanitization gate passed final reply unchanged: {final_chars} chars")
+    };
+    (
+        summary,
+        json!({
+            "condition": "final_reply_sanitization",
+            "gate_family": "final_reply",
+            "action": action,
+            "original_chars": original_chars,
+            "final_chars": final_chars,
+            "delta_chars": (final_chars as i64) - (original_chars as i64),
+            "collapsed_repetition": collapsed_repetition,
+            "gutted_by_sanitization": gutted_by_sanitization,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod gate_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn final_sanitization_telemetry_marks_changed_reply_and_repetition_collapse() {
+        let (summary, metadata) = build_final_sanitization_gate_telemetry(120, 80, true, false);
+
+        assert!(
+            summary.contains("changed final reply"),
+            "summary: {summary}"
+        );
+        assert_eq!(metadata["condition"], "final_reply_sanitization");
+        assert_eq!(metadata["action"], "sanitized");
+        assert_eq!(metadata["collapsed_repetition"], true);
+        assert_eq!(metadata["gutted_by_sanitization"], false);
+        assert_eq!(metadata["original_chars"], 120);
+        assert_eq!(metadata["final_chars"], 80);
+    }
+}
+
 pub(super) async fn run_completion_phase(
     services: &super::services::AgentServices<'_>,
     ctx: &mut CompletionCtx<'_>,
@@ -1719,45 +1776,45 @@ pub(super) async fn run_completion_phase(
         // the same sentence or line many times in a row once their context fills
         // with repetitive content; without this the user sees a wall of
         // duplicated text split across many chunked messages.
-        let reply = {
-            let (collapsed, did_collapse) =
-                crate::tools::sanitize::collapse_degenerate_repetition(&reply);
-            if did_collapse {
-                warn!(
-                    session_id,
-                    iteration,
-                    original_len = reply.len(),
-                    collapsed_len = collapsed.len(),
-                    "Collapsed degenerate repetition loop in final reply"
-                );
-            }
-            collapsed
-        };
+        let original_final_reply_chars = reply.trim().chars().count();
+        let (reply, collapsed_repetition) =
+            crate::tools::sanitize::collapse_degenerate_repetition(&reply);
+        if collapsed_repetition {
+            warn!(
+                session_id,
+                iteration,
+                original_len = original_final_reply_chars,
+                collapsed_len = reply.trim().chars().count(),
+                "Collapsed degenerate repetition loop in final reply"
+            );
+        }
 
         // Sanitize user-facing output before any channel-specific redaction.
         let pre_sanitize_chars = reply.trim().chars().count();
-        let reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
+        let sanitized_reply = crate::tools::sanitize::sanitize_user_facing_reply(&reply);
+        let gutted_by_sanitization = crate::tools::sanitize::reply_gutted_by_sanitization(
+            pre_sanitize_chars,
+            &sanitized_reply,
+        );
 
         // Safety net: if sanitization stripped a non-empty reply to empty or
         // to a dangling lead-in stub ("Here are the results:"), fall back to
         // an activity summary instead of sending a contentless message.
-        let reply =
-            if crate::tools::sanitize::reply_gutted_by_sanitization(pre_sanitize_chars, &reply) {
-                warn!(
-                    session_id,
-                    iteration, "Sanitization gutted reply — falling back to activity summary"
-                );
-                if !learning_ctx.tool_calls.is_empty() {
-                    let refs: Vec<&str> =
-                        learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
-                    build_activity_summary_reply(&refs)
-                } else {
-                    // Genuine edge case: no tools either.  Use a generic acknowledgement.
-                    "Done.".to_string()
-                }
+        let reply = if gutted_by_sanitization {
+            warn!(
+                session_id,
+                iteration, "Sanitization gutted reply — falling back to activity summary"
+            );
+            if !learning_ctx.tool_calls.is_empty() {
+                let refs: Vec<&str> = learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
+                build_activity_summary_reply(&refs)
             } else {
-                reply
-            };
+                // Genuine edge case: no tools either.  Use a generic acknowledgement.
+                "Done.".to_string()
+            }
+        } else {
+            sanitized_reply
+        };
 
         let reply = match channel_ctx.visibility {
             ChannelVisibility::Public | ChannelVisibility::PublicExternal => {
@@ -1770,7 +1827,6 @@ pub(super) async fn run_completion_phase(
             }
             _ => reply,
         };
-
         // Diagnostic: warn when completing with zero tool calls and deferred-action
         // text. This catches cases where the agent promises future work ("I'll search
         // for TODOs...") but never actually executes any tools (G2 stall pattern).
@@ -1995,6 +2051,22 @@ pub(super) async fn run_completion_phase(
         }
 
         let has_unrecovered_errors = learning_ctx.errors.iter().any(|(_, recovered)| !*recovered);
+        let (sanitization_summary, sanitization_metadata) = build_final_sanitization_gate_telemetry(
+            original_final_reply_chars,
+            reply.trim().chars().count(),
+            collapsed_repetition,
+            gutted_by_sanitization,
+        );
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::GateTelemetry,
+                sanitization_summary,
+                sanitization_metadata,
+            )
+            .await;
         let outcome = TaskOutcomeDerivation::from_completion_state(
             &validation_state,
             execution_state,

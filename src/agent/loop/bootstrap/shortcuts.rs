@@ -555,6 +555,23 @@ pub(super) async fn emit_bootstrap_direct_reply(
     }
 
     agent
+        .emit_decision_point(
+            emitter,
+            task_id,
+            0,
+            DecisionType::GateTelemetry,
+            "Bootstrap direct-return gate answered without LLM loop".to_string(),
+            json!({
+                "condition": "bootstrap_direct_return",
+                "gate_family": "bootstrap",
+                "action": "returned",
+                "reply_chars": reply_text.trim().chars().count(),
+                "agent_depth": agent.depth,
+            }),
+        )
+        .await;
+
+    agent
         .emit_direct_return_task_end(
             emitter,
             task_id,

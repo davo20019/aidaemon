@@ -7,6 +7,83 @@ use crate::agent::recall_guardrails::{
 };
 use crate::agent::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::agent) struct GateFilterStage {
+    stage: &'static str,
+    before_count: usize,
+    after_count: usize,
+    action: &'static str,
+    shadow_after_count: Option<usize>,
+}
+
+impl GateFilterStage {
+    pub(in crate::agent) fn new(
+        stage: &'static str,
+        before_count: usize,
+        after_count: usize,
+        action: &'static str,
+    ) -> Self {
+        Self {
+            stage,
+            before_count,
+            after_count,
+            action,
+            shadow_after_count: None,
+        }
+    }
+
+    fn shadow(stage: &'static str, before_count: usize, shadow_after_count: usize) -> Self {
+        Self {
+            stage,
+            before_count,
+            after_count: before_count,
+            action: "shadow_observed",
+            shadow_after_count: Some(shadow_after_count),
+        }
+    }
+}
+
+fn build_tool_filter_gate_telemetry(
+    stages: &[GateFilterStage],
+    initial_tool_count: usize,
+    final_tool_count: usize,
+) -> (String, Value) {
+    let removed_tool_count = initial_tool_count.saturating_sub(final_tool_count);
+    let filtered_stage_count = stages
+        .iter()
+        .filter(|stage| stage.before_count != stage.after_count)
+        .count();
+    let summary = format!(
+        "Tool filter gates evaluated: {initial_tool_count} -> {final_tool_count} tools ({removed_tool_count} removed)"
+    );
+    let stage_metadata: Vec<Value> = stages
+        .iter()
+        .map(|stage| {
+            json!({
+                "stage": stage.stage,
+                "before_count": stage.before_count,
+                "after_count": stage.after_count,
+                "removed_count": stage.before_count.saturating_sub(stage.after_count),
+                "shadow_after_count": stage.shadow_after_count,
+                "action": stage.action,
+            })
+        })
+        .collect();
+    (
+        summary,
+        json!({
+            "condition": "tool_filtering",
+            "gate_family": "tool_availability",
+            "action": if removed_tool_count > 0 { "filtered" } else { "passed" },
+            "initial_tool_count": initial_tool_count,
+            "final_tool_count": final_tool_count,
+            "removed_tool_count": removed_tool_count,
+            "filtered_stage_count": filtered_stage_count,
+            "stages": stage_metadata,
+        }),
+    )
+}
+
 pub(in crate::agent) async fn run_bootstrap_phase(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &BootstrapCtx<'_>,
@@ -364,30 +441,74 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let mut available_capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
     let mut base_tool_defs: Vec<Value> = Vec::new();
     let mut tool_defs: Vec<Value> = Vec::new();
+    let mut tool_filter_stages: Vec<GateFilterStage> = Vec::new();
+    let mut initial_tool_count = 0usize;
     if tools_allowed_for_user {
         let (mut defs, mut caps) = agent.tool_definitions_with_capabilities(user_text).await;
+        initial_tool_count = defs.len();
+        tool_filter_stages.push(GateFilterStage::new(
+            "owner_role",
+            initial_tool_count,
+            initial_tool_count,
+            "passed",
+        ));
 
         // Filter tools by channel visibility
         if channel_ctx.visibility == ChannelVisibility::PublicExternal {
+            let before = defs.len();
             let allowed = ["web_search", "remember_fact", "system_info"];
             defs.retain(|d| {
                 Agent::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
             });
             caps.retain(|name, _| allowed.contains(&name.as_str()));
+            tool_filter_stages.push(GateFilterStage::new(
+                "public_external_allowlist",
+                before,
+                defs.len(),
+                if before == defs.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
         }
 
         if restrict_to_personal_memory_tools {
+            let before = defs.len();
             defs = filter_tool_defs_for_personal_memory(&defs);
             caps.retain(|name, _| is_personal_memory_tool(name));
+            tool_filter_stages.push(GateFilterStage::new(
+                "personal_memory_only",
+                before,
+                defs.len(),
+                if before == defs.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
         }
         if restrict_untrusted_external_reference_tools {
+            let before = defs.len();
             defs = filter_tool_defs_for_untrusted_external_reference(&defs);
             caps.retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
+            tool_filter_stages.push(GateFilterStage::new(
+                "untrusted_external_reference",
+                before,
+                defs.len(),
+                if before == defs.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
         }
 
         available_capabilities = caps;
         base_tool_defs = defs.clone();
         tool_defs = defs;
+    } else {
+        tool_filter_stages.push(GateFilterStage::new("owner_role", 0, 0, "blocked"));
     }
 
     // Pillar A Task 6: canonicalize the roster to name-sorted order at the
@@ -445,21 +566,94 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             );
         }
         if agent.policy_config.tool_filter_enforce {
+            tool_filter_stages.push(GateFilterStage::new(
+                "policy_filter",
+                tool_defs.len(),
+                shadow_filtered.len(),
+                if tool_defs.len() == shadow_filtered.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
             tool_defs = shadow_filtered;
+        } else {
+            tool_filter_stages.push(GateFilterStage::shadow(
+                "policy_filter",
+                tool_defs.len(),
+                shadow_filtered.len(),
+            ));
         }
     }
 
     if restrict_to_personal_memory_tools {
+        let before = tool_defs.len();
         tool_defs = filter_tool_defs_for_personal_memory(&tool_defs);
+        tool_filter_stages.push(GateFilterStage::new(
+            "personal_memory_only_final",
+            before,
+            tool_defs.len(),
+            if before == tool_defs.len() {
+                "passed"
+            } else {
+                "filtered"
+            },
+        ));
+        let before_base = base_tool_defs.len();
         base_tool_defs = filter_tool_defs_for_personal_memory(&base_tool_defs);
+        tool_filter_stages.push(GateFilterStage::new(
+            "personal_memory_only_base_final",
+            before_base,
+            base_tool_defs.len(),
+            if before_base == base_tool_defs.len() {
+                "passed"
+            } else {
+                "filtered"
+            },
+        ));
         available_capabilities.retain(|name, _| is_personal_memory_tool(name));
     }
     if restrict_untrusted_external_reference_tools {
+        let before = tool_defs.len();
         tool_defs = filter_tool_defs_for_untrusted_external_reference(&tool_defs);
+        tool_filter_stages.push(GateFilterStage::new(
+            "untrusted_external_reference_final",
+            before,
+            tool_defs.len(),
+            if before == tool_defs.len() {
+                "passed"
+            } else {
+                "filtered"
+            },
+        ));
+        let before_base = base_tool_defs.len();
         base_tool_defs = filter_tool_defs_for_untrusted_external_reference(&base_tool_defs);
+        tool_filter_stages.push(GateFilterStage::new(
+            "untrusted_external_reference_base_final",
+            before_base,
+            base_tool_defs.len(),
+            if before_base == base_tool_defs.len() {
+                "passed"
+            } else {
+                "filtered"
+            },
+        ));
         available_capabilities
             .retain(|name, _| !is_untrusted_external_reference_blocked_tool(name));
     }
+
+    let (tool_filter_summary, tool_filter_metadata) =
+        build_tool_filter_gate_telemetry(&tool_filter_stages, initial_tool_count, tool_defs.len());
+    agent
+        .emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::GateTelemetry,
+            tool_filter_summary,
+            tool_filter_metadata,
+        )
+        .await;
 
     // Keep provider + router consistent for this task, even if runtime reloads.
     let llm_runtime_snapshot = agent.llm_runtime.snapshot();
@@ -669,4 +863,28 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     };
 
     Ok(BootstrapOutcome::Continue(Box::new(data)))
+}
+
+#[cfg(test)]
+mod gate_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn tool_filter_gate_telemetry_reports_removed_counts_by_stage() {
+        let stages = vec![
+            GateFilterStage::new("owner_role", 12, 12, "passed"),
+            GateFilterStage::new("public_external_allowlist", 12, 3, "filtered"),
+            GateFilterStage::new("policy_filter", 3, 2, "filtered"),
+        ];
+
+        let (summary, metadata) = build_tool_filter_gate_telemetry(&stages, 12, 2);
+
+        assert!(summary.contains("12 -> 2"), "summary: {summary}");
+        assert_eq!(metadata["condition"], "tool_filtering");
+        assert_eq!(metadata["initial_tool_count"], 12);
+        assert_eq!(metadata["final_tool_count"], 2);
+        assert_eq!(metadata["removed_tool_count"], 10);
+        assert_eq!(metadata["stages"][1]["removed_count"], 9);
+        assert_eq!(metadata["stages"][2]["stage"], "policy_filter");
+    }
 }
