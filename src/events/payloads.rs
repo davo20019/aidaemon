@@ -455,6 +455,7 @@ pub enum DecisionType {
     BudgetAutoExtension,
     LlmEfficiencyAlert,
     CoreProfileSelection,
+    GateTelemetry,
 }
 
 impl DecisionType {
@@ -481,6 +482,7 @@ impl DecisionType {
             DecisionType::InstructionsSnapshot => "instructions_snapshot",
             DecisionType::BudgetAutoExtension => "budget_auto_extension",
             DecisionType::LlmEfficiencyAlert => "llm_efficiency_alert",
+            DecisionType::GateTelemetry => "gate_telemetry",
         }
     }
 }
@@ -1383,6 +1385,11 @@ mod tests {
 
         assert_eq!(data.severity, DiagnosticSeverity::Info);
         assert!(data.code.is_none());
+    }
+
+    #[test]
+    fn gate_telemetry_decision_type_has_stable_label() {
+        assert_eq!(DecisionType::GateTelemetry.as_str(), "gate_telemetry");
     }
 
     #[test]

@@ -288,11 +288,15 @@ impl Agent {
     /// After this window the model is attempted again (credits may have been added).
     const BILLING_FAIL_CACHE_TTL: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
+    /// Settings KV key under which the runtime-learned set of models that
+    /// ignore forced `tool_choice=required` is persisted (JSON array).
+    const REQUIRED_TOOL_CHOICE_IGNORED_KEY: &'static str = "required_tool_choice_ignored_models";
+
     /// Whether `model` has previously ignored a forced `tool_choice=required`
     /// call (returned text with zero tool calls), meaning forcing it again
     /// would only burn tokens — and on some stacks (llama.cpp + Gemma)
     /// degenerate into a repetition loop until the token limit.
-    pub(in crate::agent) async fn required_tool_choice_ignored(&self, model: &str) -> bool {
+    pub(crate) async fn required_tool_choice_ignored(&self, model: &str) -> bool {
         self.required_tool_choice_ignored_models
             .read()
             .await
@@ -301,11 +305,88 @@ impl Agent {
 
     /// Record that `model` ignored a forced `tool_choice=required` call.
     /// Returns true when the model was newly flagged.
-    pub(in crate::agent) async fn record_required_tool_choice_ignored(&self, model: &str) -> bool {
+    ///
+    /// On a newly-flagged model the updated set is also persisted to the
+    /// settings KV (JSON), so the flag survives daemon restarts and the
+    /// witnessed meltdown is never re-armed.
+    pub(crate) async fn record_required_tool_choice_ignored(&self, model: &str) -> bool {
+        let newly_flagged = self
+            .required_tool_choice_ignored_models
+            .write()
+            .await
+            .insert(model.to_string());
+
+        if newly_flagged {
+            // Snapshot under the read lock, then persist outside it.
+            let snapshot: Vec<String> = {
+                let set = self.required_tool_choice_ignored_models.read().await;
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            };
+            self.persist_required_tool_choice_ignored(&snapshot).await;
+        }
+
+        newly_flagged
+    }
+
+    /// Persist the runtime-learned ignore-set to the settings KV as a JSON
+    /// array. Best-effort: a storage error is logged, never propagated.
+    pub(in crate::agent) async fn persist_required_tool_choice_ignored(&self, models: &[String]) {
+        match serde_json::to_string(models) {
+            Ok(json) => {
+                if let Err(e) = self
+                    .state
+                    .set_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY, &json)
+                    .await
+                {
+                    warn!(error = %e, "Failed to persist required_tool_choice_ignored_models");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize required_tool_choice_ignored_models");
+            }
+        }
+    }
+
+    /// Test-only: clear the in-memory ignore-set so a subsequent
+    /// `load_required_tool_choice_ignored()` exercises the persisted-KV path.
+    #[cfg(test)]
+    pub(crate) async fn clear_required_tool_choice_ignored_in_memory(&self) {
         self.required_tool_choice_ignored_models
             .write()
             .await
-            .insert(model.to_string())
+            .clear();
+    }
+
+    /// Merge any persisted runtime-learned ignore-set entries into the
+    /// in-memory set (which was already seeded from config at construction).
+    /// Call once at startup, after the Agent is built. Best-effort.
+    pub(crate) async fn load_required_tool_choice_ignored(&self) {
+        let raw = match self
+            .state
+            .get_setting(Self::REQUIRED_TOOL_CHOICE_IGNORED_KEY)
+            .await
+        {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "Failed to load required_tool_choice_ignored_models");
+                return;
+            }
+        };
+
+        match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(persisted) => {
+                let mut set = self.required_tool_choice_ignored_models.write().await;
+                for m in persisted {
+                    set.insert(m);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to parse persisted required_tool_choice_ignored_models");
+            }
+        }
     }
 
     /// Attempt an LLM call with error-classified recovery:

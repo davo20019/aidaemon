@@ -356,7 +356,26 @@ pub(super) fn is_internal_maintenance_intent(user_text: &str) -> bool {
     knowledge_maintenance || memory_health
 }
 
+/// Returns `true` when this turn is a background-output delivery injected by
+/// the terminal tool's re-engagement path (see `tools/terminal.rs`).
+/// These turns already contain the command output and must not be forced
+/// through the tool loop — the model only needs to interpret and reply.
+fn is_observation_delivery_turn(user_text: &str) -> bool {
+    user_text.contains("[Background command completed]")
+}
+
 pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
+    // Short-circuit: background-output delivery turns never need tools.
+    // The terminal re-engagement injects a synthetic message starting with
+    // "[Background command completed]" — the output is already present;
+    // forcing tool_choice=required causes degenerate repetition on some models.
+    if is_observation_delivery_turn(user_text) {
+        return IntentGateDecision {
+            needs_tools: Some(false),
+            ..Default::default()
+        };
+    }
+
     let user_text = crate::channels::attachments::user_authored_text(user_text);
     // Deterministic tool-need overrides:
     // 1) explicit filesystem paths
@@ -1518,5 +1537,40 @@ mod intent_routing_path_override_tests {
         assert!(!user_text_requests_auth_or_integration_management(
             "Draft a tweet about our launch."
         ));
+    }
+
+    #[test]
+    fn test_intent_gate_background_delivery_turn_needs_no_tools() {
+        let msg = "[Background command completed]\nCommand: `find . -name '*.log' -size +1M`\nOutput:\n./logs/app.log\n./logs/error.log\n\nThis command was part of your previous task.";
+        let d = infer_intent_gate(msg, "");
+        assert_eq!(
+            d.needs_tools,
+            Some(false),
+            "background-output delivery turn must not require tools, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn test_intent_gate_normal_local_request_still_needs_tools() {
+        let d = infer_intent_gate("what's the biggest file on my computer?", "");
+        assert_eq!(
+            d.needs_tools,
+            Some(true),
+            "local filesystem request must still require tools, got {:?}",
+            d.needs_tools
+        );
+    }
+
+    #[test]
+    fn test_intent_gate_delivery_marker_overrides_filesystem_paths() {
+        let msg = "[Background command completed]\nCommand: `ls /var/log`\nOutput:\n/var/log/syslog\n/var/log/kern.log\n/Users/alice/project/build.log\n\nThis command was part of your previous task.";
+        let d = infer_intent_gate(msg, "");
+        assert_eq!(
+            d.needs_tools,
+            Some(false),
+            "background-output delivery marker must override filesystem-path detection, got {:?}",
+            d.needs_tools
+        );
     }
 }

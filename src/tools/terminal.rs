@@ -1732,6 +1732,15 @@ impl TerminalTool {
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 let reengagements_for_notify = self.reengagements.clone();
+                // Cloned for the notifier task so it can remove the finished process
+                // from `running` (and its indexes) after delivery, preventing the
+                // idle-reaper from sending a contradictory "stopped, no results" message
+                // for a process that already delivered its output.
+                let running_for_notify = self.running.clone();
+                let running_by_dedupe_key_for_notify = self.running_by_dedupe_key.clone();
+                let task_processes_for_notify = self.task_processes.clone();
+                let dedupe_key_for_notify = dedupe_key.clone();
+                let owner_task_id_for_notify = owner_task_id.clone();
                 if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
@@ -2416,6 +2425,54 @@ impl TerminalTool {
                                         }
                                     }
                                 }
+                            }
+                            // Bug C fix: remove the finished process from `running`
+                            // (and its dedupe / task-process indexes) so the idle-reaper
+                            // cannot later send a contradictory "stopped, no results"
+                            // message for a process whose output was already delivered.
+                            //
+                            // We only reach this point after the completion_rx arm breaks
+                            // out of the select loop — i.e. the process has already exited
+                            // and its output has been delivered (status ping + agent
+                            // re-engagement / raw fallback above). Removing here is safe
+                            // because:
+                            //   • handle_check / handle_kill suppress notify_on_completion
+                            //     and return early before we get here, so they own cleanup.
+                            //   • reap_stale_background_processes filters notifier_active &&
+                            //     !detached; removing from running here means the reaper
+                            //     finds no entry and skips the process entirely.
+                            //   • The entry is NOT moved to `self.completed` (the notifier
+                            //     already delivered the output directly), consistent with
+                            //     how handle_kill works for notifier-active processes.
+                            if let Some(reaped) = running_for_notify.lock().await.remove(&pid) {
+                                // Clean up dedupe-key index (mirrors remove_indexes_for_process).
+                                if let Some(ref key) = reaped.dedupe_key {
+                                    if key == &dedupe_key_for_notify {
+                                        let mut dedupe =
+                                            running_by_dedupe_key_for_notify.lock().await;
+                                        if dedupe.get(key).copied() == Some(pid) {
+                                            dedupe.remove(key);
+                                        }
+                                    }
+                                }
+                                // Clean up task-process index.
+                                if !reaped.detached {
+                                    if let Some(ref task_id) = owner_task_id_for_notify {
+                                        let mut task_map = task_processes_for_notify.lock().await;
+                                        let mut remove_task_key = false;
+                                        if let Some(pids) = task_map.get_mut(task_id) {
+                                            pids.remove(&pid);
+                                            remove_task_key = pids.is_empty();
+                                        }
+                                        if remove_task_key {
+                                            task_map.remove(task_id);
+                                        }
+                                    }
+                                }
+                                info!(
+                                    pid,
+                                    "Notifier removed finished process from running map after delivery"
+                                );
                             }
                         });
                         notifier_started = true;

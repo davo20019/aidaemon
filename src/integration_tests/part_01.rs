@@ -1788,6 +1788,58 @@ async fn test_required_tool_choice_not_reforced_after_model_ignores_it() {
     );
 }
 
+/// Persistence round-trip: a model flagged as ignoring `tool_choice=required`
+/// is persisted to the settings KV and survives a reload (clear in-memory set,
+/// then `load_required_tool_choice_ignored()` re-populates it from the DB).
+/// This is what stops the witnessed gemma-4-26b meltdown from re-arming after a
+/// daemon restart.
+#[tokio::test]
+async fn test_required_tool_choice_ignored_persists_across_reload() {
+    use crate::traits::SettingsStore;
+
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let model = "round-trip-gemma";
+
+    // Newly flag the model — should persist to the settings KV.
+    assert!(
+        harness
+            .agent
+            .record_required_tool_choice_ignored(model)
+            .await,
+        "first record should newly flag the model"
+    );
+    assert!(harness.agent.required_tool_choice_ignored(model).await);
+
+    // The settings KV should now hold the model in its JSON array.
+    let stored = harness
+        .state
+        .get_setting("required_tool_choice_ignored_models")
+        .await
+        .unwrap()
+        .expect("persisted ignore-set must exist after recording");
+    let stored_models: Vec<String> = serde_json::from_str(&stored).unwrap();
+    assert!(
+        stored_models.iter().any(|m| m == model),
+        "persisted JSON must contain the flagged model, got {stored:?}"
+    );
+
+    // Simulate a restart: drop the in-memory set, reload from persistence.
+    harness
+        .agent
+        .clear_required_tool_choice_ignored_in_memory()
+        .await;
+    assert!(
+        !harness.agent.required_tool_choice_ignored(model).await,
+        "in-memory set should be empty after clear"
+    );
+
+    harness.agent.load_required_tool_choice_ignored().await;
+    assert!(
+        harness.agent.required_tool_choice_ignored(model).await,
+        "model must still be flagged after reload from persistence"
+    );
+}
+
 /// Stall detection: agent keeps calling an unknown tool which errors each
 /// iteration. After MAX_STALL_ITERATIONS (3), agent should gracefully stop.
 #[tokio::test]
