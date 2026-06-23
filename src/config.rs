@@ -957,6 +957,9 @@ pub struct RetentionConfig {
     /// Delete net-negative error solutions older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub error_solutions_days: u32,
+    /// Delete self-correction attempt rows older than N days (default: 30).
+    #[serde(default = "default_retention_30")]
+    pub self_correction_attempts_days: u32,
 }
 
 impl Default for RetentionConfig {
@@ -970,6 +973,7 @@ impl Default for RetentionConfig {
             goals_days: 180,
             procedures_days: 180,
             error_solutions_days: 90,
+            self_correction_attempts_days: 30,
         }
     }
 }

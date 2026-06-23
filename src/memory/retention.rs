@@ -28,6 +28,7 @@ pub struct RetentionStats {
     pub goals_deleted: u64,
     pub procedures_deleted: u64,
     pub error_solutions_deleted: u64,
+    pub self_correction_attempts_deleted: u64,
 }
 
 impl RetentionStats {
@@ -40,6 +41,7 @@ impl RetentionStats {
             + self.goals_deleted
             + self.procedures_deleted
             + self.error_solutions_deleted
+            + self.self_correction_attempts_deleted
     }
 }
 
@@ -98,6 +100,11 @@ impl RetentionManager {
         match self.cleanup_error_solutions().await {
             Ok(n) => stats.error_solutions_deleted = n,
             Err(e) => warn!("Retention: error_solutions cleanup failed: {}", e),
+        }
+
+        match self.cleanup_self_correction_attempts().await {
+            Ok(n) => stats.self_correction_attempts_deleted = n,
+            Err(e) => warn!("Retention: self_correction_attempts cleanup failed: {}", e),
         }
 
         Ok(stats)
@@ -285,6 +292,25 @@ impl RetentionManager {
         .await?;
         Ok(result.rows_affected())
     }
+
+    /// Delete self-correction attempt rows older than the configured cutoff.
+    async fn cleanup_self_correction_attempts(&self) -> anyhow::Result<u64> {
+        if self.config.self_correction_attempts_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now()
+            - Duration::days(self.config.self_correction_attempts_days as i64))
+        .to_rfc3339();
+        let result = sqlx::query(
+            "DELETE FROM self_correction_attempts WHERE id IN (
+                SELECT id FROM self_correction_attempts WHERE created_at < ? LIMIT 500
+            )",
+        )
+        .bind(&cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +459,23 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "CREATE TABLE self_correction_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                approach_signature TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                blocked_reason TEXT,
+                evidence_ref TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         pool
     }
 
@@ -567,6 +610,7 @@ mod tests {
             goals_days: 0,
             procedures_days: 0,
             error_solutions_days: 0,
+            self_correction_attempts_days: 0,
         };
         let mgr = RetentionManager::new(pool, config);
         let stats = mgr.run_all().await.unwrap();
@@ -620,5 +664,46 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_self_correction_attempts_deletes_old_keeps_recent() {
+        let pool = setup_test_db().await;
+        let config = RetentionConfig {
+            self_correction_attempts_days: 30,
+            ..RetentionConfig::default()
+        };
+        let manager = RetentionManager::new(pool.clone(), config);
+
+        // Insert one old row (40 days) and one recent row (1 day).
+        sqlx::query(
+            "INSERT INTO self_correction_attempts (subject_id, subject_kind, approach_signature, attempt_index, status, created_at) \
+             VALUES ('old', 'task', 'sig-old', 1, 'failed', datetime('now','-40 days'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO self_correction_attempts (subject_id, subject_kind, approach_signature, attempt_index, status, created_at) \
+             VALUES ('new', 'task', 'sig-new', 1, 'failed', datetime('now','-1 days'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let deleted = manager.cleanup_self_correction_attempts().await.unwrap();
+        assert_eq!(deleted, 1, "only the 40-day-old row should be deleted");
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM self_correction_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let survivor: String =
+            sqlx::query_scalar("SELECT subject_id FROM self_correction_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(survivor, "new");
     }
 }
