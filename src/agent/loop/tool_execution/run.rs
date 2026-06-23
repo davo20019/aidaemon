@@ -2166,6 +2166,7 @@ mod correction_gate_tests {
             enabled: true,
             correction_bypass_enabled: true,
             max_attempts: 3,
+            shadow_mode: true,
         };
         let correction_ctx = build_correction_execution_context(
             &config,
@@ -2223,6 +2224,7 @@ mod correction_gate_tests {
             enabled: true,
             correction_bypass_enabled: true,
             max_attempts: 3,
+            shadow_mode: true,
         };
         let correction_ctx = build_correction_execution_context(
             &config,
@@ -2300,6 +2302,7 @@ mod correction_gate_tests {
             enabled: true,
             correction_bypass_enabled: true,
             max_attempts: 1, // tight budget
+            shadow_mode: true,
         };
         let correction_ctx = build_correction_execution_context(
             &config,

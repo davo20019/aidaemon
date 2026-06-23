@@ -286,6 +286,7 @@ mod tests {
             enabled: false,
             correction_bypass_enabled: false,
             max_attempts: 3,
+            shadow_mode: true,
         }
     }
 
@@ -294,6 +295,7 @@ mod tests {
             enabled: true,
             correction_bypass_enabled: false,
             max_attempts: 3,
+            shadow_mode: true,
         }
     }
 
@@ -302,6 +304,7 @@ mod tests {
             enabled: true,
             correction_bypass_enabled: true,
             max_attempts: 3,
+            shadow_mode: true,
         }
     }
 
@@ -414,6 +417,7 @@ mod tests {
             enabled: true,
             correction_bypass_enabled: false,
             max_attempts: 1,
+            shadow_mode: true,
         };
 
         let ctx = build_correction_execution_context(
