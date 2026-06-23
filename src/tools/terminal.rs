@@ -477,6 +477,100 @@ Use one of these instead:\n\
     )
 }
 
+/// True only for the filesystem root or the home directory itself — the scan
+/// roots that make `du`/`find` pathologically slow. Subdirectories return false.
+#[allow(dead_code)]
+fn is_broad_scan_root(path: &str) -> bool {
+    let p = path.trim();
+    if p == "/" {
+        return true;
+    }
+    let p = p.trim_end_matches('/');
+    if p == "~" || p == "$HOME" {
+        return true;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && p == home.trim_end_matches('/') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect an unbounded whole-disk/whole-home scan in a single shell segment.
+/// `du` over a broad root is always flagged (it walks the full subtree to sum
+/// sizes; `-d` only limits output depth). `find` over a broad root is flagged
+/// unless `-maxdepth` is present (which bounds traversal). Returns (tool, root).
+#[allow(dead_code)]
+fn detect_unbounded_disk_scan_segment(segment: &str) -> Option<(String, String)> {
+    let tokens = shell_words::split(segment).ok()?;
+    let first = tokens.first()?;
+    // Strip any leading path (e.g. /usr/bin/du -> du).
+    let tool = std::path::Path::new(first)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(first.as_str());
+
+    match tool {
+        "du" => {
+            // Any non-flag arg that is a broad root.
+            let root = tokens
+                .iter()
+                .skip(1)
+                .find(|t| !t.starts_with('-') && is_broad_scan_root(t))?;
+            Some(("du".to_string(), root.clone()))
+        }
+        "find" => {
+            // find's search roots come before the expression; check leading
+            // non-flag args, but only flag if there is no -maxdepth limiter.
+            let has_maxdepth = tokens.iter().any(|t| t == "-maxdepth");
+            if has_maxdepth {
+                return None;
+            }
+            let root = tokens
+                .iter()
+                .skip(1)
+                .take_while(|t| !t.starts_with('-'))
+                .find(|t| is_broad_scan_root(t))?;
+            Some(("find".to_string(), root.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Scan the whole command (including chained `&&`/`|`/`;` segments) for an
+/// unbounded whole-disk/whole-home scan.
+#[allow(dead_code)]
+fn detect_unbounded_disk_scan(command: &str) -> Option<(String, String)> {
+    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
+        if let Some(hit) = detect_unbounded_disk_scan_segment(&segment) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Guidance returned to the model when an unbounded scan is blocked pre-spawn.
+#[allow(dead_code)]
+fn unbounded_scan_block_message(tool: &str, root: &str) -> String {
+    format!(
+        "Blocked: `{tool}` rooted at `{root}` scans the entire {} and is pathologically slow \
+         — it walks every file and typically never finishes (it gets auto-stopped after a few \
+         minutes without ever answering). Use a narrower, bounded command instead:\n\
+         • For \"biggest files\": pick a specific folder — `find ~/Downloads -type f -size +500M` \
+         or `find ~/projects -type f -size +500M`.\n\
+         • Add a depth limit so traversal is bounded: `find <DIR> -maxdepth 3 …`.\n\
+         • Scope `du` to a single folder: `du -sh ~/<folder>/*` (not the whole disk or home).\n\
+         If the user truly needs a whole-disk scan, ask them to confirm or run it themselves.\n\
+         Pick a scoped command and try again.",
+        if root == "/" {
+            "disk"
+        } else {
+            "home directory"
+        }
+    )
+}
+
 fn normalize_command_for_dedupe(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -3245,6 +3339,55 @@ mod tests {
         let (pattern, path) = detected.unwrap();
         assert_eq!(pattern, "async fn");
         assert_eq!(path, ".");
+    }
+
+    // ── unbounded disk scan detector tests ──
+
+    #[test]
+    fn is_broad_scan_root_matches_root_and_home_only() {
+        assert!(is_broad_scan_root("/"));
+        assert!(is_broad_scan_root("~"));
+        assert!(is_broad_scan_root("~/"));
+        assert!(is_broad_scan_root("$HOME"));
+        // Subdirectories must NOT be flagged.
+        assert!(!is_broad_scan_root("~/projects"));
+        assert!(!is_broad_scan_root("/var/log"));
+        assert!(!is_broad_scan_root("/usr"));
+        assert!(!is_broad_scan_root("."));
+    }
+
+    #[test]
+    fn detect_unbounded_disk_scan_flags_the_incident_commands() {
+        // The exact commands seen grinding for minutes on the live daemon.
+        assert!(
+            detect_unbounded_disk_scan("du -a / 2>/dev/null | sort -rn | head -n 10").is_some()
+        );
+        assert!(detect_unbounded_disk_scan("du -ah ~ | sort -rh | head -n 20").is_some());
+        assert!(detect_unbounded_disk_scan(
+            "cd '/' && find / -type f -size +100M -exec ls -lh {} + 2>/dev/null | sort -k5 -rh | head -n 10"
+        ).is_some());
+        assert!(detect_unbounded_disk_scan("find ~ -type f -size +500M").is_some());
+    }
+
+    #[test]
+    fn detect_unbounded_disk_scan_passes_scoped_and_bounded_commands() {
+        // Scoped to a subdirectory → fine.
+        assert!(detect_unbounded_disk_scan("du -sh ~/projects").is_none());
+        assert!(detect_unbounded_disk_scan("find ~/Downloads -type f -size +500M").is_none());
+        assert!(detect_unbounded_disk_scan("du -ah /var/log | sort -rh | head").is_none());
+        // find with a depth limit → fine (maxdepth bounds traversal).
+        assert!(detect_unbounded_disk_scan("find / -maxdepth 2 -type d").is_none());
+        assert!(detect_unbounded_disk_scan("find ~ -maxdepth 3 -name '*.rs'").is_none());
+        // Unrelated commands → fine.
+        assert!(detect_unbounded_disk_scan("ls -la ~").is_none());
+        assert!(detect_unbounded_disk_scan("echo hello").is_none());
+    }
+
+    #[test]
+    fn unbounded_scan_block_message_is_actionable() {
+        let msg = unbounded_scan_block_message("find", "/");
+        assert!(msg.to_lowercase().contains("scope") || msg.to_lowercase().contains("narrow"));
+        assert!(msg.contains("maxdepth") || msg.contains("-size") || msg.contains("specific"));
     }
 
     // ── format_output tests ──
