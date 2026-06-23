@@ -1169,7 +1169,10 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              started_at, completed_at
              FROM tasks
              WHERE status IN ('running', 'claimed')
-             AND datetime(started_at) < datetime('now', '-' || ? || ' seconds')
+             AND COALESCE(
+                   (SELECT MAX(ta.created_at) FROM task_activity ta WHERE ta.task_id = tasks.id),
+                   datetime(tasks.started_at)
+                 ) < datetime('now', '-' || ? || ' seconds')
              ORDER BY started_at ASC",
         )
         .bind(timeout_secs)

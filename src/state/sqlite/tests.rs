@@ -2644,6 +2644,63 @@ async fn migration_normalizes_legacy_rfc3339_task_activity_rows() {
     assert_eq!(stored, "2026-06-22 16:05:27");
 }
 
+/// Log a task activity `secs_ago` seconds in the past (via `log_task_activity`,
+/// so it goes through the same `datetime(?)` write normalization as production).
+async fn wd_log_activity(store: &SqliteStateStore, task_id: &str, secs_ago: i64) {
+    let created = (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+    let activity = crate::traits::TaskActivity {
+        id: 0,
+        task_id: task_id.to_string(),
+        activity_type: "tool_call".to_string(),
+        tool_name: Some("terminal".to_string()),
+        tool_args: None,
+        result: None,
+        success: Some(true),
+        tokens_used: None,
+        created_at: created,
+    };
+    store.log_task_activity(&activity).await.unwrap();
+}
+
+#[tokio::test]
+async fn stuck_query_spares_task_with_recent_activity_despite_old_start() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-active", 3600).await; // started 1h ago
+    wd_log_activity(&store, "t-active", 5).await; // active 5s ago
+
+    let stuck = store.get_stuck_tasks(300).await.unwrap();
+    assert!(!stuck.iter().any(|t| t.id == "t-active"));
+}
+
+#[tokio::test]
+async fn stuck_query_flags_task_with_stale_activity() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-hung", 3600).await;
+    wd_log_activity(&store, "t-hung", 600).await; // last activity 10m ago
+
+    let stuck = store.get_stuck_tasks(300).await.unwrap();
+    assert!(stuck.iter().any(|t| t.id == "t-hung"));
+}
+
+#[tokio::test]
+async fn stuck_query_falls_back_to_started_at_when_no_activity() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-noact", 600).await; // no activity rows
+
+    let stuck = store.get_stuck_tasks(300).await.unwrap();
+    assert!(stuck.iter().any(|t| t.id == "t-noact"));
+}
+
+#[tokio::test]
+async fn stuck_query_timeout_zero_selects_all_running_for_startup_recovery() {
+    let (store, _file) = setup_test_store().await;
+    wd_create_running_task(&store, "t-recent", 1).await;
+    wd_log_activity(&store, "t-recent", 1).await;
+
+    let stuck = store.get_stuck_tasks(0).await.unwrap();
+    assert!(stuck.iter().any(|t| t.id == "t-recent"));
+}
+
 // --- Notification Queue Tests ---
 
 #[tokio::test]
