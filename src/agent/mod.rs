@@ -536,6 +536,8 @@ pub(crate) use goal_dispatch::{
 mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
 
+pub mod self_correction;
+
 // `Agent` constructors (new / with_depth / set_test_*) live in `construct.rs`.
 #[path = "construct.rs"]
 mod construct;
