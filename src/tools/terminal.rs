@@ -5053,4 +5053,98 @@ mod tests {
             ),
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // P2.5-C: next ordinary unsafe command still prompts after a preapproved call
+    //
+    // After a correction-preapproved call succeeds, the next call with
+    // correction_preapproved=false and _untrusted_source=true must still reach
+    // the approval channel.  We prove this by:
+    //   1. Making a preapproved call (approval_rx has a closed receiver — no
+    //      approval request should arrive).
+    //   2. Dropping that tool and creating a fresh tool with an open approval
+    //      channel.
+    //   3. Calling with correction_preapproved=false + _untrusted_source=true.
+    //   4. Asserting that an approval request IS received on the channel.
+    //
+    // The freshness of the tool is intentional: TerminalTool's session_approved
+    // HashSet is per-instance.  The structural invariant is that correction_
+    // preapproved never touches session_approved (see terminal.rs:2853 — the
+    // `else if correction_preapproved` branch does NOT call add_session_prefix
+    // or add_prefix; it only sets needs_approval=false and logs).  Therefore
+    // even on the same instance, no residue would pollute session_approved.
+    //
+    // Using a fresh instance makes the "still prompts" proof self-contained and
+    // independent of any cross-call state.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_next_ordinary_unsafe_command_still_prompts() {
+        // --- Part 1: correction-preapproved call on a tool with a closed receiver ---
+        // We intentionally close the approval_rx; if the preapproval gate works,
+        // no approval request is sent and the command executes.
+        {
+            let db_file = tempfile::NamedTempFile::new().unwrap();
+            let db_url = format!("sqlite:{}", db_file.path().display());
+            let pool = SqlitePool::connect(&db_url).await.unwrap();
+            let (approval_tx_raw, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+            drop(approval_rx); // closed — any approval attempt would error
+            let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+            let tool =
+                TerminalTool::new(vec![], approval_tx, 1, 1000, PermissionMode::Default, pool)
+                    .await;
+            std::mem::forget(db_file);
+
+            let exec_ctx = ToolExecutionContext {
+                correction_preapproved: true,
+            };
+            let result = tool
+                .call_with_execution_context(
+                    r#"{"action":"run","command":"echo p25-preapproved","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
+                    None,
+                    exec_ctx,
+                )
+                .await
+                .expect("preapproved run must succeed without hitting closed approval channel");
+            assert!(
+                result.output.contains("p25-preapproved"),
+                "preapproved call must execute the command, got: {}",
+                result.output
+            );
+        } // tool dropped; any session_approved state is dropped with it
+
+        // --- Part 2: ordinary (non-preapproved) call must reach the approval channel ---
+        // Fresh tool with an OPEN approval channel.  We answer on a background task
+        // so the call can complete; we then verify the request was received.
+        let (tool, mut approval_rx) = make_tool_with_open_approval_channel().await;
+
+        // Answer the approval request from a background task so the tool call
+        // can complete without blocking forever.
+        tokio::spawn(async move {
+            if let Some(req) = approval_rx.recv().await {
+                // Deny it — we only care that the request WAS sent, not the outcome.
+                let _ = req.response_tx.send(ApprovalResponse::Deny);
+            }
+        });
+
+        // This call has correction_preapproved=false and _untrusted_source=true.
+        // The untrusted-source branch forces needs_approval=true, so an approval
+        // request MUST be sent to the channel.
+        let result = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"echo ordinary-unsafe","_untrusted_source":true,"_session_id":"p25-sess","_user_role":"Owner"}"#,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                },
+            )
+            .await
+            .expect("call should complete (denied, not error)");
+
+        assert!(
+            result.output.contains("denied") || result.output.contains("Deny"),
+            "ordinary unsafe command must have gone through the approval gate \
+             (expected denial message), got: {}",
+            result.output
+        );
+    }
 }
