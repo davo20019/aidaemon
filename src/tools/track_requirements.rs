@@ -2,23 +2,37 @@
 //! checklist of requirements for the current multi-step / deferred-action turn.
 //! Full-set replace each call (like a todo tool). Backed by the `plans/` store.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::channels::ChannelHub;
 use crate::plans::{PlanStore, StepStatus};
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolCapabilities};
 
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
-    hub: Arc<ChannelHub>,
+    /// Set after ChannelHub creation (core.rs ordering), mirroring the terminal
+    /// tool's deferred hub wiring. `None` until set; channel posts are skipped
+    /// until then (and in tests).
+    hub: OnceLock<Weak<ChannelHub>>,
 }
 
 impl TrackRequirementsTool {
-    pub fn new(plan_store: Arc<PlanStore>, hub: Arc<ChannelHub>) -> Self {
-        Self { plan_store, hub }
+    pub fn new(plan_store: Arc<PlanStore>) -> Self {
+        Self {
+            plan_store,
+            hub: OnceLock::new(),
+        }
+    }
+
+    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
+        let _ = self.hub.set(hub);
+    }
+
+    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
+        self.hub.get().and_then(|w| w.upgrade())
     }
 }
 
@@ -76,6 +90,18 @@ impl Tool for TrackRequirementsTool {
         })
     }
 
+    fn capabilities(&self) -> ToolCapabilities {
+        // Internal bookkeeping only: writes the checklist to the local plan store.
+        // No external side effect, no approval, full-set replace is idempotent.
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let v: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
         let session_id = match v.get("_session_id").and_then(Value::as_str) {
@@ -116,13 +142,20 @@ impl Tool for TrackRequirementsTool {
 
         // Was there already a checklist for this session? (decides whether to post.)
         let had_existing = matches!(
-            self.plan_store.get_incomplete_for_session(&session_id).await,
+            self.plan_store
+                .get_incomplete_for_session(&session_id)
+                .await,
             Ok(Some(_))
         );
 
         let plan = match self
             .plan_store
-            .upsert_checklist(&session_id, task_id.as_deref(), "track_requirements", &items)
+            .upsert_checklist(
+                &session_id,
+                task_id.as_deref(),
+                "track_requirements",
+                &items,
+            )
             .await
         {
             Ok(p) => p,
@@ -135,10 +168,11 @@ impl Tool for TrackRequirementsTool {
 
         // Post the compact checklist to the channel ONCE, on first creation.
         if !had_existing {
-            let _ = self
-                .hub
-                .send_text(&session_id, &plan.render_compact_checklist())
-                .await;
+            if let Some(hub) = self.get_hub() {
+                let _ = hub
+                    .send_text(&session_id, &plan.render_compact_checklist())
+                    .await;
+            }
         }
 
         Ok(format!(
@@ -153,9 +187,7 @@ impl Tool for TrackRequirementsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::SessionMap;
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::collections::HashMap;
 
     async fn test_tool() -> (TrackRequirementsTool, Arc<PlanStore>) {
         let pool = SqlitePoolOptions::new()
@@ -164,12 +196,8 @@ mod tests {
             .await
             .unwrap();
         let plan_store = Arc::new(PlanStore::new(pool).await.unwrap());
-        let session_map: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let hub = Arc::new(ChannelHub::new(Vec::new(), session_map));
-        (
-            TrackRequirementsTool::new(plan_store.clone(), hub),
-            plan_store,
-        )
+        // No hub set: channel posts are skipped (deferred wiring happens in core.rs).
+        (TrackRequirementsTool::new(plan_store.clone()), plan_store)
     }
 
     #[tokio::test]

@@ -174,9 +174,8 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     // checklist (backed by plan_store). Its ChannelHub is wired later via
     // set_hub() once the hub exists (core.rs ordering), like the terminal tool.
     let mut tools = tools;
-    let track_requirements_tool = Arc::new(
-        crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone()),
-    );
+    let track_requirements_tool =
+        Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone()));
     tools.push(track_requirements_tool.clone());
 
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)

@@ -157,9 +157,11 @@ async fn checklist_completion_gate(
             .await
             .insert(format!("{task_id}:nudged"))
     {
-        return Some(super::system_directives::SystemDirective::ChecklistVerificationRequired {
-            items: unchecked,
-        });
+        return Some(
+            super::system_directives::SystemDirective::ChecklistVerificationRequired {
+                items: unchecked,
+            },
+        );
     }
     // Allow finishing — post the done-vs-deferred recap once per task.
     if agent

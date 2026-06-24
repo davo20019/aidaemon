@@ -157,8 +157,13 @@ impl PlanStore {
             self.update(&existing).await?;
             Ok(existing)
         } else {
-            let mut plan =
-                TaskPlan::new(session_id, trigger, "Requirement checklist", Vec::new(), "track_requirements");
+            let mut plan = TaskPlan::new(
+                session_id,
+                trigger,
+                "Requirement checklist",
+                Vec::new(),
+                "track_requirements",
+            );
             plan.steps = steps;
             plan.current_step = current_step;
             plan.task_id = task_id.map(|t| t.to_string());
@@ -475,7 +480,10 @@ mod tests {
             .upsert_checklist("sess-1", Some("task-1"), "make+send", &items2)
             .await
             .unwrap();
-        assert_eq!(plan2.id, id, "should update existing plan, not create a new one");
+        assert_eq!(
+            plan2.id, id,
+            "should update existing plan, not create a new one"
+        );
         assert_eq!(plan2.completed_steps(), 2);
 
         // Persisted state reflects the replacement.
