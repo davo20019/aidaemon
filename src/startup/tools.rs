@@ -834,7 +834,8 @@ async fn build_base_tool(
                 )
                 .await
                 .with_event_store(event_store)
-                .with_state(state as Arc<dyn crate::traits::StateStore>),
+                .with_state(state as Arc<dyn crate::traits::StateStore>)
+                .with_self_correction(config.self_correction.clone()),
             );
             BuiltBaseTool {
                 tool: terminal.clone(),

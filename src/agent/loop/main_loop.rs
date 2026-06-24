@@ -726,6 +726,16 @@ impl Agent {
             None
         };
 
+        // Correction-execution context for this turn. `Some` ONLY when this agent
+        // is running under a deliberately-dispatched remediation goal id (see
+        // `correction_dispatch::dispatch_correction_remediation` +
+        // `Agent::correction_context_for_current_goal`). `None` for every normal,
+        // user-initiated turn — preserving the prior hardcoded `correction: None`
+        // behavior byte-for-byte on non-remediation paths. Fetched once here and
+        // cloned into each iteration's `ToolExecutionCtx` so the P2.4 per-call
+        // sandbox gate fires on the remediation task-lead and all its executors.
+        let correction_context = self.correction_context_for_current_goal().await;
+
         loop {
             let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
@@ -1506,7 +1516,7 @@ impl Agent {
                     execution_state: &mut execution_state,
                     validation_state: tool_execution_evidence.validation_state,
                     read_file_tracker: &mut turn_state.read_files,
-                    correction: None,
+                    correction: correction_context.clone(),
                 },
             )
             .await?;
