@@ -143,16 +143,16 @@ impl Tool for SendFileTool {
                     self.inbox_dir.display(),
                 ));
             }
-            Err(DeliveryError::RecoveryFailed(e)) => {
+            Err(DeliveryError::RecoveryFailed { path, error }) => {
                 return Ok(format!(
                     "Error: File is outside allowed directories ({}). I tried to copy it into \
                      the allowed inbox directory {} but that failed: {}. Copy the file into {} \
                      (e.g. with the terminal tool: cp '{}' '{}/') and send that path instead.",
                     file_path,
                     self.inbox_dir.display(),
-                    e,
+                    error,
                     self.inbox_dir.display(),
-                    file_path,
+                    path.display(),
                     self.inbox_dir.display(),
                 ));
             }

@@ -8,7 +8,7 @@ pub struct ReadyMedia {
     pub recovered_into_inbox: bool,
 }
 
-/// Error variants carry the originally-requested path (or recovery error message)
+/// Error variants carry the originally-requested path (or recovery context)
 /// so callers can construct user-facing messages that include the relevant detail.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -17,7 +17,12 @@ pub enum DeliveryError {
     NotRegularFile(String),
     Blocked(String),
     OutsideAllowedDirs(String),
-    RecoveryFailed(String),
+    /// Recovery copy into the inbox failed. Carries the canonical source path
+    /// (so the caller can render a correct `cp` example) and the error message.
+    RecoveryFailed {
+        path: PathBuf,
+        error: String,
+    },
     Ambiguous(Vec<PathBuf>),
 }
 
@@ -78,7 +83,10 @@ pub fn prepare_delivery(
                 recovered_into_inbox = true;
             }
             Err(e) => {
-                return Err(DeliveryError::RecoveryFailed(e.to_string()));
+                return Err(DeliveryError::RecoveryFailed {
+                    path: canonical,
+                    error: e.to_string(),
+                });
             }
         }
     }
