@@ -141,11 +141,58 @@ impl crate::agent::Agent {
     /// Guided tier → records `Enforced`, returns true (gate blocks as today).
     /// Autonomous tier → records `ShadowSkipped`, returns false (gate is
     /// telemetry-only; the model proceeds).
-    pub(crate) fn supervision_gate_enforced(&self, heuristic: &'static str, model: &str) -> bool {
+    ///
+    /// Each fire is also persisted as a queryable `GateTelemetry` decision
+    /// point tagged with `task_id` + `iteration`, so efficacy analysis (which
+    /// gates help vs hurt, within-task repeat loops, join to the task's
+    /// `TaskEnd` outcome) is a query against the event store rather than
+    /// log archaeology over the in-memory counter.
+    pub(crate) async fn supervision_gate_enforced(
+        &self,
+        heuristic: &'static str,
+        model: &str,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+    ) -> bool {
         let tier = self.trust_tier_for_model(model);
         let action = gate_action_for_tier(tier);
-        global().record(heuristic, model, tier, action);
+        self.persist_gate_fire(emitter, task_id, iteration, heuristic, model, tier, action)
+            .await;
         matches!(action, HeuristicAction::Enforced)
+    }
+
+    /// Record a gate fire in the in-memory counter (+ `heuristic_telemetry`
+    /// tracing event) and persist it as a queryable `GateTelemetry` decision
+    /// point. Shared by tier-gated supervision gates and always-enforced
+    /// hard-cap blocks so every gate fire is analyzable from the event store.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_gate_fire(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        heuristic: &str,
+        model: &str,
+        tier: ModelTrustTier,
+        action: HeuristicAction,
+    ) {
+        global().record(heuristic, model, tier, action);
+        self.emit_decision_point(
+            emitter,
+            task_id,
+            iteration,
+            crate::events::DecisionType::GateTelemetry,
+            format!("Supervision gate '{heuristic}': {}", action.as_str()),
+            serde_json::json!({
+                "code": "supervision_gate_fire",
+                "heuristic": heuristic,
+                "action": action.as_str(),
+                "tier": tier.as_str(),
+                "model": model,
+            }),
+        )
+        .await;
     }
 }
 
@@ -225,6 +272,117 @@ mod tests {
         assert_eq!(
             gate_action_for_tier(ModelTrustTier::Autonomous),
             HeuristicAction::ShadowSkipped
+        );
+    }
+
+    /// A supervision gate fire must be persisted as a queryable
+    /// `GateTelemetry` decision point carrying the heuristic name, action,
+    /// tier, model, and the task_id + iteration that make within-task repeat
+    /// detection a query rather than a stored counter.
+    #[tokio::test]
+    async fn gate_fire_is_persisted_as_decision_point() {
+        use crate::events::{DecisionPointData, DecisionType, EventEmitter, EventStore};
+
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .expect("test agent");
+        let session_id = "gate_telemetry_session";
+        let emitter = EventEmitter::new(harness.agent.event_store.clone(), session_id.to_string());
+
+        // Guided-tier model → gate enforces (returns true).
+        let enforced = harness
+            .agent
+            .supervision_gate_enforced(
+                "uncertainty_clarify_gate",
+                "gemma-3-27b-it",
+                &emitter,
+                "task-guided",
+                3,
+            )
+            .await;
+        assert!(enforced, "Guided-tier model should enforce the gate");
+
+        // Autonomous-tier model → gate shadow-skips (returns false).
+        let shadow = harness
+            .agent
+            .supervision_gate_enforced(
+                "uncertainty_clarify_gate",
+                "claude-opus-4-8",
+                &emitter,
+                "task-auto",
+                1,
+            )
+            .await;
+        assert!(!shadow, "Autonomous-tier model should shadow-skip the gate");
+
+        let store = EventStore::new(harness.state.pool())
+            .await
+            .expect("event store");
+        let events = store
+            .query_recent_events(session_id, 200)
+            .await
+            .expect("recent events");
+
+        let gate_fires: Vec<DecisionPointData> = events
+            .iter()
+            .filter_map(|e| e.parse_data::<DecisionPointData>().ok())
+            .filter(|d| d.decision_type == DecisionType::GateTelemetry)
+            .filter(|d| {
+                d.metadata.get("code").and_then(serde_json::Value::as_str)
+                    == Some("supervision_gate_fire")
+            })
+            .collect();
+        assert_eq!(gate_fires.len(), 2, "expected one persisted event per fire");
+
+        let guided = gate_fires
+            .iter()
+            .find(|d| d.task_id == "task-guided")
+            .expect("guided fire persisted");
+        assert_eq!(guided.iteration, 3);
+        assert_eq!(
+            guided
+                .metadata
+                .get("heuristic")
+                .and_then(serde_json::Value::as_str),
+            Some("uncertainty_clarify_gate")
+        );
+        assert_eq!(
+            guided
+                .metadata
+                .get("action")
+                .and_then(serde_json::Value::as_str),
+            Some("enforced")
+        );
+        assert_eq!(
+            guided
+                .metadata
+                .get("tier")
+                .and_then(serde_json::Value::as_str),
+            Some("guided")
+        );
+        assert_eq!(
+            guided
+                .metadata
+                .get("model")
+                .and_then(serde_json::Value::as_str),
+            Some("gemma-3-27b-it")
+        );
+
+        let auto = gate_fires
+            .iter()
+            .find(|d| d.task_id == "task-auto")
+            .expect("autonomous fire persisted");
+        assert_eq!(
+            auto.metadata
+                .get("action")
+                .and_then(serde_json::Value::as_str),
+            Some("shadow_skipped")
+        );
+        assert_eq!(
+            auto.metadata
+                .get("tier")
+                .and_then(serde_json::Value::as_str),
+            Some("autonomous")
         );
     }
 }

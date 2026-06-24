@@ -281,12 +281,17 @@ pub(super) async fn maybe_block_tool_by_budget(
         return Ok(ToolBlockKind::NotBlocked);
     };
 
-    crate::agent::heuristic_telemetry::global().record(
-        "tool_budget_block",
-        ctx.model,
-        trust_tier,
-        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
-    );
+    agent
+        .persist_gate_fire(
+            ctx.emitter,
+            ctx.task_id,
+            ctx.iteration,
+            "tool_budget_block",
+            ctx.model,
+            trust_tier,
+            crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
+        )
+        .await;
 
     warn!(
         session_id = %ctx.session_id,

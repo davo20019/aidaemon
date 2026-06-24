@@ -1296,3 +1296,90 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
         })
     }));
 }
+
+/// The efficacy-analysis payoff: a supervision gate fire is persisted as a
+/// `GateTelemetry` decision point whose `task_id` matches the turn's `TaskEnd`
+/// event (which already carries a `TaskOutcome`). That shared key is what lets
+/// "which gates help vs hurt" be a query — join gate fires → task outcome —
+/// instead of manual log archaeology.
+///
+/// Rather than depend on which supervision gate the loop happens to select
+/// (gate selection is loop-internal and evolves), this drives a real turn to
+/// produce a genuine `TaskEnd` + `task_id` + `TaskOutcome`, then records a
+/// gate fire against that same real `task_id` and asserts they join.
+#[tokio::test]
+async fn test_gate_fire_event_joins_to_task_end_by_task_id() {
+    use crate::events::{DecisionPointData, DecisionType, EventEmitter, EventType, TaskEndData};
+
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "It is running on the host operating system.",
+    )]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let session_id = "test_session";
+
+    harness
+        .agent
+        .handle_message(
+            session_id,
+            "What operating system is this running on?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let event_store = crate::events::EventStore::new(harness.state.pool())
+        .await
+        .expect("event store from harness pool");
+    let events = event_store
+        .query_recent_events(session_id, 200)
+        .await
+        .expect("recent events");
+
+    // The real turn emitted a TaskEnd carrying a task_id and a TaskOutcome —
+    // the join target an analyst correlates gate fires against.
+    let task_end = events
+        .iter()
+        .filter(|e| e.event_type == EventType::TaskEnd)
+        .find_map(|e| e.parse_data::<TaskEndData>().ok())
+        .expect("turn emitted a TaskEnd event");
+    let real_task_id = task_end.task_id.clone();
+    assert!(
+        task_end.outcome.is_some(),
+        "TaskEnd must carry a TaskOutcome for the gate-fire join to be meaningful"
+    );
+
+    // Record a supervision gate fire against that same real task_id.
+    let emitter = EventEmitter::new(harness.agent.event_store().clone(), session_id.to_string());
+    harness
+        .agent
+        .supervision_gate_enforced(
+            "mutation_contract_block",
+            "gemma-3-27b-it",
+            &emitter,
+            &real_task_id,
+            4,
+        )
+        .await;
+
+    // The gate fire is queryable and joins to the TaskEnd by task_id.
+    let events = event_store
+        .query_recent_events(session_id, 200)
+        .await
+        .expect("recent events after gate fire");
+    let joined = events
+        .iter()
+        .filter_map(|e| e.parse_data::<DecisionPointData>().ok())
+        .any(|d| {
+            d.decision_type == DecisionType::GateTelemetry
+                && d.metadata.get("code").and_then(serde_json::Value::as_str)
+                    == Some("supervision_gate_fire")
+                && d.task_id == real_task_id
+        });
+    assert!(
+        joined,
+        "gate fire did not persist with the real task_id {real_task_id} for the TaskEnd join"
+    );
+}
