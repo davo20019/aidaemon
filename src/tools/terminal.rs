@@ -505,6 +505,129 @@ fn is_broad_scan_root(path: &str) -> bool {
     false
 }
 
+/// Expand a leading `~` / `$HOME` in a shell path operand to the absolute home
+/// directory. Returns `None` if `HOME` is unset. UTF-8-safe (operates on
+/// `char`/`str` boundaries, never raw byte indices).
+fn expand_home_in_operand(operand: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    let home = home.trim_end_matches('/');
+    if operand == "~" || operand == "$HOME" {
+        return Some(home.to_string());
+    }
+    if let Some(rest) = operand.strip_prefix("~/") {
+        return Some(format!("{home}/{rest}"));
+    }
+    if let Some(rest) = operand.strip_prefix("$HOME/") {
+        return Some(format!("{home}/{rest}"));
+    }
+    None
+}
+
+/// Derive the read-only remediation scope (working_dir) from the FAILED
+/// command's actual target, rather than always using the daemon cwd.
+///
+/// Semantics (3c scope relax):
+/// - A target over home (`~`, `$HOME`, the home path, or a glob beneath it,
+///   e.g. `du ~/*`, `find ~ …`) → the home directory.
+/// - A target over `/` (e.g. `du /`, `find / …`) → `/`.
+/// - A specific bounded dir (e.g. a path under home/projects) → that dir,
+///   canonicalized when it exists.
+/// - Indeterminate (no path operand) → the daemon cwd fallback (canonicalized),
+///   as before.
+///
+/// The safety for broad scopes lives in the sandbox's read-only allowlist +
+/// sensitive-file guards, not in this derived working_dir. UTF-8-safe: parsing
+/// goes through `shell_words` + `str` ops, no raw byte slicing.
+fn derive_correction_scope_from_command(command: &str) -> std::path::PathBuf {
+    let fallback = || TerminalTool::correction_working_dir();
+
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.trim_end_matches('/').to_string());
+
+    // Walk every chained segment; take the first segment that has a usable path
+    // operand, preferring the broadest scope it implies.
+    for (segment, _) in crate::tools::command_risk::split_by_operators(command) {
+        let Ok(tokens) = shell_words::split(&segment) else {
+            continue;
+        };
+        // Skip the leading tool name; inspect its operands.
+        for tok in tokens.iter().skip(1) {
+            if tok.starts_with('-') {
+                continue; // flag, not a path
+            }
+
+            // Broad root: `/`, `~`, `$HOME`, the home path, or a glob over them.
+            if is_broad_scan_root(tok) {
+                if tok.trim() == "/" {
+                    return std::path::PathBuf::from("/");
+                }
+                // `~`, `$HOME`, or the literal home path → home dir.
+                if let Some(h) = &home {
+                    let p = std::path::PathBuf::from(h);
+                    return std::fs::canonicalize(&p).unwrap_or(p);
+                }
+                return fallback();
+            }
+
+            // A glob/path beneath home (e.g. `~/*`, `$HOME/*`, `<home>/*`).
+            // Strip a trailing glob component so `~/*` resolves to home itself.
+            let expanded = expand_home_in_operand(tok).unwrap_or_else(|| tok.to_string());
+            let scope = scope_dir_from_path_operand(&expanded, home.as_deref());
+            if let Some(dir) = scope {
+                let p = std::path::PathBuf::from(&dir);
+                return std::fs::canonicalize(&p).unwrap_or(p);
+            }
+        }
+    }
+
+    fallback()
+}
+
+/// Reduce a (home-expanded) path operand to the directory scope it targets.
+/// A trailing glob segment (e.g. `*`, `foo*`) is dropped so `<home>/*` →
+/// `<home>`. Returns `None` for operands that carry no usable absolute path.
+fn scope_dir_from_path_operand(expanded: &str, home: Option<&str>) -> Option<String> {
+    let trimmed = expanded.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Drop a trailing glob component so `/home/u/*` → `/home/u`.
+    let without_glob = if let Some(idx) = trimmed.rfind('/') {
+        let (parent, last) = trimmed.split_at(idx); // last starts with '/'
+        let last = &last[1..];
+        if last.contains('*') || last.contains('?') || last == "." {
+            parent
+        } else {
+            trimmed
+        }
+    } else if trimmed.contains('*') || trimmed.contains('?') {
+        // Bare glob with no slash and not home-rooted → indeterminate.
+        return None;
+    } else {
+        trimmed
+    };
+
+    let candidate = without_glob.trim_end_matches('/');
+    let candidate = if candidate.is_empty() { "/" } else { candidate };
+
+    // Only absolute paths are usable scopes. If the operand collapsed to the
+    // home dir, return that; otherwise require an absolute path.
+    if let Some(h) = home {
+        if candidate == h {
+            return Some(h.to_string());
+        }
+    }
+    if std::path::Path::new(candidate).is_absolute() {
+        return Some(candidate.to_string());
+    }
+    None
+}
+
 /// Detect an unbounded whole-disk/whole-home scan in a single shell segment.
 /// `du` over a broad root is always flagged (it walks the full subtree to sum
 /// sizes; `-d` only limits output depth). `find` over a broad root is flagged
@@ -1509,8 +1632,12 @@ impl TerminalTool {
             return false;
         };
 
-        // 2. Bounded working_dir for the retry (canonicalized; gate may refuse).
-        let working_dir = Self::correction_working_dir();
+        // 2. Working_dir for the retry, derived from the FAILED command's actual
+        //    target scope (home / `/` / a bounded dir; canonicalized). The gate
+        //    refuses only genuinely-invalid scopes — broad read-only scopes are
+        //    allowed and protected by the sandbox's read-only + sensitive-file
+        //    guards.
+        let working_dir = derive_correction_scope_from_command(command);
 
         // 3. Recent history for subject reconstruction (best-effort; an empty
         //    history just yields the generic original-request fallback).
@@ -3667,6 +3794,81 @@ mod tests {
         assert!(!is_broad_scan_root("/var/log"));
         assert!(!is_broad_scan_root("/usr"));
         assert!(!is_broad_scan_root("."));
+    }
+
+    // ── correction-scope derivation (3c) ──
+
+    #[test]
+    fn derive_correction_scope_home_targets() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|h| std::fs::canonicalize(&h).unwrap_or(h))
+            .expect("HOME set in test env");
+
+        // `du -sh ~/* | sort` — glob over home → home dir.
+        assert_eq!(
+            derive_correction_scope_from_command("du -sh ~/* | sort"),
+            home,
+            "du over ~/* should derive the home dir"
+        );
+        // `find ~ -type f` — root is home itself.
+        assert_eq!(
+            derive_correction_scope_from_command("find ~ -type f"),
+            home,
+            "find ~ should derive the home dir"
+        );
+        // `du ~` — bare home.
+        assert_eq!(
+            derive_correction_scope_from_command("du ~"),
+            home,
+            "du ~ should derive the home dir"
+        );
+    }
+
+    #[test]
+    fn derive_correction_scope_root_target() {
+        assert_eq!(
+            derive_correction_scope_from_command("find / -type f"),
+            std::path::PathBuf::from("/"),
+            "find / should derive /"
+        );
+        assert_eq!(
+            derive_correction_scope_from_command("du /"),
+            std::path::PathBuf::from("/"),
+            "du / should derive /"
+        );
+    }
+
+    #[test]
+    fn derive_correction_scope_bounded_dir() {
+        // A specific bounded dir under home → that dir (expanded + canonicalized
+        // if it exists, else the expanded path).
+        let home = std::env::var("HOME").expect("HOME set");
+        let target = format!("{}/projects", home.trim_end_matches('/'));
+        let expected =
+            std::fs::canonicalize(&target).unwrap_or_else(|_| std::path::PathBuf::from(&target));
+        assert_eq!(
+            derive_correction_scope_from_command(&format!("du -sh {target}/foo")),
+            std::fs::canonicalize(format!("{target}/foo"))
+                .unwrap_or_else(|_| std::path::PathBuf::from(format!("{target}/foo"))),
+            "du of a specific bounded dir should derive that dir"
+        );
+        // Sanity: the bounded dir is not the broad home scope.
+        assert_ne!(
+            expected,
+            std::path::PathBuf::from("/"),
+            "bounded dir must not collapse to /"
+        );
+    }
+
+    #[test]
+    fn derive_correction_scope_no_path_falls_back_to_cwd() {
+        let cwd = TerminalTool::correction_working_dir();
+        assert_eq!(
+            derive_correction_scope_from_command("echo hi"),
+            cwd,
+            "a command with no path operand should fall back to the daemon cwd"
+        );
     }
 
     #[test]

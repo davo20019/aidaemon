@@ -17,15 +17,23 @@ const MAX_COMMAND_CHARS_IN_SUMMARY: usize = 120;
 
 // ── Working-dir safety ────────────────────────────────────────────────────────
 
-/// Returns `true` when `dir` is considered unsafe for unattended autonomous
-/// correction.
+/// Returns `true` when `dir` is genuinely-invalid for unattended autonomous
+/// correction and must be refused.
 ///
-/// Unsafe directories are those so broad that an autonomous retry could
-/// accidentally touch files it was never intended to reach:
+/// As of Plan 3c, broad scopes like `/` and the home directory are
+/// **intentionally allowed**: read-only remediation may legitimately answer
+/// whole-computer questions (e.g. "what's the biggest file?"). The safety for
+/// those scopes is the sandbox's read-only allowlist + sensitive-file guards —
+/// NOT the working_dir boundary. This guard therefore refuses ONLY
+/// genuinely-invalid scopes:
 ///
-/// - Empty path (no directory at all)
-/// - The filesystem root `/`
-/// - The current user's home directory (`$HOME` / `~`)
+/// - Empty path (no directory at all).
+/// - A non-absolute / relative path. The bridge canonicalizes the derived
+///   working_dir before this guard sees it; a relative path that survives
+///   canonicalization signals a derivation failure, so it is refused.
+///
+/// Any absolute directory — including `/`, `$HOME`, and a literal expanded home
+/// path — is allowed and protected downstream by the sandbox.
 ///
 /// The caller (the bridge, P3b) must call this **before** launching a
 /// correction session and refuse if it returns `true`.
@@ -33,28 +41,20 @@ const MAX_COMMAND_CHARS_IN_SUMMARY: usize = 120;
 /// stays pure/honest and leaves the safety decision to the caller.
 #[allow(dead_code)]
 pub fn is_unsafe_correction_working_dir(dir: &Path) -> bool {
-    // Empty path.
+    // Empty path — no directory at all.
     if dir.as_os_str().is_empty() {
         return true;
     }
 
-    // Filesystem root.
-    if dir == Path::new("/") {
+    // Non-absolute / relative path. After the bridge canonicalizes the derived
+    // scope, a relative path indicates derivation failure — refuse it. This also
+    // catches the literal unexpanded tilde `~`, which is relative.
+    if !dir.is_absolute() {
         return true;
     }
 
-    // Home directory from the environment.
-    if let Some(home) = std::env::var_os("HOME") {
-        if dir == Path::new(&home) {
-            return true;
-        }
-    }
-
-    // Literal tilde string (not yet expanded by the caller).
-    if dir == Path::new("~") {
-        return true;
-    }
-
+    // Any absolute dir — including `/` and the home directory — is allowed;
+    // the sandbox's read-only + sensitive-file guards provide the safety.
     false
 }
 
@@ -223,46 +223,57 @@ mod tests {
         );
     }
 
-    /// RED → GREEN: is_unsafe_correction_working_dir must flag `/`, `~`, the
-    /// actual $HOME, and an empty path as unsafe; a real project subdir is safe.
+    /// RED → GREEN (3c scope relax): is_unsafe_correction_working_dir now refuses
+    /// ONLY genuinely-invalid scopes — empty and relative/uncanonicalized paths.
+    /// Broad-but-absolute scopes (`/`, the actual $HOME) are intentionally
+    /// ALLOWED: read-only remediation over the whole computer is protected by the
+    /// sandbox's read-only allowlist + sensitive-file guards, not by the
+    /// working_dir boundary.
     #[test]
     fn test_is_unsafe_correction_working_dir() {
-        // Filesystem root — always unsafe.
+        // Filesystem root — now ALLOWED (sandbox protects it).
         assert!(
-            is_unsafe_correction_working_dir(Path::new("/")),
-            "/ must be unsafe"
+            !is_unsafe_correction_working_dir(Path::new("/")),
+            "/ must now be allowed (false)"
         );
 
-        // Literal tilde — always unsafe (unexpanded).
-        assert!(
-            is_unsafe_correction_working_dir(Path::new("~")),
-            "~ must be unsafe"
-        );
-
-        // Empty path — always unsafe.
-        assert!(
-            is_unsafe_correction_working_dir(Path::new("")),
-            "empty path must be unsafe"
-        );
-
-        // $HOME from the environment — unsafe.
+        // $HOME from the environment — now ALLOWED.
         if let Ok(home) = std::env::var("HOME") {
             assert!(
-                is_unsafe_correction_working_dir(Path::new(&home)),
-                "$HOME must be unsafe"
+                !is_unsafe_correction_working_dir(Path::new(&home)),
+                "$HOME must now be allowed (false)"
             );
         }
 
-        // A concrete project subdirectory — safe.
+        // A concrete absolute project subdirectory — allowed.
         assert!(
             !is_unsafe_correction_working_dir(Path::new("/tmp/myproject/src")),
-            "/tmp/myproject/src must be safe"
+            "/tmp/myproject/src must be allowed (false)"
         );
 
-        // /tmp itself is debatable but it's not root or $HOME.
+        // /tmp — allowed (absolute).
         assert!(
             !is_unsafe_correction_working_dir(Path::new("/tmp")),
-            "/tmp must be safe (not root or $HOME)"
+            "/tmp must be allowed (false)"
+        );
+
+        // Empty path — still refused (no directory at all).
+        assert!(
+            is_unsafe_correction_working_dir(Path::new("")),
+            "empty path must be refused (true)"
+        );
+
+        // Relative / uncanonicalized path — refused (post-canonicalization a
+        // relative path signals a derivation failure).
+        assert!(
+            is_unsafe_correction_working_dir(Path::new("relative/dir")),
+            "relative path must be refused (true)"
+        );
+
+        // Literal tilde — relative (not absolute), so refused.
+        assert!(
+            is_unsafe_correction_working_dir(Path::new("~")),
+            "literal ~ is non-absolute → refused (true)"
         );
     }
 
