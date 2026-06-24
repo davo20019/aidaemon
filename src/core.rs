@@ -586,17 +586,36 @@ async fn init_heartbeat_coordinator(
         // for the policy, alongside the other stale-resource cleanups below.
         if let Some(ref terminal) = terminal_tool {
             let terminal_weak = Arc::downgrade(terminal);
+            // Progress-based reaper knobs: a process is reaped when it makes no
+            // CPU/disk/output progress for `stall` OR runs longer than `max_runtime`
+            // regardless of progress. `BACKGROUND_IDLE_REAP_SECS` /
+            // `BACKGROUND_MAX_RUNTIME_SECS` are the fallback defaults if config is 0.
+            let stall_secs = if config.daemon.watchdog.background_stall_secs > 0 {
+                config.daemon.watchdog.background_stall_secs
+            } else {
+                crate::tools::terminal::BACKGROUND_IDLE_REAP_SECS
+            };
+            let max_runtime_secs = if config.daemon.watchdog.background_max_runtime_secs > 0 {
+                config.daemon.watchdog.background_max_runtime_secs
+            } else {
+                crate::tools::terminal::BACKGROUND_MAX_RUNTIME_SECS
+            };
             heartbeat.register_job("terminal_idle_reap", Duration::from_secs(60), move || {
                 let terminal_weak = terminal_weak.clone();
                 async move {
                     let Some(terminal) = terminal_weak.upgrade() else {
                         return Ok(());
                     };
-                    let idle =
-                        Duration::from_secs(crate::tools::terminal::BACKGROUND_IDLE_REAP_SECS);
-                    let reaped = terminal.reap_stale_background_processes(idle).await;
+                    let stall = Duration::from_secs(stall_secs);
+                    let max_runtime = Duration::from_secs(max_runtime_secs);
+                    let reaped = terminal
+                        .reap_stale_background_processes_with(stall, max_runtime)
+                        .await;
                     if reaped > 0 {
-                        info!(reaped, "Idle-reaped hung background terminal commands");
+                        info!(
+                            reaped,
+                            "Idle-reaped stalled/over-runtime background commands"
+                        );
                     }
                     Ok(())
                 }
