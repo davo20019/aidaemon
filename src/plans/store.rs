@@ -146,6 +146,11 @@ impl PlanStore {
             existing.steps = steps;
             existing.current_step = current_step;
             existing.updated_at = now;
+            // Refresh task_id so the checklist scopes to the latest turn that
+            // touched it (a reused incomplete plan keeps the right owner).
+            if task_id.is_some() {
+                existing.task_id = task_id.map(|t| t.to_string());
+            }
             if existing.is_finished() {
                 existing.status = PlanStatus::Completed;
             }

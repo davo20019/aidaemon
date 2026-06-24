@@ -106,8 +106,71 @@ pub(super) async fn run_response_phase(
     )
     .await?;
     if let Some(outcome) = completion_outcome {
+        // Soft requirement-checklist verification: when the model is finishing
+        // but its self-registered checklist still has unchecked items, nudge once
+        // and continue the loop; otherwise allow the finish (and post the recap).
+        if matches!(outcome, ResponsePhaseOutcome::Return(Ok(_))) {
+            if let Some(directive) =
+                checklist_completion_gate(services.agent, ctx.session_id, ctx.task_id).await
+            {
+                ctx.pending_system_messages.push(directive);
+                return Ok(ResponsePhaseOutcome::ContinueLoop);
+            }
+        }
         return Ok(outcome);
     }
 
     Ok(ResponsePhaseOutcome::ProceedToToolExecution)
+}
+
+/// Soft completion verification for the requirement checklist. Returns
+/// `Some(directive)` to inject and block finishing when the current turn's
+/// checklist still has unchecked items and this is the first such encounter for
+/// the task; otherwise posts the done-vs-deferred recap once and returns `None`.
+/// Degrades to `None` (current behavior) when no plan store / checklist exists.
+async fn checklist_completion_gate(
+    agent: &crate::agent::Agent,
+    session_id: &str,
+    task_id: &str,
+) -> Option<super::system_directives::SystemDirective> {
+    if task_id.is_empty() {
+        return None;
+    }
+    let plan_store = agent.plan_store.read().await.clone()?;
+    // Most recent checklist for this session, scoped to the current turn.
+    let plan = plan_store
+        .get_recent_for_session(session_id, 1)
+        .await
+        .ok()?
+        .into_iter()
+        .next()
+        .filter(|p| p.task_id.as_deref() == Some(task_id))?;
+    let unchecked: Vec<String> = plan
+        .unchecked_steps()
+        .iter()
+        .map(|s| s.description.clone())
+        .collect();
+    if !unchecked.is_empty()
+        && agent
+            .checklist_turn_flags
+            .write()
+            .await
+            .insert(format!("{task_id}:nudged"))
+    {
+        return Some(super::system_directives::SystemDirective::ChecklistVerificationRequired {
+            items: unchecked,
+        });
+    }
+    // Allow finishing — post the done-vs-deferred recap once per task.
+    if agent
+        .checklist_turn_flags
+        .write()
+        .await
+        .insert(format!("{task_id}:recapped"))
+    {
+        if let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) {
+            let _ = hub.send_text(session_id, &plan.render_recap()).await;
+        }
+    }
+    None
 }

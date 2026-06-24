@@ -393,6 +393,10 @@ pub struct Agent {
     /// (core.rs ordering) via `set_plan_store`; `None` on subagents and in tests,
     /// in which case checklist verification/recap degrade to current behavior.
     plan_store: RwLock<Option<Arc<crate::plans::PlanStore>>>,
+    /// Once-per-task guards for the requirement-checklist soft verification.
+    /// Keys: "{task_id}:nudged" (nudged once) and "{task_id}:recapped" (recap
+    /// posted once). Keeps the nudge/recap from firing on every iteration.
+    checklist_turn_flags: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,

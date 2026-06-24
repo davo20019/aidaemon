@@ -216,6 +216,12 @@ pub(in crate::agent) enum SystemDirective {
         prior_user_request: Option<String>,
         prior_assistant_reply: String,
     },
+    /// The model is trying to finish but its self-registered requirement
+    /// checklist still has unchecked items. Soft verification: injected once per
+    /// task, then the turn is allowed to finish regardless.
+    ChecklistVerificationRequired {
+        items: Vec<String>,
+    },
 }
 
 impl SystemDirective {
@@ -649,6 +655,19 @@ impl SystemDirective {
                 );
                 lines.join("\n")
             }
+            Self::ChecklistVerificationRequired { items } => format!(
+                "[SYSTEM] You are about to finish, but these tracked requirements are still \
+                 unchecked:\n{}\n\
+                 Complete them now — for a file deliverable, call send_file with the produced \
+                 file's path. If you are intentionally skipping any, call track_requirements and \
+                 mark it 'deferred' with a brief reason. Do not finish while a required item is \
+                 still pending.",
+                items
+                    .iter()
+                    .map(|i| format!("- {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
         }
     }
 }
@@ -671,6 +690,18 @@ mod tests {
         assert!(with_notify.contains("completion notifications are enabled"));
         assert!(without_notify.contains("moved to the background"));
         assert!(!without_notify.contains("results will be sent automatically"));
+    }
+
+    #[test]
+    fn checklist_verification_render_lists_items_and_steers_send_file() {
+        let rendered = SystemDirective::ChecklistVerificationRequired {
+            items: vec!["send the latency file to the user".to_string()],
+        }
+        .render();
+        assert!(rendered.contains("[SYSTEM]"));
+        assert!(rendered.contains("send the latency file to the user"));
+        assert!(rendered.contains("send_file"));
+        assert!(rendered.contains("deferred"));
     }
 
     #[test]
