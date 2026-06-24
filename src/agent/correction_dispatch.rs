@@ -102,7 +102,10 @@ fn build_remediation_prompt(
          The goal it was pursuing: {goal}\n\n\
          Re-attempt this goal with a MATERIALLY DIFFERENT, faster, tightly-scoped \
          approach — do not repeat the same command. Prefer narrow, bounded \
-         operations (size filters, depth limits, specific directories). Deliver the answer."
+         operations (size filters, depth limits, specific directories). \
+         IMPORTANT: use explicit ABSOLUTE paths (e.g. /Users/<you>/...) — do NOT use \
+         `~`, `$HOME`, or `~/*`; shorthand home references and unbounded root scans \
+         are rejected by the safety sandbox and will fail. Deliver the answer."
     )
 }
 
