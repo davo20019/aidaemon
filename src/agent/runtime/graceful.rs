@@ -1165,7 +1165,7 @@ impl Agent {
         .await;
     }
 
-    pub(super) async fn emit_decision_point(
+    pub(in crate::agent) async fn emit_decision_point(
         &self,
         emitter: &crate::events::EventEmitter,
         task_id: &str,

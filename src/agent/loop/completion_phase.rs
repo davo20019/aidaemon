@@ -328,7 +328,15 @@ pub(super) async fn run_completion_phase(
                 // (e.g., "Tell me a joke in Spanish", "List your capabilities").
                 if (deferred_no_tool_streak >= DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
                     && is_substantive_text_response(&reply, 15))
-                    || !agent.supervision_gate_enforced("tools_required_text_block", &model)
+                    || !agent
+                        .supervision_gate_enforced(
+                            "tools_required_text_block",
+                            &model,
+                            emitter,
+                            task_id,
+                            iteration,
+                        )
+                        .await
                 {
                     info!(
                             session_id,
@@ -449,7 +457,15 @@ pub(super) async fn run_completion_phase(
             && !used_identity_prefill
             && looks_like_deferred_action_response(&reply)
             && !is_substantive_text_response(&reply, 200)
-            && agent.supervision_gate_enforced("deferred_action_block", &model)
+            && agent
+                .supervision_gate_enforced(
+                    "deferred_action_block",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                )
+                .await
         {
             if tool_defs.is_empty() {
                 warn!(
@@ -1276,7 +1292,15 @@ pub(super) async fn run_completion_phase(
             && completion_progress.mutation_count == 0
             && has_tool_attempts
             && stall_count < 2
-            && agent.supervision_gate_enforced("mutation_contract_block", &model)
+            && agent
+                .supervision_gate_enforced(
+                    "mutation_contract_block",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                )
+                .await
         {
             stall_count = stall_count.saturating_add(1);
             consecutive_clean_iterations = 0;
@@ -1366,7 +1390,15 @@ pub(super) async fn run_completion_phase(
             && (claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
                 || has_structural_markers
-                || agent.supervision_gate_enforced("deferred_action_guard", &model))
+                || agent
+                    .supervision_gate_enforced(
+                        "deferred_action_guard",
+                        &model,
+                        emitter,
+                        task_id,
+                        iteration,
+                    )
+                    .await)
         {
             // Post-tool-success: if we've already caught one deferral after tools
             // succeeded, accept this reply instead of stalling further.
