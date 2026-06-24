@@ -25,6 +25,7 @@ pub mod spawn;
 mod system;
 pub mod terminal;
 mod tool_trace;
+pub mod track_requirements;
 pub mod web_fetch;
 mod web_search;
 
