@@ -385,11 +385,14 @@ mod tests {
     }
 
     /// P3b.2: when the factory accepts (enabled + bypass on), the live dispatch
-    /// REGISTERS the correction context under the synthetic remediation goal id
-    /// and returns that id. This proves the threading entry point: the spawned
-    /// remediation hierarchy will look this up by its inherited `goal_id`.
+    /// returns the synthetic remediation goal id (proving it dispatched rather
+    /// than refusing). Registration is verified separately/deterministically in
+    /// [`test_correction_context_threading_invariants`] — here we only assert the
+    /// dispatch produced a goal id, because the fire-and-forget remediation task
+    /// it spawns may *tear the context down* (P3b.3 teardown) before we can
+    /// observe the registration, so counting it would race.
     #[tokio::test]
-    async fn test_dispatch_registers_correction_context_under_goal_id() {
+    async fn test_dispatch_returns_goal_id_when_factory_accepts() {
         let harness = make_test_agent().await;
         let agent = Arc::new(harness.agent);
         let state: Arc<dyn StateStore> = harness.state.clone();
@@ -407,16 +410,50 @@ mod tests {
         .expect("dispatch must not error");
 
         let goal_id = result.expect("enabled + bypass → must dispatch and return a goal id");
+        assert!(
+            !goal_id.trim().is_empty(),
+            "dispatch must return a non-empty synthetic goal id"
+        );
+    }
+
+    /// P3b.2 (deterministic, teardown-independent): the threading invariant —
+    /// an agent whose current goal id matches a registered correction context
+    /// peeks `Some` (and a second peek still sees it, i.e. peek does not
+    /// consume), while any other / no goal id reads `None`. This is the heart of
+    /// the non-stickiness guarantee: ONLY the deliberately-registered remediation
+    /// goal id gets `Some(correction)`.
+    ///
+    /// Registration is done directly (not via the full dispatch+spawn path) so
+    /// the fire-and-forget remediation task's P3b.3 teardown cannot race the
+    /// assertions.
+    #[tokio::test]
+    async fn test_correction_context_threading_invariants() {
+        use crate::agent::correction_execution::{
+            CorrectionDispatchMode, CorrectionExecutionContext,
+        };
+        use crate::agent::self_correction::SelfCorrectionController;
+
+        let harness = make_test_agent().await;
+        let agent = Arc::new(harness.agent);
+        let state: Arc<dyn StateStore> = harness.state.clone();
+
+        let goal_id = "remediation-goal-threading".to_string();
+        let ctx = Arc::new(CorrectionExecutionContext {
+            subject: subject_with("/tmp/proj", "what's the biggest file?"),
+            controller: Arc::new(SelfCorrectionController::new(state.clone(), 3)),
+            dispatch_mode: CorrectionDispatchMode::Deferred,
+            bypass_approvals: true,
+        });
+        agent.register_correction_context(&goal_id, ctx).await;
         assert_eq!(
             agent.correction_context_count().await,
             1,
-            "exactly one correction context must be registered for the dispatch"
+            "exactly one correction context must be registered"
         );
 
-        // The registered context is keyed by the returned goal id, and an agent
-        // whose current goal id matches reads `Some` (peek, not consume).
+        // An agent whose current goal id matches reads `Some` (peek, not consume).
         let mut peeker = make_test_agent().await.agent;
-        // Share the same registry as the dispatching agent so the peek sees the
+        // Share the same registry as the registering agent so the peek sees the
         // registered entry (this is what `create_child_agent` does in prod via
         // `self.correction_contexts.clone()`).
         peeker.correction_contexts = agent.correction_contexts.clone();
@@ -446,6 +483,48 @@ mod tests {
         assert!(
             peeker.correction_context_for_current_goal().await.is_none(),
             "an agent with no goal id must read None"
+        );
+    }
+
+    /// P3b.3 teardown: a dispatched remediation's correction context is cleared
+    /// after the spawned task lead completes (success OR error). The MockProvider
+    /// test agent has no `self_ref`, so the spawned task lead fails fast — which
+    /// still drives the teardown path — and the registered context is removed
+    /// within a bounded poll window. This proves contexts don't leak until FIFO
+    /// eviction.
+    #[tokio::test]
+    async fn test_dispatched_remediation_context_is_cleared_after_completion() {
+        let harness = make_test_agent().await;
+        let agent = Arc::new(harness.agent);
+        let state: Arc<dyn StateStore> = harness.state.clone();
+
+        let enabled_bypass = cfg(true, false, true);
+        let goal_id = dispatch_correction_remediation(
+            agent.clone(),
+            state.clone(),
+            None,
+            &enabled_bypass,
+            subject_with("/tmp/proj", "what's the biggest file?"),
+            "Re-attempt with a bounded find".to_string(),
+        )
+        .await
+        .expect("dispatch must not error")
+        .expect("enabled + bypass → must dispatch and return a goal id");
+
+        // Poll until the background task lead completes and the teardown clears
+        // the context. Bounded so a regression (no teardown) fails the test.
+        let mut cleared = false;
+        for _ in 0..100 {
+            if agent.correction_context_count().await == 0 {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            cleared,
+            "correction context for goal {goal_id} must be cleared after the \
+             remediation task lead completes (P3b.3 teardown)"
         );
     }
 

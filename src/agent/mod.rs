@@ -667,6 +667,20 @@ impl Agent {
         self.correction_contexts.read().await.len()
     }
 
+    /// Shared `EventStore` handle. Used by the idle-reaper → correction bridge
+    /// (`TerminalTool`) to fetch recent conversation history for subject
+    /// reconstruction. Returns a borrow of the `Arc`; clone it if an owned
+    /// handle is needed.
+    pub(crate) fn event_store(&self) -> &Arc<EventStore> {
+        &self.event_store
+    }
+
+    /// Shared `StateStore` handle. Used by the idle-reaper → correction bridge
+    /// to hand the dispatch path an owned `Arc<dyn StateStore>`.
+    pub(crate) fn state_arc(&self) -> Arc<dyn StateStore> {
+        self.state.clone()
+    }
+
     pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {
         turn_render::RenderOptions {
             vision: self.vision_config.clone(),

@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::channels::ChannelHub;
+use crate::config::SelfCorrectionConfig;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
 };
@@ -179,6 +180,13 @@ pub struct TerminalTool {
     /// Per-session timestamps of recent background-completion re-engagements,
     /// used by [`reengagement_allowed`] to cap runaway re-engagement loops.
     reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
+    /// Self-correction bridge config. Consulted by the idle-reaper: when a hung
+    /// background command is stopped, this config decides whether an autonomous
+    /// remediation task is dispatched (live), shadow-logged, or skipped
+    /// (disabled / unsafe scope). Defaults to the safe-off
+    /// [`SelfCorrectionConfig::default`] unless wired via
+    /// [`TerminalTool::with_self_correction`].
+    self_correction: SelfCorrectionConfig,
 }
 
 /// Check if a command string contains shell operators.
@@ -756,7 +764,17 @@ impl TerminalTool {
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
+            self_correction: SelfCorrectionConfig::default(),
         }
+    }
+
+    /// Wire the self-correction config so the idle-reaper can dispatch
+    /// autonomous remediation when it stops a hung background command. Without
+    /// this, `self_correction` is the safe-off default and the reaper only ever
+    /// sends the existing user notification.
+    pub fn with_self_correction(mut self, config: SelfCorrectionConfig) -> Self {
+        self.self_correction = config;
+        self
     }
 
     pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
@@ -1431,6 +1449,142 @@ impl TerminalTool {
         }
     }
 
+    /// Determine the bounded `working_dir` handed to the correction bridge for a
+    /// reaped background command, then canonicalize it.
+    ///
+    /// We do NOT know the actual project scope of a reaped command — terminal
+    /// commands run via `sh -c` inheriting the daemon's cwd, and neither
+    /// `RunningProcess` nor the owning task/goal record a project directory. The
+    /// honest "working_dir we have" is therefore the daemon's current working
+    /// directory. Per the bridge contract we pass it through unchanged in spirit
+    /// (no `$HOME` substitution to force a dispatch) and rely on the bridge's
+    /// `is_unsafe_correction_working_dir` gate to REFUSE when that turns out to be
+    /// `/`, `$HOME`, or unbounded — the correct safe outcome.
+    ///
+    /// Canonicalization is done HERE because the bridge guard does not canonicalize:
+    /// resolving `.`/`..`/symlinks before the guard sees the path is what lets the
+    /// equality checks (`== "/"`, `== $HOME`) fire reliably. If canonicalization
+    /// fails (path missing), we fall back to the raw cwd so the guard still runs.
+    fn correction_working_dir() -> std::path::PathBuf {
+        let raw = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        std::fs::canonicalize(&raw).unwrap_or(raw)
+    }
+
+    /// Attempt autonomous remediation for a just-reaped hung background command.
+    ///
+    /// Returns `true` only when a remediation task was actually dispatched (live
+    /// mode, safe scope, factory accepted) — in which case the caller sends a
+    /// quieter "retrying a different way" note instead of the alarming "stopped,
+    /// no results" message. Returns `false` for every other outcome
+    /// (correction disabled, no agent wired, unsafe scope, shadow mode, factory
+    /// refused, or any error), in which case the caller MUST send the existing
+    /// user notification — byte-identical to today.
+    ///
+    /// This is best-effort and self-contained: any failure to remediate one
+    /// reaped process is swallowed here so it can never break reaping of others.
+    async fn try_dispatch_idle_reap_remediation(
+        &self,
+        command: &str,
+        session_id: &str,
+        owner_task_id: Option<&str>,
+        idle_secs: u64,
+    ) -> bool {
+        use crate::agent::correction_dispatch::{
+            decide_correction_bridge_action, dispatch_correction_remediation,
+            CorrectionBridgeAction,
+        };
+        use crate::agent::correction_intent::reconstruct_subject_context;
+        use crate::traits::SelfCorrectionSubjectKind;
+
+        // Fast exit when the bridge is off — keeps behavior byte-identical and
+        // avoids upgrading the agent Weak / touching the event store needlessly.
+        if !self.self_correction.enabled {
+            return false;
+        }
+
+        // 1. Reach the agent (and through it the event store + state). No agent
+        //    wired (e.g. unit tests that build TerminalTool directly) → skip
+        //    remediation, keep the existing notification.
+        let Some(agent) = self.agent.get().and_then(|w| w.upgrade()) else {
+            return false;
+        };
+
+        // 2. Bounded working_dir for the retry (canonicalized; gate may refuse).
+        let working_dir = Self::correction_working_dir();
+
+        // 3. Recent history for subject reconstruction (best-effort; an empty
+        //    history just yields the generic original-request fallback).
+        let history = agent
+            .event_store()
+            .get_conversation_history(session_id, 50)
+            .await
+            .unwrap_or_default();
+
+        // Subject id: prefer the owning task id, fall back to the session id.
+        let subject_id = owner_task_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(session_id);
+
+        let subject = reconstruct_subject_context(
+            &history,
+            session_id,
+            subject_id,
+            SelfCorrectionSubjectKind::BackgroundCommand,
+            working_dir.clone(),
+            command,
+        );
+
+        // 4. Decide. Disabled was handled above; Disabled/UnsafeScope/Shadowed
+        //    all fall through to the existing notification (return false).
+        match decide_correction_bridge_action(&self.self_correction, &subject, command, idle_secs) {
+            CorrectionBridgeAction::Disabled | CorrectionBridgeAction::UnsafeScope => false,
+            CorrectionBridgeAction::Shadowed { .. } => {
+                info!(
+                    reconstructed_request = %subject.original_request,
+                    working_dir = %working_dir.display(),
+                    command = %truncate_str(command, 160),
+                    idle_secs,
+                    "SHADOW: would dispatch correction remediation"
+                );
+                false
+            }
+            CorrectionBridgeAction::Dispatch { remediation_prompt } => {
+                let state = agent.state_arc();
+                let hub = self.hub.get().cloned();
+                match dispatch_correction_remediation(
+                    agent,
+                    state,
+                    hub,
+                    &self.self_correction,
+                    subject,
+                    remediation_prompt,
+                )
+                .await
+                {
+                    Ok(Some(goal_id)) => {
+                        info!(
+                            %goal_id,
+                            working_dir = %working_dir.display(),
+                            command = %truncate_str(command, 160),
+                            idle_secs,
+                            "Dispatched autonomous remediation for idle-reaped command"
+                        );
+                        true
+                    }
+                    Ok(None) => {
+                        // Factory refused (kill-switch / no-bypass) — fall back to
+                        // the existing notification.
+                        false
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Correction remediation dispatch failed; falling back to notification");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     /// Stop disowned background processes that have gone idle (no new output for
     /// `idle_threshold`). Driven by the heartbeat so there is a single, observable
     /// owner for this resource-leak class — the per-process notifier only delivers
@@ -1511,6 +1665,11 @@ impl TerminalTool {
             let session_id = proc.notify_session_id.clone();
             let goal_id = proc.notify_goal_id.clone();
             let command_summary = truncate_str(&proc.command, 160);
+            // Full command + owning task id are captured here because `proc` is
+            // moved into `terminate_running_process` below; the correction bridge
+            // needs the untruncated command and the task scope.
+            let proc_command = proc.command.clone();
+            let owner_task_id = proc.owner_task_id.clone();
             let idle_secs = proc.last_progress_at.elapsed().as_secs();
 
             warn!(
@@ -1530,14 +1689,41 @@ impl TerminalTool {
             // Close the loop with the user: the screenshot's failure was the bot
             // silently waiting forever. Tell them it was stopped and why.
             if !session_id.is_empty() {
-                let message = format!(
-                    "⚠️ I stopped a background command that was taking too long with no results \
-                     (no output for {}): `{}`. Whole-disk scans are very slow — if you still \
-                     need this, try narrowing the search (a specific folder, a size filter, or a \
-                     depth limit).",
-                    humanize_elapsed(idle_secs),
-                    command_summary
-                );
+                // Self-correction bridge: when enabled+safe+live, dispatch an
+                // autonomous remediation instead of the alarming "stopped, no
+                // results" message. Best-effort and per-process — a failure to
+                // remediate this one process never breaks reaping of the others
+                // (all error paths inside return `false`, falling back to the
+                // existing notification). When correction is off/unsafe/shadow,
+                // this is a no-op and the message below is byte-identical to
+                // today.
+                let remediating = self
+                    .try_dispatch_idle_reap_remediation(
+                        &proc_command,
+                        &session_id,
+                        owner_task_id.as_deref(),
+                        idle_secs,
+                    )
+                    .await;
+
+                let message = if remediating {
+                    format!(
+                        "⚠️ That background command was taking too long with no results \
+                         (no output for {}): `{}`. I'm retrying this a different way — \
+                         I'll follow up with the result.",
+                        humanize_elapsed(idle_secs),
+                        command_summary
+                    )
+                } else {
+                    format!(
+                        "⚠️ I stopped a background command that was taking too long with no results \
+                         (no output for {}): `{}`. Whole-disk scans are very slow — if you still \
+                         need this, try narrowing the search (a specific folder, a size filter, or a \
+                         depth limit).",
+                        humanize_elapsed(idle_secs),
+                        command_summary
+                    )
+                };
                 let mut delivered = false;
                 if let Some(hub) = self.get_hub() {
                     if hub.send_text(&session_id, &message).await.is_ok() {
@@ -4019,6 +4205,117 @@ mod tests {
         assert!(
             saw_notice,
             "expected a user-facing notice that the hung command was stopped"
+        );
+    }
+
+    /// The correction-bridge working_dir helper returns an absolute, canonical
+    /// path (so `.`/`..`/symlinks are resolved before the bridge's
+    /// `is_unsafe_correction_working_dir` guard — which does NOT canonicalize —
+    /// sees it). Canonicalization is what makes the `== "/"` / `== $HOME`
+    /// equality checks fire reliably.
+    #[test]
+    fn test_correction_working_dir_is_canonical_absolute() {
+        let dir = TerminalTool::correction_working_dir();
+        assert!(
+            dir.is_absolute(),
+            "correction working_dir must be absolute, got {dir:?}"
+        );
+        // Canonicalizing an already-canonical path is a fixed point.
+        if let Ok(canon) = std::fs::canonicalize(&dir) {
+            assert_eq!(
+                canon, dir,
+                "correction working_dir must already be canonical"
+            );
+        }
+    }
+
+    /// Self-correction bridge: when correction is ENABLED but no agent is wired
+    /// (the bridge can't reach the event store / dispatch path), the idle-reaper
+    /// must fall back to the EXISTING user notification and dispatch nothing.
+    /// This is the safety floor: a misconfigured/half-wired bridge degrades to
+    /// today's behavior rather than silently swallowing the notice.
+    #[tokio::test]
+    async fn test_idle_reap_correction_enabled_no_agent_falls_back_to_notice() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+
+        // Correction ENABLED + bypass + live (shadow off) — but NO agent wired.
+        let live_cfg = SelfCorrectionConfig {
+            enabled: true,
+            correction_bypass_enabled: true,
+            max_attempts: 3,
+            shadow_mode: false,
+        };
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>)
+        .with_self_correction(live_cfg);
+
+        // Direct unit check of the bridge entry point: no agent → no dispatch.
+        let dispatched = tool
+            .try_dispatch_idle_reap_remediation(
+                "find / -type f -size +100M",
+                "sess_reap_noagent",
+                None,
+                300,
+            )
+            .await;
+        assert!(!dispatched, "no agent wired must NOT dispatch remediation");
+
+        // End-to-end: reap a hung process and confirm the EXISTING notice fires.
+        let response = tool
+            .call(
+                r#"{"action":"run","command":"sleep 120","_session_id":"sess_reap_noagent","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(response.contains("Moved to background (pid="));
+
+        let mut reaped = 0;
+        for _ in 0..40 {
+            reaped = tool
+                .reap_stale_background_processes(Duration::from_millis(1))
+                .await;
+            if reaped > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(reaped, 1, "expected the hung process to be reaped");
+
+        // The EXISTING "I stopped a background command" notice must still fire —
+        // NOT the quieter "retrying a different way" remediation note.
+        let mut saw_stopped_notice = false;
+        for _ in 0..20 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            if pending.iter().any(|entry| {
+                entry.session_id == "sess_reap_noagent"
+                    && entry.message.contains("I stopped a background command")
+            }) {
+                saw_stopped_notice = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            saw_stopped_notice,
+            "enabled-but-no-agent must fall back to the existing stopped-command notice"
         );
     }
 
