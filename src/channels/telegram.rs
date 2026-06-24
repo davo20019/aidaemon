@@ -6,8 +6,6 @@ use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -4717,7 +4715,6 @@ impl TelegramChannel {
             .set_typing_cancel(task_id, typing_cancel.clone())
             .await;
         let registry = Arc::clone(&self.task_registry);
-        let files_enabled = self.files_enabled;
 
         // Spawn the agent work in a separate task so the dispatcher can continue
         // processing other updates (especially callback queries for tool approval).
