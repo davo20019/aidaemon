@@ -185,6 +185,44 @@ impl TaskPlan {
         self.updated_at = Utc::now();
     }
 
+    /// Steps still requiring action (not completed/deferred/failed/skipped).
+    pub fn unchecked_steps(&self) -> Vec<&PlanStep> {
+        self.steps
+            .iter()
+            .filter(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
+            .collect()
+    }
+
+    /// Compact, channel-friendly checklist for posting to the user at start.
+    pub fn render_compact_checklist(&self) -> String {
+        let mut out = String::from("📋 Plan for this task:\n");
+        for step in &self.steps {
+            let mark = match step.status {
+                StepStatus::Completed => "✅",
+                StepStatus::Deferred => "⏭️",
+                StepStatus::Failed => "⚠️",
+                _ => "☐",
+            };
+            out.push_str(&format!("{} {}\n", mark, step.description));
+        }
+        out.trim_end().to_string()
+    }
+
+    /// End-of-turn recap of what got done vs what remains/deferred.
+    pub fn render_recap(&self) -> String {
+        let mut out = String::new();
+        for step in &self.steps {
+            let mark = match step.status {
+                StepStatus::Completed => "✅",
+                StepStatus::Deferred => "⏭️ (deferred)",
+                StepStatus::Failed => "⚠️ (failed)",
+                _ => "☐ (not done)",
+            };
+            out.push_str(&format!("{} {}\n", mark, step.description));
+        }
+        out.trim_end().to_string()
+    }
+
     /// Format the plan for system prompt injection.
     pub fn format_for_prompt(&self) -> String {
         let mut lines = vec![
@@ -205,6 +243,7 @@ impl TaskPlan {
                 StepStatus::InProgress => "[>]",
                 StepStatus::Failed => "[!]",
                 StepStatus::Skipped => "[-]",
+                StepStatus::Deferred => "[~]",
                 StepStatus::Pending => "[ ]",
             };
             let mut line = format!("  {} {}. {}", marker, step.index + 1, step.description);
@@ -335,6 +374,8 @@ pub enum StepStatus {
     Failed,
     /// Skipped (dependency failed or user skipped)
     Skipped,
+    /// Explicitly abandoned by the model (counts as resolved, not unchecked).
+    Deferred,
 }
 
 impl StepStatus {
@@ -345,6 +386,7 @@ impl StepStatus {
             StepStatus::Completed => "completed",
             StepStatus::Failed => "failed",
             StepStatus::Skipped => "skipped",
+            StepStatus::Deferred => "deferred",
         }
     }
 
@@ -355,6 +397,7 @@ impl StepStatus {
             "completed" => Some(StepStatus::Completed),
             "failed" => Some(StepStatus::Failed),
             "skipped" => Some(StepStatus::Skipped),
+            "deferred" => Some(StepStatus::Deferred),
             _ => None,
         }
     }
@@ -430,6 +473,48 @@ mod tests {
         assert!(formatted.contains("[x] 1. Run tests"));
         assert!(formatted.contains("[>] 2. Build"));
         assert!(formatted.contains("[ ] 3. Deploy"));
+    }
+
+    #[test]
+    fn test_deferred_status_round_trip() {
+        assert_eq!(StepStatus::Deferred.as_str(), "deferred");
+        assert_eq!(StepStatus::from_str("deferred"), Some(StepStatus::Deferred));
+    }
+
+    #[test]
+    fn test_unchecked_steps_excludes_completed_and_deferred() {
+        let mut plan = TaskPlan::new(
+            "s",
+            "t",
+            "d",
+            vec!["a".into(), "b".into(), "c".into()],
+            "track_requirements",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        plan.steps[1].status = StepStatus::Deferred;
+        plan.steps[2].status = StepStatus::Pending;
+        let unchecked = plan.unchecked_steps();
+        assert_eq!(unchecked.len(), 1);
+        assert_eq!(unchecked[0].description, "c");
+    }
+
+    #[test]
+    fn test_render_compact_checklist_and_recap() {
+        let mut plan = TaskPlan::new(
+            "s",
+            "t",
+            "d",
+            vec!["create script".into(), "send the file".into()],
+            "track_requirements",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        let checklist = plan.render_compact_checklist();
+        assert!(checklist.contains("create script"));
+        assert!(checklist.contains("send the file"));
+        let recap = plan.render_recap();
+        assert!(recap.contains("create script"));
+        assert!(recap.contains("send the file"));
+        assert!(recap.contains("not done"));
     }
 
     #[test]
