@@ -65,8 +65,12 @@ pub fn decide_correction_bridge_action(
     }
 
     // 3. Build the remediation prompt once for both shadow + live paths.
-    let remediation_prompt =
-        build_remediation_prompt(&subject.original_request, failed_command, idle_secs);
+    let remediation_prompt = build_remediation_prompt(
+        &subject.original_request,
+        failed_command,
+        idle_secs,
+        &subject.working_dir,
+    );
 
     // 4. Shadow-first: log the would-be remediation, do not dispatch.
     if config.shadow_mode {
@@ -92,9 +96,13 @@ fn build_remediation_prompt(
     original_request: &str,
     failed_command: &str,
     idle_secs: u64,
+    working_dir: &std::path::Path,
 ) -> String {
     let command = crate::utils::truncate_str(failed_command, MAX_EMBED_CHARS);
     let goal = crate::utils::truncate_str(original_request, MAX_EMBED_CHARS);
+    // Cap the scope dir the same way (UTF-8-safe) so a pathological path can't
+    // blow the prompt size or panic on a byte boundary.
+    let scope = crate::utils::truncate_str(&working_dir.display().to_string(), MAX_EMBED_CHARS);
 
     format!(
         "A previous command was stopped after {idle_secs}s without completing:\n\
@@ -105,7 +113,10 @@ fn build_remediation_prompt(
          operations (size filters, depth limits, specific directories). \
          IMPORTANT: use explicit ABSOLUTE paths (e.g. /Users/<you>/...) — do NOT use \
          `~`, `$HOME`, or `~/*`; shorthand home references and unbounded root scans \
-         are rejected by the safety sandbox and will fail. Deliver the answer."
+         are rejected by the safety sandbox and will fail. Deliver the answer.\n\
+         Example of an allowed command for this goal: \
+         `find {scope} -type f -size +500M -exec ls -lh {{}} +` — adapt the size \
+         threshold and directory as needed."
     )
 }
 
@@ -312,6 +323,7 @@ mod tests {
             "what's the biggest file in my downloads?",
             "find / -type f -size +100M",
             300,
+            std::path::Path::new("/Users/synthetic/Documents"),
         );
         // Contains the original goal.
         assert!(
@@ -336,6 +348,33 @@ mod tests {
         assert!(
             prompt.contains("300s"),
             "prompt must mention the idle duration: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_remediation_prompt_contains_scoped_example_command() {
+        // 3c robustness: the prompt must embed a CONCRETE worked example using
+        // the goal's actual scope directory + a `find … -size …` form, so the
+        // weak local model has something to adapt instead of abstract guidance.
+        let scope = "/Users/synthetic/Documents";
+        let prompt = build_remediation_prompt(
+            "what's the biggest file?",
+            "du -sh ~",
+            120,
+            std::path::Path::new(scope),
+        );
+        assert!(
+            prompt.contains(scope),
+            "prompt must contain the scope dir: {prompt}"
+        );
+        assert!(
+            prompt.contains("find") && prompt.contains("-size"),
+            "prompt must contain an example `find … -size` command: {prompt}"
+        );
+        // The example must use the scope dir as the find root (not a placeholder).
+        assert!(
+            prompt.contains(&format!("find {scope} -type f -size")),
+            "example command must use the scope dir as the find root: {prompt}"
         );
     }
 

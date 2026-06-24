@@ -703,16 +703,18 @@ fn command_path_operands_in_scope(
         // cannot determine where these resolve at shell-expansion time.
         if candidate.starts_with('~') {
             return Err(format!(
-                "command path operand '{}' uses tilde expansion (~) which cannot be \
-                 safely scoped in correction mode",
-                candidate
+                "Home shorthand `~`/`$HOME`/`~/*` (here `{}`) is rejected — use an explicit \
+                 ABSOLUTE path (e.g. `{}/...`).",
+                candidate,
+                working_dir.display()
             ));
         }
         if candidate.contains('$') {
             return Err(format!(
-                "command path operand '{}' uses shell variable expansion ($) which \
-                 cannot be safely scoped in correction mode",
-                candidate
+                "Home shorthand `~`/`$HOME`/`~/*` (here `{}`) is rejected — use an explicit \
+                 ABSOLUTE path (e.g. `{}/...`).",
+                candidate,
+                working_dir.display()
             ));
         }
 
@@ -726,8 +728,10 @@ fn command_path_operands_in_scope(
         let normalized = normalize_path_lexical(&resolved);
         if !normalized.starts_with(working_dir) {
             return Err(format!(
-                "command path '{}' is outside the allowed working directory",
-                candidate
+                "command path '{}' is outside the allowed working directory — \
+                 use a path inside the allowed scope `{}`.",
+                candidate,
+                working_dir.display()
             ));
         }
         if is_sensitive_file_path(&normalized) {
@@ -841,9 +845,23 @@ fn is_correction_safe_local_command(
         "pwd", "ls", "cat", "head", "tail", "wc", "grep", "rg", "find",
     ];
     if !ALLOWED_CMDS.contains(&base_cmd) {
+        // Actionable hints: the reaper-stopped command is most often a slow `du`,
+        // and the weak local model retries the same disallowed form unless told
+        // the exact allowed command to use instead.
+        if base_cmd == "du" {
+            return Err(format!(
+                "`du` is not permitted in correction mode (it recursively sizes \
+                 directories and is slow). To find large files use `find {} -type f \
+                 -size +500M -exec ls -lh {{}} +` instead.",
+                working_dir.display()
+            ));
+        }
         return Err(format!(
-            "command '{}' is not in the correction-mode read-only allowlist",
-            base_cmd
+            "command '{}' is not in the correction-mode read-only allowlist \
+             (allowed: pwd, ls, cat, head, tail, wc, grep, rg, find). To find large \
+             files use `find {} -type f -size +500M -exec ls -lh {{}} +` instead.",
+            base_cmd,
+            working_dir.display()
         ));
     }
 
@@ -915,9 +933,20 @@ fn is_correction_safe_local_command(
             let is_broad =
                 *root == "/" || *root == "~" || root.starts_with("~/") || root.starts_with("$HOME");
             if is_broad {
+                // Distinguish home-shorthand from whole-disk so the hint matches.
+                if *root == "~" || root.starts_with("~/") || root.starts_with("$HOME") {
+                    return Err(format!(
+                        "Home shorthand `~`/`$HOME`/`~/*` (here `{}`) is rejected — use an \
+                         explicit ABSOLUTE path (e.g. `{}/...`).",
+                        root,
+                        working_dir.display()
+                    ));
+                }
                 return Err(format!(
-                    "find with broad root '{}' is not allowed in correction mode",
-                    root
+                    "Unbounded scan of `{}` blocked — scope it with a specific absolute \
+                     directory and a size filter, e.g. `find {} -type f -size +500M`.",
+                    root,
+                    working_dir.display()
                 ));
             }
             // Scope check: root must be within working_dir.
@@ -930,8 +959,10 @@ fn is_correction_safe_local_command(
             let normalized = normalize_path_lexical(&resolved);
             if !normalized.starts_with(working_dir) {
                 return Err(format!(
-                    "find root '{}' is outside the allowed working directory",
-                    root
+                    "find root '{}' is outside the allowed working directory — \
+                     use a path inside the allowed scope `{}`.",
+                    root,
+                    working_dir.display()
                 ));
             }
             if is_sensitive_file_path(&normalized) {
@@ -1083,7 +1114,8 @@ fn check_local_path_scope(path_str: &str, ctx: &CorrectionSubjectContext) -> Res
     // Must be under working_dir.
     if !normalized.starts_with(&ctx.working_dir) {
         return Err(format!(
-            "path '{}' is outside the allowed working directory '{}'",
+            "path '{}' is outside the allowed working directory — use a path inside \
+             the allowed scope `{}`.",
             path_str,
             ctx.working_dir.display()
         ));
@@ -2611,6 +2643,172 @@ mod tests {
         assert!(
             sig.contains("[REDACTED"),
             "normalized_attempt_signature must contain a [REDACTED...] marker: {sig}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3c robustness: actionable block-reason hints. These assert the reason
+    // STRING is corrective while the block DECISION is unchanged.
+    // -----------------------------------------------------------------------
+
+    /// Extract the Blocked reason or panic. Helper for the hint tests.
+    fn blocked_reason(a: &ProposedAction, ctx: &CorrectionSubjectContext) -> String {
+        match classify_action(a, ctx) {
+            ActionVerdict::Blocked(r) => r,
+            v => panic!("expected Blocked, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn test_du_block_reason_is_actionable() {
+        // `du` is the canonical reaper-stopped command. Still Blocked, but the
+        // reason must steer the model to the bounded `find … -size` form.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"du -sh /tmp/test-workdir"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.contains("find") && reason.contains("-size"),
+            "du block reason must suggest a bounded `find … -size` form: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_other_disallowed_command_reason_is_actionable() {
+        // A non-`du` disallowed command (e.g. `stat`) still blocks, and the
+        // reason lists the allowlist + the find hint.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"stat /tmp/test-workdir/file"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.contains("find") && reason.contains("-size"),
+            "disallowed-command reason must suggest the `find … -size` form: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_tilde_operand_block_reason_mentions_absolute_path() {
+        // `wc ~/file` — tilde operand. Still Blocked; reason must say to use an
+        // explicit ABSOLUTE path.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"wc ~/somefile"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        let lc = reason.to_lowercase();
+        assert!(
+            lc.contains("absolute") && reason.contains('~'),
+            "tilde-operand reason must mention an absolute path and `~`: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_dollar_home_operand_block_reason_mentions_absolute_path() {
+        // `wc $HOME/file` — $HOME operand. Still Blocked; reason must say to use
+        // an explicit ABSOLUTE path.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"wc $HOME/somefile"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.to_lowercase().contains("absolute"),
+            "$HOME-operand reason must mention an absolute path: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_find_home_root_block_reason_mentions_absolute_path() {
+        // `find ~ -type f -size +500M` — home-shorthand root. Still Blocked;
+        // reason must mention absolute path.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find ~ -type f -size +500M"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.to_lowercase().contains("absolute"),
+            "find ~ root reason must mention an absolute path: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_find_root_disk_block_reason_suggests_scoped_find() {
+        // `find / -type f` — whole-disk root. Still Blocked; reason must suggest
+        // a scoped find with a size filter.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find / -type f"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.contains("find") && reason.contains("-size"),
+            "whole-disk find reason must suggest a scoped `find … -size`: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_out_of_scope_path_reason_mentions_allowed_scope() {
+        // `cat /tmp/outside.txt` — out-of-scope absolute path that is risk-Safe
+        // (so it reaches the path-scope check rather than tripping the risk gate).
+        // Still Blocked; the reason must point at the allowed scope (working_dir).
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"cat /tmp/outside.txt"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let reason = blocked_reason(&a, &ctx_with(vec![]));
+        assert!(
+            reason.contains("/tmp/test-workdir"),
+            "out-of-scope reason must name the allowed scope: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_hint_changes_do_not_alter_decisions_regression() {
+        // The block DECISIONS for all the hint cases must remain Blocked, and a
+        // legitimate in-scope command must remain Allowed (predicates untouched).
+        let ctx = ctx_with(vec![]);
+        for cmd in &[
+            r#"{"command":"du -sh /tmp/test-workdir"}"#,
+            r#"{"command":"wc ~/somefile"}"#,
+            r#"{"command":"find ~ -type f -size +500M"}"#,
+            r#"{"command":"find / -type f"}"#,
+            r#"{"command":"cat /tmp/outside.txt"}"#,
+        ] {
+            let a = extract_proposed_action("terminal", cmd, Some(&read_only_caps()), None);
+            assert!(
+                matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+                "decision must remain Blocked for {cmd}"
+            );
+        }
+        // In-scope find must still be Allowed.
+        let ok = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find /tmp/test-workdir -type f -size +500M"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        assert_eq!(
+            classify_action(&ok, &ctx),
+            ActionVerdict::Allowed,
+            "in-scope find must remain Allowed"
         );
     }
 }
