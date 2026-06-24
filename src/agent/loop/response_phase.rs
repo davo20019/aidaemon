@@ -110,8 +110,14 @@ pub(super) async fn run_response_phase(
         // but its self-registered checklist still has unchecked items, nudge once
         // and continue the loop; otherwise allow the finish (and post the recap).
         if matches!(outcome, ResponsePhaseOutcome::Return(Ok(_))) {
-            if let Some(directive) =
-                checklist_completion_gate(services.agent, ctx.session_id, ctx.task_id).await
+            if let Some(directive) = checklist_completion_gate(
+                services.agent,
+                ctx.emitter,
+                ctx.session_id,
+                ctx.task_id,
+                ctx.iteration,
+            )
+            .await
             {
                 ctx.pending_system_messages.push(directive);
                 return Ok(ResponsePhaseOutcome::ContinueLoop);
@@ -130,9 +136,12 @@ pub(super) async fn run_response_phase(
 /// Degrades to `None` (current behavior) when no plan store / checklist exists.
 async fn checklist_completion_gate(
     agent: &crate::agent::Agent,
+    emitter: &crate::events::EventEmitter,
     session_id: &str,
     task_id: &str,
+    iteration: usize,
 ) -> Option<super::system_directives::SystemDirective> {
+    use crate::plans::StepStatus;
     if task_id.is_empty() {
         return None;
     }
@@ -157,19 +166,57 @@ async fn checklist_completion_gate(
             .await
             .insert(format!("{task_id}:nudged"))
     {
+        // Telemetry: the soft-verification nudge fired (model tried to finish
+        // with items still unchecked). Joinable to TaskEnd by task_id.
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                crate::events::DecisionType::GateTelemetry,
+                "checklist soft-verification nudge fired",
+                serde_json::json!({
+                    "event": "checklist_nudge",
+                    "unchecked_count": unchecked.len(),
+                    "items": unchecked,
+                }),
+            )
+            .await;
         return Some(
             super::system_directives::SystemDirective::ChecklistVerificationRequired {
                 items: unchecked,
             },
         );
     }
-    // Allow finishing — post the done-vs-deferred recap once per task.
+    // Allow finishing — emit completion stats + post the recap once per task.
     if agent
         .checklist_turn_flags
         .write()
         .await
         .insert(format!("{task_id}:recapped"))
     {
+        let completed = plan.completed_steps();
+        let deferred = plan
+            .steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Deferred)
+            .count();
+        agent
+            .emit_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                crate::events::DecisionType::GateTelemetry,
+                "checklist turn completed",
+                serde_json::json!({
+                    "event": "checklist_complete",
+                    "total": plan.steps.len(),
+                    "completed": completed,
+                    "deferred": deferred,
+                    "unchecked": unchecked.len(),
+                }),
+            )
+            .await;
         if let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) {
             let _ = hub.send_text(session_id, &plan.render_recap()).await;
         }

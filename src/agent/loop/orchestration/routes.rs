@@ -1144,6 +1144,19 @@ async fn handle_simple_intent(
         );
         ctx.pending_system_messages
             .push(SystemDirective::PlanSuggestion { hint });
+        // Telemetry: this turn is plan-worthy, so the model is expected to call
+        // track_requirements. The denominator for checklist capture rate (join
+        // to a later checklist_nudge/checklist_complete event by task_id).
+        agent
+            .emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                crate::events::DecisionType::GateTelemetry,
+                "checklist expected (plan-worthy turn)",
+                serde_json::json!({ "event": "checklist_expected" }),
+            )
+            .await;
     }
 
     info!(
@@ -1188,6 +1201,16 @@ async fn handle_complex_intent(
         if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
             ctx.pending_system_messages
                 .push(SystemDirective::PlanSuggestion { hint });
+            agent
+                .emit_decision_point(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
+                    crate::events::DecisionType::GateTelemetry,
+                    "checklist expected (plan-worthy turn)",
+                    serde_json::json!({ "event": "checklist_expected" }),
+                )
+                .await;
         }
         ctx.pending_system_messages
             .push(SystemDirective::GoalCreationOwnerOnly);
