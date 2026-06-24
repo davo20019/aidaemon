@@ -389,6 +389,10 @@ pub struct Agent {
     /// Weak reference to the ChannelHub for background notifications.
     /// Uses RwLock because hub is created after Agent (core.rs ordering).
     hub: RwLock<Option<Weak<ChannelHub>>>,
+    /// Plan store for the requirement-checklist feature. Set after construction
+    /// (core.rs ordering) via `set_plan_store`; `None` on subagents and in tests,
+    /// in which case checklist verification/recap degrade to current behavior.
+    plan_store: RwLock<Option<Arc<crate::plans::PlanStore>>>,
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
@@ -587,6 +591,13 @@ impl Agent {
     /// Set the ChannelHub reference (called after hub creation in core.rs).
     pub async fn set_hub(&self, hub: Weak<ChannelHub>) {
         *self.hub.write().await = Some(hub);
+    }
+
+    /// Set the plan store (called after construction in core.rs). Enables the
+    /// completion phase's checklist soft-verification + recap. Absent on
+    /// subagents/tests, where checklist handling degrades to current behavior.
+    pub async fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+        *self.plan_store.write().await = Some(plan_store);
     }
 
     /// Set a weak self-reference for background task spawning.

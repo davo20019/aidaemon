@@ -261,10 +261,13 @@ pub fn get_plan_suggestion_prompt(trigger: &PlanTrigger) -> Option<String> {
     match trigger {
         PlanTrigger::Suggest(reason) => Some(format!(
             "[SYSTEM] This looks like a {} that requires structured execution. \
-             Break it into discrete steps BEFORE executing. For each step that modifies external state \
-             (deploys, publishes, sends, pushes), include a verification step that confirms the change \
-             was applied correctly. Check prerequisites (committed changes, installed dependencies, \
-             correct configuration) before executing mutations. Never claim success without verification.",
+             FIRST call the track_requirements tool with the full checklist of concrete requirements \
+             for this request (include deliverables like sending a file). As you finish each one, call \
+             track_requirements again with that item marked 'completed'. For each step that modifies \
+             external state (deploys, publishes, sends, pushes), include a verification step that confirms \
+             the change was applied correctly. Check prerequisites (committed changes, installed \
+             dependencies, correct configuration) before executing mutations. Do not claim you are done \
+             while any item is still pending, and never claim success without verification.",
             reason
         )),
         PlanTrigger::AutoCreate(_) => None,
@@ -275,6 +278,18 @@ pub fn get_plan_suggestion_prompt(trigger: &PlanTrigger) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_suggest_hint_instructs_track_requirements() {
+        let hint = get_plan_suggestion_prompt(&PlanTrigger::Suggest("deployment".to_string()))
+            .expect("suggest trigger should yield a hint");
+        assert!(
+            hint.contains("track_requirements"),
+            "hint must steer the model to the checklist tool: {hint}"
+        );
+        // None/AutoCreate triggers do not produce a suggestion hint.
+        assert!(get_plan_suggestion_prompt(&PlanTrigger::None).is_none());
+    }
 
     #[test]
     fn test_explicit_auto_command() {

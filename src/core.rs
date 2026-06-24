@@ -170,6 +170,15 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     )
     .await?;
 
+    // Requirement-checklist tool: model self-registers the durable per-turn
+    // checklist (backed by plan_store). Its ChannelHub is wired later via
+    // set_hub() once the hub exists (core.rs ordering), like the terminal tool.
+    let mut tools = tools;
+    let track_requirements_tool = Arc::new(
+        crate::tools::track_requirements::TrackRequirementsTool::new(plan_store.clone()),
+    );
+    tools.push(track_requirements_tool.clone());
+
     // 7. Agent (with deferred spawn tool wiring to break the circular dep)
     let skill_names: Vec<String> = if let Some(ref dir) = skills_dir {
         skills::load_skills(dir)
@@ -329,6 +338,12 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         cli_agent_tool,
     )
     .await;
+    // Deferred hub wiring for the requirement-checklist tool (mirrors terminal).
+    track_requirements_tool.set_hub(Arc::downgrade(&hub));
+    // Give the agent its plan_store handle so the completion phase can read the
+    // active checklist for soft verification + recap (deferred to avoid touching
+    // the large Agent::new signature and all subagent spawn call sites).
+    agent.set_plan_store(plan_store.clone()).await;
 
     // Start the heartbeat coordinator now that hub and agent are available.
     start_heartbeat_coordinator(heartbeat_opt, &hub, &agent);
