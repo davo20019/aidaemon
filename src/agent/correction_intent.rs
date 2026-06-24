@@ -107,11 +107,10 @@ pub fn reconstruct_subject_context(
         .unwrap_or_else(|| "(original request unavailable)".to_string());
 
     // Truncate the command if it would make the summary unwieldy.
-    let truncated_command = if failed_command.len() > MAX_COMMAND_CHARS_IN_SUMMARY {
-        format!("{}…", &failed_command[..MAX_COMMAND_CHARS_IN_SUMMARY])
-    } else {
-        failed_command.to_string()
-    };
+    // Use the UTF-8-safe helper so multi-byte chars straddling the byte boundary
+    // don't cause a panic (the systemic bug class documented in utils.rs).
+    let truncated_command =
+        crate::utils::truncate_str(failed_command, MAX_COMMAND_CHARS_IN_SUMMARY);
 
     let completion_contract_summary = format!(
         "Re-attempt the goal behind the failed command `{}` with a faster, scoped approach.",
@@ -329,8 +328,40 @@ mod tests {
             "summary should be reasonably short"
         );
         assert!(
-            ctx.completion_contract_summary.contains('…'),
+            ctx.completion_contract_summary.contains("..."),
             "summary must contain ellipsis when command is truncated"
+        );
+    }
+
+    /// A long command containing multi-byte UTF-8 characters positioned to
+    /// straddle byte 120 must not panic and must produce a non-empty summary.
+    #[test]
+    fn test_reconstruct_multibyte_command_no_panic() {
+        // "find ~ " is 7 bytes; each "日本語" is 9 bytes.
+        // Repeating 50 times gives 457 bytes total — well past the 120-byte limit.
+        // The 3-byte chars straddle the 120-byte boundary, triggering the old
+        // raw-byte-index panic.
+        let multibyte_cmd = "find ~ ".to_string() + &"日本語".repeat(50);
+        assert!(multibyte_cmd.len() > MAX_COMMAND_CHARS_IN_SUMMARY);
+
+        // Must not panic.
+        let ctx = reconstruct_subject_context(
+            &[make_message("user", Some("search for large files"))],
+            "s",
+            "sub",
+            SelfCorrectionSubjectKind::BackgroundCommand,
+            PathBuf::from("/tmp/project"),
+            &multibyte_cmd,
+        );
+
+        // Summary must be non-empty and must contain the truncation marker.
+        assert!(
+            !ctx.completion_contract_summary.is_empty(),
+            "summary must not be empty for multibyte command"
+        );
+        assert!(
+            ctx.completion_contract_summary.contains("..."),
+            "summary must contain ellipsis when multibyte command is truncated"
         );
     }
 
