@@ -268,17 +268,21 @@ pub fn attribute_deliverable(
 
             for sp in script_produced {
                 if !executed_scripts.contains(&sp) {
-                    // Check mtime for script-discovered paths too
-                    if let Some(mtime) = stat_mtime(&sp) {
-                        if mtime >= command_start && mtime <= window_end {
-                            produced_set.insert(sp.clone());
-                        } else {
-                            // literal write-mode open is sufficient evidence even without mtime
+                    // Script text is weak evidence (the open() may be in a comment,
+                    // a dead `if False:` branch, or reference a pre-existing file
+                    // never written this run). Require mtime-in-window confirmation
+                    // before treating it as a produced candidate; otherwise keep it
+                    // as a diagnostic-only hint (NOT auto-send eligible).
+                    match stat_mtime(&sp) {
+                        Some(mtime) if mtime >= command_start && mtime <= window_end => {
                             produced_set.insert(sp);
                         }
-                    } else {
-                        // no mtime info — trust the literal open() call
-                        produced_set.insert(sp);
+                        _ => {
+                            pattern_hints.push(format!(
+                                "unconfirmed write target (no mtime in window): {}",
+                                sp.display()
+                            ));
+                        }
                     }
                 }
             }
@@ -321,12 +325,22 @@ pub fn attribute_deliverable(
 
     // Refine the final produced set so it holds regardless of which signal
     // admitted each path:
-    //  1. Drop bare temp roots (`/tmp`, `/private/tmp`, ...) — a directory whose
+    //  1. Reject any candidate containing a `..` traversal component.
+    //  2. Drop bare temp roots (`/tmp`, `/private/tmp`, ...) — a directory whose
     //     mtime bumped because a child file was written is not the deliverable.
-    //  2. Drop any candidate that is a strict ancestor (prefix) of another
+    //  3. Drop any candidate that is a strict ancestor (prefix) of another
     //     candidate — e.g. `/tmp` when `/tmp/probe_results.txt` is present.
+    //
+    // NOTE: This module only *attributes* candidate paths. The authoritative
+    // sensitive-path blocklist (`/etc`, `~/.ssh`, etc.) lives at the delivery
+    // boundary in `file_delivery::prepare_delivery` / `BLOCKED_PATTERNS`
+    // (consumed by the next task) — we deliberately do not duplicate it here so
+    // there is a single source of truth.
     let all: Vec<PathBuf> = produced_candidates.clone();
     produced_candidates.retain(|p| {
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
+            return false;
+        }
         if is_temp_root(p) {
             return false;
         }
@@ -496,6 +510,70 @@ mod tests {
         assert!(
             matches!(auto_send_decision(&ctx), AutoSendDecision::One(p) if p == std::path::Path::new(out)),
             "expected One({out}), not Ambiguous; got {:?}",
+            ctx.produced_candidates
+        );
+    }
+
+    // --- Temporal-scope security: script-text write targets require an
+    //     mtime-in-window confirmation before becoming produced candidates. ---
+
+    #[test]
+    fn script_write_target_before_window_is_excluded() {
+        // (a) script writes /etc/passwd but its mtime predates the run window.
+        let start = t0();
+        let end = start + Duration::from_secs(40);
+        let read = |_: &std::path::Path| Some("open(\"/etc/passwd\",\"w\")\n".to_string());
+        let stat = |p: &std::path::Path| -> Option<SystemTime> {
+            match p.to_str().unwrap() {
+                "/etc/passwd" => Some(start - Duration::from_secs(86_400)),
+                _ => None,
+            }
+        };
+        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
+        assert!(
+            !ctx.produced_candidates
+                .iter()
+                .any(|p| p == std::path::Path::new("/etc/passwd")),
+            "out-of-window script write target must be excluded; got {:?}",
+            ctx.produced_candidates
+        );
+    }
+
+    #[test]
+    fn script_write_target_without_mtime_is_excluded() {
+        // (b) literal open("/tmp/x.txt","w") but stat returns None.
+        let start = t0();
+        let end = start + Duration::from_secs(40);
+        let read = |_: &std::path::Path| Some("open(\"/tmp/x.txt\",\"w\")\n".to_string());
+        let stat = |_: &std::path::Path| -> Option<SystemTime> { None };
+        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
+        assert!(
+            !ctx.produced_candidates
+                .iter()
+                .any(|p| p == std::path::Path::new("/tmp/x.txt")),
+            "script write target without mtime must be excluded; got {:?}",
+            ctx.produced_candidates
+        );
+    }
+
+    #[test]
+    fn script_write_target_in_dead_code_is_excluded() {
+        // (c) literal in a comment / `if False:` block, never touched (stat None).
+        let start = t0();
+        let end = start + Duration::from_secs(40);
+        let read = |_: &std::path::Path| {
+            Some(
+                "if False:\n    open(\"/tmp/never.txt\",\"w\")\n# open(\"/tmp/never.txt\",\"w\")\n"
+                    .to_string(),
+            )
+        };
+        let stat = |_: &std::path::Path| -> Option<SystemTime> { None };
+        let ctx = attribute_deliverable("s1", "python3 /tmp/p.py", start, end, &[], &read, &stat);
+        assert!(
+            !ctx.produced_candidates
+                .iter()
+                .any(|p| p == std::path::Path::new("/tmp/never.txt")),
+            "never-executed script write target must be excluded; got {:?}",
             ctx.produced_candidates
         );
     }
