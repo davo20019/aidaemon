@@ -123,6 +123,11 @@ pub(super) struct ToolBudgetBlockCtx<'a> {
     pub iteration: usize,
     pub tool_failure_count: &'a HashMap<String, usize>,
     pub tool_transient_failure_count: &'a HashMap<String, usize>,
+    /// Per-(tool, signature) failure counts for the task. Summed per tool to get
+    /// the aggregate failure count, which catches loops where a tool keeps
+    /// failing with *different* error signatures (so the per-signature limit
+    /// never trips) — e.g. send_file retried on varying rejected paths.
+    pub tool_failure_signatures: &'a HashMap<(String, String), usize>,
     pub tool_cooldown_until_iteration: &'a mut HashMap<String, usize>,
     pub tool_call_count: &'a HashMap<String, usize>,
     pub unknown_tools: &'a HashSet<String>,
@@ -145,6 +150,25 @@ pub(super) struct DuplicateSendFileNoopCtx<'a> {
     pub policy_bundle: &'a PolicyBundle,
 }
 
+/// A single tool that has failed this many times in a task (across *any* error
+/// signatures) is considered stuck in a retry loop and is cooled down, even when
+/// each individual signature stays below the per-signature limit. Set above
+/// normal multi-step retry counts so legitimate retry-heavy flows aren't caught.
+const AGGREGATE_TOOL_FAILURE_LIMIT: usize = 6;
+
+/// Sum of all signature-failure counts for `tool` (aggregate failures for the
+/// tool across differing error messages).
+pub(super) fn aggregate_tool_failures(
+    signatures: &HashMap<(String, String), usize>,
+    tool: &str,
+) -> usize {
+    signatures
+        .iter()
+        .filter(|((t, _), _)| t == tool)
+        .map(|(_, c)| *c)
+        .sum()
+}
+
 pub(super) async fn maybe_block_tool_by_budget(
     agent: &Agent,
     tc: &ToolCall,
@@ -159,6 +183,7 @@ pub(super) async fn maybe_block_tool_by_budget(
         .copied()
         .unwrap_or(0);
     let prior_calls = ctx.tool_call_count.get(&tc.name).copied().unwrap_or(0);
+    let aggregate_failures = aggregate_tool_failures(ctx.tool_failure_signatures, &tc.name);
 
     if let Some(until_iteration) = ctx.tool_cooldown_until_iteration.get(&tc.name).copied() {
         if ctx.iteration <= until_iteration {
@@ -216,6 +241,18 @@ pub(super) async fn maybe_block_tool_by_budget(
             ToolResultNotice::SemanticErrorLimitBlocked {
                 tool_name: tc.name.clone(),
                 prior_signature_failures,
+                prior_transient_failures,
+            }
+            .render(),
+        )
+    } else if aggregate_failures >= AGGREGATE_TOOL_FAILURE_LIMIT {
+        // Stuck in a loop: this tool keeps failing with differing error messages
+        // (so the per-signature limit never trips), often interleaved with other
+        // tools' successes (so stall_count keeps resetting). Cool it down.
+        Some(
+            ToolResultNotice::SemanticErrorLimitBlocked {
+                tool_name: tc.name.clone(),
+                prior_signature_failures: aggregate_failures,
                 prior_transient_failures,
             }
             .render(),
@@ -456,6 +493,40 @@ pub(super) async fn maybe_handle_duplicate_send_file_noop(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod aggregate_failure_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_sums_failures_across_differing_signatures() {
+        // The send_file loop: same tool, different error signatures (varying
+        // rejected paths), each below the per-signature limit but summing high.
+        let mut sigs: HashMap<(String, String), usize> = HashMap::new();
+        sigs.insert(("send_file".into(), "outside:/tmp/a".into()), 1);
+        sigs.insert(("send_file".into(), "outside:/tmp/b".into()), 1);
+        sigs.insert(("send_file".into(), "outside:/tmp/c".into()), 1);
+        sigs.insert(("terminal".into(), "exit-1".into()), 2);
+        assert_eq!(aggregate_tool_failures(&sigs, "send_file"), 3);
+        assert_eq!(aggregate_tool_failures(&sigs, "terminal"), 2);
+        assert_eq!(aggregate_tool_failures(&sigs, "read_file"), 0);
+    }
+
+    #[test]
+    fn aggregate_limit_trips_only_at_threshold() {
+        let mut sigs: HashMap<(String, String), usize> = HashMap::new();
+        for i in 0..AGGREGATE_TOOL_FAILURE_LIMIT {
+            sigs.insert(("send_file".into(), format!("sig-{i}")), 1);
+        }
+        assert!(
+            aggregate_tool_failures(&sigs, "send_file") >= AGGREGATE_TOOL_FAILURE_LIMIT,
+            "should reach the aggregate block threshold"
+        );
+        // One fewer is below threshold.
+        sigs.remove(&("send_file".into(), "sig-0".into()));
+        assert!(aggregate_tool_failures(&sigs, "send_file") < AGGREGATE_TOOL_FAILURE_LIMIT);
+    }
 }
 
 #[cfg(test)]

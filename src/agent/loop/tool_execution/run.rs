@@ -920,6 +920,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 iteration,
                 tool_failure_count: &tool_failure_count,
                 tool_transient_failure_count: &tool_transient_failure_count,
+                tool_failure_signatures: &tool_failure_signatures,
                 tool_cooldown_until_iteration: &mut tool_cooldown_until_iteration,
                 tool_call_count: &tool_call_count,
                 unknown_tools: &unknown_tools,
