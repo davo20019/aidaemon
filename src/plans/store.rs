@@ -231,6 +231,55 @@ impl PlanStore {
         Ok(())
     }
 
+    /// Mark exactly one unchecked delivery-style step Completed, only if unambiguous.
+    ///
+    /// A "delivery-style" step is one whose `status` is `Pending` or `InProgress` AND whose
+    /// description (lowercased) contains a delivery verb (`send`, `deliver`, `attach`, `share`)
+    /// AND a file/result noun (`file`, `result`, `report`, `output`, or a file extension like
+    /// `.txt`, `.csv`, `.json`, `.log`, `.zip`, `.pdf`, `.md`, `.yaml`, `.toml`, `.xlsx`).
+    ///
+    /// If exactly one step matches → sets it `Completed` + `completed_at = Utc::now()`, persists
+    /// via `update()`, returns `Ok(true)`.
+    ///
+    /// Otherwise (zero matches, >1 match, or no active plan) → returns `Ok(false)`.
+    /// Never rewrites/regenerates the plan.
+    pub async fn mark_delivery_step_complete(&self, session_id: &str) -> anyhow::Result<bool> {
+        use crate::plans::StepStatus;
+
+        let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
+            return Ok(false);
+        };
+
+        const DELIVERY_VERBS: &[&str] = &["send", "deliver", "attach", "share"];
+        const FILE_NOUNS: &[&str] = &[
+            "file", "result", "report", "output", ".txt", ".csv", ".json", ".log", ".zip", ".pdf",
+            ".md", ".yaml", ".toml", ".xlsx",
+        ];
+
+        let matching_indices: Vec<usize> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| matches!(step.status, StepStatus::Pending | StepStatus::InProgress))
+            .filter(|(_, step)| {
+                let desc = step.description.to_lowercase();
+                DELIVERY_VERBS.iter().any(|v| desc.contains(v))
+                    && FILE_NOUNS.iter().any(|n| desc.contains(n))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if matching_indices.len() != 1 {
+            return Ok(false);
+        }
+
+        let idx = matching_indices[0];
+        plan.steps[idx].status = StepStatus::Completed;
+        plan.steps[idx].completed_at = Some(Utc::now());
+        self.update(&plan).await?;
+        Ok(true)
+    }
+
     /// Link a plan to a task ID from the event store.
     pub async fn set_task_id(&self, plan_id: &str, task_id: &str) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -455,6 +504,55 @@ mod tests {
             .await
             .unwrap();
         PlanStore::new(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn mark_delivery_step_complete_marks_single_unambiguous_item() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        store
+            .upsert_checklist(
+                "s1",
+                None,
+                "test",
+                &[
+                    ("Create the script".into(), StepStatus::Completed),
+                    ("Run it for 40 seconds".into(), StepStatus::Completed),
+                    (
+                        "Send the results file to the user".into(),
+                        StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.mark_delivery_step_complete("s1").await.unwrap());
+        let plan = store
+            .get_incomplete_for_session("s1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.steps[2].status, StepStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn mark_delivery_step_complete_skips_when_ambiguous() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        store
+            .upsert_checklist(
+                "s1",
+                None,
+                "test",
+                &[
+                    ("Send file A".into(), StepStatus::Pending),
+                    ("Send file B".into(), StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(!store.mark_delivery_step_complete("s1").await.unwrap());
     }
 
     #[tokio::test]
