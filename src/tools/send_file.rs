@@ -58,6 +58,19 @@ impl SendFileTool {
         self.outbox_dirs.iter().any(|d| canonical.starts_with(d))
     }
 
+    /// Copy a readable file from outside the allowed dirs into the inbox so it
+    /// can be delivered. Returns the canonical path of the copy. Caller must have
+    /// already run the blocked-pattern check on `src`.
+    fn recover_into_inbox(&self, src: &Path) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(&self.inbox_dir)?;
+        let filename = src
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("file"));
+        let dest = self.inbox_dir.join(filename);
+        std::fs::copy(src, &dest)?;
+        dest.canonicalize()
+    }
+
     fn is_path_blocked(path: &Path) -> bool {
         let path_str = path.to_string_lossy();
         for pattern in BLOCKED_PATTERNS {
@@ -251,22 +264,42 @@ impl Tool for SendFileTool {
         }
 
         // Canonicalize to resolve symlinks and prevent traversal
-        let canonical = path.canonicalize()?;
+        let mut canonical = path.canonicalize()?;
 
-        // Check against allowed directories
-        if !self.is_path_allowed(&canonical) {
-            return Ok(format!(
-                "Error: File is outside allowed directories. Path: {}",
-                file_path
-            ));
-        }
-
-        // Check against blocked patterns
+        // Block sensitive files regardless of location — checked BEFORE any
+        // recovery copy so a blocked file is never copied into the inbox.
         if Self::is_path_blocked(&canonical) {
             return Ok(format!(
                 "Error: Sending this file is blocked for security reasons: {}",
                 file_path
             ));
+        }
+
+        // If the file is outside the allowed directories, auto-recover by copying
+        // it into the inbox dir and sending from there. This makes the common
+        // "create a file in /tmp and send it" flow work without the model looping
+        // on directory-policy errors (the file the user asked for is delivered).
+        let mut recovered_into_inbox = false;
+        if !self.is_path_allowed(&canonical) {
+            match self.recover_into_inbox(&canonical) {
+                Ok(copied) => {
+                    canonical = copied;
+                    recovered_into_inbox = true;
+                }
+                Err(e) => {
+                    return Ok(format!(
+                        "Error: File is outside allowed directories ({}). I tried to copy it into \
+                         the allowed inbox directory {} but that failed: {}. Copy the file into {} \
+                         (e.g. with the terminal tool: cp '{}' '{}/') and send that path instead.",
+                        file_path,
+                        self.inbox_dir.display(),
+                        e,
+                        self.inbox_dir.display(),
+                        canonical.display(),
+                        self.inbox_dir.display(),
+                    ));
+                }
+            }
         }
 
         // Extract filename for display
@@ -303,6 +336,11 @@ impl Tool for SendFileTool {
                 size_display,
                 canonical.display()
             ))
+        } else if recovered_into_inbox {
+            Ok(format!(
+                "File sent: {} ({}) [copied into the inbox for delivery]",
+                filename, size_display
+            ))
         } else {
             Ok(format!("File sent: {} ({})", filename, size_display))
         }
@@ -316,6 +354,66 @@ mod tests {
     fn mk_tool(outboxes: Vec<String>, inbox: String) -> SendFileTool {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         SendFileTool::new(tx, &outboxes, &inbox)
+    }
+
+    #[tokio::test]
+    async fn send_file_recovers_file_outside_allowed_dirs_into_inbox() {
+        // Regression: the model created a file in /tmp (outside allowed dirs) and
+        // send_file rejected it, causing a retry loop. send_file now copies a
+        // readable out-of-dir file into the inbox and delivers it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        let outside = tmp.path().join("external");
+        std::fs::create_dir_all(&outside).expect("create external");
+        let src = outside.join("latency_results.txt");
+        std::fs::write(&src, b"latency data").expect("write src");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+
+        let args = json!({
+            "_session_id": "sess-1",
+            "file_path": src.to_string_lossy(),
+        })
+        .to_string();
+        let out = tool.call(&args).await.expect("call ok");
+        assert!(out.contains("File sent"), "got: {out}");
+        assert!(out.contains("copied into the inbox"), "should note recovery: {out}");
+
+        let msg = rx.try_recv().expect("media message sent");
+        match msg.kind {
+            MediaKind::Document { file_path, .. } => {
+                assert!(file_path.contains("inbox"), "delivered from inbox: {file_path}");
+            }
+            _ => panic!("expected Document media"),
+        }
+        assert!(inbox.join("latency_results.txt").exists(), "copy must land in inbox");
+    }
+
+    #[tokio::test]
+    async fn send_file_blocked_file_is_not_recovered() {
+        // A sensitive file outside allowed dirs must be blocked, never copied in.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        let outside = tmp.path().join("external");
+        std::fs::create_dir_all(&outside).expect("create external");
+        let src = outside.join(".env");
+        std::fs::write(&src, b"SECRET=1").expect("write src");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+
+        let args = json!({
+            "_session_id": "s",
+            "file_path": src.to_string_lossy(),
+        })
+        .to_string();
+        let out = tool.call(&args).await.expect("call ok");
+        assert!(out.contains("blocked for security"), "got: {out}");
+        assert!(
+            !inbox.join(".env").exists(),
+            "blocked file must not be copied into the inbox"
+        );
     }
 
     #[test]
