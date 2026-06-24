@@ -58,9 +58,26 @@ impl SendFileTool {
         self.outbox_dirs.iter().any(|d| canonical.starts_with(d))
     }
 
-    /// Copy a readable file from outside the allowed dirs into the inbox so it
-    /// can be delivered. Returns the canonical path of the copy. Caller must have
-    /// already run the blocked-pattern check on `src`.
+    /// Whether a canonical path is eligible for auto-recovery into the inbox.
+    /// Restricted to system temp roots (the only place agents legitimately write
+    /// scratch output) so recovery cannot become an arbitrary-file exfiltration
+    /// path. Roots are canonicalized so macOS `/tmp` → `/private/tmp` matches.
+    fn is_recoverable_source(canonical: &Path) -> bool {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(t) = std::env::temp_dir().canonicalize() {
+            roots.push(t);
+        }
+        for p in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
+            if let Ok(c) = Path::new(p).canonicalize() {
+                roots.push(c);
+            }
+        }
+        roots.iter().any(|r| canonical.starts_with(r))
+    }
+
+    /// Copy a readable file from a recoverable temp root into the inbox so it can
+    /// be delivered. Returns the canonical path of the copy. Caller must have
+    /// already run the blocked-pattern and `is_recoverable_source` checks on `src`.
     fn recover_into_inbox(&self, src: &Path) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&self.inbox_dir)?;
         let filename = src
@@ -281,6 +298,20 @@ impl Tool for SendFileTool {
         // on directory-policy errors (the file the user asked for is delivered).
         let mut recovered_into_inbox = false;
         if !self.is_path_allowed(&canonical) {
+            // SECURITY: only auto-recover from system temp roots (where agents
+            // legitimately write scratch output). Recovering arbitrary readable
+            // paths would turn the directory allowlist into a denylist and enable
+            // exfiltration of any non-blocked file. Anything outside both the
+            // allowed dirs AND the temp roots is refused with an actionable error.
+            if !Self::is_recoverable_source(&canonical) {
+                return Ok(format!(
+                    "Error: File is outside allowed directories: {}. Only files in the allowed \
+                     output directories or a system temp dir can be sent. Move the file into {} \
+                     and send that path instead.",
+                    file_path,
+                    self.inbox_dir.display(),
+                ));
+            }
             match self.recover_into_inbox(&canonical) {
                 Ok(copied) => {
                     canonical = copied;
@@ -388,6 +419,53 @@ mod tests {
             _ => panic!("expected Document media"),
         }
         assert!(inbox.join("latency_results.txt").exists(), "copy must land in inbox");
+    }
+
+    #[test]
+    fn is_recoverable_source_only_allows_temp_roots() {
+        // A file in the system temp dir is recoverable...
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let in_temp = tmp.path().join("out.txt");
+        std::fs::write(&in_temp, b"x").expect("write");
+        let in_temp = in_temp.canonicalize().expect("canon");
+        assert!(SendFileTool::is_recoverable_source(&in_temp));
+
+        // ...but arbitrary paths outside temp are NOT (no arbitrary exfiltration).
+        assert!(!SendFileTool::is_recoverable_source(Path::new("/etc/hosts")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(!SendFileTool::is_recoverable_source(
+                &home.join("Documents/secret.pdf")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_file_rejects_non_temp_outside_path_without_copying() {
+        // A readable file outside both allowed dirs and temp roots must be
+        // refused with an error and NEVER copied into the inbox.
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return, // can't run meaningfully without a home dir
+        };
+        let inbox = home.join(".aidaemon-test-inbox-reject");
+        let _ = std::fs::remove_dir_all(&inbox);
+        // Source: a real readable file outside temp (the binary's own Cargo.toml).
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let args = json!({
+            "_session_id": "s",
+            "file_path": manifest.to_string_lossy(),
+        })
+        .to_string();
+        let out = tool.call(&args).await.expect("call ok");
+        assert!(out.contains("outside allowed directories"), "got: {out}");
+        assert!(
+            !inbox.join("Cargo.toml").exists(),
+            "non-temp file must not be copied into the inbox"
+        );
+        let _ = std::fs::remove_dir_all(&inbox);
     }
 
     #[tokio::test]
