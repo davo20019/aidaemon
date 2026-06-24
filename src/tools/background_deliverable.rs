@@ -37,16 +37,24 @@ pub enum AutoSendDecision {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Bare temp-directory roots that are never themselves deliverables (their mtime
+/// bumps whenever any child is written).
+fn is_temp_root(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/tmp") | Some("/private/tmp") | Some("/var/tmp") | Some("/private/var/tmp")
+    )
+}
+
 /// Patterns that signal dynamic filename construction — never a concrete path.
 fn is_dynamic_content(text: &str) -> bool {
     let dynamic_patterns = [
         "strftime",
-        "uuid",
         "tempfile.gettempdir",
         "os.path.join",
         "$(",
-        "uuid4()",
-        "uuid1()",
+        "uuid4(",
+        "uuid1(",
     ];
     dynamic_patterns.iter().any(|p| text.contains(p))
 }
@@ -311,6 +319,21 @@ pub fn attribute_deliverable(
     let mut produced_candidates: Vec<PathBuf> = produced_set.into_iter().collect();
     produced_candidates.sort();
 
+    // Refine the final produced set so it holds regardless of which signal
+    // admitted each path:
+    //  1. Drop bare temp roots (`/tmp`, `/private/tmp`, ...) — a directory whose
+    //     mtime bumped because a child file was written is not the deliverable.
+    //  2. Drop any candidate that is a strict ancestor (prefix) of another
+    //     candidate — e.g. `/tmp` when `/tmp/probe_results.txt` is present.
+    let all: Vec<PathBuf> = produced_candidates.clone();
+    produced_candidates.retain(|p| {
+        if is_temp_root(p) {
+            return false;
+        }
+        // Strict ancestor of any other candidate → not the deliverable.
+        !all.iter().any(|other| other != p && other.starts_with(p))
+    });
+
     BackgroundDeliverableContext {
         session_id: session_id.to_string(),
         command: command.to_string(),
@@ -431,6 +454,48 @@ mod tests {
         assert!(
             matches!(auto_send_decision(&ctx), AutoSendDecision::Ambiguous(v) if v.len() == 2),
             "expected Ambiguous(2) but got {:?}",
+            ctx.produced_candidates
+        );
+    }
+
+    #[test]
+    fn parent_dir_mtime_bump_does_not_create_phantom_candidate() {
+        // The OS bumps /tmp's mtime when a child file is written. The temp-root
+        // directory must NOT become a second produced candidate alongside the
+        // real output file.
+        let start = t0();
+        let end = start + Duration::from_secs(40);
+        let script = "/tmp/probe.py";
+        let out = "/tmp/probe_results.txt";
+        let read = |p: &std::path::Path| -> Option<String> {
+            if p == std::path::Path::new(script) {
+                Some("output_path = \"/tmp/probe_results.txt\"\nopen(output_path, \"a\")\n".into())
+            } else {
+                None
+            }
+        };
+        // Both /tmp AND /tmp/probe_results.txt have in-window mtimes; the script
+        // file is before the window.
+        let stat = |p: &std::path::Path| -> Option<SystemTime> {
+            match p.to_str().unwrap() {
+                "/tmp" => Some(start + Duration::from_secs(20)),
+                "/tmp/probe_results.txt" => Some(start + Duration::from_secs(20)),
+                "/tmp/probe.py" => Some(start - Duration::from_secs(10)),
+                _ => None,
+            }
+        };
+        let ctx = attribute_deliverable(
+            "s1",
+            "cd /tmp && python3 /tmp/probe.py",
+            start,
+            end,
+            &[],
+            &read,
+            &stat,
+        );
+        assert!(
+            matches!(auto_send_decision(&ctx), AutoSendDecision::One(p) if p == std::path::Path::new(out)),
+            "expected One({out}), not Ambiguous; got {:?}",
             ctx.produced_candidates
         );
     }
