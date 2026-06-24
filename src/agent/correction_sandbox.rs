@@ -851,28 +851,37 @@ fn is_correction_safe_local_command(
         if base_cmd == "du" {
             return Err(format!(
                 "`du` is not permitted in correction mode (it recursively sizes \
-                 directories and is slow). To find large files use `find {} -type f \
-                 -size +500M -exec ls -lh {{}} +` instead.",
+                 directories and is slow). To find large files use \
+                 `find {} -type f -size +1G -printf '%s\\t%p\\n'` (lists \
+                 \"<bytes>\\t<path>\" per file; pick the largest) instead.",
                 working_dir.display()
             ));
         }
         return Err(format!(
             "command '{}' is not in the correction-mode read-only allowlist \
              (allowed: pwd, ls, cat, head, tail, wc, grep, rg, find). To find large \
-             files use `find {} -type f -size +500M -exec ls -lh {{}} +` instead.",
+             files use `find {} -type f -size +1G -printf '%s\\t%p\\n'` (lists \
+             \"<bytes>\\t<path>\" per file; pick the largest) instead.",
             base_cmd,
             working_dir.display()
         ));
     }
 
-    // `find` must not use -exec, -delete, -ok, -printf, -fprintf, -fls, -fprint,
+    // `find` must not use -exec, -delete, -ok, -fprintf, -fls, -fprint,
     // and must not scan broad/out-of-scope roots (I1 + I2).
+    //
+    // Note on `-printf` vs `-fprintf`/`-fls`/`-fprint`: `-printf FORMAT` only
+    // prints file METADATA (size/path/times) to STDOUT — it is read-only and
+    // strictly less powerful than the already-allowed `cat`, so it is ALLOWED.
+    // The file-WRITING variants `-fprintf FILE`/`-fls FILE`/`-fprint FILE`
+    // redirect that output into a file, so they remain BLOCKED. `-exec`/`-ok`
+    // execute commands and `-delete` removes files, so they remain BLOCKED too.
     if base_cmd == "find" {
-        // I2: reject file-writing find actions.
+        // I2: reject file-writing / executing / deleting find actions.
         for token in cmd.split_whitespace() {
             if matches!(
                 token,
-                "-exec" | "-delete" | "-ok" | "-printf" | "-fprintf" | "-fls" | "-fprint"
+                "-exec" | "-delete" | "-ok" | "-fprintf" | "-fls" | "-fprint"
             ) {
                 return Err(format!(
                     "find with '{}' is not allowed in correction mode",
@@ -2051,6 +2060,76 @@ mod tests {
     }
 
     #[test]
+    fn test_find_printf_is_allowed() {
+        // `-printf FORMAT` prints file METADATA to stdout (read-only) — it must
+        // be Allowed. This is the exact worked-example form embedded in the
+        // remediation hints/prompt; it MUST classify as Allowed so a model
+        // copying the example is not blocked again.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find /tmp/test-workdir -type f -size +1G -printf '%s\\t%p\\n'"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]); // working_dir = /tmp/test-workdir
+        assert_eq!(
+            classify_action(&a, &ctx),
+            ActionVerdict::Allowed,
+            "find -printf (read-only stdout metadata) must be Allowed"
+        );
+    }
+
+    #[test]
+    fn test_find_fprintf_still_blocked() {
+        // The file-WRITING variant `-fprintf FILE` must remain Blocked even
+        // though the read-only `-printf` is now allowed (distinct tokens).
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find . -fprintf /tmp/x %p"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "find -fprintf (writes to a file) must stay Blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_exec_still_blocked() {
+        // `-exec` executes commands — must remain Blocked.
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find . -type f -exec ls {} +"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "find -exec must stay Blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_delete_still_blocked() {
+        // `-delete` removes files — must remain Blocked (and is also a hard
+        // destructive block at the risk layer for the whole-disk root).
+        let a = extract_proposed_action(
+            "terminal",
+            r#"{"command":"find / -delete"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let ctx = ctx_with(vec![]);
+        assert!(
+            matches!(classify_action(&a, &ctx), ActionVerdict::Blocked(_)),
+            "find -delete must stay Blocked"
+        );
+    }
+
+    #[test]
     fn test_find_scoped_allowed() {
         // find within working_dir with no dangerous actions → Allowed
         let a = extract_proposed_action(
@@ -2690,6 +2769,36 @@ mod tests {
         assert!(
             reason.contains("find") && reason.contains("-size"),
             "disallowed-command reason must suggest the `find … -size` form: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_block_reason_hints_use_printf_not_exec() {
+        // The worked-example in the block reasons must use the Allowed
+        // `-printf` form, NOT the (blocked) `-exec ls -lh {} +` form, so a
+        // model copying the hint is not blocked again.
+        let du = extract_proposed_action(
+            "terminal",
+            r#"{"command":"du -sh /tmp/test-workdir"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let du_reason = blocked_reason(&du, &ctx_with(vec![]));
+        assert!(
+            du_reason.contains("-printf") && !du_reason.contains("-exec"),
+            "du hint must use -printf and not -exec: {du_reason}"
+        );
+
+        let other = extract_proposed_action(
+            "terminal",
+            r#"{"command":"stat /tmp/test-workdir/file"}"#,
+            Some(&read_only_caps()),
+            None,
+        );
+        let other_reason = blocked_reason(&other, &ctx_with(vec![]));
+        assert!(
+            other_reason.contains("-printf") && !other_reason.contains("-exec"),
+            "allowlist hint must use -printf and not -exec: {other_reason}"
         );
     }
 

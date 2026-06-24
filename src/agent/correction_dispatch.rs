@@ -115,8 +115,10 @@ fn build_remediation_prompt(
          `~`, `$HOME`, or `~/*`; shorthand home references and unbounded root scans \
          are rejected by the safety sandbox and will fail. Deliver the answer.\n\
          Example of an allowed command for this goal: \
-         `find {scope} -type f -size +500M -exec ls -lh {{}} +` — adapt the size \
-         threshold and directory as needed."
+         `find {scope} -type f -size +1G -printf '%s\\t%p\\n'` — this lists \
+         \"<bytes>\\t<path>\" for each file over the threshold; read the output \
+         and pick the largest. Adapt the size threshold and directory as needed. \
+         (Pipes and `-exec` are blocked in correction mode, so do not use them.)"
     )
 }
 
@@ -375,6 +377,32 @@ mod tests {
         assert!(
             prompt.contains(&format!("find {scope} -type f -size")),
             "example command must use the scope dir as the find root: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_remediation_prompt_example_uses_printf_not_exec() {
+        // The worked example must use the Allowed `-printf` form, NOT the
+        // (blocked) `-exec ls -lh {} +` form, so a model copying it is not
+        // blocked again by the correction sandbox.
+        let scope = "/Users/synthetic/Documents";
+        let prompt = build_remediation_prompt(
+            "what's the biggest file?",
+            "du -sh ~",
+            120,
+            std::path::Path::new(scope),
+        );
+        assert!(
+            prompt.contains("-printf"),
+            "prompt example must use -printf: {prompt}"
+        );
+        assert!(
+            !prompt.contains("-exec ls"),
+            "prompt example must not use the blocked -exec form: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("find {scope} -type f -size +1G -printf")),
+            "example must be the scoped -printf form: {prompt}"
         );
     }
 
