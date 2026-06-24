@@ -42,29 +42,90 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
 /// Prevents notification spam for long-running processes (servers, daemons).
 const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 
-/// A disowned background process (notifier-active, non-detached) that produces
-/// no new output for this long is treated as hung and auto-stopped by the
-/// heartbeat reaper. Sized well above the notifier's still-running re-engagement
-/// (~105s) so a genuinely-progressing-but-quiet command gets a fair chance.
-/// The observed failure: a whole-disk `du -ah ~ | sort | head` that emitted zero
-/// bytes and ran for ~11 hours without exiting. Detached processes (dev servers
-/// started with `detach=true`) are exempt, and any process that keeps streaming
-/// output is never reaped because each new byte resets its idle clock.
+/// A disowned background process (notifier-active, non-detached) that makes no
+/// progress (no CPU time, disk I/O, or output growth) for this long is treated
+/// as stalled and auto-stopped by the heartbeat reaper. Default fallback for the
+/// stall threshold when config is absent. The observed failure: a whole-disk
+/// `du -ah ~ | sort | head` that emitted zero bytes and ran for ~11 hours
+/// without exiting. Detached processes (dev servers started with `detach=true`)
+/// are exempt, and any process that is genuinely working — advancing CPU time,
+/// statting files (disk I/O), or streaming output — resets its progress clock
+/// and is never reaped on the stall path.
 pub const BACKGROUND_IDLE_REAP_SECS: u64 = 300;
+
+/// Default maximum total runtime (seconds) for a notifier-active background
+/// process, regardless of progress. Backstop for busy-loops (high CPU, no useful
+/// progress) and genuinely-too-slow commands that would otherwise run forever.
+/// 20 minutes. Used as the fallback when config is absent.
+pub const BACKGROUND_MAX_RUNTIME_SECS: u64 = 1200;
+
+/// Why a background process was reaped — drives the user-facing wording and the
+/// `terminate_running_process` reason string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapReason {
+    /// No CPU/disk/output progress for the stall threshold.
+    Stalled,
+    /// Total runtime hit the max-runtime backstop (busy-loop / too-slow).
+    MaxRuntime,
+}
+
+impl ReapReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReapReason::Stalled => "stalled",
+            ReapReason::MaxRuntime => "max_runtime",
+        }
+    }
+    fn terminate_reason(self) -> &'static str {
+        match self {
+            ReapReason::Stalled => "idle: no progress",
+            ReapReason::MaxRuntime => "idle: max runtime",
+        }
+    }
+}
+
+/// Cross-platform progress signal for one sweep. A process is "making progress"
+/// if ANY of its cumulative CPU time, cumulative disk I/O bytes, or output bytes
+/// grew since the last sweep. Pure + injectable so the policy is unit-testable
+/// without spawning real processes or sampling the OS.
+///
+/// `*_now` values that could not be sampled (process gone / OS denied the stat)
+/// MUST be passed as the previous value (no change) by the caller, so a missing
+/// signal simply contributes nothing rather than being mistaken for progress.
+fn process_made_progress(
+    cpu_ms_prev: u64,
+    cpu_ms_now: u64,
+    io_bytes_prev: u64,
+    io_bytes_now: u64,
+    output_len_prev: usize,
+    output_len_now: usize,
+) -> bool {
+    cpu_ms_now > cpu_ms_prev || io_bytes_now > io_bytes_prev || output_len_now > output_len_prev
+}
 
 /// Pure decision: should a tracked background process be idle-reaped?
 ///
-/// Reaped only when it is notifier-active (the user was promised a result),
-/// not detached (detached = "survives, requires explicit kill"), and its output
-/// has not grown for at least `threshold`. Kept as a free function so the policy
-/// is unit-testable without spawning real processes.
+/// Reaped only when it is notifier-active (the user was promised a result) and
+/// not detached (detached = "survives, requires explicit kill"), AND either:
+///   - it has made no progress (no CPU/IO/output advance) for at least
+///     `stall_threshold` — truly stalled; or
+///   - its total runtime has reached `max_runtime` — busy-loop / too-slow
+///     backstop, fired even if it is technically "making progress".
+///
+/// Kept as a free function so the policy is unit-testable without spawning real
+/// processes.
 fn should_idle_reap(
     notifier_active: bool,
     detached: bool,
-    idle: Duration,
-    threshold: Duration,
+    no_progress_elapsed: Duration,
+    total_runtime: Duration,
+    stall_threshold: Duration,
+    max_runtime: Duration,
 ) -> bool {
-    notifier_active && !detached && idle >= threshold
+    if !notifier_active || detached {
+        return false;
+    }
+    no_progress_elapsed >= stall_threshold || total_runtime >= max_runtime
 }
 
 /// A request sent to the ChannelHub for command approval.
@@ -107,12 +168,20 @@ struct RunningProcess {
     notify_session_id: String,
     notify_goal_id: String,
     /// Idle-reap bookkeeping: total output bytes observed at the last sweep and
-    /// the instant that count last grew. A notifier-active, non-detached process
-    /// whose output stops growing for [`BACKGROUND_IDLE_REAP_SECS`] is treated as
-    /// hung (e.g. a whole-disk `du`/`find` scan) and stopped by the heartbeat
-    /// reaper. Streaming processes keep resetting `last_progress_at` and survive.
+    /// the instant ANY progress signal last advanced. A notifier-active,
+    /// non-detached process that makes no progress (no CPU time, disk I/O, or
+    /// output growth) for the stall threshold is treated as hung (e.g. a
+    /// whole-disk `du`/`find` scan) and stopped by the heartbeat reaper.
+    /// Genuinely-working processes keep resetting `last_progress_at` and survive
+    /// the stall path; the max-runtime backstop still catches busy-loops.
     last_progress_len: usize,
     last_progress_at: Instant,
+    /// Cumulative CPU time (ms) observed at the last sweep. Advancing CPU time is
+    /// progress even when the process is silent (a busy scan statting files).
+    last_cpu_ms: u64,
+    /// Cumulative disk read+written bytes observed at the last sweep. Advancing
+    /// disk I/O is progress even when the process is silent.
+    last_io_bytes: u64,
 }
 
 /// Finalized background process output retained briefly so `action="check"`
@@ -132,6 +201,7 @@ struct CompletedProcess {
 const MAX_REENGAGEMENTS_PER_WINDOW: usize = 3;
 /// Sliding window for the re-engagement cap.
 const REENGAGE_WINDOW: Duration = Duration::from_secs(600);
+const BACKGROUND_DELIVERY_DEDUPE_WINDOW: Duration = Duration::from_secs(600);
 
 /// Sliding-window limiter for background-completion agent re-engagements.
 /// Records `now` and returns `true` when the session still has budget;
@@ -152,6 +222,31 @@ fn reengagement_allowed(
         return false;
     }
     entries.push_back(now);
+    true
+}
+
+fn normalize_background_delivery_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn background_delivery_allowed(
+    log: &mut HashMap<String, HashMap<String, Instant>>,
+    session_id: &str,
+    text: &str,
+    now: Instant,
+) -> bool {
+    let normalized = normalize_background_delivery_text(text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let entries = log.entry(session_id.to_string()).or_default();
+    entries.retain(|_, sent_at| now.duration_since(*sent_at) < BACKGROUND_DELIVERY_DEDUPE_WINDOW);
+    if entries.contains_key(&normalized) {
+        return false;
+    }
+
+    entries.insert(normalized, now);
     true
 }
 
@@ -180,6 +275,7 @@ pub struct TerminalTool {
     /// Per-session timestamps of recent background-completion re-engagements,
     /// used by [`reengagement_allowed`] to cap runaway re-engagement loops.
     reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
+    recent_background_deliveries: Arc<Mutex<HashMap<String, HashMap<String, Instant>>>>,
     /// Self-correction bridge config. Consulted by the idle-reaper: when a hung
     /// background command is stopped, this config decides whether an autonomous
     /// remediation task is dispatched (live), shadow-logged, or skipped
@@ -887,6 +983,7 @@ impl TerminalTool {
             hub: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
+            recent_background_deliveries: Arc::new(Mutex::new(HashMap::new())),
             self_correction: SelfCorrectionConfig::default(),
         }
     }
@@ -1722,7 +1819,62 @@ impl TerminalTool {
     /// still streaming output keeps resetting its idle clock and is never reaped;
     /// detached processes (dev servers) are exempt entirely. Returns the number of
     /// processes stopped.
-    pub async fn reap_stale_background_processes(&self, idle_threshold: Duration) -> usize {
+    ///
+    /// Convenience wrapper around [`Self::reap_stale_background_processes_with`]
+    /// that uses the default max-runtime backstop ([`BACKGROUND_MAX_RUNTIME_SECS`]).
+    /// Production wiring (core.rs) calls the two-arg form so both knobs come from
+    /// config; this single-arg form is retained for tests that only exercise the
+    /// stall path.
+    #[cfg(test)]
+    pub async fn reap_stale_background_processes(&self, stall_threshold: Duration) -> usize {
+        self.reap_stale_background_processes_with(
+            stall_threshold,
+            Duration::from_secs(BACKGROUND_MAX_RUNTIME_SECS),
+        )
+        .await
+    }
+
+    /// Sample cumulative (CPU-ms, disk-IO-bytes) for each pid via `sysinfo`.
+    ///
+    /// Cross-platform: `sysinfo` covers macOS/Linux/Windows, so there are no
+    /// per-OS `cfg` blocks. A pid that has exited (or that the OS won't stat)
+    /// simply has no map entry — the caller treats a missing sample as "no
+    /// progress signal from CPU/IO" and falls back to output-based progress.
+    /// Refreshes only the tracked pids (cheap: a handful every 60s).
+    fn sample_process_resources(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        if pids.is_empty() {
+            return HashMap::new();
+        }
+        let sys_pids: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&sys_pids),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_disk_usage(),
+        );
+
+        let mut out = HashMap::with_capacity(pids.len());
+        for pid in pids {
+            if let Some(proc) = sys.process(Pid::from_u32(*pid)) {
+                let cpu_ms = proc.accumulated_cpu_time();
+                let du = proc.disk_usage();
+                let io_bytes = du.total_read_bytes.saturating_add(du.total_written_bytes);
+                out.insert(*pid, (cpu_ms, io_bytes));
+            }
+        }
+        out
+    }
+
+    /// Stall + max-runtime variant. `stall_threshold`: reap after no
+    /// progress (CPU/IO/output) for this long. `max_runtime`: reap regardless of
+    /// progress once total runtime reaches this (busy-loop / too-slow backstop).
+    pub async fn reap_stale_background_processes_with(
+        &self,
+        stall_threshold: Duration,
+        max_runtime: Duration,
+    ) -> usize {
         // Phase 1: snapshot eligible candidates under the `running` lock. Clone the
         // buffer Arcs so Phase 2 can measure output WITHOUT holding `running`
         // (lock-order discipline: never hold `running` while locking a buffer).
@@ -1732,6 +1884,9 @@ impl TerminalTool {
             stderr_buf: Arc<Mutex<Vec<u8>>>,
             last_progress_len: usize,
             last_progress_at: Instant,
+            last_cpu_ms: u64,
+            last_io_bytes: u64,
+            started_at: Instant,
         }
         let candidates: Vec<Candidate> = {
             let running = self.running.lock().await;
@@ -1744,6 +1899,9 @@ impl TerminalTool {
                     stderr_buf: p.stderr_buf.clone(),
                     last_progress_len: p.last_progress_len,
                     last_progress_at: p.last_progress_at,
+                    last_cpu_ms: p.last_cpu_ms,
+                    last_io_bytes: p.last_io_bytes,
+                    started_at: p.started_at,
                 })
                 .collect()
         };
@@ -1751,26 +1909,73 @@ impl TerminalTool {
             return 0;
         }
 
-        // Phase 2: measure current output (no `running` lock held). Growing output
-        // refreshes the idle clock; quiescent output past the threshold is stale.
-        let mut to_grow: Vec<(u32, usize)> = Vec::new();
-        let mut to_reap: Vec<u32> = Vec::new();
+        // Phase 2: sample resources + output (no `running` lock held). A process
+        // is "making progress" if ANY of CPU time / disk I/O / output grew; that
+        // refreshes its progress clock. A process making no progress past the
+        // stall threshold — OR any process whose total runtime hit max_runtime —
+        // is reaped (max-runtime is the busy-loop / too-slow backstop).
+        let pids: Vec<u32> = candidates.iter().map(|c| c.pid).collect();
+        let samples = Self::sample_process_resources(&pids);
+
+        // Updates for processes that made progress: (pid, output_len, cpu_ms, io_bytes).
+        let mut to_grow: Vec<(u32, usize, u64, u64)> = Vec::new();
+        let mut to_reap: Vec<(u32, ReapReason)> = Vec::new();
         for c in candidates {
             let len = c.stdout_buf.lock().await.len() + c.stderr_buf.lock().await.len();
-            if len > c.last_progress_len {
-                to_grow.push((c.pid, len));
-            } else if should_idle_reap(true, false, c.last_progress_at.elapsed(), idle_threshold) {
-                to_reap.push(c.pid);
+            // Missing sample (process gone / OS denied) → carry previous values
+            // forward so a missing CPU/IO signal contributes nothing and we fall
+            // back to output-based progress only.
+            let (cpu_ms, io_bytes) = samples
+                .get(&c.pid)
+                .copied()
+                .unwrap_or((c.last_cpu_ms, c.last_io_bytes));
+
+            let made_progress = process_made_progress(
+                c.last_cpu_ms,
+                cpu_ms,
+                c.last_io_bytes,
+                io_bytes,
+                c.last_progress_len,
+                len,
+            );
+
+            let total_runtime = c.started_at.elapsed();
+            let no_progress_elapsed = if made_progress {
+                Duration::ZERO
+            } else {
+                c.last_progress_at.elapsed()
+            };
+
+            if should_idle_reap(
+                true,
+                false,
+                no_progress_elapsed,
+                total_runtime,
+                stall_threshold,
+                max_runtime,
+            ) {
+                let reason =
+                    if total_runtime >= max_runtime && no_progress_elapsed < stall_threshold {
+                        ReapReason::MaxRuntime
+                    } else {
+                        ReapReason::Stalled
+                    };
+                to_reap.push((c.pid, reason));
+            } else if made_progress {
+                // Refresh bookkeeping for a genuinely-working process.
+                to_grow.push((c.pid, len, cpu_ms, io_bytes));
             }
         }
 
-        // Phase 3a: refresh idle bookkeeping for processes that produced new output.
+        // Phase 3a: refresh progress bookkeeping for processes that advanced.
         if !to_grow.is_empty() {
             let now = Instant::now();
             let mut running = self.running.lock().await;
-            for (pid, len) in to_grow {
+            for (pid, len, cpu_ms, io_bytes) in to_grow {
                 if let Some(proc) = running.get_mut(&pid) {
                     proc.last_progress_len = len;
+                    proc.last_cpu_ms = cpu_ms;
+                    proc.last_io_bytes = io_bytes;
                     proc.last_progress_at = now;
                 }
             }
@@ -1780,7 +1985,7 @@ impl TerminalTool {
         // drop indexes, notify the user (the notifier is suppressed by
         // `terminate_running_process`, so the reaper owns delivery), then terminate.
         let mut reaped = 0usize;
-        for pid in to_reap {
+        for (pid, reason) in to_reap {
             let proc = {
                 let mut running = self.running.lock().await;
                 running.remove(&pid)
@@ -1797,17 +2002,22 @@ impl TerminalTool {
             // needs the untruncated command and the task scope.
             let proc_command = proc.command.clone();
             let owner_task_id = proc.owner_task_id.clone();
+            // For the stall path, idle_secs = time since last progress. For the
+            // max-runtime path, the meaningful number is total runtime.
             let idle_secs = proc.last_progress_at.elapsed().as_secs();
+            let runtime_secs = proc.started_at.elapsed().as_secs();
 
             warn!(
                 pid,
                 command = %proc.command,
                 idle_secs,
-                "Idle-reaping hung background process (no new output past threshold)"
+                runtime_secs,
+                reason = reason.as_str(),
+                "Idle-reaping background process (no CPU/disk/output progress, or max runtime reached)"
             );
 
             if let Err(e) = self
-                .terminate_running_process(pid, proc, "idle: no output")
+                .terminate_running_process(pid, proc, reason.terminate_reason())
                 .await
             {
                 warn!(pid, error = %e, "Failed to terminate idle background process");
@@ -1824,32 +2034,60 @@ impl TerminalTool {
                 // existing notification). When correction is off/unsafe/shadow,
                 // this is a no-op and the message below is byte-identical to
                 // today.
+                // The elapsed figure handed to the correction bridge: time-since-
+                // progress for a stall, total runtime for the max-runtime backstop.
+                let reason_secs = match reason {
+                    ReapReason::Stalled => idle_secs,
+                    ReapReason::MaxRuntime => runtime_secs,
+                };
                 let remediating = self
                     .try_dispatch_idle_reap_remediation(
                         &proc_command,
                         &session_id,
                         owner_task_id.as_deref(),
-                        idle_secs,
+                        reason_secs,
                     )
                     .await;
 
+                // Reason-specific phrasing. Both keep the existing "stopped a
+                // background command" / scoping-guidance shape so the user always
+                // gets actionable next steps.
                 let message = if remediating {
-                    format!(
-                        "⚠️ That background command was taking too long with no results \
-                         (no output for {}): `{}`. I'm retrying this a different way — \
-                         I'll follow up with the result.",
-                        humanize_elapsed(idle_secs),
-                        command_summary
-                    )
+                    match reason {
+                        ReapReason::Stalled => format!(
+                            "⚠️ That background command stopped making progress \
+                             (no CPU/disk activity for {}): `{}`. I'm retrying this a \
+                             different way — I'll follow up with the result.",
+                            humanize_elapsed(idle_secs),
+                            command_summary
+                        ),
+                        ReapReason::MaxRuntime => format!(
+                            "⚠️ That background command ran for over {} without finishing: \
+                             `{}`. I'm retrying this a different way — I'll follow up with \
+                             the result.",
+                            humanize_elapsed(runtime_secs),
+                            command_summary
+                        ),
+                    }
                 } else {
-                    format!(
-                        "⚠️ I stopped a background command that was taking too long with no results \
-                         (no output for {}): `{}`. Whole-disk scans are very slow — if you still \
-                         need this, try narrowing the search (a specific folder, a size filter, or a \
-                         depth limit).",
-                        humanize_elapsed(idle_secs),
-                        command_summary
-                    )
+                    match reason {
+                        ReapReason::Stalled => format!(
+                            "⚠️ I stopped a background command because it stopped making \
+                             progress (no CPU/disk activity for {}): `{}`. Whole-disk scans \
+                             are very slow — if you still need this, try narrowing the search \
+                             (a specific folder, a size filter, or a depth limit).",
+                            humanize_elapsed(idle_secs),
+                            command_summary
+                        ),
+                        ReapReason::MaxRuntime => format!(
+                            "⚠️ I stopped a background command because it ran for over {} \
+                             without finishing: `{}`. Whole-disk scans are very slow — if you \
+                             still need this, try narrowing the search (a specific folder, a \
+                             size filter, or a depth limit).",
+                            humanize_elapsed(runtime_secs),
+                            command_summary
+                        ),
+                    }
                 };
                 let mut delivered = false;
                 if let Some(hub) = self.get_hub() {
@@ -2025,6 +2263,8 @@ impl TerminalTool {
                     notify_goal_id: notify_goal_id.unwrap_or("").to_string(),
                     last_progress_len: 0,
                     last_progress_at: Instant::now(),
+                    last_cpu_ms: 0,
+                    last_io_bytes: 0,
                 };
 
                 self.running.lock().await.insert(pid, proc);
@@ -2045,6 +2285,8 @@ impl TerminalTool {
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 let reengagements_for_notify = self.reengagements.clone();
+                let recent_background_deliveries_for_notify =
+                    self.recent_background_deliveries.clone();
                 // Cloned for the notifier task so it can remove the finished process
                 // from `running` (and its indexes) after delivery, preventing the
                 // idle-reaper from sending a contradictory "stopped, no results" message
@@ -2571,38 +2813,57 @@ impl TerminalTool {
                                         crate::tools::sanitize::sanitize_user_facing_reply(
                                             &message,
                                         );
-                                    let mut delivered = false;
-                                    if let Some(ref hub) = hub_for_notify {
-                                        if let Err(e) =
-                                            hub.send_text(&session_for_notify, &message).await
-                                        {
-                                            warn!(
-                                                pid,
-                                                error = %e,
-                                                session_id = %session_for_notify,
-                                                "Failed to deliver short background command output"
-                                            );
-                                        } else {
-                                            delivered = true;
-                                        }
-                                    }
-                                    if !delivered {
-                                        if let Some(ref state) = state_for_notify {
-                                            let entry = crate::traits::NotificationEntry::new(
-                                                &goal_id_for_notify,
-                                                &session_for_notify,
-                                                "progress",
-                                                &message,
-                                            );
-                                            if let Err(e) = state.enqueue_notification(&entry).await
+                                    let delivery_allowed = {
+                                        let mut log =
+                                            recent_background_deliveries_for_notify.lock().await;
+                                        background_delivery_allowed(
+                                            &mut log,
+                                            &session_for_notify,
+                                            &message,
+                                            Instant::now(),
+                                        )
+                                    };
+                                    if !delivery_allowed {
+                                        info!(
+                                            pid,
+                                            session_id = %session_for_notify,
+                                            "Suppressed duplicate short background command output"
+                                        );
+                                    } else {
+                                        let mut delivered = false;
+                                        if let Some(ref hub) = hub_for_notify {
+                                            if let Err(e) =
+                                                hub.send_text(&session_for_notify, &message).await
                                             {
                                                 warn!(
                                                     pid,
                                                     error = %e,
                                                     session_id = %session_for_notify,
-                                                    goal_id = %goal_id_for_notify,
-                                                    "Failed to enqueue short background command output"
+                                                    "Failed to deliver short background command output"
                                                 );
+                                            } else {
+                                                delivered = true;
+                                            }
+                                        }
+                                        if !delivered {
+                                            if let Some(ref state) = state_for_notify {
+                                                let entry = crate::traits::NotificationEntry::new(
+                                                    &goal_id_for_notify,
+                                                    &session_for_notify,
+                                                    "progress",
+                                                    &message,
+                                                );
+                                                if let Err(e) =
+                                                    state.enqueue_notification(&entry).await
+                                                {
+                                                    warn!(
+                                                        pid,
+                                                        error = %e,
+                                                        session_id = %session_for_notify,
+                                                        goal_id = %goal_id_for_notify,
+                                                        "Failed to enqueue short background command output"
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -2667,7 +2928,26 @@ impl TerminalTool {
                                             Ok(reply) => {
                                                 // Send the agent's analysis to the user
                                                 if !reply.trim().is_empty() {
-                                                    if let Some(ref hub) = hub_for_notify {
+                                                    let delivery_allowed = {
+                                                        let mut log =
+                                                            recent_background_deliveries_for_notify
+                                                                .lock()
+                                                                .await;
+                                                        background_delivery_allowed(
+                                                            &mut log,
+                                                            &session_for_notify,
+                                                            &reply,
+                                                            Instant::now(),
+                                                        )
+                                                    };
+                                                    if !delivery_allowed {
+                                                        formatted_delivered = true;
+                                                        info!(
+                                                            pid,
+                                                            session_id = %session_for_notify,
+                                                            "Suppressed duplicate agent follow-up for background command"
+                                                        );
+                                                    } else if let Some(ref hub) = hub_for_notify {
                                                         match hub
                                                             .send_text(&session_for_notify, &reply)
                                                             .await
@@ -2700,39 +2980,60 @@ impl TerminalTool {
                                             "Output from `{}`:\n\n```\n{}\n```",
                                             command_summary, output
                                         );
-                                        let mut delivered = false;
-                                        if let Some(ref hub) = hub_for_notify {
-                                            if let Err(e) =
-                                                hub.send_text(&session_for_notify, &fallback).await
-                                            {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    session_id = %session_for_notify,
-                                                    "Failed to deliver fallback background command output"
-                                                );
-                                            } else {
-                                                delivered = true;
-                                            }
-                                        }
-                                        if !delivered {
-                                            if let Some(ref state) = state_for_notify {
-                                                let entry = crate::traits::NotificationEntry::new(
-                                                    &goal_id_for_notify,
-                                                    &session_for_notify,
-                                                    "progress",
-                                                    &fallback,
-                                                );
-                                                if let Err(e) =
-                                                    state.enqueue_notification(&entry).await
+                                        let delivery_allowed = {
+                                            let mut log = recent_background_deliveries_for_notify
+                                                .lock()
+                                                .await;
+                                            background_delivery_allowed(
+                                                &mut log,
+                                                &session_for_notify,
+                                                &fallback,
+                                                Instant::now(),
+                                            )
+                                        };
+                                        if !delivery_allowed {
+                                            info!(
+                                                pid,
+                                                session_id = %session_for_notify,
+                                                "Suppressed duplicate fallback background command output"
+                                            );
+                                        } else {
+                                            let mut delivered = false;
+                                            if let Some(ref hub) = hub_for_notify {
+                                                if let Err(e) = hub
+                                                    .send_text(&session_for_notify, &fallback)
+                                                    .await
                                                 {
                                                     warn!(
                                                         pid,
                                                         error = %e,
                                                         session_id = %session_for_notify,
-                                                        goal_id = %goal_id_for_notify,
-                                                        "Failed to enqueue fallback background command output"
+                                                        "Failed to deliver fallback background command output"
                                                     );
+                                                } else {
+                                                    delivered = true;
+                                                }
+                                            }
+                                            if !delivered {
+                                                if let Some(ref state) = state_for_notify {
+                                                    let entry =
+                                                        crate::traits::NotificationEntry::new(
+                                                            &goal_id_for_notify,
+                                                            &session_for_notify,
+                                                            "progress",
+                                                            &fallback,
+                                                        );
+                                                    if let Err(e) =
+                                                        state.enqueue_notification(&entry).await
+                                                    {
+                                                        warn!(
+                                                            pid,
+                                                            error = %e,
+                                                            session_id = %session_for_notify,
+                                                            goal_id = %goal_id_for_notify,
+                                                            "Failed to enqueue fallback background command output"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -4293,42 +4594,89 @@ mod tests {
 
     #[test]
     fn test_should_idle_reap_policy() {
-        let threshold = Duration::from_secs(300);
-        // Notifier-active, non-detached, past threshold → reap.
+        let stall = Duration::from_secs(120);
+        let max_runtime = Duration::from_secs(1200);
+        let no = Duration::ZERO;
+
+        // No progress past the stall threshold (well under max runtime) → reap.
         assert!(should_idle_reap(
             true,
             false,
-            Duration::from_secs(301),
-            threshold
+            Duration::from_secs(121),
+            Duration::from_secs(200),
+            stall,
+            max_runtime,
         ));
-        // Exactly at threshold → reap (>=).
+        // Exactly at the stall threshold → reap (>=).
         assert!(should_idle_reap(
             true,
             false,
-            Duration::from_secs(300),
-            threshold
+            Duration::from_secs(120),
+            Duration::from_secs(200),
+            stall,
+            max_runtime,
         ));
-        // Below threshold → keep.
+        // Progress recent (no_progress below stall) AND under max runtime → keep.
         assert!(!should_idle_reap(
             true,
             false,
-            Duration::from_secs(299),
-            threshold
+            Duration::from_secs(119),
+            Duration::from_secs(200),
+            stall,
+            max_runtime,
         ));
-        // Detached (dev server) → never reaped, even when long idle.
+        // Busy-loop: progress recent (no_progress=0) but total runtime hit the
+        // max-runtime backstop → reap.
+        assert!(should_idle_reap(
+            true,
+            false,
+            no,
+            Duration::from_secs(1200),
+            stall,
+            max_runtime,
+        ));
+        assert!(should_idle_reap(
+            true,
+            false,
+            no,
+            Duration::from_secs(5000),
+            stall,
+            max_runtime,
+        ));
+        // Detached (dev server) → never reaped, even when long idle / long-running.
         assert!(!should_idle_reap(
             true,
             true,
             Duration::from_secs(100_000),
-            threshold
+            Duration::from_secs(100_000),
+            stall,
+            max_runtime,
         ));
         // Not notifier-active (task-owned, no promise to deliver) → not reaped here.
         assert!(!should_idle_reap(
             false,
             false,
             Duration::from_secs(100_000),
-            threshold
+            Duration::from_secs(100_000),
+            stall,
+            max_runtime,
         ));
+    }
+
+    #[test]
+    fn test_process_made_progress_any_signal_grows() {
+        // CPU advanced (silent busy scan statting files) → progress.
+        assert!(process_made_progress(100, 150, 0, 0, 0, 0));
+        // Disk I/O advanced (silent scan reading directory entries) → progress.
+        assert!(process_made_progress(0, 0, 1_000, 2_000, 0, 0));
+        // Output grew (streaming) → progress.
+        assert!(process_made_progress(0, 0, 0, 0, 10, 25));
+        // Nothing advanced (truly stalled) → no progress.
+        assert!(!process_made_progress(100, 100, 2_000, 2_000, 25, 25));
+        // A carried-forward (equal) signal alone is not progress; any OTHER
+        // advancing signal still wins.
+        assert!(!process_made_progress(100, 100, 0, 0, 0, 0));
+        assert!(process_made_progress(100, 100, 0, 0, 0, 1));
     }
 
     /// A disowned, no-output background command (the `du -ah ~` failure mode) is
@@ -4670,6 +5018,77 @@ mod tests {
         assert!(
             saw_output,
             "short background command output (the count the user asked for) must be delivered directly as a short result, not dropped or re-engaged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_terminal_duplicate_result_is_suppressed() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().display().to_string();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state = Arc::new(
+            SqliteStateStore::new(&db_path, 100, None, embedding_service)
+                .await
+                .unwrap(),
+        );
+        let pool = state.pool();
+        let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            approval_tx,
+            1,
+            4000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await
+        .with_state(state.clone() as Arc<dyn StateStore>);
+
+        let first = tool
+            .call(
+                r#"{"action":"run","command":"sleep 2; echo duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(first.contains("Moved to background (pid="));
+
+        let second = tool
+            .call(
+                r#"{"action":"run","command":"sleep 2; printf '%s\n' duplicate-result","_session_id":"sess_dupe_result","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(second.contains("Moved to background (pid="));
+
+        for _ in 0..60 {
+            let pending = state.get_pending_notifications(50).await.unwrap();
+            let result_count = pending
+                .iter()
+                .filter(|entry| {
+                    entry.session_id == "sess_dupe_result"
+                        && entry.notification_type == "progress"
+                        && entry.message == "Result: `duplicate-result`"
+                })
+                .count();
+            if result_count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let pending = state.get_pending_notifications(50).await.unwrap();
+        let result_count = pending
+            .iter()
+            .filter(|entry| {
+                entry.session_id == "sess_dupe_result"
+                    && entry.notification_type == "progress"
+                    && entry.message == "Result: `duplicate-result`"
+            })
+            .count();
+        assert_eq!(
+            result_count, 1,
+            "duplicate background completions should not deliver the same result twice"
         );
     }
 

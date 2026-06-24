@@ -1281,6 +1281,17 @@ pub struct WatchdogConfig {
     /// drives channel stale-watchdog behavior. Default: 300 = 5 min.
     #[serde(default = "default_task_inactivity_timeout_secs")]
     pub task_inactivity_timeout_secs: u64,
+    /// Seconds a notifier-active background terminal command may make NO progress
+    /// (no CPU time, disk I/O, or output growth) before the heartbeat reaper
+    /// stops it. CPU/IO is a far better "is it working?" signal than silence, so
+    /// this defaults lower (120 = 2 min) than the legacy output-only 300s.
+    #[serde(default = "default_background_stall_secs")]
+    pub background_stall_secs: u64,
+    /// Maximum total runtime (seconds) for a notifier-active background terminal
+    /// command, regardless of progress. Backstop for busy-loops (high CPU, no
+    /// useful progress) and genuinely-too-slow commands. Default: 1200 = 20 min.
+    #[serde(default = "default_background_max_runtime_secs")]
+    pub background_max_runtime_secs: u64,
 }
 
 impl Default for WatchdogConfig {
@@ -1290,6 +1301,8 @@ impl Default for WatchdogConfig {
             stale_threshold_secs: default_watchdog_stale_secs(),
             llm_call_timeout_secs: default_llm_call_timeout_secs(),
             task_inactivity_timeout_secs: default_task_inactivity_timeout_secs(),
+            background_stall_secs: default_background_stall_secs(),
+            background_max_runtime_secs: default_background_max_runtime_secs(),
         }
     }
 }
@@ -1305,6 +1318,12 @@ fn default_llm_call_timeout_secs() -> u64 {
 }
 fn default_task_inactivity_timeout_secs() -> u64 {
     300
+}
+fn default_background_stall_secs() -> u64 {
+    120
+}
+fn default_background_max_runtime_secs() -> u64 {
+    1200
 }
 
 #[derive(Debug, Deserialize, Clone)]
