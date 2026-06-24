@@ -993,19 +993,44 @@ fn format_short_background_result(output_trimmed: &str) -> String {
 /// ends the moment a long-running command detaches: a request like "send me the
 /// file when done" would otherwise be silently dropped, since the model would
 /// just summarize the output instead of completing the requested action.
-fn build_background_reengagement_followup(command_summary: &str, output: &str) -> String {
-    format!(
+fn build_background_reengagement_followup(
+    command_summary: &str,
+    output: &str,
+    unchecked: &[String],
+) -> String {
+    let mut s = format!(
         "[Background command completed]\n\
          Command: `{command_summary}`\n\
          Output:\n{output}\n\n\
          This command was part of your previous task. Check your session history \
          for the original user request and continue where you left off, using the \
-         output above to proceed with the remaining steps.\n\
-         If the original request asked you to send, share, or deliver a file (or \
-         produce any other deliverable), complete that now — for a file, call the \
-         send_file tool with the produced file's path. Do not just describe the \
-         result; perform the action the user asked for."
-    )
+         output above to proceed with the remaining steps.\n"
+    );
+    if unchecked.is_empty() {
+        // No durable checklist for this task — fall back to generic deferred-
+        // deliverable steering (the interim behavior from 74324f9).
+        s.push_str(
+            "If the original request asked you to send, share, or deliver a file (or \
+             produce any other deliverable), complete that now — for a file, call the \
+             send_file tool with the produced file's path. Do not just describe the \
+             result; perform the action the user asked for.",
+        );
+    } else {
+        // Persisted checklist exists — list the still-unchecked requirements so
+        // the model completes the exact deferred items, not a guess.
+        s.push_str(
+            "The following tracked requirements for this task are still UNCHECKED — \
+             complete each one now:\n",
+        );
+        for item in unchecked {
+            s.push_str(&format!("- {item}\n"));
+        }
+        s.push_str(
+            "For a file deliverable, call send_file with the produced file's path. After \
+             completing each item, call track_requirements to mark it 'completed'.",
+        );
+    }
+    s
 }
 
 impl TerminalTool {
@@ -2395,6 +2420,9 @@ impl TerminalTool {
                 // working on the original task.
                 let mut notifier_started = false;
                 let state_for_notify = self.state.clone();
+                // Pool clone so the notifier can read the durable requirement
+                // checklist and inject still-unchecked items into re-engagement.
+                let pool_for_notify = self.pool.clone();
                 let hub_for_notify = self.get_hub();
                 let agent_for_notify = self.agent.get().and_then(|w| w.upgrade());
                 let reengagements_for_notify = self.reengagements.clone();
@@ -3011,9 +3039,33 @@ impl TerminalTool {
                                         // Skip the agent path entirely — fall through to the
                                         // raw-output fallback delivery below.
                                     } else if let Some(ref agent) = agent_for_notify {
+                                        // Load the durable checklist's still-unchecked items so the
+                                        // re-engagement names the exact deferred requirements (e.g.
+                                        // "send the latency file") instead of a generic hint.
+                                        let unchecked: Vec<String> = if let Some(ref pool) =
+                                            pool_for_notify
+                                        {
+                                            match crate::plans::PlanStore::new(pool.clone()).await {
+                                                Ok(ps) => match ps
+                                                    .get_incomplete_for_session(&session_for_notify)
+                                                    .await
+                                                {
+                                                    Ok(Some(plan)) => plan
+                                                        .unchecked_steps()
+                                                        .iter()
+                                                        .map(|s| s.description.clone())
+                                                        .collect(),
+                                                    _ => Vec::new(),
+                                                },
+                                                Err(_) => Vec::new(),
+                                            }
+                                        } else {
+                                            Vec::new()
+                                        };
                                         let followup = build_background_reengagement_followup(
                                             &command_summary,
                                             &output,
+                                            &unchecked,
                                         );
                                         info!(
                                             pid,
@@ -3978,9 +4030,11 @@ mod tests {
         // original turn ended before the file was sent. The re-engagement
         // follow-up must explicitly steer the model to complete deferred
         // deliverables (call send_file), not merely summarize the output.
+        // No persisted checklist → generic deferred-deliverable steering.
         let followup = build_background_reengagement_followup(
             "python3 /tmp/ping_latency.py",
             "latency results written to /tmp/latency.txt",
+            &[],
         );
         assert!(
             followup.contains("send_file"),
@@ -3997,6 +4051,29 @@ mod tests {
         assert!(
             followup.contains("python3 /tmp/ping_latency.py"),
             "follow-up must include the command: {followup}"
+        );
+    }
+
+    #[test]
+    fn test_reengagement_followup_lists_persisted_unchecked_items() {
+        // With a durable checklist, the re-engagement names the exact still-
+        // unchecked requirements instead of the generic hint.
+        let followup = build_background_reengagement_followup(
+            "python3 /tmp/ping.py",
+            "latency written to /tmp/latency.txt",
+            &["send the latency file to the user".to_string()],
+        );
+        assert!(
+            followup.contains("send the latency file to the user"),
+            "must list the unchecked item: {followup}"
+        );
+        assert!(
+            followup.contains("/tmp/latency.txt"),
+            "must include the command output: {followup}"
+        );
+        assert!(
+            followup.contains("track_requirements"),
+            "must instruct marking items completed: {followup}"
         );
     }
 
