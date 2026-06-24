@@ -166,11 +166,29 @@ impl Tool for TrackRequirementsTool {
             }
         };
 
-        // Post the compact checklist to the channel ONCE, on first creation.
-        if !had_existing {
-            if let Some(hub) = self.get_hub() {
+        // Surface the checklist to the user. On first creation, post a tracked
+        // message and remember its id so later updates edit it in place (☐→✅)
+        // on channels that support editing (Telegram). Channels that don't track
+        // return None and fall back to the start-post + recap behavior.
+        if let Some(hub) = self.get_hub() {
+            if !had_existing {
+                if let Ok(Some(mid)) = hub
+                    .send_text_tracked(&session_id, &plan.render_compact_checklist())
+                    .await
+                {
+                    let _ = self
+                        .plan_store
+                        .set_checkpoint(&plan.id, "ui_message_id", json!(mid))
+                        .await;
+                }
+            } else if let Some(mid) = plan
+                .checkpoint
+                .get("ui_message_id")
+                .and_then(|v| v.as_str())
+            {
+                // Subsequent update: edit the tracked message in place.
                 let _ = hub
-                    .send_text(&session_id, &plan.render_compact_checklist())
+                    .edit_text(&session_id, mid, &plan.render_compact_checklist())
                     .await;
             }
         }

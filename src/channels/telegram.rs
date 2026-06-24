@@ -5025,6 +5025,59 @@ impl Channel for TelegramChannel {
             .await
     }
 
+    async fn send_text_tracked(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+        // Plain send (no parse mode) so the message id can be captured for later
+        // in-place editing. Used for short, self-contained UI messages (the
+        // requirement checklist), not formatted prose.
+        let msg = self.bot.send_message(ChatId(chat_id), text).await?;
+        Ok(Some(msg.id.0.to_string()))
+    }
+
+    async fn edit_text(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
+        let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
+            .unwrap_or_else(|| {
+                self.allowed_user_ids
+                    .read()
+                    .unwrap()
+                    .first()
+                    .copied()
+                    .unwrap_or(0) as i64
+            });
+        let mid: i32 = match message_id.parse() {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        match self
+            .bot
+            .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
+            .await
+        {
+            Ok(_) => Ok(true),
+            // Telegram rejects an edit whose text is identical to the current
+            // message — that's benign (nothing to change), so treat it as success.
+            Err(e) if e.to_string().contains("message is not modified") => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {

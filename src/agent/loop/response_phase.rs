@@ -218,7 +218,23 @@ async fn checklist_completion_gate(
             )
             .await;
         if let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) {
-            let _ = hub.send_text(session_id, &plan.render_recap()).await;
+            match plan
+                .checkpoint
+                .get("ui_message_id")
+                .and_then(|v| v.as_str())
+            {
+                // Live message exists: edit it to its final state in place — no
+                // extra recap message (the evolving checklist is the recap).
+                Some(mid) => {
+                    let _ = hub
+                        .edit_text(session_id, mid, &plan.render_compact_checklist())
+                        .await;
+                }
+                // Fallback channel (no editing): post the recap as a new message.
+                None => {
+                    let _ = hub.send_text(session_id, &plan.render_recap()).await;
+                }
+            }
         }
     }
     None

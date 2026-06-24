@@ -509,6 +509,36 @@ impl ChannelHub {
         }
     }
 
+    /// Send text and return an editable message id when the owning channel
+    /// supports it (`None` otherwise). Bypasses the send_text dedup window so the
+    /// tracked message is always delivered and its id captured.
+    pub async fn send_text_tracked(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some(channel) = self.channel_for_session(session_id).await {
+            channel.send_text_tracked(session_id, text).await
+        } else {
+            anyhow::bail!("No channel found for session {}", session_id)
+        }
+    }
+
+    /// Edit a previously-sent message in place. Returns `Ok(false)` when no
+    /// channel owns the session or the channel can't edit.
+    pub async fn edit_text(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<bool> {
+        if let Some(channel) = self.channel_for_session(session_id).await {
+            channel.edit_text(session_id, message_id, text).await
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Send media to the channel that owns a specific session.
     /// Falls back to text caption for channels without media support.
     pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
@@ -684,6 +714,45 @@ mod tests {
         // Telegram channel should have no messages
         let telegram_msgs = ch_telegram.captured_messages().await;
         assert_eq!(telegram_msgs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tracked_send_and_edit_fall_back_on_non_editing_channel() {
+        // A channel that implements only send_text uses the trait defaults:
+        // send_text_tracked delivers the message but returns None (no id), and
+        // edit_text reports unsupported. This is the cross-channel fallback that
+        // keeps the checklist's start-post + recap behavior intact off Telegram.
+        let ch = Arc::new(NamedTestChannel::new("slack"));
+        let ch_dyn: Arc<dyn Channel> = ch.clone();
+        let session_map = session_map_with(vec![("sess_1", "slack")]);
+        let hub = ChannelHub::new(vec![ch_dyn], session_map);
+
+        let id = hub
+            .send_text_tracked("sess_1", "📋 Plan")
+            .await
+            .expect("tracked send ok");
+        assert!(
+            id.is_none(),
+            "non-editing channel must report no message id"
+        );
+        // The message was still delivered via the default send_text path.
+        let msgs = ch.captured_messages().await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].1, "📋 Plan");
+
+        let edited = hub
+            .edit_text("sess_1", "123", "📋 Plan ✅")
+            .await
+            .expect("edit ok");
+        assert!(!edited, "non-editing channel must report edit unsupported");
+    }
+
+    #[tokio::test]
+    async fn test_edit_text_no_channel_is_noop() {
+        let session_map = empty_session_map();
+        let hub = ChannelHub::new(vec![], session_map);
+        let edited = hub.edit_text("sess_1", "1", "x").await.expect("ok");
+        assert!(!edited);
     }
 
     #[tokio::test]

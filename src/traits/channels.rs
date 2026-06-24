@@ -36,6 +36,32 @@ pub trait Channel: Send + Sync {
     /// Send a text message to a session.
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
 
+    /// Send a text message and return a channel-specific message id that can be
+    /// passed to [`Channel::edit_text`] later. Channels that support in-place
+    /// editing (e.g. Telegram) override this; the default sends via
+    /// [`Channel::send_text`] and returns `None` (no tracking), so callers fall
+    /// back to non-editing UX.
+    async fn send_text_tracked(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.send_text(session_id, text).await?;
+        Ok(None)
+    }
+
+    /// Edit a previously-sent message in place. Returns `Ok(true)` if the edit
+    /// was applied (or the content was already current), `Ok(false)` if the
+    /// channel does not support editing. Default: unsupported.
+    async fn edit_text(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Send media (photo/file) to a session.
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()>;
 
