@@ -128,6 +128,72 @@ fn should_idle_reap(
     no_progress_elapsed >= stall_threshold || total_runtime >= max_runtime
 }
 
+/// Pure subtree resource aggregation: for each tracked root pid, sum the
+/// cumulative `(cpu_ms, io_bytes)` of that pid AND all its transitive
+/// descendants.
+///
+/// Background commands run via `sh -c '<pipeline>'`, so the tracked pid is the
+/// idle `sh` wrapper while the real work (`du`/`find`/`sort`/`head`) runs in
+/// child processes. Summing the whole subtree means a busy child registers as
+/// progress for the tracked wrapper pid, preventing a false reap of a working
+/// command.
+///
+/// Kept free of `sysinfo` so it can be unit-tested against synthetic trees:
+/// `sample_process_resources` builds `children_of` + `per_pid` from sysinfo,
+/// then delegates here.
+///
+/// - `children_of`: parent pid → child pids (built from each process's parent).
+/// - `per_pid`: pid → `(cpu_ms, io_bytes)` cumulative sample for that one pid.
+/// - A `visited` set guards against malformed cyclic maps (a real process tree
+///   never cycles, but this is cheap insurance against an infinite loop).
+/// - A root absent from `per_pid` (e.g. exited between snapshot and lookup)
+///   yields no map entry; the caller carries forward the previous sample, so an
+///   absent entry is safe.
+fn sum_subtree_resources(
+    roots: &[u32],
+    children_of: &HashMap<u32, Vec<u32>>,
+    per_pid: &HashMap<u32, (u64, u64)>,
+) -> HashMap<u32, (u64, u64)> {
+    // Defensive cap on traversal breadth for a single root so a pathologically
+    // huge / malformed tree can't blow up the 60s sweep. A real background
+    // pipeline has a handful of stages, never thousands.
+    const MAX_SUBTREE_NODES: usize = 100_000;
+
+    let mut out = HashMap::with_capacity(roots.len());
+    for &root in roots {
+        // Only emit an entry if the root itself was sampled; a missing root
+        // means the process is gone and the caller must carry forward.
+        if !per_pid.contains_key(&root) {
+            continue;
+        }
+        let mut visited: HashSet<u32> = HashSet::new();
+        let mut stack: Vec<u32> = vec![root];
+        let mut cpu_sum: u64 = 0;
+        let mut io_sum: u64 = 0;
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue; // cycle guard / already counted
+            }
+            if visited.len() > MAX_SUBTREE_NODES {
+                break;
+            }
+            if let Some(&(cpu, io)) = per_pid.get(&pid) {
+                cpu_sum = cpu_sum.saturating_add(cpu);
+                io_sum = io_sum.saturating_add(io);
+            }
+            if let Some(children) = children_of.get(&pid) {
+                for &child in children {
+                    if !visited.contains(&child) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        out.insert(root, (cpu_sum, io_sum));
+    }
+    out
+}
+
 /// A request sent to the ChannelHub for command approval.
 pub struct ApprovalRequest {
     pub command: String,
@@ -1840,31 +1906,56 @@ impl TerminalTool {
     /// per-OS `cfg` blocks. A pid that has exited (or that the OS won't stat)
     /// simply has no map entry — the caller treats a missing sample as "no
     /// progress signal from CPU/IO" and falls back to output-based progress.
-    /// Refreshes only the tracked pids (cheap: a handful every 60s).
+    ///
+    /// The returned value for each tracked root pid is the SUM of cumulative CPU
+    /// time + disk I/O across that pid AND all its transitive descendants.
+    /// Background commands run via `sh -c '<pipeline>'`, so the tracked pid is
+    /// the idle `sh` wrapper while the real work (`du`/`find`/`sort`/`head`)
+    /// runs in its children. Sampling only the wrapper would see zero CPU/IO and
+    /// false-reap a busy command; summing the subtree counts the working child's
+    /// progress against the tracked wrapper pid.
+    ///
+    /// Cost note: refreshing ALL processes once per call is heavier than
+    /// refreshing only the tracked pids, but the reaper sweep runs at most once
+    /// per 60s, so a single full-process refresh (cpu + disk only) per sweep is
+    /// an acceptable, bounded cost. The parent→children index and subtree
+    /// traversal are O(total processes), trivial at typical process counts.
     fn sample_process_resources(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
         if pids.is_empty() {
             return HashMap::new();
         }
-        let sys_pids: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+
+        // Refresh ALL processes (not just the tracked roots) so descendant
+        // CPU/IO is visible. cpu + disk only — we never need names/cmdlines here.
         let mut sys = System::new();
         sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&sys_pids),
+            ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cpu().with_disk_usage(),
         );
 
-        let mut out = HashMap::with_capacity(pids.len());
-        for pid in pids {
-            if let Some(proc) = sys.process(Pid::from_u32(*pid)) {
-                let cpu_ms = proc.accumulated_cpu_time();
-                let du = proc.disk_usage();
-                let io_bytes = du.total_read_bytes.saturating_add(du.total_written_bytes);
-                out.insert(*pid, (cpu_ms, io_bytes));
+        // Build a flat per-pid sample map and a parent→children index from the
+        // full snapshot, then delegate the subtree summing to the pure helper.
+        let procs = sys.processes();
+        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::with_capacity(procs.len());
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, proc) in procs {
+            let pid_u32 = pid.as_u32();
+            let cpu_ms = proc.accumulated_cpu_time();
+            let du = proc.disk_usage();
+            let io_bytes = du.total_read_bytes.saturating_add(du.total_written_bytes);
+            per_pid.insert(pid_u32, (cpu_ms, io_bytes));
+            if let Some(parent) = proc.parent() {
+                children_of
+                    .entry(parent.as_u32())
+                    .or_default()
+                    .push(pid_u32);
             }
         }
-        out
+
+        sum_subtree_resources(pids, &children_of, &per_pid)
     }
 
     /// Stall + max-runtime variant. `stall_threshold`: reap after no
@@ -4677,6 +4768,63 @@ mod tests {
         // advancing signal still wins.
         assert!(!process_made_progress(100, 100, 0, 0, 0, 0));
         assert!(process_made_progress(100, 100, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_sum_subtree_resources_includes_children() {
+        // sh wrapper (100) is idle; its du child (101) is churning, with a
+        // grandchild (102). The busy descendants must count toward the tracked
+        // wrapper pid so a working pipeline is not false-reaped.
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        children.insert(100, vec![101]);
+        children.insert(101, vec![102]);
+        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
+        per_pid.insert(100, (0, 0));
+        per_pid.insert(101, (5_000, 2_000_000));
+        per_pid.insert(102, (10, 50));
+
+        let out = sum_subtree_resources(&[100], &children, &per_pid);
+        assert_eq!(out.get(&100), Some(&(5_010, 2_000_050)));
+    }
+
+    #[test]
+    fn test_sum_subtree_resources_isolated_root() {
+        // A root with no children sums to just its own values.
+        let children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
+        per_pid.insert(42, (123, 456));
+
+        let out = sum_subtree_resources(&[42], &children, &per_pid);
+        assert_eq!(out.get(&42), Some(&(123, 456)));
+    }
+
+    #[test]
+    fn test_sum_subtree_resources_handles_cycle_safely() {
+        // A malformed parent->child map containing a cycle (100->101->100)
+        // must not infinite-loop; the visited set bounds the traversal and each
+        // node is counted at most once.
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        children.insert(100, vec![101]);
+        children.insert(101, vec![100]); // cycle back to root
+        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
+        per_pid.insert(100, (1, 2));
+        per_pid.insert(101, (3, 4));
+
+        let out = sum_subtree_resources(&[100], &children, &per_pid);
+        assert_eq!(out.get(&100), Some(&(4, 6)));
+    }
+
+    #[test]
+    fn test_sum_subtree_missing_pid() {
+        // A root absent from per_pid (process exited between snapshot and
+        // lookup) contributes nothing → no map entry. The caller carries
+        // forward the previous sample, so an absent entry is safe.
+        let children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
+
+        let out = sum_subtree_resources(&[999], &children, &per_pid);
+        assert_eq!(out.get(&999), None);
+        assert!(out.is_empty());
     }
 
     /// A disowned, no-output background command (the `du -ah ~` failure mode) is
