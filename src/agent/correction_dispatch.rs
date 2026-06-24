@@ -236,23 +236,38 @@ mod tests {
 
     #[test]
     fn test_bridge_unsafe_scope_refused() {
-        // Unsafe scope must be refused even with bypass enabled and shadow off.
+        // After the scope relaxation, only genuinely-invalid scopes are refused:
+        // empty or non-absolute (relative) working_dir. Broad scopes like `/` and
+        // home are now ALLOWED (the read-only sandbox is the safety), so they are
+        // NOT refused here.
         let config = cfg(true, false, true);
-        let subject = subject_with("/", "what's the biggest file?");
-        let action = decide_correction_bridge_action(&config, &subject, "find / -type f", 120);
+
+        // Relative (non-absolute) working_dir => still UnsafeScope.
+        let subject_rel = subject_with("relative/dir", "what's the biggest file?");
+        let action_rel =
+            decide_correction_bridge_action(&config, &subject_rel, "find . -type f", 120);
         assert!(
-            matches!(action, CorrectionBridgeAction::UnsafeScope),
-            "whole-disk working_dir must be refused, got {action:?}"
+            matches!(action_rel, CorrectionBridgeAction::UnsafeScope),
+            "relative working_dir must be refused, got {action_rel:?}"
         );
 
-        // Also refuse $HOME.
+        // `/` and home are now ALLOWED scopes (not refused). With shadow_mode=true
+        // they reach Shadowed, never UnsafeScope.
+        let subject_root = subject_with("/", "what's the biggest file?");
+        let action_root =
+            decide_correction_bridge_action(&config, &subject_root, "find / -type f", 120);
+        assert!(
+            !matches!(action_root, CorrectionBridgeAction::UnsafeScope),
+            "whole-disk working_dir is now an allowed broad scope, got {action_root:?}"
+        );
+
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/test".to_string());
         let subject_home = subject_with(&home, "what's the biggest file?");
         let action_home =
             decide_correction_bridge_action(&config, &subject_home, "find ~ -type f", 120);
         assert!(
-            matches!(action_home, CorrectionBridgeAction::UnsafeScope),
-            "whole-home working_dir must be refused, got {action_home:?}"
+            !matches!(action_home, CorrectionBridgeAction::UnsafeScope),
+            "home working_dir is now an allowed broad scope, got {action_home:?}"
         );
     }
 
