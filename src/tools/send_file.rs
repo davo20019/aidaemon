@@ -409,16 +409,25 @@ mod tests {
         .to_string();
         let out = tool.call(&args).await.expect("call ok");
         assert!(out.contains("File sent"), "got: {out}");
-        assert!(out.contains("copied into the inbox"), "should note recovery: {out}");
+        assert!(
+            out.contains("copied into the inbox"),
+            "should note recovery: {out}"
+        );
 
         let msg = rx.try_recv().expect("media message sent");
         match msg.kind {
             MediaKind::Document { file_path, .. } => {
-                assert!(file_path.contains("inbox"), "delivered from inbox: {file_path}");
+                assert!(
+                    file_path.contains("inbox"),
+                    "delivered from inbox: {file_path}"
+                );
             }
             _ => panic!("expected Document media"),
         }
-        assert!(inbox.join("latency_results.txt").exists(), "copy must land in inbox");
+        assert!(
+            inbox.join("latency_results.txt").exists(),
+            "copy must land in inbox"
+        );
     }
 
     #[test]
@@ -431,7 +440,9 @@ mod tests {
         assert!(SendFileTool::is_recoverable_source(&in_temp));
 
         // ...but arbitrary paths outside temp are NOT (no arbitrary exfiltration).
-        assert!(!SendFileTool::is_recoverable_source(Path::new("/etc/hosts")));
+        assert!(!SendFileTool::is_recoverable_source(Path::new(
+            "/etc/hosts"
+        )));
         if let Some(home) = dirs::home_dir() {
             assert!(!SendFileTool::is_recoverable_source(
                 &home.join("Documents/secret.pdf")
