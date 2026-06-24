@@ -102,6 +102,66 @@ impl PlanStore {
         Ok(())
     }
 
+    /// Create or replace the active checklist for a session. Full-set replace:
+    /// the provided items become the plan's steps. Reuses an existing incomplete
+    /// plan (same id) when present so updates are idempotent.
+    pub async fn upsert_checklist(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+        trigger: &str,
+        items: &[(String, crate::plans::StepStatus)],
+    ) -> anyhow::Result<TaskPlan> {
+        use crate::plans::{PlanStep, StepStatus};
+        let now = Utc::now();
+        let steps: Vec<PlanStep> = items
+            .iter()
+            .enumerate()
+            .map(|(index, (description, status))| PlanStep {
+                index,
+                description: description.clone(),
+                status: *status,
+                tool_call_ids: Vec::new(),
+                result_summary: None,
+                error: None,
+                retry_count: 0,
+                started_at: if matches!(status, StepStatus::InProgress | StepStatus::Completed) {
+                    Some(now)
+                } else {
+                    None
+                },
+                completed_at: if matches!(status, StepStatus::Completed) {
+                    Some(now)
+                } else {
+                    None
+                },
+            })
+            .collect();
+        let current_step = steps
+            .iter()
+            .position(|s| matches!(s.status, StepStatus::Pending | StepStatus::InProgress))
+            .unwrap_or(0);
+
+        if let Some(mut existing) = self.get_incomplete_for_session(session_id).await? {
+            existing.steps = steps;
+            existing.current_step = current_step;
+            existing.updated_at = now;
+            if existing.is_finished() {
+                existing.status = PlanStatus::Completed;
+            }
+            self.update(&existing).await?;
+            Ok(existing)
+        } else {
+            let mut plan =
+                TaskPlan::new(session_id, trigger, "Requirement checklist", Vec::new(), "track_requirements");
+            plan.steps = steps;
+            plan.current_step = current_step;
+            plan.task_id = task_id.map(|t| t.to_string());
+            self.create(&plan).await?;
+            Ok(plan)
+        }
+    }
+
     /// Update just the status of a plan.
     pub async fn set_status(&self, plan_id: &str, status: PlanStatus) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -385,6 +445,37 @@ mod tests {
             .await
             .unwrap();
         PlanStore::new(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_upsert_checklist_creates_then_replaces() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        let items = vec![
+            ("create script".to_string(), StepStatus::InProgress),
+            ("send the file".to_string(), StepStatus::Pending),
+        ];
+        let plan = store
+            .upsert_checklist("sess-1", Some("task-1"), "make+send", &items)
+            .await
+            .unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        let id = plan.id.clone();
+
+        let items2 = vec![
+            ("create script".to_string(), StepStatus::Completed),
+            ("send the file".to_string(), StepStatus::Completed),
+        ];
+        let plan2 = store
+            .upsert_checklist("sess-1", Some("task-1"), "make+send", &items2)
+            .await
+            .unwrap();
+        assert_eq!(plan2.id, id, "should update existing plan, not create a new one");
+        assert_eq!(plan2.completed_steps(), 2);
+
+        // Persisted state reflects the replacement.
+        let fetched = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(fetched.completed_steps(), 2);
     }
 
     #[tokio::test]
