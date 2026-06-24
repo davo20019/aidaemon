@@ -986,6 +986,28 @@ fn format_short_background_result(output_trimmed: &str) -> String {
     }
 }
 
+/// Build the internal follow-up that re-engages the agent loop after a
+/// background command completes. Beyond replaying the output, it explicitly
+/// steers the model to finish any *deferred deliverable* the user requested
+/// before the command was backgrounded. This matters because the original turn
+/// ends the moment a long-running command detaches: a request like "send me the
+/// file when done" would otherwise be silently dropped, since the model would
+/// just summarize the output instead of completing the requested action.
+fn build_background_reengagement_followup(command_summary: &str, output: &str) -> String {
+    format!(
+        "[Background command completed]\n\
+         Command: `{command_summary}`\n\
+         Output:\n{output}\n\n\
+         This command was part of your previous task. Check your session history \
+         for the original user request and continue where you left off, using the \
+         output above to proceed with the remaining steps.\n\
+         If the original request asked you to send, share, or deliver a file (or \
+         produce any other deliverable), complete that now — for a file, call the \
+         send_file tool with the produced file's path. Do not just describe the \
+         result; perform the action the user asked for."
+    )
+}
+
 impl TerminalTool {
     pub async fn new(
         allowed_prefixes: Vec<String>,
@@ -2989,15 +3011,9 @@ impl TerminalTool {
                                         // Skip the agent path entirely — fall through to the
                                         // raw-output fallback delivery below.
                                     } else if let Some(ref agent) = agent_for_notify {
-                                        let followup = format!(
-                                            "[Background command completed]\n\
-                                             Command: `{}`\n\
-                                             Output:\n{}\n\n\
-                                             This command was part of your previous task. \
-                                             Check your session history for the original user request \
-                                             and continue where you left off. Use the output above \
-                                             to proceed with the remaining steps of the task.",
-                                            command_summary, output
+                                        let followup = build_background_reengagement_followup(
+                                            &command_summary,
+                                            &output,
                                         );
                                         info!(
                                             pid,
@@ -3017,6 +3033,16 @@ impl TerminalTool {
                                             .await
                                         {
                                             Ok(reply) => {
+                                                // Defense-in-depth: the re-engaged loop reads session
+                                                // history containing this command's "moved to background"
+                                                // tool result and sometimes regurgitates that internal
+                                                // scaffolding. The agent's own sanitizer runs upstream,
+                                                // but re-run it here so the terminal delivery path can
+                                                // never leak scaffolding regardless of upstream changes.
+                                                let reply =
+                                                    crate::tools::sanitize::sanitize_user_facing_reply(
+                                                        &reply,
+                                                    );
                                                 // Send the agent's analysis to the user
                                                 if !reply.trim().is_empty() {
                                                     let delivery_allowed = {
@@ -3944,6 +3970,35 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn test_reengagement_followup_steers_deferred_file_send() {
+        // Regression (screenshot 2026-06-24): user asked "Send me the file when
+        // done"; the command ran past 30s and was moved to background, so the
+        // original turn ended before the file was sent. The re-engagement
+        // follow-up must explicitly steer the model to complete deferred
+        // deliverables (call send_file), not merely summarize the output.
+        let followup = build_background_reengagement_followup(
+            "python3 /tmp/ping_latency.py",
+            "latency results written to /tmp/latency.txt",
+        );
+        assert!(
+            followup.contains("send_file"),
+            "follow-up must steer file delivery: {followup}"
+        );
+        assert!(
+            followup.contains("send, share, or deliver a file"),
+            "follow-up must mention the deferred deliverable: {followup}"
+        );
+        assert!(
+            followup.contains("latency results written to /tmp/latency.txt"),
+            "follow-up must include the command output: {followup}"
+        );
+        assert!(
+            followup.contains("python3 /tmp/ping_latency.py"),
+            "follow-up must include the command: {followup}"
+        );
+    }
 
     #[test]
     fn test_reengagement_allowed_caps_per_session_window() {

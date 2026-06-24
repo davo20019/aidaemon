@@ -93,6 +93,15 @@ static DIAGNOSTIC_BLOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         // verbatim — strip the whole line regardless of tag, including after
         // [SYSTEM] was rewritten to [CONTENT FILTERED] by the input sanitizer.
         Regex::new(r"(?m)^[^\n]*A background task (?:is now running|was moved)[^\n]*$").unwrap(),
+        // Terminal "moved to background" completion scaffolding (terminal.rs /
+        // run_helpers.rs). When the background notifier re-engages the agent loop,
+        // the model reads this status/steering text from session history and
+        // regurgitates it into its user-facing reply. Strip the whole line.
+        Regex::new(r"(?m)^[^\n]*Completion notifications are enabled[^\n]*$").unwrap(),
+        // Path auto-injection notice (tool_result_notices.rs). Its [SYSTEM] tag is
+        // rewritten to [CONTENT FILTERED] by the input sanitizer before the model
+        // echoes it, defeating the [SYSTEM] block rule — match the sentence itself.
+        Regex::new(r"(?m)^[^\n]*Path was auto-injected[^\n]*$").unwrap(),
         // [UNTRUSTED EXTERNAL DATA ...] block through [END UNTRUSTED ...]
         Regex::new(
             r"(?si)\[UNTRUSTED EXTERNAL DATA[^\]]*\].*?\[END UNTRUSTED EXTERNAL DATA\][^\n]*",
@@ -1748,6 +1757,37 @@ mod tests {
         assert!(
             !sys_result.contains("A background task was moved"),
             "system-tagged directive leaked: {sys_result}"
+        );
+    }
+
+    #[test]
+    fn test_strip_background_completion_scaffolding_leak() {
+        // Regression (screenshot 2026-06-24): a backgrounded ping command's
+        // re-engaged reply echoed the terminal tool's own "moved to background"
+        // scaffolding — the completion-notification sentence and the path
+        // auto-injection notice (whose [SYSTEM] tag the input sanitizer had
+        // already rewritten to [CONTENT FILTERED]). Both leaked into the chat.
+        let input = "Here's the command output:\n\nCompletion notifications are enabled. The user will be notified when this process finishes.\n\n[CONTENT FILTERED] Path was auto-injected from project context: /tmp\n\nA network latency test for davidloor.com has finished, and the results are stored in a text file.";
+        let result = strip_diagnostic_blocks(input);
+        assert!(
+            !result.contains("Completion notifications are enabled"),
+            "completion-notification scaffolding leaked: {result}"
+        );
+        assert!(
+            !result.contains("Path was auto-injected"),
+            "path auto-injection notice leaked: {result}"
+        );
+        // The genuine answer must survive.
+        assert!(
+            result.contains("A network latency test for davidloor.com has finished"),
+            "real answer was stripped: {result}"
+        );
+        // The other run_helpers.rs phrasing must also be caught.
+        let variant = "Completion notifications are enabled, and the final result will be sent automatically when it finishes.";
+        assert!(
+            !strip_diagnostic_blocks(variant).contains("Completion notifications are enabled"),
+            "completion-notification variant leaked: {}",
+            strip_diagnostic_blocks(variant)
         );
     }
 
