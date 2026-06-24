@@ -890,6 +890,11 @@ impl Agent {
             self.audio_config.clone(),
             self.stt_config.clone(),
             self.harness_eval_config.clone(),
+            // Share the parent's correction-context registry so a remediation
+            // task lead and its executors (which inherit the remediation goal id)
+            // can all read the same `Arc<CorrectionExecutionContext>` and thread
+            // it into their `ToolExecutionCtx.correction`.
+            self.correction_contexts.clone(),
         ));
 
         if let Some(spawn_tool) = spawn_tool {

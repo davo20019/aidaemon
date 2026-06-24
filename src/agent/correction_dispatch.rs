@@ -10,7 +10,17 @@
 //! tasks (P3b.2 / P3b.3), so the remediation-prompt fields are tolerated as
 //! dead code until then.
 
+use std::sync::{Arc, Weak};
+
+use crate::agent::correction_execution::{
+    build_correction_execution_context, CorrectionDispatchMode,
+};
+use crate::agent::correction_sandbox::CorrectionSubjectContext;
+use crate::agent::{spawn_background_task_lead, Agent};
+use crate::channels::ChannelHub;
 use crate::config::SelfCorrectionConfig;
+use crate::traits::{Goal, StateStore};
+use crate::types::{ChannelContext, UserRole};
 
 /// Outcome of evaluating whether a reaped command should trigger autonomous
 /// remediation.
@@ -96,10 +106,96 @@ fn build_remediation_prompt(
     )
 }
 
+/// Session id used for synthetic remediation goals. Remediation runs are
+/// daemon-internal and never belong to a user channel session.
+#[allow(dead_code)]
+const CORRECTION_REMEDIATION_SESSION: &str = "internal:self-correction";
+
+/// LIVE dispatch of an autonomous remediation task with a per-call correction
+/// gate (Plan 3c, Task P3b.2).
+///
+/// This is the security-sensitive bridge that actually *fires* the 3b per-call
+/// sandbox gate. It:
+///
+/// 1. Builds the correction-execution context via
+///    [`build_correction_execution_context`] in [`CorrectionDispatchMode::Deferred`].
+///    If the factory refuses (kill-switch: `enabled=false`, or Deferred with
+///    `correction_bypass_enabled=false` — which would hang waiting on interactive
+///    approval), this returns `Ok(None)` and dispatches **nothing**.
+/// 2. Mints a synthetic finite [`Goal`] whose `description`/user_text is the
+///    `remediation_prompt`, registers the correction context against that goal's
+///    unique id on the agent, then spawns it through the existing
+///    [`spawn_background_task_lead`] path with [`ChannelContext::internal`] and
+///    [`UserRole::Owner`].
+///
+/// The registered context is keyed by the synthetic goal's globally-unique UUID.
+/// Because the remediation task-lead and every executor it spawns inherit that
+/// same `goal_id`, each of their agent loops reads `Some(ctx)` into
+/// `ToolExecutionCtx.correction` (peek, not consume), while every other turn —
+/// which carries a different (or no) `goal_id` — reads `None`. This is the
+/// invariant: ONLY the deliberately-dispatched remediation task gets
+/// `Some(correction)`.
+///
+/// Returns `Ok(Some(goal_id))` on dispatch, `Ok(None)` when the factory refused.
+///
+/// Tolerated as dead in plain (non-test) lib builds until the live reaper caller
+/// (a later 3c task) invokes it; exercised by this module's tests.
+#[allow(dead_code)]
+pub async fn dispatch_correction_remediation(
+    agent: Arc<Agent>,
+    state: Arc<dyn StateStore>,
+    hub: Option<Weak<ChannelHub>>,
+    config: &SelfCorrectionConfig,
+    subject: CorrectionSubjectContext,
+    remediation_prompt: String,
+) -> anyhow::Result<Option<String>> {
+    // 1. Build the correction context. Deferred mode is mandatory here: this is
+    //    an unattended, background remediation. The factory enforces the
+    //    kill-switch rules (disabled, or Deferred-without-bypass → None).
+    let Some(correction_ctx) = build_correction_execution_context(
+        config,
+        state.clone(),
+        subject,
+        CorrectionDispatchMode::Deferred,
+    ) else {
+        // Kill-switch tripped: do not dispatch anything.
+        return Ok(None);
+    };
+
+    // 2. Mint a synthetic finite goal carrying the remediation prompt. Its fresh
+    //    UUID id is the unique registry key for the correction context.
+    let goal = Goal::new_finite(&remediation_prompt, CORRECTION_REMEDIATION_SESSION);
+    let goal_id = goal.id.clone();
+
+    // Register BEFORE spawning so the spawned hierarchy's loops observe the
+    // context the moment they construct their `ToolExecutionCtx`.
+    agent
+        .register_correction_context(&goal_id, correction_ctx)
+        .await;
+
+    // 3. Spawn the remediation task lead in the background. It runs with an
+    //    internal channel context and Owner role (remediation acts on the
+    //    owner's behalf within the sandbox). `spawn_background_task_lead` is
+    //    fire-and-forget (it `tokio::spawn`s internally), so we do NOT await it.
+    spawn_background_task_lead(
+        agent,
+        goal,
+        remediation_prompt,
+        CORRECTION_REMEDIATION_SESSION.to_string(),
+        ChannelContext::internal(),
+        UserRole::Owner,
+        state,
+        hub,
+        None, // no goal-token registry for synthetic remediation goals
+        None, // no heartbeat dispatch-trigger task
+    );
+
+    Ok(Some(goal_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::correction_sandbox::CorrectionSubjectContext;
     use crate::traits::SelfCorrectionSubjectKind;
     use std::path::PathBuf;
 
@@ -222,6 +318,200 @@ mod tests {
         assert!(
             prompt.contains("300s"),
             "prompt must mention the idle duration: {prompt}"
+        );
+    }
+
+    // ── P3b.2 TDD: live dispatch + correction-context threading ─────────────
+
+    /// Build a fully-wired test agent (real SqliteStateStore, EventStore, etc.).
+    async fn make_test_agent() -> crate::testing::TestHarness {
+        crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .expect("test agent setup")
+    }
+
+    /// P3b.2: the factory kill-switch must short-circuit the LIVE dispatch.
+    /// `enabled=false` → `Ok(None)` and NOTHING is registered/spawned.
+    #[tokio::test]
+    async fn test_dispatch_returns_none_when_factory_refuses() {
+        let harness = make_test_agent().await;
+        let agent = Arc::new(harness.agent);
+        let state: Arc<dyn StateStore> = harness.state.clone();
+
+        // Case 1: master kill-switch off.
+        let disabled = cfg(false, true, true);
+        let result = dispatch_correction_remediation(
+            agent.clone(),
+            state.clone(),
+            None,
+            &disabled,
+            subject_with("/tmp/proj", "what's the biggest file?"),
+            "remediate this".to_string(),
+        )
+        .await
+        .expect("dispatch must not error");
+        assert!(
+            result.is_none(),
+            "disabled config must dispatch nothing (Ok(None)), got {result:?}"
+        );
+        assert_eq!(
+            agent.correction_context_count().await,
+            0,
+            "disabled config must register no correction context"
+        );
+
+        // Case 2: enabled but Deferred + bypass OFF → factory refuses (would hang
+        // on interactive approval), so the live dispatch must also refuse.
+        let no_bypass = cfg(true, false, false);
+        let result2 = dispatch_correction_remediation(
+            agent.clone(),
+            state.clone(),
+            None,
+            &no_bypass,
+            subject_with("/tmp/proj", "what's the biggest file?"),
+            "remediate this".to_string(),
+        )
+        .await
+        .expect("dispatch must not error");
+        assert!(
+            result2.is_none(),
+            "Deferred + bypass-off must dispatch nothing (Ok(None)), got {result2:?}"
+        );
+        assert_eq!(
+            agent.correction_context_count().await,
+            0,
+            "Deferred + bypass-off must register no correction context"
+        );
+    }
+
+    /// P3b.2: when the factory accepts (enabled + bypass on), the live dispatch
+    /// REGISTERS the correction context under the synthetic remediation goal id
+    /// and returns that id. This proves the threading entry point: the spawned
+    /// remediation hierarchy will look this up by its inherited `goal_id`.
+    #[tokio::test]
+    async fn test_dispatch_registers_correction_context_under_goal_id() {
+        let harness = make_test_agent().await;
+        let agent = Arc::new(harness.agent);
+        let state: Arc<dyn StateStore> = harness.state.clone();
+
+        let enabled_bypass = cfg(true, false, true);
+        let result = dispatch_correction_remediation(
+            agent.clone(),
+            state.clone(),
+            None,
+            &enabled_bypass,
+            subject_with("/tmp/proj", "what's the biggest file?"),
+            "Re-attempt with a bounded find".to_string(),
+        )
+        .await
+        .expect("dispatch must not error");
+
+        let goal_id = result.expect("enabled + bypass → must dispatch and return a goal id");
+        assert_eq!(
+            agent.correction_context_count().await,
+            1,
+            "exactly one correction context must be registered for the dispatch"
+        );
+
+        // The registered context is keyed by the returned goal id, and an agent
+        // whose current goal id matches reads `Some` (peek, not consume).
+        let mut peeker = make_test_agent().await.agent;
+        // Share the same registry as the dispatching agent so the peek sees the
+        // registered entry (this is what `create_child_agent` does in prod via
+        // `self.correction_contexts.clone()`).
+        peeker.correction_contexts = agent.correction_contexts.clone();
+        peeker.set_test_goal_id(Some(goal_id.clone()));
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_some(),
+            "an agent running under the remediation goal id must peek Some(correction)"
+        );
+
+        // Peek must NOT consume — a second peek still sees it (so executors
+        // sharing the goal id also get Some).
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_some(),
+            "peek must not consume; executors sharing the goal id must also see Some"
+        );
+
+        // An agent with a DIFFERENT goal id (a normal, unrelated turn) reads None.
+        peeker.set_test_goal_id(Some("some-other-goal".to_string()));
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_none(),
+            "an unrelated goal id must read None — the invariant: only the \
+             remediation task gets Some(correction)"
+        );
+
+        // An agent with no goal id (a plain user turn) reads None.
+        peeker.set_test_goal_id(None);
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_none(),
+            "an agent with no goal id must read None"
+        );
+    }
+
+    /// P3b.2: the bounded map evicts the oldest entry past the cap, but never
+    /// drops the entry being inserted — so a fire-and-forget spawn that never
+    /// tears down cannot leak unboundedly, and the just-dispatched remediation
+    /// always retains its own context.
+    #[tokio::test]
+    async fn test_correction_context_registry_is_bounded() {
+        use crate::agent::correction_execution::{
+            CorrectionDispatchMode, CorrectionExecutionContext,
+        };
+        use crate::agent::self_correction::SelfCorrectionController;
+
+        let harness = make_test_agent().await;
+        let agent = Arc::new(harness.agent);
+        let state: Arc<dyn StateStore> = harness.state.clone();
+
+        let make_ctx = || {
+            Arc::new(CorrectionExecutionContext {
+                subject: super::CorrectionSubjectContext {
+                    subject_id: "s".to_string(),
+                    subject_kind: SelfCorrectionSubjectKind::BackgroundCommand,
+                    session_id: "sess".to_string(),
+                    original_request: "req".to_string(),
+                    completion_contract_summary: String::new(),
+                    intended_accounts: Vec::new(),
+                    allowed_external_targets: Vec::new(),
+                    working_dir: PathBuf::from("/tmp/proj"),
+                },
+                controller: Arc::new(SelfCorrectionController::new(state.clone(), 3)),
+                dispatch_mode: CorrectionDispatchMode::Deferred,
+                bypass_approvals: true,
+            })
+        };
+
+        // Insert well past the cap.
+        let total = super::super::MAX_CORRECTION_CONTEXTS + 10;
+        let last_goal_id = format!("goal-{}", total - 1);
+        for i in 0..total {
+            agent
+                .register_correction_context(&format!("goal-{i}"), make_ctx())
+                .await;
+        }
+
+        assert!(
+            agent.correction_context_count().await <= super::super::MAX_CORRECTION_CONTEXTS,
+            "registry must stay bounded by MAX_CORRECTION_CONTEXTS"
+        );
+
+        // The most-recently inserted entry must still be present (insert never
+        // evicts the key it is inserting). Use a peeker that shares the registry.
+        let mut peeker = make_test_agent().await.agent;
+        peeker.correction_contexts = agent.correction_contexts.clone();
+        peeker.set_test_goal_id(Some(last_goal_id.clone()));
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_some(),
+            "the just-inserted context must survive bounded eviction"
+        );
+
+        // clear_correction_context removes a specific entry.
+        agent.clear_correction_context(&last_goal_id).await;
+        peeker.set_test_goal_id(Some(last_goal_id));
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_none(),
+            "clear_correction_context must remove the entry"
         );
     }
 }

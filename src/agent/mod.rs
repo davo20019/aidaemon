@@ -477,7 +477,43 @@ pub struct Agent {
     harness_eval: Arc<RwLock<Option<HarnessEvalAccumulator>>>,
     /// Harness eval scoring configuration.
     harness_eval_config: HarnessEvalConfig,
+    /// Per-remediation correction-execution contexts, keyed by the synthetic
+    /// remediation **goal id** (a fresh UUID minted in
+    /// `correction_dispatch::dispatch_correction_remediation`). Shared across the
+    /// whole agent hierarchy (parent → child task-lead → executors) via `Arc`,
+    /// so every loop running under a given remediation goal id can read the same
+    /// `Arc<CorrectionExecutionContext>` and thread it into its
+    /// `ToolExecutionCtx.correction`.
+    ///
+    /// Safety / non-stickiness:
+    /// - The key is a globally-unique UUID associated with exactly ONE
+    ///   deliberately-dispatched remediation goal. No user turn, no other goal,
+    ///   and no other session ever carries that `goal_id`, so the per-call
+    ///   correction gate can only ever fire for the remediation task it was
+    ///   dispatched for — every other turn reads `None`.
+    /// - Reads CLONE the `Arc` (they do not remove it) so the gate fires on the
+    ///   remediation task-lead AND all of its executors (which inherit the same
+    ///   `goal_id`). This is NOT a session-global or sticky flag: it is scoped
+    ///   to a single unique goal id.
+    /// - The map is bounded (oldest entries evicted on insert) so a fire-and-forget
+    ///   background spawn that never reports completion cannot leak unboundedly.
+    correction_contexts: Arc<
+        tokio::sync::RwLock<
+            HashMap<String, Arc<crate::agent::correction_execution::CorrectionExecutionContext>>,
+        >,
+    >,
 }
+
+/// Maximum number of in-flight remediation correction contexts retained in
+/// `Agent::correction_contexts`. Remediations are rare and short-lived; this cap
+/// only guards against an unbounded leak if a background spawn never tears its
+/// entry down. When exceeded, the oldest-inserted entry is evicted.
+///
+/// Consumed by `register_correction_context`, which is exercised by the dispatch
+/// path / tests; tolerated as dead in plain (non-test) lib builds until the live
+/// reaper caller lands in a later 3c task.
+#[allow(dead_code)]
+const MAX_CORRECTION_CONTEXTS: usize = 64;
 
 pub(in crate::agent) use system_directives::{EarlyStopSeverity, SystemDirective};
 
@@ -562,6 +598,73 @@ impl Agent {
     /// Current recursion depth of this agent.
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Register a correction-execution context for a remediation goal id.
+    ///
+    /// Called by `correction_dispatch::dispatch_correction_remediation` BEFORE
+    /// spawning the remediation task lead, so that the spawned hierarchy's agent
+    /// loops can thread `Some(ctx)` into their `ToolExecutionCtx.correction` (see
+    /// `correction_contexts` field docs for the safety/non-stickiness invariant).
+    ///
+    /// The map is bounded by [`MAX_CORRECTION_CONTEXTS`]; if inserting would
+    /// exceed the cap, the oldest-inserted entry is evicted first (FIFO) so a
+    /// fire-and-forget background spawn that never tears its entry down cannot
+    /// leak unboundedly.
+    ///
+    /// Exercised by the dispatch path and its tests; tolerated as dead in plain
+    /// (non-test) lib builds until the live caller lands in a later 3c task.
+    #[allow(dead_code)]
+    pub(crate) async fn register_correction_context(
+        &self,
+        goal_id: &str,
+        ctx: Arc<crate::agent::correction_execution::CorrectionExecutionContext>,
+    ) {
+        let mut map = self.correction_contexts.write().await;
+        if !map.contains_key(goal_id) && map.len() >= MAX_CORRECTION_CONTEXTS {
+            // Evict an arbitrary existing entry to stay bounded. Entries are
+            // keyed by unique goal ids, so this can only drop a *different*,
+            // already-running remediation's context — never the one we are about
+            // to insert. The worst case is that a long-running prior remediation
+            // loses its preapproval mid-flight and falls back to normal approval,
+            // which fails *safe*, not open.
+            if let Some(stale) = map.keys().next().cloned() {
+                map.remove(&stale);
+            }
+        }
+        map.insert(goal_id.to_string(), ctx);
+    }
+
+    /// Read (clone) the correction-execution context for this agent's current
+    /// goal id, if one was registered.
+    ///
+    /// This is a PEEK (it does not remove the entry) so the same context is
+    /// visible to the remediation task-lead AND every executor it spawns (they
+    /// all inherit the same `goal_id`). Returns `None` for `goal_id == None` and
+    /// for any goal id with no registered context — i.e. every normal,
+    /// user-initiated turn. Used at the `ToolExecutionCtx` construction site in
+    /// `main_loop.rs`.
+    pub(crate) async fn correction_context_for_current_goal(
+        &self,
+    ) -> Option<Arc<crate::agent::correction_execution::CorrectionExecutionContext>> {
+        let goal_id = self.goal_id.as_deref()?;
+        self.correction_contexts.read().await.get(goal_id).cloned()
+    }
+
+    /// Remove the correction-execution context for a remediation goal id once the
+    /// remediation task has finished. Idempotent. Called by the dispatch's
+    /// teardown so completed remediations do not linger in the bounded map.
+    ///
+    /// Tolerated as dead until the live teardown caller lands in a later 3c task.
+    #[allow(dead_code)]
+    pub(crate) async fn clear_correction_context(&self, goal_id: &str) {
+        self.correction_contexts.write().await.remove(goal_id);
+    }
+
+    /// Test-only: number of registered correction contexts.
+    #[cfg(test)]
+    pub(crate) async fn correction_context_count(&self) -> usize {
+        self.correction_contexts.read().await.len()
     }
 
     pub(crate) fn render_options(&self, model: &str) -> turn_render::RenderOptions {

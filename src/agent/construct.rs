@@ -167,6 +167,7 @@ impl Agent {
             stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
+            correction_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -303,6 +304,14 @@ impl Agent {
         audio_config: AudioConfig,
         stt_config: SttConfig,
         harness_eval_config: HarnessEvalConfig,
+        correction_contexts: Arc<
+            tokio::sync::RwLock<
+                HashMap<
+                    String,
+                    Arc<crate::agent::correction_execution::CorrectionExecutionContext>,
+                >,
+            >,
+        >,
     ) -> Self {
         let fallback = llm_runtime
             .router()
@@ -369,6 +378,9 @@ impl Agent {
             stt_config,
             harness_eval: Arc::new(RwLock::new(None)),
             harness_eval_config,
+            // Shared with the spawning parent so the remediation hierarchy
+            // (task-lead + executors) all see the same registered context.
+            correction_contexts,
         }
     }
 }
