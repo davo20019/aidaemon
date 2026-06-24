@@ -537,6 +537,7 @@ mod background_task_lead;
 pub use background_task_lead::spawn_background_task_lead;
 
 pub mod correction_execution;
+pub mod correction_intent;
 pub mod correction_sandbox;
 pub mod self_correction;
 
