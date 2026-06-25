@@ -360,13 +360,25 @@ impl Agent {
         // Skipped for conversational queries, short messages, and acknowledgments.
         // In tests, MockProvider silently intercepts planning calls (skip_planning_calls=true).
         {
-            use super::bootstrap_phase::task_planning::{generate_task_plan, should_skip_planning};
+            use super::bootstrap_phase::task_planning::{generate_task_plan, planning_skip_reason};
             use crate::agent::execution_state::LinearIntentStep;
-            if !should_skip_planning(
-                &turn_context.completion_contract.task_kind,
-                user_text,
-                false,
-            ) {
+            let planner_trust_tier = self.trust_tier_for_model(&model).as_str();
+            let planner_skip_reason = planning_skip_reason(user_text, false);
+            if let Some(reason) = planner_skip_reason {
+                self.emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    crate::events::DecisionType::HandHoldingTelemetry,
+                    "Task planner skipped".to_string(),
+                    super::hand_holding_telemetry::planner_skip_metadata(
+                        reason,
+                        &model,
+                        planner_trust_tier,
+                    ),
+                )
+                .await;
+            } else {
                 // Build conversation context from recent messages for the planner.
                 // This ensures the planner sees the same narrative as the main LLM,
                 // preventing intent loss across multi-hop follow-ups.
@@ -395,17 +407,54 @@ impl Agent {
                     }
                 };
                 let plan_opt = if let Some(ref router) = llm_router {
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        crate::events::DecisionType::HandHoldingTelemetry,
+                        "Task planner attempted".to_string(),
+                        super::hand_holding_telemetry::planner_result_metadata(
+                            "attempted",
+                            &model,
+                            planner_trust_tier,
+                            super::hand_holding_telemetry::PlannerResultStats::empty(),
+                            None,
+                        ),
+                    )
+                    .await;
                     generate_task_plan(
                         llm_provider.clone(),
                         router,
                         user_text,
                         planner_context.as_deref(),
+                        Some(super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
+                            emitter: &emitter,
+                            state: self.state.as_ref(),
+                            session_id,
+                            task_id: &task_id,
+                        }),
                     )
                     .await
                 } else {
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        crate::events::DecisionType::HandHoldingTelemetry,
+                        "Task planner unavailable".to_string(),
+                        super::hand_holding_telemetry::planner_result_metadata(
+                            "no_plan",
+                            &model,
+                            planner_trust_tier,
+                            super::hand_holding_telemetry::PlannerResultStats::empty(),
+                            Some("no_router"),
+                        ),
+                    )
+                    .await;
                     None
                 };
                 if let Some(plan) = plan_opt {
+                    let before_contract = turn_context.completion_contract.clone();
                     // The planner read the actual request (any language), so
                     // its contract classification refines the English-keyword
                     // inference. Explicit user verification requests are
@@ -415,14 +464,13 @@ impl Agent {
                             .task_kind
                             .as_deref()
                             .and_then(crate::agent::parse_planned_task_kind);
-                        let before = turn_context.completion_contract.clone();
                         crate::agent::apply_planned_contract_signals(
                             &mut turn_context.completion_contract,
                             signals.expects_mutation,
                             signals.requires_observation,
                             planned_kind,
                         );
-                        if turn_context.completion_contract != before {
+                        if turn_context.completion_contract != before_contract {
                             info!(
                                 session_id,
                                 task_kind = ?turn_context.completion_contract.task_kind,
@@ -434,6 +482,27 @@ impl Agent {
                             );
                         }
                     }
+                    let contract_changed = turn_context.completion_contract != before_contract;
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        crate::events::DecisionType::HandHoldingTelemetry,
+                        "Task planner succeeded".to_string(),
+                        super::hand_holding_telemetry::planner_result_metadata(
+                            "succeeded",
+                            &model,
+                            planner_trust_tier,
+                            super::hand_holding_telemetry::PlannerResultStats {
+                                step_count: plan.steps.len(),
+                                success_criteria_count: plan.success_criteria.len(),
+                                contract_present: plan.contract.is_some(),
+                                contract_changed,
+                            },
+                            None,
+                        ),
+                    )
+                    .await;
                     let linear_steps: Vec<LinearIntentStep> = plan
                         .steps
                         .iter()
@@ -469,6 +538,22 @@ impl Agent {
                         step_count,
                         "Task plan installed and budget evaluated"
                     );
+                } else if llm_router.is_some() {
+                    self.emit_decision_point(
+                        &emitter,
+                        &task_id,
+                        0,
+                        crate::events::DecisionType::HandHoldingTelemetry,
+                        "Task planner returned no plan".to_string(),
+                        super::hand_holding_telemetry::planner_result_metadata(
+                            "no_plan",
+                            &model,
+                            planner_trust_tier,
+                            super::hand_holding_telemetry::PlannerResultStats::empty(),
+                            Some("planner_returned_none"),
+                        ),
+                    )
+                    .await;
                 }
             }
         }
@@ -1546,14 +1631,56 @@ impl Agent {
                             let tool_summary =
                                 summarize_tool_calls_for_replan(&learning_ctx.tool_calls, 8);
                             if let Some(ref router) = llm_router {
+                                self.emit_decision_point(
+                                    &emitter,
+                                    &task_id,
+                                    iteration,
+                                    crate::events::DecisionType::HandHoldingTelemetry,
+                                    "Replanner attempted step evaluation".to_string(),
+                                    super::hand_holding_telemetry::replanner_result_metadata(
+                                        "attempted",
+                                        &model,
+                                        self.trust_tier_for_model(&model).as_str(),
+                                        step.step_index,
+                                        &step.description,
+                                        false,
+                                        None,
+                                    ),
+                                )
+                                .await;
                                 if let Some(evidence) = evaluate_step_completion(
                                     llm_provider.clone(),
                                     router,
                                     &step.description,
                                     &tool_summary,
+                                    Some(
+                                        super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
+                                            emitter: &emitter,
+                                            state: self.state.as_ref(),
+                                            session_id,
+                                            task_id: &task_id,
+                                        },
+                                    ),
                                 )
                                 .await
                                 {
+                                    self.emit_decision_point(
+                                        &emitter,
+                                        &task_id,
+                                        iteration,
+                                        crate::events::DecisionType::HandHoldingTelemetry,
+                                        "Replanner advanced current step".to_string(),
+                                        super::hand_holding_telemetry::replanner_result_metadata(
+                                            "advanced",
+                                            &model,
+                                            self.trust_tier_for_model(&model).as_str(),
+                                            step.step_index,
+                                            &step.description,
+                                            true,
+                                            Some(&evidence),
+                                        ),
+                                    )
+                                    .await;
                                     if let Some(ref mut plan) =
                                         execution_state.active_linear_intent_plan
                                     {
@@ -1564,6 +1691,24 @@ impl Agent {
                                             "Re-planner advanced plan to next step"
                                         );
                                     }
+                                } else {
+                                    self.emit_decision_point(
+                                        &emitter,
+                                        &task_id,
+                                        iteration,
+                                        crate::events::DecisionType::HandHoldingTelemetry,
+                                        "Replanner did not advance current step".to_string(),
+                                        super::hand_holding_telemetry::replanner_result_metadata(
+                                            "not_advanced",
+                                            &model,
+                                            self.trust_tier_for_model(&model).as_str(),
+                                            step.step_index,
+                                            &step.description,
+                                            false,
+                                            None,
+                                        ),
+                                    )
+                                    .await;
                                 }
                             }
                         }

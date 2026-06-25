@@ -456,6 +456,7 @@ pub enum DecisionType {
     LlmEfficiencyAlert,
     CoreProfileSelection,
     GateTelemetry,
+    HandHoldingTelemetry,
 }
 
 impl DecisionType {
@@ -483,6 +484,7 @@ impl DecisionType {
             DecisionType::BudgetAutoExtension => "budget_auto_extension",
             DecisionType::LlmEfficiencyAlert => "llm_efficiency_alert",
             DecisionType::GateTelemetry => "gate_telemetry",
+            DecisionType::HandHoldingTelemetry => "hand_holding_telemetry",
         }
     }
 }
@@ -1390,6 +1392,30 @@ mod tests {
     #[test]
     fn gate_telemetry_decision_type_has_stable_label() {
         assert_eq!(DecisionType::GateTelemetry.as_str(), "gate_telemetry");
+    }
+
+    #[test]
+    fn hand_holding_telemetry_decision_type_has_stable_label() {
+        assert_eq!(
+            DecisionType::HandHoldingTelemetry.as_str(),
+            "hand_holding_telemetry"
+        );
+        let json = serde_json::to_value(DecisionPointData {
+            decision_type: DecisionType::HandHoldingTelemetry,
+            task_id: "task-handholding".to_string(),
+            iteration: 0,
+            severity: DiagnosticSeverity::Info,
+            code: Some("task_planner_result".to_string()),
+            metadata: json!({
+                "component": "task_planner",
+                "action": "succeeded"
+            }),
+            summary: "Task planner succeeded".to_string(),
+        })
+        .expect("serialize decision point");
+        let parsed: DecisionPointData =
+            serde_json::from_value(json).expect("deserialize decision point");
+        assert_eq!(parsed.decision_type, DecisionType::HandHoldingTelemetry);
     }
 
     #[test]

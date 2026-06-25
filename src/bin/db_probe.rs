@@ -380,6 +380,156 @@ async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> a
     Ok(())
 }
 
+async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!(
+        "== Hand-Holding Telemetry Summary (Last {} Hours) ==",
+        hours
+    );
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          json_extract(data, '$.metadata.component') AS component,
+          json_extract(data, '$.metadata.action') AS action,
+          json_extract(data, '$.metadata.reason') AS reason,
+          json_extract(data, '$.metadata.model') AS model,
+          json_extract(data, '$.metadata.trust_tier') AS trust_tier,
+          COUNT(*) AS fires
+        FROM events
+        WHERE event_type = 'decision_point'
+          AND json_extract(data, '$.decision_type') = 'hand_holding_telemetry'
+          AND created_at >= ?
+        GROUP BY component, action, reason, model, trust_tier
+        ORDER BY fires DESC, component, action
+        "#,
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        println!("- no hand_holding_telemetry decision points found");
+    } else {
+        println!("Hand-holding events:");
+        for row in rows {
+            println!(
+                "- component={} action={} reason={} model={} tier={} fires={}",
+                row.try_get::<Option<String>, _>("component")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("action")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("reason")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("model")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("trust_tier")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.get::<i64, _>("fires"),
+            );
+        }
+    }
+
+    let outcome_rows = sqlx::query(
+        r#"
+        SELECT
+          json_extract(dp.data, '$.metadata.component') AS component,
+          json_extract(dp.data, '$.metadata.action') AS action,
+          COALESCE(
+            json_extract(te.data, '$.outcome'),
+            CASE json_extract(te.data, '$.status')
+              WHEN 'completed' THEN 'succeeded'
+              ELSE 'failed'
+            END
+          ) AS outcome,
+          COUNT(DISTINCT dp.task_id) AS tasks,
+          COUNT(*) AS fires,
+          ROUND(AVG(json_extract(te.data, '$.duration_secs')), 1) AS avg_secs,
+          ROUND(AVG(json_extract(te.data, '$.efficiency.llm_calls')), 1) AS avg_llm_calls,
+          ROUND(AVG(
+            json_extract(te.data, '$.efficiency.input_tokens')
+            + json_extract(te.data, '$.efficiency.output_tokens')
+          ), 0) AS avg_tokens
+        FROM events dp
+        LEFT JOIN events te ON te.task_id = dp.task_id AND te.event_type = 'task_end'
+        WHERE dp.event_type = 'decision_point'
+          AND json_extract(dp.data, '$.decision_type') = 'hand_holding_telemetry'
+          AND dp.created_at >= ?
+        GROUP BY component, action, outcome
+        ORDER BY component, action, outcome
+        "#,
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    println!("\nJoined to task outcomes:");
+    if outcome_rows.is_empty() {
+        println!("- no hand-holding events to join");
+    } else {
+        for row in outcome_rows {
+            println!(
+                "- component={} action={} outcome={} tasks={} fires={} avg_secs={} avg_llm_calls={} avg_tokens={}",
+                row.try_get::<Option<String>, _>("component")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("action")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("outcome")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.get::<i64, _>("tasks"),
+                row.get::<i64, _>("fires"),
+                row.try_get::<Option<f64>, _>("avg_secs")?.unwrap_or(0.0),
+                row.try_get::<Option<f64>, _>("avg_llm_calls")?
+                    .unwrap_or(0.0),
+                row.try_get::<Option<f64>, _>("avg_tokens")?.unwrap_or(0.0),
+            );
+        }
+    }
+
+    let gate_rows = sqlx::query(
+        r#"
+        SELECT
+          json_extract(data, '$.metadata.heuristic') AS heuristic,
+          json_extract(data, '$.metadata.action') AS action,
+          json_extract(data, '$.metadata.tier') AS tier,
+          json_extract(data, '$.metadata.model') AS model,
+          COUNT(*) AS fires
+        FROM events
+        WHERE event_type = 'decision_point'
+          AND json_extract(data, '$.decision_type') = 'gate_telemetry'
+          AND json_extract(data, '$.metadata.code') = 'supervision_gate_fire'
+          AND created_at >= ?
+        GROUP BY heuristic, action, tier, model
+        ORDER BY fires DESC
+        "#,
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    println!("\nSupervision gates:");
+    if gate_rows.is_empty() {
+        println!("- no supervision_gate_fire events found");
+    } else {
+        for row in gate_rows {
+            println!(
+                "- heuristic={} action={} tier={} model={} fires={}",
+                row.try_get::<Option<String>, _>("heuristic")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("action")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("tier")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.try_get::<Option<String>, _>("model")?
+                    .unwrap_or_else(|| "-".to_string()),
+                row.get::<i64, _>("fires"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn record_fixture_from_session(
     pool: &SqlitePool,
     session_id: &str,
@@ -528,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
         .find(|w| w[0] == "--eval-task")
         .map(|w| w[1].clone());
     let eval_summary = args.iter().any(|arg| arg == "--eval-summary");
+    let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -595,6 +746,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if eval_summary {
         print_eval_summary(&pool, eval_hours, !eval_include_subagents).await?;
+        return Ok(());
+    }
+    if handholding_summary {
+        print_handholding_summary(&pool, eval_hours).await?;
         return Ok(());
     }
     if let Some(session_id) = record_fixture_session.as_deref() {

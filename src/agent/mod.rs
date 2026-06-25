@@ -236,6 +236,8 @@ pub(in crate::agent) use llm::LlmCallTelemetry;
 pub(crate) mod attachment_content;
 pub(crate) mod audio;
 pub(in crate::agent) mod eval;
+#[path = "loop/hand_holding_telemetry.rs"]
+mod hand_holding_telemetry;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
 #[path = "loop/main_loop.rs"]
