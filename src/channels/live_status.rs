@@ -55,14 +55,23 @@ impl LiveStatus {
             (Some(id), true) => match sink.edit(id, &body).await {
                 Ok(true) => {}
                 _ => {
-                    // Edit failed/unsupported: send once, then stop editing.
+                    // First edit failure: stop editing for the rest of the turn and
+                    // send a fresh message instead.
                     self.edit_supported = false;
                     if let Ok(Some(new_id)) = sink.create(&body).await {
                         self.message_id = Some(new_id);
                     }
                 }
             },
-            _ => {
+            (Some(_), false) => {
+                // Editing is disabled for this turn after an earlier failure: fall back
+                // to today's throttled send behavior — a fresh message per update, so
+                // progress is never lost (the consumer applies the 3s throttle).
+                if let Ok(Some(new_id)) = sink.create(&body).await {
+                    self.message_id = Some(new_id);
+                }
+            }
+            (None, _) => {
                 if let Ok(Some(id)) = sink.create(&body).await {
                     self.message_id = Some(id);
                 }
@@ -215,15 +224,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_send_when_edit_fails() {
+    async fn keeps_sending_after_edit_fallback() {
         let sink = FakeSink::new(false); // edits always fail
         let mut s = LiveStatus::new();
-        s.set_activity(&sink, "first".into()).await; // create
-        s.set_activity(&sink, "second".into()).await; // edit fails -> create again
+        s.set_activity(&sink, "first".into()).await; // create #1
+        s.set_activity(&sink, "second".into()).await; // edit fails -> create #2
+        s.set_activity(&sink, "third".into()).await; // still no edit -> create #3
         assert_eq!(
             sink.creates.lock().unwrap().len(),
-            2,
-            "fell back to a fresh send"
+            3,
+            "post-fallback updates keep sending fresh messages; progress is never lost"
+        );
+        assert_eq!(
+            sink.edits.lock().unwrap().len(),
+            1,
+            "edit attempted once, then disabled"
         );
     }
 
