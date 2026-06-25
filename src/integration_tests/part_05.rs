@@ -299,7 +299,7 @@ async fn test_full_stack_status_updates_received() {
         matches!(
             u,
             StatusUpdate::ToolStart { name, summary }
-                if name == "running a command" && summary.contains("echo hello")
+                if name == "running a command" && summary.is_empty()
         )
     });
     let has_tool_complete = updates.iter().any(
@@ -326,7 +326,7 @@ async fn test_full_stack_status_updates_received() {
     );
     assert!(
         dm_start_shows_command,
-        "Private-DM ToolStart should carry the redacted command. Updates: {:?}",
+        "Private-DM ToolStart should suppress the command summary. Updates: {:?}",
         updates
     );
 }

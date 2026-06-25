@@ -726,13 +726,12 @@ pub fn user_facing_tool_activity(
 
     let label = friendly_tool_label(name);
 
-    if summary_is_command_bearing(name)
-        && !matches!(visibility, crate::types::ChannelVisibility::Private)
-    {
-        // Never expose the raw command / absolute paths outside a 1-on-1 DM.
-        // Any new visibility variant lands here (fail closed).
+    if summary_is_command_bearing(name) {
+        // Never expose the raw command / absolute paths in any user-facing
+        // surface. The full command stays in tool results and logs for the LLM.
         return (label, String::new());
     }
+    let _ = visibility; // retained for signature compatibility / other callers
 
     let cleaned = shorten_home_dir(summary);
     let cleaned = redact_secrets(&cleaned);
@@ -1116,15 +1115,28 @@ mod tests {
     }
 
     #[test]
-    fn user_facing_activity_shows_redacted_command_in_private_dm() {
-        let summary = "`curl -H \"Authorization: Bearer abc123\" https://api.example.com`";
+    fn command_summary_suppressed_in_private_dm() {
+        let (label, summary) = user_facing_tool_activity(
+            "terminal",
+            "`cd '/tmp' && python3 /tmp/netprobe3.py`",
+            crate::types::ChannelVisibility::Private,
+        );
+        assert_eq!(label, "running a command");
+        assert_eq!(summary, "", "raw command must not reach chat even in a DM");
+    }
+
+    #[test]
+    fn user_facing_activity_suppresses_all_commands() {
+        // Commands are now suppressed in all channel visibilities, including Private.
+        // The full command still flows to the LLM via tool results — this only
+        // changes the user-facing status text projection.
+        let summary = "`curl -H \"Authorization: Bearer xyz789\" https://api.example.com`";
         let (label, clean) =
             user_facing_tool_activity("terminal", summary, ChannelVisibility::Private);
         assert_eq!(label, "running a command");
-        assert!(clean.contains("curl"), "command should be visible: {clean}");
-        assert!(
-            !clean.contains("abc123"),
-            "secret must be redacted: {clean}"
+        assert_eq!(
+            clean, "",
+            "commands must never appear in user-facing status"
         );
     }
 
