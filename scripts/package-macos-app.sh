@@ -14,6 +14,7 @@
 #   scripts/package-macos-app.sh                 # uses target/release if present, else target/debug
 #   scripts/package-macos-app.sh --debug         # force the debug build
 #   scripts/package-macos-app.sh --build         # cargo build --release --features computer_use-macos first
+#   scripts/package-macos-app.sh --build --debug # fast DEBUG build (no release opt) — for local/dev
 #
 # See COMPUTER_USE_MACOS.md for the full walkthrough.
 set -euo pipefail
@@ -39,9 +40,17 @@ for arg in "$@"; do
 done
 
 if [ "$DO_BUILD" = "1" ]; then
-  echo "Building release with computer_use-macos..."
-  ( cd "$PROJECT_DIR" && cargo build --release --features computer_use-macos )
-  PROFILE="release"
+  if [ "$PROFILE" = "debug" ]; then
+    # Fast dev path: skip release optimization/LTO. Compiles far quicker; the
+    # binary runs slower, which is fine for local iteration.
+    echo "Building DEBUG (fast, local/dev) with computer_use-macos..."
+    ( cd "$PROJECT_DIR" && cargo build --features computer_use-macos )
+    PROFILE="debug"
+  else
+    echo "Building release with computer_use-macos..."
+    ( cd "$PROJECT_DIR" && cargo build --release --features computer_use-macos )
+    PROFILE="release"
+  fi
 fi
 
 if [ -z "$PROFILE" ]; then
