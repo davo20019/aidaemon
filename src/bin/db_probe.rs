@@ -185,6 +185,16 @@ fn token_only_breakdown(
     }
 }
 
+fn handholding_detail_label(reason: Option<&str>, error: Option<&str>) -> String {
+    if let Some(reason) = reason.filter(|value| !value.is_empty()) {
+        return format!("reason={reason}");
+    }
+    if let Some(error) = error.filter(|value| !value.is_empty()) {
+        return format!("error={error}");
+    }
+    "detail=-".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +303,19 @@ mod tests {
         assert_eq!(counts.legacy_token_rows, 1);
         assert_eq!(counts.legacy_event_rows, 2);
     }
+
+    #[test]
+    fn handholding_detail_prefers_reason_then_error() {
+        assert_eq!(
+            handholding_detail_label(Some("control_command"), Some("ignored")),
+            "reason=control_command"
+        );
+        assert_eq!(
+            handholding_detail_label(None, Some("planner_returned_none")),
+            "error=planner_returned_none"
+        );
+        assert_eq!(handholding_detail_label(None, None), "detail=-");
+    }
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
@@ -393,6 +416,7 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
           json_extract(data, '$.metadata.component') AS component,
           json_extract(data, '$.metadata.action') AS action,
           json_extract(data, '$.metadata.reason') AS reason,
+          json_extract(data, '$.metadata.error') AS error,
           json_extract(data, '$.metadata.model') AS model,
           json_extract(data, '$.metadata.trust_tier') AS trust_tier,
           COUNT(*) AS fires
@@ -400,7 +424,7 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
         WHERE event_type = 'decision_point'
           AND json_extract(data, '$.decision_type') = 'hand_holding_telemetry'
           AND created_at >= ?
-        GROUP BY component, action, reason, model, trust_tier
+        GROUP BY component, action, reason, error, model, trust_tier
         ORDER BY fires DESC, component, action
         "#,
     )
@@ -414,13 +438,15 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
         println!("Hand-holding events:");
         for row in rows {
             println!(
-                "- component={} action={} reason={} model={} tier={} fires={}",
+                "- component={} action={} {} model={} tier={} fires={}",
                 row.try_get::<Option<String>, _>("component")?
                     .unwrap_or_else(|| "-".to_string()),
                 row.try_get::<Option<String>, _>("action")?
                     .unwrap_or_else(|| "-".to_string()),
-                row.try_get::<Option<String>, _>("reason")?
-                    .unwrap_or_else(|| "-".to_string()),
+                handholding_detail_label(
+                    row.try_get::<Option<String>, _>("reason")?.as_deref(),
+                    row.try_get::<Option<String>, _>("error")?.as_deref(),
+                ),
                 row.try_get::<Option<String>, _>("model")?
                     .unwrap_or_else(|| "-".to_string()),
                 row.try_get::<Option<String>, _>("trust_tier")?
@@ -435,6 +461,8 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
         SELECT
           json_extract(dp.data, '$.metadata.component') AS component,
           json_extract(dp.data, '$.metadata.action') AS action,
+          json_extract(dp.data, '$.metadata.reason') AS reason,
+          json_extract(dp.data, '$.metadata.error') AS error,
           COALESCE(
             json_extract(te.data, '$.outcome'),
             CASE json_extract(te.data, '$.status')
@@ -455,8 +483,8 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
         WHERE dp.event_type = 'decision_point'
           AND json_extract(dp.data, '$.decision_type') = 'hand_holding_telemetry'
           AND dp.created_at >= ?
-        GROUP BY component, action, outcome
-        ORDER BY component, action, outcome
+        GROUP BY component, action, reason, error, outcome
+        ORDER BY component, action, reason, error, outcome
         "#,
     )
     .bind(&cutoff)
@@ -469,11 +497,15 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
     } else {
         for row in outcome_rows {
             println!(
-                "- component={} action={} outcome={} tasks={} fires={} avg_secs={} avg_llm_calls={} avg_tokens={}",
+                "- component={} action={} {} outcome={} tasks={} fires={} avg_secs={} avg_llm_calls={} avg_tokens={}",
                 row.try_get::<Option<String>, _>("component")?
                     .unwrap_or_else(|| "-".to_string()),
                 row.try_get::<Option<String>, _>("action")?
                     .unwrap_or_else(|| "-".to_string()),
+                handholding_detail_label(
+                    row.try_get::<Option<String>, _>("reason")?.as_deref(),
+                    row.try_get::<Option<String>, _>("error")?.as_deref(),
+                ),
                 row.try_get::<Option<String>, _>("outcome")?
                     .unwrap_or_else(|| "-".to_string()),
                 row.get::<i64, _>("tasks"),

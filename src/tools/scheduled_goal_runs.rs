@@ -448,6 +448,26 @@ impl ScheduledGoalRunsTool {
             blocked
         );
 
+        let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+        let coalesces = schedules.iter().any(|s| s.fire_policy != "always_fire");
+        let open_tasks: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"))
+            .collect();
+        if coalesces && !open_tasks.is_empty() {
+            out.push_str("\n**Open task(s) blocking coalesced schedule fires**");
+            for t in open_tasks.iter().take(5) {
+                out.push_str(&format!(
+                    "\n- **{}** status={} created={} desc={}",
+                    t.id,
+                    t.status,
+                    t.created_at,
+                    Self::truncate(&t.description, 160)
+                ));
+            }
+            out.push('\n');
+        }
+
         for t in &tasks {
             let activities = self
                 .state
@@ -842,6 +862,78 @@ mod tests {
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn run_history_reports_open_tasks_as_schedule_blockers() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let goal = Goal::new_continuous(
+            "Post daily optimized tweets",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let next_run = crate::cron_utils::compute_next_run("0 9 * * *")
+            .unwrap()
+            .to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily at 9am".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: next_run,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let open_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Analyze fetched engagement metrics".to_string(),
+            status: "pending".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&open_task).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "run_history",
+                    "goal_id": goal_id
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Open task(s) blocking coalesced schedule fires"));
+        assert!(result.contains("Analyze fetched engagement metrics"));
     }
 
     #[tokio::test]

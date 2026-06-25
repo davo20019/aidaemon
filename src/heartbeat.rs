@@ -467,6 +467,12 @@ impl HeartbeatCoordinator {
             }
         }
 
+        // Phase 1d: Pending tasks whose dependencies reached terminal failure
+        // can never dispatch. Mark them blocked before schedule coalescing so
+        // stale dependent work does not suppress future scheduled runs forever.
+        self.block_pending_tasks_with_terminal_failed_dependencies()
+            .await;
+
         // Phase 2: Fire due schedules (recurring + one-shot)
         self.check_due_goal_schedules().await;
 
@@ -551,6 +557,75 @@ impl HeartbeatCoordinator {
             );
             if let Err(e) = self.state.mark_task_interrupted(&task.id).await {
                 error!(task_id = %task.id, error = %e, "Failed to mark stuck task");
+            }
+        }
+    }
+
+    async fn block_pending_tasks_with_terminal_failed_dependencies(&self) {
+        let goals = match self.state.get_active_goals().await {
+            Ok(g) => g,
+            Err(e) => {
+                error!(error = %e, "Failed to get active goals for pending dependency cleanup");
+                return;
+            }
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let terminal_failed = |status: &str| {
+            matches!(
+                status,
+                "failed" | "blocked" | "interrupted" | "cancelled" | "abandoned"
+            )
+        };
+
+        for goal in &goals {
+            let tasks = match self.state.get_tasks_for_goal(&goal.id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(goal_id = %goal.id, error = %e, "Failed to get tasks for pending dependency cleanup");
+                    continue;
+                }
+            };
+            let by_id: std::collections::HashMap<&str, &crate::traits::Task> =
+                tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+            for task in tasks.iter().filter(|t| t.status == "pending") {
+                let Some(deps_json) = task.depends_on.as_deref() else {
+                    continue;
+                };
+                let deps: Vec<String> = serde_json::from_str(deps_json).unwrap_or_default();
+                let Some(failed_dep) = deps
+                    .iter()
+                    .filter_map(|dep_id| by_id.get(dep_id.as_str()))
+                    .find(|dep| terminal_failed(&dep.status))
+                else {
+                    continue;
+                };
+
+                let mut updated = task.clone();
+                updated.status = "blocked".to_string();
+                updated.blocker = Some(format!(
+                    "Dependency {} ended with status {} before this task could run.",
+                    failed_dep.id, failed_dep.status
+                ));
+                updated.completed_at = Some(now.clone());
+                if let Err(e) = self.state.update_task(&updated).await {
+                    error!(
+                        task_id = %task.id,
+                        goal_id = %goal.id,
+                        dependency_id = %failed_dep.id,
+                        error = %e,
+                        "Failed to block pending task with terminal failed dependency"
+                    );
+                } else {
+                    warn!(
+                        task_id = %task.id,
+                        goal_id = %goal.id,
+                        dependency_id = %failed_dep.id,
+                        dependency_status = %failed_dep.status,
+                        "Blocked pending task with terminal failed dependency"
+                    );
+                }
             }
         }
     }
@@ -1789,6 +1864,109 @@ mod tests {
             .expect("schedule should still exist");
         let next = chrono::DateTime::parse_from_rfc3339(&updated_sched.next_run_at).unwrap();
         assert!(next.with_timezone(&chrono::Utc) > now);
+    }
+
+    #[tokio::test]
+    async fn test_pending_task_with_interrupted_dependency_does_not_block_next_schedule_fire() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let goal = Goal::new_continuous("Daily dependency cleanup test", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let dependency = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Fetch prerequisite data".to_string(),
+            status: "interrupted".to_string(),
+            priority: "low".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: Some("agent-1".to_string()),
+            context: None,
+            result: None,
+            error: Some("interrupted".to_string()),
+            blocker: None,
+            idempotent: true,
+            retry_count: 1,
+            max_retries: 1,
+            created_at: (now - chrono::Duration::minutes(10)).to_rfc3339(),
+            started_at: Some((now - chrono::Duration::minutes(9)).to_rfc3339()),
+            completed_at: Some((now - chrono::Duration::minutes(5)).to_rfc3339()),
+        };
+        state.create_task(&dependency).await.unwrap();
+
+        let dependent = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Analyze prerequisite data".to_string(),
+            status: "pending".to_string(),
+            priority: "low".to_string(),
+            task_order: 2,
+            parallel_group: None,
+            depends_on: Some(serde_json::json!([dependency.id.clone()]).to_string()),
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: (now - chrono::Duration::minutes(9)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&dependent).await.unwrap();
+
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: due_ts,
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        let dependent_after = tasks
+            .iter()
+            .find(|t| t.id == dependent.id)
+            .expect("dependent task should still exist");
+        assert_eq!(dependent_after.status, "blocked");
+
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.description.starts_with("Scheduled check:")),
+            "new scheduled run should be enqueued after unfulfillable pending dependency is blocked"
+        );
     }
 
     #[tokio::test]
