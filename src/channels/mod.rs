@@ -6,6 +6,7 @@ pub(crate) mod connect;
 mod discord;
 mod formatting;
 mod hub;
+pub(crate) mod live_status;
 #[cfg(feature = "slack")]
 mod slack;
 pub(crate) mod telegram;
