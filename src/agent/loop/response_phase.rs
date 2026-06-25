@@ -217,25 +217,10 @@ async fn checklist_completion_gate(
                 }),
             )
             .await;
-        if let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) {
-            match plan
-                .checkpoint
-                .get("ui_message_id")
-                .and_then(|v| v.as_str())
-            {
-                // Live message exists: edit it to its final state in place — no
-                // extra recap message (the evolving checklist is the recap).
-                Some(mid) => {
-                    let _ = hub
-                        .edit_text(session_id, mid, &plan.render_compact_checklist())
-                        .await;
-                }
-                // Fallback channel (no editing): post the recap as a new message.
-                None => {
-                    let _ = hub.send_text(session_id, &plan.render_recap()).await;
-                }
-            }
-        }
+        // The final checklist state is surfaced through the single live status
+        // surface (StatusUpdate::Checklist), emitted from the tool-execution loop
+        // as the checklist evolves. Final-answer delivery is owned elsewhere, so
+        // this phase no longer posts/edits channel messages directly.
     }
     None
 }

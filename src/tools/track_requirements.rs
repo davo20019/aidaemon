@@ -2,37 +2,21 @@
 //! checklist of requirements for the current multi-step / deferred-action turn.
 //! Full-set replace each call (like a todo tool). Backed by the `plans/` store.
 
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::channels::ChannelHub;
 use crate::plans::{PlanStore, StepStatus};
 use crate::traits::{Tool, ToolCapabilities};
 
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
-    /// Set after ChannelHub creation (core.rs ordering), mirroring the terminal
-    /// tool's deferred hub wiring. `None` until set; channel posts are skipped
-    /// until then (and in tests).
-    hub: OnceLock<Weak<ChannelHub>>,
 }
 
 impl TrackRequirementsTool {
     pub fn new(plan_store: Arc<PlanStore>) -> Self {
-        Self {
-            plan_store,
-            hub: OnceLock::new(),
-        }
-    }
-
-    pub fn set_hub(&self, hub: Weak<ChannelHub>) {
-        let _ = self.hub.set(hub);
-    }
-
-    fn get_hub(&self) -> Option<Arc<ChannelHub>> {
-        self.hub.get().and_then(|w| w.upgrade())
+        Self { plan_store }
     }
 }
 
@@ -140,14 +124,6 @@ impl Tool for TrackRequirementsTool {
             return Ok("track_requirements: no items provided.".to_string());
         }
 
-        // Was there already a checklist for this session? (decides whether to post.)
-        let had_existing = matches!(
-            self.plan_store
-                .get_incomplete_for_session(&session_id)
-                .await,
-            Ok(Some(_))
-        );
-
         let plan = match self
             .plan_store
             .upsert_checklist(
@@ -166,33 +142,9 @@ impl Tool for TrackRequirementsTool {
             }
         };
 
-        // Surface the checklist to the user. On first creation, post a tracked
-        // message and remember its id so later updates edit it in place (☐→✅)
-        // on channels that support editing (Telegram). Channels that don't track
-        // return None and fall back to the start-post + recap behavior.
-        if let Some(hub) = self.get_hub() {
-            if !had_existing {
-                if let Ok(Some(mid)) = hub
-                    .send_text_tracked(&session_id, &plan.render_compact_checklist())
-                    .await
-                {
-                    let _ = self
-                        .plan_store
-                        .set_checkpoint(&plan.id, "ui_message_id", json!(mid))
-                        .await;
-                }
-            } else if let Some(mid) = plan
-                .checkpoint
-                .get("ui_message_id")
-                .and_then(|v| v.as_str())
-            {
-                // Subsequent update: edit the tracked message in place.
-                let _ = hub
-                    .edit_text(&session_id, mid, &plan.render_compact_checklist())
-                    .await;
-            }
-        }
-
+        // The rendered checklist is returned to the agent loop, which surfaces it
+        // to the user via the single live status surface (StatusUpdate::Checklist).
+        // This tool no longer posts/edits channel messages directly.
         Ok(format!(
             "Checklist updated ({}/{} done):\n{}",
             plan.completed_steps(),
@@ -214,7 +166,8 @@ mod tests {
             .await
             .unwrap();
         let plan_store = Arc::new(PlanStore::new(pool).await.unwrap());
-        // No hub set: channel posts are skipped (deferred wiring happens in core.rs).
+        // The tool only persists checklist state; UI delivery is handled by the
+        // agent loop via StatusUpdate::Checklist, so there is no hub to wire here.
         (TrackRequirementsTool::new(plan_store.clone()), plan_store)
     }
 

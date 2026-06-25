@@ -45,6 +45,7 @@ async fn reconcile_successful_tool_checklist(
     tool_name: &str,
     arguments: &str,
     result_text: &str,
+    status_tx: &Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
 ) {
     let Some(plan_store) = agent.plan_store.read().await.clone() else {
         return;
@@ -67,32 +68,15 @@ async fn reconcile_successful_tool_checklist(
         }
     };
 
-    let Some(message_id) = updated_plan
-        .checkpoint
-        .get("ui_message_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) else {
-        return;
-    };
-    if let Err(e) = hub
-        .edit_text(
-            session_id,
-            &message_id,
-            &updated_plan.render_compact_checklist(),
-        )
-        .await
-    {
-        warn!(
-            error = %e,
-            session_id,
-            tool = %tool_name,
-            "Failed to edit reconciled requirement checklist"
-        );
-    }
+    // Auto-completion already happened in `reconcile_checklist_after_tool_success`
+    // above; here we only surface the updated checklist to the user via the single
+    // live status surface instead of editing a channel message directly.
+    send_status(
+        status_tx,
+        StatusUpdate::Checklist {
+            text: updated_plan.render_compact_checklist(),
+        },
+    );
 }
 
 /// Per-call correction sandbox gate (Plan 3b P2.4).
@@ -1759,6 +1743,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &tc.name,
                 &effective_arguments,
                 &result_text,
+                &status_tx,
             )
             .await;
         }
@@ -1822,13 +1807,28 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     &complete_summary_src,
                     channel_ctx.visibility,
                 );
-            send_status(
-                &status_tx,
-                StatusUpdate::ToolComplete {
-                    name: complete_label,
-                    summary: complete_summary,
-                },
-            );
+            if tc.name == "track_requirements" {
+                // The checklist itself is the live surface for this tool. Emit the
+                // rendered checklist (parsed from the tool result) and suppress the
+                // generic ToolComplete so the surface does not flash "updating
+                // checklist…" over the freshly rendered list.
+                if let Some((_, checklist)) = result_text.split_once(":\n") {
+                    send_status(
+                        &status_tx,
+                        StatusUpdate::Checklist {
+                            text: checklist.to_string(),
+                        },
+                    );
+                }
+            } else {
+                send_status(
+                    &status_tx,
+                    StatusUpdate::ToolComplete {
+                        name: complete_label,
+                        summary: complete_summary,
+                    },
+                );
+            }
             let caps = available_capabilities
                 .get(&tc.name)
                 .copied()
