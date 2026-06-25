@@ -724,6 +724,56 @@ async fn background_ack_characterization_forces_text_with_handoff_directive() {
     );
 }
 
+// Task 5: when a root-agent turn moves a command to the background, the turn's
+// final user-facing answer must be a NEUTRAL handoff — never the model's premature
+// give-up summary ("Activity summary", "results were not provided"). The handoff is
+// enforced deterministically in the stopping phase, independent of model compliance
+// (the real result is delivered out-of-band by the completion notifier).
+#[tokio::test]
+async fn background_detach_delivers_neutral_handoff_not_giveup_summary() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
+        // If the loop ever reached a forced-text pass, the model would give up on
+        // empty stdout — this MUST NOT reach the user.
+        MockProvider::text_response(
+            "Activity summary: the command ran but the results were not provided.",
+        ),
+    ]);
+
+    // Root (depth-0) harness mirrors a real user turn, where the deterministic
+    // background handoff applies.
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(BackgroundDetachTool) as Arc<dyn Tool>],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "background_detach_neutral_handoff",
+            "Start a long running background job",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let lower = reply.to_lowercase();
+    assert!(
+        !lower.contains("results were not provided") && !lower.contains("activity summary"),
+        "the model's give-up summary must not be the final answer; got: {reply}"
+    );
+    assert!(
+        lower.contains("background") && lower.contains("running in the background"),
+        "the final answer must be the neutral background handoff; got: {reply}"
+    );
+}
+
 #[tokio::test]
 async fn contradictory_file_evidence_forces_recheck_before_final_answer() {
     let project_dir = tempfile::tempdir().unwrap();
