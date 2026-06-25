@@ -34,6 +34,13 @@ pub struct ChannelHub {
     /// Best-effort duplicate suppression for rapid-fire identical messages.
     /// Keyed by session_id.
     last_sent_text: RwLock<HashMap<String, (String, tokio::time::Instant)>>,
+    /// Short-window de-duplication of identical document deliveries to the same
+    /// session. Without it, a file the background notifier delivers
+    /// deterministically (Task 4) is sent a SECOND time when the model also calls
+    /// `send_file` for it (e.g. the user's request ends with "…then send me the
+    /// file"). Keyed by `(session_id, canonical file path)`; genuinely different
+    /// files (different paths) are never suppressed. Photos are never deduped.
+    recent_media_deliveries: RwLock<HashMap<String, tokio::time::Instant>>,
 }
 
 impl ChannelHub {
@@ -45,6 +52,47 @@ impl ChannelHub {
             queue_policy: None,
             delivery_note_agent: None,
             last_sent_text: RwLock::new(HashMap::new()),
+            recent_media_deliveries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// How long a delivered document suppresses an identical re-delivery.
+    const MEDIA_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// De-dup key for a media message, or `None` for media that should never be
+    /// deduped (in-memory photos have no stable identity).
+    fn media_dedupe_key(session_id: &str, media: &MediaMessage) -> Option<String> {
+        match &media.kind {
+            MediaKind::Document { file_path, .. } => Some(format!("{session_id}\u{1}{file_path}")),
+            MediaKind::Photo { .. } => None,
+        }
+    }
+
+    /// Claim a document delivery within the dedupe window. Returns `true` if this
+    /// is the first delivery (caller should proceed) or the media is unkeyable;
+    /// `false` if an identical document was already delivered to this session
+    /// recently (caller should skip). On a failed send, call
+    /// [`release_media_delivery`](Self::release_media_delivery) so a retry isn't
+    /// wrongly suppressed.
+    async fn claim_media_delivery(&self, session_id: &str, media: &MediaMessage) -> bool {
+        let Some(key) = Self::media_dedupe_key(session_id, media) else {
+            return true;
+        };
+        let now = tokio::time::Instant::now();
+        let mut log = self.recent_media_deliveries.write().await;
+        log.retain(|_, t| now.duration_since(*t) < Self::MEDIA_DEDUPE_WINDOW);
+        if log.contains_key(&key) {
+            return false;
+        }
+        log.insert(key, now);
+        true
+    }
+
+    /// Release a previously-claimed document delivery (used when the actual send
+    /// failed, so a later retry of the same file is not suppressed).
+    async fn release_media_delivery(&self, session_id: &str, media: &MediaMessage) {
+        if let Some(key) = Self::media_dedupe_key(session_id, media) {
+            self.recent_media_deliveries.write().await.remove(&key);
         }
     }
 
@@ -433,7 +481,17 @@ impl ChannelHub {
             let mut delivery_result: Result<(), String> = Ok(());
             if let Some(channel) = self.channel_for_session(&msg.session_id).await {
                 if channel.capabilities().media {
-                    if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
+                    // Skip a document already delivered to this session recently
+                    // (e.g. the notifier's deterministic delivery beat this
+                    // `send_file` to the same file). The file is already in the
+                    // chat, so report success to the enqueuing tool.
+                    if !self.claim_media_delivery(&msg.session_id, &msg).await {
+                        info!(
+                            session_id = %msg.session_id,
+                            "Suppressed duplicate document delivery from media queue (already delivered recently)"
+                        );
+                    } else if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
+                        self.release_media_delivery(&msg.session_id, &msg).await;
                         had_error = true;
                         delivery_result = Err(e.to_string());
                         warn!("Failed to send media via {}: {}", channel.name(), e);
@@ -544,7 +602,17 @@ impl ChannelHub {
     pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
         if let Some(channel) = self.channel_for_session(session_id).await {
             if channel.capabilities().media {
-                channel.send_media(session_id, media).await?;
+                if !self.claim_media_delivery(session_id, media).await {
+                    info!(
+                        session_id,
+                        "Suppressed duplicate document delivery (already delivered recently)"
+                    );
+                    return Ok(());
+                }
+                if let Err(e) = channel.send_media(session_id, media).await {
+                    self.release_media_delivery(session_id, media).await;
+                    return Err(e);
+                }
                 self.record_media_delivery_note(media).await;
                 Ok(())
             } else {
@@ -577,7 +645,21 @@ impl ChannelHub {
                 session_id
             );
         }
-        channel.send_media(session_id, media).await?;
+        // Suppress a duplicate of a document already delivered to this session
+        // within the dedupe window (e.g. the model's `send_file` racing the
+        // notifier's deterministic delivery of the same file). Treat as success —
+        // the file IS in the chat.
+        if !self.claim_media_delivery(session_id, media).await {
+            info!(
+                session_id,
+                "Suppressed duplicate document delivery (already delivered recently)"
+            );
+            return Ok(());
+        }
+        if let Err(e) = channel.send_media(session_id, media).await {
+            self.release_media_delivery(session_id, media).await;
+            return Err(e);
+        }
         self.record_media_delivery_note(media).await;
         Ok(())
     }
@@ -672,6 +754,103 @@ mod tests {
 
     fn empty_session_map() -> SessionMap {
         Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// A media-capable channel that counts how many documents it actually sent,
+    /// so tests can prove de-duplication suppressed a redundant delivery.
+    struct CountingMediaChannel {
+        sent_docs: Mutex<Vec<String>>, // file paths
+    }
+
+    impl CountingMediaChannel {
+        fn new() -> Self {
+            Self {
+                sent_docs: Mutex::new(Vec::new()),
+            }
+        }
+        async fn doc_count(&self) -> usize {
+            self.sent_docs.lock().await.len()
+        }
+    }
+
+    #[async_trait]
+    impl Channel for CountingMediaChannel {
+        fn name(&self) -> String {
+            "counting_media".to_string()
+        }
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                markdown: true,
+                inline_buttons: false,
+                media: true,
+                max_message_len: 4096,
+            }
+        }
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media(&self, _session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+            if let crate::types::MediaKind::Document { file_path, .. } = &media.kind {
+                self.sent_docs.lock().await.push(file_path.clone());
+            }
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _session_id: &str,
+            _command: &str,
+            _risk_level: RiskLevel,
+            _warnings: &[String],
+            _permission_mode: PermissionMode,
+        ) -> anyhow::Result<ApprovalResponse> {
+            Ok(ApprovalResponse::AllowOnce)
+        }
+    }
+
+    fn doc_msg(session_id: &str, file_path: &str, filename: &str) -> MediaMessage {
+        MediaMessage {
+            session_id: session_id.to_string(),
+            caption: filename.to_string(),
+            kind: crate::types::MediaKind::Document {
+                file_path: file_path.to_string(),
+                filename: filename.to_string(),
+            },
+            result_tx: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_media_strict_dedupes_identical_document_within_window() {
+        let channel = Arc::new(CountingMediaChannel::new());
+        let session_map = empty_session_map();
+        session_map
+            .write()
+            .await
+            .insert("s1".to_string(), "counting_media".to_string());
+        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn Channel>], session_map);
+
+        // Same file delivered twice (e.g. notifier then model send_file) → one send.
+        hub.send_media_strict("s1", &doc_msg("s1", "/inbox/r.txt", "r.txt"))
+            .await
+            .unwrap();
+        hub.send_media_strict("s1", &doc_msg("s1", "/inbox/r.txt", "r.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.doc_count().await,
+            1,
+            "identical document must be delivered only once within the dedupe window"
+        );
+
+        // A genuinely different file is NOT suppressed.
+        hub.send_media_strict("s1", &doc_msg("s1", "/inbox/other.txt", "other.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.doc_count().await,
+            2,
+            "a different document must still be delivered"
+        );
     }
 
     fn session_map_with(entries: Vec<(&str, &str)>) -> SessionMap {
