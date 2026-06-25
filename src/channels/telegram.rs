@@ -4692,6 +4692,7 @@ impl TelegramChannel {
                             old_budget, new_budget, extension, max_extensions
                         )
                     }
+                    StatusUpdate::Checklist { text } => text.clone(),
                 };
                 let _ = status_bot.send_message(status_chat_id, text).await;
                 dm_status_count += 1;

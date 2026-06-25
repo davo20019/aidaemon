@@ -1299,6 +1299,7 @@ impl SlackChannel {
                             old_budget, new_budget, extension, max_extensions
                         )
                     }
+                    StatusUpdate::Checklist { text } => text.clone(),
                 };
                 let _ = status_self
                     .post_message(&status_channel, &text, status_thread.as_deref())

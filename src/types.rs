@@ -282,6 +282,10 @@ pub enum StatusUpdate {
         extension: usize,
         max_extensions: usize,
     },
+    /// A rendered task-plan checklist to display on the single live surface.
+    /// Replaces the separate checklist message previously posted by
+    /// `track_requirements` directly through the hub.
+    Checklist { text: String },
 }
 
 /// The kind of media being sent.

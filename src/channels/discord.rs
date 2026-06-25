@@ -499,6 +499,7 @@ impl DiscordChannel {
                             old_budget, new_budget, extension, max_extensions
                         )
                     }
+                    StatusUpdate::Checklist { text } => text.clone(),
                 };
                 let _ = status_channel_id.say(&status_http, &text).await;
                 last_sent = tokio::time::Instant::now();
