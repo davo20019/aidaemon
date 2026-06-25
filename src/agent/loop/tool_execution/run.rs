@@ -292,17 +292,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let mut successful_tool_calls = 0;
     let mut iteration_had_tool_failures = false;
     let mut hard_block_streak: usize = 0;
-    let active_dialogue_scope = agent
-        .state
-        .get_dialogue_state(session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|state| {
-            state
-                .open_request
-                .and_then(|request| request.semantic_scope)
-        });
+    let active_dialogue_scope = effective_dialogue_scope_for_tool_execution(
+        agent
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|state| {
+                state
+                    .open_request
+                    .and_then(|request| request.semantic_scope)
+            }),
+        _user_text,
+    );
     info!(
         session_id,
         iteration,
