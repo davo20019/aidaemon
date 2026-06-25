@@ -557,6 +557,31 @@ impl ChannelHub {
         }
     }
 
+    /// Send media to the channel that owns a session, requiring REAL media
+    /// support. Unlike [`send_media`], this never silently falls back to a text
+    /// caption: if the owning channel cannot deliver documents/photos it returns
+    /// an error so callers (e.g. the terminal deliverable notifier) can report an
+    /// honest delivery failure instead of mistaking a text fallback for success.
+    pub async fn send_media_strict(
+        &self,
+        session_id: &str,
+        media: &MediaMessage,
+    ) -> anyhow::Result<()> {
+        let Some(channel) = self.channel_for_session(session_id).await else {
+            anyhow::bail!("No channel found for session {}", session_id);
+        };
+        if !channel.capabilities().media {
+            anyhow::bail!(
+                "Channel '{}' for session {} cannot deliver media documents",
+                channel.name(),
+                session_id
+            );
+        }
+        channel.send_media(session_id, media).await?;
+        self.record_media_delivery_note(media).await;
+        Ok(())
+    }
+
     /// Broadcast text to a list of session IDs (e.g., trigger notifications).
     /// Errors are logged but don't stop the broadcast.
     pub async fn broadcast_text(&self, session_ids: &[String], text: &str) {

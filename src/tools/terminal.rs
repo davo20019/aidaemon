@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolExecutionContext, ToolVerificationMode,
 };
-use crate::types::{ApprovalResponse, StatusUpdate};
+use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
@@ -316,6 +317,221 @@ fn background_delivery_allowed(
     true
 }
 
+/// Completion-time deliverable attribution for a finished background command.
+///
+/// Reads the session's incomplete checklist (best-effort) and runs the pure
+/// [`attribute_deliverable`](crate::tools::background_deliverable::attribute_deliverable)
+/// classifier over the command + any referenced script + filesystem mtimes.
+/// Returns `Some(path)` only when exactly ONE safe, explicit produced-output
+/// file is attributed (auto-send eligible). Ambiguous (>1) or none → `None`, so
+/// the caller falls back to normal re-engagement / trivial-skip behavior.
+async fn attribute_one_deliverable(
+    session_id: &str,
+    command: &str,
+    command_start: std::time::SystemTime,
+    command_end: std::time::SystemTime,
+    plan_store: Option<&Arc<crate::plans::PlanStore>>,
+) -> Option<PathBuf> {
+    let checklist_text: Vec<String> = match plan_store {
+        Some(ps) => match ps.get_incomplete_for_session(session_id).await {
+            Ok(Some(plan)) => plan.steps.iter().map(|s| s.description.clone()).collect(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let read_script = |p: &std::path::Path| -> Option<String> { std::fs::read_to_string(p).ok() };
+    let stat_mtime = |p: &std::path::Path| -> Option<std::time::SystemTime> {
+        std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+    };
+    let ctx = crate::tools::background_deliverable::attribute_deliverable(
+        session_id,
+        command,
+        command_start,
+        command_end,
+        &checklist_text,
+        &read_script,
+        &stat_mtime,
+    );
+    match crate::tools::background_deliverable::auto_send_decision(&ctx) {
+        crate::tools::background_deliverable::AutoSendDecision::One(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// Map a [`file_delivery::DeliveryError`] to a short, honest user-facing reason.
+fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> String {
+    use crate::tools::file_delivery::DeliveryError;
+    match err {
+        DeliveryError::FileNotFound(_) => "the file no longer exists".to_string(),
+        DeliveryError::NotRegularFile(_) => "it is not a regular file".to_string(),
+        DeliveryError::Blocked(_) => "the path is blocked for security reasons".to_string(),
+        DeliveryError::OutsideAllowedDirs(_) => {
+            "it is outside the allowed delivery directories".to_string()
+        }
+        DeliveryError::RecoveryFailed { error, .. } => {
+            format!("recovery into the inbox failed ({error})")
+        }
+        DeliveryError::Ambiguous(_) => "multiple files matched the name".to_string(),
+    }
+}
+
+/// Deliver one attributed produced-output file directly to the session's
+/// channel, guarded by the process-scoped deliver-once ledger. On a successful
+/// document send, the conservative single-item checklist write-back marks the
+/// delivery step complete. On any failure, an honest text message is sent
+/// instead so the user is never left thinking a file was delivered when it was
+/// not. Returns nothing; all paths are best-effort with logging.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_attributed_background_file(
+    path: &std::path::Path,
+    session_id: &str,
+    command_summary: &str,
+    inbox_dir: &std::path::Path,
+    outbox_dirs: &[PathBuf],
+    delivered_deliverables: &Arc<Mutex<HashSet<(String, String)>>>,
+    plan_store: Option<&Arc<crate::plans::PlanStore>>,
+    hub: Option<&Arc<ChannelHub>>,
+    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    goal_id: &str,
+    pid: u32,
+) {
+    let original_name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ready = match crate::tools::file_delivery::prepare_delivery(
+        &path.to_string_lossy(),
+        &cwd,
+        inbox_dir,
+        outbox_dirs,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!(
+                "⚠️ The background command finished and produced `{}`, but I couldn't deliver it: {}.",
+                original_name,
+                describe_delivery_error(&e)
+            );
+            deliver_background_text(hub, state, session_id, goal_id, &msg, pid).await;
+            return;
+        }
+    };
+
+    let canonical = ready.canonical_path.to_string_lossy().to_string();
+    // Deliver-once: the FIRST claimant for this (session, canonical path) sends;
+    // duplicate completion paths / the reaper / a re-engaged send get `false`.
+    {
+        let mut ledger = delivered_deliverables.lock().await;
+        if !ledger.insert((session_id.to_string(), canonical.clone())) {
+            info!(
+                pid,
+                session_id = %session_id,
+                "Deliver-once: background deliverable already sent; skipping re-send"
+            );
+            return;
+        }
+    }
+
+    let caption = format!(
+        "Here's the result file from `{command_summary}`: {}",
+        ready.filename
+    );
+    let msg = MediaMessage {
+        session_id: session_id.to_string(),
+        caption: caption.clone(),
+        kind: MediaKind::Document {
+            file_path: ready.canonical_path.to_string_lossy().to_string(),
+            filename: ready.filename.clone(),
+        },
+        // No result_tx: `send_media_strict` already returns Err on a non-media
+        // channel or send failure, so its `Ok` IS the honest success signal — a
+        // text fallback can never masquerade as a document delivery.
+        result_tx: None,
+    };
+
+    let sent = match hub {
+        Some(hub) => match hub.send_media_strict(session_id, &msg).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    pid,
+                    error = %e,
+                    session_id = %session_id,
+                    "Failed to deliver attributed background result file"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+
+    if sent {
+        info!(
+            pid,
+            session_id = %session_id,
+            filename = %ready.filename,
+            "Delivered attributed background result file as a document"
+        );
+        // Conservative single-item checklist write-back (ignores Ok(false)).
+        if let Some(ps) = plan_store {
+            if let Err(e) = ps.mark_delivery_step_complete(session_id).await {
+                warn!(
+                    pid,
+                    error = %e,
+                    session_id = %session_id,
+                    "Failed to mark delivery checklist step complete after sending file"
+                );
+            }
+        }
+    } else {
+        let msg = format!(
+            "⚠️ The background command finished and produced `{original_name}`, but I couldn't deliver the file to this channel."
+        );
+        deliver_background_text(hub, state, session_id, goal_id, &msg, pid).await;
+    }
+}
+
+/// Send a background status/failure line to the session's channel, falling back
+/// to the durable notification queue when no live channel is available. Mirrors
+/// the hub-then-enqueue pattern used throughout the completion notifier.
+async fn deliver_background_text(
+    hub: Option<&Arc<ChannelHub>>,
+    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    session_id: &str,
+    goal_id: &str,
+    message: &str,
+    pid: u32,
+) {
+    let mut delivered = false;
+    if let Some(hub) = hub {
+        match hub.send_text(session_id, message).await {
+            Ok(()) => delivered = true,
+            Err(e) => warn!(
+                pid,
+                error = %e,
+                session_id = %session_id,
+                "Failed to deliver background deliverable status text"
+            ),
+        }
+    }
+    if !delivered {
+        if let Some(state) = state {
+            let entry =
+                crate::traits::NotificationEntry::new(goal_id, session_id, "progress", message);
+            if let Err(e) = state.enqueue_notification(&entry).await {
+                warn!(
+                    pid,
+                    error = %e,
+                    session_id = %session_id,
+                    goal_id = %goal_id,
+                    "Failed to enqueue background deliverable status text"
+                );
+            }
+        }
+    }
+}
+
 pub struct TerminalTool {
     /// Permanently allowed prefixes (from config + DB)
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
@@ -342,6 +558,21 @@ pub struct TerminalTool {
     /// used by [`reengagement_allowed`] to cap runaway re-engagement loops.
     reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
     recent_background_deliveries: Arc<Mutex<HashMap<String, HashMap<String, Instant>>>>,
+    /// Process-scoped deliver-once ledger keyed by `(session_id, canonical path)`.
+    /// The first caller to claim a key wins; later duplicate completion
+    /// notifications, the stale reaper, and any re-engaged send must not re-send
+    /// the same file. Lives with the in-memory process tracking (matching the
+    /// design's v1 process-scoped guarantee).
+    delivered_deliverables: Arc<Mutex<HashSet<(String, String)>>>,
+    /// Durable plan store, used at background completion to read the session's
+    /// incomplete checklist (for deliverable attribution + the conservative
+    /// delivery-step write-back). Wired via [`set_plan_store`].
+    plan_store: OnceLock<Arc<crate::plans::PlanStore>>,
+    /// Inbox directory for harness-side file delivery recovery-copy. Defaults to
+    /// the system temp dir until wired via [`with_delivery_dirs`].
+    inbox_dir: PathBuf,
+    /// Allowed outbox directories for harness-side file delivery validation.
+    outbox_dirs: Vec<PathBuf>,
     /// Self-correction bridge config. Consulted by the idle-reaper: when a hung
     /// background command is stopped, this config decides whether an autonomous
     /// remediation task is dispatched (live), shadow-logged, or skipped
@@ -1097,8 +1328,22 @@ impl TerminalTool {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             recent_background_deliveries: Arc::new(Mutex::new(HashMap::new())),
+            delivered_deliverables: Arc::new(Mutex::new(HashSet::new())),
+            plan_store: OnceLock::new(),
+            inbox_dir: std::env::temp_dir(),
+            outbox_dirs: Vec::new(),
             self_correction: SelfCorrectionConfig::default(),
         }
+    }
+
+    /// Wire the inbox + outbox directories used by harness-side background
+    /// deliverable delivery (`prepare_delivery`). Mirrors the dirs `send_file`
+    /// is constructed with. Without this, delivery defaults to the system temp
+    /// dir as inbox with no extra outbox dirs.
+    pub fn with_delivery_dirs(mut self, inbox_dir: PathBuf, outbox_dirs: Vec<PathBuf>) -> Self {
+        self.inbox_dir = inbox_dir;
+        self.outbox_dirs = outbox_dirs;
+        self
     }
 
     /// Wire the self-correction config so the idle-reaper can dispatch
@@ -1133,6 +1378,13 @@ impl TerminalTool {
     /// the agent loop to process the output and continue the original task.
     pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
         let _ = self.agent.set(agent);
+    }
+
+    /// Wire the durable plan store so the background completion notifier can read
+    /// the session's incomplete checklist (for deliverable attribution + the
+    /// conservative delivery-step write-back).
+    pub fn set_plan_store(&self, plan_store: Arc<crate::plans::PlanStore>) {
+        let _ = self.plan_store.set(plan_store);
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
@@ -2428,6 +2680,12 @@ impl TerminalTool {
                 let reengagements_for_notify = self.reengagements.clone();
                 let recent_background_deliveries_for_notify =
                     self.recent_background_deliveries.clone();
+                // Deliver-once ledger + delivery dirs + durable plan store for
+                // harness-side deliverable attribution and direct file delivery.
+                let delivered_deliverables_for_notify = self.delivered_deliverables.clone();
+                let plan_store_for_notify = self.plan_store.get().cloned();
+                let inbox_dir_for_notify = self.inbox_dir.clone();
+                let outbox_dirs_for_notify = self.outbox_dirs.clone();
                 // Cloned for the notifier task so it can remove the finished process
                 // from `running` (and its indexes) after delivery, preventing the
                 // idle-reaper from sending a contradictory "stopped, no results" message
@@ -2495,6 +2753,13 @@ impl TerminalTool {
                             // new output" channel messages (the agent already told
                             // the user the command is running).
                             let mut last_pinged_output: Option<String> = None;
+                            // Set in the completion arm when exactly one safe explicit
+                            // produced-output file is attributed: the generic "finished"
+                            // ping is suppressed and the file is delivered deterministically
+                            // after the loop (skipping model re-engagement). Only the
+                            // completion arm `break`s out to the post-loop read, and it
+                            // always assigns this first, so no initializer is needed.
+                            let attributed_deliverable: Option<PathBuf>;
 
                             loop {
                                 tokio::select! {
@@ -2527,27 +2792,27 @@ impl TerminalTool {
                                             2500,
                                         );
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
-                                        // Short, friendly status ping only — no pid, no raw command
-                                        // (those stay in status_tx + logs). The actual output is
-                                        // delivered by agent re-engagement below, or the verbatim
-                                        // fallback when re-engagement can't run.
-                                        let message = if exit_code == Some(0) {
-                                            format!(
-                                                "✅ Background command finished in {}.",
-                                                humanize_elapsed(elapsed_secs)
-                                            )
-                                        } else {
-                                            let mut m = format!(
-                                                "⚠️ Background command finished with errors in {}",
-                                                humanize_elapsed(elapsed_secs)
-                                            );
-                                            if let Some(code) = exit_code {
-                                                m.push_str(&format!(" (exit code {})", code));
-                                            }
-                                            m.push('.');
-                                            m
-                                        };
 
+                                        // Deliverable attribution: if the command produced exactly
+                                        // one safe explicit output file, deliver THAT file directly
+                                        // after the loop and suppress the generic "finished" ping +
+                                        // model re-engagement (the file is the deterministic answer).
+                                        let command_end = std::time::SystemTime::now();
+                                        let command_start = command_end
+                                            .checked_sub(started_at_for_notify.elapsed())
+                                            .unwrap_or(command_end);
+                                        attributed_deliverable = attribute_one_deliverable(
+                                            &session_for_notify,
+                                            &command_for_notify,
+                                            command_start,
+                                            command_end,
+                                            plan_store_for_notify.as_ref(),
+                                        )
+                                        .await;
+
+                                        // Internal progress signal (typing indicator + logs) is
+                                        // telemetry — emit it regardless of how the result is
+                                        // delivered. pid + raw command belong here, not in chat.
                                         if let Some(ref tx) = status_tx_for_notify {
                                             if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
                                                 name: "terminal".to_string(),
@@ -2564,6 +2829,37 @@ impl TerminalTool {
                                                 );
                                             }
                                         }
+
+                                        if attributed_deliverable.is_some() {
+                                            // Defer to deterministic file delivery after the loop.
+                                            // Do NOT send the generic "✅ finished" ping and do NOT
+                                            // set completion_output_for_agent (no re-engagement).
+                                            info!(
+                                                pid,
+                                                session_id = %session_for_notify,
+                                                "Attributed a produced-output file; delivering it directly (suppressing finished-ping + re-engagement)"
+                                            );
+                                            break;
+                                        }
+
+                                        // No deliverable — keep the existing friendly status ping
+                                        // and feed the output to agent re-engagement below.
+                                        let message = if exit_code == Some(0) {
+                                            format!(
+                                                "✅ Background command finished in {}.",
+                                                humanize_elapsed(elapsed_secs)
+                                            )
+                                        } else {
+                                            let mut m = format!(
+                                                "⚠️ Background command finished with errors in {}",
+                                                humanize_elapsed(elapsed_secs)
+                                            );
+                                            if let Some(code) = exit_code {
+                                                m.push_str(&format!(" (exit code {})", code));
+                                            }
+                                            m.push('.');
+                                            m
+                                        };
 
                                         let mut delivered = false;
                                         if let Some(ref hub) = hub_for_notify {
@@ -2892,7 +3188,27 @@ impl TerminalTool {
                             // a new message at the exact same time, both could execute
                             // concurrently. In practice this is rare since the background
                             // command finishes long after the user's original request.
-                            if let Some(output) = completion_output_for_agent {
+                            if let Some(path) = attributed_deliverable {
+                                // Deterministic deliverable path: send the single attributed
+                                // produced-output file directly (deliver-once guarded), then
+                                // fall through to the running-map cleanup below. This replaces
+                                // re-engagement / the empty-stdout trivial-skip for the case the
+                                // design targets: a command that writes only to a result file.
+                                deliver_attributed_background_file(
+                                    &path,
+                                    &session_for_notify,
+                                    &command_summary,
+                                    &inbox_dir_for_notify,
+                                    &outbox_dirs_for_notify,
+                                    &delivered_deliverables_for_notify,
+                                    plan_store_for_notify.as_ref(),
+                                    hub_for_notify.as_ref(),
+                                    state_for_notify.as_ref(),
+                                    &goal_id_for_notify,
+                                    pid,
+                                )
+                                .await;
+                            } else if let Some(output) = completion_output_for_agent {
                                 let output_trimmed = output.trim();
                                 // Only genuinely empty output is trivial. A short
                                 // result is often the whole answer — a `wc -l` count,
