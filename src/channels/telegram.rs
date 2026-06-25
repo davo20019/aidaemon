@@ -4913,10 +4913,20 @@ impl Channel for TelegramChannel {
                     .copied()
                     .unwrap_or(0) as i64
             });
-        // Plain send (no parse mode) so the message id can be captured for later
-        // in-place editing. Used for short, self-contained UI messages (the
-        // requirement checklist), not formatted prose.
-        let msg = self.bot.send_message(ChatId(chat_id), text).await?;
+        // Render markdown → Telegram HTML so the live surface displays formatted
+        // content (the final reply is edited into this message at turn end, and it
+        // carries markdown). Fall back to a plain send if Telegram rejects the
+        // HTML. The returned message id is captured for later in-place editing.
+        let html = markdown_to_telegram_html(text);
+        let msg = match self
+            .bot
+            .send_message(ChatId(chat_id), &html)
+            .parse_mode(ParseMode::Html)
+            .await
+        {
+            Ok(m) => m,
+            Err(_) => self.bot.send_message(ChatId(chat_id), text).await?,
+        };
         Ok(Some(msg.id.0.to_string()))
     }
 
@@ -4939,16 +4949,30 @@ impl Channel for TelegramChannel {
             Ok(v) => v,
             Err(_) => return Ok(false),
         };
+        // Render markdown → Telegram HTML so an edited-in final reply displays
+        // formatted (matches the normal send path). Fall back to a plain edit if
+        // Telegram rejects the HTML (a rare conversion edge), so an edit is never
+        // lost to a formatting error.
+        let html = markdown_to_telegram_html(text);
         match self
             .bot
-            .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
+            .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), &html)
+            .parse_mode(ParseMode::Html)
             .await
         {
             Ok(_) => Ok(true),
             // Telegram rejects an edit whose text is identical to the current
             // message — that's benign (nothing to change), so treat it as success.
             Err(e) if e.to_string().contains("message is not modified") => Ok(true),
-            Err(e) => Err(e.into()),
+            Err(_) => match self
+                .bot
+                .edit_message_text(ChatId(chat_id), teloxide::types::MessageId(mid), text)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(e) if e.to_string().contains("message is not modified") => Ok(true),
+                Err(e) => Err(e.into()),
+            },
         }
     }
 
@@ -5360,8 +5384,13 @@ async fn run_status_consumer(
             continue;
         }
         // Ordinary progress → single live surface, gated by min_interval.
+        // Exception: the plan checklist is the highest-value content and edits in
+        // place, so it must never be dropped by the throttle. It typically arrives
+        // within a second of the track_requirements ToolStart (well inside
+        // min_interval), which previously discarded it and the plan never showed.
         let now = tokio::time::Instant::now();
-        if now.duration_since(last_sent) < min_interval {
+        let is_checklist = matches!(&update, StatusUpdate::Checklist { .. });
+        if !is_checklist && now.duration_since(last_sent) < min_interval {
             continue;
         }
         let sink_ref: &dyn SurfaceSink = sink.as_ref();

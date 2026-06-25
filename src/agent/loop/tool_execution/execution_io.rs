@@ -45,13 +45,18 @@ pub(super) async fn execute_tool_call_io(
         &summarize_tool_args(&tc.name, ctx.effective_arguments),
         ctx.channel_ctx.visibility,
     );
-    send_status(
-        ctx.status_tx,
-        StatusUpdate::ToolStart {
-            name: start_label,
-            summary: start_summary,
-        },
-    );
+    // `track_requirements` renders its own checklist as the live surface (emitted
+    // as StatusUpdate::Checklist right after the call). Skip its generic ToolStart
+    // so the surface shows the plan, not a raw "track_requirements…" line first.
+    if tc.name != "track_requirements" {
+        send_status(
+            ctx.status_tx,
+            StatusUpdate::ToolStart {
+                name: start_label,
+                summary: start_summary,
+            },
+        );
+    }
 
     // Emit ToolCall event
     let _ = ctx
