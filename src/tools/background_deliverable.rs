@@ -21,6 +21,11 @@ pub struct BackgroundDeliverableContext {
     pub command_end: SystemTime,
     /// Explicit absolute paths classified as produced output (auto-send eligible).
     pub produced_candidates: Vec<PathBuf>,
+    /// Explicit output-like paths from script/checklist evidence that were not
+    /// confirmed by an mtime in the command window. These are not auto-send
+    /// eligible, but they let callers close out "expected file never appeared"
+    /// promises honestly.
+    pub unconfirmed_candidates: Vec<PathBuf>,
     /// Diagnostic-only dynamic/pattern hints (NOT auto-send eligible in v1).
     pub pattern_hints: Vec<String>,
 }
@@ -216,6 +221,7 @@ pub fn attribute_deliverable(
     stat_mtime: &dyn Fn(&Path) -> Option<SystemTime>,
 ) -> BackgroundDeliverableContext {
     let mut produced_set: HashSet<PathBuf> = HashSet::new();
+    let mut unconfirmed_set: HashSet<PathBuf> = HashSet::new();
     let mut pattern_hints: Vec<String> = Vec::new();
 
     // mtime window: [command_start, command_end + 2s]
@@ -278,6 +284,7 @@ pub fn attribute_deliverable(
                             produced_set.insert(sp);
                         }
                         _ => {
+                            unconfirmed_set.insert(sp.clone());
                             pattern_hints.push(format!(
                                 "unconfirmed write target (no mtime in window): {}",
                                 sp.display()
@@ -290,6 +297,9 @@ pub fn attribute_deliverable(
             // Also check script-mentioned absolute paths for mtime signal
             let script_paths = extract_absolute_paths(&script_text);
             for sp_str in script_paths {
+                if is_dynamic_content(&sp_str) {
+                    continue;
+                }
                 let sp = PathBuf::from(&sp_str);
                 if executed_scripts.contains(&sp) {
                     continue;
@@ -297,7 +307,11 @@ pub fn attribute_deliverable(
                 if let Some(mtime) = stat_mtime(&sp) {
                     if mtime >= command_start && mtime <= window_end {
                         produced_set.insert(sp);
+                    } else {
+                        unconfirmed_set.insert(sp);
                     }
+                } else {
+                    unconfirmed_set.insert(sp);
                 }
             }
         }
@@ -322,6 +336,8 @@ pub fn attribute_deliverable(
     // Build final list (deterministic order via sort)
     let mut produced_candidates: Vec<PathBuf> = produced_set.into_iter().collect();
     produced_candidates.sort();
+    let mut unconfirmed_candidates: Vec<PathBuf> = unconfirmed_set.into_iter().collect();
+    unconfirmed_candidates.sort();
 
     // Refine the final produced set so it holds regardless of which signal
     // admitted each path:
@@ -348,12 +364,30 @@ pub fn attribute_deliverable(
         !all.iter().any(|other| other != p && other.starts_with(p))
     });
 
+    let produced_confirmed: HashSet<PathBuf> = produced_candidates.iter().cloned().collect();
+    let all_unconfirmed: Vec<PathBuf> = unconfirmed_candidates.clone();
+    unconfirmed_candidates.retain(|p| {
+        if produced_confirmed.contains(p) {
+            return false;
+        }
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
+            return false;
+        }
+        if is_temp_root(p) {
+            return false;
+        }
+        !all_unconfirmed
+            .iter()
+            .any(|other| other != p && other.starts_with(p))
+    });
+
     BackgroundDeliverableContext {
         session_id: session_id.to_string(),
         command: command.to_string(),
         command_start,
         command_end,
         produced_candidates,
+        unconfirmed_candidates,
         pattern_hints,
     }
 }

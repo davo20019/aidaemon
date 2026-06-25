@@ -244,6 +244,7 @@ impl PlanStore {
     /// Otherwise (zero matches, >1 match, or no active plan) → returns `Ok(false)`.
     /// Never rewrites/regenerates the plan.
     pub async fn mark_delivery_step_complete(&self, session_id: &str) -> anyhow::Result<bool> {
+        use crate::agent::keyword_match as contains_keyword_as_words;
         use crate::plans::StepStatus;
 
         let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
@@ -251,9 +252,9 @@ impl PlanStore {
         };
 
         const DELIVERY_VERBS: &[&str] = &["send", "deliver", "attach", "share"];
-        const FILE_NOUNS: &[&str] = &[
-            "file", "result", "report", "output", ".txt", ".csv", ".json", ".log", ".zip", ".pdf",
-            ".md", ".yaml", ".toml", ".xlsx",
+        const FILE_NOUNS: &[&str] = &["file", "result", "report", "output"];
+        const FILE_EXTENSIONS: &[&str] = &[
+            ".txt", ".csv", ".json", ".log", ".zip", ".pdf", ".md", ".yaml", ".toml", ".xlsx",
         ];
 
         let matching_indices: Vec<usize> = plan
@@ -263,8 +264,13 @@ impl PlanStore {
             .filter(|(_, step)| matches!(step.status, StepStatus::Pending | StepStatus::InProgress))
             .filter(|(_, step)| {
                 let desc = step.description.to_lowercase();
-                DELIVERY_VERBS.iter().any(|v| desc.contains(v))
-                    && FILE_NOUNS.iter().any(|n| desc.contains(n))
+                DELIVERY_VERBS
+                    .iter()
+                    .any(|v| contains_keyword_as_words(&desc, v))
+                    && (FILE_NOUNS
+                        .iter()
+                        .any(|n| contains_keyword_as_words(&desc, n))
+                        || FILE_EXTENSIONS.iter().any(|ext| desc.contains(ext)))
             })
             .map(|(i, _)| i)
             .collect();
@@ -553,6 +559,26 @@ mod tests {
             .await
             .unwrap();
         assert!(!store.mark_delivery_step_complete("s1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_delivery_step_complete_uses_word_boundaries_for_verbs() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        store
+            .upsert_checklist(
+                "s1",
+                None,
+                "test",
+                &[("Research sender output format".into(), StepStatus::Pending)],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !store.mark_delivery_step_complete("s1").await.unwrap(),
+            "`sender` must not match the delivery verb `send`"
+        );
     }
 
     #[tokio::test]

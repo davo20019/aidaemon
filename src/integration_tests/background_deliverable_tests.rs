@@ -15,6 +15,7 @@ use crate::traits::{Channel, ChannelCapabilities, Tool};
 use crate::types::{MediaKind, MediaMessage};
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -25,9 +26,14 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 struct MediaCaptureChannel {
     documents: Mutex<Vec<(String /*filename*/, String /*caption*/)>>,
     texts: Mutex<Vec<String>>,
+    fail_media: AtomicBool,
 }
 
 impl MediaCaptureChannel {
+    fn fail_next_media_sends(&self, fail: bool) {
+        self.fail_media.store(fail, AtomicOrdering::Relaxed);
+    }
+
     async fn document_count(&self) -> usize {
         self.documents.lock().await.len()
     }
@@ -60,6 +66,9 @@ impl Channel for MediaCaptureChannel {
     }
 
     async fn send_media(&self, _session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+        if self.fail_media.load(AtomicOrdering::Relaxed) {
+            anyhow::bail!("synthetic media failure");
+        }
         if let MediaKind::Document { filename, .. } = &media.kind {
             self.documents
                 .lock()
@@ -289,5 +298,252 @@ async fn reaped_command_without_produced_file_sends_honest_failure() {
         "no document should be sent when the produced file never appeared"
     );
 
+    let _ = std::fs::remove_file(&missing_path);
+}
+
+#[tokio::test]
+async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let a_path = std::env::temp_dir().join(format!("bgd_ambig_a_{}.txt", std::process::id()));
+    let b_path = std::env::temp_dir().join(format!("bgd_ambig_b_{}.txt", std::process::id()));
+    let script_path = std::env::temp_dir().join(format!("bgd_ambig_{}.py", std::process::id()));
+    let _ = std::fs::remove_file(&a_path);
+    let _ = std::fs::remove_file(&b_path);
+    std::fs::write(
+        &script_path,
+        format!(
+            "import pathlib, time\ntime.sleep(2)\npathlib.Path('{}').write_text('a')\npathlib.Path('{}').write_text('b')\n",
+            a_path.display(),
+            b_path.display()
+        ),
+    )
+    .unwrap();
+
+    let session_id = "sess_bgd_ambig";
+    let (tool, _state, channel) = make_terminal_with_hub(inbox, vec![], session_id).await;
+    let command = format!(
+        "python3 {} --output {} --output {}",
+        script_path.display(),
+        a_path.display(),
+        b_path.display(),
+    );
+    let call = serde_json::json!({
+        "action": "run",
+        "command": command,
+        "_session_id": session_id,
+        "_user_role": "Owner",
+    })
+    .to_string();
+
+    let response = tool.call(&call).await.unwrap();
+    assert!(
+        response.contains("Moved to background (pid="),
+        "command should have detached: {response}"
+    );
+
+    let mut got_ambiguity = false;
+    for _ in 0..80 {
+        let texts = channel.texts().await;
+        if texts.iter().any(|t| t.to_lowercase().contains("multiple") && t.to_lowercase().contains("output")) {
+            got_ambiguity = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert_eq!(channel.document_count().await, 0, "ambiguous outputs must not be auto-sent");
+    assert!(
+        got_ambiguity,
+        "ambiguous outputs should produce an honest ambiguity message; texts={:?}",
+        channel.texts().await
+    );
+
+    let _ = std::fs::remove_file(&a_path);
+    let _ = std::fs::remove_file(&b_path);
+    let _ = std::fs::remove_file(&script_path);
+}
+
+#[tokio::test]
+async fn failed_media_send_does_not_poison_deliver_once_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let script_path = std::env::temp_dir().join(format!("bgd_retry_{}.py", std::process::id()));
+    let result_path =
+        std::env::temp_dir().join(format!("bgd_retry_results_{}.txt", std::process::id()));
+    let script = format!(
+        "import time\noutput_path = \"{}\"\ntime.sleep(2)\nopen(output_path, 'w').write('retry ok\\n')\n",
+        result_path.display()
+    );
+    std::fs::write(&script_path, script).unwrap();
+
+    let session_id = "sess_bgd_retry";
+    let (tool, _state, channel) = make_terminal_with_hub(inbox, vec![], session_id).await;
+    channel.fail_next_media_sends(true);
+
+    let command = format!("python3 {}", script_path.display());
+    let call = serde_json::json!({
+        "action": "run",
+        "command": command,
+        "_session_id": session_id,
+        "_user_role": "Owner",
+    })
+    .to_string();
+    let response = tool.call(&call).await.unwrap();
+    assert!(response.contains("Moved to background (pid="));
+
+    let mut got_failure = false;
+    for _ in 0..80 {
+        let texts = channel.texts().await;
+        if texts.iter().any(|t| t.to_lowercase().contains("couldn't deliver")) {
+            got_failure = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(got_failure, "first failed media send should report failure");
+    assert_eq!(channel.document_count().await, 0);
+
+    channel.fail_next_media_sends(false);
+    let response = tool.call(&call).await.unwrap();
+    assert!(response.contains("Moved to background (pid="));
+
+    let mut delivered = false;
+    for _ in 0..80 {
+        if channel.document_count().await == 1 {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(delivered, "second attempt should deliver after first send failure");
+
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+}
+
+#[tokio::test]
+async fn nonzero_background_command_with_file_reports_failure_without_autosend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let result_path =
+        std::env::temp_dir().join(format!("bgd_failed_results_{}.txt", std::process::id()));
+    let script_path =
+        std::env::temp_dir().join(format!("bgd_failed_{}.py", std::process::id()));
+    let _ = std::fs::remove_file(&result_path);
+    std::fs::write(
+        &script_path,
+        format!(
+            "import pathlib, sys, time\ntime.sleep(2)\npathlib.Path('{}').write_text('partial')\nsys.exit(7)\n",
+            result_path.display()
+        ),
+    )
+    .unwrap();
+
+    let session_id = "sess_bgd_nonzero";
+    let (tool, _state, channel) = make_terminal_with_hub(inbox, vec![], session_id).await;
+    let command = format!(
+        "python3 {} --output {}",
+        script_path.display(),
+        result_path.display()
+    );
+    let call = serde_json::json!({
+        "action": "run",
+        "command": command,
+        "_session_id": session_id,
+        "_user_role": "Owner",
+    })
+    .to_string();
+
+    let response = tool.call(&call).await.unwrap();
+    assert!(
+        response.contains("Moved to background (pid="),
+        "command should have detached: {response}"
+    );
+
+    let mut got_failure = false;
+    for _ in 0..80 {
+        let texts = channel.texts().await;
+        if texts.iter().any(|t| t.to_lowercase().contains("exit code 7") && t.to_lowercase().contains("not sending")) {
+            got_failure = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(channel.document_count().await, 0, "nonzero commands should not auto-send result files");
+    assert!(
+        got_failure,
+        "nonzero command should report failure and not auto-send; texts={:?}",
+        channel.texts().await
+    );
+
+    let _ = std::fs::remove_file(&result_path);
+    let _ = std::fs::remove_file(&script_path);
+}
+
+#[tokio::test]
+async fn reaped_script_declared_missing_output_reports_honest_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let script_path =
+        std::env::temp_dir().join(format!("bgd_declared_missing_{}.py", std::process::id()));
+    let missing_path =
+        std::env::temp_dir().join(format!("bgd_declared_missing_results_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&missing_path);
+    std::fs::write(
+        &script_path,
+        format!(
+            "import time\noutput_path = '{}'\ntime.sleep(30)\n# intended output path is declared but never written\n",
+            missing_path.display()
+        ),
+    )
+    .unwrap();
+
+    let session_id = "sess_bgd_declared_missing";
+    let (tool, _state, channel) = make_terminal_with_hub(inbox, vec![], session_id).await;
+    let command = format!("python3 {}", script_path.display());
+    let call = serde_json::json!({
+        "action": "run",
+        "command": command,
+        "_session_id": session_id,
+        "_user_role": "Owner",
+    })
+    .to_string();
+
+    let response = tool.call(&call).await.unwrap();
+    assert!(response.contains("Moved to background (pid="));
+
+    let reaped = tool
+        .reap_stale_background_processes_with(Duration::from_secs(0), Duration::from_secs(0))
+        .await;
+    assert!(reaped >= 1);
+
+    let mut got_honest = false;
+    for _ in 0..40 {
+        let texts = channel.texts().await;
+        if texts.iter().any(|t| {
+            let l = t.to_lowercase();
+            l.contains("never appeared") && l.contains("nothing to send")
+        }) {
+            got_honest = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        got_honest,
+        "script-declared missing output should get honest closeout; texts={:?}",
+        channel.texts().await
+    );
+
+    let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&missing_path);
 }

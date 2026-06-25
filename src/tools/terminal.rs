@@ -317,21 +317,43 @@ fn background_delivery_allowed(
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliverableDeliveryState {
+    Delivering,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug)]
+enum DeliverableAttribution {
+    One(PathBuf),
+    Ambiguous(Vec<PathBuf>),
+    ExpectedMissing(Vec<PathBuf>),
+    Hints(Vec<String>),
+    None,
+}
+
+fn format_deliverable_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .take(5)
+        .map(|p| format!("`{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Completion-time deliverable attribution for a finished background command.
 ///
 /// Reads the session's incomplete checklist (best-effort) and runs the pure
 /// [`attribute_deliverable`](crate::tools::background_deliverable::attribute_deliverable)
 /// classifier over the command + any referenced script + filesystem mtimes.
-/// Returns `Some(path)` only when exactly ONE safe, explicit produced-output
-/// file is attributed (auto-send eligible). Ambiguous (>1) or none → `None`, so
-/// the caller falls back to normal re-engagement / trivial-skip behavior.
-async fn attribute_one_deliverable(
+async fn attribute_background_deliverable(
     session_id: &str,
     command: &str,
     command_start: std::time::SystemTime,
     command_end: std::time::SystemTime,
     plan_store: Option<&Arc<crate::plans::PlanStore>>,
-) -> Option<PathBuf> {
+) -> DeliverableAttribution {
     let checklist_text: Vec<String> = match plan_store {
         Some(ps) => match ps.get_incomplete_for_session(session_id).await {
             Ok(Some(plan)) => plan.steps.iter().map(|s| s.description.clone()).collect(),
@@ -353,8 +375,21 @@ async fn attribute_one_deliverable(
         &stat_mtime,
     );
     match crate::tools::background_deliverable::auto_send_decision(&ctx) {
-        crate::tools::background_deliverable::AutoSendDecision::One(p) => Some(p),
-        _ => None,
+        crate::tools::background_deliverable::AutoSendDecision::One(p) => {
+            DeliverableAttribution::One(p)
+        }
+        crate::tools::background_deliverable::AutoSendDecision::Ambiguous(paths) => {
+            DeliverableAttribution::Ambiguous(paths)
+        }
+        crate::tools::background_deliverable::AutoSendDecision::None => {
+            if !ctx.unconfirmed_candidates.is_empty() {
+                DeliverableAttribution::ExpectedMissing(ctx.unconfirmed_candidates)
+            } else if !ctx.pattern_hints.is_empty() {
+                DeliverableAttribution::Hints(ctx.pattern_hints)
+            } else {
+                DeliverableAttribution::None
+            }
+        }
     }
 }
 
@@ -388,7 +423,7 @@ async fn deliver_attributed_background_file(
     command_summary: &str,
     inbox_dir: &std::path::Path,
     outbox_dirs: &[PathBuf],
-    delivered_deliverables: &Arc<Mutex<HashSet<(String, String)>>>,
+    delivered_deliverables: &Arc<Mutex<HashMap<(String, String), DeliverableDeliveryState>>>,
     plan_store: Option<&Arc<crate::plans::PlanStore>>,
     hub: Option<&Arc<ChannelHub>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
@@ -423,15 +458,33 @@ async fn deliver_attributed_background_file(
     // duplicate completion paths / the reaper / a re-engaged send get `false`.
     {
         let mut ledger = delivered_deliverables.lock().await;
-        if !ledger.insert((session_id.to_string(), canonical.clone())) {
-            info!(
-                pid,
-                session_id = %session_id,
-                "Deliver-once: background deliverable already sent; skipping re-send"
-            );
-            return;
+        let key = (session_id.to_string(), canonical.clone());
+        match ledger.get(&key) {
+            Some(DeliverableDeliveryState::Delivered | DeliverableDeliveryState::Delivering) => {
+                info!(
+                    pid,
+                    session_id = %session_id,
+                    "Deliver-once: background deliverable already sent or in flight; skipping re-send"
+                );
+                return;
+            }
+            Some(DeliverableDeliveryState::Failed) | None => {
+                ledger.insert(key, DeliverableDeliveryState::Delivering);
+            }
         }
     }
+
+    let mark_delivery_state = |state: DeliverableDeliveryState| {
+        let delivered_deliverables = delivered_deliverables.clone();
+        let session_id = session_id.to_string();
+        let canonical = canonical.clone();
+        async move {
+            delivered_deliverables
+                .lock()
+                .await
+                .insert((session_id, canonical), state);
+        }
+    };
 
     let caption = format!(
         "Here's the result file from `{command_summary}`: {}",
@@ -467,6 +520,7 @@ async fn deliver_attributed_background_file(
     };
 
     if sent {
+        mark_delivery_state(DeliverableDeliveryState::Delivered).await;
         info!(
             pid,
             session_id = %session_id,
@@ -485,6 +539,7 @@ async fn deliver_attributed_background_file(
             }
         }
     } else {
+        mark_delivery_state(DeliverableDeliveryState::Failed).await;
         let msg = format!(
             "⚠️ The background command finished and produced `{original_name}`, but I couldn't deliver the file to this channel."
         );
@@ -559,11 +614,9 @@ pub struct TerminalTool {
     reengagements: Arc<Mutex<HashMap<String, std::collections::VecDeque<Instant>>>>,
     recent_background_deliveries: Arc<Mutex<HashMap<String, HashMap<String, Instant>>>>,
     /// Process-scoped deliver-once ledger keyed by `(session_id, canonical path)`.
-    /// The first caller to claim a key wins; later duplicate completion
-    /// notifications, the stale reaper, and any re-engaged send must not re-send
-    /// the same file. Lives with the in-memory process tracking (matching the
-    /// design's v1 process-scoped guarantee).
-    delivered_deliverables: Arc<Mutex<HashSet<(String, String)>>>,
+    /// `Delivered` is recorded only after a real document/media send succeeds;
+    /// failed sends remain retryable.
+    delivered_deliverables: Arc<Mutex<HashMap<(String, String), DeliverableDeliveryState>>>,
     /// Durable plan store, used at background completion to read the session's
     /// incomplete checklist (for deliverable attribution + the conservative
     /// delivery-step write-back). Wired via [`set_plan_store`].
@@ -1328,7 +1381,7 @@ impl TerminalTool {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             recent_background_deliveries: Arc::new(Mutex::new(HashMap::new())),
-            delivered_deliverables: Arc::new(Mutex::new(HashSet::new())),
+            delivered_deliverables: Arc::new(Mutex::new(HashMap::new())),
             plan_store: OnceLock::new(),
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
@@ -2454,7 +2507,7 @@ impl TerminalTool {
                     let command_start = command_end
                         .checked_sub(Duration::from_secs(runtime_secs))
                         .unwrap_or(command_end);
-                    match attribute_one_deliverable(
+                    match attribute_background_deliverable(
                         &session_id,
                         &proc_command,
                         command_start,
@@ -2463,14 +2516,14 @@ impl TerminalTool {
                     )
                     .await
                     {
-                        Some(path) => {
+                        DeliverableAttribution::One(path) => {
                             let file_appeared = std::fs::metadata(&path).is_ok();
                             let already_delivered = self
                                 .delivered_deliverables
                                 .lock()
                                 .await
-                                .iter()
-                                .any(|(s, _)| s == &session_id);
+                                .get(&(session_id.clone(), path.to_string_lossy().to_string()))
+                                == Some(&DeliverableDeliveryState::Delivered);
                             if !file_appeared && !already_delivered {
                                 Some(
                                     path.file_name()
@@ -2481,7 +2534,16 @@ impl TerminalTool {
                                 None
                             }
                         }
-                        None => None,
+                        DeliverableAttribution::ExpectedMissing(paths) => {
+                            paths.first().map(|path| {
+                                path.file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.to_string_lossy().to_string())
+                            })
+                        }
+                        DeliverableAttribution::Ambiguous(_)
+                        | DeliverableAttribution::Hints(_)
+                        | DeliverableAttribution::None => None,
                     }
                 };
 
@@ -2820,13 +2882,11 @@ impl TerminalTool {
                             // new output" channel messages (the agent already told
                             // the user the command is running).
                             let mut last_pinged_output: Option<String> = None;
-                            // Set in the completion arm when exactly one safe explicit
-                            // produced-output file is attributed: the generic "finished"
-                            // ping is suppressed and the file is delivered deterministically
-                            // after the loop (skipping model re-engagement). Only the
-                            // completion arm `break`s out to the post-loop read, and it
-                            // always assigns this first, so no initializer is needed.
-                            let attributed_deliverable: Option<PathBuf>;
+                            // Set in the completion arm. Attributed deliverables suppress
+                            // the generic "finished" ping and resolve to direct delivery
+                            // or an honest ambiguity/failure message.
+                            let deliverable_attribution: DeliverableAttribution;
+                            let direct_deliverable_delivery: bool;
 
                             loop {
                                 tokio::select! {
@@ -2868,7 +2928,7 @@ impl TerminalTool {
                                         let command_start = command_end
                                             .checked_sub(started_at_for_notify.elapsed())
                                             .unwrap_or(command_end);
-                                        attributed_deliverable = attribute_one_deliverable(
+                                        deliverable_attribution = attribute_background_deliverable(
                                             &session_for_notify,
                                             &command_for_notify,
                                             command_start,
@@ -2897,16 +2957,95 @@ impl TerminalTool {
                                             }
                                         }
 
-                                        if attributed_deliverable.is_some() {
-                                            // Defer to deterministic file delivery after the loop.
-                                            // Do NOT send the generic "✅ finished" ping and do NOT
-                                            // set completion_output_for_agent (no re-engagement).
-                                            info!(
-                                                pid,
-                                                session_id = %session_for_notify,
-                                                "Attributed a produced-output file; delivering it directly (suppressing finished-ping + re-engagement)"
-                                            );
-                                            break;
+                                        match &deliverable_attribution {
+                                            DeliverableAttribution::One(_) if exit_code == Some(0) => {
+                                                direct_deliverable_delivery = true;
+                                                // Defer to deterministic file delivery after the loop.
+                                                // Do NOT send the generic "✅ finished" ping and do NOT
+                                                // set completion_output_for_agent (no re-engagement).
+                                                info!(
+                                                    pid,
+                                                    session_id = %session_for_notify,
+                                                    "Attributed a produced-output file; delivering it directly (suppressing finished-ping + re-engagement)"
+                                                );
+                                                break;
+                                            }
+                                            DeliverableAttribution::One(path) => {
+                                                direct_deliverable_delivery = false;
+                                                let code = exit_code
+                                                    .map(|c| format!("exit code {c}"))
+                                                    .unwrap_or_else(|| "an unknown exit status".to_string());
+                                                let msg = format!(
+                                                    "⚠️ The background command finished with errors ({code}) and produced `{}`. I'm not sending it automatically because the command did not complete successfully.",
+                                                    path.file_name()
+                                                        .map(|f| f.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| path.to_string_lossy().to_string())
+                                                );
+                                                deliver_background_text(
+                                                    hub_for_notify.as_ref(),
+                                                    state_for_notify.as_ref(),
+                                                    &session_for_notify,
+                                                    &goal_id_for_notify,
+                                                    &msg,
+                                                    pid,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            DeliverableAttribution::Ambiguous(paths) => {
+                                                direct_deliverable_delivery = false;
+                                                let msg = format!(
+                                                    "⚠️ The background command finished, but multiple output files matched: {}. I did not auto-send a file because the deliverable is ambiguous.",
+                                                    format_deliverable_paths(paths)
+                                                );
+                                                deliver_background_text(
+                                                    hub_for_notify.as_ref(),
+                                                    state_for_notify.as_ref(),
+                                                    &session_for_notify,
+                                                    &goal_id_for_notify,
+                                                    &msg,
+                                                    pid,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            DeliverableAttribution::ExpectedMissing(paths) => {
+                                                direct_deliverable_delivery = false;
+                                                let msg = format!(
+                                                    "⚠️ The background command finished before the expected output file appeared: {}. There's nothing to send.",
+                                                    format_deliverable_paths(paths)
+                                                );
+                                                deliver_background_text(
+                                                    hub_for_notify.as_ref(),
+                                                    state_for_notify.as_ref(),
+                                                    &session_for_notify,
+                                                    &goal_id_for_notify,
+                                                    &msg,
+                                                    pid,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            DeliverableAttribution::Hints(hints) => {
+                                                direct_deliverable_delivery = false;
+                                                let msg = format!(
+                                                    "⚠️ The background command finished, but the output filename was dynamic or pattern-based, so I couldn't choose a single file to send automatically. Hints: {}",
+                                                    hints.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+                                                );
+                                                deliver_background_text(
+                                                    hub_for_notify.as_ref(),
+                                                    state_for_notify.as_ref(),
+                                                    &session_for_notify,
+                                                    &goal_id_for_notify,
+                                                    &msg,
+                                                    pid,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            DeliverableAttribution::None => {
+                                                direct_deliverable_delivery = false;
+                                            }
                                         }
 
                                         // No deliverable — keep the existing friendly status ping
@@ -3255,26 +3394,28 @@ impl TerminalTool {
                             // a new message at the exact same time, both could execute
                             // concurrently. In practice this is rare since the background
                             // command finishes long after the user's original request.
-                            if let Some(path) = attributed_deliverable {
+                            if direct_deliverable_delivery {
                                 // Deterministic deliverable path: send the single attributed
                                 // produced-output file directly (deliver-once guarded), then
                                 // fall through to the running-map cleanup below. This replaces
                                 // re-engagement / the empty-stdout trivial-skip for the case the
                                 // design targets: a command that writes only to a result file.
-                                deliver_attributed_background_file(
-                                    &path,
-                                    &session_for_notify,
-                                    &command_summary,
-                                    &inbox_dir_for_notify,
-                                    &outbox_dirs_for_notify,
-                                    &delivered_deliverables_for_notify,
-                                    plan_store_for_notify.as_ref(),
-                                    hub_for_notify.as_ref(),
-                                    state_for_notify.as_ref(),
-                                    &goal_id_for_notify,
-                                    pid,
-                                )
-                                .await;
+                                if let DeliverableAttribution::One(path) = deliverable_attribution {
+                                    deliver_attributed_background_file(
+                                        &path,
+                                        &session_for_notify,
+                                        &command_summary,
+                                        &inbox_dir_for_notify,
+                                        &outbox_dirs_for_notify,
+                                        &delivered_deliverables_for_notify,
+                                        plan_store_for_notify.as_ref(),
+                                        hub_for_notify.as_ref(),
+                                        state_for_notify.as_ref(),
+                                        &goal_id_for_notify,
+                                        pid,
+                                    )
+                                    .await;
+                                }
                             } else if let Some(output) = completion_output_for_agent {
                                 let output_trimmed = output.trim();
                                 // Only genuinely empty output is trivial. A short
