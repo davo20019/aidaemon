@@ -4658,11 +4658,29 @@ impl TelegramChannel {
                         // skip the queue, and spawn concurrent tasks — silently
                         // dropping themselves. Finalized below before queue check.
                         if !reply.trim().is_empty() {
-                            if let Err(e) =
-                                send_full_or_expandable_reply(&bot, chat_id, &reply).await
+                            let handled = if let (Some(live_owner), Some(live_sink)) =
+                                (live_owner.as_ref(), live_sink.as_ref())
                             {
-                                warn!("Failed to send Telegram message: {}", e);
+                                use crate::channels::live_status::SurfaceSink;
+                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                                live_owner
+                                    .lock()
+                                    .await
+                                    .finalize_text(sink_ref, &reply)
+                                    .await
+                            } else {
+                                false
+                            };
+                            if !handled {
+                                if let Err(e) =
+                                    send_full_or_expandable_reply(&bot, chat_id, &reply).await
+                                {
+                                    warn!("Failed to send Telegram message: {}", e);
+                                }
                             }
+                        }
+                        if let Some(live_owner) = live_owner.as_ref() {
+                            live_owner.lock().await.reset();
                         }
                     }
                     Err(e) => {
@@ -4684,6 +4702,9 @@ impl TelegramChannel {
                         } else {
                             warn!("Agent error: {}", e);
                             let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                        }
+                        if let Some(live_owner) = live_owner.as_ref() {
+                            live_owner.lock().await.reset();
                         }
                     }
                 }

@@ -265,4 +265,15 @@ mod tests {
         let handled = s.finalize_text(&sink, "Answer").await;
         assert!(!handled, "no surface -> caller sends normally");
     }
+
+    #[tokio::test]
+    async fn finalize_text_false_when_edit_fails() {
+        let sink = FakeSink::new(false); // edit always returns Ok(false)
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, "working".into()).await;
+        assert!(
+            !s.finalize_text(&sink, "huge reply").await,
+            "edit failed -> finalize returns false -> caller sends normally"
+        );
+    }
 }
