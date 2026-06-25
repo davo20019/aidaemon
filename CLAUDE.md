@@ -1,287 +1,293 @@
-# CLAUDE.md
+# AGENTS.md / CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This is the shared coding-agent guide for this repository. `AGENTS.md` is a
+symlink to this file, so keep the content agent-neutral unless a rule truly only
+applies to one tool.
 
 ## Build & Run
 
 ```bash
-cargo build                          # debug build
-cargo build --release                # release build
-cargo build --features discord       # with Discord channel
-cargo build --features slack         # with Slack channel
-cargo build --features browser       # with headless Chrome tool
-cargo build --features encryption    # with SQLCipher encryption
-cargo build --features "discord,slack,browser"  # multiple features
+cargo build
+cargo build --release
+cargo build --features browser
+cargo build --features discord
+cargo build --features slack
+cargo build --features encryption
+cargo build --features "browser,slack,discord"
 ```
 
 ```bash
-cargo test                           # run all tests
-cargo test router                    # run router tests only
-cargo test --lib memory              # run memory tests only
-cargo test <test_name>               # run a single test by name
+cargo test
+cargo test --all-features
+cargo test router
+cargo test --lib memory
+cargo test integration_tests
+cargo test <test_name>
 ```
 
 ```bash
-cargo clippy                         # lint
-cargo fmt --check                    # check formatting
-cargo fmt                            # auto-format
+cargo fmt
+cargo fmt --check
+cargo clippy --all-features -- -D warnings
 ```
 
-No `rustfmt.toml` — uses default Rust formatting conventions.
+No `rustfmt.toml` is present; use default Rust formatting.
 
-## Releasing & Publishing
+## Pre-Commit Checklist
 
-**Pre-commit checklist (MUST pass before committing):**
-1. `cargo fmt` — auto-format all code
-2. `cargo clippy --all-features -- -D warnings` — zero warnings
-3. `cargo test` — all tests pass
+Before committing release-quality code:
 
-**Release steps:**
-1. Bump version in `Cargo.toml`
-2. Add a changelog entry to `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/) format (Added/Changed/Fixed/Security sections)
-3. Run the pre-commit checklist above
-4. Stage all changes including `Cargo.lock` and commit
-5. Push to `master`
-6. Tag with `git tag vX.Y.Z` and push the tag — **only after the commit passes fmt + clippy + tests**
-7. Create a GitHub release via `gh release create`
-8. CI handles `cargo publish` and Homebrew tap update automatically
+1. `cargo fmt`
+2. `cargo clippy --all-features -- -D warnings`
+3. `cargo test`
 
-**IMPORTANT**: `cargo publish` packages only git-tracked files. Before publishing:
-- Ensure all changes are committed and pushed — do NOT use `--allow-dirty`
-- Ensure `.gitignore` excludes non-Rust artifacts (`node_modules/`, temp files, etc.)
-- The crate has a 10MB upload limit — if it fails with "Payload Too Large", check what's being packaged with `cargo package --list`
+For CI parity on broad changes, prefer:
 
-## Architecture
-
-**aidaemon** is a personal AI agent daemon (single Rust binary) accessible via Telegram/Slack/Discord with agentic tool use, MCP integration, and persistent memory.
-
-### Core Flow
-
-```
-main.rs → config loading → core.rs (subsystem init) → spawn channels + agent + background tasks
+```bash
+cargo test --all-features
+cargo test --lib harness_eval --all-features
+cargo build --release --features "browser"
 ```
 
-The **agent loop** (`agent/`) is the heart: user message → build history → router selects model → LLM call → if tool calls, execute and loop → return response. It has stall detection (same tool 3+ times), repetition detection, and hard iteration limits. The agent was decomposed in v0.9.0 into submodules: `agent/loop/` (phases), `agent/runtime/` (LLM calls, history, system prompt), `agent/consultant/` (multi-pass analysis), `agent/intent/` (intent classification), `agent/policy/` (guardrails).
+## Release Notes
 
-### Key Abstractions (traits.rs)
+Release flow:
 
-Four core traits drive the architecture:
-- **`Tool`** — anything the LLM can call (`name()`, `schema()`, `call()`)
-- **`Channel`** — input sources (`send_text()`, `send_media()`, `request_approval()`)
-- **`StateStore`** — persistence layer (SQLite impl in `state/sqlite.rs`)
-- **`ModelProvider`** — LLM backends (`chat()`, `list_models()`)
+1. Bump `Cargo.toml`.
+2. Add a `CHANGELOG.md` entry using Keep a Changelog sections.
+3. Run the pre-commit checklist.
+4. Commit all release changes, including `Cargo.lock`.
+5. Push to `master`.
+6. Tag with `git tag vX.Y.Z` after checks pass, then push the tag.
+7. Create a GitHub release.
 
-#### Tool Schema Format (IMPORTANT)
+`cargo publish` packages only git-tracked files. Do not publish with
+`--allow-dirty`. If package upload fails for size, inspect contents with:
 
-`schema()` must return the **full OpenAI function object** with `name`, `description`, and `parameters`. Do NOT return just the parameters object — the LLM won't know what the tool is called or what it does.
+```bash
+cargo package --list
+```
+
+## Project Shape
+
+`aidaemon` is a single Rust daemon for personal AI-agent workflows across chat
+channels, local tools, MCP integrations, persistent memory, goals, scheduling,
+and delegated agent work.
+
+Current high-level flow:
+
+```text
+main.rs -> config.rs -> core.rs -> startup/* -> channels + agent + background tasks
+```
+
+Where to look first:
+
+- `src/core.rs` wires the daemon together and coordinates startup modules.
+- `src/startup/` owns most subsystem setup: stores, provider/router, tools,
+  skills, MCP, memory pipeline, channel startup, DB security, and final wiring.
+- `src/agent/` contains the agent runtime. Important subareas are `loop/`,
+  `runtime/`, `intent/`, `policy/`, `tools/`, `specialists/`, and `eval/`.
+- `src/tools/` contains LLM-callable tools plus deterministic local tools such
+  as file read/write/edit/search, command execution, git helpers, browser,
+  computer-use, MCP, OAuth/API management, memory, goals, and diagnostics.
+- `src/traits.rs` is a thin re-export layer. The actual trait definitions live
+  under `src/traits/`.
+- `src/state/sqlite/` is the SQLite persistence implementation, split by domain:
+  facts, messages, goals, people, skills, dynamic bots/agents/MCP, OAuth,
+  settings, prompt snapshots, notifications, token usage, and migrations.
+- `src/events/` stores immutable activity events and event-derived context.
+- `src/memory/` handles embeddings, retrieval/scoring, retention, procedures,
+  people intelligence, task learning, proactive memory, and background
+  consolidation.
+- `src/plans/` handles persistent multi-step plans and recovery.
+- `src/channels/` contains Telegram, Slack, Discord, channel connection, command,
+  attachment, approval, and hub routing code.
+- `specialists/` contains bundled specialist prompts used by `spawn_agent`.
+- `tests/` and `src/integration_tests/` contain CLI/package smoke tests and
+  agent-loop integration tests.
+
+Prefer reading the current module files over trusting stale architecture notes.
+This codebase changes quickly; keep this guide focused on durable invariants and
+navigation pointers.
+
+## Core Traits
+
+The core interfaces are re-exported from `src/traits.rs`:
+
+- `Tool`: LLM-callable capability.
+- `Channel`: inbound/outbound chat channel abstraction.
+- `StateStore` and domain store traits: persistence facade and SQLite-backed
+  implementations.
+- `ModelProvider`: LLM backend abstraction.
+- Goal, memory, people, dynamic config, dialogue, and trigger-event traits/types
+  are split into focused files under `src/traits/`.
+
+When calling store-trait methods on concrete types, import:
 
 ```rust
-// CORRECT — includes name, description, and parameters wrapper
+use crate::traits::store_prelude::*;
+```
+
+## Tool Schema Rule
+
+`Tool::schema()` must return the full OpenAI function object with `name`,
+`description`, and `parameters`. Do not return only the parameters object.
+
+```rust
 fn schema(&self) -> Value {
     json!({
         "name": "my_tool",
         "description": "What this tool does and when to use it",
         "parameters": {
             "type": "object",
-            "properties": { ... },
+            "properties": {},
             "additionalProperties": false
         }
     })
 }
-
-// WRONG — missing name/description, LLM can't identify or select this tool
-fn schema(&self) -> Value {
-    json!({
-        "type": "object",
-        "properties": { ... }
-    })
-}
 ```
 
-#### Dynamic Bots (IMPORTANT)
+Tool schemas are linted in `src/tools/schema_lint_tests.rs`.
 
-Bots can be added two ways: **config-based** (in `config.toml`) or **dynamic** (added via `/connect` command, stored in `dynamic_bots` SQLite table). When registering tools or features that depend on channel tokens (e.g., `ReadChannelHistoryTool` needs Slack bot_tokens), you MUST check BOTH sources:
-- `config.all_slack_bots()` — config-based bots only
-- `state.get_dynamic_bots().await` — dynamic bots from DB
+## Dynamic Bot Rule
 
-Failing to check dynamic bots will cause features to silently not register even though the channel is connected and working.
+Channel-connected bots can come from both static config and dynamic database
+state. When registering tools or features that depend on channel tokens, check
+both:
 
-#### Keyword Matching (IMPORTANT)
+- `config.all_slack_bots()` for config-based Slack bots.
+- `state.get_dynamic_bots().await` for dynamically connected bots.
 
-When matching keywords or phrases in user/LLM text (intent classification, deferred action detection, trigger matching, etc.), **always use word-boundary matching, never substring matching**. Substring matching causes false positives: e.g., `"deploy"` matches `"deployed"`, `"implement"` matches `"implementation"`.
+Do not assume the config file is the only source of connected channels.
 
-Use the `contains_keyword_as_words()` helper in `agent.rs` — it splits text on whitespace, trims surrounding punctuation (preserving apostrophes for contractions), and checks for exact consecutive word sequences. Both text and keyword sides are normalized the same way, so commas/brackets in keywords are handled correctly.
+## Keyword Matching Rule
+
+For natural-language keyword or phrase matching, use word-boundary matching via
+`contains_keyword_as_words()` from `src/agent/intent/intent_routing.rs` (also
+re-exported through `agent` helpers). Avoid substring matching for user/LLM text.
+
+Examples:
 
 ```rust
-// CORRECT — word-boundary matching
-contains_keyword_as_words("check deployed sites", "deploy")  // false ✓
-contains_keyword_as_words("deploy the app", "deploy")         // true ✓
-contains_keyword_as_words("set up monitoring", "set up")      // true ✓
-contains_keyword_as_words("I'll check the report", "i'll check") // true ✓
-
-// WRONG — substring matching catches derived forms
-"check deployed sites".contains("deploy")  // true ✗ — false positive
+contains_keyword_as_words("deploy the app", "deploy");      // true
+contains_keyword_as_words("check deployed sites", "deploy"); // false
+contains_keyword_as_words("set up monitoring", "set up");    // true
 ```
 
-**Exceptions where substring matching (`.contains()`) is appropriate:**
-- Structural format markers like `[tool_use:`, `[tool_call:`, `[consultation]`, `[INTENT_GATE]` — format patterns, not natural language.
-- Multi-word phrases with enough specificity to avoid false positives (e.g., `"you are now"`, `"pretend to be"`, `"ignore previous instructions"`). These are safe because the phrase itself provides sufficient context. For single-word-ish patterns, add a trailing space or extra context to prevent substring overlap (e.g., `"act as a "` not `"act as"`, `"jailbreak mode"` not `"jailbreak"`).
+Substring matching with `.contains()` is appropriate for structural markers and
+protocol fragments such as `[tool_use:`, `[tool_call:`, `[INTENT_GATE]`, or for
+long fixed phrases where substring overlap is not a concern.
 
-### Module Map
+## Test & Fixture Data Hygiene
 
-- **`core.rs`** — orchestrates startup: creates state store, event store, provider, router, tools, agent, channels, dashboard. Handles the deferred wiring for `SpawnAgentTool` (circular dep: Agent ↔ SpawnAgentTool resolved via weak reference + `set_agent()`).
-- **`agent/`** — modular agent system decomposed into submodules:
-  - `mod.rs` (~3000 lines) — agent struct, message handling, tool registration.
-  - `loop/` — phase-based agent loop: `main_loop.rs`, `llm_phase.rs`, `message_build_phase.rs`, `stopping_phase.rs`, `bootstrap/`, `tool_execution/` (budget, guards, result learning), `consultant_*` phases.
-  - `runtime/` — LLM calls (`llm.rs`), history management (`history.rs`), system prompt construction (`system_prompt.rs`), graceful shutdown (`graceful.rs`), model selection (`models.rs`), post-task processing (`post_task.rs`).
-  - `consultant/` — multi-pass analysis for complex queries.
-  - `intent/` — intent classification and gate logic. The gate is a **single deterministic layer**: `infer_intent_gate()` keyword rules arm `needs_tools` for filesystem/local-execution/auth/connected-API requests, and `classify_intent_complexity()` routes schedule/complex requests deterministically. The model-emitted `[INTENT_GATE]` JSON protocol (Layer 2) was removed in v0.9.21 — only defensive marker *stripping* remains (`response_analysis.rs`, `runtime/turn_context.rs`, completion-phase structural-marker checks). Enforcement is trust-tiered at four supervision sites in `loop/completion_phase.rs` (`Agent::supervision_gate_enforced` shadow-skips Autonomous-tier models); the anti-fabrication conditions (claimed mutations/delegations with no tool calls, structural markers) are universal across tiers. `llm_classifier.rs` is offline scaffolding, wired to nothing in production.
-  - `policy/` — guardrails and safety signal detection.
-- **`channels/hub.rs`** — `ChannelHub` routes messages between session IDs and channels via `SessionMap: Arc<RwLock<HashMap<String, String>>>`.
-- **`state/sqlite/`** (~400KB across 20 files) — multi-layer memory: `mod.rs` (core CRUD), `facts.rs` (fact storage with semantic dedup + embeddings), `episodes.rs` (conversation summaries with channel scoping), `migrations.rs` (schema migrations), `messages.rs`, `goals.rs`, `people.rs`, `skills.rs`, `dynamic_bots.rs`, `dynamic_cli_agents.rs`, `learning.rs`, `token_usage.rs`, `tests.rs`, and more.
-- **`router.rs`** — routes queries to `default_model` or `fallback_models`. Legacy Fast/Primary/Smart tiers are auto-migrated to the default+fallback model chain on startup.
-- **`events/`** — event sourcing: all agent activity is immutable events. `consolidation.rs` processes events into facts/procedures daily. `context.rs` compiles session context from events.
-- **`memory/`** — background consolidation (embeddings every 5s, fact extraction every 6h, decay daily). Uses `fastembed` AllMiniLML6V2 for vector embeddings. `manager.rs` handles episode creation for both idle and active long-running sessions. `comprehensive_tests.rs` has 17 test subsystems (A-M) covering canonical keys, supersession, privacy, retrieval, episodes, procedures, concurrency, and more.
-- **`plans/`** — persistent multi-step task plans with detection, generation, tracking, and crash recovery.
-- **`tools/terminal.rs`** — shell execution with risk assessment (`command_risk.rs`) and inline approval flow (Allow Once / Allow Always / Deny).
-- **`tools/sanitize.rs`** — reply sanitization pipeline: strips model identity leaks, internal tool name references, and diagnostic/system blocks from user-facing output. Also provides `sanitize_external_content()` for input sanitization and `redact_secrets()`.
-- **`tools/config_manager.rs`** — runtime provider switching with presets (OpenAI, Anthropic, Google, Moonshot, MiniMax, etc.) and config management actions.
-- **`tools/memory.rs`** — `RememberFactTool` with batch fact storage (multiple facts in one call) and `ManageMemoriesTool` with fuzzy forget (canonical, case-insensitive, substring matching).
-- **`providers/`** — `openai_compatible.rs` (with optional Cloudflare AI Gateway support), `google_genai.rs`, `anthropic_native.rs` — pluggable LLM backends.
-- **`skills/mod.rs`** — advanced skill system with trigger-based matching, bundled resources, and dynamic management. Skills can come from filesystem (`.md` files), URLs, inline content, remote registries, or auto-promotion from successful procedures. `SharedSkillRegistry` (`Arc<RwLock<Vec<Skill>>>`) allows runtime add/remove. Each skill has metadata (name, description, triggers, source, source_url, enabled flag) and can bundle resource files (scripts, references, configs) in a directory structure. Matching is whole-word + case-insensitive with optional LLM confirmation via fast model.
-- **`skills/resources.rs`** — `ResourceEntry` and `ResourceResolver` trait (`FileSystemResolver` impl) for loading bundled skill files on demand with path traversal protection and 32KB size cap.
-- **`tools/use_skill.rs`** — `UseSkillTool` lets the agent activate skills on demand by name.
-- **`tools/manage_skills.rs`** — `ManageSkillsTool` with 10 actions: add (from URL), add_inline, list, remove, enable, disable, browse (search registries), install (from registry), update (re-fetch from source). Includes SSRF protection.
-- **`tools/skill_resources.rs`** — `SkillResourcesTool` with list/read actions for loading bundled resource files from skills.
-- **`tools/skill_registry.rs`** — registry client for browsing/searching/installing skills from remote JSON manifests configured in `[skills.registries]`.
-- **`memory/skill_promotion.rs`** — `SkillPromoter` background task (12h cycle) that auto-converts successful procedures (≥5 uses, ≥80% success rate) into skills via LLM generation.
-- **`config.rs`** — loads `config.toml` with secret resolution: `"keychain"` → OS credential store, `"${ENV_VAR}"` → env var, or plain value.
+This project is open source and published. Never put real personal data into the
+repository: real names, addresses, phone numbers, email addresses, employers,
+birthdays, private channel IDs, or other PII.
 
-### Concurrency Model
+Use clearly synthetic placeholders in tests, fixtures, docs, specs, comments,
+and subagent briefs. Good examples:
 
-- Tokio async runtime throughout
-- `Arc<RwLock<...>>` for shared state
-- Background tasks via `tokio::spawn` (memory consolidation, event pruning, health probes, scheduler ticks)
-- Channels run their own event loops (Telegram polling, Discord gateway, Slack Socket Mode)
+- `Alice Rivera`
+- `Jordan Lee`
+- `Acme Corp`
+- `telegram:synthetic-user-1`
+- daughters `Mia` and `Zoe`
 
-### Feature Flags
+When debugging with live daemon memory or real user examples, translate the case
+to synthetic equivalents before writing tests or docs.
 
-- `browser` — `chromiumoxide` for headless Chrome
-- `discord` — `serenity` for Discord bot
-- `slack` — `tokio-tungstenite` for Slack Socket Mode
-- `encryption` — `libsqlite3-sys/bundled-sqlcipher` for SQLCipher
+## Testing Guidance
 
-### Platform-Specific
+Use focused tests for narrow changes and broader suites for shared behavior.
 
-Keyring crate uses platform-native backends: `apple-native` (macOS), `sync-secret-service` (Linux), `windows-native` (Windows). These are selected via `[target.'cfg(...)'.dependencies]` in Cargo.toml.
-
-### Test & Fixture Data Hygiene (IMPORTANT)
-
-aidaemon is **open source and published** (crates.io + GitHub). NEVER put **real personal data** into the repository — real people's names (including the owner's family, friends, colleagues), addresses, phone numbers, emails, employers, birthdays, or any other PII — in tests, fixtures, doc examples, specs, plans, or comments. Use clearly-synthetic placeholders (e.g. `Alice Rivera`, `Acme Corp`, `partner_name = "Jordan Lee"`, daughters `Mia`/`Zoe`).
-
-This matters most when working from **live examples**: if a task's data comes from the running daemon's real memory (e.g. debugging a recall bug with the owner's actual family), **substitute synthetic equivalents before writing anything into the repo or design docs.** Any relationship/logic a test needs can be expressed with fictional entities — the assertions don't care whether the name is real.
-
-This binds subagents and generated code too: if a brief you hand a subagent contains real PII as an example, replace it with synthetic data in the brief first. (Real PII already committed in git history is a separate cleanup decision — scrubbing the working tree does not remove it from past commits.)
-
-### Testing
-
-Tests are spread across 40+ files as `#[cfg(test)]` modules, totaling 1300+ tests. Key test areas:
-
-- **Unit tests:** router classification, memory/embedding math, plan detection, event context, command risk patterns, skill matching, scheduler parsing, SQLite state store CRUD, provider message conversion, terminal output formatting, channel hub routing, content sanitization, markdown formatting, semantic fact dedup, episode lifecycle
-- **Integration tests:** 13 test files (`part_00` through `part_11` + `scheduler_flaw`) exercising the full agent loop with mock LLM
-- **Comprehensive memory tests:** `memory/comprehensive_tests.rs` — 17 subsystems (A-M) covering canonical keys, supersession chains, privacy/channel scoping, retrieval, episodes, procedures, patterns, people, decay, cleanup, concurrency
-- **Property-based tests:** `proptest` for fuzz-testing command risk classification, string truncation, content sanitization, and markdown formatting
-- **Dev-dependencies:** `tempfile`, `proptest`, `insta` (with `yaml` feature)
+Useful targets:
 
 ```bash
-cargo test                           # run all tests
-cargo test integration_tests         # run integration tests only
-cargo test test_tool_execution       # run a single test by name
-cargo test --lib memory              # run memory-related tests only
-cargo test proptest                  # run property-based tests
+cargo test integration_tests
+cargo test --lib memory
+cargo test --lib harness_eval --all-features
+cargo test proptest
 ```
 
-#### CI/CD
+Integration tests exercise the real `Agent::handle_message` path with
+`MockProvider`, `TestChannel`, temp SQLite state, event/plan stores, embeddings,
+and a small default tool set. See `src/testing.rs` for harness helpers.
 
-The project uses GitHub Actions for continuous integration and release gating.
+The first embedding-backed test run may download the fastembed model into
+`.fastembed_cache/`.
 
-**CI pipeline** (`.github/workflows/ci.yml`) — runs on push to `master` and all PRs:
-- `check` job: `cargo fmt --check` (continue-on-error) + `cargo clippy --all-features -- -D warnings`
-- `test` job: `cargo test --all-features` on ubuntu-latest and macos-14
-- `build-check` job: `cargo build --release --features "browser,slack,discord"`
-- `coverage` job: `cargo-llvm-cov` → Codecov (continue-on-error, visibility only)
+## CI/CD
 
-**Release gating** (`.github/workflows/release.yml`):
-- `quality-gate` job runs `cargo test --all-features` before any build/release job
-- All downstream jobs (build, GitHub Release, crates.io, Homebrew) are blocked if tests fail
+GitHub Actions are the source of truth:
 
-To generate local coverage: `cargo llvm-cov --all-features --lcov --output-path lcov.info`
+- `.github/workflows/ci.yml` runs formatting, clippy, all-feature tests on Linux
+  and macOS, harness eval, release build checks, coverage visibility, and release
+  tag guarding.
+- `.github/workflows/release.yml` gates releases on `cargo test --all-features`,
+  builds release artifacts, creates GitHub releases, publishes crates.io, and
+  triggers Homebrew tap updates.
+- `.github/workflows/update-homebrew.yml` updates the tap after releases.
 
-#### Integration Tests
+If this document and workflow files disagree, trust the workflow files and update
+this guide.
 
-Integration tests exercise the real agent loop (`Agent::handle_message`) with a mock LLM provider and temp-file SQLite DB. They verify the same code path all channels use.
+## Feature Flags
 
-```bash
-cargo test integration_tests          # run integration tests only
-cargo test test_tool_execution        # run a single integration test
-```
+Current important feature flags:
 
-**What they test:** Agent loop, tool execution, memory/state persistence, multi-turn history, session isolation, channel auth simulation, memory privacy (channel-scoped, private, global), security (sanitization, prompt injection defense), stall detection, multi-step workflows, system prompt structure.
+- `browser`: headless browser tool via `chromiumoxide`.
+- `discord`: Discord channel via `serenity`.
+- `slack`: Slack channel via `tokio-tungstenite`.
+- `terminal-bridge`: terminal bridge websocket/crypto/PTY support.
+- `encryption`: SQLCipher via `libsqlite3-sys/bundled-sqlcipher`.
+- `computer_use`: shared computer-use code.
+- `computer_use-macos`: macOS computer-use dependencies and probe support.
 
-**Test infrastructure** (`src/testing.rs`):
-- **`MockProvider`** — mock `ModelProvider` with scripted responses and call logging. Use `MockProvider::new()` for default "Mock response", or `MockProvider::with_responses(vec![...])` for scripted sequences. Helpers: `text_response()`, `tool_call_response()`.
-- **`TestChannel`** — mock `Channel` that captures outgoing messages. Not wired to ChannelHub — tests call `agent.handle_message()` directly.
-- **`setup_test_agent(provider)`** — creates a fully wired `Agent` with real `SqliteStateStore` (temp file), real `EventStore`/`PlanStore`, real `EmbeddingService`, and `SystemInfoTool` only. Returns `TestHarness { agent, state, provider, channel }`. Each call creates an isolated DB for safe parallel execution.
-
-First run downloads the fastembed model (~25MB, cached in `.fastembed_cache/` in the working directory — fastembed's `InitOptions::default()`, not `~/.cache/`). CI caches this dir to avoid HuggingFace 429 rate limits.
+Check `Cargo.toml` for the exact current defaults and dependency mapping.
 
 ## Debugging with db_probe
 
-The database is encrypted with SQLCipher. To inspect it, use `src/bin/db_probe.rs` — a CLI tool that connects with the encryption key and dumps diagnostic data.
+The encrypted database can be inspected with `src/bin/db_probe.rs`.
 
-**Prerequisites:** Requires `AIDAEMON_ENCRYPTION_KEY` env var (or in `.env` file). Optionally set `AIDAEMON_DB_PATH` (defaults to `aidaemon.db`).
+Prerequisites:
+
+- `AIDAEMON_ENCRYPTION_KEY` in the environment or `.env`.
+- Optional `AIDAEMON_DB_PATH` (defaults to `aidaemon.db`).
+
+Examples:
 
 ```bash
-# Build and run (encryption feature required)
 cargo run --bin db_probe --features encryption
-
-# Search message history for a keyword (with surrounding context)
-cargo run --bin db_probe --features encryption -- --search "dogs-project"
-cargo run --bin db_probe --features encryption -- --search "error" --search-limit 20 --search-context 10
-
-# Inspect a specific session's events and messages
+cargo run --bin db_probe --features encryption -- --search "error"
 cargo run --bin db_probe --features encryption -- --session "telegram:12345"
-
-# Inspect a specific task's full event stream
 cargo run --bin db_probe --features encryption -- --task "task-uuid-here"
-
-# Inspect a specific CLI agent invocation
 cargo run --bin db_probe --features encryption -- --invocation 42
-
-# Repair stale CLI agent invocations (no completion recorded, older than N hours)
 cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
-
-# Change token usage lookback window (default: 7 hours, max: 720)
 cargo run --bin db_probe --features encryption -- --token-hours 24
 ```
 
-**Default output includes:** recent CLI agent invocations, open (incomplete) invocations, token usage stats (totals, per-session, hourly), recent task events, recent `cli_agent` tool events, recent messages, and dynamic CLI agent config.
+## Specialist System
 
-## MCP Tools
+Specialists are bundled prompts in `specialists/<kind>.md` with optional user
+overrides in `~/.aidaemon/specialists/` (`config.specialists_override_dir`).
 
-- When using chrome-devtools, prefer `take_screenshot` over `take_snapshot` to save tokens. Only use `take_snapshot` when you specifically need element UIDs for interaction (clicking, filling, etc.).
+Implementation lives in `src/agent/specialists/`:
 
-## Specialist Experts System
-- **Storage**: bundled `specialists/<kind>.md` (`include_str!`) + user overrides at `~/.aidaemon/specialists/` (configurable via `config.specialists_override_dir`)
-- **Module**: `src/agent/specialists/` (`mod.rs`, `parse.rs`, `registry.rs`, `render.rs`, `validation.rs`; `cfg(test)` `override_tests.rs`, `equivalence_tests.rs`)
-- **Frontmatter**: kind, description, optional model/tools/max_iterations/tool_budget/timeout_secs
-- **Template vars**: `{{mission}}` `{{task}}` `{{depth}}` `{{max_depth}}` `{{max_iterations}}` `{{goal_id}}` `{{working_dir}}` `{{is_scheduled}}` `{{parent_session_id}}` `{{execution_mode}}`
-- **Migration safety**: byte-equivalence with legacy `build_task_lead_prompt` / `build_executor_prompt` asserted in `src/agent/specialists/equivalence_tests.rs` over 12 fixtures (depth × is_scheduled × has_cli_agent). Legacy fns retained as `#[cfg(test)]` oracle.
-- **Spawn integration**: `spawn_agent` schema gains optional `specialist` arg (8-value enum, `task_lead` excluded). `Agent::resolve_specialist_kind` chooses: role-wins → arg-wins-if-non-task-lead → heuristic fallback.
-- **LLM discovery**: descriptions surface in two places, both driven from `SpecialistRegistry::llm_visible_kinds()` so user overrides change both surfaces on next start:
-  - `spawn_agent` schema — `specialist` parameter description lists each non-`task_lead` kind + its frontmatter description (built in `src/tools/spawn.rs`).
-  - System prompt — "## Available Specialists" block in `src/agent/runtime/system_prompt.rs`, spliced in before the `## Tools` section of the root agent's prompt.
-- **Tool allowlist**: intersected with the role-pre-filtered tool set via `intersect_tools` (role boundary enforced upstream by the spawn-flow role filter).
-- **Budgets**: `max_iterations` and `timeout_secs` clamped via `clamp_max_iterations`/`clamp_timeout` (timeout cap: `self.timeout_secs` if >0 else 3600).
-- **Telemetry**: spawn `tracing::info!` includes `specialist_source` (`"bundled"` | `"user_override"`).
-- **Defaults**: bundled `task_lead.md` and `executor.md` are byte-for-byte the legacy prompt content (verified by equivalence tests).
+- `parse.rs`: frontmatter and template parsing.
+- `registry.rs`: bundled/user override registry.
+- `render.rs`: prompt rendering.
+- `validation.rs`: validation and clamping.
+- `equivalence_tests.rs` and `override_tests.rs`: migration and override tests.
+
+`spawn_agent` exposes specialist selection through `src/tools/spawn.rs` and
+runtime support in `src/agent/runtime/spawn.rs`. LLM-visible specialist
+descriptions come from `SpecialistRegistry::llm_visible_kinds()` and appear in
+both the tool schema and root system prompt.
+
+## MCP / Browser Notes
+
+MCP startup and dynamic MCP state live in `src/startup/mcp.rs`,
+`src/tools/manage_mcp.rs`, and `src/state/sqlite/dynamic_mcp.rs`.
+
+When using browser inspection tools, prefer screenshots over full accessibility
+snapshots unless element IDs are needed for interaction.

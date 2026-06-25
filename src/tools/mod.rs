@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod background_deliverable;
 #[cfg(feature = "browser")]
 pub mod browser;
 #[cfg(feature = "slack")]
@@ -10,6 +11,7 @@ pub(crate) mod command_semantics;
 pub mod computer_use;
 mod config_manager;
 mod diagnose;
+pub mod file_delivery;
 mod goal_trace;
 mod health_probe;
 mod manage_memories;

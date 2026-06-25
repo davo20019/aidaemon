@@ -335,6 +335,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
         spawn_tool,
         terminal_tool,
         cli_agent_tool,
+        plan_store.clone(),
     )
     .await;
     // Deferred hub wiring for the requirement-checklist tool (mirrors terminal).

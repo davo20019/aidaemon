@@ -152,6 +152,22 @@ pub(super) fn semantic_scope_blocks_tool(
     )
 }
 
+pub(super) fn is_scheduled_goal_execution_text(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("[system: already scheduled and firing now; do not reschedule.]")
+}
+
+pub(super) fn effective_dialogue_scope_for_tool_execution(
+    active_scope: Option<ToolSemanticScope>,
+    user_text: &str,
+) -> Option<ToolSemanticScope> {
+    if is_scheduled_goal_execution_text(user_text) {
+        None
+    } else {
+        active_scope
+    }
+}
+
 pub(super) struct DeterministicToolContractViolation {
     pub(super) reason: String,
     pub(super) coaching: String,
@@ -739,6 +755,33 @@ mod tests {
         let args = r#"{"action":"diagnose_scheduled","goal_id":"goal-123"}"#;
         let violation = deterministic_tool_contract_violation("manage_memories", args);
         assert!(violation.is_none());
+    }
+
+    #[test]
+    fn scheduled_execution_text_clears_stale_goal_state_scope() {
+        let scope = effective_dialogue_scope_for_tool_execution(
+            Some(ToolSemanticScope::GoalState),
+            "Scheduled check: Post daily update [SYSTEM: already scheduled and firing now; do not reschedule.]",
+        );
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn finite_scheduled_execution_text_clears_stale_goal_state_scope() {
+        let scope = effective_dialogue_scope_for_tool_execution(
+            Some(ToolSemanticScope::GoalState),
+            "Execute scheduled goal: Publish queued API update [SYSTEM: already scheduled and firing now; do not reschedule.]",
+        );
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn scheduled_goal_question_keeps_goal_state_scope() {
+        let scope = effective_dialogue_scope_for_tool_execution(
+            Some(ToolSemanticScope::GoalState),
+            "What times does the scheduled tweet goal run?",
+        );
+        assert_eq!(scope, Some(ToolSemanticScope::GoalState));
     }
 
     #[test]

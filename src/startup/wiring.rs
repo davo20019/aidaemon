@@ -65,6 +65,7 @@ pub async fn wire_hub_cycles(
     spawn_tool: Option<Arc<crate::tools::SpawnAgentTool>>,
     terminal_tool: Option<Arc<crate::tools::TerminalTool>>,
     cli_agent_tool: Option<Arc<crate::tools::CliAgentTool>>,
+    plan_store: Arc<crate::plans::PlanStore>,
 ) {
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
@@ -78,6 +79,9 @@ pub async fn wire_hub_cycles(
     if let Some(tt) = terminal_tool {
         tt.set_hub(Arc::downgrade(hub));
         tt.set_agent(Arc::downgrade(agent));
+        // Durable plan store for completion-time deliverable attribution and the
+        // conservative delivery-step write-back.
+        tt.set_plan_store(plan_store);
     }
     if let Some(cat) = cli_agent_tool {
         cat.set_hub(Arc::downgrade(hub));

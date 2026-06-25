@@ -823,6 +823,16 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::Terminal => {
+            // Mirror the dirs `send_file` is constructed with so harness-side
+            // background deliverable delivery routes through the same shared
+            // validation/recovery (`prepare_delivery`).
+            let inbox_dir = PathBuf::from(shellexpand::tilde(&config.files.inbox_dir).to_string());
+            let outbox_dirs: Vec<PathBuf> = config
+                .files
+                .outbox_dirs
+                .iter()
+                .map(|d| PathBuf::from(shellexpand::tilde(d).to_string()))
+                .collect();
             let terminal = Arc::new(
                 TerminalTool::new(
                     config.terminal.allowed_prefixes.clone(),
@@ -835,7 +845,8 @@ async fn build_base_tool(
                 .await
                 .with_event_store(event_store)
                 .with_state(state as Arc<dyn crate::traits::StateStore>)
-                .with_self_correction(config.self_correction.clone()),
+                .with_self_correction(config.self_correction.clone())
+                .with_delivery_dirs(inbox_dir, outbox_dirs),
             );
             BuiltBaseTool {
                 tool: terminal.clone(),
