@@ -2,9 +2,6 @@
 //! the first progress event and edited in place for every subsequent update, so a
 //! task shows one calm, updating line/checklist instead of many messages.
 
-// Items are wired in Task 5 (telegram integration); allow dead_code until then.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::channels::ChannelHub;
@@ -38,6 +35,8 @@ impl LiveStatus {
     }
 
     /// True once a surface message exists for this turn.
+    // Wired in Task 6 (finalize surface into reply).
+    #[allow(dead_code)]
     pub fn has_surface(&self) -> bool {
         self.message_id.is_some()
     }
@@ -95,6 +94,8 @@ impl LiveStatus {
 
     /// Edit the surface into the final reply. Returns true if the caller no
     /// longer needs to send the reply separately.
+    // Wired in Task 6 (finalize surface into reply).
+    #[allow(dead_code)]
     pub async fn finalize_text(&mut self, sink: &dyn SurfaceSink, reply: &str) -> bool {
         if reply.trim().is_empty() {
             return false;
@@ -108,6 +109,8 @@ impl LiveStatus {
     }
 
     /// Flip the surface to a terminal done-state before a file is delivered.
+    // Wired in Task 6 (finalize surface into reply).
+    #[allow(dead_code)]
     pub async fn finalize_done(&mut self, sink: &dyn SurfaceSink) {
         if let (Some(id), true) = (&self.message_id, self.edit_supported) {
             let body = self

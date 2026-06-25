@@ -4514,198 +4514,250 @@ impl TelegramChannel {
             }
         });
 
+        // Upgrade the channel hub weak reference while `self` is still in scope.
+        // The hub is needed for the live-status surface (Task 4/5).
+        let status_hub = self
+            .channel_hub
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()));
+
         // Status update channel — agent emits updates, we display them rate-limited.
-        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
-        let status_bot = bot.clone();
-        let status_chat_id = msg.chat.id;
+        let (status_tx, status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(16);
         let is_dm = channel_ctx.visibility == ChannelVisibility::Private;
-        let status_task = tokio::spawn(async move {
-            let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-            let min_interval = Duration::from_secs(3);
-            let mut dm_status_count: u32 = 0;
-            const MAX_DM_STATUS_MESSAGES: u32 = 6;
-            while let Some(update) = status_rx.recv().await {
-                if is_indicator_only_status(&update) {
-                    let _ = status_bot
-                        .send_chat_action(status_chat_id, ChatAction::Typing)
-                        .await;
-                    continue;
-                }
-                // In non-DM channels, suppress progress chatter.
-                if !is_dm {
-                    if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                        // Fall through — cost notifications must reach the user
-                    } else {
-                        continue;
-                    }
-                }
-                let now = tokio::time::Instant::now();
-                // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
-                // and for BudgetExtended (cost notifications should always be delivered)
-                let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
-                    if chunk.contains("https://") || chunk.contains("http://"));
-                let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
-                // Hard cap on DM status messages to prevent notification spam.
-                // BudgetExtended and URL-containing messages always bypass the cap.
-                if !has_url && !is_budget_ext && dm_status_count >= MAX_DM_STATUS_MESSAGES {
-                    // After the cap, just send typing indicator instead
-                    let _ = status_bot
-                        .send_chat_action(status_chat_id, ChatAction::Typing)
-                        .await;
-                    continue;
-                }
-                if !has_url && !is_budget_ext && now.duration_since(last_sent) < min_interval {
-                    continue;
-                }
-                let text = match &update {
-                    StatusUpdate::Thinking(_) => continue,
-                    StatusUpdate::ToolStart { name, summary } => {
-                        let mut chars = name.chars();
-                        let cap_name = match chars.next() {
-                            None => String::new(),
-                            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
-                        };
-                        if summary.is_empty() {
-                            format!("{}...", cap_name)
-                        } else {
-                            format!("{}: {}...", cap_name, summary)
+
+        // Build the single live-status surface (owner + hub-backed sink) when the hub
+        // is available. The normal core.rs startup path wires the hub before any channel
+        // traffic arrives, so the None branch is purely defensive.
+        let (live_owner, live_sink): (
+            Option<std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>>,
+            Option<std::sync::Arc<crate::channels::live_status::HubSurfaceSink>>,
+        ) = if let Some(hub) = status_hub {
+            let owner = std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::channels::live_status::LiveStatus::new(),
+            ));
+            let sink = std::sync::Arc::new(crate::channels::live_status::HubSurfaceSink::new(
+                hub,
+                session_id.clone(),
+            ));
+            (Some(owner), Some(sink))
+        } else {
+            warn!(
+                session_id = %session_id,
+                "Telegram status surface disabled: ChannelHub is not wired"
+            );
+            (None, None)
+        };
+
+        let status_task = match (&live_owner, &live_sink) {
+            (Some(owner), Some(sink)) => tokio::spawn(run_status_consumer(
+                status_rx,
+                owner.clone(),
+                sink.clone(),
+                bot.clone(),
+                msg.chat.id,
+                is_dm,
+            )),
+            _ => {
+                // Fallback: hub unavailable — legacy consumer keeps basic progress
+                // visible so user requests still work in degraded mode.
+                let mut status_rx = status_rx;
+                let status_bot = bot.clone();
+                let status_chat_id = msg.chat.id;
+                tokio::spawn(async move {
+                    let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
+                    let min_interval = Duration::from_secs(3);
+                    let mut dm_status_count: u32 = 0;
+                    const MAX_DM_STATUS_MESSAGES: u32 = 6;
+                    while let Some(update) = status_rx.recv().await {
+                        if is_indicator_only_status(&update) {
+                            let _ = status_bot
+                                .send_chat_action(status_chat_id, ChatAction::Typing)
+                                .await;
+                            continue;
                         }
-                    }
-                    StatusUpdate::ToolProgress { name, chunk } => {
-                        // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
-                        if chunk.contains("https://") || chunk.contains("http://") {
-                            format!("📤 {}\n{}", name, chunk)
-                        } else {
-                            let preview: String = chunk.chars().take(100).collect();
-                            if chunk.len() > 100 {
-                                format!("📤 {}: {}...", name, preview)
+                        // In non-DM channels, suppress progress chatter.
+                        if !is_dm {
+                            if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
+                                // Fall through — cost notifications must reach the user
                             } else {
-                                format!("📤 {}: {}", name, preview)
+                                continue;
                             }
                         }
-                    }
-                    StatusUpdate::ToolComplete { name, summary } => {
-                        format!("✓ {}: {}", name, summary)
-                    }
-                    StatusUpdate::ToolCancellable { name, task_id } => {
-                        format!("⏳ {} started (task_id: {})", name, task_id)
-                    }
-                    StatusUpdate::ProgressSummary {
-                        elapsed_mins,
-                        summary,
-                    } => {
-                        format!("📊 Progress ({} min): {}", elapsed_mins, summary)
-                    }
-                    StatusUpdate::IterationWarning { current, threshold } => {
-                        format!(
-                            "⚠️ Approaching soft limit: {} of {} iterations",
-                            current, threshold
-                        )
-                    }
-                    StatusUpdate::PlanCreated {
-                        description,
-                        total_steps,
-                        ..
-                    } => {
-                        format!("📋 Plan created: {} ({} steps)", description, total_steps)
-                    }
-                    StatusUpdate::PlanStepStart {
-                        step_index,
-                        total_steps,
-                        description,
-                        ..
-                    } => {
-                        format!(
-                            "▶️ Step {}/{}: {}",
-                            step_index + 1,
-                            total_steps,
-                            description
-                        )
-                    }
-                    StatusUpdate::PlanStepComplete {
-                        step_index,
-                        total_steps,
-                        description,
-                        summary,
-                        ..
-                    } => {
-                        let base = format!(
-                            "✅ Step {}/{} done: {}",
-                            step_index + 1,
-                            total_steps,
-                            description
-                        );
-                        if let Some(s) = summary {
-                            format!("{} - {}", base, s)
-                        } else {
-                            base
+                        let now = tokio::time::Instant::now();
+                        // Skip rate limiting for ToolProgress with URLs (e.g., OAuth authorize links)
+                        // and for BudgetExtended (cost notifications should always be delivered)
+                        let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
+                            if chunk.contains("https://") || chunk.contains("http://"));
+                        let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+                        // Hard cap on DM status messages to prevent notification spam.
+                        // BudgetExtended and URL-containing messages always bypass the cap.
+                        if !has_url && !is_budget_ext && dm_status_count >= MAX_DM_STATUS_MESSAGES {
+                            // After the cap, just send typing indicator instead
+                            let _ = status_bot
+                                .send_chat_action(status_chat_id, ChatAction::Typing)
+                                .await;
+                            continue;
                         }
+                        if !has_url
+                            && !is_budget_ext
+                            && now.duration_since(last_sent) < min_interval
+                        {
+                            continue;
+                        }
+                        let text = match &update {
+                            StatusUpdate::Thinking(_) => continue,
+                            StatusUpdate::ToolStart { name, summary } => {
+                                let mut chars = name.chars();
+                                let cap_name = match chars.next() {
+                                    None => String::new(),
+                                    Some(f) => {
+                                        f.to_uppercase().collect::<String>() + chars.as_str()
+                                    }
+                                };
+                                if summary.is_empty() {
+                                    format!("{}...", cap_name)
+                                } else {
+                                    format!("{}: {}...", cap_name, summary)
+                                }
+                            }
+                            StatusUpdate::ToolProgress { name, chunk } => {
+                                // Don't truncate if the chunk contains a URL (e.g., OAuth authorize links)
+                                if chunk.contains("https://") || chunk.contains("http://") {
+                                    format!("📤 {}\n{}", name, chunk)
+                                } else {
+                                    let preview: String = chunk.chars().take(100).collect();
+                                    if chunk.len() > 100 {
+                                        format!("📤 {}: {}...", name, preview)
+                                    } else {
+                                        format!("📤 {}: {}", name, preview)
+                                    }
+                                }
+                            }
+                            StatusUpdate::ToolComplete { name, summary } => {
+                                format!("✓ {}: {}", name, summary)
+                            }
+                            StatusUpdate::ToolCancellable { name, task_id } => {
+                                format!("⏳ {} started (task_id: {})", name, task_id)
+                            }
+                            StatusUpdate::ProgressSummary {
+                                elapsed_mins,
+                                summary,
+                            } => {
+                                format!("📊 Progress ({} min): {}", elapsed_mins, summary)
+                            }
+                            StatusUpdate::IterationWarning { current, threshold } => {
+                                format!(
+                                    "⚠️ Approaching soft limit: {} of {} iterations",
+                                    current, threshold
+                                )
+                            }
+                            StatusUpdate::PlanCreated {
+                                description,
+                                total_steps,
+                                ..
+                            } => {
+                                format!("📋 Plan created: {} ({} steps)", description, total_steps)
+                            }
+                            StatusUpdate::PlanStepStart {
+                                step_index,
+                                total_steps,
+                                description,
+                                ..
+                            } => {
+                                format!(
+                                    "▶️ Step {}/{}: {}",
+                                    step_index + 1,
+                                    total_steps,
+                                    description
+                                )
+                            }
+                            StatusUpdate::PlanStepComplete {
+                                step_index,
+                                total_steps,
+                                description,
+                                summary,
+                                ..
+                            } => {
+                                let base = format!(
+                                    "✅ Step {}/{} done: {}",
+                                    step_index + 1,
+                                    total_steps,
+                                    description
+                                );
+                                if let Some(s) = summary {
+                                    format!("{} - {}", base, s)
+                                } else {
+                                    base
+                                }
+                            }
+                            StatusUpdate::PlanStepFailed {
+                                step_index,
+                                description,
+                                error,
+                                ..
+                            } => {
+                                format!(
+                                    "❌ Step {} failed: {} - {}",
+                                    step_index + 1,
+                                    description,
+                                    error
+                                )
+                            }
+                            StatusUpdate::PlanComplete {
+                                description,
+                                total_steps,
+                                duration_secs,
+                                ..
+                            } => {
+                                let mins = duration_secs / 60;
+                                let secs = duration_secs % 60;
+                                format!(
+                                    "🎉 Plan complete: {} ({} steps in {}m {}s)",
+                                    description, total_steps, mins, secs
+                                )
+                            }
+                            StatusUpdate::PlanAbandoned { description, .. } => {
+                                format!("🚫 Plan abandoned: {}", description)
+                            }
+                            StatusUpdate::PlanRevised {
+                                description,
+                                reason,
+                                new_total_steps,
+                                ..
+                            } => {
+                                format!(
+                                    "🔄 Plan revised: {} ({} steps) - {}",
+                                    description, new_total_steps, reason
+                                )
+                            }
+                            StatusUpdate::BudgetExtended {
+                                old_budget,
+                                new_budget,
+                                extension,
+                                max_extensions,
+                            } => {
+                                format!(
+                                    "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
+                                    old_budget, new_budget, extension, max_extensions
+                                )
+                            }
+                            StatusUpdate::Checklist { text } => text.clone(),
+                        };
+                        let _ = status_bot.send_message(status_chat_id, text).await;
+                        dm_status_count += 1;
+                        // Re-send typing indicator immediately after each status message.
+                        // Telegram clears the typing indicator when a message is sent, so
+                        // without this there's a visible gap until the typing loop's next
+                        // 4-second tick.
+                        let _ = status_bot
+                            .send_chat_action(status_chat_id, ChatAction::Typing)
+                            .await;
+                        last_sent = tokio::time::Instant::now();
                     }
-                    StatusUpdate::PlanStepFailed {
-                        step_index,
-                        description,
-                        error,
-                        ..
-                    } => {
-                        format!(
-                            "❌ Step {} failed: {} - {}",
-                            step_index + 1,
-                            description,
-                            error
-                        )
-                    }
-                    StatusUpdate::PlanComplete {
-                        description,
-                        total_steps,
-                        duration_secs,
-                        ..
-                    } => {
-                        let mins = duration_secs / 60;
-                        let secs = duration_secs % 60;
-                        format!(
-                            "🎉 Plan complete: {} ({} steps in {}m {}s)",
-                            description, total_steps, mins, secs
-                        )
-                    }
-                    StatusUpdate::PlanAbandoned { description, .. } => {
-                        format!("🚫 Plan abandoned: {}", description)
-                    }
-                    StatusUpdate::PlanRevised {
-                        description,
-                        reason,
-                        new_total_steps,
-                        ..
-                    } => {
-                        format!(
-                            "🔄 Plan revised: {} ({} steps) - {}",
-                            description, new_total_steps, reason
-                        )
-                    }
-                    StatusUpdate::BudgetExtended {
-                        old_budget,
-                        new_budget,
-                        extension,
-                        max_extensions,
-                    } => {
-                        format!(
-                            "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
-                            old_budget, new_budget, extension, max_extensions
-                        )
-                    }
-                    StatusUpdate::Checklist { text } => text.clone(),
-                };
-                let _ = status_bot.send_message(status_chat_id, text).await;
-                dm_status_count += 1;
-                // Re-send typing indicator immediately after each status message.
-                // Telegram clears the typing indicator when a message is sent, so
-                // without this there's a visible gap until the typing loop's next
-                // 4-second tick.
-                let _ = status_bot
-                    .send_chat_action(status_chat_id, ChatAction::Typing)
-                    .await;
-                last_sent = tokio::time::Instant::now();
+                })
             }
-        });
+        };
 
         // Register this task for tracking and cancellation.
         let description: String = text.chars().take(80).collect();
@@ -4747,6 +4799,10 @@ impl TelegramChannel {
             let mut current_typing_cancel = typing_cancel;
             let mut current_status_task = status_task;
             let mut current_heartbeat = heartbeat;
+            // live_owner/live_sink are carried through all queue-drain iterations so
+            // that Task 6 can finalize the surface after the agent reply is ready.
+            let live_owner = live_owner;
+            let live_sink = live_sink;
             // Hard wall-clock deadline: no single message handling can exceed this,
             // regardless of heartbeat or LLM watchdog state. This catches hangs in
             // non-LLM code paths (DB queries, bootstrap phase, etc.) that the
@@ -4856,70 +4912,94 @@ impl TelegramChannel {
                     current_task_id = new_task_id;
                     current_cancel_token = new_cancel_token;
 
-                    // Create new status channel and typing indicator
-                    let (new_status_tx, mut new_status_rx) =
+                    // Create new status channel for the queued turn.
+                    let (new_status_tx, new_status_rx) =
                         tokio::sync::mpsc::channel::<StatusUpdate>(16);
                     current_status_tx = new_status_tx;
 
-                    let status_bot = bot.clone();
-                    current_status_task = tokio::spawn(async move {
-                        let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
-                        let min_interval = Duration::from_secs(3);
-                        while let Some(update) = new_status_rx.recv().await {
-                            if is_indicator_only_status(&update) {
-                                let _ = status_bot
-                                    .send_chat_action(chat_id, ChatAction::Typing)
-                                    .await;
-                                continue;
-                            }
-                            // In non-DM channels, suppress progress chatter except
-                            // BudgetExtended, which must always reach the user.
-                            if !is_dm {
-                                if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
-                                    // Fall through — cost notifications must reach the user
-                                } else {
-                                    continue;
-                                }
-                            }
-                            let now = tokio::time::Instant::now();
-                            let is_budget_ext =
-                                matches!(&update, StatusUpdate::BudgetExtended { .. });
-                            if !is_budget_ext && now.duration_since(last_sent) < min_interval {
-                                continue;
-                            }
-                            let text = match &update {
-                                StatusUpdate::Thinking(_) => continue,
-                                StatusUpdate::ToolStart { name, summary } => {
-                                    let mut chars = name.chars();
-                                    let cap_name = match chars.next() {
-                                        None => String::new(),
-                                        Some(f) => {
-                                            f.to_uppercase().collect::<String>() + chars.as_str()
-                                        }
-                                    };
-                                    if summary.is_empty() {
-                                        format!("{}...", cap_name)
-                                    } else {
-                                        format!("{}: {}...", cap_name, summary)
-                                    }
-                                }
-                                StatusUpdate::BudgetExtended {
-                                    old_budget,
-                                    new_budget,
-                                    extension,
-                                    max_extensions,
-                                } => {
-                                    format!(
-                                        "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
-                                        old_budget, new_budget, extension, max_extensions
-                                    )
-                                }
-                                _ => continue, // Skip other status updates for queued messages
-                            };
-                            let _ = status_bot.send_message(chat_id, text).await;
-                            last_sent = tokio::time::Instant::now();
+                    // Reset the live surface and spawn a fresh consumer for the
+                    // queued turn, reusing the same owner/sink (Task 6 will finalize).
+                    current_status_task = match (&live_owner, &live_sink) {
+                        (Some(owner), Some(sink)) => {
+                            owner.lock().await.reset();
+                            tokio::spawn(run_status_consumer(
+                                new_status_rx,
+                                owner.clone(),
+                                sink.clone(),
+                                bot.clone(),
+                                chat_id,
+                                is_dm,
+                            ))
                         }
-                    });
+                        _ => {
+                            // Legacy fallback: hub unavailable — minimal consumer so
+                            // queued turns still show basic progress.
+                            let mut new_status_rx = new_status_rx;
+                            let status_bot = bot.clone();
+                            tokio::spawn(async move {
+                                let mut last_sent =
+                                    tokio::time::Instant::now() - Duration::from_secs(10);
+                                let min_interval = Duration::from_secs(3);
+                                while let Some(update) = new_status_rx.recv().await {
+                                    if is_indicator_only_status(&update) {
+                                        let _ = status_bot
+                                            .send_chat_action(chat_id, ChatAction::Typing)
+                                            .await;
+                                        continue;
+                                    }
+                                    // In non-DM channels, suppress progress chatter except
+                                    // BudgetExtended, which must always reach the user.
+                                    if !is_dm {
+                                        if matches!(&update, StatusUpdate::BudgetExtended { .. }) {
+                                            // Fall through — cost notifications must reach the user
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    let now = tokio::time::Instant::now();
+                                    let is_budget_ext =
+                                        matches!(&update, StatusUpdate::BudgetExtended { .. });
+                                    if !is_budget_ext
+                                        && now.duration_since(last_sent) < min_interval
+                                    {
+                                        continue;
+                                    }
+                                    let text = match &update {
+                                        StatusUpdate::Thinking(_) => continue,
+                                        StatusUpdate::ToolStart { name, summary } => {
+                                            let mut chars = name.chars();
+                                            let cap_name = match chars.next() {
+                                                None => String::new(),
+                                                Some(f) => {
+                                                    f.to_uppercase().collect::<String>()
+                                                        + chars.as_str()
+                                                }
+                                            };
+                                            if summary.is_empty() {
+                                                format!("{}...", cap_name)
+                                            } else {
+                                                format!("{}: {}...", cap_name, summary)
+                                            }
+                                        }
+                                        StatusUpdate::BudgetExtended {
+                                            old_budget,
+                                            new_budget,
+                                            extension,
+                                            max_extensions,
+                                        } => {
+                                            format!(
+                                                "💰 Auto-extended token budget {} → {} ({}/{}) — continuing.",
+                                                old_budget, new_budget, extension, max_extensions
+                                            )
+                                        }
+                                        _ => continue,
+                                    };
+                                    let _ = status_bot.send_message(chat_id, text).await;
+                                    last_sent = tokio::time::Instant::now();
+                                }
+                            })
+                        }
+                    };
 
                     // Fresh heartbeat for queued message
                     let new_heartbeat = Arc::new(AtomicU64::new(
@@ -5433,6 +5513,103 @@ pub fn determine_role(owner_ids: &[u64], user_id: u64) -> UserRole {
 
 fn is_indicator_only_status(update: &StatusUpdate) -> bool {
     matches!(update, StatusUpdate::Thinking(_))
+}
+
+/// Single status consumer used at both the primary and queue-drain sites.
+///
+/// Ordinary progress events are folded into the `LiveStatus` single-surface owner
+/// (one message created lazily and edited in place). BudgetExtended and URL-bearing
+/// OAuth links are must-deliver and sent as their own messages. All existing gating
+/// is preserved: `is_indicator_only_status`, non-DM suppression, 3 s `min_interval`,
+/// and the BudgetExtended / URL bypass.
+async fn run_status_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<StatusUpdate>,
+    owner: std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>,
+    sink: std::sync::Arc<crate::channels::live_status::HubSurfaceSink>,
+    bot: Bot,
+    chat_id: ChatId,
+    is_dm: bool,
+) {
+    use crate::channels::live_status::SurfaceSink;
+    let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(10);
+    let min_interval = Duration::from_secs(3);
+    while let Some(update) = rx.recv().await {
+        if is_indicator_only_status(&update) {
+            let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+            continue;
+        }
+        let has_url = matches!(&update, StatusUpdate::ToolProgress { chunk, .. }
+            if chunk.contains("https://") || chunk.contains("http://"));
+        let is_budget_ext = matches!(&update, StatusUpdate::BudgetExtended { .. });
+        // Non-DM channels: suppress progress except BudgetExtended (unchanged behaviour).
+        if !is_dm && !is_budget_ext {
+            continue;
+        }
+        // BudgetExtended and URL-bearing OAuth links are must-deliver: send as
+        // their own message (never folded into the live surface).
+        if is_budget_ext || has_url {
+            let text = match &update {
+                StatusUpdate::BudgetExtended {
+                    old_budget,
+                    new_budget,
+                    extension,
+                    max_extensions,
+                } => format!(
+                    "💰 Auto-extended token budget {old_budget} → {new_budget} \
+                     ({extension}/{max_extensions}) — continuing."
+                ),
+                StatusUpdate::ToolProgress { name, chunk } => format!("📤 {name}\n{chunk}"),
+                _ => String::new(),
+            };
+            if !text.is_empty() {
+                let _ = bot.send_message(chat_id, text).await;
+            }
+            continue;
+        }
+        // Ordinary progress → single live surface, gated by min_interval.
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_sent) < min_interval {
+            continue;
+        }
+        let sink_ref: &dyn SurfaceSink = sink.as_ref();
+        match &update {
+            StatusUpdate::Checklist { text } => {
+                owner
+                    .lock()
+                    .await
+                    .set_checklist(sink_ref, text.clone())
+                    .await;
+            }
+            StatusUpdate::ToolStart { name, summary } => {
+                let line = if summary.is_empty() {
+                    format!("{name}…")
+                } else {
+                    format!("{name}: {summary}…")
+                };
+                owner.lock().await.set_activity(sink_ref, line).await;
+            }
+            StatusUpdate::ToolComplete { name, .. } => {
+                owner
+                    .lock()
+                    .await
+                    .set_activity(sink_ref, format!("{name}…"))
+                    .await;
+            }
+            StatusUpdate::PlanStepStart { description, .. }
+            | StatusUpdate::PlanStepComplete { description, .. } => {
+                owner
+                    .lock()
+                    .await
+                    .set_activity(sink_ref, description.clone())
+                    .await;
+            }
+            _ => {
+                continue; // other Plan*/Thinking variants: no separate message
+            }
+        }
+        last_sent = tokio::time::Instant::now();
+        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+    }
 }
 
 #[cfg(test)]
