@@ -34,13 +34,6 @@ impl LiveStatus {
         }
     }
 
-    /// True once a surface message exists for this turn.
-    // Wired in Task 6 (finalize surface into reply).
-    #[allow(dead_code)]
-    pub fn has_surface(&self) -> bool {
-        self.message_id.is_some()
-    }
-
     fn render(&self) -> Option<String> {
         if let Some(c) = &self.checklist {
             return Some(c.clone());
@@ -94,8 +87,6 @@ impl LiveStatus {
 
     /// Edit the surface into the final reply. Returns true if the caller no
     /// longer needs to send the reply separately.
-    // Wired in Task 6 (finalize surface into reply).
-    #[allow(dead_code)]
     pub async fn finalize_text(&mut self, sink: &dyn SurfaceSink, reply: &str) -> bool {
         if reply.trim().is_empty() {
             return false;
@@ -109,8 +100,6 @@ impl LiveStatus {
     }
 
     /// Flip the surface to a terminal done-state before a file is delivered.
-    // Wired in Task 6 (finalize surface into reply).
-    #[allow(dead_code)]
     pub async fn finalize_done(&mut self, sink: &dyn SurfaceSink) {
         if let (Some(id), true) = (&self.message_id, self.edit_supported) {
             let body = self
@@ -274,6 +263,37 @@ mod tests {
         assert!(
             !s.finalize_text(&sink, "huge reply").await,
             "edit failed -> finalize returns false -> caller sends normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_done_resolves_surface_to_done() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_activity(&sink, "Working…".into()).await;
+        s.finalize_done(&sink).await;
+        let edits = sink.edits.lock().unwrap();
+        // First edit is from set_activity (second call), last is finalize_done
+        assert_eq!(
+            edits.last().unwrap().1,
+            "✅ Done",
+            "finalize_done edits surface to '✅ Done' when no checklist is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_done_resolves_surface_to_checklist() {
+        let sink = FakeSink::new(true);
+        let mut s = LiveStatus::new();
+        s.set_checklist(&sink, "📋 Plan\n✅ Step 1\n☐ Step 2".into())
+            .await;
+        s.finalize_done(&sink).await;
+        let edits = sink.edits.lock().unwrap();
+        // finalize_done should edit the surface to the checklist body
+        assert_eq!(
+            edits.last().unwrap().1,
+            "📋 Plan\n✅ Step 1\n☐ Step 2",
+            "finalize_done edits surface to checklist body when checklist is set"
         );
     }
 }

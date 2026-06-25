@@ -1812,7 +1812,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 // rendered checklist (parsed from the tool result) and suppress the
                 // generic ToolComplete so the surface does not flash "updating
                 // checklist…" over the freshly rendered list.
-                if let Some((_, checklist)) = result_text.split_once(":\n") {
+                if let Some(checklist) = parse_checklist_from_result(&result_text) {
                     send_status(
                         &status_tx,
                         StatusUpdate::Checklist {
@@ -2445,21 +2445,29 @@ mod correction_gate_tests {
     }
 }
 
+/// Extract the rendered checklist from a track_requirements tool result of the
+/// form "Checklist updated (N/M done):\n<rendered>". Returns None if the result
+/// doesn't carry a rendered list (degraded/error returns), in which case no
+/// Checklist status is emitted.
+pub(crate) fn parse_checklist_from_result(result_text: &str) -> Option<&str> {
+    result_text
+        .split_once(":\n")
+        .map(|(_, checklist)| checklist)
+}
+
 // ── checklist-parse unit tests ────────────────────────────────────────────────
 //
-// Covers the `split_once(":\n")` used at line ~1815 to parse the rendered
-// checklist out of a `track_requirements` tool result.
+// Covers `parse_checklist_from_result`, the shared helper used to parse the
+// rendered checklist out of a `track_requirements` tool result.
 #[cfg(test)]
 mod checklist_parse_tests {
-    fn extract_checklist(result: &str) -> Option<&str> {
-        result.split_once(":\n").map(|(_, c)| c)
-    }
+    use super::parse_checklist_from_result;
 
     #[test]
     fn well_formed_result_splits_to_rendered_checklist() {
         let result = "Checklist updated (1/2 done):\n📋 Plan\n✅ Step 1\n☐ Step 2";
         assert_eq!(
-            extract_checklist(result),
+            parse_checklist_from_result(result),
             Some("📋 Plan\n✅ Step 1\n☐ Step 2"),
             "rendered checklist must follow the colon-newline delimiter"
         );
@@ -2469,7 +2477,7 @@ mod checklist_parse_tests {
     fn malformed_result_without_colon_newline_yields_none() {
         let result = "Checklist updated (1/2 done)";
         assert_eq!(
-            extract_checklist(result),
+            parse_checklist_from_result(result),
             None,
             "no delimiter -> no checklist emitted"
         );
@@ -2479,6 +2487,6 @@ mod checklist_parse_tests {
     fn empty_checklist_body_is_still_some() {
         // edge-case: delimiter present but nothing after it
         let result = "Checklist updated (0/1 done):\n";
-        assert_eq!(extract_checklist(result), Some(""));
+        assert_eq!(parse_checklist_from_result(result), Some(""));
     }
 }

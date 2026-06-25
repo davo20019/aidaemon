@@ -4678,6 +4678,14 @@ impl TelegramChannel {
                                     warn!("Failed to send Telegram message: {}", e);
                                 }
                             }
+                        } else if let (Some(live_owner), Some(live_sink)) =
+                            (live_owner.as_ref(), live_sink.as_ref())
+                        {
+                            // Empty reply: resolve any live surface so it doesn't stay
+                            // stuck on "⏳ Running…" forever.
+                            use crate::channels::live_status::SurfaceSink;
+                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                            live_owner.lock().await.finalize_done(sink_ref).await;
                         }
                         if let Some(live_owner) = live_owner.as_ref() {
                             live_owner.lock().await.reset();
@@ -4703,7 +4711,18 @@ impl TelegramChannel {
                             warn!("Agent error: {}", e);
                             let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                         }
-                        if let Some(live_owner) = live_owner.as_ref() {
+                        if let (Some(live_owner), Some(live_sink)) =
+                            (live_owner.as_ref(), live_sink.as_ref())
+                        {
+                            use crate::channels::live_status::SurfaceSink;
+                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                            let _ = live_owner
+                                .lock()
+                                .await
+                                .finalize_text(sink_ref, &format!("⚠️ {error_msg}"))
+                                .await;
+                            live_owner.lock().await.reset();
+                        } else if let Some(live_owner) = live_owner.as_ref() {
                             live_owner.lock().await.reset();
                         }
                     }
