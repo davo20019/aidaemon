@@ -39,6 +39,62 @@ enum CorrectionGateDecision {
     GiveUpToolResult { report: String },
 }
 
+async fn reconcile_successful_tool_checklist(
+    agent: &Agent,
+    session_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    result_text: &str,
+) {
+    let Some(plan_store) = agent.plan_store.read().await.clone() else {
+        return;
+    };
+
+    let updated_plan = match plan_store
+        .reconcile_checklist_after_tool_success(session_id, tool_name, arguments, result_text)
+        .await
+    {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(
+                error = %e,
+                session_id,
+                tool = %tool_name,
+                "Failed to reconcile successful tool call into requirement checklist"
+            );
+            return;
+        }
+    };
+
+    let Some(message_id) = updated_plan
+        .checkpoint
+        .get("ui_message_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(hub) = agent.hub.read().await.as_ref().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    if let Err(e) = hub
+        .edit_text(
+            session_id,
+            &message_id,
+            &updated_plan.render_compact_checklist(),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            session_id,
+            tool = %tool_name,
+            "Failed to edit reconciled requirement checklist"
+        );
+    }
+}
+
 /// Per-call correction sandbox gate (Plan 3b P2.4).
 ///
 /// Classifies the proposed tool call against the default-deny sandbox policy,
@@ -1695,6 +1751,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         if let Some(outcome) = learning_outcome.control_flow {
             commit_state!();
             return Ok(outcome);
+        }
+        if !is_error {
+            reconcile_successful_tool_checklist(
+                agent,
+                session_id,
+                &tc.name,
+                &effective_arguments,
+                &result_text,
+            )
+            .await;
         }
         if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
             if let Some(diagnosis) = super::reflection::maybe_trigger_reflection(

@@ -187,7 +187,7 @@ Continue with tools that directly match the user request.",
                     .to_string()
             }
             Self::SendFileSucceededStopAndReply => {
-                "[SYSTEM] send_file succeeded. Unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now.".to_string()
+                "[SYSTEM] send_file succeeded. If an active requirement checklist exists, update it now before replying; otherwise, unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now.".to_string()
             }
             Self::RecoverableFilePathMiss { tool_name } => format!(
                 "[SYSTEM] Recoverable file/path miss for `{}`. \
@@ -505,7 +505,7 @@ mod tests {
     fn send_file_success_render_matches_previous_text() {
         assert_eq!(
             ToolResultNotice::SendFileSucceededStopAndReply.render(),
-            "[SYSTEM] send_file succeeded. Unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now."
+            "[SYSTEM] send_file succeeded. If an active requirement checklist exists, update it now before replying; otherwise, unless the user explicitly requested additional files or modifications, stop calling tools and reply to the user now."
         );
     }
 

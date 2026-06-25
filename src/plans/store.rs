@@ -286,6 +286,132 @@ impl PlanStore {
         Ok(true)
     }
 
+    /// Reconcile a successful tool call back into the active requirement checklist.
+    ///
+    /// This is intentionally conservative: it only checks off pending/in-progress
+    /// items whose text names the same path (or basename) as the successful tool
+    /// call and whose wording matches the tool's role. The model should still use
+    /// `track_requirements` for nuanced/non-file requirements.
+    pub async fn reconcile_checklist_after_tool_success(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        result: &str,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        use crate::agent::keyword_match as contains_keyword_as_words;
+        use crate::plans::StepStatus;
+
+        let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let evidence_paths = checklist_tool_evidence_paths(tool_name, arguments, result);
+        if evidence_paths.is_empty() {
+            return Ok(None);
+        }
+
+        let mut changed = false;
+        for step in &mut plan.steps {
+            if !matches!(step.status, StepStatus::Pending | StepStatus::InProgress) {
+                continue;
+            }
+            let desc = step.description.to_lowercase();
+            if !evidence_paths
+                .iter()
+                .any(|path| checklist_step_mentions_path(&desc, path))
+            {
+                continue;
+            }
+
+            let matches_tool_role = match tool_name {
+                "send_file" => {
+                    checklist_is_delivery_step(&desc)
+                        || contains_keyword_as_words(&desc, "send")
+                        || contains_keyword_as_words(&desc, "deliver")
+                }
+                "write_file" => {
+                    contains_keyword_as_words(&desc, "create")
+                        || contains_keyword_as_words(&desc, "write")
+                        || contains_keyword_as_words(&desc, "save")
+                }
+                "edit_file" => {
+                    contains_keyword_as_words(&desc, "edit")
+                        || contains_keyword_as_words(&desc, "update")
+                        || contains_keyword_as_words(&desc, "modify")
+                        || contains_keyword_as_words(&desc, "append")
+                }
+                "read_file" => {
+                    !checklist_is_delivery_step(&desc)
+                        && (contains_keyword_as_words(&desc, "ensure")
+                            || contains_keyword_as_words(&desc, "verify")
+                            || contains_keyword_as_words(&desc, "check")
+                            || contains_keyword_as_words(&desc, "read")
+                            || contains_keyword_as_words(&desc, "result")
+                            || contains_keyword_as_words(&desc, "results")
+                            || contains_keyword_as_words(&desc, "output")
+                            || contains_keyword_as_words(&desc, "append")
+                            || contains_keyword_as_words(&desc, "appended"))
+                }
+                "terminal" | "run_command" => {
+                    !result.to_lowercase().contains("moved to background")
+                        && (contains_keyword_as_words(&desc, "run")
+                            || contains_keyword_as_words(&desc, "execute")
+                            || contains_keyword_as_words(&desc, "start"))
+                }
+                _ => false,
+            };
+
+            if matches_tool_role {
+                step.status = StepStatus::Completed;
+                step.completed_at = Some(Utc::now());
+                step.result_summary = Some(crate::utils::truncate_str(result, 200));
+                changed = true;
+            }
+        }
+
+        if changed
+            && tool_name == "read_file"
+            && result.contains("File:")
+            && result.contains("lines")
+        {
+            let matching_run_steps: Vec<usize> = plan
+                .steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| {
+                    matches!(step.status, StepStatus::Pending | StepStatus::InProgress)
+                })
+                .filter(|(_, step)| {
+                    let desc = step.description.to_lowercase();
+                    contains_keyword_as_words(&desc, "script")
+                        && (contains_keyword_as_words(&desc, "run")
+                            || contains_keyword_as_words(&desc, "execute")
+                            || contains_keyword_as_words(&desc, "start"))
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+            if matching_run_steps.len() == 1 {
+                let idx = matching_run_steps[0];
+                plan.steps[idx].status = StepStatus::Completed;
+                plan.steps[idx].completed_at = Some(Utc::now());
+                plan.steps[idx].result_summary = Some(crate::utils::truncate_str(result, 200));
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return Ok(None);
+        }
+
+        plan.updated_at = Utc::now();
+        if plan.is_finished() {
+            plan.status = PlanStatus::Completed;
+        }
+        self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
     /// Link a plan to a task ID from the event store.
     pub async fn set_task_id(&self, plan_id: &str, task_id: &str) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -498,6 +624,78 @@ impl PlanStore {
     }
 }
 
+fn checklist_tool_evidence_paths(tool_name: &str, arguments: &str, result: &str) -> Vec<String> {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let mut paths = Vec::new();
+    match tool_name {
+        "send_file" => push_json_path_arg(&args, "file_path", &mut paths),
+        "write_file" | "read_file" | "edit_file" => {
+            push_json_path_arg(&args, "path", &mut paths);
+            push_json_path_arg(&args, "file_path", &mut paths);
+        }
+        "terminal" | "run_command" => {
+            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+                paths.extend(extract_absolute_paths_for_checklist(command));
+            }
+        }
+        _ => {}
+    }
+    paths.extend(extract_absolute_paths_for_checklist(result));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn push_json_path_arg(args: &serde_json::Value, key: &str, paths: &mut Vec<String>) {
+    if let Some(path) = args.get(key).and_then(serde_json::Value::as_str) {
+        paths.push(path.to_string());
+    }
+}
+
+fn extract_absolute_paths_for_checklist(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '"' | '\'' | '`' | ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
+                )
+            });
+            if trimmed.starts_with('/') {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn checklist_step_mentions_path(step_desc_lower: &str, path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    if step_desc_lower.contains(&path_lower) {
+        return true;
+    }
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|filename| step_desc_lower.contains(&filename.to_lowercase()))
+        .unwrap_or(false)
+}
+
+fn checklist_is_delivery_step(step_desc_lower: &str) -> bool {
+    use crate::agent::keyword_match as contains_keyword_as_words;
+
+    const DELIVERY_VERBS: &[&str] = &["send", "deliver", "attach", "share"];
+    const FILE_NOUNS: &[&str] = &["file", "result", "results", "report", "output"];
+    DELIVERY_VERBS
+        .iter()
+        .any(|v| contains_keyword_as_words(step_desc_lower, v))
+        && FILE_NOUNS
+            .iter()
+            .any(|n| contains_keyword_as_words(step_desc_lower, n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +777,75 @@ mod tests {
             !store.mark_delivery_step_complete("s1").await.unwrap(),
             "`sender` must not match the delivery verb `send`"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_checklist_after_tool_success_marks_obvious_tool_backed_items() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        store
+            .upsert_checklist(
+                "s1",
+                None,
+                "test",
+                &[
+                    (
+                        "Create /tmp/mgate.py to measure TCP latency to 1.1.1.1".into(),
+                        StepStatus::Pending,
+                    ),
+                    (
+                        "Ensure results are appended to /tmp/mgate_results.txt".into(),
+                        StepStatus::Pending,
+                    ),
+                    ("Run the script for 45 seconds".into(), StepStatus::Pending),
+                    (
+                        "Send /tmp/mgate_results.txt to the user".into(),
+                        StepStatus::Pending,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        store
+            .reconcile_checklist_after_tool_success(
+                "s1",
+                "write_file",
+                r#"{"path":"/tmp/mgate.py"}"#,
+                "Created /tmp/mgate.py 888 bytes, 31 lines",
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_checklist_after_tool_success(
+                "s1",
+                "read_file",
+                r#"{"path":"/tmp/mgate_results.txt"}"#,
+                "File: /tmp/mgate_results.txt (45 lines, 1539 bytes)",
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_checklist_after_tool_success(
+                "s1",
+                "send_file",
+                r#"{"file_path":"/tmp/mgate_results.txt"}"#,
+                "File sent: mgate_results.txt (2 KB)",
+            )
+            .await
+            .unwrap();
+
+        let plan = store
+            .get_recent_for_session("s1", 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(plan.steps[0].status, StepStatus::Completed);
+        assert_eq!(plan.steps[1].status, StepStatus::Completed);
+        assert_eq!(plan.steps[2].status, StepStatus::Completed);
+        assert_eq!(plan.steps[3].status, StepStatus::Completed);
+        assert_eq!(plan.status, PlanStatus::Completed);
     }
 
     #[tokio::test]
