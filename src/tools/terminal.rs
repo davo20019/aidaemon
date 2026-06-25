@@ -410,6 +410,15 @@ fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> 
     }
 }
 
+/// Build the user-facing caption for an auto-delivered background result file.
+/// Never embeds the shell command — only the filename and an optional summary.
+fn build_deliverable_caption(filename: &str, summary: Option<&str>) -> String {
+    match summary {
+        Some(s) if !s.trim().is_empty() => format!("{}\n\n📄 {}", s.trim(), filename),
+        _ => format!("Done — result file attached.\n\n📄 {}", filename),
+    }
+}
+
 /// Deliver one attributed produced-output file directly to the session's
 /// channel, guarded by the process-scoped deliver-once ledger. On a successful
 /// document send, the conservative single-item checklist write-back marks the
@@ -420,7 +429,7 @@ fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> 
 async fn deliver_attributed_background_file(
     path: &std::path::Path,
     session_id: &str,
-    command_summary: &str,
+    _command_summary: &str,
     inbox_dir: &std::path::Path,
     outbox_dirs: &[PathBuf],
     delivered_deliverables: &Arc<Mutex<HashMap<(String, String), DeliverableDeliveryState>>>,
@@ -486,10 +495,7 @@ async fn deliver_attributed_background_file(
         }
     };
 
-    let caption = format!(
-        "Here's the result file from `{command_summary}`: {}",
-        ready.filename
-    );
+    let caption = build_deliverable_caption(&ready.filename, None);
     let msg = MediaMessage {
         session_id: session_id.to_string(),
         caption: caption.clone(),
@@ -4546,6 +4552,20 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn deliverable_caption_has_no_command() {
+        let cap = build_deliverable_caption("netprobe_results3.txt", None);
+        assert!(
+            !cap.contains("cd "),
+            "caption must not contain a shell command"
+        );
+        assert!(
+            !cap.contains('`'),
+            "caption must not contain backticked command"
+        );
+        assert!(cap.contains("netprobe_results3.txt"));
+    }
 
     #[test]
     fn test_reengagement_followup_steers_deferred_file_send() {
