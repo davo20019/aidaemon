@@ -2943,26 +2943,6 @@ impl TerminalTool {
                                         )
                                         .await;
 
-                                        // Internal progress signal (typing indicator + logs) is
-                                        // telemetry — emit it regardless of how the result is
-                                        // delivered. pid + raw command belong here, not in chat.
-                                        if let Some(ref tx) = status_tx_for_notify {
-                                            if let Err(e) = tx.try_send(StatusUpdate::ToolProgress {
-                                                name: "terminal".to_string(),
-                                                chunk: format!(
-                                                    "Background command finished (pid={}): {}",
-                                                    pid, command_summary
-                                                ),
-                                            }) {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier failed to send progress status update"
-                                                );
-                                            }
-                                        }
-
                                         match &deliverable_attribution {
                                             DeliverableAttribution::One(_) if exit_code == Some(0) => {
                                                 direct_deliverable_delivery = true;
@@ -3058,7 +3038,7 @@ impl TerminalTool {
                                         // and feed the output to agent re-engagement below.
                                         let message = if exit_code == Some(0) {
                                             format!(
-                                                "✅ Background command finished in {}.",
+                                                "✅ Done — finished in {}.",
                                                 humanize_elapsed(elapsed_secs)
                                             )
                                         } else {
@@ -5273,7 +5253,9 @@ mod tests {
                 {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Background command finished") {
+                if entry.message.contains("Done — finished in")
+                    || entry.message.contains("finished with errors in")
+                {
                     saw_completion = true;
                 }
             }
@@ -5339,7 +5321,9 @@ mod tests {
                 if entry.message.contains("Still working on it") {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Background command finished") {
+                if entry.message.contains("Done — finished in")
+                    || entry.message.contains("finished with errors in")
+                {
                     saw_completion = true;
                 }
             }
