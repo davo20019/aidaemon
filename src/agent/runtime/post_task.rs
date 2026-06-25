@@ -431,7 +431,7 @@ pub(super) fn graceful_timeout_response(
     learning_ctx: &LearningContext,
     elapsed: Duration,
 ) -> String {
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let mut summary = format!(
         "I've been working on this for {} minutes and reached the time limit. \
             Here's what I accomplished so far:\n\n{}\
@@ -455,7 +455,7 @@ pub(super) fn graceful_budget_response(
     learning_ctx: &LearningContext,
     _tokens_used: u64,
 ) -> String {
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let mut summary = format!(
         "I've reached my processing limit for this task. \
             Here's what I accomplished so far:\n\n{}\
@@ -480,7 +480,7 @@ pub(super) fn graceful_scheduled_run_budget_response(
     tokens_used: i64,
     budget_per_check: i64,
 ) -> String {
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let mut summary = format!(
         "This scheduled run hit its per-run processing budget (used {} / {} tokens). \
             Here's what I accomplished so far:\n\n{}\
@@ -555,7 +555,7 @@ pub(super) fn graceful_stall_response(
         deferred_no_tool_error_marker,
         tool_failure_count,
     );
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let error_explanation = format_error_explanation(&learning_ctx.errors);
     let failure_summary = format_tool_failure_summary(tool_failure_count);
     if sent_file_successfully {
@@ -602,7 +602,7 @@ pub(super) fn graceful_partial_stall_response(
         deferred_no_tool_error_marker,
         tool_failure_count,
     );
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let error_explanation = format_error_explanation(&learning_ctx.errors);
     let failure_summary = format_tool_failure_summary(tool_failure_count);
     if sent_file_successfully {
@@ -643,7 +643,7 @@ pub(super) fn graceful_repetitive_response(
     learning_ctx: &LearningContext,
     _tool_name: &str,
 ) -> String {
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let error_explanation = format_error_explanation(&learning_ctx.errors);
     let mut msg = String::from("I seem to be stuck on this task.\n\n");
     if !activity.is_empty() {
@@ -660,7 +660,7 @@ pub(super) fn graceful_repetitive_response(
 
 /// Graceful response when hard iteration cap is reached (legacy mode).
 pub(super) fn graceful_cap_response(learning_ctx: &LearningContext, _iterations: usize) -> String {
-    let activity = categorize_tool_calls(&learning_ctx.tool_calls);
+    let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
     let mut summary = format!(
         "I've reached my processing limit for this task. \
             Here's what I accomplished so far:\n\n{}\
@@ -918,7 +918,20 @@ pub(in crate::agent) fn display_tool_call(call: &str) -> String {
 ///
 /// Parses entries like `"read_file(Hero.jsx)"` and `"terminal(\`pip install fpdf\`)"` into
 /// grouped categories so the next interaction can understand what was already done.
+///
+/// Recap for internal/LLM context — keeps raw command text so the model can see
+/// exactly what already ran (helps avoid re-running the same command).
 pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
+    categorize_tool_calls_inner(tool_calls, false)
+}
+
+/// Recap for user-facing replies — redacts raw shell commands to a count so they
+/// never reach chat, while keeping file / search / source detail.
+pub(in crate::agent) fn categorize_tool_calls_user_facing(tool_calls: &[String]) -> String {
+    categorize_tool_calls_inner(tool_calls, true)
+}
+
+fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> String {
     let mut files_read: Vec<&str> = Vec::new();
     let mut files_written: Vec<&str> = Vec::new();
     let mut commands_run: Vec<&str> = Vec::new();
@@ -983,8 +996,18 @@ pub(in crate::agent) fn categorize_tool_calls(tool_calls: &[String]) -> String {
         sections.push(format!("Files written: {}", items.join(", ")));
     }
     if !commands_run.is_empty() {
-        let items: Vec<&str> = commands_run.iter().copied().take(10).collect();
-        sections.push(format!("Commands run: {}", items.join(", ")));
+        if redact_commands {
+            // Never surface raw shell commands in user-facing recaps — count only.
+            let n = commands_run.len();
+            sections.push(format!(
+                "Commands run: {} command{}",
+                n,
+                if n == 1 { "" } else { "s" }
+            ));
+        } else {
+            let items: Vec<&str> = commands_run.iter().copied().take(10).collect();
+            sections.push(format!("Commands run: {}", items.join(", ")));
+        }
     }
     if !files_sent.is_empty() {
         let items: Vec<&str> = files_sent.iter().copied().take(5).collect();
@@ -1093,6 +1116,27 @@ mod tests {
         assert!(result.contains("Files sent:"));
         assert!(result.contains("Guide.pdf"));
         assert!(result.contains("Searches:"));
+    }
+
+    #[test]
+    fn user_facing_recap_redacts_raw_commands_to_a_count() {
+        let calls = vec![
+            "read_file(netprobe6.py)".to_string(),
+            "terminal(`cd '/tmp' && timeout 45s python3 /tmp/netprobe6.py`)".to_string(),
+            "terminal(`cd '/tmp' && python3 /tmp/netprobe6.py`)".to_string(),
+        ];
+        let internal = categorize_tool_calls(&calls);
+        let user = categorize_tool_calls_user_facing(&calls);
+        // Internal recap keeps the raw command so the model can see what ran.
+        assert!(internal.contains("cd '/tmp'"));
+        // User-facing recap NEVER surfaces a raw shell command.
+        assert!(
+            !user.contains("cd '/tmp'") && !user.contains("python3"),
+            "user-facing recap leaked a command: {user}"
+        );
+        assert!(user.contains("Commands run: 2 commands"));
+        // File detail is still shown to the user.
+        assert!(user.contains("Files read: netprobe6.py"));
     }
 
     #[test]

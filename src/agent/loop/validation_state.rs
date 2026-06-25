@@ -835,7 +835,7 @@ pub(crate) fn summarize_partial_result_with_plan(
         {
             reconciliation.summary
         } else if !learning_ctx.tool_calls.is_empty() {
-            let summary = post_task::categorize_tool_calls(&learning_ctx.tool_calls);
+            let summary = post_task::categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
             if summary.trim().is_empty() {
                 format!(
                     "Completed {} tool action(s).",

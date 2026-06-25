@@ -277,7 +277,7 @@ pub(super) fn structured_result_synthesis_directive(
 
 pub(super) fn build_activity_summary_reply(tool_calls: &[&str]) -> String {
     let calls: Vec<String> = tool_calls.iter().map(|call| (*call).to_string()).collect();
-    let summary = post_task::categorize_tool_calls(&calls);
+    let summary = post_task::categorize_tool_calls_user_facing(&calls);
     if !summary.trim().is_empty() {
         return summary.trim().to_string();
     }
