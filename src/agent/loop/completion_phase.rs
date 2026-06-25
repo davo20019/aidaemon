@@ -203,7 +203,30 @@ pub(super) async fn run_completion_phase(
                     session_id,
                     iteration, "Background detach acknowledgement enforced"
                 );
-                reply = background_ack;
+                let assistant_msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: Some(background_ack.clone()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls_json: None,
+                    created_at: Utc::now(),
+                    importance: 0.4,
+                    ..Message::runtime_defaults()
+                };
+                agent
+                    .append_assistant_message_with_event(
+                        emitter,
+                        &assistant_msg,
+                        "system",
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                commit_state!();
+                return Ok(Some(ResponsePhaseOutcome::Return(Ok(background_ack))));
             }
         }
 

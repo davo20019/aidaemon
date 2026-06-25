@@ -148,16 +148,15 @@ impl TaskOutcomeDerivation {
         if self.has_unrecovered_model_error {
             return TaskOutcome::Failed;
         }
-        // A long-running command moved to the background (with a "will notify you
-        // when done" ack) is a deferral, not a failure — score it Partial even
-        // though no final user-facing answer was produced this turn.
-        if self.deferred_to_background {
-            return TaskOutcome::Partial;
-        }
         if self.terminal_cause.is_some() {
             return TaskOutcome::Failed;
         }
         if !self.response_has_user_value {
+            // A long-running command moved to the background (with a "will notify
+            // you when done" ack) is a deferral, not a failure.
+            if self.deferred_to_background {
+                return TaskOutcome::Partial;
+            }
             return TaskOutcome::Failed;
         }
         if self.required_actions.unresolved > 0 || !self.completion_contract_fulfilled {
@@ -383,10 +382,24 @@ mod tests {
         d.response_has_user_value = false;
         assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
 
-        // With a valid reply and no error it is still Partial (a deferral).
+        // With a valid final reply and no unresolved work, a previously
+        // backgrounded task can complete successfully.
         let mut d = base_derivation();
         d.deferred_to_background = true;
-        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
+        assert_eq!(d.derive_outcome(), TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn completed_background_followup_can_succeed() {
+        let mut d = base_derivation();
+        d.deferred_to_background = true;
+        d.required_actions = RequestedActionSummary {
+            required: 3,
+            satisfied: 3,
+            unresolved: 0,
+        };
+
+        assert_eq!(d.derive_outcome(), TaskOutcome::Succeeded);
     }
 
     #[test]
