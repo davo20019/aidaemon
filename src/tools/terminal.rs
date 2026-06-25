@@ -2439,10 +2439,77 @@ impl TerminalTool {
                     )
                     .await;
 
+                // Task 6: honest closeout for an unfulfilled deliverable. If this
+                // command was structured to produce an explicit output file
+                // (attributable) but the file never appeared and nothing was
+                // delivered for this session, say so plainly instead of the generic
+                // whole-disk-scan guidance — that command was not a scan, it was
+                // supposed to hand back a file. Skipped when remediation is running
+                // (it will follow up) or when nothing is attributable (servers,
+                // watchers, scans → unchanged behavior).
+                let unfulfilled_deliverable: Option<String> = if remediating {
+                    None
+                } else {
+                    let command_end = std::time::SystemTime::now();
+                    let command_start = command_end
+                        .checked_sub(Duration::from_secs(runtime_secs))
+                        .unwrap_or(command_end);
+                    match attribute_one_deliverable(
+                        &session_id,
+                        &proc_command,
+                        command_start,
+                        command_end,
+                        self.plan_store.get(),
+                    )
+                    .await
+                    {
+                        Some(path) => {
+                            let file_appeared = std::fs::metadata(&path).is_ok();
+                            let already_delivered = self
+                                .delivered_deliverables
+                                .lock()
+                                .await
+                                .iter()
+                                .any(|(s, _)| s == &session_id);
+                            if !file_appeared && !already_delivered {
+                                Some(
+                                    path.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.to_string_lossy().to_string()),
+                                )
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
                 // Reason-specific phrasing. Both keep the existing "stopped a
                 // background command" / scoping-guidance shape so the user always
                 // gets actionable next steps.
-                let message = if remediating {
+                let message = if let Some(filename) = unfulfilled_deliverable {
+                    match reason {
+                        ReapReason::Stalled => format!(
+                            "⚠️ I stopped a background command because it stopped making \
+                             progress (no CPU/disk activity for {}): `{}`. The expected \
+                             output file `{}` never appeared, so there's nothing to send. \
+                             You may want to re-run it or check why it didn't produce the file.",
+                            humanize_elapsed(idle_secs),
+                            command_summary,
+                            filename
+                        ),
+                        ReapReason::MaxRuntime => format!(
+                            "⚠️ I stopped a background command because it ran for over {} \
+                             without finishing: `{}`. The expected output file `{}` never \
+                             appeared, so there's nothing to send. You may want to re-run it \
+                             or check why it didn't produce the file.",
+                            humanize_elapsed(runtime_secs),
+                            command_summary,
+                            filename
+                        ),
+                    }
+                } else if remediating {
                     match reason {
                         ReapReason::Stalled => format!(
                             "⚠️ That background command stopped making progress \

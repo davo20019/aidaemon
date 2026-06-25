@@ -217,3 +217,77 @@ async fn empty_stdout_background_command_delivers_result_file() {
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&result_path);
 }
+
+// Task 6: a detached command that was structured to produce an explicit output
+// file but is idle-reaped before the file ever appears must close out with an
+// HONEST failure ("expected output file ... never appeared"), not a silent end or
+// the generic whole-disk-scan guidance (this command was not a scan).
+#[tokio::test]
+async fn reaped_command_without_produced_file_sends_honest_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let missing_path = std::env::temp_dir().join(format!(
+        "bgd_unfulfilled_{}_{}.txt",
+        std::process::id(),
+        "reap"
+    ));
+    let _ = std::fs::remove_file(&missing_path);
+
+    let session_id = "sess_bgd_reap";
+    let (tool, _state, channel) = make_terminal_with_hub(inbox, vec![], session_id).await;
+
+    // A command that hangs (so the idle-reaper, not the completion notifier,
+    // handles it) and carries an explicit `--output` target it never writes.
+    let command = format!(
+        "python3 -c \"import time; time.sleep(30)\" --output {}",
+        missing_path.display()
+    );
+    let call = serde_json::json!({
+        "action": "run",
+        "command": command,
+        "_session_id": session_id,
+        "_user_role": "Owner",
+    })
+    .to_string();
+
+    let response = tool.call(&call).await.unwrap();
+    assert!(
+        response.contains("Moved to background (pid="),
+        "command should have been moved to background: {response}"
+    );
+
+    // Force an immediate reap (zero idle + zero max-runtime thresholds).
+    let reaped = tool
+        .reap_stale_background_processes_with(Duration::from_secs(0), Duration::from_secs(0))
+        .await;
+    assert!(reaped >= 1, "the hung background command should have been reaped");
+
+    // Allow the reaper's notification to flush.
+    let mut got_honest = false;
+    for _ in 0..40 {
+        let texts = channel.texts().await;
+        if texts.iter().any(|t| {
+            let l = t.to_lowercase();
+            l.contains("never appeared") && l.contains("nothing to send")
+        }) {
+            got_honest = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let texts = channel.texts().await;
+    assert!(
+        got_honest,
+        "reaper must send an honest unfulfilled-deliverable failure; texts={texts:?}"
+    );
+    // No file was produced, so nothing should have been delivered as a document.
+    assert_eq!(
+        channel.document_count().await,
+        0,
+        "no document should be sent when the produced file never appeared"
+    );
+
+    let _ = std::fs::remove_file(&missing_path);
+}
