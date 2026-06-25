@@ -49,6 +49,25 @@ cargo test --lib harness_eval --all-features
 cargo build --release --features "browser"
 ```
 
+## Git Safety
+
+This repository often has active, unrelated work in the tree. Do not clean up,
+discard, or revert files unless the user explicitly asks for that exact action.
+
+Never run broad destructive commands such as:
+
+```bash
+git checkout *
+git checkout .
+git restore .
+git reset --hard
+git clean -fd
+```
+
+If a change needs to be reverted, inspect the diff first and revert only the
+specific lines or files you changed. Prefer `git diff`, `git status --short`,
+and targeted patches. When unrelated files are modified, leave them alone.
+
 ## Release Notes
 
 Release flow:
