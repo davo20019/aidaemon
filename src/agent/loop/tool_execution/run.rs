@@ -2444,3 +2444,41 @@ mod correction_gate_tests {
         );
     }
 }
+
+// ── checklist-parse unit tests ────────────────────────────────────────────────
+//
+// Covers the `split_once(":\n")` used at line ~1815 to parse the rendered
+// checklist out of a `track_requirements` tool result.
+#[cfg(test)]
+mod checklist_parse_tests {
+    fn extract_checklist(result: &str) -> Option<&str> {
+        result.split_once(":\n").map(|(_, c)| c)
+    }
+
+    #[test]
+    fn well_formed_result_splits_to_rendered_checklist() {
+        let result = "Checklist updated (1/2 done):\n📋 Plan\n✅ Step 1\n☐ Step 2";
+        assert_eq!(
+            extract_checklist(result),
+            Some("📋 Plan\n✅ Step 1\n☐ Step 2"),
+            "rendered checklist must follow the colon-newline delimiter"
+        );
+    }
+
+    #[test]
+    fn malformed_result_without_colon_newline_yields_none() {
+        let result = "Checklist updated (1/2 done)";
+        assert_eq!(
+            extract_checklist(result),
+            None,
+            "no delimiter -> no checklist emitted"
+        );
+    }
+
+    #[test]
+    fn empty_checklist_body_is_still_some() {
+        // edge-case: delimiter present but nothing after it
+        let result = "Checklist updated (0/1 done):\n";
+        assert_eq!(extract_checklist(result), Some(""));
+    }
+}
