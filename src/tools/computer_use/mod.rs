@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::channels::attachments::save_tool_observation_image;
 use crate::config::{ComputerUseConfig, ProviderKind, VisionConfig};
+use crate::events::{Event, EventStore, EventType};
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
@@ -63,6 +64,10 @@ pub struct ComputerUseTool {
     /// immediate exact repeat (e.g. clicking a Like/toggle twice) that could
     /// undo the first action. Cleared by any other action (observation included).
     last_mutation_sig: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Optional events store: when present, every action is also persisted as a
+    /// structured event so the full trajectory (incl. click_method/outcome/
+    /// timing) is auditable from the DB, not only from stdout logs.
+    events: Option<Arc<EventStore>>,
 }
 
 const DUPLICATE_MUTATION_CAUTION: &str = "\n[NOTE] This repeats your previous action on the same \
@@ -81,6 +86,7 @@ impl ComputerUseTool {
         inbox_dir: PathBuf,
         approval: ApprovalBroker,
         media_tx: mpsc::Sender<MediaMessage>,
+        events: Option<Arc<EventStore>>,
     ) -> Self {
         #[cfg(all(not(test), target_os = "macos", feature = "computer_use-macos"))]
         let harness: Arc<dyn ComputerHarness> = Arc::new(macos::MacOsHarness::new(config.clone()));
@@ -100,6 +106,56 @@ impl ComputerUseTool {
             session_telemetry: SessionTelemetry::default(),
             pending_meta: tokio::sync::Mutex::new(PendingActionMeta::default()),
             last_mutation_sig: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            events,
+        }
+    }
+
+    /// Persist one action as a structured DecisionPoint event (decision_type
+    /// "computer_use_action") so the full trajectory — including click_method,
+    /// outcome and timing that stdout-only `log_action` carries — is queryable
+    /// from the events store. No-op when no events store is wired in (tests).
+    #[allow(clippy::too_many_arguments)]
+    async fn record_action_event(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        action: &str,
+        app: &str,
+        success: bool,
+        error: Option<&str>,
+        click_method: Option<&str>,
+        duration_ms: u64,
+        is_mutation: bool,
+        target: &ElementTarget,
+    ) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if session_id.is_empty() {
+            return;
+        }
+        let data = json!({
+            "decision_type": "computer_use_action",
+            "name": TOOL_NAME,
+            "task_id": task_id,
+            "action": action,
+            "app": app,
+            "outcome": if success { "ok" } else { "error" },
+            "error": error,
+            "click_method": click_method,
+            "duration_ms": duration_ms,
+            "is_mutation": is_mutation,
+            "target": {
+                "index": target.index,
+                "title": target.title,
+                "role": target.role,
+            },
+        });
+        if let Err(e) = events
+            .append(Event::new(session_id, EventType::DecisionPoint, data))
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist computer_use action event");
         }
     }
 
@@ -942,6 +998,10 @@ impl Tool for ComputerUseTool {
             .get("_task_id")
             .and_then(|v| v.as_str())
             .unwrap_or("default");
+        let session_id = args
+            .get("_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let is_mutation = !matches!(action, "list_apps" | "get_app_state" | "screenshot");
 
         let mut element_target = pending.element_target;
@@ -1009,6 +1069,19 @@ impl Tool for ComputerUseTool {
                         target: Some(&element_target),
                     })
                     .await;
+                self.record_action_event(
+                    session_id,
+                    task_id,
+                    action,
+                    app,
+                    true,
+                    None,
+                    click_method,
+                    duration_ms,
+                    is_mutation,
+                    &element_target,
+                )
+                .await;
                 let mut outcome = outcome;
                 if self
                     .duplicate_mutation_caution(task_id, is_mutation, &element_target, &args)
@@ -1046,6 +1119,19 @@ impl Tool for ComputerUseTool {
                         target: Some(&element_target),
                     })
                     .await;
+                self.record_action_event(
+                    session_id,
+                    task_id,
+                    action,
+                    app,
+                    false,
+                    Some(&err),
+                    click_method,
+                    duration_ms,
+                    is_mutation,
+                    &element_target,
+                )
+                .await;
                 // A failed action didn't take effect — reset so a later retry
                 // isn't wrongly flagged as a no-op repeat.
                 self.last_mutation_sig.lock().await.remove(task_id);
@@ -1127,6 +1213,7 @@ pub async fn test_tool(config: ComputerUseConfig, inbox: PathBuf) -> ComputerUse
         inbox,
         ApprovalBroker::new(approval_tx),
         media_tx,
+        None,
     );
     tool.approval_state
         .approve_all_for_test("telegram:1", "com.apple.calculator")

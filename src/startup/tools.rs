@@ -505,6 +505,7 @@ pub async fn register_optional_tools(
                     std::path::PathBuf::from(&inbox_dir),
                     approval_tx.clone(),
                     media_tx.clone(),
+                    Some(event_store.clone()),
                 )));
             }
             OptionalToolId::SendFile => {
