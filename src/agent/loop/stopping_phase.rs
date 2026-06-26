@@ -1669,7 +1669,8 @@ pub(super) async fn run_stopping_phase(
                 if let Some(tool_output) =
                     latest_non_system_tool_output_excerpt(agent, session_id, 2500).await
                 {
-                    let activity = post_task::categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
+                    let activity =
+                        post_task::categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
                     let mut reply = String::from("Here's a summary of what was accomplished:\n\n");
                     if !activity.is_empty() {
                         reply.push_str(&activity);

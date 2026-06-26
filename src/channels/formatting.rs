@@ -247,6 +247,41 @@ pub(crate) fn markdown_to_telegram_html(md: &str) -> String {
     result
 }
 
+/// Convert common LLM markdown to readable plain text for Telegram fallbacks.
+pub(crate) fn markdown_to_telegram_plain_fallback(md: &str) -> String {
+    let md = strip_latex(md);
+    let mut result = String::with_capacity(md.len());
+    let mut in_code_block = false;
+
+    for line in md.lines() {
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        let processed = if in_code_block {
+            line.to_string()
+        } else {
+            let line = strip_heading(line).unwrap_or_else(|| line.to_string());
+            let line =
+                if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                    format!("• {}", rest)
+                } else {
+                    line
+                };
+            convert_inline_formatting_to_plain(&line)
+        };
+
+        result.push_str(&processed);
+        result.push('\n');
+    }
+
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
+
 /// Escape `<`, `>`, `&` for Telegram HTML.
 pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -336,6 +371,64 @@ fn convert_inline_formatting(s: &str) -> String {
                 let inner: String = chars[i + 1..end].iter().collect();
                 result.push_str(&inner);
                 result.push_str("</i>");
+                i = end + 1;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+fn convert_inline_formatting_to_plain(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '`' {
+            if let Some(end) = find_char(&chars, '`', i + 1) {
+                result.extend(chars[i + 1..end].iter());
+                i = end + 1;
+                continue;
+            }
+        }
+
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double_char(&chars, '*', i + 2) {
+                result.extend(chars[i + 2..end].iter());
+                i = end + 2;
+                continue;
+            }
+        }
+
+        if chars[i] == '[' {
+            if let Some((text, url, end)) = parse_link(&chars, i) {
+                result.push_str(&text);
+                if !url.is_empty() {
+                    result.push_str(" (");
+                    result.push_str(&url);
+                    result.push(')');
+                }
+                i = end;
+                continue;
+            }
+        }
+
+        if chars[i] == '_' {
+            if let Some(end) = find_char(&chars, '_', i + 1) {
+                result.extend(chars[i + 1..end].iter());
+                i = end + 1;
+                continue;
+            }
+        }
+
+        if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
+            if let Some(end) = find_single_star(&chars, i + 1) {
+                result.extend(chars[i + 1..end].iter());
                 i = end + 1;
                 continue;
             }
@@ -701,6 +794,17 @@ mod tests {
     fn test_markdown_to_telegram_bold() {
         let result = markdown_to_telegram_html("This is **bold** text");
         assert!(result.contains("<b>bold</b>"));
+    }
+
+    #[test]
+    fn test_markdown_to_telegram_plain_fallback_strips_markup() {
+        let result = markdown_to_telegram_plain_fallback(
+            "**Option 1: Colombia**\n- Current Form: `6 points`\n[Details](https://example.com)",
+        );
+        assert_eq!(
+            result,
+            "Option 1: Colombia\n• Current Form: 6 points\nDetails (https://example.com)"
+        );
     }
 
     #[test]

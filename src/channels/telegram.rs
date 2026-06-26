@@ -21,8 +21,8 @@ use tracing::{debug, info, warn};
 use super::approval_render;
 use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{
-    build_help_text, html_escape, markdown_to_telegram_html, sanitize_filename, split_message,
-    strip_latex,
+    build_help_text, html_escape, markdown_to_telegram_html, markdown_to_telegram_plain_fallback,
+    sanitize_filename, split_message,
 };
 use super::telegram_bootstrap_signing::{
     random_terminal_bootstrap_nonce, sign_terminal_tenant_bot_bootstrap_proof,
@@ -5214,7 +5214,7 @@ async fn send_markdown_chunks_or_fallback_result(
 ) -> anyhow::Result<()> {
     let html = markdown_to_telegram_html(markdown);
     let html_chunks = split_message(&html, 4096);
-    let plain_chunks = split_message(&strip_latex(markdown), 4096);
+    let plain_chunks = split_message(&markdown_to_telegram_plain_fallback(markdown), 4096);
     let mut first_err: Option<anyhow::Error> = None;
 
     for (i, html_chunk) in html_chunks.iter().enumerate() {
@@ -5248,7 +5248,7 @@ async fn send_full_or_expandable_reply(
     chat_id: ChatId,
     markdown: &str,
 ) -> anyhow::Result<()> {
-    let plain = strip_latex(markdown);
+    let plain = markdown_to_telegram_plain_fallback(markdown);
     if plain.chars().count() > TELEGRAM_EXPANDABLE_TRIGGER_CHARS {
         return send_expandable_blockquote_reply(bot, chat_id, markdown).await;
     }
@@ -5261,7 +5261,7 @@ async fn send_expandable_blockquote_reply(
     markdown: &str,
 ) -> anyhow::Result<()> {
     let html_body = markdown_to_telegram_html(markdown);
-    let plain = strip_latex(markdown);
+    let plain = markdown_to_telegram_plain_fallback(markdown);
     let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
     let html_chunks = split_message(&html_body, max_chunk);
     let plain_chunks = split_message(&plain, max_chunk);
