@@ -59,7 +59,15 @@ pub struct ComputerUseTool {
     media_tx: mpsc::Sender<MediaMessage>,
     session_telemetry: SessionTelemetry,
     pending_meta: tokio::sync::Mutex<PendingActionMeta>,
+    /// Per-task signature of the last element-targeted mutation, to flag an
+    /// immediate exact repeat (e.g. clicking a Like/toggle twice) that could
+    /// undo the first action. Cleared by any other action (observation included).
+    last_mutation_sig: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 }
+
+const DUPLICATE_MUTATION_CAUTION: &str = "\n[NOTE] This repeats your previous action on the same \
+target with no get_app_state in between. If the first one already worked, doing it again may UNDO \
+it (e.g. toggle a Like off). Call get_app_state to check the current state before repeating.";
 
 impl ComputerUseTool {
     pub fn new(
@@ -86,7 +94,38 @@ impl ComputerUseTool {
             media_tx,
             session_telemetry: SessionTelemetry::default(),
             pending_meta: tokio::sync::Mutex::new(PendingActionMeta::default()),
+            last_mutation_sig: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Flag (don't block) an exact repeat of an element-targeted mutation with no
+    /// observation in between — the pattern that can silently undo a toggle. Any
+    /// other action (or an observation) resets the streak for the task.
+    async fn duplicate_mutation_caution(
+        &self,
+        task_id: &str,
+        is_mutation: bool,
+        element_target: &ElementTarget,
+        args: &Value,
+    ) -> bool {
+        let mut last = self.last_mutation_sig.lock().await;
+        // Only element-targeted mutations are toggle-prone; everything else
+        // (observations, press_key, page scrolls) resets the streak.
+        if !is_mutation || element_target.index.is_none() {
+            last.remove(task_id);
+            return false;
+        }
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let sig = format!(
+            "{action}|{:?}|{}|{value}|{text}",
+            element_target.index,
+            element_target.title.as_deref().unwrap_or("")
+        );
+        let repeat = last.get(task_id) == Some(&sig);
+        last.insert(task_id.to_string(), sig);
+        repeat
     }
 
     async fn clear_pending_meta(&self) {
@@ -947,6 +986,13 @@ impl Tool for ComputerUseTool {
                         target: Some(&element_target),
                     })
                     .await;
+                let mut outcome = outcome;
+                if self
+                    .duplicate_mutation_caution(task_id, is_mutation, &element_target, &args)
+                    .await
+                {
+                    outcome.output.push_str(DUPLICATE_MUTATION_CAUTION);
+                }
                 Ok(outcome)
             }
             Err(err) => {
@@ -977,6 +1023,9 @@ impl Tool for ComputerUseTool {
                         target: Some(&element_target),
                     })
                     .await;
+                // A failed action didn't take effect — reset so a later retry
+                // isn't wrongly flagged as a no-op repeat.
+                self.last_mutation_sig.lock().await.remove(task_id);
                 Ok(ToolCallOutcome::from_output(format!("Error: {err}")))
             }
         }
@@ -1031,6 +1080,7 @@ impl Tool for ComputerUseTool {
         self.cache.lock().await.clear_task(task_id);
         self.pins.clear_task(task_id).await;
         self.approval_state.clear_task(task_id).await;
+        self.last_mutation_sig.lock().await.remove(task_id);
         Ok(())
     }
 

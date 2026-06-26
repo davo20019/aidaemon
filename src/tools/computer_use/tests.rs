@@ -647,6 +647,65 @@ async fn scroll_without_a_target_element_succeeds() {
 }
 
 #[tokio::test]
+async fn repeated_identical_click_is_cautioned() {
+    // Clicking the same element twice with no get_app_state in between (the
+    // pattern that can toggle a Like back off) appends a caution.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+    let mk = |gen: u64| {
+        merge(json!({
+            "action": "click",
+            "app": "Calculator",
+            "snapshot_generation": gen,
+            "element_index": 1,
+            "_session_id": "telegram:1",
+            "_task_id": "task-dup"
+        }))
+    };
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-dup"
+    }));
+    tool.call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+
+    let first = tool
+        .call_with_status_outcome(&mk(1).to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !first.output.contains("[NOTE]"),
+        "first click should not be cautioned: {}",
+        first.output
+    );
+    let second = tool
+        .call_with_status_outcome(&mk(2).to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        second.output.contains("[NOTE]") && second.output.contains("UNDO"),
+        "repeating the same click should be cautioned: {}",
+        second.output
+    );
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

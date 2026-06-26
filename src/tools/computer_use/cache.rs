@@ -98,7 +98,7 @@ impl SnapshotCache {
                 .is_none_or(|r| el.role.to_ascii_lowercase().contains(r));
             let title_ok = title_l
                 .as_deref()
-                .is_none_or(|t| el.title.to_ascii_lowercase().contains(t));
+                .is_none_or(|t| title_matches(&el.title.to_ascii_lowercase(), t));
             if role_ok && title_ok {
                 seen += 1;
                 if seen == occ {
@@ -141,6 +141,31 @@ impl SnapshotCache {
     pub fn state_hash(&self, key: &SnapshotKey) -> Option<u64> {
         self.current.get(key).map(|c| c.state_hash)
     }
+}
+
+/// Whether an element's (already-lowercased) title matches a descriptor query.
+/// Beyond a plain substring, common web/social action verbs are treated as
+/// synonyms, because apps label the same control differently — e.g. LinkedIn's
+/// Like button is named "Reaction button state: no reaction", so a search for
+/// "like" should still find it without the model having to discover the exact
+/// accessible name.
+fn title_matches(element_title_lower: &str, query_lower: &str) -> bool {
+    if element_title_lower.contains(query_lower) {
+        return true;
+    }
+    const SYNONYM_GROUPS: &[&[&str]] = &[
+        &["like", "react", "reaction"],
+        &["comment", "reply"],
+        &["share", "repost"],
+    ];
+    for group in SYNONYM_GROUPS {
+        if group.iter().any(|w| query_lower.contains(w))
+            && group.iter().any(|w| element_title_lower.contains(w))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn hash_snapshot(snapshot: &AppSnapshot) -> u64 {
@@ -268,5 +293,34 @@ mod tests {
             .resolve_descriptor(&key(), g, None, Some("nope"), 1)
             .unwrap_err();
         assert!(err.contains("No interactive element matching"), "{err}");
+    }
+
+    #[test]
+    fn descriptor_matches_action_synonyms() {
+        // LinkedIn labels the Like button "Reaction button state: no reaction";
+        // a search for "Like" should still resolve it.
+        let mut cache = SnapshotCache::default();
+        let mut snap = sample_snapshot();
+        snap.elements = vec![
+            elem(1, "AXButton", "Reaction button state: no reaction"),
+            elem(2, "AXButton", "Comment"),
+        ];
+        let g = cache.store(key(), snap).generation;
+        assert_eq!(
+            cache
+                .resolve_descriptor(&key(), g, None, Some("Like"), 1)
+                .unwrap(),
+            1
+        );
+        // Plain substring still works and doesn't over-match across groups.
+        assert_eq!(
+            cache
+                .resolve_descriptor(&key(), g, None, Some("comment"), 1)
+                .unwrap(),
+            2
+        );
+        assert!(cache
+            .resolve_descriptor(&key(), g, None, Some("like"), 1)
+            .is_ok());
     }
 }
