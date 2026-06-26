@@ -1099,7 +1099,7 @@ impl HeartbeatCoordinator {
         let now = chrono::Utc::now();
         let now_ts = now.to_rfc3339();
 
-        let Some(goal) = self.state.get_goal(&schedule.goal_id).await? else {
+        let Some(mut goal) = self.state.get_goal(&schedule.goal_id).await? else {
             return Ok(());
         };
 
@@ -1108,8 +1108,13 @@ impl HeartbeatCoordinator {
             return Ok(());
         }
 
-        // Auto-retirement suggestion: skip stale continuous goals (>30d idle).
-        if goal.goal_type == "continuous" {
+        // A continuous goal idle >30 days has likely stopped doing useful
+        // work. We KEEP firing it (so it can recover on its own once it starts
+        // succeeding again), but surface a one-time alert so a silently-dead
+        // goal becomes visible instead of being skipped forever. The alert is
+        // gated on `notified_at` so we don't re-alert on every tick while the
+        // goal stays idle (e.g. blocked by an open task via coalescing).
+        if goal.goal_type == "continuous" && goal.notified_at.is_none() {
             if let Some(ref last_action) = goal.last_useful_action {
                 if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_action) {
                     let days_idle =
@@ -1119,19 +1124,25 @@ impl HeartbeatCoordinator {
                             goal_id = %goal.id,
                             description = %goal.description,
                             days_idle,
-                            "Continuous goal has been idle for >30 days, skipping scheduled fire"
+                            "Continuous goal idle >30 days; alerting user and continuing to fire"
                         );
-                        // Advance recurring schedules so we don't hot-loop. One-shots stay due.
-                        if !schedule.is_one_shot {
-                            if let Ok(next) =
-                                crate::cron_utils::compute_next_run(&schedule.cron_expr)
-                            {
-                                schedule.next_run_at = next.to_rfc3339();
-                                schedule.updated_at = now_ts.clone();
-                                let _ = self.state.update_goal_schedule(&schedule).await;
-                            }
-                        }
-                        return Ok(());
+                        let msg = format!(
+                            "Heads up: your recurring goal \"{}\" hasn't made progress in {} days. \
+                             It's still scheduled and will keep trying — reply if you'd like to pause or cancel it.",
+                            goal.description, days_idle
+                        );
+                        let entry = crate::traits::NotificationEntry::new(
+                            &goal.id,
+                            &goal.session_id,
+                            "evergreen_alert",
+                            &msg,
+                        );
+                        let _ = self.state.enqueue_notification(&entry).await;
+                        let _ = self.state.mark_goal_notified(&goal.id).await;
+                        // Keep the in-memory copy consistent so the later
+                        // update_goal (after task creation) doesn't clobber
+                        // notified_at back to NULL and re-alert next tick.
+                        goal.notified_at = Some(now_ts.clone());
                     }
                 }
             }
@@ -1782,6 +1793,162 @@ mod tests {
         assert!(
             sched.is_none(),
             "One-shot schedules should be deleted after firing"
+        );
+    }
+
+    /// A continuous goal idle >30 days must KEEP firing (not be silently
+    /// skipped forever) and must surface a one-time alert to the user.
+    #[tokio::test]
+    async fn test_idle_continuous_goal_keeps_firing_and_alerts_user() {
+        let state = test_state_store().await;
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+
+        let mut goal =
+            Goal::new_continuous("Post daily tweets", "session-1", Some(5000), Some(500_000));
+        // Idle for 40 days — well past the 30-day auto-retire threshold.
+        goal.last_useful_action = Some((now - chrono::Duration::days(40)).to_rfc3339());
+        state.create_goal(&goal).await.unwrap();
+
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("0 9 * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: due_ts,
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        // Keeps firing: a task is created instead of being silently skipped.
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Idle continuous goal should still fire (create a task), not be skipped"
+        );
+        assert_eq!(tasks[0].status, "pending");
+
+        // Surfaces a one-time alert so the idle goal is no longer silent.
+        let notifs = state.get_pending_notifications(10).await.unwrap();
+        let alerts: Vec<_> = notifs
+            .iter()
+            .filter(|n| n.notification_type == "evergreen_alert" && n.goal_id == goal.id)
+            .collect();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Idle continuous goal should enqueue exactly one evergreen_alert notification"
+        );
+    }
+
+    /// The idle alert must fire at most once per idle episode, even if the
+    /// goal stays idle across many ticks (e.g. an open task keeps coalescing
+    /// the fire so `last_useful_action` never resets).
+    #[tokio::test]
+    async fn test_idle_continuous_goal_alerts_only_once() {
+        let state = test_state_store().await;
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+
+        let mut goal =
+            Goal::new_continuous("Post daily tweets", "session-1", Some(5000), Some(500_000));
+        goal.last_useful_action = Some((now - chrono::Duration::days(40)).to_rfc3339());
+        state.create_goal(&goal).await.unwrap();
+
+        // A pre-existing open task makes the fire coalesce (back off) every
+        // time, so `last_useful_action` never resets and the goal stays idle.
+        let open_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "in-flight work".to_string(),
+            status: "pending".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&open_task).await.unwrap();
+
+        let due_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: due_ts,
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+
+        // Fire repeatedly while the goal stays idle.
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+        coordinator
+            .fire_due_schedule(schedule.clone())
+            .await
+            .unwrap();
+
+        let alerts = state
+            .get_pending_notifications(20)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.notification_type == "evergreen_alert" && n.goal_id == goal.id)
+            .count();
+        assert_eq!(
+            alerts, 1,
+            "Idle alert must be sent at most once, not every tick"
+        );
+
+        // Coalescing is still respected: no new execution tasks were created
+        // while the open task is in flight.
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "No new task should be created while coalescing"
         );
     }
 
