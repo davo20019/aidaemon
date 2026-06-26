@@ -229,11 +229,18 @@ pub(super) async fn execute_tool_call_io(
             // middle to lossy head+tail compression. No recovery path → fall
             // back to lossy compression. Errors are never spilled.
             let over_cap = result_text.chars().count() > max_chars;
+            // The computer_use accessibility tree is the model's working data: it
+            // must stay inline and complete so the model can target an element
+            // directly. Spilling it to a file (whose notice tells the model to
+            // read_file/grep it) sends the planner into a read_file/terminal loop
+            // instead of clicking; lossy head+tail compression would drop mid-tree
+            // controls (e.g. a feed's Like buttons). So never spill or compress it.
+            let keep_inline = tc.name == "computer_use";
             let has_fs_recovery = agent
                 .tools
                 .iter()
                 .any(|t| matches!(t.name(), "read_file" | "terminal") && t.is_available());
-            let spilled = if over_cap && !result_is_err && has_fs_recovery {
+            let spilled = if over_cap && !result_is_err && has_fs_recovery && !keep_inline {
                 crate::tools::result_spill::build_spilled_preview(
                     &tc.name,
                     ctx.session_id,
@@ -252,6 +259,8 @@ pub(super) async fn execute_tool_call_io(
                     );
                     preview
                 }
+                // Keep the full GUI tree inline (do not compress away the middle).
+                None if keep_inline => result_text,
                 None => crate::memory::context_window::compress_tool_result(
                     &tc.name,
                     &result_text,
