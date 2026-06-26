@@ -400,9 +400,9 @@ pub(super) async fn maybe_handle_trivial_ack_shortcut(
     task_id: &str,
     emitter: &crate::events::EventEmitter,
 ) -> anyhow::Result<Option<String>> {
-    // Cheap local acknowledgment shortcut: avoid an LLM call for trivial turns like
-    // "thanks" or a single emoji reaction. Keep this conservative to avoid eating
-    // genuine requests.
+    // Cheap local acknowledgment shortcut: avoid an LLM call for trivial text turns
+    // like "thanks". Keep emoji reactions in the model path because their meaning
+    // depends heavily on conversational context and tone.
     if agent.depth != 0 {
         return Ok(None);
     }
@@ -413,16 +413,6 @@ pub(super) async fn maybe_handle_trivial_ack_shortcut(
         .to_ascii_lowercase();
     let is_thanks = matches!(normalized.as_str(), "thanks" | "thank you" | "thx");
     let is_ok = matches!(normalized.as_str(), "ok" | "okay");
-    let is_single_emoji_reaction = {
-        let char_count = trimmed.chars().count();
-        char_count > 0
-            && char_count <= 4
-            && !trimmed.is_ascii()
-            && trimmed
-                .chars()
-                .all(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
-    };
-
     // If the previous assistant turn ended with a question, treat "ok/okay" as non-terminal
     // and let the LLM re-ask for missing info rather than replying "Got it.".
     let ok_is_safe_to_short_circuit = if is_ok {
@@ -441,7 +431,7 @@ pub(super) async fn maybe_handle_trivial_ack_shortcut(
 
     let trivial_reply = if is_thanks {
         Some("You're welcome.".to_string())
-    } else if is_single_emoji_reaction || (is_ok && ok_is_safe_to_short_circuit) {
+    } else if is_ok && ok_is_safe_to_short_circuit {
         Some("Got it.".to_string())
     } else {
         None

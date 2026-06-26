@@ -1231,3 +1231,30 @@ async fn provider_option_rejection_falls_back_to_default_chat() {
         "expected default chat options when the text-only pass is disabled"
     );
 }
+
+#[tokio::test]
+async fn emoji_only_turn_uses_model_instead_of_generic_ack_shortcut() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("😂")]);
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "emoji_only_no_generic_ack",
+            "😂",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "😂");
+    assert!(
+        harness.provider.call_count().await > 0,
+        "emoji-only turns should be interpreted by the model, not short-circuited"
+    );
+}
