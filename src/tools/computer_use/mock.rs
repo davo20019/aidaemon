@@ -69,6 +69,21 @@ impl ComputerHarness for MockHarness {
         }])
     }
 
+    async fn launch_app(&self, app: &str) -> Result<AppInfo, String> {
+        if app.eq_ignore_ascii_case("calculator")
+            || app.eq_ignore_ascii_case("com.apple.calculator")
+        {
+            return Ok(AppInfo {
+                name: "Calculator".to_string(),
+                bundle_id: "com.apple.calculator".to_string(),
+                pid: 4242,
+            });
+        }
+        Err(format!(
+            "Mock harness can only launch Calculator, not '{app}'"
+        ))
+    }
+
     async fn get_app_state(
         &self,
         app: &str,

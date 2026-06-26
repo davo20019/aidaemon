@@ -386,7 +386,13 @@ impl ComputerUseTool {
                 // Optional: activation has no element target, and it is often
                 // the first action on an app — before any get_app_state.
                 let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
-                let resolved = self.resolve_app(&app).await?;
+                // "Activate this app" naturally means "open it" when it isn't
+                // running yet — fall back to launching so the model doesn't dead
+                // end on a not-running error.
+                let resolved = match self.resolve_app(&app).await {
+                    Ok(found) => found,
+                    Err(_) => self.harness.launch_app(&app).await?,
+                };
                 self.ensure_action_approvals(
                     &ctx,
                     action,
@@ -573,6 +579,30 @@ impl ComputerUseTool {
                 self.build_outcome(body, Some(&snapshot), &ctx.session_id)
                     .await
             }
+            ComputerActionKind::LaunchApp => {
+                let app = required_app(args)?;
+                // Launch first (this only starts the process — no screenshot),
+                // then run the per-app approval before any get_app_state captures
+                // the window, preserving "approve before we look at it".
+                let resolved = self.harness.launch_app(&app).await?;
+                self.ensure_action_approvals(
+                    &ctx,
+                    action,
+                    Some(&resolved.bundle_id),
+                    Some(&resolved.name),
+                    ActionClass::LocalMutation,
+                    None,
+                )
+                .await?;
+                let mut cache = self.cache.lock().await;
+                let snapshot = self
+                    .harness
+                    .get_app_state(&resolved.name, &ctx, &mut cache)
+                    .await?;
+                let text = format_full_tree(&snapshot);
+                self.build_outcome(text, Some(&snapshot), &ctx.session_id)
+                    .await
+            }
             ComputerActionKind::ListApps => {
                 unreachable!("list_apps handled before match");
             }
@@ -594,7 +624,7 @@ impl ComputerUseTool {
         }) {
             return Ok(found.clone());
         }
-        Err(format!("No running app matching '{app}'"))
+        Err(policy::no_running_app_message(app))
     }
 
     async fn resolve_bundle_id(&self, app: &str) -> Result<String, String> {
@@ -694,10 +724,11 @@ impl Tool for ComputerUseTool {
 
     fn description(&self) -> &str {
         "Inspect and control native macOS applications via accessibility trees and screenshots. \
-         Call get_app_state before mutating actions; copy the exact snapshot_generation from the \
-         most recent result into every mutation (do not increment or guess it). After your final \
-         mutating action, call get_app_state and confirm the visible state matches the goal \
-         before reporting success."
+         Only apps that are already running can be controlled — if the target app is not listed by \
+         list_apps, call launch_app to start it first. Call get_app_state before mutating actions; \
+         copy the exact snapshot_generation from the most recent result into every mutation (do not \
+         increment or guess it). After your final mutating action, call get_app_state and confirm \
+         the visible state matches the goal before reporting success."
     }
 
     fn schema(&self) -> Value {
@@ -711,6 +742,7 @@ impl Tool for ComputerUseTool {
                         "type": "string",
                         "enum": [
                             "list_apps",
+                            "launch_app",
                             "get_app_state",
                             "screenshot",
                             "activate_app",
@@ -720,11 +752,11 @@ impl Tool for ComputerUseTool {
                             "scroll",
                             "set_value"
                         ],
-                        "description": "The desktop action to perform"
+                        "description": "The desktop action to perform. computer_use can only control apps that are already running; if the target app is not in list_apps, use launch_app to start it first."
                     },
                     "app": {
                         "type": "string",
-                        "description": "Application name or bundle id. Required for every action except list_apps."
+                        "description": "Application name or bundle id. Required for every action except list_apps. If the app is installed but not running, call launch_app with this name first."
                     },
                     "snapshot_generation": {
                         "type": "integer",

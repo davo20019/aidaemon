@@ -15,6 +15,7 @@ pub enum ActionClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputerActionKind {
     ListApps,
+    LaunchApp,
     GetAppState,
     Screenshot,
     ActivateApp,
@@ -29,6 +30,7 @@ impl ComputerActionKind {
     pub fn parse(action: &str) -> Result<Self, String> {
         match action {
             "list_apps" => Ok(Self::ListApps),
+            "launch_app" => Ok(Self::LaunchApp),
             "get_app_state" => Ok(Self::GetAppState),
             "screenshot" => Ok(Self::Screenshot),
             "activate_app" => Ok(Self::ActivateApp),
@@ -38,7 +40,7 @@ impl ComputerActionKind {
             "scroll" => Ok(Self::Scroll),
             "set_value" => Ok(Self::SetValue),
             other => Err(format!(
-                "Unknown computer_use action '{other}'. Valid: list_apps, get_app_state, screenshot, activate_app, click, type_text, press_key, scroll, set_value"
+                "Unknown computer_use action '{other}'. Valid: list_apps, launch_app, get_app_state, screenshot, activate_app, click, type_text, press_key, scroll, set_value"
             )),
         }
     }
@@ -46,6 +48,7 @@ impl ComputerActionKind {
     pub fn action_name(self) -> &'static str {
         match self {
             Self::ListApps => "list_apps",
+            Self::LaunchApp => "launch_app",
             Self::GetAppState => "get_app_state",
             Self::Screenshot => "screenshot",
             Self::ActivateApp => "activate_app",
@@ -60,16 +63,35 @@ impl ComputerActionKind {
     pub fn base_class(self) -> ActionClass {
         match self {
             Self::ListApps | Self::GetAppState | Self::Screenshot => ActionClass::Observation,
-            Self::ActivateApp | Self::Click | Self::TypeText | Self::PressKey | Self::Scroll => {
-                ActionClass::LocalMutation
-            }
+            Self::LaunchApp
+            | Self::ActivateApp
+            | Self::Click
+            | Self::TypeText
+            | Self::PressKey
+            | Self::Scroll => ActionClass::LocalMutation,
             Self::SetValue => ActionClass::LocalMutation,
         }
     }
 
     pub fn requires_snapshot_generation(self) -> bool {
-        !matches!(self, Self::ListApps | Self::GetAppState | Self::Screenshot)
+        // launch_app starts an app that has no prior snapshot, so (like the
+        // observation actions and activate_app) it carries no generation.
+        !matches!(
+            self,
+            Self::ListApps | Self::LaunchApp | Self::GetAppState | Self::Screenshot
+        )
     }
+}
+
+/// Actionable error for when a target app is not currently running. The tool can
+/// only attach to live processes, so an installed-but-closed app is invisible;
+/// the message states the literal next step (launch it) instead of dead-ending.
+pub fn no_running_app_message(app: &str) -> String {
+    format!(
+        "No running app matching '{app}'. It may be installed but not running — computer_use \
+         only controls apps that are already open. Start it with action \"launch_app\" \
+         (app: \"{app}\"), or call list_apps to see what is currently running."
+    )
 }
 
 /// Bundle identifiers that must never receive input events.

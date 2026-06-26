@@ -3,7 +3,7 @@
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axuielement::ax_action::AX_PRESS_ACTION;
@@ -84,6 +84,26 @@ impl ComputerHarness for MacOsHarness {
     async fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
         self.check_permissions()?;
         list_running_apps()
+    }
+
+    async fn launch_app(&self, app: &str) -> Result<AppInfo, String> {
+        self.check_permissions()?;
+        // Idempotent: if it is already running, just hand back the live instance.
+        if let Ok(found) = resolve_app(app) {
+            return Ok(found);
+        }
+        launch_app_process(app)?;
+        // `open` returns as soon as the launch is initiated; the process can take
+        // a moment to register with System Events, so poll until it appears.
+        let timeout = Duration::from_secs(self.config.action_timeout_secs.max(5));
+        let resolved = wait_for_running_app(app, timeout)?;
+        if is_prohibited_bundle(&resolved.bundle_id) {
+            return Err(format!(
+                "App '{}' ({}) is blocked by computer_use policy",
+                resolved.name, resolved.bundle_id
+            ));
+        }
+        Ok(resolved)
     }
 
     async fn get_app_state(
@@ -377,7 +397,52 @@ fn resolve_app(app: &str) -> Result<AppInfo, String> {
     }) {
         return Ok(found.clone());
     }
-    Err(format!("No running app matching '{app}'"))
+    Err(super::policy::no_running_app_message(app))
+}
+
+/// Start an installed app via `/usr/bin/open`. Arguments are passed without a
+/// shell, so the app string can never be interpreted as code. Tries the value
+/// as an application name first, then as a bundle identifier.
+fn launch_app_process(app: &str) -> Result<(), String> {
+    let by_name = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(app)
+        .output()
+        .map_err(|e| format!("Failed to launch '{app}': {e}"))?;
+    if by_name.status.success() {
+        return Ok(());
+    }
+    let by_bundle = Command::new("/usr/bin/open")
+        .arg("-b")
+        .arg(app)
+        .output()
+        .map_err(|e| format!("Failed to launch '{app}': {e}"))?;
+    if by_bundle.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "Could not launch '{app}': not found as an application name or bundle id. \
+         Check the exact name, or call list_apps to see what is already running. ({})",
+        String::from_utf8_lossy(&by_name.stderr).trim()
+    ))
+}
+
+/// Poll the running-app list until `app` appears or the timeout elapses.
+fn wait_for_running_app(app: &str, timeout: Duration) -> Result<AppInfo, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(found) = resolve_app(app) {
+            return Ok(found);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Launched '{app}' but it did not register as running within {}s. It may still be \
+                 starting — call list_apps or get_app_state again shortly.",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn bundle_id_for_pid(pid: i32) -> Option<String> {

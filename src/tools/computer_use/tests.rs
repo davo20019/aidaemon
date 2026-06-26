@@ -313,6 +313,96 @@ async fn schema_documents_requirements_and_verification() {
 }
 
 #[tokio::test]
+async fn schema_includes_launch_app_action() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let schema = tool.schema();
+    let actions = schema["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        actions.iter().any(|v| v == "launch_app"),
+        "launch_app should be a documented action: {actions:?}"
+    );
+}
+
+#[tokio::test]
+async fn not_running_app_error_points_to_launch_app() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    // The mock only knows Calculator, so any other app resolves as "not running".
+    let mut args = json!({
+        "action": "get_app_state",
+        "app": "Slack",
+        "_session_id": "telegram:1",
+        "_task_id": "task-notrunning"
+    });
+    if let Some(obj) = args.as_object_mut() {
+        obj.extend(test_model_args().as_object().unwrap().clone());
+    }
+    let outcome = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        outcome.output.contains("launch_app"),
+        "a not-running app should tell the model to launch it instead of dead-ending: {}",
+        outcome.output
+    );
+}
+
+#[tokio::test]
+async fn launch_app_returns_tree_for_running_app() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let mut args = json!({
+        "action": "launch_app",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-launch"
+    });
+    if let Some(obj) = args.as_object_mut() {
+        obj.extend(test_model_args().as_object().unwrap().clone());
+    }
+    let outcome = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !outcome.output.starts_with("Error:"),
+        "launch_app should succeed for a known app: {}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("snapshot_generation="),
+        "launch_app should return an inspectable tree with a generation: {}",
+        outcome.output
+    );
+    assert_eq!(outcome.metadata.attachments.len(), 1);
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

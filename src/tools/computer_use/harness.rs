@@ -15,6 +15,13 @@ pub trait ComputerHarness: Send + Sync {
 
     async fn list_apps(&self) -> Result<Vec<AppInfo>, String>;
 
+    /// Launch an installed app that is not currently running and wait until it
+    /// registers as a running process. Returns the app's identity (no screenshot
+    /// is taken — capturing is gated behind per-app approval, which the caller
+    /// runs before the first `get_app_state`). If the app is already running this
+    /// is idempotent and returns the running instance.
+    async fn launch_app(&self, app: &str) -> Result<AppInfo, String>;
+
     async fn get_app_state(
         &self,
         app: &str,
