@@ -1065,24 +1065,47 @@ print("\(Int(p.x)),\(Int(screen - p.y))")"#,
     Ok((x, y))
 }
 
-fn press_key_combo(raw: &str) -> Result<(), String> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    for part in raw.split('+').map(str::trim).filter(|s| !s.is_empty()) {
-        let key = match part.to_ascii_lowercase().as_str() {
-            "return" | "enter" => Key::Return,
-            "tab" => Key::Tab,
-            "escape" | "esc" => Key::Escape,
-            "command" | "cmd" => Key::Meta,
-            "shift" => Key::Shift,
-            "control" | "ctrl" => Key::Control,
-            "option" | "alt" => Key::Alt,
-            other if other.len() == 1 => Key::Unicode(other.chars().next().unwrap()),
-            other => return Err(format!("Unsupported key token '{other}'")),
-        };
-        enigo
-            .key(key, Direction::Click)
-            .map_err(|e| e.to_string())?;
+fn parse_key_token(part: &str) -> Result<Key, String> {
+    match part.to_ascii_lowercase().as_str() {
+        "return" | "enter" => Ok(Key::Return),
+        "tab" => Ok(Key::Tab),
+        "escape" | "esc" => Ok(Key::Escape),
+        "command" | "cmd" => Ok(Key::Meta),
+        "shift" => Ok(Key::Shift),
+        "control" | "ctrl" => Ok(Key::Control),
+        "option" | "alt" => Ok(Key::Alt),
+        other if other.chars().count() == 1 => Ok(Key::Unicode(other.chars().next().unwrap())),
+        other => Err(format!("Unsupported key token '{other}'")),
     }
+}
+
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(key, Key::Meta | Key::Shift | Key::Control | Key::Alt)
+}
+
+fn press_key_combo(raw: &str) -> Result<(), String> {
+    let keys = raw
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_key_token)
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((main, modifiers)) = keys.split_last() else {
+        return Err("empty key combo".to_string());
+    };
+    // Modifiers must stay held while the main key is pressed — clicking each
+    // token independently (press+release) turns "Command+a" into a literal "a".
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    for m in modifiers {
+        enigo.key(*m, Direction::Press).map_err(|e| e.to_string())?;
+    }
+    let main_result = enigo.key(*main, Direction::Click);
+    // Always release held modifiers, even if the main keypress failed, so we
+    // never strand a modifier in the down state.
+    for m in modifiers.iter().rev() {
+        let _ = enigo.key(*m, Direction::Release);
+    }
+    main_result.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1100,4 +1123,42 @@ fn scroll_direction(direction: &str, pages: f64) -> Result<(), String> {
         .scroll(delta, enigo::Axis::Vertical)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_combo(raw: &str) -> Vec<Key> {
+        raw.split('+')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| parse_key_token(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn modifier_combo_separates_held_modifier_from_main_key() {
+        // "Command+a" must hold Meta while clicking 'a' — not click each
+        // independently (which would type a literal "a").
+        let keys = parse_combo("Command+a");
+        let (main, modifiers) = keys.split_last().unwrap();
+        assert_eq!(modifiers.len(), 1);
+        assert!(
+            is_modifier_key(&modifiers[0]),
+            "Command should be a modifier"
+        );
+        assert!(
+            !is_modifier_key(main),
+            "'a' should be the main key, not a modifier"
+        );
+    }
+
+    #[test]
+    fn single_key_has_no_modifiers() {
+        let keys = parse_combo("Return");
+        let (main, modifiers) = keys.split_last().unwrap();
+        assert!(modifiers.is_empty());
+        assert!(!is_modifier_key(main));
+    }
 }
