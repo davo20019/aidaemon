@@ -32,13 +32,40 @@ const SCREEN_RECORDING_HELP: &str = "Screen Recording permission is required. \
 Grant it in System Settings → Privacy & Security → Screen Recording for aidaemon. \
 This permission only takes effect after the daemon is restarted.";
 
+const LOCKED_SCREEN_HELP: &str = "The Mac screen is locked — macOS routes all keyboard \
+and mouse input to the lock screen, so computer_use cannot type or click in any app until \
+it is unlocked. (Reading state and screenshots still work, which is why a screenshot may \
+look correct.) Stop and ask the user to unlock the Mac, then retry.";
+
 // CoreGraphics screen-capture authorization (macOS 10.15+). Preflight is a
 // non-prompting probe; Request triggers the system prompt and registers the
 // app in the Screen Recording pane so the user has something to toggle.
+// CGSessionCopyCurrentDictionary exposes the login-session state (incl. screen
+// lock); it returns NULL when there is no owning GUI session.
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
+}
+
+// Minimal CoreFoundation surface for reading one boolean out of the session
+// dictionary. The framework is already linked transitively; declaring just
+// these four entry points avoids taking a direct core-foundation crate dep
+// (two major versions are already in the tree).
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFStringCreateWithCString(
+        alloc: *const std::ffi::c_void,
+        c_str: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFDictionaryGetValue(
+        dict: *const std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> u8;
+    fn CFRelease(cf: *const std::ffi::c_void);
 }
 
 pub struct MacOsHarness {
@@ -727,7 +754,45 @@ fn encode_png(image: RgbaImage, config: &ComputerUseConfig) -> Result<Vec<u8>, S
 /// dead-ending. Models rarely call `activate_app` on their own — they retry the
 /// same blocked keystroke — so doing the activation here is what makes typing
 /// into apps like Slack actually land instead of bouncing on "Activate first".
+/// Returns true if the macOS login session reports the screen as locked. While
+/// locked, loginwindow owns the foreground and synthetic input is undeliverable,
+/// so this is a hard blocker we want to report distinctly rather than letting it
+/// masquerade as a foreground mismatch.
+fn screen_is_locked() -> bool {
+    // SAFETY: standard CoreFoundation/CoreGraphics C calls. We own the copied
+    // session dictionary and the created CFString, and release both; the value
+    // fetched via CFDictionaryGetValue is not owned and is not released.
+    unsafe {
+        let dict = CGSessionCopyCurrentDictionary();
+        if dict.is_null() {
+            return false;
+        }
+        // kCFStringEncodingUTF8 = 0x0800_0100. Trailing NUL makes this a C string.
+        let key_bytes = b"CGSSessionScreenIsLocked\0";
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            key_bytes.as_ptr() as *const std::ffi::c_char,
+            0x0800_0100,
+        );
+        let mut locked = false;
+        if !key.is_null() {
+            let value = CFDictionaryGetValue(dict, key);
+            if !value.is_null() {
+                locked = CFBooleanGetValue(value) != 0;
+            }
+            CFRelease(key);
+        }
+        CFRelease(dict);
+        locked
+    }
+}
+
 fn ensure_foreground(app: &AppInfo) -> Result<(), String> {
+    // A locked screen blocks all synthetic input no matter how often we activate
+    // — surface that plainly instead of looping on "foreground mismatch".
+    if screen_is_locked() {
+        return Err(LOCKED_SCREEN_HELP.to_string());
+    }
     if verify_foreground(app).is_ok() {
         return Ok(());
     }
