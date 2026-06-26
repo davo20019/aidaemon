@@ -716,6 +716,19 @@ impl TelegramChannel {
         Some((listen_addr, opts))
     }
 
+    /// How long a resolved approval card stays visible before it is auto-deleted,
+    /// so an answered prompt doesn't linger and get mistaken for one that still
+    /// needs action. On by default (10s); override with the
+    /// `AIDAEMON_APPROVAL_DISMISS_SECS` env var, or set it to `0` to keep
+    /// resolved cards in the chat.
+    fn resolved_approval_dismiss_delay() -> Option<Duration> {
+        let secs = std::env::var("AIDAEMON_APPROVAL_DISMISS_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(10);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
     /// Handle callback query from inline keyboard buttons.
     async fn handle_callback(&self, q: CallbackQuery, bot: Bot) {
         // Authorization check: only allowed users can approve/deny commands.
@@ -851,6 +864,20 @@ impl TelegramChannel {
             let original = m.text().unwrap_or("");
             let updated = approval_render::finalize_approval_message(original, &response);
             let _ = bot.edit_message_text(m.chat.id, m.id, updated).await;
+
+            // Auto-dismiss the resolved card after a short delay so an answered
+            // approval doesn't linger and get mistaken for one still awaiting a
+            // response. This runs only after the user has responded, so a
+            // still-pending prompt is never removed out from under them.
+            if let Some(delay) = Self::resolved_approval_dismiss_delay() {
+                let bot = bot.clone();
+                let chat_id = m.chat.id;
+                let msg_id = m.id;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = bot.delete_message(chat_id, msg_id).await;
+                });
+            }
         }
 
         let _ = response_tx.send(response);
