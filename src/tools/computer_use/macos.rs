@@ -164,7 +164,7 @@ impl ComputerHarness for MacOsHarness {
                 let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
                 return Ok((refreshed, Some(index), "ax_press"));
             }
-            verify_foreground(&resolved)?;
+            ensure_foreground(&resolved)?;
             click_element(&element)?;
             let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
             return Ok((refreshed, Some(index), "cursor"));
@@ -176,7 +176,7 @@ impl ComputerHarness for MacOsHarness {
             (Some(x), Some(y)) => (x, y),
             _ => return Err("click requires element_index or both x and y coordinates".to_string()),
         };
-        verify_foreground(&resolved)?;
+        ensure_foreground(&resolved)?;
         click_global_point(px, py)?;
         Ok((
             capture_app(resolved, &self.config, cache, ctx)?,
@@ -196,7 +196,7 @@ impl ComputerHarness for MacOsHarness {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
         cache.validate_generation(&key, generation)?;
-        verify_foreground(&resolved)?;
+        ensure_foreground(&resolved)?;
         let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
         enigo
             .text(text)
@@ -215,7 +215,7 @@ impl ComputerHarness for MacOsHarness {
         let resolved = resolve_app(app)?;
         let key_id = snapshot_key(resolved.bundle_id.clone(), ctx);
         cache.validate_generation(&key_id, generation)?;
-        verify_foreground(&resolved)?;
+        ensure_foreground(&resolved)?;
         press_key_combo(key)?;
         capture_app(resolved, &self.config, cache, ctx)
     }
@@ -233,7 +233,7 @@ impl ComputerHarness for MacOsHarness {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
         let _element = cache.element_by_index(&key, generation, element_index)?;
-        verify_foreground(&resolved)?;
+        ensure_foreground(&resolved)?;
         scroll_direction(direction, pages)?;
         Ok((
             capture_app(resolved, &self.config, cache, ctx)?,
@@ -255,7 +255,7 @@ impl ComputerHarness for MacOsHarness {
         let element = cache
             .element_by_index(&key, generation, element_index)?
             .clone();
-        verify_foreground(&resolved)?;
+        ensure_foreground(&resolved)?;
         click_element(&element)?;
         let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
         enigo.text(value).map_err(|e| e.to_string())?;
@@ -719,6 +719,28 @@ fn encode_png(image: RgbaImage, config: &ComputerUseConfig) -> Result<Vec<u8>, S
         ));
     }
     Ok(buf)
+}
+
+/// Ensure the target app is frontmost before sending synthetic keyboard/cursor
+/// input. The OS routes synthetic events to whichever app currently has focus,
+/// so if the target isn't frontmost we activate it and re-check rather than
+/// dead-ending. Models rarely call `activate_app` on their own — they retry the
+/// same blocked keystroke — so doing the activation here is what makes typing
+/// into apps like Slack actually land instead of bouncing on "Activate first".
+fn ensure_foreground(app: &AppInfo) -> Result<(), String> {
+    if verify_foreground(app).is_ok() {
+        return Ok(());
+    }
+    activate_app(app)?;
+    // Activation goes through the window server asynchronously; poll briefly for
+    // focus to actually transfer before giving up.
+    for _ in 0..12 {
+        std::thread::sleep(Duration::from_millis(60));
+        if verify_foreground(app).is_ok() {
+            return Ok(());
+        }
+    }
+    verify_foreground(app)
 }
 
 fn verify_foreground(app: &AppInfo) -> Result<(), String> {
