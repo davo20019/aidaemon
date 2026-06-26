@@ -23,7 +23,7 @@ use crate::config::ComputerUseConfig;
 
 use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
-use super::policy::is_prohibited_bundle;
+use super::policy::{is_prohibited_bundle, is_text_input_element};
 use super::types::{AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement};
 
 const ACCESSIBILITY_HELP: &str = "Accessibility permission is required. \
@@ -257,6 +257,13 @@ impl ComputerHarness for MacOsHarness {
             if !press_element_via_ax(resolved.pid, index, &self.config)? {
                 ensure_foreground(&resolved)?;
                 click_element(&element)?;
+            }
+            // Focusing a text field places the cursor without selecting, so
+            // typing would insert into any leftover content (e.g. a stale URL in
+            // the address bar). Select-all first so the new text replaces it.
+            if is_text_input_element(&element) {
+                ensure_foreground(&resolved)?;
+                press_key_combo("Command+a")?;
             }
         }
         ensure_foreground(&resolved)?;

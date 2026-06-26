@@ -103,6 +103,24 @@ pub fn is_prohibited_bundle(bundle_id: &str) -> bool {
         .any(|blocked| bundle_id.eq_ignore_ascii_case(blocked))
 }
 
+/// Whether an element is an editable text input. Used to decide whether to
+/// select-all before typing into it (so the new text replaces leftover content,
+/// e.g. a stale URL in an address bar) — typing into a non-text control should
+/// not trigger a select-all.
+pub fn is_text_input_element(element: &IndexedElement) -> bool {
+    let role = element.role.to_ascii_lowercase();
+    let subrole = element
+        .subrole
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    role.contains("textfield")
+        || role.contains("textarea")
+        || role.contains("combobox")
+        || role.contains("searchfield")
+        || subrole.contains("searchfield")
+}
+
 pub fn is_secure_element(element: &IndexedElement) -> bool {
     let role = element.role.to_ascii_lowercase();
     let subrole = element
@@ -215,5 +233,30 @@ mod tests {
     #[test]
     fn terminal_bundle_is_prohibited() {
         assert!(is_prohibited_bundle("com.apple.Terminal"));
+    }
+
+    #[test]
+    fn text_inputs_are_detected() {
+        let field = IndexedElement {
+            index: 1,
+            role: "AXTextField".to_string(),
+            title: "Address and search bar".to_string(),
+            enabled: true,
+            bounds: None,
+            subrole: None,
+            interactive: true,
+        };
+        assert!(is_text_input_element(&field));
+
+        let button = IndexedElement {
+            index: 2,
+            role: "AXButton".to_string(),
+            title: "Like".to_string(),
+            enabled: true,
+            bounds: None,
+            subrole: None,
+            interactive: true,
+        };
+        assert!(!is_text_input_element(&button));
     }
 }
