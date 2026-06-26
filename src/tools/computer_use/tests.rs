@@ -647,6 +647,65 @@ async fn scroll_without_a_target_element_succeeds() {
 }
 
 #[tokio::test]
+async fn click_with_no_state_change_is_flagged_for_verification() {
+    // In the mock, a click sets a fixed "(clicked)" window title; a second click
+    // on a different element produces an identical snapshot, so the verifier
+    // should warn that nothing changed.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+    let click = |gen: u64, index: u32| {
+        merge(json!({
+            "action": "click",
+            "app": "Calculator",
+            "snapshot_generation": gen,
+            "element_index": index,
+            "_session_id": "telegram:1",
+            "_task_id": "task-verify"
+        }))
+    };
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-verify"
+    }));
+    tool.call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+
+    // First click changes the window title -> not flagged.
+    let first = tool
+        .call_with_status_outcome(&click(1, 1).to_string(), None)
+        .await
+        .unwrap();
+    assert!(!first.output.contains("[VERIFY]"), "{}", first.output);
+
+    // Second click on a different element yields an identical snapshot -> flagged.
+    let second = tool
+        .call_with_status_outcome(&click(2, 2).to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        second.output.contains("[VERIFY]") && !second.output.contains("[NOTE]"),
+        "a click that changed nothing should be flagged for verification (not as a dup): {}",
+        second.output
+    );
+}
+
+#[tokio::test]
 async fn repeated_identical_click_is_cautioned() {
     // Clicking the same element twice with no get_app_state in between (the
     // pattern that can toggle a Like back off) appends a caution.

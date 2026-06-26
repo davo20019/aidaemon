@@ -69,6 +69,11 @@ const DUPLICATE_MUTATION_CAUTION: &str = "\n[NOTE] This repeats your previous ac
 target with no get_app_state in between. If the first one already worked, doing it again may UNDO \
 it (e.g. toggle a Like off). Call get_app_state to check the current state before repeating.";
 
+const NO_VISIBLE_CHANGE_NOTICE: &str = "\n[VERIFY] The accessibility state did not change after \
+this click — it may NOT have taken effect (e.g. the click hit the wrong sub-element, the control \
+needs a hover/second step, or the page had not updated). Do NOT assume success: re-read with \
+get_app_state (or a screenshot) and confirm the intended change before reporting done.";
+
 impl ComputerUseTool {
     pub fn new(
         config: ComputerUseConfig,
@@ -473,6 +478,10 @@ impl ComputerUseTool {
                 let bundle_id = resolved.bundle_id.clone();
                 let mut cache = self.cache.lock().await;
                 let key = self.snapshot_key(&bundle_id, &ctx);
+                // Snapshot the pre-click state so we can tell whether the click
+                // actually changed anything (a click that hits nothing leaves the
+                // accessibility tree identical).
+                let before_hash = cache.state_hash(&key);
                 let element_index = resolve_target_index(args, &cache, &key, generation)?;
                 let mut action_class = ActionClass::LocalMutation;
                 let mut summary = None;
@@ -501,7 +510,15 @@ impl ComputerUseTool {
                     .click(&app, generation, element_index, x, y, &ctx, &mut cache)
                     .await?;
                 self.set_click_method(click_method).await;
-                let text = format_condensed_refresh(&snapshot, focus);
+                // Verify the click had an effect: if the post-click state hashes
+                // identically to before, nothing observable changed.
+                let after_hash = cache.state_hash(&key);
+                let no_change = matches!((before_hash, after_hash), (Some(a), Some(b)) if a == b);
+                drop(cache);
+                let mut text = format_condensed_refresh(&snapshot, focus);
+                if no_change {
+                    text.push_str(NO_VISIBLE_CHANGE_NOTICE);
+                }
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await
             }

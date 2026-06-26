@@ -207,11 +207,15 @@ impl ComputerHarness for MacOsHarness {
 
         if let Some(index) = element_index {
             let element = cache.element_by_index(&key, generation, index)?.clone();
+            // Make the action visible: move the real pointer onto the target so
+            // the user can see where the agent is clicking (AX-press itself moves
+            // nothing). On by default; AIDAEMON_CU_SHOW_CURSOR=0 disables it.
+            show_cursor_on_element(&element);
             // Prefer an AX press: it activates the control directly without
-            // moving the real cursor or requiring the app to be frontmost, so a
-            // GUI task works even while the user is looking at another window.
-            // Only fall back to a synthetic cursor click (which needs the app in
-            // the foreground) if the control can't be AX-pressed.
+            // requiring the app to be frontmost, so a GUI task works even while
+            // the user is looking at another window. Only fall back to a
+            // synthetic cursor click (which needs the app frontmost) if the
+            // control can't be AX-pressed.
             if press_element_via_ax(resolved.pid, index, &self.config)? {
                 let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
                 return Ok((refreshed, Some(index), "ax_press"));
@@ -254,6 +258,7 @@ impl ComputerHarness for MacOsHarness {
         // AX press (no foreground needed); fall back to a synthetic cursor click.
         if let Some(index) = element_index {
             let element = cache.element_by_index(&key, generation, index)?.clone();
+            show_cursor_on_element(&element);
             if !press_element_via_ax(resolved.pid, index, &self.config)? {
                 ensure_foreground(&resolved)?;
                 click_element(&element)?;
@@ -1022,6 +1027,30 @@ fn click_element(element: &IndexedElement) -> Result<(), String> {
     let cx = bounds.x + bounds.width / 2.0;
     let cy = bounds.y + bounds.height / 2.0;
     click_global_point(cx, cy)
+}
+
+/// Whether to move the real pointer to an element before acting on it via the
+/// (otherwise invisible) AX path, so the user can watch where the agent is
+/// working. On by default; set `AIDAEMON_CU_SHOW_CURSOR=0` to disable (e.g. to
+/// avoid hover side effects or cursor hijacking while you use the Mac).
+fn show_cursor_enabled() -> bool {
+    std::env::var("AIDAEMON_CU_SHOW_CURSOR")
+        .map(|v| {
+            let v = v.trim();
+            v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(true)
+}
+
+/// Move the real pointer onto an element (best-effort, ignores errors) so an
+/// AX-press is visible. Skipped when `show_cursor_enabled()` is off.
+fn show_cursor_on_element(element: &IndexedElement) {
+    if !show_cursor_enabled() {
+        return;
+    }
+    if let Some(bounds) = element.bounds {
+        let _ = move_cursor_to_element(&bounds);
+    }
 }
 
 /// Move the cursor over an element's center without clicking — used to scope a
