@@ -150,6 +150,31 @@ impl ComputerHarness for MacOsHarness {
         capture_app(resolved, &self.config, cache, ctx)
     }
 
+    async fn capture_screenshot(&self, app: &str) -> Result<AppSnapshot, String> {
+        self.check_permissions()?;
+        let resolved = resolve_app(app)?;
+        if is_prohibited_bundle(&resolved.bundle_id) {
+            return Err(format!(
+                "App '{}' ({}) is blocked by computer_use policy",
+                resolved.name, resolved.bundle_id
+            ));
+        }
+        // Image only: no AX walk, no cache.store — so the element generation is
+        // left untouched and a mutation issued after this screenshot is not stale.
+        let png = capture_window_png(resolved.pid, &resolved.name, &self.config)?;
+        Ok(AppSnapshot {
+            generation: 0,
+            bundle_id: resolved.bundle_id,
+            app_name: resolved.name,
+            pid: resolved.pid,
+            window_id: 1,
+            window_title: String::new(),
+            elements: Vec::new(),
+            truncated: false,
+            png,
+        })
+    }
+
     async fn activate_app(
         &self,
         app: &str,

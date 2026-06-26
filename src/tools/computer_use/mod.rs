@@ -343,11 +343,12 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::Screenshot => {
-                // Capture the app window and deliver the image to the user's
-                // chat (an explicit "send me a screenshot" should arrive), while
-                // also attaching it to the tool result for the model. Unlike
-                // get_app_state this returns no tree — the model just wanted a
-                // picture.
+                // A screenshot is a pure observation: capture the image only and
+                // deliver it to the chat (and attach it for the model). It must
+                // NOT advance the element generation, and it reports the current
+                // cached snapshot_generation so the model keeps using the right
+                // value — silently bumping it here used to make every
+                // post-screenshot mutation fail as stale.
                 let app = required_app(args)?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
@@ -359,8 +360,7 @@ impl ComputerUseTool {
                     None,
                 )
                 .await?;
-                let mut cache = self.cache.lock().await;
-                let snapshot = self.harness.get_app_state(&app, &ctx, &mut cache).await?;
+                let snapshot = self.harness.capture_screenshot(&app).await?;
                 if !snapshot.png.is_empty() {
                     let _ = self
                         .media_tx
@@ -374,9 +374,23 @@ impl ComputerUseTool {
                         })
                         .await;
                 }
+                let generation_hint = {
+                    let cache = self.cache.lock().await;
+                    let key = self.snapshot_key(&resolved.bundle_id, &ctx);
+                    match cache.current_generation(&key) {
+                        Some(g) => format!(
+                            " Current snapshot_generation={g} — reuse it for your next click/type \
+                             (a screenshot does not change it); call get_app_state only if the UI \
+                             has changed."
+                        ),
+                        None => " No snapshot captured yet — call get_app_state to get element \
+                                 indices before any click/type."
+                            .to_string(),
+                    }
+                };
                 let text = format!(
-                    "Screenshot of {} ({}) captured and sent to the chat.",
-                    snapshot.app_name, snapshot.bundle_id
+                    "Screenshot of {} ({}) captured and sent to the chat.{}",
+                    snapshot.app_name, snapshot.bundle_id, generation_hint
                 );
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await

@@ -29,6 +29,15 @@ pub trait ComputerHarness: Send + Sync {
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String>;
 
+    /// Capture only the app window image — no accessibility-tree walk and, by
+    /// design, NO new cached snapshot. A screenshot is a pure observation: it
+    /// must not advance the element generation, or every mutation issued after a
+    /// screenshot would be rejected as stale (the model can't see the bumped
+    /// number). The returned snapshot carries the PNG for delivery; its element
+    /// list is empty and its generation field is unset (the dispatch reports the
+    /// existing cached generation instead).
+    async fn capture_screenshot(&self, app: &str) -> Result<AppSnapshot, String>;
+
     /// `generation` is optional: activation has no element target, so a stale
     /// snapshot can't misdirect it, and activating is often the first action on
     /// an app (before any get_app_state). When present it is still validated.

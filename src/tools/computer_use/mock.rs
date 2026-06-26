@@ -107,6 +107,20 @@ impl ComputerHarness for MockHarness {
         Ok(cache.store(key, snap))
     }
 
+    async fn capture_screenshot(&self, app: &str) -> Result<AppSnapshot, String> {
+        if !app.eq_ignore_ascii_case("calculator")
+            && !app.eq_ignore_ascii_case("com.apple.calculator")
+        {
+            return Err(format!(
+                "Mock harness only supports Calculator, not '{app}'"
+            ));
+        }
+        // Image only: no cache.store, so the element generation is not advanced.
+        let mut snap = self.calculator_snapshot(0);
+        snap.elements.clear();
+        Ok(snap)
+    }
+
     async fn activate_app(
         &self,
         app: &str,

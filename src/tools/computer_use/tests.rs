@@ -403,6 +403,82 @@ async fn launch_app_returns_tree_for_running_app() {
 }
 
 #[tokio::test]
+async fn screenshot_does_not_invalidate_generation() {
+    // Repro of the real failure: get_app_state -> screenshot -> type_text reusing
+    // the generation get_app_state reported. A screenshot must NOT advance the
+    // generation, so the mutation must not be rejected as stale.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+
+    // Fresh cache: the first get_app_state stores generation 1.
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-shot"
+    }));
+    let gs_out = tool
+        .call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+    assert!(gs_out.output.contains("snapshot_generation=1"));
+
+    // A screenshot in between must report the current generation and not bump it.
+    let shot = merge(json!({
+        "action": "screenshot",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-shot"
+    }));
+    let shot_out = tool
+        .call_with_status_outcome(&shot.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !shot_out.output.starts_with("Error:"),
+        "screenshot should succeed: {}",
+        shot_out.output
+    );
+    assert!(
+        shot_out.output.contains("snapshot_generation=1"),
+        "screenshot should report the still-current generation: {}",
+        shot_out.output
+    );
+
+    // Reusing generation 1 (what get_app_state reported) must still be valid.
+    let tt = merge(json!({
+        "action": "type_text",
+        "app": "Calculator",
+        "snapshot_generation": 1,
+        "text": "hello",
+        "_session_id": "telegram:1",
+        "_task_id": "task-shot"
+    }));
+    let tt_out = tool
+        .call_with_status_outcome(&tt.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !tt_out.output.contains("Stale"),
+        "a screenshot must not invalidate the working generation: {}",
+        tt_out.output
+    );
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(
