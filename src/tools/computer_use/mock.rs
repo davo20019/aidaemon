@@ -191,14 +191,21 @@ impl ComputerHarness for MockHarness {
         &self,
         app: &str,
         generation: u64,
-        element_index: u32,
+        element_index: Option<u32>,
         _direction: &str,
         _pages: f64,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, u32), String> {
+    ) -> Result<(AppSnapshot, Option<u32>), String> {
         let key = snapshot_key(app, ctx)?;
-        let _el = cache.element_by_index(&key, generation, element_index)?;
+        match element_index {
+            Some(index) => {
+                let _el = cache.element_by_index(&key, generation, index)?;
+            }
+            None => {
+                cache.validate_generation(&key, generation)?;
+            }
+        }
         Ok((
             cache.store(key, self.calculator_snapshot(generation)),
             element_index,

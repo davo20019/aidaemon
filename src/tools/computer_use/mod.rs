@@ -524,19 +524,23 @@ impl ComputerUseTool {
                 let direction = required_str(args, "direction")?;
                 let pages = args.get("pages").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let resolved = self.resolve_app(&app).await?;
-                let (element_index, element) = {
+                // Element target is optional: with no element, scroll the focused
+                // window/page — the common "scroll the feed" case.
+                let element = {
                     let cache = self.cache.lock().await;
                     let key = self.snapshot_key(&resolved.bundle_id, &ctx);
-                    let index =
-                        resolve_target_index(args, &cache, &key, generation)?.ok_or_else(|| {
-                            "scroll requires element_index or element_title/element_role"
-                                .to_string()
-                        })?;
-                    let element = cache.element_by_index(&key, generation, index)?.clone();
-                    (index, element)
+                    match resolve_target_index(args, &cache, &key, generation)? {
+                        Some(index) => Some((
+                            index,
+                            cache.element_by_index(&key, generation, index)?.clone(),
+                        )),
+                        None => None,
+                    }
                 };
-                self.set_element_target(Some(&element), Some(element_index))
-                    .await;
+                let element_index = element.as_ref().map(|(i, _)| *i);
+                if let Some((index, el)) = &element {
+                    self.set_element_target(Some(el), Some(*index)).await;
+                }
                 self.ensure_action_approvals(
                     &ctx,
                     action,
@@ -559,7 +563,7 @@ impl ComputerUseTool {
                         &mut cache,
                     )
                     .await?;
-                let body = format_condensed_refresh(&snapshot, Some(focus));
+                let body = format_condensed_refresh(&snapshot, focus);
                 self.build_outcome(body, Some(&snapshot), &ctx.session_id)
                     .await
             }
@@ -841,7 +845,7 @@ impl Tool for ComputerUseTool {
                     "direction": {
                         "type": "string",
                         "enum": ["up", "down", "left", "right"],
-                        "description": "Scroll direction"
+                        "description": "Scroll direction. For scroll, element_index/element_title are OPTIONAL — omit them to scroll the whole page/feed; provide one only to scroll a specific pane."
                     },
                     "pages": { "type": "number", "description": "Scroll amount in pages (default 1)" },
                     "value": { "type": "string", "description": "Value for set_value" }

@@ -294,16 +294,30 @@ impl ComputerHarness for MacOsHarness {
         &self,
         app: &str,
         generation: u64,
-        element_index: u32,
+        element_index: Option<u32>,
         direction: &str,
         pages: f64,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, u32), String> {
+    ) -> Result<(AppSnapshot, Option<u32>), String> {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        let _element = cache.element_by_index(&key, generation, element_index)?;
-        ensure_foreground(&resolved)?;
+        // A named element scopes the scroll to that pane: move the cursor over it
+        // so the wheel events target it. With no element, scroll the focused
+        // window (the common "scroll the page/feed" case).
+        match element_index {
+            Some(index) => {
+                let element = cache.element_by_index(&key, generation, index)?.clone();
+                ensure_foreground(&resolved)?;
+                if let Some(bounds) = element.bounds {
+                    let _ = move_cursor_to_element(&bounds);
+                }
+            }
+            None => {
+                cache.validate_generation(&key, generation)?;
+                ensure_foreground(&resolved)?;
+            }
+        }
         scroll_direction(direction, pages)?;
         Ok((
             capture_app(resolved, &self.config, cache, ctx)?,
@@ -355,7 +369,7 @@ fn capture_app(
     let window = focused_or_main_window(&app_element)?;
     let window_title =
         optional_string_attr(&window, AX_TITLE_ATTRIBUTE).unwrap_or_else(|| app.name.clone());
-    let limits = AxWalkLimits::from_config(config);
+    let limits = AxWalkLimits::for_app(config, &app.bundle_id);
     let (elements, truncated) = walk_tree(&window, limits);
     let png = capture_window_png(app.pid, &app.name, config)?;
     let snapshot = AppSnapshot {
@@ -1008,6 +1022,17 @@ fn click_element(element: &IndexedElement) -> Result<(), String> {
     let cx = bounds.x + bounds.width / 2.0;
     let cy = bounds.y + bounds.height / 2.0;
     click_global_point(cx, cy)
+}
+
+/// Move the cursor over an element's center without clicking — used to scope a
+/// scroll to the element's pane (scroll-wheel events target the hovered area).
+fn move_cursor_to_element(bounds: &ElementBounds) -> Result<(), String> {
+    let cx = (bounds.x + bounds.width / 2.0).round() as i32;
+    let cy = (bounds.y + bounds.height / 2.0).round() as i32;
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo
+        .move_mouse(cx, cy, Coordinate::Abs)
+        .map_err(|e| e.to_string())
 }
 
 fn click_global_point(x: f64, y: f64) -> Result<(), String> {

@@ -65,6 +65,30 @@ impl AxWalkLimits {
             max_duration: config.action_timeout(),
         }
     }
+
+    /// Walk limits for a specific app. Browsers render web content as a very deep
+    /// accessibility tree — a feed's Like/Comment buttons can sit 30+ levels down,
+    /// far past the native-app default depth — so give browser windows a much
+    /// deeper and wider budget. The duration cap still bounds the walk.
+    pub fn for_app(config: &ComputerUseConfig, bundle_id: &str) -> Self {
+        let mut limits = Self::from_config(config);
+        if is_browser_bundle(bundle_id) {
+            limits.max_depth = limits.max_depth.max(40);
+            limits.max_nodes = limits.max_nodes.max(1200);
+        }
+        limits
+    }
+}
+
+/// Whether a bundle id is a web browser (whose content nests far deeper than a
+/// native app's controls).
+pub fn is_browser_bundle(bundle_id: &str) -> bool {
+    let b = bundle_id.to_ascii_lowercase();
+    [
+        "chrome", "chromium", "safari", "edgemac", "firefox", "brave", "arc", "opera", "vivaldi",
+    ]
+    .iter()
+    .any(|name| b.contains(name))
 }
 
 /// Serialize a full accessibility tree for `get_app_state`.
@@ -157,6 +181,32 @@ fn format_element_line(el: &IndexedElement) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browsers_get_a_deeper_walk_budget() {
+        let config = ComputerUseConfig {
+            ax_max_depth: 12,
+            ax_max_nodes: 500,
+            ..Default::default()
+        };
+        let chrome = AxWalkLimits::for_app(&config, "com.google.Chrome");
+        assert!(chrome.max_depth >= 40, "browser depth should be raised");
+        assert!(
+            chrome.max_nodes >= 1200,
+            "browser node budget should be raised"
+        );
+
+        let native = AxWalkLimits::for_app(&config, "com.apple.calculator");
+        assert_eq!(
+            native.max_depth, 12,
+            "native apps keep the configured depth"
+        );
+        assert_eq!(native.max_nodes, 500);
+
+        assert!(is_browser_bundle("com.apple.Safari"));
+        assert!(is_browser_bundle("org.mozilla.firefox"));
+        assert!(!is_browser_bundle("com.tinyspeck.slackmacgap"));
+    }
 
     fn sample_snapshot() -> AppSnapshot {
         AppSnapshot {

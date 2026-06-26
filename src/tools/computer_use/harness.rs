@@ -82,16 +82,19 @@ pub trait ComputerHarness: Send + Sync {
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String>;
 
+    /// Scroll `direction`. When `element_index` is `Some`, position over that
+    /// element first so the right pane scrolls; when `None`, scroll the focused
+    /// window/page (so "scroll the feed" works without naming an element).
     async fn scroll(
         &self,
         app: &str,
         generation: u64,
-        element_index: u32,
+        element_index: Option<u32>,
         direction: &str,
         pages: f64,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
-    ) -> Result<(AppSnapshot, u32), String>;
+    ) -> Result<(AppSnapshot, Option<u32>), String>;
 
     async fn set_value(
         &self,

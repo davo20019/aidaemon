@@ -599,6 +599,54 @@ async fn schema_documents_descriptor_targeting() {
 }
 
 #[tokio::test]
+async fn scroll_without_a_target_element_succeeds() {
+    // "scroll the page" — no element_index/descriptor — must work now.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-scroll"
+    }));
+    tool.call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+
+    let scroll = merge(json!({
+        "action": "scroll",
+        "app": "Calculator",
+        "snapshot_generation": 1,
+        "direction": "down",
+        "_session_id": "telegram:1",
+        "_task_id": "task-scroll"
+    }));
+    let out = tool
+        .call_with_status_outcome(&scroll.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !out.output.contains("requires element_index"),
+        "scroll should no longer require an element target: {}",
+        out.output
+    );
+    assert!(!out.output.starts_with("Error:"), "{}", out.output);
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(
