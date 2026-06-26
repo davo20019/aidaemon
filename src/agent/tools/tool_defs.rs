@@ -204,6 +204,15 @@ impl Agent {
                 Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
             });
         }
+        // Keep the core-prompt roster consistent with the per-turn tool set:
+        // desktop control is never advertised outside DMs/internal sessions.
+        if !Self::visibility_allows_desktop_control(visibility) {
+            defs.retain(|d| {
+                Self::tool_name_from_definition(d)
+                    .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
+                    .unwrap_or(true)
+            });
+        }
 
         let mut roster: Vec<(String, String)> = defs
             .iter()
@@ -451,6 +460,43 @@ impl Agent {
         filtered.into_iter().map(|(d, _, _)| d).collect()
     }
 
+    /// Tools that drive the owner's physical machine (desktop GUI automation).
+    /// These are powerful, owner-machine actions: an inbound chat message — or
+    /// the bot's own posted content echoed back in a shared channel — must never
+    /// be able to launch them. They are therefore offered only in 1-on-1 DMs and
+    /// internal/system sessions, never in group or public conversations.
+    const DESKTOP_CONTROL_TOOLS: &'static [&'static str] = &["computer_use"];
+
+    /// Whether desktop-control tools may be exposed in a conversation of this
+    /// visibility. Only direct messages (`Private`) and internal/system sessions
+    /// (`Internal`, e.g. the scheduler or spawned sub-agents) qualify. Group and
+    /// public channels never do, so another participant's message cannot reach
+    /// the desktop.
+    pub(crate) fn visibility_allows_desktop_control(visibility: ChannelVisibility) -> bool {
+        matches!(
+            visibility,
+            ChannelVisibility::Private | ChannelVisibility::Internal
+        )
+    }
+
+    /// Strip desktop-control tools from `defs`/`caps` when the channel visibility
+    /// does not permit them. No-op for `Private`/`Internal`.
+    pub(crate) fn restrict_desktop_control_for_visibility(
+        defs: &mut Vec<Value>,
+        caps: &mut HashMap<String, ToolCapabilities>,
+        visibility: ChannelVisibility,
+    ) {
+        if Self::visibility_allows_desktop_control(visibility) {
+            return;
+        }
+        defs.retain(|d| {
+            Self::tool_name_from_definition(d)
+                .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
+                .unwrap_or(true)
+        });
+        caps.retain(|name, _| !Self::DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
+    }
+
     pub(super) async fn load_policy_tool_set(
         &self,
         user_message: &str,
@@ -468,6 +514,10 @@ impl Agent {
             });
             caps.retain(|name, _| allowed.contains(&name.as_str()));
         }
+
+        // Desktop control is owner-machine-only: never expose it outside DMs and
+        // internal sessions, so a shared-channel message can't trigger it.
+        Self::restrict_desktop_control_for_visibility(&mut defs, &mut caps, channel_visibility);
 
         let base_defs = defs.clone();
         defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
@@ -548,6 +598,77 @@ mod tests {
     fn tool_definition_contract_accepts_valid_definition() {
         let def = valid_tool_def();
         assert!(Agent::validate_tool_definition_contract(&def).is_ok());
+    }
+
+    #[test]
+    fn desktop_control_allowed_only_in_dms_and_internal() {
+        // Direct messages and internal/system sessions may drive the desktop.
+        assert!(Agent::visibility_allows_desktop_control(
+            ChannelVisibility::Private
+        ));
+        assert!(Agent::visibility_allows_desktop_control(
+            ChannelVisibility::Internal
+        ));
+        // Group and public conversations must not — a participant's message
+        // (or the bot's own echoed content) could otherwise launch it.
+        assert!(!Agent::visibility_allows_desktop_control(
+            ChannelVisibility::PrivateGroup
+        ));
+        assert!(!Agent::visibility_allows_desktop_control(
+            ChannelVisibility::Public
+        ));
+        assert!(!Agent::visibility_allows_desktop_control(
+            ChannelVisibility::PublicExternal
+        ));
+    }
+
+    #[test]
+    fn restrict_desktop_control_strips_computer_use_in_channels() {
+        for visibility in [
+            ChannelVisibility::PrivateGroup,
+            ChannelVisibility::Public,
+            ChannelVisibility::PublicExternal,
+        ] {
+            let mut defs = vec![named_tool_def("computer_use"), named_tool_def("web_search")];
+            let mut caps = HashMap::from([
+                ("computer_use".to_string(), ToolCapabilities::default()),
+                ("web_search".to_string(), ToolCapabilities::default()),
+            ]);
+            Agent::restrict_desktop_control_for_visibility(&mut defs, &mut caps, visibility);
+            let names: Vec<&str> = defs
+                .iter()
+                .filter_map(Agent::tool_name_from_definition)
+                .collect();
+            assert!(
+                !names.contains(&"computer_use"),
+                "computer_use should be stripped in {visibility:?}"
+            );
+            assert!(
+                names.contains(&"web_search"),
+                "unrelated tools must survive in {visibility:?}"
+            );
+            assert!(!caps.contains_key("computer_use"));
+            assert!(caps.contains_key("web_search"));
+        }
+    }
+
+    #[test]
+    fn restrict_desktop_control_keeps_computer_use_in_dm_and_internal() {
+        for visibility in [ChannelVisibility::Private, ChannelVisibility::Internal] {
+            let mut defs = vec![named_tool_def("computer_use"), named_tool_def("web_search")];
+            let mut caps =
+                HashMap::from([("computer_use".to_string(), ToolCapabilities::default())]);
+            Agent::restrict_desktop_control_for_visibility(&mut defs, &mut caps, visibility);
+            let names: Vec<&str> = defs
+                .iter()
+                .filter_map(Agent::tool_name_from_definition)
+                .collect();
+            assert!(
+                names.contains(&"computer_use"),
+                "computer_use must remain available in {visibility:?}"
+            );
+            assert!(caps.contains_key("computer_use"));
+        }
     }
 
     proptest! {

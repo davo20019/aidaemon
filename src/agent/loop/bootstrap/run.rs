@@ -473,6 +473,27 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             ));
         }
 
+        // Desktop control (computer_use) is an owner-machine action and must not
+        // be reachable from shared/public conversations — only DMs and internal
+        // sessions. This stops a channel message that merely mentions the tool
+        // from launching it.
+        {
+            let before = defs.len();
+            Agent::restrict_desktop_control_for_visibility(
+                &mut defs,
+                &mut caps,
+                channel_ctx.visibility,
+            );
+            if before != defs.len() {
+                tool_filter_stages.push(GateFilterStage::new(
+                    "desktop_control_visibility",
+                    before,
+                    defs.len(),
+                    "filtered",
+                ));
+            }
+        }
+
         if restrict_to_personal_memory_tools {
             let before = defs.len();
             defs = filter_tool_defs_for_personal_memory(&defs);
