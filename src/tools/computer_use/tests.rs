@@ -755,6 +755,39 @@ async fn repeated_identical_click_is_cautioned() {
 }
 
 #[tokio::test]
+async fn results_carry_the_gui_task_anchor() {
+    // Every computer_use result reminds the model to emit a computer_use call
+    // (not narrate it in a file) — the fix for the observed derailment.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let mut args = json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-anchor"
+    });
+    if let Some(obj) = args.as_object_mut() {
+        obj.extend(test_model_args().as_object().unwrap().clone());
+    }
+    let out = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        out.output.contains("[NEXT]") && out.output.contains("computer_use call"),
+        "result should carry the GUI task anchor: {}",
+        out.output
+    );
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

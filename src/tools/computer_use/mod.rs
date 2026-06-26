@@ -79,6 +79,17 @@ this click — it may NOT have taken effect (e.g. the click hit the wrong sub-el
 needs a hover/second step, or the page had not updated). Do NOT assume success: re-read with \
 get_app_state (or a screenshot) and confirm the intended change before reporting done.";
 
+/// Appended to every computer_use result to keep a weak model on-task. The
+/// observed derailment was the model *narrating* its next click as a code
+/// comment via edit_file (and grepping saved result files) instead of emitting
+/// the actual call — this reminds it that only a computer_use call does anything.
+const GUI_TASK_ANCHOR: &str =
+    "\n[NEXT] You are operating an app through computer_use. Do the next \
+step by emitting a computer_use tool call NOW — prefer targeting by element_title (with occurrence \
+for repeats), e.g. click element_title=\"Like\". Do NOT write/edit files, run terminal or grep on \
+saved results, or describe the action in a comment: only a computer_use call changes anything on \
+screen.";
+
 impl ComputerUseTool {
     pub fn new(
         config: ComputerUseConfig,
@@ -395,7 +406,7 @@ impl ComputerUseTool {
             }
         }
         Ok(ToolCallOutcome {
-            output: text,
+            output: format!("{text}{GUI_TASK_ANCHOR}"),
             metadata,
         })
     }
