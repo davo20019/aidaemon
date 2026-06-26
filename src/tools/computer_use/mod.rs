@@ -478,15 +478,16 @@ impl ComputerUseTool {
                 let bundle_id = resolved.bundle_id.clone();
                 let mut cache = self.cache.lock().await;
                 let key = self.snapshot_key(&bundle_id, &ctx);
-                // Snapshot the pre-click state so we can tell whether the click
-                // actually changed anything (a click that hits nothing leaves the
-                // accessibility tree identical).
-                let before_hash = cache.state_hash(&key);
                 let element_index = resolve_target_index(args, &cache, &key, generation)?;
                 let mut action_class = ActionClass::LocalMutation;
                 let mut summary = None;
+                // Capture the targeted element's identity so we can verify the
+                // click actually changed *it* (a whole-snapshot diff is useless on
+                // a live page where unrelated content churns every frame).
+                let mut before_target: Option<(u32, String, String)> = None;
                 if let Some(index) = element_index {
                     let element = cache.element_by_index(&key, generation, index)?.clone();
+                    before_target = Some((index, element.role.clone(), element.title.clone()));
                     self.set_element_target(Some(&element), Some(index)).await;
                     action_class = classify_target(action, Some(&element), None);
                     if action_class == ActionClass::Prohibited {
@@ -510,13 +511,18 @@ impl ComputerUseTool {
                     .click(&app, generation, element_index, x, y, &ctx, &mut cache)
                     .await?;
                 self.set_click_method(click_method).await;
-                // Verify the click had an effect: if the post-click state hashes
-                // identically to before, nothing observable changed.
-                let after_hash = cache.state_hash(&key);
-                let no_change = matches!((before_hash, after_hash), (Some(a), Some(b)) if a == b);
                 drop(cache);
+                // Element-specific verification: if the targeted element is still
+                // present unchanged (same role + title) after the click, the click
+                // had no effect on it — flag it instead of implying success.
+                let target_unchanged = before_target.as_ref().is_some_and(|(i, role, title)| {
+                    snapshot
+                        .elements
+                        .iter()
+                        .any(|e| e.index == *i && &e.role == role && &e.title == title)
+                });
                 let mut text = format_condensed_refresh(&snapshot, focus);
-                if no_change {
+                if target_unchanged {
                     text.push_str(NO_VISIBLE_CHANGE_NOTICE);
                 }
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)

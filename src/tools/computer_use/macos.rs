@@ -24,7 +24,9 @@ use crate::config::ComputerUseConfig;
 use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
 use super::policy::{is_prohibited_bundle, is_text_input_element};
-use super::types::{AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement};
+use super::types::{
+    is_browser_bundle, AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement,
+};
 
 const ACCESSIBILITY_HELP: &str = "Accessibility permission is required. \
 Grant it in System Settings → Privacy & Security → Accessibility for aidaemon, then retry.";
@@ -211,19 +213,26 @@ impl ComputerHarness for MacOsHarness {
             // the user can see where the agent is clicking (AX-press itself moves
             // nothing). On by default; AIDAEMON_CU_SHOW_CURSOR=0 disables it.
             show_cursor_on_element(&element);
-            // Prefer an AX press: it activates the control directly without
-            // requiring the app to be frontmost, so a GUI task works even while
-            // the user is looking at another window. Only fall back to a
-            // synthetic cursor click (which needs the app frontmost) if the
-            // control can't be AX-pressed.
-            if press_element_via_ax(resolved.pid, index, &self.config)? {
+            // Web content frequently accepts an AX press without firing the page's
+            // JS click handler — AX reports success but nothing happens (e.g. a
+            // LinkedIn Like). So for browsers go straight to a real synthetic
+            // cursor click, which does fire web handlers. For native apps prefer
+            // AX-press: it needs no foreground and doesn't move the real cursor.
+            if !is_browser_bundle(&resolved.bundle_id)
+                && press_element_via_ax(resolved.pid, index, &self.config)?
+            {
                 let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
                 return Ok((refreshed, Some(index), "ax_press"));
             }
             ensure_foreground(&resolved)?;
             click_element(&element)?;
+            let method = if is_browser_bundle(&resolved.bundle_id) {
+                "cursor_web"
+            } else {
+                "cursor"
+            };
             let refreshed = capture_app(resolved, &self.config, cache, ctx)?;
-            return Ok((refreshed, Some(index), "cursor"));
+            return Ok((refreshed, Some(index), method));
         }
 
         // Raw coordinate clicks can only go through the synthetic cursor, which

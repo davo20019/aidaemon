@@ -647,10 +647,10 @@ async fn scroll_without_a_target_element_succeeds() {
 }
 
 #[tokio::test]
-async fn click_with_no_state_change_is_flagged_for_verification() {
-    // In the mock, a click sets a fixed "(clicked)" window title; a second click
-    // on a different element produces an identical snapshot, so the verifier
-    // should warn that nothing changed.
+async fn click_with_no_target_change_is_flagged_for_verification() {
+    // The mock click never changes the clicked element's role/title, so the
+    // element-specific verifier should warn that the target did not change —
+    // exactly the signal that catches a web Like that silently did nothing.
     let dir = TempDir::new().unwrap();
     let tool = test_tool(
         ComputerUseConfig {
@@ -666,16 +666,6 @@ async fn click_with_no_state_change_is_flagged_for_verification() {
         }
         v
     };
-    let click = |gen: u64, index: u32| {
-        merge(json!({
-            "action": "click",
-            "app": "Calculator",
-            "snapshot_generation": gen,
-            "element_index": index,
-            "_session_id": "telegram:1",
-            "_task_id": "task-verify"
-        }))
-    };
     let gs = merge(json!({
         "action": "get_app_state",
         "app": "Calculator",
@@ -686,22 +676,22 @@ async fn click_with_no_state_change_is_flagged_for_verification() {
         .await
         .unwrap();
 
-    // First click changes the window title -> not flagged.
-    let first = tool
-        .call_with_status_outcome(&click(1, 1).to_string(), None)
-        .await
-        .unwrap();
-    assert!(!first.output.contains("[VERIFY]"), "{}", first.output);
-
-    // Second click on a different element yields an identical snapshot -> flagged.
-    let second = tool
-        .call_with_status_outcome(&click(2, 2).to_string(), None)
+    let click = merge(json!({
+        "action": "click",
+        "app": "Calculator",
+        "snapshot_generation": 1,
+        "element_index": 1,
+        "_session_id": "telegram:1",
+        "_task_id": "task-verify"
+    }));
+    let out = tool
+        .call_with_status_outcome(&click.to_string(), None)
         .await
         .unwrap();
     assert!(
-        second.output.contains("[VERIFY]") && !second.output.contains("[NOTE]"),
-        "a click that changed nothing should be flagged for verification (not as a dup): {}",
-        second.output
+        out.output.contains("[VERIFY]"),
+        "a click whose target element is unchanged should be flagged: {}",
+        out.output
     );
 }
 
