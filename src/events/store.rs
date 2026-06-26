@@ -2443,6 +2443,8 @@ mod tests {
                 .map(|cached| input_tokens.saturating_sub(cached)),
             est_input_tokens,
             tool_calls_count: 0,
+            offered_tools: Vec::new(),
+            chosen_tools: Vec::new(),
             build_ms: Some(5),
             prefix_hash_system: None,
             prefix_hash_pre_boundary: None,

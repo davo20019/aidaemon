@@ -664,6 +664,20 @@ pub(super) async fn run_llm_phase(
                     fresh_input_tokens,
                     est_input_tokens: Some(est_input_tokens),
                     tool_calls_count: resp.tool_calls.len() as u32,
+                    // The exact tools offered to the model on this call (post
+                    // policy/force-text/budget) and what it chose — so a single
+                    // db_probe query can show whether a tool was available when
+                    // the model fell back to another one.
+                    offered_tools: effective_tools
+                        .iter()
+                        .filter_map(|d| {
+                            d.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect(),
+                    chosen_tools: resp.tool_calls.iter().map(|tc| tc.name.clone()).collect(),
                     build_ms: Some(build_ms),
                     prefix_hash_system: Some(prefix_fp.hash_system.clone()),
                     prefix_hash_pre_boundary: Some(prefix_fp.hash_pre_boundary.clone()),

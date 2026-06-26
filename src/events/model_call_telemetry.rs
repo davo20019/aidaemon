@@ -150,6 +150,8 @@ pub async fn record_background_model_call_telemetry(
                 fresh_input_tokens,
                 est_input_tokens: None,
                 tool_calls_count: response.tool_calls.len() as u32,
+                offered_tools: Vec::new(),
+                chosen_tools: Vec::new(),
                 build_ms: None,
                 prefix_hash_system: None,
                 prefix_hash_pre_boundary: None,

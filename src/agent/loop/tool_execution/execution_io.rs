@@ -228,7 +228,8 @@ pub(super) async fn execute_tool_call_io(
             // then pages / jq / greps the full data instead of losing the
             // middle to lossy head+tail compression. No recovery path → fall
             // back to lossy compression. Errors are never spilled.
-            let over_cap = result_text.chars().count() > max_chars;
+            let original_chars = result_text.chars().count();
+            let over_cap = original_chars > max_chars;
             // The computer_use accessibility tree is the model's working data: it
             // must stay inline and complete so the model can target an element
             // directly. Spilling it to a file (whose notice tells the model to
@@ -250,6 +251,7 @@ pub(super) async fn execute_tool_call_io(
             } else {
                 None
             };
+            let was_spilled = spilled.is_some();
             result_text = match spilled {
                 Some(preview) => {
                     tracing::info!(
@@ -267,6 +269,36 @@ pub(super) async fn execute_tool_call_io(
                     max_chars,
                 ),
             };
+            // Record how the harness transformed the result before the model saw
+            // it — spill/compress/kept-inline + how many chars were hidden. This
+            // is the mutation that caused the read_file/terminal derailment and
+            // was previously only visible in stdout; persist it so a single
+            // db_probe --task query explains "why did the model do that".
+            if over_cap && !result_is_err {
+                let shown_chars = result_text.chars().count();
+                let decision_type = if was_spilled {
+                    "tool_result_spilled"
+                } else if keep_inline {
+                    "tool_result_kept_inline"
+                } else {
+                    "tool_result_compressed"
+                };
+                let _ = ctx
+                    .emitter
+                    .emit(
+                        EventType::DecisionPoint,
+                        serde_json::json!({
+                            "decision_type": decision_type,
+                            "name": tc.name,
+                            "task_id": ctx.task_id,
+                            "original_chars": original_chars,
+                            "shown_chars": shown_chars,
+                            "hidden_chars": original_chars.saturating_sub(shown_chars),
+                            "max_chars": max_chars,
+                        }),
+                    )
+                    .await;
+            }
         }
     }
 

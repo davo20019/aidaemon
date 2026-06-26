@@ -250,6 +250,16 @@ pub struct LlmCallData {
     /// Hash of effective tool definitions sent to the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_defs_hash: Option<String>,
+    /// Tool names actually offered to the model on this call (after policy
+    /// filtering, force-text, and budget fitting). Lets `db_probe --task` answer
+    /// "was tool X available when the model chose tool Y" — e.g. whether
+    /// computer_use was present when the model fell back to terminal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_tools: Vec<String>,
+    /// Tool names the model called in its response to this call (empty for a
+    /// text-only response).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_tools: Vec<String>,
     /// Hash of the injected session summary message, if present.
     /// Retired by Pillar A; always written as `None`/empty. Kept for
     /// parser/back-compat so older event rows can still be deserialized.
@@ -1039,6 +1049,8 @@ mod tests {
             fresh_input_tokens: Some(40),
             est_input_tokens: Some(120),
             tool_calls_count: 1,
+            offered_tools: vec!["web_search".to_string(), "computer_use".to_string()],
+            chosen_tools: vec!["web_search".to_string()],
             build_ms: Some(7),
             prefix_hash_system: Some("sys-hash".to_string()),
             prefix_hash_pre_boundary: Some("pre-hash".to_string()),
