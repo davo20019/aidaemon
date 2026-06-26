@@ -3,6 +3,7 @@
 //! Usage:
 //!   computer_use_probe --app Calculator --inspect
 //!   computer_use_probe --app Calculator --click-index 3
+//!   computer_use_probe --windows            # dump every on-screen window xcap can see
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -18,6 +19,7 @@ fn main() {
     let mut app = "Calculator".to_string();
     let mut inspect_only = true;
     let mut click_index: Option<u32> = None;
+    let mut list_windows = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -26,6 +28,7 @@ fn main() {
                 app = args.get(i).cloned().unwrap_or(app);
             }
             "--inspect" => inspect_only = true,
+            "--windows" => list_windows = true,
             "--click-index" => {
                 inspect_only = false;
                 i += 1;
@@ -40,10 +43,40 @@ fn main() {
         i += 1;
     }
 
-    if let Some(index) = click_index {
+    if list_windows {
+        run_windows();
+    } else if let Some(index) = click_index {
         run_click(&app, index);
     } else if inspect_only {
         run_inspect(&app);
+    }
+}
+
+/// Dump every window xcap can enumerate — the same source `capture_window_png`
+/// matches against. Reveals which process owns the on-screen window and whether
+/// a target (e.g. Chrome) is minimized or simply absent from the capture list.
+#[cfg(target_os = "macos")]
+fn run_windows() {
+    use xcap::Window;
+
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let windows = Window::all().expect("Window::all");
+    println!("xcap sees {} window(s):", windows.len());
+    for w in &windows {
+        println!(
+            "  pid={:?} app={:?} title={:?} minimized={:?} size={}x{} pos=({},{})",
+            w.pid().ok(),
+            w.app_name().unwrap_or_default(),
+            w.title().unwrap_or_default(),
+            w.is_minimized().ok(),
+            w.width().unwrap_or(0),
+            w.height().unwrap_or(0),
+            w.x().unwrap_or(0),
+            w.y().unwrap_or(0),
+        );
     }
 }
 

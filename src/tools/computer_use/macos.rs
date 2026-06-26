@@ -730,14 +730,60 @@ fn capture_window_png(
     config: &ComputerUseConfig,
 ) -> Result<Vec<u8>, String> {
     let windows = Window::all().map_err(|e| e.to_string())?;
-    let window = windows
+    // Match by pid or app name (case-insensitive); an app can run more than one
+    // process, and the on-screen window may be owned by a sibling pid. Among the
+    // matches, prefer a non-minimized window and the largest one — that is the
+    // real document window rather than a menubar/popover/utility sliver.
+    let mut candidates: Vec<Window> = windows
         .into_iter()
-        .find(|w| {
-            w.pid().ok() == Some(pid as u32) || w.app_name().ok().as_deref() == Some(app_name)
+        .filter(|w| {
+            w.pid().ok() == Some(pid as u32)
+                || w.app_name()
+                    .ok()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(app_name))
         })
-        .ok_or_else(|| format!("No capturable window for {app_name}"))?;
+        .collect();
+    candidates.sort_by_key(|w| {
+        let minimized = w.is_minimized().unwrap_or(false);
+        let area = (w.width().unwrap_or(0) as u64) * (w.height().unwrap_or(0) as u64);
+        // Non-minimized first, then largest area first.
+        (minimized, std::cmp::Reverse(area))
+    });
+    let window = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| no_capturable_window_message(pid, app_name))?;
     let image = window.capture_image().map_err(|e| e.to_string())?;
     encode_png(resize_image(image, config)?, config)
+}
+
+/// Build an actionable error for when no on-screen window can be captured for an
+/// app. `xcap` only sees windows on the *currently displayed* Space, so a window
+/// living on another Mission Control Space or display is invisible here even
+/// though the app is running and the accessibility tree can see it. Distinguish
+/// "has windows, just not on this desktop" from "no window open at all", and
+/// steer the model away from flailing into unrelated tools.
+fn no_capturable_window_message(pid: i32, app_name: &str) -> String {
+    let ax_window_count = AXUIElement::from_pid(pid)
+        .and_then(|el| windows_for_app(&el).ok())
+        .map(|w| w.len())
+        .unwrap_or(0);
+    if ax_window_count > 0 {
+        format!(
+            "Cannot capture {app_name}: it is running with {ax_window_count} window(s), but none \
+             are on the desktop that is currently on screen — the window is most likely on another \
+             Mission Control Space or display (or hidden/minimized). Ask the user to bring a \
+             {app_name} window to the front on the active desktop, then retry. Do NOT switch to \
+             terminal or other tools — computer_use cannot capture a window that is off the \
+             current Space."
+        )
+    } else {
+        format!(
+            "Cannot capture {app_name}: it is running but has no open window. Ask the user to open \
+             a {app_name} window (or open one yourself with a New Window shortcut after activating \
+             it), then retry. Do NOT switch to terminal or other tools."
+        )
+    }
 }
 
 fn resize_image(image: RgbaImage, config: &ComputerUseConfig) -> Result<RgbaImage, String> {
