@@ -1070,6 +1070,19 @@ fn parse_key_token(part: &str) -> Result<Key, String> {
         "return" | "enter" => Ok(Key::Return),
         "tab" => Ok(Key::Tab),
         "escape" | "esc" => Ok(Key::Escape),
+        "space" | "spacebar" => Ok(Key::Space),
+        "backspace" => Ok(Key::Backspace),
+        "delete" | "del" => Ok(Key::Delete),
+        // Navigation keys — models reach for these to scroll/move (e.g. PageDown
+        // to scroll a feed), so accept the common spellings instead of erroring.
+        "pagedown" | "page_down" | "pgdn" => Ok(Key::PageDown),
+        "pageup" | "page_up" | "pgup" => Ok(Key::PageUp),
+        "home" => Ok(Key::Home),
+        "end" => Ok(Key::End),
+        "up" | "uparrow" | "arrowup" => Ok(Key::UpArrow),
+        "down" | "downarrow" | "arrowdown" => Ok(Key::DownArrow),
+        "left" | "leftarrow" | "arrowleft" => Ok(Key::LeftArrow),
+        "right" | "rightarrow" | "arrowright" => Ok(Key::RightArrow),
         "command" | "cmd" => Ok(Key::Meta),
         "shift" => Ok(Key::Shift),
         "control" | "ctrl" => Ok(Key::Control),
@@ -1160,5 +1173,24 @@ mod tests {
         let (main, modifiers) = keys.split_last().unwrap();
         assert!(modifiers.is_empty());
         assert!(!is_modifier_key(main));
+    }
+
+    #[test]
+    fn navigation_keys_are_supported() {
+        for token in [
+            "page_down",
+            "PageDown",
+            "pgdn",
+            "down",
+            "home",
+            "space",
+            "backspace",
+        ] {
+            assert!(
+                parse_key_token(token).is_ok(),
+                "expected '{token}' to be a supported key token"
+            );
+        }
+        assert!(parse_key_token("definitely_not_a_key").is_err());
     }
 }
