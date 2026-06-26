@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.15] - 2026-06-25
+
+### Added
+
+- **Single live status surface (Telegram).** A task's progress now renders into **one self-editing message per turn** instead of a stream of separate messages (a typical "create a script, run it, send the file" task dropped from ~8 messages to the surface + the deliverable). The plan checklist, per-tool activity, and the final reply all flow into the same message: it is lazily created on the first substantial progress event, edited in place as work proceeds (☐→✅ for a plan, or a single `⏳ …` line for plan-less turns), and at the end either becomes the final reply (edited in) or flips to a done state before the deliverable is sent. Built on a new `LiveStatus` owner + `HubSurfaceSink` (using the channel-agnostic `send_text_tracked`/`edit_text` hub APIs, so it survives the per-turn status task being aborted) and a new `StatusUpdate::Checklist` variant. Fast/trivial turns create no surface at all. Slack/Discord compile against the new variant and degrade to the prior throttled-send behavior.
+
+### Changed
+
+- **Raw shell commands and process ids never appear in user-facing chat.** Commands and pids are kept in tool results and logs (so the model still sees exactly what ran), but are stripped from every user-facing surface: the live status line, the auto-delivered background result-file caption, background-completion notices ("moved to background"/"finished" pid lines are gone), and the "Activity summary" fallback recaps (which now read "Commands run: N commands"). The suppression is unconditional, including in private DMs.
+- **Final replies and status content render Markdown on Telegram.** The live-surface create/edit path now converts Markdown → Telegram HTML (matching the normal send path), and the plain-text fallback used when an HTML send is rejected now strips Markdown (bold/italic/headings/inline code → plain, list bullets → `•`, `[text](url)` → `text (url)`) instead of only stripping LaTeX — so a reply with `### **Heading**` no longer shows raw markup.
+- **The requirement checklist is delivered as a status event, unified onto the live surface.** `track_requirements` no longer posts/edits its own message through the hub; it emits the rendered checklist as `StatusUpdate::Checklist`, which the live surface renders. The checklist update bypasses the status throttle (it arrives immediately after the tool's own start ping and was previously dropped), so the plan reliably appears. Auto-completion of checklist items from other successful tool calls is preserved — only its delivery changed. The now-unused `ui_message_id` checkpoint plumbing and the separate final recap UI were removed.
+- **Emoji-only reactions are interpreted by the model.** A single-emoji turn was short-circuited to a canned "Got it."; because an emoji reaction's meaning depends on conversational context and tone, it now goes through the model. Text acknowledgements ("thanks"/"ok") keep the cheap local shortcut.
+- **Faster local/dev rebuilds.** `scripts/package-macos-app.sh --build --debug` now does a debug build (skips release optimization) for quick local iteration; `--build` alone still produces the optimized release binary.
+
+### Fixed
+
+- **Background tasks no longer end prematurely.** Avoids cutting a background task short before its follow-up work completes.
+- **Coalesced goals with failed dependencies are unblocked.** A goal coalesced with a dependency that failed is no longer left stuck.
+
 ## [0.11.14] - 2026-06-25
 
 ### Added
