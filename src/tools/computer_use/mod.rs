@@ -428,13 +428,13 @@ impl ComputerUseTool {
             ComputerActionKind::Click => {
                 let app = required_app(args)?;
                 let generation = required_generation(args)?;
-                let element_index = optional_u32(args, "element_index");
                 let x = optional_f64(args, "x");
                 let y = optional_f64(args, "y");
                 let resolved = self.resolve_app(&app).await?;
                 let bundle_id = resolved.bundle_id.clone();
                 let mut cache = self.cache.lock().await;
                 let key = self.snapshot_key(&bundle_id, &ctx);
+                let element_index = resolve_target_index(args, &cache, &key, generation)?;
                 let mut action_class = ActionClass::LocalMutation;
                 let mut summary = None;
                 if let Some(index) = element_index {
@@ -485,9 +485,11 @@ impl ComputerUseTool {
                 )
                 .await?;
                 let mut cache = self.cache.lock().await;
+                let key = self.snapshot_key(&resolved.bundle_id, &ctx);
+                let element_index = resolve_target_index(args, &cache, &key, generation)?;
                 let snapshot = self
                     .harness
-                    .type_text(&app, generation, &text, &ctx, &mut cache)
+                    .type_text(&app, generation, element_index, &text, &ctx, &mut cache)
                     .await?;
                 let body = format_condensed_refresh(&snapshot, None);
                 self.build_outcome(body, Some(&snapshot), &ctx.session_id)
@@ -519,16 +521,19 @@ impl ComputerUseTool {
             ComputerActionKind::Scroll => {
                 let app = required_app(args)?;
                 let generation = required_generation(args)?;
-                let element_index = required_u32(args, "element_index")?;
                 let direction = required_str(args, "direction")?;
                 let pages = args.get("pages").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let resolved = self.resolve_app(&app).await?;
-                let element = {
+                let (element_index, element) = {
                     let cache = self.cache.lock().await;
                     let key = self.snapshot_key(&resolved.bundle_id, &ctx);
-                    cache
-                        .element_by_index(&key, generation, element_index)?
-                        .clone()
+                    let index =
+                        resolve_target_index(args, &cache, &key, generation)?.ok_or_else(|| {
+                            "scroll requires element_index or element_title/element_role"
+                                .to_string()
+                        })?;
+                    let element = cache.element_by_index(&key, generation, index)?.clone();
+                    (index, element)
                 };
                 self.set_element_target(Some(&element), Some(element_index))
                     .await;
@@ -561,12 +566,15 @@ impl ComputerUseTool {
             ComputerActionKind::SetValue => {
                 let app = required_app(args)?;
                 let generation = required_generation(args)?;
-                let element_index = required_u32(args, "element_index")?;
                 let value = required_str(args, "value")?;
                 let resolved = self.resolve_app(&app).await?;
                 let bundle_id = resolved.bundle_id.clone();
                 let mut cache = self.cache.lock().await;
                 let key = self.snapshot_key(&bundle_id, &ctx);
+                let element_index = resolve_target_index(args, &cache, &key, generation)?
+                    .ok_or_else(|| {
+                        "set_value requires element_index or element_title/element_role".to_string()
+                    })?;
                 let element = cache
                     .element_by_index(&key, generation, element_index)?
                     .clone();
@@ -726,6 +734,36 @@ fn optional_u32(args: &Value, key: &str) -> Option<u32> {
         .and_then(|v| u32::try_from(v).ok())
 }
 
+/// Resolve the target element index for an action. An explicit `element_index`
+/// wins; otherwise a descriptor (`element_title` and/or `element_role`, with an
+/// optional 1-based `occurrence`) is resolved against the current snapshot, so
+/// the model can target a control by its stable label rather than a positional
+/// index that renumbers across re-renders. Returns `Ok(None)` when neither an
+/// index nor a descriptor was supplied (e.g. a coordinate click).
+fn resolve_target_index(
+    args: &Value,
+    snapshot_cache: &SnapshotCache,
+    key: &cache::SnapshotKey,
+    generation: u64,
+) -> Result<Option<u32>, String> {
+    if let Some(index) = optional_u32(args, "element_index") {
+        return Ok(Some(index));
+    }
+    let role = args.get("element_role").and_then(|v| v.as_str());
+    let title = args.get("element_title").and_then(|v| v.as_str());
+    if role.is_none() && title.is_none() {
+        return Ok(None);
+    }
+    let occurrence = args
+        .get("occurrence")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(1);
+    snapshot_cache
+        .resolve_descriptor(key, generation, role, title, occurrence)
+        .map(Some)
+}
+
 fn optional_f64(args: &Value, key: &str) -> Option<f64> {
     args.get(key).and_then(|v| v.as_f64())
 }
@@ -741,8 +779,12 @@ impl Tool for ComputerUseTool {
          Only apps that are already running can be controlled — if the target app is not listed by \
          list_apps, call launch_app to start it first. Call get_app_state before mutating actions; \
          copy the exact snapshot_generation from the most recent result into every mutation (do not \
-         increment or guess it). After your final mutating action, call get_app_state and confirm \
-         the visible state matches the goal before reporting success."
+         increment or guess it). To click or type into a control, prefer targeting it by \
+         element_title (and element_role) rather than element_index — titles are stable while \
+         indices renumber on every re-render; use occurrence for repeated labels. type_text focuses \
+         the element you target before typing, so always pass element_title/element_index when \
+         typing into a specific field (e.g. an address bar). After your final mutating action, call \
+         get_app_state and confirm the visible state matches the goal before reporting success."
     }
 
     fn schema(&self) -> Value {
@@ -778,11 +820,23 @@ impl Tool for ComputerUseTool {
                     },
                     "element_index": {
                         "type": "integer",
-                        "description": "Indexed element from the accessibility tree"
+                        "description": "Indexed element from the accessibility tree. WARNING: indices renumber whenever the screen changes (page load, scroll, new element). Prefer targeting by element_title/element_role, which are stable. Used by click, type_text, scroll, set_value."
+                    },
+                    "element_title": {
+                        "type": "string",
+                        "description": "Target an element by its visible title/label (case-insensitive substring), resolved against the latest snapshot. More robust than element_index because it survives re-renders. E.g. 'Address and search bar', 'Like', 'Send'. Combine with occurrence to disambiguate repeats."
+                    },
+                    "element_role": {
+                        "type": "string",
+                        "description": "Target an element by accessibility role (case-insensitive substring), e.g. 'button', 'textfield'. Use with or instead of element_title to disambiguate."
+                    },
+                    "occurrence": {
+                        "type": "integer",
+                        "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Default 1."
                     },
                     "x": { "type": "number", "description": "Coordinate click x (global points)" },
                     "y": { "type": "number", "description": "Coordinate click y (global points)" },
-                    "text": { "type": "string", "description": "Text to type" },
+                    "text": { "type": "string", "description": "Text to type. For type_text, also pass element_title (or element_index) to focus that field first; otherwise the text goes to whatever currently has keyboard focus." },
                     "key": { "type": "string", "description": "Key combo such as Return or Command+s" },
                     "direction": {
                         "type": "string",

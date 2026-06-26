@@ -479,6 +479,126 @@ async fn screenshot_does_not_invalidate_generation() {
 }
 
 #[tokio::test]
+async fn type_text_by_descriptor_resolves_and_focuses() {
+    // get_app_state then type_text targeting a field by element_title (not index).
+    // The mock validates the resolved index exists, so success means the
+    // descriptor resolved to a real element.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-desc"
+    }));
+    tool.call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+
+    // Mock snapshot has buttons titled "7" (index 1) and "+" (index 2).
+    let tt = merge(json!({
+        "action": "type_text",
+        "app": "Calculator",
+        "snapshot_generation": 1,
+        "element_title": "+",
+        "text": "hi",
+        "_session_id": "telegram:1",
+        "_task_id": "task-desc"
+    }));
+    let out = tool
+        .call_with_status_outcome(&tt.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !out.output.starts_with("Error:"),
+        "type_text by descriptor should resolve to a real element: {}",
+        out.output
+    );
+}
+
+#[tokio::test]
+async fn descriptor_with_no_match_is_actionable() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let merge = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+    let gs = merge(json!({
+        "action": "get_app_state",
+        "app": "Calculator",
+        "_session_id": "telegram:1",
+        "_task_id": "task-nomatch"
+    }));
+    tool.call_with_status_outcome(&gs.to_string(), None)
+        .await
+        .unwrap();
+
+    let click = merge(json!({
+        "action": "click",
+        "app": "Calculator",
+        "snapshot_generation": 1,
+        "element_title": "Nonexistent Button",
+        "_session_id": "telegram:1",
+        "_task_id": "task-nomatch"
+    }));
+    let out = tool
+        .call_with_status_outcome(&click.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        out.output.contains("No interactive element matching"),
+        "an unmatched descriptor should give an actionable error: {}",
+        out.output
+    );
+}
+
+#[tokio::test]
+async fn schema_documents_descriptor_targeting() {
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let schema = tool.schema();
+    let props = &schema["parameters"]["properties"];
+    assert!(props.get("element_title").is_some(), "element_title param");
+    assert!(props.get("element_role").is_some(), "element_role param");
+    assert!(props.get("occurrence").is_some(), "occurrence param");
+    let text_desc = props["text"]["description"].as_str().unwrap();
+    assert!(
+        text_desc.contains("element_title") || text_desc.contains("focus"),
+        "text description should explain focusing the target field: {text_desc}"
+    );
+}
+
+#[tokio::test]
 async fn mutation_budget_blocks_after_limit() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

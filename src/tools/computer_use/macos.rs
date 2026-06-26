@@ -241,6 +241,7 @@ impl ComputerHarness for MacOsHarness {
         &self,
         app: &str,
         generation: u64,
+        element_index: Option<u32>,
         text: &str,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
@@ -248,6 +249,16 @@ impl ComputerHarness for MacOsHarness {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
         cache.validate_generation(&key, generation)?;
+        // If a target field was named, focus it first so the keystrokes land
+        // there instead of in whatever control currently holds focus. Prefer an
+        // AX press (no foreground needed); fall back to a synthetic cursor click.
+        if let Some(index) = element_index {
+            let element = cache.element_by_index(&key, generation, index)?.clone();
+            if !press_element_via_ax(resolved.pid, index, &self.config)? {
+                ensure_foreground(&resolved)?;
+                click_element(&element)?;
+            }
+        }
         ensure_foreground(&resolved)?;
         let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
         enigo

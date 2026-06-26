@@ -60,10 +60,14 @@ pub trait ComputerHarness: Send + Sync {
         cache: &mut SnapshotCache,
     ) -> Result<(AppSnapshot, Option<u32>, &'static str), String>;
 
+    /// Type `text`. When `element_index` is `Some`, focus that element first (so
+    /// the text lands in the intended field rather than in whatever happened to
+    /// hold keyboard focus); when `None`, type into the current focus.
     async fn type_text(
         &self,
         app: &str,
         generation: u64,
+        element_index: Option<u32>,
         text: &str,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,

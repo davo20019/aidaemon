@@ -160,12 +160,17 @@ impl ComputerHarness for MockHarness {
         &self,
         app: &str,
         generation: u64,
+        element_index: Option<u32>,
         _text: &str,
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String> {
         let key = snapshot_key(app, ctx)?;
         cache.validate_generation(&key, generation)?;
+        if let Some(index) = element_index {
+            // Validate the targeted element exists, mirroring the macOS focus step.
+            let _ = cache.element_by_index(&key, generation, index)?;
+        }
         Ok(cache.store(key, self.calculator_snapshot(generation)))
     }
 
