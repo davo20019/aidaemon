@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.16] - 2026-06-27
+
+### Added
+
+- **macOS computer-use maturation.** A `launch_app` action with auto-launch/activate (and an actionable error when the target app isn't running); targeting elements by **label** with focus-then-type instead of by brittle index; **synonym-aware** descriptor targeting; a deeper accessibility-tree walk for browsers plus scrolling without an explicit target; navigation keys in `press_key` (PageDown, arrows, Home/End, …); and distinct detection/reporting of a locked screen.
+- **Computer-use action auditing.** Each computer-use action is persisted to the events store (DB-auditable), and a new telemetry record captures per-call offered/chosen tools and result transforms in the database.
+- **Telegram: resolved approval cards auto-dismiss** once acted on.
+
+### Changed
+
+- **Computer-use is gated to DMs and internal sessions only**, and the model is anchored to *act* rather than narrate. Post-click verification with a visible cursor is on by default.
+- **The computer-use accessibility tree stays inline** in context (never spilled/compressed), and superseded trees are collapsed to bound context growth.
+
+### Fixed
+
+- **Stack-overflow crash loop from nested sub-agent spawning.** Spawned child agents ran inline on the parent's tokio worker stack; a 3-deep orchestrator→task_lead→executor chain overflowed the default 2 MB stack and crash-looped the daemon. Children now run on their own task (polling from the worker stack base), and the worker stack size was enlarged for headroom.
+- **Continuous scheduled goals no longer die silently.** A continuous goal idle >30 days was silently skipped forever (it could never record progress, a permanent deadlock); it now keeps firing and surfaces a one-time alert. A goal's `last_useful_action` is also refreshed whenever a task completes (not only when a schedule fires), so freshness stays accurate.
+- **OAuth tokens recover automatically at startup.** When the stored access token is unavailable (e.g. `NO_KEYCHAIN` mode reading a `.env` without the bearer, or an expired token), the daemon now refreshes from the refresh token + client credentials instead of leaving the service unauthenticated. Also fixes ordinary bearer expiry across restarts.
+- **`http_request` retries transient upstream 5xx** for idempotent methods (GET/HEAD/OPTIONS) with backoff, so a one-off server hiccup no longer hard-blocks scheduled work. Writes and rate-limits (429) are never retried.
+- **Computer-use reliability.** Click verification is keyed on a stable element identity rather than index; the descriptor resolver no longer mis-matches exact names via synonyms; element-specific click verification with a real click on web; modifiers are held in `press_key_combo` (e.g. Command+A); a text field is cleared before typing; an actionable error is returned when a window is off the active Space; a screenshot no longer invalidates the snapshot generation; and the target app is auto-activated before synthetic input.
+
 ## [0.11.15] - 2026-06-25
 
 ### Added
