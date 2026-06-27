@@ -3677,3 +3677,59 @@ async fn record_and_get_self_correction_attempts_round_trip() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn completing_a_task_refreshes_goal_last_useful_action() {
+    let (store, _tmp) = setup_test_store().await;
+
+    let mut goal =
+        crate::traits::Goal::new_continuous("daily tweet", "session-1", Some(5000), Some(500_000));
+    let stale = "2026-01-01T00:00:00+00:00".to_string();
+    goal.last_useful_action = Some(stale.clone());
+    store.create_goal(&goal).await.unwrap();
+
+    let now_ts = chrono::Utc::now().to_rfc3339();
+    let mut task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "do the thing".to_string(),
+        status: "pending".to_string(),
+        priority: "low".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 1,
+        created_at: now_ts.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    store.create_task(&task).await.unwrap();
+
+    // A non-terminal status change must NOT bump freshness.
+    task.status = "running".to_string();
+    store.update_task(&task).await.unwrap();
+    let g = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert_eq!(
+        g.last_useful_action.as_deref(),
+        Some(stale.as_str()),
+        "non-terminal task update must not change goal freshness"
+    );
+
+    // Completing the task refreshes the goal's last_useful_action.
+    task.status = "completed".to_string();
+    task.completed_at = Some(now_ts.clone());
+    store.update_task(&task).await.unwrap();
+    let g2 = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert!(
+        g2.last_useful_action.as_deref() != Some(stale.as_str()),
+        "completing a task should refresh goal.last_useful_action"
+    );
+    assert!(g2.last_useful_action.is_some());
+}

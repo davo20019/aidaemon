@@ -563,6 +563,20 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.id)
         .execute(&self.pool)
         .await?;
+
+        // A completed task counts as useful progress for its goal — refresh the
+        // goal's freshness so the >30-day idle auto-skip never mis-fires on a
+        // goal that's actively completing work. (A 0-row match if the goal is
+        // gone is not an error.)
+        if task.status == "completed" {
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query("UPDATE goals SET last_useful_action = ?, updated_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(&now)
+                .bind(&task.goal_id)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
