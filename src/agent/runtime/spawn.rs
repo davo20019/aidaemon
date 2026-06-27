@@ -1275,16 +1275,43 @@ impl Agent {
             )
             .await;
         let child_session_for_events = child_session.clone();
-        let result = child
-            .handle_message(
-                &child_session,
-                task,
-                status_tx,
-                user_role,
-                channel_ctx,
-                None,
-            )
-            .await;
+
+        // Run the child agent on its OWN tokio task instead of awaiting it
+        // inline. An inline `.await` nests the child's (very large) agent-loop
+        // poll chain on the parent's worker-thread stack; a 3-deep
+        // orchestrator → task_lead → executor chain then overflowed the default
+        // 2 MB worker stack (SIGABRT stack-overflow crash loop). Spawning makes
+        // each agent level poll from the worker stack base, so stack usage no
+        // longer accumulates with spawn depth. The child still observes parent
+        // cancellation via its derived cancel_token; the guard below also tears
+        // the task down if this future is dropped (preserving cancel-on-drop).
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let session_for_task = child_session.clone();
+        let task_for_task = task.to_string();
+        let join = tokio::spawn(async move {
+            child
+                .handle_message(
+                    &session_for_task,
+                    &task_for_task,
+                    status_tx,
+                    user_role,
+                    channel_ctx,
+                    None,
+                )
+                .await
+        });
+        let _abort = AbortOnDrop(join.abort_handle());
+        let result = match join.await {
+            Ok(r) => r,
+            Err(join_err) => Err(anyhow::anyhow!(
+                "child agent task did not complete: {join_err}"
+            )),
+        };
 
         if self.harness_eval_enabled() {
             if let Ok(events) = self

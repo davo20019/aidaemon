@@ -302,9 +302,17 @@ pub fn run() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     daemon::spawn_macos_keep_awake();
 
-    // Run async
+    // Run async.
+    //
+    // Use an enlarged worker-thread stack (default is 2 MB). The agent loop
+    // (`handle_message_impl`) compiles to a very large async state machine, and
+    // a spawn chain (orchestrator → task_lead → executor) can stack several of
+    // these per worker thread; the 2 MB default overflowed and crash-looped the
+    // daemon. Sub-agents are also now run on their own tasks (see
+    // `runtime/spawn.rs`), but the larger stack gives durable headroom.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
         .build()?
         .block_on(crate::core::run(config, config_path))
 }
