@@ -746,10 +746,28 @@ impl OAuthGateway {
                             info!(service = %conn.service, "Restored OAuth connection");
                         }
                         Err(_) => {
-                            warn!(
-                                service = %conn.service,
-                                "OAuth connection in DB but token not found in keychain"
-                            );
+                            // The stored access token is unavailable — e.g.
+                            // NO_KEYCHAIN mode reading a .env that only carries
+                            // the refresh token + client creds, or an
+                            // expired/missing bearer. Mint a fresh one from the
+                            // refresh token instead of giving up;
+                            // refresh_token() populates the in-memory http
+                            // profile on success.
+                            match self.refresh_token(&conn.service).await {
+                                Ok(_) => {
+                                    info!(
+                                        service = %conn.service,
+                                        "Restored OAuth connection via token refresh (access token was unavailable)"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        service = %conn.service,
+                                        error = %e,
+                                        "OAuth connection in DB but access token unavailable and refresh failed"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1374,5 +1392,87 @@ mod tests {
             .allowed_domains
             .iter()
             .any(|domain| domain == "api.x.com"));
+    }
+
+    #[tokio::test]
+    async fn restore_connections_refreshes_when_access_token_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("refresh_token")
+            );
+            Json(serde_json::json!({
+                "access_token": "restored-via-refresh",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "twitter".to_string(),
+                display_name: "Twitter/X".to_string(),
+                auth_type: OAuthType::OAuth2Pkce,
+                authorize_url: "https://twitter.com/i/oauth2/authorize".to_string(),
+                token_url: format!("http://{addr}/oauth/token"),
+                scopes: vec!["tweet.read".to_string()],
+                allowed_domains: vec!["api.twitter.com".to_string(), "api.x.com".to_string()],
+            })
+            .await;
+
+        // Reproduce the real failure: NO_KEYCHAIN mode reading a .env that has
+        // the refresh token + client creds but NOT the access token.
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        gateway
+            .state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                scopes: r#"["tweet.read"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        // Startup restore must mint a bearer via refresh when the access token
+        // is absent, instead of leaving the profile unloaded.
+        gateway.restore_connections().await;
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        let profiles = gateway.http_profiles.read().await;
+        let profile = profiles
+            .get("twitter")
+            .expect("twitter profile should be restored via refresh");
+        assert_eq!(profile.token.as_deref(), Some("restored-via-refresh"));
     }
 }
