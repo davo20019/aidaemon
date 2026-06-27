@@ -37,7 +37,9 @@ use harness::{ComputerHarness, HarnessRequestContext};
 use pin_registry::ComputerUsePinRegistry;
 use policy::{classify_target, is_prohibited_bundle, ActionClass, ComputerActionKind};
 use telemetry::{ActionLog, ActionRecord, ElementTarget, MutationBudget, SessionTelemetry};
-use types::{format_condensed_refresh, format_full_tree, AppSnapshot, IndexedElement};
+use types::{
+    format_condensed_refresh, format_full_tree, AppSnapshot, ElementBounds, IndexedElement,
+};
 
 const TOOL_NAME: &str = "computer_use";
 
@@ -78,6 +80,25 @@ const NO_VISIBLE_CHANGE_NOTICE: &str = "\n[VERIFY] The accessibility state did n
 this click — it may NOT have taken effect (e.g. the click hit the wrong sub-element, the control \
 needs a hover/second step, or the page had not updated). Do NOT assume success: re-read with \
 get_app_state (or a screenshot) and confirm the intended change before reporting done.";
+
+/// Whether two element bounds denote the same on-screen control — their centers
+/// fall within a small tolerance. Used to re-identify a clicked element after a
+/// re-render, where indices change but on-screen position does not. `None` bounds
+/// on either side conservatively match: prefer flagging a possible no-op over
+/// silently missing one (a missed no-op lets the model claim false success).
+fn bounds_match(a: Option<ElementBounds>, b: Option<ElementBounds>) -> bool {
+    const TOLERANCE: f64 = 24.0;
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let acx = a.x + a.width / 2.0;
+            let acy = a.y + a.height / 2.0;
+            let bcx = b.x + b.width / 2.0;
+            let bcy = b.y + b.height / 2.0;
+            (acx - bcx).abs() <= TOLERANCE && (acy - bcy).abs() <= TOLERANCE
+        }
+        _ => true,
+    }
+}
 
 /// Appended to every computer_use result to keep a weak model on-task. The
 /// observed derailment was the model *narrating* its next click as a code
@@ -551,10 +572,11 @@ impl ComputerUseTool {
                 // Capture the targeted element's identity so we can verify the
                 // click actually changed *it* (a whole-snapshot diff is useless on
                 // a live page where unrelated content churns every frame).
-                let mut before_target: Option<(u32, String, String)> = None;
+                let mut before_target: Option<(String, String, Option<ElementBounds>)> = None;
                 if let Some(index) = element_index {
                     let element = cache.element_by_index(&key, generation, index)?.clone();
-                    before_target = Some((index, element.role.clone(), element.title.clone()));
+                    before_target =
+                        Some((element.role.clone(), element.title.clone(), element.bounds));
                     self.set_element_target(Some(&element), Some(index)).await;
                     action_class = classify_target(action, Some(&element), None);
                     if action_class == ActionClass::Prohibited {
@@ -582,12 +604,19 @@ impl ComputerUseTool {
                 // Element-specific verification: if the targeted element is still
                 // present unchanged (same role + title) after the click, the click
                 // had no effect on it — flag it instead of implying success.
-                let target_unchanged = before_target.as_ref().is_some_and(|(i, role, title)| {
-                    snapshot
-                        .elements
-                        .iter()
-                        .any(|e| e.index == *i && &e.role == role && &e.title == title)
-                });
+                // Re-identify the clicked element by role + title + on-screen
+                // position, NOT by index: indices renumber on every re-render, so
+                // an index match would fail to find the (still unchanged) element
+                // and wrongly imply the click worked. If the same control with the
+                // same title is still at the same spot, the click had no effect on
+                // it — e.g. a Like button still labeled "...no reaction" after a
+                // click that didn't register.
+                let target_unchanged =
+                    before_target.as_ref().is_some_and(|(role, title, bounds)| {
+                        snapshot.elements.iter().any(|e| {
+                            &e.role == role && &e.title == title && bounds_match(e.bounds, *bounds)
+                        })
+                    });
                 let mut text = format_condensed_refresh(&snapshot, focus);
                 if target_unchanged {
                     text.push_str(NO_VISIBLE_CHANGE_NOTICE);

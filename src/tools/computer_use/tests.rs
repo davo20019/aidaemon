@@ -5,6 +5,31 @@ use super::test_tool;
 use crate::config::ComputerUseConfig;
 use crate::traits::Tool;
 
+#[test]
+fn bounds_match_reidentifies_control_across_index_renumber() {
+    use crate::tools::computer_use::types::ElementBounds;
+    let b = |x: f64, y: f64| ElementBounds {
+        x,
+        y,
+        width: 40.0,
+        height: 40.0,
+    };
+    // Same on-screen spot (within tolerance) → same control, even though its
+    // index renumbered after the re-render. This is what makes the post-click
+    // "did it change?" check fire when a Like button is still "no reaction".
+    assert!(super::bounds_match(
+        Some(b(100.0, 200.0)),
+        Some(b(108.0, 205.0))
+    ));
+    // A different post's like button (far away) is NOT the same control.
+    assert!(!super::bounds_match(
+        Some(b(100.0, 200.0)),
+        Some(b(100.0, 600.0))
+    ));
+    // Missing bounds conservatively match (prefer flagging a possible no-op).
+    assert!(super::bounds_match(None, Some(b(100.0, 200.0))));
+}
+
 #[tokio::test]
 async fn schema_includes_action_enum() {
     let dir = TempDir::new().unwrap();
