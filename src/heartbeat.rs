@@ -1400,17 +1400,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn test_state_store() -> Arc<dyn StateStore> {
-        let db_file = tempfile::NamedTempFile::new().unwrap();
+        // Persist the temp DB file for the test process's lifetime. If the
+        // NamedTempFile were dropped here, the path would be unlinked and a
+        // later (lazily-opened) pool connection would re-create an empty
+        // database — surfacing as "no such table" under parallel test load on
+        // CI. keep() leaks the file, which is fine for short-lived test runs.
+        let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
         Arc::new(
-            SqliteStateStore::new(
-                db_file.path().to_str().unwrap(),
-                100,
-                None,
-                embedding_service,
-            )
-            .await
-            .unwrap(),
+            SqliteStateStore::new(db_path.to_str().unwrap(), 100, None, embedding_service)
+                .await
+                .unwrap(),
         )
     }
 
