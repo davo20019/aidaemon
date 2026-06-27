@@ -24,6 +24,8 @@ const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum number of redirect hops to follow.
 const MAX_REDIRECTS: usize = 5;
+/// Bounded retries for transient upstream 5xx on idempotent requests.
+const MAX_TRANSIENT_RETRIES: usize = 2;
 
 /// Default maximum response size (10 MB).
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 10_485_760;
@@ -787,6 +789,19 @@ impl HttpRequestTool {
     }
 
     /// Classify request risk level.
+    /// Whether a failed request should be transparently retried. We retry only
+    /// idempotent methods on transient upstream 5xx errors — never writes
+    /// (a 5xx may have been applied server-side, so retrying risks
+    /// double-execution) and never 4xx/429 (a 429 needs a long rate-limit wait
+    /// that a short retry can't satisfy).
+    fn should_retry_idempotent_5xx(method: &str, status: reqwest::StatusCode) -> bool {
+        let idempotent = matches!(
+            method.to_ascii_uppercase().as_str(),
+            "GET" | "HEAD" | "OPTIONS"
+        );
+        idempotent && status.is_server_error()
+    }
+
     fn classify_risk(method: &str, has_auth: bool) -> RiskLevel {
         match method {
             "GET" | "HEAD" if !has_auth => RiskLevel::Safe,
@@ -893,6 +908,7 @@ impl HttpRequestTool {
         let mut current_method = method.to_string();
         let original_url = parsed_url.clone();
         let mut redirect_count = 0;
+        let mut retry_count = 0;
         let mut resend_body = false;
 
         let response = loop {
@@ -962,6 +978,24 @@ impl HttpRequestTool {
                     Self::strip_credentials_from_error_with(profiles_snapshot, &e.to_string())
                 )
             })?;
+
+            // Transparently retry idempotent requests on transient upstream 5xx
+            // (e.g. an X API hiccup) instead of surfacing a one-off 500 that the
+            // agent then treats as a hard blocker. Writes are never retried.
+            if retry_count < MAX_TRANSIENT_RETRIES
+                && Self::should_retry_idempotent_5xx(&current_method, resp.status())
+            {
+                retry_count += 1;
+                let backoff = Duration::from_millis(400 * (1u64 << (retry_count - 1)));
+                warn!(
+                    method = %current_method,
+                    status = resp.status().as_u16(),
+                    attempt = retry_count,
+                    "Transient upstream 5xx; retrying after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
 
             if follow_redirects && resp.status().is_redirection() {
                 redirect_count += 1;
@@ -1637,6 +1671,43 @@ impl Tool for HttpRequestTool {
 mod tests {
     use super::*;
     use crate::config::{HttpAuthProfile, HttpAuthType};
+
+    #[test]
+    fn retries_only_idempotent_requests_on_transient_5xx() {
+        use reqwest::StatusCode;
+        // Idempotent + 5xx → retry (the transient case that hard-blocked the
+        // Twitter goal on a GET user lookup).
+        assert!(HttpRequestTool::should_retry_idempotent_5xx(
+            "GET",
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(HttpRequestTool::should_retry_idempotent_5xx(
+            "GET",
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(HttpRequestTool::should_retry_idempotent_5xx(
+            "head",
+            StatusCode::BAD_GATEWAY
+        ));
+        // Never retry writes — a 5xx may have been applied server-side.
+        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
+            "POST",
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        // Never retry non-5xx, including rate limits (need a long wait).
+        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
+            "GET",
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
+            "GET",
+            StatusCode::NOT_FOUND
+        ));
+        assert!(!HttpRequestTool::should_retry_idempotent_5xx(
+            "GET",
+            StatusCode::OK
+        ));
+    }
 
     fn make_oauth_profile() -> HttpAuthProfile {
         HttpAuthProfile {
