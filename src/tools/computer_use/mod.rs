@@ -617,6 +617,38 @@ impl ComputerUseTool {
                             &e.role == role && &e.title == title && bounds_match(e.bounds, *bounds)
                         })
                     });
+                // Diagnostics: when target_unchanged comes out false, tell apart
+                // "title changed" (same_role_title==0, the click DID do something)
+                // from "feed reflowed so bounds drifted past tolerance"
+                // (same_role_title>0 but nearest center is far). Grep `cu_verify`.
+                if let Some((role, title, bounds)) = before_target.as_ref() {
+                    let same_rt: Vec<&IndexedElement> = snapshot
+                        .elements
+                        .iter()
+                        .filter(|e| &e.role == role && &e.title == title)
+                        .collect();
+                    let nearest = same_rt
+                        .iter()
+                        .filter_map(|e| match (e.bounds, *bounds) {
+                            (Some(a), Some(b)) => Some(
+                                ((a.x + a.width / 2.0) - (b.x + b.width / 2.0))
+                                    .hypot((a.y + a.height / 2.0) - (b.y + b.height / 2.0)),
+                            ),
+                            _ => None,
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    tracing::info!(
+                        target: "cu_verify",
+                        title = %title,
+                        role = %role,
+                        before_bounds = ?bounds,
+                        target_unchanged,
+                        same_role_title_count = same_rt.len(),
+                        nearest_same_rt_center_dist = nearest,
+                        post_click_elements = snapshot.elements.len(),
+                        "post-click no-op verification diagnostics"
+                    );
+                }
                 let mut text = format_condensed_refresh(&snapshot, focus);
                 if target_unchanged {
                     text.push_str(NO_VISIBLE_CHANGE_NOTICE);
