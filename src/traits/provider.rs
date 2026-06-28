@@ -105,6 +105,49 @@ impl TokenUsage {
         self.cached_input_tokens
             .map(|cached| self.input_tokens.saturating_sub(cached))
     }
+
+    /// Tokens to charge against work/cost budgets for this call: fresh input
+    /// (cache-read tokens excluded — on a prefix-caching backend they are
+    /// re-read from KV cache, not recomputed) plus output. Falls back to full
+    /// input when the backend does not report cache info, so budgets never
+    /// undercount blindly.
+    ///
+    /// This keeps daily/per-run goal budgets measuring real incremental work
+    /// instead of re-billing the (~95%+ cached) system-prompt prefix on every
+    /// turn, which otherwise made multi-turn goals hit their cap on near-free
+    /// cache reads.
+    pub fn budget_tokens(&self) -> u64 {
+        let input = self.fresh_input_tokens().unwrap_or(self.input_tokens);
+        input as u64 + self.output_tokens as u64
+    }
+}
+
+#[cfg(test)]
+mod token_usage_budget_tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn budget_tokens_excludes_cached_prefix_reads() {
+        // 15k prompt, 14.8k of it a cache hit -> only 200 fresh + 300 output is work.
+        let u = TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 300,
+            cached_input_tokens: Some(14_800),
+            ..Default::default()
+        };
+        assert_eq!(u.budget_tokens(), 500);
+    }
+
+    #[test]
+    fn budget_tokens_falls_back_to_full_input_without_cache_info() {
+        let u = TokenUsage {
+            input_tokens: 15_000,
+            output_tokens: 300,
+            cached_input_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(u.budget_tokens(), 15_300);
+    }
 }
 
 /// The LLM's response: either content text, tool calls, or both.

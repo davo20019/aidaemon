@@ -709,13 +709,16 @@ pub(super) async fn run_llm_phase(
 
     // Record token usage (both for task budget and daily budget)
     if let Some(ref usage) = resp.usage {
-        *task_tokens_used += (usage.input_tokens + usage.output_tokens) as u64;
+        // Charge budgets on real incremental work (fresh input + output), not
+        // the re-read cached prefix — see TokenUsage::budget_tokens.
+        *task_tokens_used += usage.budget_tokens();
         info!(
             session_id,
             iteration,
             input_tokens = usage.input_tokens,
             output_tokens = usage.output_tokens,
-            total_tokens = usage.input_tokens + usage.output_tokens,
+            cached_input_tokens = usage.cached_input_tokens.unwrap_or(0),
+            billed_tokens = usage.budget_tokens(),
             task_tokens_used = *task_tokens_used,
             "LLM token usage"
         );
@@ -723,7 +726,7 @@ pub(super) async fn run_llm_phase(
         // admission control. Scheduled runs use a separate per-run budget
         // once they have started.
         if let Some(goal_id) = resolved_goal_id.as_ref() {
-            let delta_tokens = (usage.input_tokens + usage.output_tokens) as i64;
+            let delta_tokens = usage.budget_tokens() as i64;
             match services
                 .agent
                 .state
