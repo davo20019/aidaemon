@@ -1370,7 +1370,7 @@ impl HeartbeatCoordinator {
         if !is_group_session(&goal.session_id) {
             if let Some(hub_weak) = &self.hub {
                 if let Some(hub_arc) = hub_weak.upgrade() {
-                    let short_desc: String = goal.description.chars().take(200).collect();
+                    let short_desc = crate::tools::sanitize::short_goal_label(&goal.description);
                     let _ = hub_arc
                         .send_text(
                             &goal.session_id,

@@ -222,7 +222,11 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
                                 )
                             })
                             .unwrap_or_else(|| "unscheduled".to_string());
-                        activated.push(format!("{} (next run {})", goal.description, next_run));
+                        activated.push(format!(
+                            "{} (next run {})",
+                            crate::tools::sanitize::short_goal_label(&goal.description),
+                            next_run
+                        ));
                     }
                     Ok(false) => {}
                     Err(e) => activation_errors.push(e.to_string()),

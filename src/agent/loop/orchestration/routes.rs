@@ -146,7 +146,8 @@ async fn confirm_scheduled_goal_activation(
                 .unwrap_or_else(|| "n/a".to_string());
             format!(
                 "✅ Scheduled: {} — next run {}.",
-                goal.description, next_run
+                crate::tools::sanitize::short_goal_label(&goal.description),
+                next_run
             )
         }
         Ok(false) => {
@@ -210,7 +211,11 @@ async fn confirm_scheduled_goal_activation_batch(
                         crate::cron_utils::humanize_run_time(dt.with_timezone(&chrono::Local))
                     })
                     .unwrap_or_else(|| "n/a".to_string());
-                activated.push(format!("{} (next run {})", goal.description, next_run));
+                activated.push(format!(
+                    "{} (next run {})",
+                    crate::tools::sanitize::short_goal_label(&goal.description),
+                    next_run
+                ));
             }
             Ok(false) => {}
             Err(e) => activation_errors.push(e.to_string()),
@@ -1049,7 +1054,9 @@ async fn handle_scheduled_intent(
             if let Some(hub_arc) = hub_weak.upgrade() {
                 let confirmation_desc = format!(
                     "Schedule {} goal ({}): {}",
-                    schedule_kind, schedule_desc, goal.description
+                    schedule_kind,
+                    schedule_desc,
+                    crate::tools::sanitize::short_goal_label(&goal.description)
                 );
                 let details = vec![
                     format!("{} schedule", schedule_kind),
