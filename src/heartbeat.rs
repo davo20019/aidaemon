@@ -26,6 +26,23 @@ fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+/// Whether a goal's daily token budget is exhausted *for today*. Only usage
+/// recorded on the current UTC day counts: stale `tokens_used_today` from a
+/// previous day (before the daily reset has run) must NOT block a goal, or an
+/// expensive run can deadlock the goal across the day boundary (the budget gate
+/// keeps deferring it, so it never fires, so it never resets).
+fn daily_budget_exhausted(
+    budget_daily: Option<i64>,
+    tokens_used_today: i64,
+    tokens_used_day: &str,
+    today: &str,
+) -> bool {
+    match budget_daily {
+        Some(budget) => tokens_used_day == today && tokens_used_today >= budget,
+        None => false,
+    }
+}
+
 /// Seconds since a task's most recent activity (or its `started_at` when it has
 /// no activity rows). Used to tag stuck-task interrupts so the inactivity
 /// threshold can be tuned from data. Returns 0 if no timestamp parses (never
@@ -753,16 +770,20 @@ impl HeartbeatCoordinator {
             // Daily budget is admission control for scheduled runs, not a reason
             // to abandon already-pending scheduled work.
             if !is_scheduled_goal {
-                if let Some(budget_daily) = goal.budget_daily {
-                    if goal.tokens_used_today >= budget_daily {
-                        tracing::info!(
-                            goal_id = %goal.id,
-                            tokens_used = goal.tokens_used_today,
-                            budget = budget_daily,
-                            "Skipping pending-task dispatch — goal daily budget exhausted"
-                        );
-                        continue;
-                    }
+                let budget_today = chrono::Utc::now().date_naive().to_string();
+                if daily_budget_exhausted(
+                    goal.budget_daily,
+                    goal.tokens_used_today,
+                    &goal.tokens_used_day,
+                    &budget_today,
+                ) {
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        tokens_used = goal.tokens_used_today,
+                        budget = ?goal.budget_daily,
+                        "Skipping pending-task dispatch — today's goal daily budget exhausted"
+                    );
+                    continue;
                 }
             }
 
@@ -1175,14 +1196,21 @@ impl HeartbeatCoordinator {
             return Ok(());
         }
 
-        // Budget check: skip if daily budget exhausted, but back off schedule to avoid hot-loop.
-        if let Some(budget_daily) = goal.budget_daily {
-            if goal.tokens_used_today >= budget_daily {
-                schedule.next_run_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
-                schedule.updated_at = now_ts.clone();
-                let _ = self.state.update_goal_schedule(&schedule).await;
-                return Ok(());
-            }
+        // Budget check: skip if *today's* daily budget is exhausted, but back off
+        // schedule to avoid hot-loop. Stale prior-day usage must not count, or the
+        // goal deadlocks across the day boundary (it would defer forever and never
+        // fire, so its counter would never reset).
+        let budget_today = now.date_naive().to_string();
+        if daily_budget_exhausted(
+            goal.budget_daily,
+            goal.tokens_used_today,
+            &goal.tokens_used_day,
+            &budget_today,
+        ) {
+            schedule.next_run_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+            schedule.updated_at = now_ts.clone();
+            let _ = self.state.update_goal_schedule(&schedule).await;
+            return Ok(());
         }
 
         // ── Advance schedule BEFORE creating task to prevent race-condition
@@ -1398,6 +1426,30 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, Task};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn daily_budget_only_blocks_on_current_day_usage() {
+        let today = "2026-06-28";
+        // Over budget, usage recorded today -> exhausted.
+        assert!(daily_budget_exhausted(Some(500_000), 964_666, today, today));
+        // Over budget, but usage is from a PRIOR day (reset hasn't run) -> NOT
+        // exhausted, so the goal can fire and reset instead of deadlocking.
+        assert!(!daily_budget_exhausted(
+            Some(500_000),
+            964_666,
+            "2026-06-27",
+            today
+        ));
+        // Under budget today -> not exhausted.
+        assert!(!daily_budget_exhausted(
+            Some(500_000),
+            100_000,
+            today,
+            today
+        ));
+        // No daily budget configured -> never exhausted.
+        assert!(!daily_budget_exhausted(None, 999_999, today, today));
+    }
 
     async fn test_state_store() -> Arc<dyn StateStore> {
         // Persist the temp DB file for the test process's lifetime. If the
