@@ -736,14 +736,29 @@ impl ManageGoalTasksTool {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
 
-        goal.status = "completed".to_string();
-        goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        // A continuous (recurring) goal is open-ended: a successful run does not
+        // complete the goal. Keep it active for the next cycle and clear the
+        // failure streak. Only finite goals are marked completed.
+        let is_continuous = goal.goal_type == "continuous";
+        if is_continuous {
+            goal.dispatch_failures = 0;
+        } else {
+            goal.status = "completed".to_string();
+            goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        }
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
         self.state.update_goal(&goal).await?;
-        info!(goal_id = %self.goal_id, "Goal completed");
+        info!(goal_id = %self.goal_id, is_continuous, "Goal run completed");
 
-        let mut response = format!("Goal {} completed: {}", self.goal_id, summary);
+        let mut response = if is_continuous {
+            format!(
+                "Recurring goal {} run completed (goal stays active for the next cycle): {}",
+                self.goal_id, summary
+            )
+        } else {
+            format!("Goal {} completed: {}", self.goal_id, summary)
+        };
         if let Some(excerpt) = self.build_completed_task_result_excerpt().await? {
             response.push_str("\n\n");
             response.push_str(&excerpt);
@@ -890,6 +905,33 @@ impl ManageGoalTasksTool {
             info!(goal_id = %self.goal_id, "Goal failed");
         }
 
+        // Surface a recurring goal that keeps failing, so it doesn't retry
+        // forever in silence. Alert on every Nth consecutive failure (the streak
+        // is cleared by a successful run in complete_goal).
+        const REPEATED_FAILURE_ALERT_THRESHOLD: i32 = 3;
+        if is_continuous
+            && goal.dispatch_failures >= REPEATED_FAILURE_ALERT_THRESHOLD
+            && goal.dispatch_failures % REPEATED_FAILURE_ALERT_THRESHOLD == 0
+        {
+            let msg = format!(
+                "Heads up: your recurring goal \"{}\" has failed {} runs in a row. It is still \
+                 scheduled and will keep retrying, but it likely needs attention. Latest failure: {}",
+                goal.description, goal.dispatch_failures, summary
+            );
+            let entry = crate::traits::NotificationEntry::new(
+                &goal.id,
+                &goal.session_id,
+                "evergreen_alert",
+                &msg,
+            );
+            let _ = self.state.enqueue_notification(&entry).await;
+            info!(
+                goal_id = %self.goal_id,
+                failures = goal.dispatch_failures,
+                "Alerted user: recurring goal failing repeatedly"
+            );
+        }
+
         // Cancel remaining pending/claimed tasks so they don't get re-dispatched
         let tasks = self
             .state
@@ -972,6 +1014,76 @@ mod tests {
         assert!(
             g.dispatch_failures >= 1,
             "the run failure should be recorded for repeated-failure detection"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_goal_alerts_after_repeated_continuous_failures() {
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
+        state.create_goal(&cg).await.unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+        let body = json!({ "action": "fail_goal", "summary": "run failed" }).to_string();
+
+        // First two failures: no alert yet.
+        tool.call(&body).await.unwrap();
+        tool.call(&body).await.unwrap();
+        let count = |ns: Vec<crate::traits::NotificationEntry>, id: &str| {
+            ns.into_iter()
+                .filter(|n| n.notification_type == "evergreen_alert" && n.goal_id == id)
+                .count()
+        };
+        assert_eq!(
+            count(state.get_pending_notifications(20).await.unwrap(), &cg.id),
+            0,
+            "should not alert before the failure threshold"
+        );
+
+        // Third consecutive failure crosses the threshold: one alert.
+        tool.call(&body).await.unwrap();
+        assert_eq!(
+            count(state.get_pending_notifications(20).await.unwrap(), &cg.id),
+            1,
+            "should alert once a continuous goal has failed 3 runs in a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_goal_keeps_continuous_active_and_clears_failures() {
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
+        state.create_goal(&cg).await.unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+
+        // Record a couple of failures.
+        let fail = json!({ "action": "fail_goal", "summary": "x" }).to_string();
+        tool.call(&fail).await.unwrap();
+        tool.call(&fail).await.unwrap();
+
+        // A successful run: one completed task, then complete_goal.
+        tool.call(
+            &json!({ "action": "create_task", "description": "daily check", "task_order": 1 })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let tasks = state.get_tasks_for_goal(&cg.id).await.unwrap();
+        let mut t = tasks[0].clone();
+        t.status = "completed".to_string();
+        t.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        state.update_task(&t).await.unwrap();
+        tool.call(&json!({ "action": "complete_goal", "summary": "daily check done" }).to_string())
+            .await
+            .unwrap();
+
+        let g = state.get_goal(&cg.id).await.unwrap().unwrap();
+        assert_eq!(
+            g.status, "active",
+            "a continuous goal stays active after a successful run"
+        );
+        assert_eq!(
+            g.dispatch_failures, 0,
+            "a successful run clears the failure streak"
         );
     }
 
