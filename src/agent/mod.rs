@@ -566,11 +566,11 @@ pub use goal_dispatch::is_group_session;
 pub(in crate::agent) use goal_dispatch::{
     active_scheduled_root_task_id, auto_dispatch_scheduled_run_extension_budget,
     clear_scheduled_run_state, effective_goal_daily_budget, goal_has_scheduled_provenance,
-    is_low_signal_task_lead_reply, looks_like_evidence_grounding_challenge,
-    looks_like_false_capability_denial_after_tool_success, looks_like_incomplete_live_work_summary,
-    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
-    salvageable_task_lead_result, strip_leading_wait, task_has_scheduled_provenance,
-    truncate_goal_result_text, user_facing_task_description,
+    is_low_signal_task_lead_reply, is_scheduled_task_description,
+    looks_like_evidence_grounding_challenge, looks_like_false_capability_denial_after_tool_success,
+    looks_like_incomplete_live_work_summary, parse_goal_leading_wait, parse_wait_task_seconds,
+    persist_scheduled_run_state, salvageable_task_lead_result, strip_leading_wait,
+    task_has_scheduled_provenance, truncate_goal_result_text, user_facing_task_description,
 };
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,

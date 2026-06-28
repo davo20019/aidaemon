@@ -17,9 +17,10 @@ use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, effective_goal_daily_budget, extract_file_paths_from_text,
     goal_completion_response_indicates_incomplete_work, goal_has_scheduled_provenance,
-    is_group_session, is_low_signal_task_lead_reply, parse_goal_leading_wait,
-    parse_wait_task_seconds, persist_scheduled_run_state, salvageable_task_lead_result,
-    strip_leading_wait, truncate_goal_result_text, user_facing_task_description, Agent,
+    is_group_session, is_low_signal_task_lead_reply, is_scheduled_task_description,
+    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
+    salvageable_task_lead_result, strip_leading_wait, truncate_goal_result_text,
+    user_facing_task_description, Agent,
 };
 
 /// Progress-heartbeat wait schedule: quick early updates, then exponential
@@ -197,8 +198,19 @@ pub fn spawn_background_task_lead(
                         let in_progress: Vec<String> = tasks
                             .iter()
                             .filter(|t| t.status == "claimed" || t.status == "running")
+                            // Skip the parent "Scheduled check: <goal>" task — its
+                            // description is the full (often huge) goal text, which
+                            // is internal noise, not a user-facing step.
+                            .filter(|t| !is_scheduled_task_description(&t.description))
                             .take(2)
-                            .map(|t| user_facing_task_description(&t.description))
+                            // Keep each step label short so the progress line stays a
+                            // glanceable one-liner, never a wall of text.
+                            .map(|t| {
+                                truncate_goal_result_text(
+                                    &user_facing_task_description(&t.description),
+                                    80,
+                                )
+                            })
                             .collect();
                         let progress_msg = if total == 1 {
                             // Single-step goals: step-count jargon ("0/1 steps
