@@ -74,6 +74,11 @@ pub fn spawn_background_task_lead(
     hub: Option<Weak<crate::channels::ChannelHub>>,
     goal_token_registry: Option<crate::goal_tokens::GoalTokenRegistry>,
     dispatch_trigger_task_id: Option<String>,
+    // When the caller already posted a tracked "starting" message (e.g. the
+    // scheduled-run "🔄 Running scheduled task" announcement), pass its id here so
+    // the progress heartbeat edits THAT message in place instead of posting a new
+    // one — folding the announcement and progress into one self-updating surface.
+    initial_surface_id: Option<String>,
 ) {
     tokio::spawn(async move {
         // Teardown handles for the self-correction bridge (3c P3b.3). The body
@@ -167,6 +172,7 @@ pub fn spawn_background_task_lead(
             let heartbeat_session = session_id.clone();
             let heartbeat_state = state.clone();
             let heartbeat_goal_id = goal_id.clone();
+            let heartbeat_initial_surface = initial_surface_id;
             let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) =
                 tokio::sync::oneshot::channel::<()>();
             let heartbeat_handle = tokio::spawn(async move {
@@ -178,8 +184,10 @@ pub fn spawn_background_task_lead(
                 let mut interval_count = 0u32;
                 let mut last_progress_key: Option<String> = None;
                 let mut planning_msg_count = 0u32;
-                // One self-editing surface for the whole run's progress stream.
-                let mut surface_id: Option<String> = None;
+                // One self-editing surface for the whole run's progress stream —
+                // seeded with the caller's "starting" message when present, so that
+                // message morphs into the progress updates instead of a new one.
+                let mut surface_id: Option<String> = heartbeat_initial_surface;
                 loop {
                     // Backoff schedule: 15s, 30s, 1m, 2m, 5m, 10m, then every 15m.
                     // Long-running goals keep emitting (no message cap) — the

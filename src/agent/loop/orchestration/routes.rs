@@ -1325,6 +1325,7 @@ async fn handle_complex_intent(
             bg_hub,
             agent.goal_token_registry.clone(),
             None,
+            None,
         );
     } else {
         // No self_ref available (sub-agent or test) — fall back to sync.

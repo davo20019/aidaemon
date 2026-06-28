@@ -891,6 +891,7 @@ impl HeartbeatCoordinator {
                         hub,
                         goal_token_registry,
                         Some(first_task.id.clone()),
+                        None,
                     );
                     continue;
                 }
@@ -1367,16 +1368,22 @@ impl HeartbeatCoordinator {
 
         // Notify user that the scheduled goal is executing (DMs only —
         // group channels just get the results without progress noise).
+        // Post the "Running scheduled task" announcement as a TRACKED surface so
+        // the task lead's progress heartbeat can edit it in place — one self-
+        // updating message instead of a separate announcement + progress stream.
+        let mut running_surface_id: Option<String> = None;
         if !is_group_session(&goal.session_id) {
             if let Some(hub_weak) = &self.hub {
                 if let Some(hub_arc) = hub_weak.upgrade() {
                     let short_desc = crate::tools::sanitize::short_goal_label(&goal.description);
-                    let _ = hub_arc
-                        .send_text(
+                    running_surface_id = hub_arc
+                        .send_text_tracked(
                             &goal.session_id,
                             &format!("🔄 Running scheduled task: {}", short_desc),
                         )
-                        .await;
+                        .await
+                        .ok()
+                        .flatten();
                 }
             }
         }
@@ -1403,6 +1410,7 @@ impl HeartbeatCoordinator {
                         self.hub.clone(),
                         self.goal_token_registry.clone(),
                         Some(task.id.clone()),
+                        running_surface_id,
                     );
                 }
                 Ok(false) => {}

@@ -204,6 +204,7 @@ pub async fn dispatch_correction_remediation(
         hub,
         None, // no goal-token registry for synthetic remediation goals
         None, // no heartbeat dispatch-trigger task
+        None, // no pre-posted surface to reuse
     );
 
     Ok(Some(goal_id))

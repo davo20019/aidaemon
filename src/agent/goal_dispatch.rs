@@ -672,6 +672,11 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         .iter()
         .filter(|t| t.status == "completed" && t.error.is_none())
         .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
+        // Skip the parent "Execute scheduled goal: <goal>" task: its description
+        // is the full goal text (plus internal [SYSTEM: …] markers) and its
+        // result is a generic "completed via sub-tasks" — pure noise next to the
+        // real sub-task deliverables.
+        .filter(|t| !is_scheduled_task_description(&t.description))
         .collect();
 
     if successful.is_empty() {
@@ -716,7 +721,7 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
             };
             format!(
                 "**{}**\n{}",
-                t.description,
+                user_facing_task_description(&t.description),
                 truncate_goal_result_text(result, cap)
             )
         })
