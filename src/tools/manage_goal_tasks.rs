@@ -913,10 +913,11 @@ impl ManageGoalTasksTool {
             && goal.dispatch_failures >= REPEATED_FAILURE_ALERT_THRESHOLD
             && goal.dispatch_failures % REPEATED_FAILURE_ALERT_THRESHOLD == 0
         {
+            let goal_label = crate::tools::sanitize::short_goal_label(&goal.description);
             let msg = format!(
                 "Heads up: your recurring goal \"{}\" has failed {} runs in a row. It is still \
                  scheduled and will keep retrying, but it likely needs attention. Latest failure: {}",
-                goal.description, goal.dispatch_failures, summary
+                goal_label, goal.dispatch_failures, summary
             );
             let entry = crate::traits::NotificationEntry::new(
                 &goal.id,

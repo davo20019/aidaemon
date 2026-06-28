@@ -1150,7 +1150,8 @@ impl HeartbeatCoordinator {
                         let msg = format!(
                             "Heads up: your recurring goal \"{}\" hasn't made progress in {} days. \
                              It's still scheduled and will keep trying — reply if you'd like to pause or cancel it.",
-                            goal.description, days_idle
+                            crate::tools::sanitize::short_goal_label(&goal.description),
+                            days_idle
                         );
                         let entry = crate::traits::NotificationEntry::new(
                             &goal.id,

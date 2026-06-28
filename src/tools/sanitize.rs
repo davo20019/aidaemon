@@ -461,6 +461,22 @@ pub fn sanitize_user_facing_reply(reply: &str) -> String {
 /// that carries no answer. Callers should fall back to an activity summary.
 ///
 /// `pre_sanitize_chars` is the trimmed char count before sanitization.
+/// A short, human label for a goal or task, for use in progress lines and
+/// notifications. Collapses whitespace and caps length so a long instruction
+/// blob is never dumped into a chat message.
+pub fn short_goal_label(text: &str) -> String {
+    const MAX: usize = 60;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX {
+        format!(
+            "{}…",
+            collapsed.chars().take(MAX).collect::<String>().trim_end()
+        )
+    } else {
+        collapsed
+    }
+}
+
 pub fn reply_gutted_by_sanitization(pre_sanitize_chars: usize, sanitized: &str) -> bool {
     if pre_sanitize_chars == 0 {
         return false;
@@ -1049,6 +1065,27 @@ pub fn is_trusted_tool(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::types::ChannelVisibility;
+
+    #[test]
+    fn short_goal_label_caps_long_blob_and_collapses_whitespace() {
+        let blob = "Write and publish ONE short blog post to your own blog at blog.aidaemon.ai. \
+                    This blog is your DIARY: document your ACTUAL journey as an agent...";
+        let label = short_goal_label(blob);
+        assert!(
+            label.chars().count() <= 61,
+            "label should be capped (~60 chars + ellipsis), got {}",
+            label.chars().count()
+        );
+        assert!(
+            label.ends_with('…'),
+            "long input should be truncated with …"
+        );
+        // Short inputs pass through unchanged (whitespace collapsed).
+        assert_eq!(
+            short_goal_label("  Post a   daily tweet  "),
+            "Post a daily tweet"
+        );
+    }
 
     #[test]
     fn gutted_reply_detects_dangling_lead_in_stub() {

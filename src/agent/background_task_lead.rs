@@ -34,6 +34,31 @@ fn heartbeat_wait_secs(interval_count: u32) -> u64 {
         .unwrap_or(900)
 }
 
+/// Emit a progress update onto a SINGLE self-editing surface: the first update
+/// creates a tracked message; subsequent updates edit it in place. Collapses the
+/// heartbeat into one updating message instead of a stream of pings. Falls back
+/// to a fresh tracked send if the channel can't edit (e.g. the message aged out).
+async fn emit_progress_surface(
+    hub: &Option<Weak<crate::channels::ChannelHub>>,
+    session: &str,
+    surface_id: &mut Option<String>,
+    text: &str,
+) {
+    let Some(hub_arc) = hub.as_ref().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    if let Some(id) = surface_id.clone() {
+        match hub_arc.edit_text(session, &id, text).await {
+            Ok(true) => return,
+            // Couldn't edit (no editable surface) — drop the id and post fresh.
+            _ => *surface_id = None,
+        }
+    }
+    if let Ok(Some(new_id)) = hub_arc.send_text_tracked(session, text).await {
+        *surface_id = Some(new_id);
+    }
+}
+
 /// Spawn a task lead in the background (free function to satisfy Send requirements).
 /// This runs `spawn_child` on the given agent with TaskLead role, then updates
 /// the goal and notifies the user when complete.
@@ -153,6 +178,8 @@ pub fn spawn_background_task_lead(
                 let mut interval_count = 0u32;
                 let mut last_progress_key: Option<String> = None;
                 let mut planning_msg_count = 0u32;
+                // One self-editing surface for the whole run's progress stream.
+                let mut surface_id: Option<String> = None;
                 loop {
                     // Backoff schedule: 15s, 30s, 1m, 2m, 5m, 10m, then every 15m.
                     // Long-running goals keep emitting (no message cap) — the
@@ -176,16 +203,13 @@ pub fn spawn_background_task_lead(
                         // schedule so a hung planning phase is never silent.
                         planning_msg_count += 1;
                         if planning_msg_count == 1 || interval_count >= 3 {
-                            if let Some(hub_weak) = &heartbeat_hub {
-                                if let Some(hub_arc) = hub_weak.upgrade() {
-                                    let _ = hub_arc
-                                    .send_text(
-                                        &heartbeat_session,
-                                        "⏳ Still working on your request — planning the steps...",
-                                    )
-                                    .await;
-                                }
-                            }
+                            emit_progress_surface(
+                                &heartbeat_hub,
+                                &heartbeat_session,
+                                &mut surface_id,
+                                "⏳ Still working on your request — planning the steps...",
+                            )
+                            .await;
                         }
                     } else {
                         // Count genuinely completed tasks (exclude cancelled ones with errors)
@@ -248,11 +272,13 @@ pub fn spawn_background_task_lead(
                         if !state_changed && interval_count < 3 {
                             continue;
                         }
-                        if let Some(hub_weak) = &heartbeat_hub {
-                            if let Some(hub_arc) = hub_weak.upgrade() {
-                                let _ = hub_arc.send_text(&heartbeat_session, &progress_msg).await;
-                            }
-                        }
+                        emit_progress_surface(
+                            &heartbeat_hub,
+                            &heartbeat_session,
+                            &mut surface_id,
+                            &progress_msg,
+                        )
+                        .await;
                     }
                 }
             });
