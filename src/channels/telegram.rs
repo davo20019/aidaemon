@@ -6,7 +6,8 @@ use std::sync::{Arc, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use teloxide::error_handlers::LoggingErrorHandler;
+use futures::future::BoxFuture;
+use teloxide::error_handlers::{ErrorHandler, LoggingErrorHandler};
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, ButtonRequest, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
@@ -601,7 +602,22 @@ impl TelegramChannel {
             );
         }
 
-        dispatcher.dispatch().await;
+        // Long polling. Use an explicit polling listener + a loud error handler
+        // (teloxide's default logs under a target our filter drops, which is how
+        // a wedged getUpdates went silent). A watchdog runs alongside: if
+        // getUpdates keeps failing past the threshold, it returns, which drops
+        // the dispatch future and lets `start_with_retry` reconnect with a fresh
+        // getUpdates connection instead of staying silently dead.
+        let error_count = Arc::new(AtomicU64::new(0));
+        let err_handler = Arc::new(PollingErrorHandler {
+            bot_username: bot_username.clone(),
+            error_count: Arc::clone(&error_count),
+        });
+        let listener = teloxide::update_listeners::polling_default(self.bot.clone()).await;
+        tokio::select! {
+            _ = dispatcher.dispatch_with_listener(listener, err_handler) => {}
+            _ = poll_health_watchdog(error_count, bot_username.clone()) => {}
+        }
     }
 
     fn build_webhook_options(
@@ -5657,9 +5673,115 @@ async fn run_legacy_status_consumer(
     }
 }
 
+/// Tracks whether Telegram long-polling has been failing continuously long
+/// enough to be considered "wedged" — e.g. a persistent getUpdates 409 after a
+/// restart that teloxide's internal retry never recovers from. Pure and
+/// testable: the caller supplies the current cumulative error count and `now`.
+#[derive(Default)]
+struct PollHealth {
+    streak_started_at: Option<Instant>,
+    last_count: u64,
+}
+
+impl PollHealth {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when getUpdates has been erroring continuously for at least
+    /// `threshold`. A tick with no new errors clears the streak (teloxide
+    /// recovered on its own).
+    fn observe(&mut self, current_count: u64, now: Instant, threshold: Duration) -> bool {
+        if current_count > self.last_count {
+            let started = *self.streak_started_at.get_or_insert(now);
+            self.last_count = current_count;
+            now.saturating_duration_since(started) >= threshold
+        } else {
+            self.streak_started_at = None;
+            self.last_count = current_count;
+            false
+        }
+    }
+}
+
+/// Error handler for the Telegram polling listener. teloxide's default handler
+/// logs under the `teloxide` target, which our tracing filter drops — that's how
+/// a wedged getUpdates went completely silent. This logs loudly under our own
+/// target and counts errors so the watchdog can force a reconnect.
+struct PollingErrorHandler {
+    bot_username: String,
+    error_count: Arc<AtomicU64>,
+}
+
+impl<E: std::fmt::Debug> ErrorHandler<E> for PollingErrorHandler {
+    fn handle_error(self: Arc<Self>, error: E) -> BoxFuture<'static, ()> {
+        let n = self.error_count.fetch_add(1, Ordering::Relaxed) + 1;
+        // Loud on the first error, then periodically, so a sustained wedge is
+        // visible without flooding the log on every retry.
+        if n == 1 || n % 10 == 0 {
+            warn!(
+                name = %self.bot_username,
+                consecutive_errors = n,
+                error = ?error,
+                "Telegram getUpdates polling error"
+            );
+        }
+        Box::pin(async {})
+    }
+}
+
+/// Watchdog that returns once Telegram polling has been failing continuously
+/// past the wedge threshold, so the caller (`start_with_retry`) can restart the
+/// dispatcher with a fresh getUpdates connection. A healthy or merely quiet bot
+/// keeps it parked indefinitely (it only trips on *sustained* errors).
+async fn poll_health_watchdog(error_count: Arc<AtomicU64>, bot_username: String) {
+    const TICK: Duration = Duration::from_secs(30);
+    const WEDGE_THRESHOLD: Duration = Duration::from_secs(120);
+    let mut health = PollHealth::new();
+    loop {
+        tokio::time::sleep(TICK).await;
+        let count = error_count.load(Ordering::Relaxed);
+        if health.observe(count, Instant::now(), WEDGE_THRESHOLD) {
+            warn!(
+                name = %bot_username,
+                total_errors = count,
+                threshold_secs = WEDGE_THRESHOLD.as_secs(),
+                "Telegram long-polling wedged (getUpdates failing continuously); restarting dispatcher to re-establish the connection"
+            );
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_health_flags_wedge_after_sustained_errors() {
+        let mut h = PollHealth::new();
+        let t0 = Instant::now();
+        let threshold = Duration::from_secs(120);
+        // Errors begin.
+        assert!(!h.observe(1, t0, threshold));
+        // Still erroring, but within the threshold — give teloxide time to recover.
+        assert!(!h.observe(3, t0 + Duration::from_secs(60), threshold));
+        // Errors sustained past the threshold — wedged, force a restart.
+        assert!(h.observe(5, t0 + Duration::from_secs(121), threshold));
+    }
+
+    #[test]
+    fn poll_health_clears_streak_when_errors_stop() {
+        let mut h = PollHealth::new();
+        let t0 = Instant::now();
+        let threshold = Duration::from_secs(120);
+        assert!(!h.observe(1, t0, threshold));
+        // A tick with no new errors means teloxide recovered: clear the streak.
+        assert!(!h.observe(1, t0 + Duration::from_secs(60), threshold));
+        // A later error starts a fresh streak, so it is not immediately a wedge
+        // even though wall-clock is now past t0 + threshold.
+        assert!(!h.observe(2, t0 + Duration::from_secs(130), threshold));
+    }
 
     #[test]
     fn thinking_status_uses_native_telegram_indicator_only() {
