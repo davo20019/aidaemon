@@ -866,12 +866,29 @@ impl ManageGoalTasksTool {
             obj.insert("failure_summary".to_string(), json!(summary));
         }
 
-        goal.status = "failed".to_string();
+        // A continuous (recurring) goal is never terminally failed by a single
+        // run: keep it active so its schedule retries next cycle, and record the
+        // failure (dispatch_failures) for repeated-failure detection. Only finite
+        // goals are marked "failed".
+        let is_continuous = goal.goal_type == "continuous";
+        if is_continuous {
+            goal.dispatch_failures += 1;
+        } else {
+            goal.status = "failed".to_string();
+        }
         goal.context = Some(context.to_string());
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
         self.state.update_goal(&goal).await?;
-        info!(goal_id = %self.goal_id, "Goal failed");
+        if is_continuous {
+            info!(
+                goal_id = %self.goal_id,
+                failures = goal.dispatch_failures,
+                "Continuous goal run failed; goal kept active for next cycle"
+            );
+        } else {
+            info!(goal_id = %self.goal_id, "Goal failed");
+        }
 
         // Cancel remaining pending/claimed tasks so they don't get re-dispatched
         let tasks = self
@@ -894,10 +911,17 @@ impl ManageGoalTasksTool {
             info!(goal_id = %self.goal_id, cancelled, "Cancelled pending tasks for failed goal");
         }
 
-        Ok(format!(
-            "Goal {} failed (cancelled {} pending tasks): {}",
-            self.goal_id, cancelled, summary
-        ))
+        if is_continuous {
+            Ok(format!(
+                "Recurring goal {} run failed (cancelled {} pending tasks); the goal stays active and will retry next cycle: {}",
+                self.goal_id, cancelled, summary
+            ))
+        } else {
+            Ok(format!(
+                "Goal {} failed (cancelled {} pending tasks): {}",
+                self.goal_id, cancelled, summary
+            ))
+        }
     }
 }
 
@@ -926,6 +950,29 @@ mod tests {
         // We need to keep db_file alive, but for tests we'll leak it
         std::mem::forget(db_file);
         (state as Arc<dyn StateStore>, goal.id)
+    }
+
+    #[tokio::test]
+    async fn fail_goal_keeps_continuous_goal_active() {
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
+        assert_eq!(cg.status, "active");
+        state.create_goal(&cg).await.unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+
+        tool.call(&json!({ "action": "fail_goal", "summary": "deploy failed today" }).to_string())
+            .await
+            .unwrap();
+
+        let g = state.get_goal(&cg.id).await.unwrap().unwrap();
+        assert_eq!(
+            g.status, "active",
+            "a single run failure must NOT terminally fail a continuous goal"
+        );
+        assert!(
+            g.dispatch_failures >= 1,
+            "the run failure should be recorded for repeated-failure detection"
+        );
     }
 
     #[tokio::test]
