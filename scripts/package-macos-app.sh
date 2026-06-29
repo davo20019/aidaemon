@@ -117,6 +117,15 @@ else
   echo "Bootstrapped launchd agent."
 fi
 
+# Best-effort: re-assert the flags the local llama-server must carry (e.g.
+# --kv-unified, required for the idle-slot RAM cache during goal runs). The
+# llama plist is hand-managed and not generated here, so this guards against it
+# being recreated without the flag. Idempotent no-op when already present;
+# never fatal to the daemon deploy.
+if [[ -x "$PROJECT_DIR/scripts/ensure-llama-flags.sh" ]]; then
+  "$PROJECT_DIR/scripts/ensure-llama-flags.sh" || echo "warning: ensure-llama-flags.sh failed (non-fatal)"
+fi
+
 echo
 echo "Done. aidaemon.app installed and running ($VERSION, $PROFILE)."
 echo "If this is your first install (or you switched signing identity), grant:"
