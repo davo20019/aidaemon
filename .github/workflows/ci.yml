@@ -36,7 +36,24 @@ jobs:
             exit 0
           fi
 
-          echo "::error::Release commit '${SUBJECT}' reached master without matching tag '${TAG_NAME}' pointing at ${GITHUB_SHA}."
+          # The documented release flow (CLAUDE.md "Release Notes") pushes the
+          # release commit first, waits for CI to pass, then pushes the tag. So a
+          # fresh release commit legitimately reaches master moments before its
+          # tag exists. Allow a grace window so normal releases don't flash a
+          # transient failure; only hard-fail once a release commit has lingered
+          # untagged past the window (re-run this job after pushing the tag to
+          # turn it green).
+          GRACE_SECONDS=5400  # 90 minutes
+          COMMIT_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          NOW_EPOCH="$(date -u +%s)"
+          AGE=$(( NOW_EPOCH - COMMIT_EPOCH ))
+
+          if [ "$AGE" -lt "$GRACE_SECONDS" ]; then
+            echo "::notice::Release commit '${SUBJECT}' has no '${TAG_NAME}' tag yet (commit is ${AGE}s old, within the ${GRACE_SECONDS}s grace window). Push it with 'git push origin ${TAG_NAME}', then re-run this job to confirm."
+            exit 0
+          fi
+
+          echo "::error::Release commit '${SUBJECT}' reached master without matching tag '${TAG_NAME}' pointing at ${GITHUB_SHA} (untagged for ${AGE}s, past the ${GRACE_SECONDS}s grace window)."
           echo "Tags currently pointing at ${GITHUB_SHA}:"
           git tag --points-at "$GITHUB_SHA" || true
           exit 1
