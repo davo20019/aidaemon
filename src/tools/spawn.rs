@@ -336,6 +336,90 @@ fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
     }
 }
 
+/// Deterministic, conservative check: does this task describe a single bounded,
+/// read-only command (disk free, count files, git status, list/find largest)
+/// that the orchestrator should run inline with `terminal` rather than pay a
+/// ~18s cold prefill + a full sub-agent loop to delegate?
+///
+/// Errs HARD toward `false` (allow the spawn): a missed trivial task only costs
+/// one spawn, but wrongly inlining real work would block a sub-agent that was
+/// needed. Anything generative, mutating, exploratory, or multi-step → `false`.
+/// No LLM involved — pure keyword rules.
+pub(crate) fn should_run_inline(mission_and_task: &str) -> bool {
+    let text = mission_and_task.to_ascii_lowercase();
+    let has = |needles: &[&str]| {
+        needles
+            .iter()
+            .any(|n| crate::agent::keyword_match(&text, n))
+    };
+
+    // Generative / mutating / exploratory / multi-step work needs a real agent
+    // loop — never inline these.
+    const SPAWN_MARKERS: &[&str] = &[
+        "write",
+        "create",
+        "generate",
+        "compose",
+        "draft",
+        "summary",
+        "summarize",
+        "a report",
+        "the report",
+        "publish",
+        "deploy",
+        "install",
+        "modify",
+        "delete",
+        "remove",
+        "push",
+        "send",
+        "migrate",
+        "refactor",
+        "build",
+        "fix",
+        "research",
+        "analyze",
+        "investigate",
+        "explore",
+        "review",
+        "audit",
+        "implement",
+        "diagnose",
+    ];
+    if has(SPAWN_MARKERS) {
+        return false;
+    }
+    // Multi-step markers.
+    if text.contains("step 1") || text.contains(" then ") || text.matches(". ").count() >= 2 {
+        return false;
+    }
+
+    // Recognized single read-only data fetch.
+    const INLINE_MARKERS: &[&str] = &[
+        "disk free",
+        "free space",
+        "disk space",
+        "disk usage",
+        "git branch",
+        "current branch",
+        "last commit",
+        "git status",
+        "git log",
+        "largest files",
+        "biggest files",
+        "list files",
+        "uptime",
+        "memory usage",
+        "cpu usage",
+    ];
+    if has(INLINE_MARKERS) {
+        return true;
+    }
+    // "count … files" / "number of … files" is a file count (a command); but
+    // "count the bugs" is analysis — require the "files" noun to inline.
+    (has(&["count"]) || text.contains("number of")) && has(&["files"])
+}
+
 #[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
@@ -456,6 +540,24 @@ impl Tool for SpawnAgentTool {
         } else {
             None
         };
+
+        // Inline gate: a single bounded read-only command (disk free, count
+        // files, git status, find largest …) doesn't warrant a fresh sub-agent
+        // — that pays a ~18s cold prefill + a full loop to run a ~1s command.
+        // Refuse the spawn and have the orchestrator run it inline with
+        // `terminal` in its warm context. Deterministic + conservative: only the
+        // clearly-trivial cases are blocked; anything ambiguous still spawns.
+        if child_role == Some(AgentRole::Executor) && should_run_inline(&args.task) {
+            info!(task = %args.task, "spawn refused: single read-only command, run inline");
+            return Ok(format!(
+                "Run this inline — \"{}\" is a single read-only command, not work that needs a \
+                 sub-agent. Execute it yourself with the `terminal` tool, then record the result \
+                 via manage_goal_tasks(action=\"update_task\", status=\"completed\", result=...). \
+                 Do NOT call spawn_agent for trivial commands.",
+                args.task
+            ));
+        }
+
         // LLM-provided task_id takes priority; fall back to injected _task_id
         let task_id_ref = args.task_id.or(args._task_id.clone());
         let goal_id_ref = args._goal_id.clone();
@@ -832,6 +934,42 @@ impl SpawnAgentTool {
                     self.timeout_secs
                 ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_gate_tests {
+    use super::should_run_inline;
+
+    #[test]
+    fn inlines_single_read_only_commands() {
+        // Real tasks from telemetry that each got a wasteful ~30s sub-agent.
+        for t in [
+            "Report disk free space on / using 'df -h /'",
+            "Check current disk free space on /",
+            "Count the number of .rs files in ~/projects/aidaemon/src",
+            "Count how many .rs files are in ~/projects/aidaemon/src",
+            "Determine the current git branch and the subject of the last commit",
+            "Get the current git branch and the last commit subject",
+            "Find the 3 largest files under ~/projects/aidaemon",
+        ] {
+            assert!(should_run_inline(t), "should inline: {t}");
+        }
+    }
+
+    #[test]
+    fn spawns_for_substantial_or_mutating_work() {
+        for t in [
+            "Write a self-test summary to ~/aidaemon-selftest.md",
+            "Write a summary report to a markdown file.",
+            "Research the latest Rust async patterns and summarize them",
+            "Refactor the auth module across 8 files and run the tests",
+            "Deploy the blog to Cloudflare",
+            "Count the bugs in the codebase and analyze the root causes",
+            "Investigate why scheduled goals fail to authenticate",
+        ] {
+            assert!(!should_run_inline(t), "should spawn (not inline): {t}");
         }
     }
 }
