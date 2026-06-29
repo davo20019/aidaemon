@@ -347,6 +347,21 @@ pub(super) async fn run_llm_phase(
     // calling is disabled via tool_choice=none below, and any tool calls the
     // model still emits are dropped by the hard force-text guard further down.
     let effective_tools: &[Value] = effective_tools_for_call(force_text_response, tool_defs);
+    // Prompt-composition telemetry: where the fixed prefix goes (tool defs vs
+    // system prompt+memory vs history). Lets us evaluate prompt-size levers
+    // (tool subsetting, leaner system prompt) with real numbers per call.
+    {
+        let comp =
+            crate::memory::context_window::prompt_composition(messages.as_slice(), effective_tools);
+        info!(
+            session_id,
+            iteration,
+            system_tokens = comp.system_tokens,
+            tools_tokens = comp.tools_tokens,
+            history_tokens = comp.history_tokens,
+            "prompt composition (est)"
+        );
+    }
     if force_text_response {
         info!(
             session_id,

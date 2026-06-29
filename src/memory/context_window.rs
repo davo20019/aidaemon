@@ -34,6 +34,38 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+/// Estimated token breakdown of an LLM request's prompt, for observability into
+/// where the fixed prefix goes: tool definitions vs the system prompt (which
+/// includes injected memory/context) vs the conversation history. Same chars/4
+/// estimate as `estimate_tokens`.
+pub struct PromptComposition {
+    pub system_tokens: usize,
+    pub tools_tokens: usize,
+    pub history_tokens: usize,
+}
+
+/// Split an outgoing request's `messages` (system vs everything else) and `tools`
+/// into estimated token counts. Memory/context injected into the system prompt is
+/// counted under `system_tokens` (it lives inside the `role:"system"` message).
+pub fn prompt_composition(messages: &[Value], tools: &[Value]) -> PromptComposition {
+    let mut system_tokens = 0usize;
+    let mut history_tokens = 0usize;
+    for m in messages {
+        let toks = estimate_tokens(&serde_json::to_string(m).unwrap_or_default());
+        if m.get("role").and_then(|r| r.as_str()) == Some("system") {
+            system_tokens += toks;
+        } else {
+            history_tokens += toks;
+        }
+    }
+    let tools_tokens = estimate_tokens(&serde_json::to_string(tools).unwrap_or_default());
+    PromptComposition {
+        system_tokens,
+        tools_tokens,
+        history_tokens,
+    }
+}
+
 const MULTIMODAL_IMAGE_TOKEN_SURROGATE: usize = 1_200;
 const MULTIMODAL_AUDIO_BYTES_PER_TOKEN: usize = 100;
 
@@ -1071,6 +1103,28 @@ pub fn spawn_incremental_summarization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_composition_splits_system_tools_history() {
+        let messages = vec![
+            serde_json::json!({"role":"system","content":"You are a focused task lead with a fairly long system prompt and injected memory context here."}),
+            serde_json::json!({"role":"user","content":"do the thing"}),
+            serde_json::json!({"role":"assistant","content":"working on it now"}),
+        ];
+        let tools = vec![
+            serde_json::json!({"name":"terminal","description":"run a shell command on the host machine"}),
+        ];
+        let c = prompt_composition(&messages, &tools);
+        assert!(c.system_tokens > 0, "system should be counted");
+        assert!(c.tools_tokens > 0, "tools should be counted");
+        assert!(c.history_tokens > 0, "history should be counted");
+        // The system message is the largest single chunk here.
+        assert!(c.system_tokens > c.history_tokens);
+        // No system message -> system_tokens is zero, others still counted.
+        let no_sys = prompt_composition(&messages[1..], &tools);
+        assert_eq!(no_sys.system_tokens, 0);
+        assert!(no_sys.history_tokens > 0 && no_sys.tools_tokens > 0);
+    }
 
     fn active_fact(category: &str, key: &str, value: &str) -> crate::traits::Fact {
         let now = chrono::Utc::now();
