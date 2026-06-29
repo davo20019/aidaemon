@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.17] - 2026-06-28
+
+### Added
+
+- **Local-model prompt-cache survives goal runs (`--kv-unified`).** llama.cpp's idle-slot KV cache (`--cache-idle-slots`, backed by the `--cache-ram` pool) only activates with a unified KV buffer, which defaults off when `--parallel` is set explicitly — so a goal run's prompt prefix was evicted by the interleaved background memory pipeline and re-prefilled on every call. The flag is now part of the launch, with `scripts/ensure-llama-flags.sh` (idempotent) re-asserting it after any plist recreation and `package-macos-app.sh` running it on every build. Measured impact on a real goal run: cache hit `~0% → ~97%` steady-state, per-call prefill `~18s → ~1s`, and goal budget `~396k → ~115k` for the same self-check.
+- **Inline-gate for trivial sub-agent tasks.** A deterministic, conservative classifier (`should_run_inline`, no LLM) refuses to spawn a fresh sub-agent for a single bounded read-only command (count files, `df`, git status, find largest) — telemetry showed those each cost ~25–45s of cold prefill + a full loop to do ~1s of work. The orchestrator is directed to run them inline with `terminal` instead. Errs hard toward spawning: anything generative/mutating/exploratory/multi-step still delegates.
+- **Repeated-failure alerts for recurring goals.** A continuous goal that fails consecutive runs now surfaces an `evergreen_alert` (every Nth failure) instead of silently retrying forever; a successful run clears the streak.
+- **Telegram long-polling can no longer wedge silently.** `getUpdates` failures now log loudly under our own tracing target (not teloxide's dropped one), and a watchdog restarts the dispatcher with a fresh connection if polling fails continuously past a threshold — fixing a post-restart wedge where the daemon stayed alive but stopped receiving messages with zero log output.
+
+### Changed
+
+- **Goal budgets charge real incremental work, not re-billed cached prefix.** With prompt caching, ~95%+ of each call's input is a cache read of the stable system-prompt prefix; the budget previously charged it at full price every turn, so multi-turn goals hit their cap on near-free re-reads. `TokenUsage::budget_tokens()` now charges fresh input + output (falling back to full input when no cache info is reported), cutting billed budget ~3.4× on a real run.
+- **One self-editing progress surface for scheduled/background runs.** The "🔄 Running scheduled task" announcement is posted as a tracked message and folds into the progress heartbeat, which edits it in place — one updating message instead of a separate announcement plus a stream of pings, matching the foreground live-status surface.
+- **Short goal labels across all user-facing surfaces.** Progress lines, the repeated-failure / idle alerts, the schedule-confirmation card, and the "✅ Scheduled" echoes now show a concise `short_goal_label` instead of the full goal-instruction blob. The progress line also skips the internal "Scheduled check" parent task; the completion summary skips that parent task and strips internal `[SYSTEM: …]` markers.
+
+### Fixed
+
+- **A single run failure no longer terminally kills a continuous goal.** `fail_goal` set `status="failed"` unconditionally, so when a recurring goal's run failed (e.g. a deploy step), the whole goal stopped firing forever. Continuous goals now stay active and retry next cycle (recording the failure for repeated-failure detection); only finite goals are marked failed.
+- **Day-aware daily-budget gate.** The budget gate now blocks only on the *current* day's usage, fixing a rollover deadlock where the previous day's spend kept a goal from firing after midnight.
+- **CI flake in heartbeat tests.** Keep the temp DB file alive in `test_state_store` so a dropped temp file no longer surfaces as a "no such table: goals" failure.
+
 ## [0.11.16] - 2026-06-27
 
 ### Added

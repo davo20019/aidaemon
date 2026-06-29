@@ -5718,7 +5718,7 @@ impl<E: std::fmt::Debug> ErrorHandler<E> for PollingErrorHandler {
         let n = self.error_count.fetch_add(1, Ordering::Relaxed) + 1;
         // Loud on the first error, then periodically, so a sustained wedge is
         // visible without flooding the log on every retry.
-        if n == 1 || n % 10 == 0 {
+        if n == 1 || n.is_multiple_of(10) {
             warn!(
                 name = %self.bot_username,
                 consecutive_errors = n,
