@@ -330,7 +330,7 @@ async fn collect_table_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<Strin
     Ok(counts)
 }
 
-fn resolve_db_path(config_path: &Path, db_path: &str) -> PathBuf {
+pub(crate) fn resolve_db_path(config_path: &Path, db_path: &str) -> PathBuf {
     let p = PathBuf::from(db_path);
     if p.is_absolute() {
         p

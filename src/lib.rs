@@ -30,6 +30,7 @@ mod queue_telemetry;
 mod reminders;
 mod router;
 mod session;
+mod single_instance;
 mod skills;
 mod startup;
 mod state;

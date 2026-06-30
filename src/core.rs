@@ -97,6 +97,18 @@ fn collect_default_alert_sessions(config: &AppConfig) -> Vec<String> {
 
 pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::Result<()> {
     let mut config = config;
+
+    // Single-instance guard: refuse to start if another daemon already holds the
+    // lock for this database. Two instances on one DB silently race over goals,
+    // tasks, and the terminal bridge — goals die as "interrupted" and never
+    // complete. Acquire before touching the DB so a duplicate bails immediately.
+    let db_path = crate::startup::db_security::resolve_db_path(&config_path, &config.state.db_path);
+    let lock_path = std::path::PathBuf::from(format!("{}.lock", db_path.display()));
+    if let Err(e) = crate::single_instance::acquire(&lock_path) {
+        tracing::error!("{e}");
+        return Err(e);
+    }
+
     crate::startup::db_security::enforce_database_encryption(&mut config, &config_path).await?;
 
     let write_consistency_thresholds = config.policy.write_consistency.thresholds();
