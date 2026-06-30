@@ -283,7 +283,13 @@ cargo run --bin db_probe --features encryption -- --task "task-uuid-here"
 cargo run --bin db_probe --features encryption -- --invocation 42
 cargo run --bin db_probe --features encryption -- --repair-stale-cli 24
 cargo run --bin db_probe --features encryption -- --token-hours 24
+cargo run --bin db_probe --features encryption -- --fabrication-audit --eval-hours 72
 ```
+
+`--fabrication-audit` is a post-hoc trace check: it flags tasks whose final
+assistant reply claims a side-effecting action (posted/ran/deployed/wrote a
+file, etc.) while the task made zero tool calls — a candidate fabricated
+completion. It verifies outcomes rather than predicting tool-need up front.
 
 ## Specialist System
 

@@ -67,6 +67,60 @@ fn events_cutoff_rfc3339(now: chrono::DateTime<chrono::Utc>, hours: i64) -> Stri
     (now - chrono::Duration::hours(hours)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// Post-hoc fabrication heuristic: detect a first-person claim that a
+/// *side-effecting* action was completed (posted, ran, deployed, wrote a file,
+/// etc.). The fabrication audit pairs this with the task's tool-call count — a
+/// claim with zero tool calls is a candidate for a fabricated completion.
+///
+/// Phrasing is curated for precision over recall: it intentionally misses
+/// ambiguous bare verbs (e.g. "committed", "pushed" without an object) to avoid
+/// false positives like "I'm committed to helping" or "I pushed back on that".
+/// Returns the matched action category, or `None` if no completion claim.
+fn claims_completion_action(text: &str) -> Option<&'static str> {
+    let l = text.to_ascii_lowercase();
+    const PATTERNS: &[(&str, &str)] = &[
+        ("posted", "posted"),
+        ("i published", "published"),
+        ("i've published", "published"),
+        ("published to", "published"),
+        ("tweeted", "tweeted"),
+        ("i deployed", "deployed"),
+        ("deployed to", "deployed"),
+        ("i ran the", "ran"),
+        ("i ran it", "ran"),
+        ("i've run", "ran"),
+        ("i have run", "ran"),
+        ("ran the command", "ran"),
+        ("ran the script", "ran"),
+        ("i executed", "executed"),
+        ("executed the", "executed"),
+        ("i sent", "sent"),
+        ("i've sent", "sent"),
+        ("sent the", "sent"),
+        ("sent you", "sent"),
+        ("i committed", "committed"),
+        ("committed the", "committed"),
+        ("i pushed the", "pushed"),
+        ("pushed to", "pushed"),
+        ("i created the", "created"),
+        ("i've created", "created"),
+        ("i have created", "created"),
+        ("created the file", "created"),
+        ("i wrote the", "wrote"),
+        ("wrote the file", "wrote"),
+        ("i saved", "saved"),
+        ("saved to", "saved"),
+        ("i scheduled", "scheduled"),
+        ("i've scheduled", "scheduled"),
+        ("i uploaded", "uploaded"),
+        ("i merged", "merged"),
+    ];
+    PATTERNS
+        .iter()
+        .find(|(needle, _)| l.contains(needle))
+        .map(|(_, label)| *label)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TelemetryReconciliationCounts {
     correlated: usize,
@@ -199,6 +253,52 @@ fn handholding_detail_label(reason: Option<&str>, error: Option<&str>) -> String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn claims_completion_action_flags_side_effect_claims() {
+        assert_eq!(
+            claims_completion_action("I've created the script and ran it for you. Output: 55"),
+            Some("created")
+        );
+        assert_eq!(
+            claims_completion_action("I posted the tweet to @aidaemon_ai."),
+            Some("posted")
+        );
+        assert_eq!(
+            claims_completion_action("Done — I published the blog post."),
+            Some("published")
+        );
+        assert_eq!(
+            claims_completion_action("I ran the command and here is the output."),
+            Some("ran")
+        );
+    }
+
+    #[test]
+    fn claims_completion_action_ignores_non_claims_and_ambiguous_phrasing() {
+        // No completion of a side-effecting action.
+        assert_eq!(
+            claims_completion_action("The Fibonacci number is 55."),
+            None
+        );
+        assert_eq!(
+            claims_completion_action("Here's a draft tweet you could post."),
+            None
+        );
+        // Ambiguous bare verbs must NOT trip the heuristic.
+        assert_eq!(
+            claims_completion_action("I ran into an issue and couldn't finish."),
+            None
+        );
+        assert_eq!(
+            claims_completion_action("I'm committed to helping you with this."),
+            None
+        );
+        assert_eq!(
+            claims_completion_action("I pushed back on that assumption."),
+            None
+        );
+    }
 
     #[test]
     fn canonical_task_outcome_rejects_unrecognized_values() {
@@ -562,6 +662,116 @@ async fn print_handholding_summary(pool: &SqlitePool, hours: i64) -> anyhow::Res
     Ok(())
 }
 
+/// Per-task aggregate used by the fabrication audit.
+struct FabricationTask {
+    session_id: String,
+    last_ts: String,
+    last_reply: String,
+    tool_calls: i64,
+}
+
+/// Post-hoc fabrication audit: for each task in the window, fold all
+/// `assistant_response` events into (final non-empty reply, total tool calls),
+/// then flag tasks whose final reply claims a side-effecting action
+/// ([`claims_completion_action`]) while the task made zero tool calls. This is
+/// the trace-based replacement for the predict-ahead `needs_tools` keyword
+/// guard: it does not guess intent up front, it verifies the outcome.
+async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Fabrication Audit (Last {} Hours) ==", hours);
+    println!("(final reply claims an action AND the task made zero tool calls)\n");
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          created_at,
+          session_id,
+          json_extract(data, '$.task_id') AS task_id,
+          COALESCE(json_extract(data, '$.content'), '') AS content,
+          COALESCE(json_array_length(json_extract(data, '$.tool_calls')), 0) AS tool_calls
+        FROM events
+        WHERE event_type = 'assistant_response'
+          AND created_at >= ?
+          AND json_extract(data, '$.task_id') IS NOT NULL
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let mut tasks: std::collections::HashMap<String, FabricationTask> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let task_id: String = row.get("task_id");
+        let content: String = row.get("content");
+        let tool_calls: i64 = row.get("tool_calls");
+        let created_at: String = row.get("created_at");
+        let session_id: String = row.get("session_id");
+        let entry = tasks.entry(task_id).or_insert_with(|| FabricationTask {
+            session_id,
+            last_ts: String::new(),
+            last_reply: String::new(),
+            tool_calls: 0,
+        });
+        entry.tool_calls += tool_calls;
+        // The user-facing completion is the latest non-empty assistant content.
+        if !content.trim().is_empty() {
+            entry.last_ts = created_at;
+            entry.last_reply = content;
+        }
+    }
+
+    let total = tasks.len();
+    let mut claim_tasks = 0usize;
+    let mut candidates: Vec<(String, &FabricationTask, &'static str)> = Vec::new();
+    for (id, task) in &tasks {
+        if let Some(label) = claims_completion_action(&task.last_reply) {
+            claim_tasks += 1;
+            if task.tool_calls == 0 {
+                candidates.push((id.clone(), task, label));
+            }
+        }
+    }
+
+    println!("- tasks with a final reply:            {}", total);
+    println!("- ...claiming a side-effect action:    {}", claim_tasks);
+    println!(
+        "- ...with ZERO tool calls (candidates): {}",
+        candidates.len()
+    );
+    if claim_tasks > 0 {
+        println!(
+            "- fabrication rate (candidates / claims): {:.0}%",
+            candidates.len() as f64 / claim_tasks as f64 * 100.0
+        );
+    }
+
+    candidates.sort_by(|a, b| b.1.last_ts.cmp(&a.1.last_ts));
+    println!("\nCandidates (newest first):");
+    if candidates.is_empty() {
+        println!("- none — every action claim was backed by a tool call");
+    }
+    for (id, task, label) in &candidates {
+        let snippet: String = task
+            .last_reply
+            .chars()
+            .take(160)
+            .collect::<String>()
+            .replace('\n', " ");
+        println!(
+            "- [{}] claim={} task={} session={}\n    \"{}\"",
+            task.last_ts,
+            label,
+            &id[..id.len().min(8)],
+            task.session_id,
+            snippet,
+        );
+    }
+
+    Ok(())
+}
+
 async fn record_fixture_from_session(
     pool: &SqlitePool,
     session_id: &str,
@@ -711,6 +921,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|w| w[1].clone());
     let eval_summary = args.iter().any(|arg| arg == "--eval-summary");
     let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
+    let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -782,6 +993,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if handholding_summary {
         print_handholding_summary(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if fabrication_audit {
+        print_fabrication_audit(&pool, eval_hours).await?;
         return Ok(());
     }
     if let Some(session_id) = record_fixture_session.as_deref() {
