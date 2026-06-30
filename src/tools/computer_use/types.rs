@@ -109,7 +109,26 @@ pub fn format_full_tree(snapshot: &AppSnapshot) -> String {
     for el in &snapshot.elements {
         out.push_str(&format_element_line(el));
     }
+    tracing::info!(
+        kind = "full",
+        app = %snapshot.app_name,
+        elements = snapshot.elements.len(),
+        ax_chars = out.len(),
+        ax_tokens_est = out.len() / 4,
+        "computer_use observation size"
+    );
     out
+}
+
+/// Rough token cost of a rendered computer-use observation, for telemetry into
+/// where a computer-use prompt's bytes go: the AX-tree text (chars/4, matching
+/// `memory::context_window::estimate_tokens`) plus a fixed surrogate for an
+/// attached screenshot. The AX tree is the variable, sometimes-huge part (a
+/// browser full tree can be ~1200 nodes); the screenshot is small and capped.
+pub fn observation_token_estimate(ax_text: &str, has_screenshot: bool) -> usize {
+    let ax_tokens = ax_text.len() / 4;
+    let screenshot_tokens = if has_screenshot { 1200 } else { 0 };
+    ax_tokens + screenshot_tokens
 }
 
 /// Condensed refresh returned after mutating actions.
@@ -159,6 +178,14 @@ pub fn format_condensed_refresh(snapshot: &AppSnapshot, focus_index: Option<u32>
     if snapshot.truncated {
         out.push_str("[TRUNCATED]\n");
     }
+    tracing::info!(
+        kind = "condensed",
+        app = %snapshot.app_name,
+        elements = snapshot.elements.len(),
+        ax_chars = out.len(),
+        ax_tokens_est = out.len() / 4,
+        "computer_use observation size"
+    );
     out
 }
 
@@ -246,6 +273,17 @@ mod tests {
         let text = format_full_tree(&sample_snapshot());
         assert!(text.contains("snapshot_generation=3"));
         assert!(text.contains("1 AXButton \"7\" enabled"));
+    }
+
+    #[test]
+    fn observation_estimate_counts_ax_text_and_screenshot() {
+        let text = "x".repeat(400); // 400 chars -> 100 tokens
+        assert_eq!(observation_token_estimate(&text, false), 100);
+        // The screenshot surrogate is added only when an image is attached.
+        assert_eq!(observation_token_estimate(&text, true), 1300);
+        // A real full-tree render is non-trivially sized.
+        let full = format_full_tree(&sample_snapshot());
+        assert!(observation_token_estimate(&full, true) > 1200);
     }
 
     #[test]
