@@ -66,6 +66,11 @@ pub struct ComputerUseTool {
     /// immediate exact repeat (e.g. clicking a Like/toggle twice) that could
     /// undo the first action. Cleared by any other action (observation included).
     last_mutation_sig: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Name of the most recently resolved app, updated on every successful
+    /// `resolve_app`. Lets an action that omits `app` resume on the app the model
+    /// is already operating instead of dead-ending into a validation error — a
+    /// small-model derail trigger (it abandons computer_use and flails).
+    last_app: tokio::sync::Mutex<Option<String>>,
     /// Optional events store: when present, every action is also persisted as a
     /// structured event so the full trajectory (incl. click_method/outcome/
     /// timing) is auditable from the DB, not only from stdout logs.
@@ -138,6 +143,7 @@ impl ComputerUseTool {
             session_telemetry: SessionTelemetry::default(),
             pending_meta: tokio::sync::Mutex::new(PendingActionMeta::default()),
             last_mutation_sig: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            last_app: tokio::sync::Mutex::new(None),
             events,
         }
     }
@@ -457,7 +463,7 @@ impl ComputerUseTool {
 
         match action {
             ComputerActionKind::GetAppState => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
@@ -481,7 +487,7 @@ impl ComputerUseTool {
                 // cached snapshot_generation so the model keeps using the right
                 // value — silently bumping it here used to make every
                 // post-screenshot mutation fail as stale.
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let resolved = self.resolve_app(&app).await?;
                 self.ensure_action_approvals(
                     &ctx,
@@ -528,7 +534,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::ActivateApp => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 // Optional: activation has no element target, and it is often
                 // the first action on an app — before any get_app_state.
                 let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
@@ -558,7 +564,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::Click => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let generation = required_generation(args)?;
                 let x = optional_f64(args, "x");
                 let y = optional_f64(args, "y");
@@ -657,7 +663,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::TypeText => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let generation = required_generation(args)?;
                 let text = required_str(args, "text")?;
                 let resolved = self.resolve_app(&app).await?;
@@ -686,7 +692,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::PressKey => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let generation = required_generation(args)?;
                 let key = required_str(args, "key")?;
                 let resolved = self.resolve_app(&app).await?;
@@ -709,7 +715,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::Scroll => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let generation = required_generation(args)?;
                 let direction = required_str(args, "direction")?;
                 let pages = args.get("pages").and_then(|v| v.as_f64()).unwrap_or(1.0);
@@ -758,7 +764,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::SetValue => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 let generation = required_generation(args)?;
                 let value = required_str(args, "value")?;
                 let resolved = self.resolve_app(&app).await?;
@@ -796,7 +802,7 @@ impl ComputerUseTool {
                     .await
             }
             ComputerActionKind::LaunchApp => {
-                let app = required_app(args)?;
+                let app = self.sticky_app(args).await?;
                 // Launch first (this only starts the process — no screenshot),
                 // then run the per-app approval before any get_app_state captures
                 // the window, preserving "approve before we look at it".
@@ -825,22 +831,37 @@ impl ComputerUseTool {
         }
     }
 
+    /// Resolve the effective `app` for an action, applying stickiness: an
+    /// explicit `app` arg, else the last-focused app, else a literal-next-step
+    /// error. Keeps small models from abandoning computer_use on a missing `app`.
+    async fn sticky_app(&self, args: &Value) -> Result<String, String> {
+        let last = self.last_app.lock().await.clone();
+        resolve_sticky_app(args, last.as_deref())
+    }
+
     async fn resolve_app(&self, app: &str) -> Result<types::AppInfo, String> {
         let apps = self.harness.list_apps().await?;
         let needle = app.trim();
-        if let Some(found) = apps.iter().find(|a| {
-            a.bundle_id.eq_ignore_ascii_case(needle) || a.name.eq_ignore_ascii_case(needle)
-        }) {
-            return Ok(found.clone());
+        let found = apps
+            .iter()
+            .find(|a| {
+                a.bundle_id.eq_ignore_ascii_case(needle) || a.name.eq_ignore_ascii_case(needle)
+            })
+            .or_else(|| {
+                apps.iter().find(|a| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+            });
+        match found {
+            Some(a) => {
+                // Remember the app so a later action that omits `app` resumes here.
+                *self.last_app.lock().await = Some(a.name.clone());
+                Ok(a.clone())
+            }
+            None => Err(policy::no_running_app_message(app)),
         }
-        if let Some(found) = apps.iter().find(|a| {
-            a.name
-                .to_ascii_lowercase()
-                .contains(&needle.to_ascii_lowercase())
-        }) {
-            return Ok(found.clone());
-        }
-        Err(policy::no_running_app_message(app))
     }
 
     async fn resolve_bundle_id(&self, app: &str) -> Result<String, String> {
@@ -863,18 +884,62 @@ fn required_str(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Missing required parameter: {key}"))
 }
 
-// Small models recover from validation errors far more reliably when the
-// message states the literal next step instead of just naming the gap.
-fn required_app(args: &Value) -> Result<String, String> {
-    args.get("app")
+// Resolve the effective `app` for an action: the explicit `app` arg when present
+// and non-empty, else the last-focused app (sticky), else a literal-next-step
+// error. Stickiness stops small models from derailing when they omit `app` on a
+// follow-up action — the app is already known from the prior get_app_state, so a
+// missing arg should resume on it rather than dead-end into a validation error.
+// Small models recover from validation errors far more reliably when the message
+// states the literal next step instead of just naming the gap.
+fn resolve_sticky_app(args: &Value, last_app: Option<&str>) -> Result<String, String> {
+    if let Some(app) = args
+        .get("app")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            "Missing required parameter: app — repeat the same call with app set to the \
-             application you are controlling (use the name from your last get_app_state or \
-             list_apps result)"
-                .to_string()
-        })
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok(app.to_string());
+    }
+    if let Some(last) = last_app.filter(|s| !s.trim().is_empty()) {
+        return Ok(last.to_string());
+    }
+    Err(
+        "Missing required parameter: app — repeat the same call with app set to the \
+         application you are controlling (use the name from your last get_app_state or \
+         list_apps result)"
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod sticky_app_tests {
+    use super::resolve_sticky_app;
+    use serde_json::json;
+
+    #[test]
+    fn explicit_app_wins_then_sticky_then_error() {
+        let with = json!({"app": "Google Chrome"});
+        assert_eq!(resolve_sticky_app(&with, None).unwrap(), "Google Chrome");
+        // An explicit arg beats the sticky last-app.
+        assert_eq!(
+            resolve_sticky_app(&with, Some("Safari")).unwrap(),
+            "Google Chrome"
+        );
+        // Missing `app` falls back to the last-focused app — no derail.
+        let without = json!({"action": "click"});
+        assert_eq!(
+            resolve_sticky_app(&without, Some("Google Chrome")).unwrap(),
+            "Google Chrome"
+        );
+        // Empty/whitespace `app` also falls back.
+        let blank = json!({"app": "  "});
+        assert_eq!(
+            resolve_sticky_app(&blank, Some("Chrome")).unwrap(),
+            "Chrome"
+        );
+        // Nothing known -> literal-next-step error (preserves the old guidance).
+        let err = resolve_sticky_app(&without, None).unwrap_err();
+        assert!(err.contains("Missing required parameter: app"));
+    }
 }
 
 fn required_generation(args: &Value) -> Result<u64, String> {
