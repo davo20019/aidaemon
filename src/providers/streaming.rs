@@ -58,6 +58,9 @@ pub(crate) struct StreamAccumulator {
     tool_calls: BTreeMap<u64, PartialToolCall>,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    /// llama.cpp emits a top-level `timings` object (prefill/decode wall time)
+    /// on the final chunk; preserved so the shared parse path can split latency.
+    timings: Option<Value>,
     saw_done: bool,
 }
 
@@ -74,6 +77,9 @@ impl StreamAccumulator {
         };
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(usage.clone());
+        }
+        if let Some(timings) = chunk.get("timings").filter(|t| !t.is_null()) {
+            self.timings = Some(timings.clone());
         }
         let Some(choice) = chunk["choices"].get(0) else {
             return true;
@@ -164,6 +170,9 @@ impl StreamAccumulator {
         if let Some(usage) = self.usage {
             body["usage"] = usage;
         }
+        if let Some(timings) = self.timings {
+            body["timings"] = timings;
+        }
         body
     }
 }
@@ -253,6 +262,18 @@ mod tests {
             "reasoning must land on the key the non-streaming parse reads"
         );
         assert_eq!(body["choices"][0]["message"]["content"], "answer");
+    }
+
+    #[test]
+    fn final_chunk_timings_survive_finalize() {
+        // llama.cpp sends `timings` on the final chunk alongside usage; it must
+        // land in the synthetic body so the shared parse path can read the
+        // prefill/decode split.
+        let mut acc = StreamAccumulator::default();
+        acc.apply_payload(r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1},"timings":{"prompt_ms":120.0,"predicted_ms":40.0}}"#);
+        let body = acc.finalize(false);
+        assert_eq!(body["timings"]["prompt_ms"], 120.0);
+        assert_eq!(body["timings"]["predicted_ms"], 40.0);
     }
 
     #[test]

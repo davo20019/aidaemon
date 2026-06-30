@@ -871,6 +871,7 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

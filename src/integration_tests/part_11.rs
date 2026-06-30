@@ -959,6 +959,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -972,6 +973,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -985,6 +987,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

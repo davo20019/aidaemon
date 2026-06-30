@@ -222,6 +222,19 @@ impl OpenAiCompatibleProvider {
             }
         }
 
+        // llama.cpp reports server-side timing in a top-level `timings` object
+        // (sibling of `usage`): `prompt_ms` is prefill, `predicted_ms` is decode.
+        // Capturing these splits end-to-end latency into its two components so a
+        // slow call can be attributed to cold prefill vs long decode vs queue
+        // contention without guessing from token counts.
+        let timings = data.get("timings");
+        let prompt_ms = timings
+            .and_then(|t| t.get("prompt_ms"))
+            .and_then(Value::as_f64);
+        let decode_ms = timings
+            .and_then(|t| t.get("predicted_ms"))
+            .and_then(Value::as_f64);
+
         let usage = data.get("usage").and_then(|u| {
             Some(TokenUsage {
                 input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
@@ -229,6 +242,8 @@ impl OpenAiCompatibleProvider {
                 cached_input_tokens: Self::cached_input_tokens_from_usage(u),
                 cache_creation_input_tokens: None,
                 model: model.to_string(),
+                prompt_ms,
+                decode_ms,
             })
         });
 
@@ -983,6 +998,50 @@ mod tests {
 
         assert_eq!(response.thinking.as_deref(), Some("private trace"));
         assert_eq!(response.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn parses_llama_cpp_timings_into_prefill_decode_split() {
+        let response = OpenAiCompatibleProvider::parse_chat_response_body(
+            &json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "ok" }
+                }],
+                "usage": { "prompt_tokens": 12000, "completion_tokens": 200 },
+                "timings": {
+                    "prompt_n": 12000,
+                    "prompt_ms": 34000.5,
+                    "predicted_n": 200,
+                    "predicted_ms": 6500.0
+                }
+            }),
+            "gemma-4-26b",
+        )
+        .expect("response should parse");
+
+        let usage = response.usage.expect("usage present");
+        assert_eq!(usage.prompt_ms, Some(34000.5));
+        assert_eq!(usage.decode_ms, Some(6500.0));
+    }
+
+    #[test]
+    fn timings_absent_leaves_split_none() {
+        let response = OpenAiCompatibleProvider::parse_chat_response_body(
+            &json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "ok" }
+                }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 2 }
+            }),
+            "gemma-4-26b",
+        )
+        .expect("response should parse");
+
+        let usage = response.usage.expect("usage present");
+        assert_eq!(usage.prompt_ms, None);
+        assert_eq!(usage.decode_ms, None);
     }
 
     #[test]

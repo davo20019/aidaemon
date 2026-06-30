@@ -111,6 +111,7 @@ impl MockProvider {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -133,6 +134,7 @@ impl MockProvider {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

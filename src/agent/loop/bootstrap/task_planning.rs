@@ -107,6 +107,8 @@ async fn record_auxiliary_model_call(
                 fell_back: false,
                 attempts: 1,
                 latency_ms,
+                prompt_ms: None,
+                decode_ms: None,
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,

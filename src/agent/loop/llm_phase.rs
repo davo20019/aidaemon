@@ -638,6 +638,14 @@ pub(super) async fn run_llm_phase(
                     )
                 })
                 .unwrap_or((0, 0, None, None, None));
+        // Server-side prefill/decode split (llama.cpp `timings`). The remainder
+        // `latency_ms - prompt_ms - decode_ms` is queue/transport overhead — the
+        // contention signal when a warm call is unexpectedly slow.
+        let (prompt_ms, decode_ms) = resp
+            .usage
+            .as_ref()
+            .map(|u| (u.prompt_ms, u.decode_ms))
+            .unwrap_or((None, None));
         let final_model = if llm_telemetry.final_model.is_empty() {
             model.to_string()
         } else {
@@ -647,6 +655,8 @@ pub(super) async fn run_llm_phase(
             session_id,
             iteration,
             latency_ms = llm_latency_ms,
+            prefill_ms = prompt_ms,
+            decode_ms,
             build_ms,
             model,
             final_model = %final_model,
@@ -672,6 +682,8 @@ pub(super) async fn run_llm_phase(
                     fell_back: llm_telemetry.fell_back,
                     attempts: llm_telemetry.attempts,
                     latency_ms: llm_latency_ms,
+                    prompt_ms,
+                    decode_ms,
                     input_tokens: in_tok,
                     output_tokens: out_tok,
                     cached_input_tokens,
@@ -1069,6 +1081,32 @@ pub(super) async fn run_llm_phase(
         tool_names = ?tc_names,
         "LLM response received"
     );
+
+    // Response-composition telemetry: where the decoded output goes (narration
+    // text vs the structured tool call vs thinking). Decode time scales with
+    // output tokens, so this shows whether the cost is trimmable verbosity or
+    // the essential tool call — the output-side counterpart to prompt composition.
+    {
+        let tool_calls_serialized: String = resp
+            .tool_calls
+            .iter()
+            .map(|tc| format!("{} {}", tc.name, tc.arguments))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out_comp = crate::memory::context_window::response_composition(
+            resp.content.as_deref(),
+            &tool_calls_serialized,
+            resp.thinking.as_deref(),
+        );
+        info!(
+            session_id,
+            iteration,
+            text_tokens = out_comp.text_tokens,
+            tool_call_tokens = out_comp.tool_call_tokens,
+            thinking_tokens = out_comp.thinking_tokens,
+            "response composition (est)"
+        );
+    }
 
     // Clear pending empty-response retry context once the model produces
     // any actionable output (text or tool calls).

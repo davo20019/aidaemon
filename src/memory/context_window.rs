@@ -44,6 +44,31 @@ pub struct PromptComposition {
     pub history_tokens: usize,
 }
 
+/// Estimated token breakdown of an LLM response's decoded output: free-text
+/// content (narration/reasoning) vs serialized tool-call args (the structured
+/// action) vs thinking. Decode time scales with total output tokens, so this
+/// shows whether the cost is verbose narration (trimmable) or the actual tool
+/// call (essential) — the input-side counterpart to `PromptComposition`.
+pub struct ResponseComposition {
+    pub text_tokens: usize,
+    pub tool_call_tokens: usize,
+    pub thinking_tokens: usize,
+}
+
+/// Break a response's decoded output into estimated token counts. `tool_calls`
+/// is the concatenation of each call's `name` + `arguments` JSON.
+pub fn response_composition(
+    content: Option<&str>,
+    tool_calls: &str,
+    thinking: Option<&str>,
+) -> ResponseComposition {
+    ResponseComposition {
+        text_tokens: content.map(estimate_tokens).unwrap_or(0),
+        tool_call_tokens: estimate_tokens(tool_calls),
+        thinking_tokens: thinking.map(estimate_tokens).unwrap_or(0),
+    }
+}
+
 /// Split an outgoing request's `messages` (system vs everything else) and `tools`
 /// into estimated token counts. Memory/context injected into the system prompt is
 /// counted under `system_tokens` (it lives inside the `role:"system"` message).
@@ -1124,6 +1149,24 @@ mod tests {
         let no_sys = prompt_composition(&messages[1..], &tools);
         assert_eq!(no_sys.system_tokens, 0);
         assert!(no_sys.history_tokens > 0 && no_sys.tools_tokens > 0);
+    }
+
+    #[test]
+    fn response_composition_splits_text_toolcalls_thinking() {
+        // 400-char narration -> 100 tokens; 40-char tool call -> 10 tokens.
+        let content = "n".repeat(400);
+        let tool_calls = "computer_use ".to_string() + &"a".repeat(27); // 40 chars
+        let c = response_composition(Some(&content), &tool_calls, None);
+        assert_eq!(c.text_tokens, 100);
+        assert_eq!(c.tool_call_tokens, 10);
+        assert_eq!(c.thinking_tokens, 0);
+        // A pure tool-call response (no narration) is mostly tool_call tokens.
+        let pure = response_composition(None, &tool_calls, None);
+        assert_eq!(pure.text_tokens, 0);
+        assert!(pure.tool_call_tokens > 0);
+        // Thinking is counted when present.
+        let thinking = response_composition(None, "", Some(&"t".repeat(80)));
+        assert_eq!(thinking.thinking_tokens, 20);
     }
 
     fn active_fact(category: &str, key: &str, value: &str) -> crate::traits::Fact {

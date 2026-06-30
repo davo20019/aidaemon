@@ -217,6 +217,16 @@ pub struct LlmCallData {
     pub attempts: u32,
     /// End-to-end latency including any recovery/fallback, in milliseconds.
     pub latency_ms: u64,
+    /// Server-reported prefill (prompt evaluation) time in ms, when the backend
+    /// exposes it (llama.cpp `timings.prompt_ms`). Splits `latency_ms` into its
+    /// prefill component so a slow call can be attributed to cold prefill vs
+    /// long decode vs queue contention (`latency_ms - prompt_ms - decode_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ms: Option<f64>,
+    /// Server-reported decode (token generation) time in ms, when exposed
+    /// (llama.cpp `timings.predicted_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<f64>,
     /// Actual input (prompt) tokens reported by the provider.
     #[serde(default)]
     pub input_tokens: u32,
@@ -1042,6 +1052,8 @@ mod tests {
             fell_back: true,
             attempts: 3,
             latency_ms: 1234,
+            prompt_ms: Some(800.0),
+            decode_ms: Some(400.0),
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: Some(60),
@@ -1072,6 +1084,8 @@ mod tests {
         assert!(back.fell_back);
         assert_eq!(back.attempts, 3);
         assert_eq!(back.latency_ms, 1234);
+        assert_eq!(back.prompt_ms, Some(800.0));
+        assert_eq!(back.decode_ms, Some(400.0));
         assert_eq!(back.input_tokens, 100);
         assert_eq!(back.output_tokens, 50);
         assert_eq!(back.cached_input_tokens, Some(60));

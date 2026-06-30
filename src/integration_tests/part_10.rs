@@ -294,6 +294,7 @@ async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

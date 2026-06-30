@@ -56,6 +56,7 @@ async fn test_empty_llm_response_retried_then_fallback() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -69,6 +70,7 @@ async fn test_empty_llm_response_retried_then_fallback() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

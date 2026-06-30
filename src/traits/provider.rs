@@ -98,6 +98,14 @@ pub struct TokenUsage {
     /// Input tokens newly written into a provider-side cache, when reported.
     pub cache_creation_input_tokens: Option<u32>,
     pub model: String,
+    /// Server-reported prefill (prompt evaluation) wall time in milliseconds,
+    /// when the backend exposes it (llama.cpp `timings.prompt_ms`). Lets us
+    /// split end-to-end `latency_ms` into prefill vs decode instead of inferring
+    /// it from token counts.
+    pub prompt_ms: Option<f64>,
+    /// Server-reported decode (token generation) wall time in milliseconds,
+    /// when the backend exposes it (llama.cpp `timings.predicted_ms`).
+    pub decode_ms: Option<f64>,
 }
 
 impl TokenUsage {

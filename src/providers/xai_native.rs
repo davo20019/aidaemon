@@ -324,6 +324,7 @@ impl XaiNativeProvider {
                 cached_input_tokens,
                 cache_creation_input_tokens: None,
                 model: model.to_string(),
+                ..Default::default()
             })
         })
     }

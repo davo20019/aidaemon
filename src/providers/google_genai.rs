@@ -473,6 +473,7 @@ impl GoogleGenAiProvider {
                     .map(|tokens| tokens.min(u32::MAX as u64) as u32),
                 cache_creation_input_tokens: None,
                 model: model.to_string(),
+                ..Default::default()
             })
         });
 

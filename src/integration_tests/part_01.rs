@@ -1202,6 +1202,7 @@ async fn test_plain_text_retry_does_not_trip_execution_budget_before_tool_mode()
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: Some("truncated".to_string()),
@@ -1253,6 +1254,7 @@ async fn test_execution_budget_starts_after_tool_handoff_response() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -1303,6 +1305,7 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -1321,6 +1324,7 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: Some("oversized_observational_retry".to_string()),
@@ -1488,6 +1492,7 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -1675,6 +1680,7 @@ async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

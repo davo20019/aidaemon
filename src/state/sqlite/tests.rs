@@ -1783,6 +1783,7 @@ async fn test_record_and_get_token_usage() {
         output_tokens: 50,
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        ..Default::default()
     };
 
     store
@@ -1811,6 +1812,7 @@ async fn test_token_usage_since_filter() {
         output_tokens: 50,
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        ..Default::default()
     };
     let usage2 = TokenUsage {
         model: "gpt-3.5".to_string(),
@@ -1818,6 +1820,7 @@ async fn test_token_usage_since_filter() {
         output_tokens: 80,
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        ..Default::default()
     };
 
     store

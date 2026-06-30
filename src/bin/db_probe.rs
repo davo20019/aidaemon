@@ -1399,6 +1399,8 @@ async fn main() -> anyhow::Result<()> {
             json_extract(data, '$.model') AS model,
             json_extract(data, '$.fell_back') AS fell_back,
             json_extract(data, '$.latency_ms') AS latency_ms,
+            json_extract(data, '$.prompt_ms') AS prompt_ms,
+            json_extract(data, '$.decode_ms') AS decode_ms,
             json_extract(data, '$.input_tokens') AS input_tokens,
             json_extract(data, '$.output_tokens') AS output_tokens,
             json_extract(data, '$.cached_input_tokens') AS cached_input_tokens,
@@ -1416,13 +1418,29 @@ async fn main() -> anyhow::Result<()> {
         println!("(none)");
     } else {
         for row in llm_events {
+            let latency_ms = row
+                .try_get::<Option<i64>, _>("latency_ms")
+                .unwrap_or(None)
+                .unwrap_or(0);
+            let prefill_ms = row.try_get::<Option<f64>, _>("prompt_ms").unwrap_or(None);
+            let decode_ms = row.try_get::<Option<f64>, _>("decode_ms").unwrap_or(None);
+            // The slice of wall-clock the server did NOT attribute to prefill or
+            // decode: queue wait + transport. A large overhead on a warm call is
+            // the contention signal (another session evicting/sharing the KV).
+            let overhead_ms = match (prefill_ms, decode_ms) {
+                (Some(p), Some(d)) => Some((latency_ms as f64 - p - d).round() as i64),
+                _ => None,
+            };
             println!(
-                "- task_id={:?} iter={} model={} fell_back={} latency_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} at={}",
+                "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} at={}",
                 row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
                 row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
                 row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1),
-                row.try_get::<Option<i64>, _>("latency_ms").unwrap_or(None).unwrap_or(0),
+                latency_ms,
+                prefill_ms.map(|v| v.round() as i64),
+                decode_ms.map(|v| v.round() as i64),
+                overhead_ms,
                 row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
                 row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
@@ -1504,6 +1522,8 @@ async fn main() -> anyhow::Result<()> {
                 json_extract(data, '$.fell_back') AS fell_back,
                 json_extract(data, '$.attempts') AS attempts,
                 json_extract(data, '$.latency_ms') AS latency_ms,
+                json_extract(data, '$.prompt_ms') AS prompt_ms,
+                json_extract(data, '$.decode_ms') AS decode_ms,
                 json_extract(data, '$.build_ms') AS build_ms,
                 json_extract(data, '$.input_tokens') AS input_tokens,
                 json_extract(data, '$.output_tokens') AS output_tokens,
@@ -1535,13 +1555,26 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ => model.unwrap_or_default(),
                 };
+                let latency_ms = row
+                    .try_get::<Option<i64>, _>("latency_ms")
+                    .unwrap_or(None)
+                    .unwrap_or(0);
+                let prefill_ms = row.try_get::<Option<f64>, _>("prompt_ms").unwrap_or(None);
+                let decode_ms = row.try_get::<Option<f64>, _>("decode_ms").unwrap_or(None);
+                let overhead_ms = match (prefill_ms, decode_ms) {
+                    (Some(p), Some(d)) => Some((latency_ms as f64 - p - d).round() as i64),
+                    _ => None,
+                };
                 println!(
-                    "- iter={} model={} fell_back={} attempts={} latency_ms={} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
+                    "- iter={} model={} fell_back={} attempts={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
                     row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
                     model_label,
                     fell_back,
                     row.try_get::<Option<i64>, _>("attempts").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("latency_ms").unwrap_or(None).unwrap_or(0),
+                    latency_ms,
+                    prefill_ms.map(|v| v.round() as i64),
+                    decode_ms.map(|v| v.round() as i64),
+                    overhead_ms,
                     row.try_get::<Option<i64>, _>("build_ms").unwrap_or(None).unwrap_or(0),
                     row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
                     row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),

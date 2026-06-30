@@ -2435,6 +2435,8 @@ mod tests {
             fell_back,
             attempts,
             latency_ms,
+            prompt_ms: None,
+            decode_ms: None,
             input_tokens,
             output_tokens: 100,
             cached_input_tokens,

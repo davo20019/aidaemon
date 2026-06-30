@@ -496,6 +496,7 @@ async fn test_empty_first_pass_response_not_intercepted() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -541,6 +542,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -555,6 +557,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -605,6 +608,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: Some(
@@ -622,6 +626,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -673,6 +678,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,
@@ -736,6 +742,7 @@ async fn test_initial_routing_call_drops_hallucinated_tool_calls() {
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
                 model: "mock".to_string(),
+                ..Default::default()
             }),
             thinking: None,
             response_note: None,

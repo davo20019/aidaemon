@@ -118,6 +118,13 @@ pub async fn record_background_model_call_telemetry(
             )
         })
         .unwrap_or((0, 0, None, None, None));
+    // Server prefill/decode split — background jobs (summarization, extraction)
+    // are decode-heavy, so this attributes their latency directly.
+    let (prompt_ms, decode_ms) = response
+        .usage
+        .as_ref()
+        .map(|usage| (usage.prompt_ms, usage.decode_ms))
+        .unwrap_or((None, None));
 
     record_model_call_telemetry(
         &emitter,
@@ -143,6 +150,8 @@ pub async fn record_background_model_call_telemetry(
                 fell_back: false,
                 attempts: 1,
                 latency_ms: latency.as_millis() as u64,
+                prompt_ms,
+                decode_ms,
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,

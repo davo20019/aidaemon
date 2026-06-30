@@ -473,6 +473,7 @@ impl AnthropicNativeProvider {
                     .and_then(Value::as_u64)
                     .map(|tokens| tokens.min(u32::MAX as u64) as u32),
                 model: model.to_string(),
+                ..Default::default()
             })
         })
     }
