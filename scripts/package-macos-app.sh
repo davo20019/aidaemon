@@ -91,6 +91,15 @@ fi
 codesign -f -s "$SIGN_AS" --identifier "$BUNDLE_ID" --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
 
+# launchd hands a process a minimal PATH (/usr/bin:/bin:…), so user-installed
+# tools (npm/node/wrangler via conda/homebrew) aren't found — `npm run deploy`
+# style tasks fail with "command not found". Derive a PATH from the build env
+# (node's bin dir + homebrew) so the daemon's terminal tool can find them.
+# Portable: no hardcoded user path; resolves whatever node is installed.
+NODE_BIN_DIR=""
+if command -v node >/dev/null 2>&1; then NODE_BIN_DIR="$(dirname "$(command -v node)")"; fi
+DAEMON_PATH="${NODE_BIN_DIR:+$NODE_BIN_DIR:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -100,6 +109,8 @@ cat > "$PLIST" <<PLISTEOF
     <key>ProgramArguments</key>
     <array><string>$APP/Contents/MacOS/aidaemon</string></array>
     <key>WorkingDirectory</key><string>$PROJECT_DIR</string>
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>$DAEMON_PATH</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>$LOG_DIR/stdout.log</string>
