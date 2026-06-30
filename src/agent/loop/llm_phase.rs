@@ -42,6 +42,18 @@ fn should_observe_inline_dump(is_truncated: bool, has_tool_calls: bool) -> bool 
     is_truncated && !has_tool_calls
 }
 
+/// Whether to disable chain-of-thought for this turn. Computer-use is a
+/// mechanical GUI loop (click / type / observe) where the model burns ~400-900
+/// reasoning tokens per action with no measured accuracy benefit — and the ~45%
+/// of turns that are pure observations (screenshot / get_app_state) need no
+/// reasoning at all. Decode is the latency bottleneck, so suppressing thinking
+/// here roughly cuts per-call decode ~85% (≈30s → ≈5s). Keyed on the *last*
+/// tool: computer-use tasks are long runs of back-to-back computer_use calls,
+/// so "last tool was computer_use" reliably means "still in the GUI loop".
+fn should_suppress_thinking(last_tool: &str) -> bool {
+    last_tool == "computer_use"
+}
+
 /// Check if the continuation text has significant word overlap with the prefix,
 /// indicating the LLM re-started from scratch instead of continuing.
 fn has_significant_overlap(prefix: &str, continuation: &str) -> bool {
@@ -417,6 +429,17 @@ pub(super) async fn run_llm_phase(
         }
         // Don't reset the count here — it gets reset when a successful
         // response is received (below).
+    }
+    // Disable thinking while in a computer-use flow (decode-dominated, no
+    // accuracy benefit). Placed after truncation recovery so it wins: a CU turn
+    // never needs reasoning, even mid-recovery. "off" makes the provider omit
+    // enable_thinking, which disables Gemma's chat-template thinking entirely.
+    if should_suppress_thinking(&consecutive_same_tool.0) {
+        llm_options.reasoning_effort_override = Some("off".to_string());
+        info!(
+            session_id,
+            iteration, "Computer-use flow: disabling reasoning for this turn (decode bottleneck)"
+        );
     }
     if force_text_response {
         llm_options.tool_choice = ToolChoiceMode::None;
@@ -1303,6 +1326,16 @@ fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suppresses_thinking_only_in_computer_use_flow() {
+        // Once the last tool was computer_use, the agent is in a mechanical GUI
+        // loop — disable thinking. Other tools keep reasoning.
+        assert!(should_suppress_thinking("computer_use"));
+        assert!(!should_suppress_thinking("terminal"));
+        assert!(!should_suppress_thinking("spawn_agent"));
+        assert!(!should_suppress_thinking(""));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_keeper_advances_during_long_await() {
