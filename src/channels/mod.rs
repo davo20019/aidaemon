@@ -7,6 +7,7 @@ mod discord;
 mod formatting;
 mod hub;
 pub(crate) mod live_status;
+mod rate_limit;
 #[cfg(feature = "slack")]
 mod slack;
 pub(crate) mod telegram;

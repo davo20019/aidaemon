@@ -580,14 +580,31 @@ impl SlackChannel {
     /// Make a POST Slack API call with a JSON body.
     async fn slack_api_post(&self, method: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("https://slack.com/api/{}", method);
-        let resp = self
+        let body_bytes = serde_json::to_vec(body)?;
+        let mut resp = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .header("Content-Type", "application/json; charset=utf-8")
-            .body(serde_json::to_vec(body)?)
+            .body(body_bytes.clone())
             .send()
             .await?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Some(delay) = crate::channels::rate_limit::retry_after_from_headers(
+                resp.headers(),
+                crate::channels::rate_limit::default_retry_after_cap(),
+            ) {
+                crate::channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+                resp = self
+                    .http
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.bot_token))
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(body_bytes)
+                    .send()
+                    .await?;
+            }
+        }
         let result: Value = resp.json().await?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let error = result
@@ -2122,12 +2139,26 @@ async fn slack_post_message(
     if let Some(ts) = thread_ts {
         body["thread_ts"] = Value::String(ts.to_string());
     }
-    let resp = http
+    let mut resp = http
         .post("https://slack.com/api/chat.postMessage")
         .header("Authorization", format!("Bearer {}", bot_token))
         .json(&body)
         .send()
         .await?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        if let Some(delay) = crate::channels::rate_limit::retry_after_from_headers(
+            resp.headers(),
+            crate::channels::rate_limit::default_retry_after_cap(),
+        ) {
+            crate::channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+            resp = http
+                .post("https://slack.com/api/chat.postMessage")
+                .header("Authorization", format!("Bearer {}", bot_token))
+                .json(&body)
+                .send()
+                .await?;
+        }
+    }
     let result: Value = resp.json().await?;
     if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let error = result

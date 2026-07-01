@@ -14,6 +14,7 @@ use teloxide::types::{
     KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo,
 };
 use teloxide::update_listeners::webhooks;
+use teloxide::RequestError;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -4957,14 +4958,17 @@ impl Channel for TelegramChannel {
         // carries markdown). Fall back to a plain send if Telegram rejects the
         // HTML. The returned message id is captured for later in-place editing.
         let html = markdown_to_telegram_html(text);
-        let msg = match self
-            .bot
-            .send_message(ChatId(chat_id), &html)
-            .parse_mode(ParseMode::Html)
-            .await
+        let msg = match retry_telegram_rate_limit(|| {
+            self.bot
+                .send_message(ChatId(chat_id), &html)
+                .parse_mode(ParseMode::Html)
+        })
+        .await
         {
             Ok(m) => m,
-            Err(_) => self.bot.send_message(ChatId(chat_id), text).await?,
+            Err(_) => {
+                retry_telegram_rate_limit(|| self.bot.send_message(ChatId(chat_id), text)).await?
+            }
         };
         Ok(Some(msg.id.0.to_string()))
     }
@@ -5028,11 +5032,13 @@ impl Channel for TelegramChannel {
         match &media.kind {
             MediaKind::Photo { data } => {
                 let photo = InputFile::memory(data.clone()).file_name("screenshot.png");
-                self.bot
-                    .send_photo(ChatId(chat_id), photo)
-                    .caption(&media.caption)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
+                retry_telegram_rate_limit(|| {
+                    self.bot
+                        .send_photo(ChatId(chat_id), photo.clone())
+                        .caption(&media.caption)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send photo: {}", e))?;
             }
             MediaKind::Document {
                 file_path,
@@ -5043,7 +5049,8 @@ impl Channel for TelegramChannel {
                 if !media.caption.is_empty() {
                     req = req.caption(&media.caption);
                 }
-                req.await
+                retry_telegram_rate_limit(|| req.clone())
+                    .await
                     .map_err(|e| anyhow::anyhow!("Failed to send document: {}", e))?;
             }
         }
@@ -5232,17 +5239,34 @@ async fn send_html_or_fallback(
     html: &str,
     plain: &str,
 ) -> Result<(), teloxide::RequestError> {
-    match bot
-        .send_message(chat_id, html)
-        .parse_mode(ParseMode::Html)
+    match retry_telegram_rate_limit(|| bot.send_message(chat_id, html).parse_mode(ParseMode::Html))
         .await
     {
         Ok(_) => Ok(()),
         Err(e) => {
             warn!("HTML send failed, falling back to plain text: {}", e);
-            bot.send_message(chat_id, plain).await?;
+            retry_telegram_rate_limit(|| bot.send_message(chat_id, plain)).await?;
             Ok(())
         }
+    }
+}
+
+async fn retry_telegram_rate_limit<Op, Req, T>(mut op: Op) -> Result<T, RequestError>
+where
+    Op: FnMut() -> Req,
+    Req: std::future::IntoFuture<Output = Result<T, RequestError>>,
+{
+    match op().into_future().await {
+        Ok(value) => Ok(value),
+        Err(RequestError::RetryAfter(after)) => {
+            let delay = crate::channels::rate_limit::bounded_retry_after(
+                after.duration(),
+                crate::channels::rate_limit::default_retry_after_cap(),
+            );
+            crate::channels::rate_limit::sleep_after_rate_limit("telegram", delay).await;
+            op().into_future().await
+        }
+        Err(err) => Err(err),
     }
 }
 
