@@ -245,7 +245,6 @@ fn looks_like_error_signal(lower: &str) -> bool {
             "404 not found",
             "no such file",
             "status code ",
-            "http/",
             "timed out",
             "timeout",
             "rate limit",
@@ -515,10 +514,17 @@ pub(super) fn classify_tool_result_failure(
         return None;
     }
 
+    let mut saw_success_http_status = false;
     if let Some(status) = extract_http_status_from_text(cleaned) {
         if let Some(kind) = classify_http_status(status) {
             return Some(kind);
         }
+        // A parseable 2xx/3xx status is success evidence (e.g. a sub-agent
+        // quoting `HTTP/2 200` from curl output). Suppress the generic
+        // keyword scan below, which would otherwise misread the quoted
+        // status line as an error signal; JSON and exit-code checks still
+        // run.
+        saw_success_http_status = true;
     }
 
     // External data tools (http_request, web_fetch) return content that
@@ -559,7 +565,7 @@ pub(super) fn classify_tool_result_failure(
     // the command clearly ran and returned data. Error-related keywords
     // in the output (e.g. pytest headers, test names containing "error")
     // are content, not actual errors. Only flag short outputs.
-    if looks_like_error_signal(&lower) {
+    if !saw_success_http_status && looks_like_error_signal(&lower) {
         if matches!(tool_name, "terminal" | "run_command") && cleaned.len() > 500 {
             return None;
         }
@@ -950,6 +956,41 @@ mod tool_error_detection_tests {
     #[test]
     fn detects_spawn_agent_timeout_as_transient_error() {
         let result = "Error: specialist timed out after 300 seconds";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn successful_answer_quoting_http_2xx_is_not_a_failure() {
+        // Live repro from telemetry 2026-06-30: a sub-agent verified a blog
+        // post with `curl -I`, quoted the HTTP/2 200 response, and the
+        // classifier marked the success as a Semantic failure via the
+        // "http/" keyword, injecting "The error says: The blog post is
+        // live..." coaching into the parent loop.
+        let result = "The blog post is live. The `curl -I` command returned an **HTTP 200** status code.\n\n\
+**Command run**:\n`curl -I https://blog.example.com/posts/synthetic-post/`\n\n\
+**Output**:\n```http\nHTTP/2 200 \ndate: Tue, 30 Jun 2026 15:21:40 GMT\ncontent-type: text/html\ncf-cache-status: MISS\nserver: cloudflare\n```";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn successful_answer_mentioning_status_code_2xx_is_not_a_failure() {
+        let result = "Verified: the endpoint returned status code 200 and the payload matched.";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn mentioning_http_protocol_version_without_status_is_not_a_failure() {
+        let result = "The connection was upgraded to HTTP/2 and the site loads correctly.";
+        let classified = classify_tool_result_failure("spawn_agent", result);
+        assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn http_error_status_in_answer_still_classifies_as_failure() {
+        let result = "The request failed. Response line: HTTP/1.1 503 Service Unavailable";
         let classified = classify_tool_result_failure("spawn_agent", result);
         assert_eq!(classified, Some(ToolFailureClass::Transient));
     }
