@@ -1308,6 +1308,13 @@ pub(super) async fn run_completion_phase(
         // actually called, nudge the model to complete the file modification.
         // This catches the case where the model reads files and generates
         // analysis text but never calls write_file to save the result.
+        //
+        // An honest admission that the deliverable could not be produced or
+        // found is NOT a fabricated completion — blocking it only forces the
+        // model to re-generate the same truthful answer (observed live: a
+        // "couldn't find that file" reply blocked 3 times, ~5 minutes of
+        // re-decode). The gate targets false success claims and content
+        // dumps, both of which lack such an admission.
         if !force_text_fast_path_accepted
             && !force_text_response
             && agent.depth == 0
@@ -1315,6 +1322,7 @@ pub(super) async fn run_completion_phase(
             && completion_progress.mutation_count == 0
             && has_tool_attempts
             && stall_count < 2
+            && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
             && agent
                 .supervision_gate_enforced(
                     "mutation_contract_block",

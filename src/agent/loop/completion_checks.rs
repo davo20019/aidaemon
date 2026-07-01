@@ -625,6 +625,42 @@ fn claims_unqualified_success(reply_lower: &str) -> bool {
         .is_match(reply_lower)
 }
 
+/// Whether the reply honestly reports that the requested deliverable could
+/// not be produced or found. Such a reply contains no fabricated claim, so
+/// the mutation-contract gate must let it through instead of forcing the
+/// model to re-answer. Deliberately narrower than
+/// [`mentions_failure_or_partial`]: generic words like "error" appear in
+/// legitimately pasted content, and this predicate weakens an
+/// anti-fabrication gate.
+pub(super) fn reply_admits_unfulfilled_request(reply: &str) -> bool {
+    let lower = reply.to_ascii_lowercase();
+    if claims_unqualified_success(&lower) {
+        return false;
+    }
+    [
+        "couldn't find",
+        "could not find",
+        "couldn't locate",
+        "could not locate",
+        "didn't find",
+        "did not find",
+        "no file",
+        "no such file",
+        "doesn't exist",
+        "does not exist",
+        "wasn't able to",
+        "was not able to",
+        "unable to",
+        "couldn't complete",
+        "could not complete",
+        "couldn't send",
+        "could not send",
+        "not found",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn mentions_failure_or_partial(reply_lower: &str) -> bool {
     [
         "failed",
@@ -790,7 +826,8 @@ mod tests {
         build_structured_tool_output_completion_reply, build_tool_output_completion_reply,
         choose_completion_recovery_candidate, extract_structured_tool_output_excerpt,
         looks_like_idle_reengagement_reply, looks_like_recovery_message_with_trivial_content,
-        reply_acknowledges_outcome_reconciliation, should_enforce_no_tool_text_when_tools_required,
+        reply_acknowledges_outcome_reconciliation, reply_admits_unfulfilled_request,
+        should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output, tool_output_completion_prefix,
         CompletionRecoveryCandidate,
     };
@@ -1307,6 +1344,38 @@ mod tests {
         assert!(!reply_acknowledges_outcome_reconciliation(
             "All tweets successfully completed!",
             &reconciliation
+        ));
+    }
+
+    #[test]
+    fn honest_unavailability_reply_admits_unfulfilled_request() {
+        // Live repro (task d78444e5): "Send me my makpar resume" — the file
+        // does not exist, the model answered honestly, and the mutation gate
+        // blocked that answer 3 times (~5 minutes of re-generation). An
+        // honest admission of unfulfillment contains no fabricated claim and
+        // must not be treated as one.
+        let reply = "I couldn't find a file specifically named \"makpar resume\" in your projects or resume folders. I did find your project files for Makpar, but no resume file associated with that name. Would you like me to send the general resume instead?";
+        assert!(reply_admits_unfulfilled_request(reply));
+    }
+
+    #[test]
+    fn success_claims_and_content_dumps_do_not_admit_unfulfillment() {
+        // Fabricated completion — the gate's core target — must still block.
+        assert!(!reply_admits_unfulfilled_request(
+            "Done! I've sent the resume to you."
+        ));
+        // Narrating readiness without acting must still block.
+        assert!(!reply_admits_unfulfilled_request(
+            "I've activated Slack and I'm ready to proceed with sending your message."
+        ));
+        // Dumping requested file content as chat text must still block.
+        assert!(!reply_admits_unfulfilled_request(
+            "Here is the rewritten config:\n\nserver:\n  port: 8080\n  workers: 4"
+        ));
+        // An inability phrase buried in an unqualified success claim is not
+        // an honest admission.
+        assert!(!reply_admits_unfulfilled_request(
+            "All tasks completed successfully! (One asset couldn't be found but I substituted it.)"
         ));
     }
 
