@@ -90,6 +90,26 @@ impl RequestedActionSummary {
         let satisfied = actions.values().filter(|&&satisfied| satisfied).count() as u32;
         let unresolved = required.saturating_sub(satisfied);
 
+        if unresolved > 0 {
+            tracing::info!(
+                required,
+                satisfied,
+                unresolved,
+                "Task outcome bookkeeping: unresolved required actions"
+            );
+            // Keys are normalized from user-request text; keep them out of
+            // the plaintext INFO log (the DB is encrypted, the log is not).
+            let unresolved_keys: Vec<&str> = actions
+                .iter()
+                .filter(|(_, &satisfied)| !satisfied)
+                .map(|(key, _)| key.as_str())
+                .collect();
+            tracing::debug!(
+                ?unresolved_keys,
+                "Task outcome bookkeeping: unresolved required action keys"
+            );
+        }
+
         Self {
             required,
             satisfied,
