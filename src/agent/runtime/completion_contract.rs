@@ -714,6 +714,25 @@ fn current_request_segment(text: &str) -> &str {
     text
 }
 
+/// Narrow a freshly inferred contract to what a delegated executor child can
+/// actually satisfy on its own.
+///
+/// An executor runs one narrowly-scoped step of a decomposed plan; the
+/// orchestrating parent owns goal-level verification and routinely delegates
+/// it to a sibling task. Reverification inferred from mutation-flavored
+/// phrases ("deploy", "publish") in the mission would demand a verification
+/// the child was never asked to perform — and stamp a fully successful step
+/// `partial`. Reverification survives only when the mission itself asks for
+/// it.
+pub(super) fn scope_contract_for_delegated_executor(
+    mut contract: CompletionContract,
+) -> CompletionContract {
+    if !contract.explicit_verification_requested {
+        contract.requires_reverification_after_mutation = false;
+    }
+    contract
+}
+
 pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -740,7 +759,15 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     // still influences system prompt hints and budget routing but does
     // not override the signal-derived task kind or mutation expectation.
 
-    let expects_mutation = if connected_content_mode.expects_live_delivery() {
+    // The live-delivery content mode must not override an explicitly
+    // read-only request: "check if the post is live" is a Check whose
+    // fulfillment is the observation itself, not a delivery.
+    let live_delivery_override = connected_content_mode.expects_live_delivery()
+        && !matches!(
+            task_kind,
+            CompletionTaskKind::Check | CompletionTaskKind::Find
+        );
+    let expects_mutation = if live_delivery_override {
         true
     } else {
         matches!(
@@ -783,6 +810,64 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_only_check_mission_does_not_expect_mutation_despite_live_content_mode() {
+        // Live repro (task 6680789b): a sub-agent's verification mission
+        // mentioning "the post is live" classified as DeliverOnly content
+        // mode, whose expects_live_delivery() override forced
+        // expects_mutation=true onto a Check task. The child made its
+        // observation perfectly and still scored partial.
+        let contract = infer_completion_contract(
+            "Use `curl -I https://blog.example.com/posts/synthetic-post/` to check if the post is live. Expect an HTTP 200 status code.",
+            &[],
+        );
+        assert_eq!(contract.task_kind, CompletionTaskKind::Check);
+        assert!(
+            !contract.expects_mutation,
+            "a read-only check must not expect a mutation"
+        );
+        assert!(contract.requires_observation);
+    }
+
+    #[test]
+    fn genuine_live_delivery_request_still_expects_mutation() {
+        // Control: the live-delivery override must keep applying to requests
+        // that actually ask for content to be delivered.
+        let contract = infer_completion_contract(
+            "Write a short announcement and post it to the blog so it goes live.",
+            &[],
+        );
+        assert!(contract.expects_mutation);
+    }
+
+    #[test]
+    fn executor_scope_clears_implicit_reverification_only() {
+        // Live repro (task 9437a263): an executor child whose whole mission
+        // was "run `npm run deploy`" carried
+        // requires_reverification_after_mutation=true from the "deploy"
+        // phrase, though the parent decomposed verification into a sibling
+        // task. The child deployed successfully and still scored partial.
+        let deploy = infer_completion_contract(
+            "1. Navigate to `~/projects/example-blog`.\n2. Run `npm run deploy`.\n3. Report the output of the command.",
+            &[],
+        );
+        assert!(deploy.requires_reverification_after_mutation);
+        let scoped = scope_contract_for_delegated_executor(deploy);
+        assert!(
+            !scoped.requires_reverification_after_mutation,
+            "implicit reverification must not survive executor scoping"
+        );
+
+        // Explicit verification requested in the mission itself must survive.
+        let explicit = infer_completion_contract(
+            "Run `npm run deploy` in ~/projects/example-blog, then verify the site returns HTTP 200.",
+            &[],
+        );
+        assert!(explicit.explicit_verification_requested);
+        let scoped = scope_contract_for_delegated_executor(explicit);
+        assert!(scoped.requires_reverification_after_mutation);
+    }
 
     #[test]
     fn visible_issue_contract_requires_observation_and_reverification() {

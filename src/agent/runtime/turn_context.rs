@@ -6,7 +6,9 @@
 //! unchanged. The project-hint / project-scope extraction family lives in the
 //! sibling [`project_scope`](super::project_scope) module.
 
-use super::completion_contract::infer_completion_contract;
+use super::completion_contract::{
+    infer_completion_contract, scope_contract_for_delegated_executor,
+};
 use super::followup::{
     classify_followup_mode, find_previous_turns, has_project_scope_divergence_with_aliases,
     looks_like_multi_project_request, looks_like_scope_carryover_ack, sanitize_carryover_blocks,
@@ -334,8 +336,11 @@ impl Agent {
             allow_multi_project_scope,
             allow_scope_carryover,
         );
-        let completion_contract =
+        let mut completion_contract =
             infer_completion_contract(&goal_user_text, &self.path_aliases.projects);
+        if self.role() == crate::traits::AgentRole::Executor {
+            completion_contract = scope_contract_for_delegated_executor(completion_contract);
+        }
         TurnContext {
             goal_user_text,
             recent_messages: extract_recent_parent_messages(
