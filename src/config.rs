@@ -439,6 +439,14 @@ pub struct ProviderConfig {
     /// truncation-recovery path instead of failing the whole call.
     #[serde(default)]
     pub streaming: bool,
+    /// Models whose final (no-tool-call) answers are re-issued through a
+    /// tool-less, schema-constrained `{reasoning, response}` second pass
+    /// before delivery. For models (e.g. local Gemma via llama.cpp) that emit
+    /// raw undelimited chain-of-thought as their answer body under
+    /// challenge/truncation-recovery turns. Matched by exact model name;
+    /// empty (disabled) by default. OpenAI-compatible providers only.
+    #[serde(default)]
+    pub structured_answer_models: Vec<String>,
     #[serde(default)]
     pub models: ModelsConfig,
     /// Ordered cross-provider fallback chain.
@@ -3850,6 +3858,35 @@ primary = "gemma-4-26b"
 "#;
         let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
         assert!(cfg.provider.llama_cpp_thinking);
+    }
+
+    #[test]
+    fn provider_structured_answer_models_defaults_to_empty() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+
+[provider.models]
+primary = "gemma-4-26b"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert!(cfg.provider.structured_answer_models.is_empty());
+    }
+
+    #[test]
+    fn provider_structured_answer_models_parses_when_set() {
+        let toml = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "test-key"
+structured_answer_models = ["gemma-4-26b"]
+
+[provider.models]
+primary = "gemma-4-26b"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse app config");
+        assert_eq!(cfg.provider.structured_answer_models, vec!["gemma-4-26b"]);
     }
 
     #[test]

@@ -42,7 +42,8 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
             .with_reasoning_effort(config.reasoning_effort.clone())
             .with_llama_cpp_thinking(config.llama_cpp_thinking)
             .with_slot_routing(config.slot_routing.clone())
-            .with_streaming(config.streaming),
+            .with_streaming(config.streaming)
+            .with_structured_answer_models(config.structured_answer_models.clone()),
         ),
         ProviderKind::XaiNative => Arc::new(
             crate::providers::XaiNativeProvider::new_with_options(

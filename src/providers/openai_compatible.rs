@@ -38,6 +38,13 @@ pub struct OpenAiCompatibleProvider {
     /// partial text is reported as a `length` cutoff so truncation recovery
     /// continues it instead of losing the response.
     streaming: bool,
+    /// Models whose final (no-tool-call) answers are re-issued through a
+    /// tool-less, schema-constrained `{reasoning, response}` second pass.
+    /// For models (local Gemma) that emit raw undelimited chain-of-thought AS
+    /// their answer body on challenge/truncation-recovery turns; a JSON
+    /// grammar cannot coexist with tool calls, hence intercept-and-reissue.
+    /// Matched by exact model name; empty (off) by default.
+    structured_answer_models: Vec<String>,
 }
 
 impl Drop for OpenAiCompatibleProvider {
@@ -104,6 +111,353 @@ fn normalize_tool_name(name: &str) -> String {
     name.trim().to_string()
 }
 
+/// Why a response `content` string looks like it may carry leaked model
+/// reasoning that the provider/server failed to split into a structured
+/// `reasoning`/`reasoning_content` field.
+///
+/// Diagnostic only — this classification never changes delivery; it exists so
+/// the next real occurrence of the intermittent reasoning-leak (raw
+/// chain-of-thought reaching a user) is captured with ground truth. The
+/// distinction matters for the fix: a `Delimited` leak can be stripped
+/// deterministically at the boundary, whereas `UndelimitedProse` cannot and is
+/// the only case that would justify envelope/schema enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningLeakSignal {
+    /// Content carries an explicit thinking delimiter (e.g. `<think>`).
+    Delimited,
+    /// No delimiter, but content reads as first-person meta-deliberation about
+    /// the user/task, or echoes daemon-internal prompt scaffolding.
+    UndelimitedProse,
+}
+
+/// Heuristically classify whether `content` looks like leaked reasoning.
+///
+/// Intended to be called only when the structured reasoning field came back
+/// empty; a non-empty reasoning field means the split already worked. Tuned for
+/// precision on the scaffold-echo and delimiter signals (near-zero false
+/// positives); the prose path requires two distinct deliberation markers so a
+/// single incidental phrase in a genuine answer does not trip it.
+fn classify_possible_reasoning_leak(content: &str) -> Option<ReasoningLeakSignal> {
+    let trimmed = content.trim();
+    if trimmed.len() < 40 {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+
+    // Explicit thinking delimiters emitted by various chat templates. Any hit is
+    // an unambiguous split failure.
+    const DELIMITERS: &[&str] = &[
+        "<think>",
+        "</think>",
+        "◁think▷",
+        "◁/think▷",
+        "<start_of_thinking>",
+        "</start_of_thinking>",
+        "<end_of_thinking>",
+        "<|thinking|>",
+        "<|end_thinking|>",
+    ];
+    if DELIMITERS.iter().any(|d| lower.contains(d)) {
+        return Some(ReasoningLeakSignal::Delimited);
+    }
+
+    // Daemon-internal prompt scaffolding echoed back into an outbound reply is a
+    // strong leak signal: these markers are internal and should never appear in
+    // user-visible content.
+    const SCAFFOLD_ECHOES: &[&str] = &["original request:", "follow-up:"];
+    if SCAFFOLD_ECHOES.iter().any(|m| lower.contains(m)) {
+        return Some(ReasoningLeakSignal::UndelimitedProse);
+    }
+
+    // First-person meta-deliberation about the user/task. Two distinct markers
+    // required to fire.
+    const DELIBERATION_MARKERS: &[&str] = &[
+        "the user is",
+        "the user wants",
+        "the user said",
+        "it seems the user",
+        "since they said",
+        "i should acknowledge",
+        "i should respond",
+        "i'll acknowledge",
+        "i will acknowledge",
+        "let me think",
+        "wait, looking",
+        "communication preferences",
+    ];
+    let hits = DELIBERATION_MARKERS
+        .iter()
+        .filter(|m| lower.contains(**m))
+        .count();
+    if hits >= 2 {
+        return Some(ReasoningLeakSignal::UndelimitedProse);
+    }
+
+    None
+}
+
+/// Outcome of parsing the structured `{reasoning, response}` second-pass body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StructuredAnswerParse {
+    /// Valid JSON with a non-blank `response`.
+    Complete { reasoning: String, response: String },
+    /// Invalid JSON (typically max_tokens truncation mid-string) but the
+    /// user-visible `response` prefix was salvageable.
+    Partial { response: String },
+    /// Nothing user-deliverable could be extracted.
+    Unusable,
+}
+
+/// What to deliver after the structured second pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecondPassResolution {
+    Deliver {
+        response: String,
+        reasoning: Option<String>,
+        truncated: bool,
+    },
+    /// Truncation on the first attempt: retry once with a larger token cap.
+    RetryLarger,
+    /// Second pass unusable but the draft is not reasoning-shaped: ship it.
+    UseDraft,
+    /// Second pass unusable AND the draft looks like leaked reasoning:
+    /// deliver an honest failure instead of raw chain-of-thought.
+    Suppress,
+}
+
+/// Instruction appended at the END of the message list (not the system
+/// prompt) for the structured second pass, so the llama.cpp prompt cache
+/// reuses the first pass's prefill for the shared prefix — a system-prompt
+/// edit would force a full cold re-prefill of the whole conversation.
+const STRUCTURED_ANSWER_INSTRUCTION: &str = "Format your reply as a JSON object with two \
+string fields, in this order: \"reasoning\" then \"response\". Put ALL analysis, counting, \
+double-checking, self-correction, and notes about this conversation in \"reasoning\" — none \
+of it in \"response\". \"response\" is the only text the user will see: the final, polished \
+reply to my last message — direct and complete, with no deliberation, no apologies for \
+earlier drafts, and no commentary about the conversation or your own process.";
+
+/// User-visible text for the one combination where nothing safe can ship:
+/// the second pass produced nothing usable AND the draft is leaked reasoning.
+const STRUCTURED_ANSWER_SUPPRESSED_MSG: &str = "I ran into a formatting problem while \
+finalizing this reply and don't have a clean answer to send. Please ask again.";
+
+/// JSON schema for the structured final answer. The user-visible field is
+/// named `response` (not `answer`) because serde_json serializes object keys
+/// alphabetically and llama.cpp compiles the schema into a grammar in wire
+/// order: `reasoning` must decode BEFORE the user-visible field so the model
+/// drains its deliberation first ("rea" < "res"). Renaming either field can
+/// silently flip that order and re-open the leak.
+fn structured_answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "All deliberation, checking, and self-correction. Never shown to the user."
+            },
+            "response": {
+                "type": "string",
+                "description": "The final user-visible reply. Polished and complete; no deliberation."
+            }
+        },
+        "required": ["reasoning", "response"],
+        "additionalProperties": false
+    })
+}
+
+fn append_answer_instruction(messages: &[Value]) -> Vec<Value> {
+    let mut out = messages.to_vec();
+    if let Some(last) = out.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(text) = last.get("content").and_then(Value::as_str) {
+                let combined = format!("{}\n\n{}", text, STRUCTURED_ANSWER_INSTRUCTION);
+                last["content"] = json!(combined);
+                return out;
+            }
+        }
+    }
+    out.push(json!({"role": "user", "content": STRUCTURED_ANSWER_INSTRUCTION}));
+    out
+}
+
+/// Best-effort extraction of a string field's value from truncated/invalid
+/// JSON: finds `"<key>"`, skips to the opening quote, then decodes JSON
+/// string escapes until the closing quote or end of input.
+fn salvage_json_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let start = text.find(&needle)? + needle.len();
+    let mut chars = text[start..].chars().peekable();
+    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+        chars.next();
+    }
+    if chars.next() != Some(':') {
+        return None;
+    }
+    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+        chars.next();
+    }
+    if chars.next() != Some('"') {
+        return None;
+    }
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000C}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        out.push(ch);
+                    }
+                }
+                // Covers \" \\ \/ — the escaped char is itself.
+                Some(other) => out.push(other),
+                None => break,
+            },
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+fn parse_structured_answer(raw: &str) -> StructuredAnswerParse {
+    let mut text = raw.trim();
+    // A non-grammar backend (e.g. cloud fallback) may fence the JSON.
+    if let Some(rest) = text.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.trim_start();
+        text = rest.strip_suffix("```").map(str::trim_end).unwrap_or(rest);
+    }
+    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) {
+        let response = obj.get("response").and_then(Value::as_str).unwrap_or("");
+        if !response.trim().is_empty() {
+            let reasoning = obj.get("reasoning").and_then(Value::as_str).unwrap_or("");
+            return StructuredAnswerParse::Complete {
+                reasoning: reasoning.to_string(),
+                response: response.to_string(),
+            };
+        }
+        return StructuredAnswerParse::Unusable;
+    }
+    match salvage_json_string_field(text, "response") {
+        Some(response) if !response.trim().is_empty() => {
+            StructuredAnswerParse::Partial { response }
+        }
+        _ => StructuredAnswerParse::Unusable,
+    }
+}
+
+fn resolve_structured_answer(
+    parse: StructuredAnswerParse,
+    second_truncated: bool,
+    already_retried: bool,
+    draft_leaky: bool,
+) -> SecondPassResolution {
+    let can_retry = second_truncated && !already_retried;
+    match parse {
+        StructuredAnswerParse::Complete {
+            reasoning,
+            response,
+        } => SecondPassResolution::Deliver {
+            response,
+            reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
+            truncated: false,
+        },
+        StructuredAnswerParse::Partial { response } => {
+            if can_retry {
+                SecondPassResolution::RetryLarger
+            } else {
+                SecondPassResolution::Deliver {
+                    response,
+                    reasoning: None,
+                    truncated: true,
+                }
+            }
+        }
+        StructuredAnswerParse::Unusable => {
+            if can_retry {
+                SecondPassResolution::RetryLarger
+            } else if !draft_leaky {
+                SecondPassResolution::UseDraft
+            } else {
+                SecondPassResolution::Suppress
+            }
+        }
+    }
+}
+
+fn needs_structured_answer_pass(
+    models: &[String],
+    model: &str,
+    tools: &[Value],
+    options: &ChatOptions,
+    response: &ProviderResponse,
+) -> bool {
+    // No tools on the request means this is not the agent's answer turn (the
+    // second pass itself runs tool-less — this is also the recursion guard).
+    // Callers that already asked for structured output manage their own shape.
+    if tools.is_empty() || !matches!(options.response_mode, ResponseMode::Text) {
+        return false;
+    }
+    if !models.iter().any(|m| m == model) {
+        return false;
+    }
+    response.tool_calls.is_empty()
+        && response
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+}
+
+fn structured_answer_chat_options(base: &ChatOptions) -> ChatOptions {
+    let mut opts = base.clone();
+    opts.response_mode = ResponseMode::JsonSchema {
+        name: "final_answer".to_string(),
+        schema: structured_answer_schema(),
+        strict: true,
+    };
+    opts.tool_choice = ToolChoiceMode::None;
+    // Thinking OFF: the reasoning field replaces the thinking channel instead
+    // of duplicating it (duplication doubles decode and drives truncation).
+    opts.reasoning_effort_override = Some("off".to_string());
+    opts
+}
+
+fn merge_token_usage(base: Option<TokenUsage>, extra: Option<TokenUsage>) -> Option<TokenUsage> {
+    fn sum_u32(x: Option<u32>, y: Option<u32>) -> Option<u32> {
+        match (x, y) {
+            (None, v) | (v, None) => v,
+            (Some(x), Some(y)) => Some(x + y),
+        }
+    }
+    fn sum_f64(x: Option<f64>, y: Option<f64>) -> Option<f64> {
+        match (x, y) {
+            (None, v) | (v, None) => v,
+            (Some(x), Some(y)) => Some(x + y),
+        }
+    }
+    match (base, extra) {
+        (None, u) | (u, None) => u,
+        (Some(a), Some(b)) => Some(TokenUsage {
+            input_tokens: a.input_tokens + b.input_tokens,
+            output_tokens: a.output_tokens + b.output_tokens,
+            cached_input_tokens: sum_u32(a.cached_input_tokens, b.cached_input_tokens),
+            cache_creation_input_tokens: sum_u32(
+                a.cache_creation_input_tokens,
+                b.cache_creation_input_tokens,
+            ),
+            model: a.model,
+            prompt_ms: sum_f64(a.prompt_ms, b.prompt_ms),
+            decode_ms: sum_f64(a.decode_ms, b.decode_ms),
+        }),
+    }
+}
+
 impl OpenAiCompatibleProvider {
     #[allow(dead_code)]
     pub fn new(base_url: &str, api_key: &str) -> Result<Self, String> {
@@ -152,6 +506,7 @@ impl OpenAiCompatibleProvider {
             llama_cpp_thinking: false,
             slot_routing: SlotRoutingConfig::default(),
             streaming: false,
+            structured_answer_models: Vec::new(),
         })
     }
 
@@ -177,6 +532,13 @@ impl OpenAiCompatibleProvider {
     /// Enable SSE streaming transport (off by default).
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self
+    }
+
+    /// Enable the structured final-answer second pass for these exact model
+    /// names (off by default — empty list).
+    pub fn with_structured_answer_models(mut self, models: Vec<String>) -> Self {
+        self.structured_answer_models = models;
         self
     }
 
@@ -303,6 +665,31 @@ impl OpenAiCompatibleProvider {
                 thinking_len = thinking.as_ref().map(|t| t.len()).unwrap_or(0),
                 "Reasoning tokens received from provider"
             );
+        }
+
+        // Diagnostic (no behavior change): when the structured reasoning field is
+        // empty but `content` reads as reasoning, the provider/server did not
+        // separate the model's chain-of-thought — the exact condition behind the
+        // intermittent reasoning-leak (raw scratchpad reaching a user). Capture
+        // the final model + a bounded snippet so the next real occurrence reveals
+        // whether the leak is delimited (deterministic strip suffices) or
+        // undelimited prose (needs envelope/schema enforcement). See
+        // docs/final-answer-structured-output-audit.md.
+        if thinking.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            if let Some(content_str) = content.as_deref() {
+                if let Some(signal) = classify_possible_reasoning_leak(content_str) {
+                    let snippet: String = content_str.trim().chars().take(500).collect();
+                    warn!(
+                        model,
+                        signal = ?signal,
+                        content_len = content_str.len(),
+                        has_tool_calls = !tool_calls.is_empty(),
+                        snippet = %snippet,
+                        "Possible reasoning leak: content looks reasoning-shaped but \
+                         structured reasoning field is empty (candidate final-answer leak)"
+                    );
+                }
+            }
         }
 
         Ok(ProviderResponse {
@@ -578,21 +965,11 @@ impl OpenAiCompatibleProvider {
 
         body
     }
-}
 
-#[async_trait]
-impl ModelProvider for OpenAiCompatibleProvider {
-    async fn chat(
-        &self,
-        model: &str,
-        messages: &[Value],
-        tools: &[Value],
-    ) -> anyhow::Result<ProviderResponse> {
-        self.chat_with_options(model, messages, tools, &ChatOptions::default())
-            .await
-    }
-
-    async fn chat_with_options(
+    /// Execute one buffered/streaming chat request. This is the raw
+    /// transport; `chat_with_options` layers the structured final-answer
+    /// interception on top of it.
+    async fn execute_chat_request(
         &self,
         model: &str,
         messages: &[Value],
@@ -703,6 +1080,172 @@ impl ModelProvider for OpenAiCompatibleProvider {
         Self::parse_chat_response_body(&data, model)
     }
 
+    /// Second, tool-less, grammar-constrained pass over the same conversation
+    /// producing the final user-visible answer as `{reasoning, response}`.
+    ///
+    /// Exists because some local models (Gemma) emit raw undelimited
+    /// chain-of-thought AS the answer body on challenge/truncation-recovery
+    /// turns, and no thinking-config lever cleans it — the only reliable fix
+    /// is an output boundary on the answer turn. A JSON grammar cannot
+    /// coexist with live tools, hence intercept-and-reissue. Never errors:
+    /// every failure mode degrades to the draft (if clean) or an honest
+    /// failure notice (if the draft is leaked reasoning).
+    async fn run_structured_answer_pass(
+        &self,
+        model: &str,
+        messages: &[Value],
+        options: &ChatOptions,
+        first: ProviderResponse,
+    ) -> ProviderResponse {
+        let draft = first.content.clone().unwrap_or_default();
+        let draft_leak = classify_possible_reasoning_leak(&draft);
+        info!(
+            model,
+            draft_len = draft.len(),
+            draft_leak = ?draft_leak,
+            "Structured answer pass: re-issuing final answer through schema"
+        );
+        let second_messages = append_answer_instruction(messages);
+        let mut second_options = structured_answer_chat_options(options);
+        let mut usage = first.usage.clone();
+        let mut retried = false;
+        let resolution = loop {
+            let second = match self
+                .execute_chat_request(model, &second_messages, &[], &second_options)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(model, error = %e, "Structured answer pass request failed");
+                    // Same policy as an unusable parse; transport retries are
+                    // the caller's job, not ours.
+                    break resolve_structured_answer(
+                        StructuredAnswerParse::Unusable,
+                        false,
+                        retried,
+                        draft_leak.is_some(),
+                    );
+                }
+            };
+            usage = merge_token_usage(usage, second.usage.clone());
+            // parse_chat_response_body sets response_note only for
+            // finish_reason=length, so its presence means truncation.
+            let second_truncated = second.response_note.is_some();
+            let parse = parse_structured_answer(second.content.as_deref().unwrap_or(""));
+            match resolve_structured_answer(parse, second_truncated, retried, draft_leak.is_some())
+            {
+                SecondPassResolution::RetryLarger => {
+                    retried = true;
+                    let bumped = options
+                        .max_tokens_override
+                        .or(self.max_tokens)
+                        .unwrap_or(2048)
+                        .saturating_mul(2);
+                    info!(
+                        model,
+                        bumped, "Structured answer truncated; retrying with larger cap"
+                    );
+                    second_options.max_tokens_override = Some(bumped);
+                }
+                other => break other,
+            }
+        };
+        match resolution {
+            SecondPassResolution::Deliver {
+                response,
+                reasoning,
+                truncated,
+            } => {
+                // Permanent telemetry: the "no rework in response" instruction
+                // is soft on a contract-unreliable model — this is how we find
+                // out when it stops holding.
+                if let Some(signal) = classify_possible_reasoning_leak(&response) {
+                    warn!(
+                        model,
+                        signal = ?signal,
+                        "Structured answer still reasoning-shaped after schema pass"
+                    );
+                }
+                let response_note = truncated.then(|| {
+                    "Final answer was truncated at the token limit; the delivered text may be \
+                     incomplete."
+                        .to_string()
+                });
+                ProviderResponse {
+                    content: Some(response),
+                    tool_calls: Vec::new(),
+                    usage,
+                    thinking: reasoning.or(first.thinking),
+                    response_note,
+                }
+            }
+            SecondPassResolution::UseDraft => {
+                info!(
+                    model,
+                    "Structured answer pass unusable; draft is clean, shipping draft"
+                );
+                ProviderResponse { usage, ..first }
+            }
+            SecondPassResolution::Suppress => {
+                warn!(
+                    model,
+                    draft_snippet = %draft.chars().take(300).collect::<String>(),
+                    "Structured answer pass unusable AND draft is reasoning-shaped; \
+                     suppressing draft"
+                );
+                ProviderResponse {
+                    content: Some(STRUCTURED_ANSWER_SUPPRESSED_MSG.to_string()),
+                    tool_calls: Vec::new(),
+                    usage,
+                    thinking: first.thinking,
+                    response_note: Some(
+                        "Structured answer pass failed and the draft looked like leaked \
+                         reasoning; delivered an honest failure notice instead."
+                            .to_string(),
+                    ),
+                }
+            }
+            SecondPassResolution::RetryLarger => unreachable!("retry handled in loop"),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiCompatibleProvider {
+    async fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> anyhow::Result<ProviderResponse> {
+        self.chat_with_options(model, messages, tools, &ChatOptions::default())
+            .await
+    }
+
+    async fn chat_with_options(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+        options: &ChatOptions,
+    ) -> anyhow::Result<ProviderResponse> {
+        let first = self
+            .execute_chat_request(model, messages, tools, options)
+            .await?;
+        if !needs_structured_answer_pass(
+            &self.structured_answer_models,
+            model,
+            tools,
+            options,
+            &first,
+        ) {
+            return Ok(first);
+        }
+        Ok(self
+            .run_structured_answer_pass(model, messages, options, first)
+            .await)
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let primary_url = format!("{}/models", self.base_url);
         let primary_resp = self
@@ -760,6 +1303,491 @@ mod tests {
     fn test_https_accepted() {
         let result = validate_base_url("https://api.openai.com");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reasoning_leak_delimited_think_tags() {
+        let c = "<think>The user is testing me, I should keep it brief.</think>\n\nUnderstood.";
+        assert_eq!(
+            classify_possible_reasoning_leak(c),
+            Some(ReasoningLeakSignal::Delimited)
+        );
+    }
+
+    #[test]
+    fn reasoning_leak_scaffold_echo_is_prose_signal() {
+        // The 2026-06-30 incident: internal "Original request:" / "Follow-up:"
+        // scaffolding echoed verbatim into an outbound reply.
+        let c = "It's almost like they are providing a log or a summary of their own \
+                 test.\nOriginal request: [text]\nFollow-up: [text]\nI'll acknowledge it.";
+        assert_eq!(
+            classify_possible_reasoning_leak(c),
+            Some(ReasoningLeakSignal::UndelimitedProse)
+        );
+    }
+
+    #[test]
+    fn reasoning_leak_undelimited_deliberation_prose() {
+        // Reconstructed from the incident: first-person meta-deliberation with
+        // multiple distinct markers, no delimiter, no scaffold echo.
+        let c = "It seems the user is providing context or summarizing what they were \
+                 doing. Since they said \"nothing needed\", I should acknowledge the \
+                 explanation. I'll keep it brief as per the communication preferences.";
+        assert_eq!(
+            classify_possible_reasoning_leak(c),
+            Some(ReasoningLeakSignal::UndelimitedProse)
+        );
+    }
+
+    #[test]
+    fn reasoning_leak_clean_answer_does_not_fire() {
+        // The actual clean answer the live server produced for the same prompt.
+        let c = "Yes, a brief acknowledgment like \"Understood\" is polite and confirms \
+                 you are functioning correctly.";
+        assert_eq!(classify_possible_reasoning_leak(c), None);
+    }
+
+    #[test]
+    fn reasoning_leak_single_marker_does_not_fire() {
+        // One incidental deliberation phrase in a genuine answer must not trip it.
+        let c = "The user is asking about the weather, and it looks clear all week.";
+        assert_eq!(classify_possible_reasoning_leak(c), None);
+    }
+
+    #[test]
+    fn reasoning_leak_short_content_does_not_fire() {
+        assert_eq!(classify_possible_reasoning_leak("<think>hi</think>"), None);
+    }
+
+    // === Structured final-answer second pass ===
+
+    #[test]
+    fn structured_answer_schema_orders_reasoning_before_response() {
+        // llama.cpp builds its grammar in wire order, and serde_json serializes
+        // keys alphabetically — the drain field must decode before the
+        // user-visible one or the whole mechanism is defeated.
+        let serialized = serde_json::to_string(&structured_answer_schema()).unwrap();
+        let r = serialized.find("\"reasoning\"").expect("reasoning field");
+        let a = serialized.find("\"response\"").expect("response field");
+        assert!(
+            r < a,
+            "reasoning must serialize before response: {serialized}"
+        );
+        let schema = structured_answer_schema();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+    }
+
+    #[test]
+    fn parse_structured_answer_complete() {
+        let raw = r#"{"reasoning":"6 r's, 9.11 < 9.8","response":"There are 6 r's, and 9.11 is smaller."}"#;
+        match parse_structured_answer(raw) {
+            StructuredAnswerParse::Complete {
+                reasoning,
+                response,
+            } => {
+                assert_eq!(reasoning, "6 r's, 9.11 < 9.8");
+                assert_eq!(response, "There are 6 r's, and 9.11 is smaller.");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_answer_fenced_json() {
+        // A non-grammar backend (cloud fallback) may fence the JSON.
+        let raw = "```json\n{\"reasoning\":\"r\",\"response\":\"clean\"}\n```";
+        match parse_structured_answer(raw) {
+            StructuredAnswerParse::Complete { response, .. } => assert_eq!(response, "clean"),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_answer_truncated_mid_response_salvages_prefix() {
+        // max_tokens hit mid-string: invalid JSON, but the user-visible prefix
+        // is recoverable (with escapes decoded).
+        let raw = r#"{"reasoning":"long deliberation","response":"Line one.\nLine tw"#;
+        match parse_structured_answer(raw) {
+            StructuredAnswerParse::Partial { response } => {
+                assert_eq!(response, "Line one.\nLine tw");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_answer_truncated_mid_reasoning_is_unusable() {
+        let raw = r#"{"reasoning":"I will now re-count the letters carefu"#;
+        assert!(matches!(
+            parse_structured_answer(raw),
+            StructuredAnswerParse::Unusable
+        ));
+    }
+
+    #[test]
+    fn parse_structured_answer_escapes_in_salvage() {
+        let raw = r#"{"reasoning":"r","response":"She said \"hi\" A\\B"#;
+        match parse_structured_answer(raw) {
+            StructuredAnswerParse::Partial { response } => {
+                assert_eq!(response, "She said \"hi\" A\\B");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_structured_answer_garbage_is_unusable() {
+        assert!(matches!(
+            parse_structured_answer("not json at all"),
+            StructuredAnswerParse::Unusable
+        ));
+        assert!(matches!(
+            parse_structured_answer(""),
+            StructuredAnswerParse::Unusable
+        ));
+    }
+
+    #[test]
+    fn parse_structured_answer_empty_response_field_is_unusable() {
+        let raw = r#"{"reasoning":"thought about it","response":"   "}"#;
+        assert!(matches!(
+            parse_structured_answer(raw),
+            StructuredAnswerParse::Unusable
+        ));
+    }
+
+    #[test]
+    fn append_answer_instruction_extends_trailing_user_text() {
+        let messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"Are you sure?"}),
+        ];
+        let out = append_answer_instruction(&messages);
+        assert_eq!(out.len(), 2);
+        let content = out[1]["content"].as_str().unwrap();
+        assert!(content.starts_with("Are you sure?"));
+        assert!(content.contains("\"response\""));
+        // Prefix untouched so the llama.cpp prompt cache reuses the first
+        // pass's prefill.
+        assert_eq!(out[0], messages[0]);
+    }
+
+    #[test]
+    fn append_answer_instruction_appends_new_user_message_after_non_user() {
+        let messages = vec![
+            json!({"role":"user","content":"do it"}),
+            json!({"role":"assistant","content":null,"tool_calls":[]}),
+            json!({"role":"tool","content":"ok","tool_call_id":"1"}),
+        ];
+        let out = append_answer_instruction(&messages);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[3]["role"], "user");
+        assert!(out[3]["content"].as_str().unwrap().contains("\"response\""));
+    }
+
+    #[test]
+    fn append_answer_instruction_appends_new_user_message_for_block_content() {
+        let messages = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
+        let out = append_answer_instruction(&messages);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    fn text_response(content: &str) -> ProviderResponse {
+        ProviderResponse {
+            content: Some(content.to_string()),
+            tool_calls: vec![],
+            usage: None,
+            thinking: None,
+            response_note: None,
+        }
+    }
+
+    #[test]
+    fn needs_pass_fires_for_flagged_model_final_answer_with_tools_live() {
+        let models = vec!["gemma-4-26b".to_string()];
+        let tools = vec![json!({"type":"function"})];
+        assert!(needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &tools,
+            &ChatOptions::default(),
+            &text_response("Here is your answer.")
+        ));
+    }
+
+    #[test]
+    fn needs_pass_skips_unflagged_model() {
+        let models = vec!["gemma-4-26b".to_string()];
+        let tools = vec![json!({"type":"function"})];
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "other-model",
+            &tools,
+            &ChatOptions::default(),
+            &text_response("answer")
+        ));
+        assert!(!needs_structured_answer_pass(
+            &[],
+            "gemma-4-26b",
+            &tools,
+            &ChatOptions::default(),
+            &text_response("answer")
+        ));
+    }
+
+    #[test]
+    fn needs_pass_skips_when_no_tools_live() {
+        // Second pass itself runs with no tools — this is the recursion guard.
+        let models = vec!["gemma-4-26b".to_string()];
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &[],
+            &ChatOptions::default(),
+            &text_response("answer")
+        ));
+    }
+
+    #[test]
+    fn needs_pass_skips_tool_call_responses() {
+        let models = vec!["gemma-4-26b".to_string()];
+        let tools = vec![json!({"type":"function"})];
+        let mut resp = text_response("thinking about which tool");
+        resp.tool_calls.push(ToolCall {
+            id: "1".into(),
+            name: "web_search".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        });
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &tools,
+            &ChatOptions::default(),
+            &resp
+        ));
+    }
+
+    #[test]
+    fn needs_pass_skips_non_text_response_mode() {
+        // Callers that already requested structured output manage their own shape.
+        let models = vec!["gemma-4-26b".to_string()];
+        let tools = vec![json!({"type":"function"})];
+        let opts = ChatOptions {
+            response_mode: ResponseMode::JsonObject,
+            ..Default::default()
+        };
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &tools,
+            &opts,
+            &text_response("{}")
+        ));
+    }
+
+    #[test]
+    fn needs_pass_skips_blank_content() {
+        let models = vec!["gemma-4-26b".to_string()];
+        let tools = vec![json!({"type":"function"})];
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &tools,
+            &ChatOptions::default(),
+            &text_response("   ")
+        ));
+        let mut resp = text_response("");
+        resp.content = None;
+        assert!(!needs_structured_answer_pass(
+            &models,
+            "gemma-4-26b",
+            &tools,
+            &ChatOptions::default(),
+            &resp
+        ));
+    }
+
+    #[test]
+    fn structured_answer_options_disable_thinking_and_tools() {
+        let base = ChatOptions {
+            id_slot: Some(3),
+            max_tokens_override: Some(1000),
+            reasoning_effort_override: Some("high".into()),
+            ..Default::default()
+        };
+        let opts = structured_answer_chat_options(&base);
+        assert_eq!(opts.reasoning_effort_override.as_deref(), Some("off"));
+        assert_eq!(opts.tool_choice, ToolChoiceMode::None);
+        // Same slot: the second pass shares the first pass's KV prefix.
+        assert_eq!(opts.id_slot, Some(3));
+        assert_eq!(opts.max_tokens_override, Some(1000));
+        match &opts.response_mode {
+            ResponseMode::JsonSchema { name, strict, .. } => {
+                assert_eq!(name, "final_answer");
+                assert!(*strict);
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_pass_request_body_has_no_thinking_and_no_tools() {
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8081/v1", "k")
+            .unwrap()
+            .with_llama_cpp_thinking(true);
+        let opts = structured_answer_chat_options(&ChatOptions::default());
+        let body = provider.build_request_body(
+            "gemma-4-26b",
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            &opts,
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "thinking must be OFF on the answer pass"
+        );
+        assert_eq!(body["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn resolve_complete_delivers_answer_with_reasoning() {
+        let parse = StructuredAnswerParse::Complete {
+            reasoning: "checked twice".into(),
+            response: "It is 6.".into(),
+        };
+        assert_eq!(
+            resolve_structured_answer(parse, false, false, true),
+            SecondPassResolution::Deliver {
+                response: "It is 6.".into(),
+                reasoning: Some("checked twice".into()),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_partial_truncated_first_try_retries_larger() {
+        let parse = StructuredAnswerParse::Partial {
+            response: "half an ans".into(),
+        };
+        assert_eq!(
+            resolve_structured_answer(parse, true, false, true),
+            SecondPassResolution::RetryLarger
+        );
+    }
+
+    #[test]
+    fn resolve_partial_after_retry_delivers_truncated() {
+        let parse = StructuredAnswerParse::Partial {
+            response: "half an ans".into(),
+        };
+        assert_eq!(
+            resolve_structured_answer(parse, true, true, true),
+            SecondPassResolution::Deliver {
+                response: "half an ans".into(),
+                reasoning: None,
+                truncated: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_unusable_truncated_first_try_retries() {
+        assert_eq!(
+            resolve_structured_answer(StructuredAnswerParse::Unusable, true, false, true),
+            SecondPassResolution::RetryLarger
+        );
+    }
+
+    #[test]
+    fn resolve_unusable_clean_draft_falls_back_to_draft() {
+        // Most drafts are clean — a failed second pass must not lose them.
+        assert_eq!(
+            resolve_structured_answer(StructuredAnswerParse::Unusable, false, false, false),
+            SecondPassResolution::UseDraft
+        );
+        assert_eq!(
+            resolve_structured_answer(StructuredAnswerParse::Unusable, true, true, false),
+            SecondPassResolution::UseDraft
+        );
+    }
+
+    #[test]
+    fn resolve_unusable_leaky_draft_suppresses() {
+        // The one case that must never ship: raw chain-of-thought.
+        assert_eq!(
+            resolve_structured_answer(StructuredAnswerParse::Unusable, false, false, true),
+            SecondPassResolution::Suppress
+        );
+        assert_eq!(
+            resolve_structured_answer(StructuredAnswerParse::Unusable, true, true, true),
+            SecondPassResolution::Suppress
+        );
+    }
+
+    #[test]
+    fn merge_token_usage_sums_both_passes() {
+        let first = TokenUsage {
+            input_tokens: 14_000,
+            output_tokens: 300,
+            cached_input_tokens: Some(1_000),
+            cache_creation_input_tokens: None,
+            model: "gemma-4-26b".into(),
+            prompt_ms: Some(2_000.0),
+            decode_ms: Some(9_000.0),
+        };
+        let second = TokenUsage {
+            input_tokens: 14_400,
+            output_tokens: 200,
+            cached_input_tokens: Some(14_000),
+            cache_creation_input_tokens: None,
+            model: "gemma-4-26b".into(),
+            prompt_ms: Some(500.0),
+            decode_ms: Some(6_000.0),
+        };
+        let merged = merge_token_usage(Some(first), Some(second)).unwrap();
+        assert_eq!(merged.input_tokens, 28_400);
+        assert_eq!(merged.output_tokens, 500);
+        assert_eq!(merged.cached_input_tokens, Some(15_000));
+        assert_eq!(merged.prompt_ms, Some(2_500.0));
+        assert_eq!(merged.decode_ms, Some(15_000.0));
+        assert_eq!(merged.model, "gemma-4-26b");
+
+        assert!(merge_token_usage(None, None).is_none());
+        let only_second = merge_token_usage(
+            None,
+            Some(TokenUsage {
+                input_tokens: 5,
+                output_tokens: 7,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(only_second.input_tokens, 5);
+        assert_eq!(only_second.output_tokens, 7);
+    }
+
+    #[test]
+    fn parse_leaves_leaked_content_verbatim() {
+        // The diagnostic must not alter delivery: reasoning-shaped content with no
+        // structured reasoning field still round-trips unchanged.
+        let leaked = "It seems the user is testing me. I should acknowledge. Understood.";
+        let body = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": leaked },
+                "finish_reason": "stop"
+            }]
+        });
+        let resp =
+            OpenAiCompatibleProvider::parse_chat_response_body(&body, "gemma-4-26b").unwrap();
+        assert_eq!(resp.content.as_deref(), Some(leaked));
+        assert!(resp.thinking.is_none());
     }
 
     #[test]
