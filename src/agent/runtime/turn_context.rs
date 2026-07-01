@@ -851,4 +851,38 @@ mod tests {
         );
         assert!(!turn_context.completion_contract.requires_observation);
     }
+
+    #[tokio::test]
+    async fn build_turn_context_does_not_carry_prior_user_into_new_task_goal_text() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        harness
+            .state
+            .append_message(&msg(
+                "user",
+                "Yes, just testing your handling of garbled input, nothing needed.",
+            ))
+            .await
+            .expect("append prior user");
+        harness
+            .state
+            .append_message(&msg("assistant", "Understood."))
+            .await
+            .expect("append prior assistant");
+
+        let current = "Check whether thinking output is being exposed to the user.";
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", current)
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::NewTask));
+        assert_eq!(turn_context.goal_user_text, current);
+        assert!(!turn_context.goal_user_text.contains("Original request:"));
+        assert!(!turn_context.goal_user_text.contains("Current request:"));
+    }
 }
