@@ -114,6 +114,20 @@ pub fn truncation_notice_with_hint(
     )
 }
 
+/// Whether a line is harness-injected scaffolding (truncation notices,
+/// [SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
+/// tool output. Such lines are addressed to the model and must never be
+/// mistaken for error content or shipped to the user.
+pub fn is_internal_scaffolding_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.contains("OUTPUT TRUNCATED")
+        || trimmed.starts_with("[SYSTEM]")
+        || trimmed.starts_with("[DIAGNOSTIC]")
+        || trimmed.starts_with("[TOOL STATS]")
+        || trimmed.starts_with("[UNTRUSTED EXTERNAL DATA")
+        || trimmed.starts_with("[END UNTRUSTED")
+}
+
 /// Extract a JSON object from LLM output, handling code fences and preamble text.
 /// Tries direct parse first, then falls back to finding `{...}` bounds.
 pub fn extract_json_object(raw: &str) -> Option<String> {

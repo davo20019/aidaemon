@@ -19,6 +19,7 @@ const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
 pub(super) fn extract_error_summary_line(result_text: &str) -> Option<String> {
     result_text
         .lines()
+        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
         .find(|l| {
             l.contains("API ERROR")
                 || l.contains("Error")
@@ -704,6 +705,30 @@ mod tests {
         default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
     };
     use crate::traits::ToolCallEffect;
+
+    #[test]
+    fn error_summary_skips_harness_truncation_notice() {
+        // Live repro (task 29a8c716): the truncation notice's own wording
+        // ("inventing the omitted content is an error") matched the keyword
+        // scan, so the harness-injected notice — not the real error — became
+        // the ledger's error_summary and was later shipped to the user via
+        // the reconciliation fallback reply.
+        let result_text = format!(
+            "{}\nsome command output line\nError: No such file or directory\n",
+            crate::utils::truncation_notice(4000, 4265)
+        );
+        let summary = extract_error_summary_line(&result_text);
+        assert_eq!(summary.as_deref(), Some("Error: No such file or directory"));
+    }
+
+    #[test]
+    fn error_summary_is_none_when_only_scaffolding_matches() {
+        let result_text = format!(
+            "{}\nplain output with no failures\n[SYSTEM] IMPORTANT — The error says: \"something\"\n",
+            crate::utils::truncation_notice(4000, 4265)
+        );
+        assert_eq!(extract_error_summary_line(&result_text), None);
+    }
 
     #[test]
     fn internal_scope_violation_detects_session_mismatch() {

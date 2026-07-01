@@ -774,6 +774,9 @@ pub(super) fn build_outcome_reconciliation_fallback_reply(reconciliation: &str) 
                 std::sync::LazyLock::new(|| regex::Regex::new(r" at iteration \d+").unwrap());
             RE.replace_all(l, "").to_string()
         })
+        // Attempt-detail lines can carry model-facing scaffolding (e.g. a
+        // truncation notice captured as an error summary) — never ship it.
+        .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
         .collect::<Vec<_>>()
         .join("\n");
     format!("Here's what happened:\n\n{}", cleaned)
@@ -1305,6 +1308,23 @@ mod tests {
             "All tweets successfully completed!",
             &reconciliation
         ));
+    }
+
+    #[test]
+    fn fallback_reply_omits_internal_scaffolding_lines() {
+        // Live repro (task 29a8c716): a contaminated attempt-detail line
+        // carrying the model-facing truncation notice reached the user
+        // verbatim ("- terminal: [⚠ OUTPUT TRUNCATED — ... Do NOT
+        // enumerate..."). Whatever upstream produces, the user-facing
+        // fallback must never ship harness scaffolding.
+        let reconciliation = format!(
+            "[SYSTEM] External mutation attempt reconciliation: 0 of 1 attempts succeeded, 1 failed.\n  - terminal at iteration 5: {}",
+            crate::utils::truncation_notice(4000, 4265)
+        );
+        let fallback = build_outcome_reconciliation_fallback_reply(&reconciliation);
+        assert!(fallback.contains("0 of 1 attempts succeeded"));
+        assert!(!fallback.contains("OUTPUT TRUNCATED"));
+        assert!(!fallback.contains("Do NOT enumerate"));
     }
 
     #[test]
