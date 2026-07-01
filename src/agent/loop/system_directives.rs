@@ -156,6 +156,11 @@ pub(in crate::agent) enum SystemDirective {
     /// but no write_file or edit_file tool was called.  Nudge the model to
     /// complete the requested file modification before declaring completion.
     MutationStillRequired,
+    /// The model's final answer was mostly harness scaffolding (tool-result
+    /// envelopes, [SYSTEM] notices) and was gutted by sanitization. Ask it to
+    /// restate the answer in plain language once before any deterministic
+    /// fallback ships.
+    FinalAnswerRejectedInternalMarkers,
     /// The model produced a very short response after significant work (many
     /// tool calls) for a multi-part request. Nudge it to provide a comprehensive
     /// response addressing all parts of the user's request.
@@ -528,6 +533,7 @@ impl SystemDirective {
             Self::OutcomeReconciliation(summary) => summary.clone(),
             Self::TaskPlanContext(plan) => plan.clone(),
             Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
+            Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::ResponseQualityNudge { user_text_hint } => format!(
                 "[SYSTEM] Your response was too brief and did not address the user's full request. \
                  The user asked: \"{}\"\n\n\

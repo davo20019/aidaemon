@@ -1014,8 +1014,18 @@ fn categorize_tool_calls_inner(tool_calls: &[String], redact_commands: bool) -> 
         sections.push(format!("Files sent: {}", items.join(", ")));
     }
     if !searches.is_empty() {
-        let items: Vec<&str> = searches.iter().copied().take(5).collect();
-        sections.push(format!("Searches: {}", items.join(", ")));
+        // Dedupe and drop empty-arg entries — repeated globs otherwise render
+        // as "Searches: makpar, , makpar".
+        let mut seen = std::collections::BTreeSet::new();
+        let items: Vec<&str> = searches
+            .iter()
+            .copied()
+            .filter(|s| !s.trim().is_empty() && seen.insert(s.trim()))
+            .take(5)
+            .collect();
+        if !items.is_empty() {
+            sections.push(format!("Searches: {}", items.join(", ")));
+        }
     }
     if !external_reads.is_empty() {
         let items: Vec<&str> = external_reads.iter().copied().take(8).collect();

@@ -13,6 +13,7 @@ include!("integration_tests/part_11.rs");
 include!("integration_tests/part_12_delegation.rs");
 include!("integration_tests/part_13_dialogue_state.rs");
 include!("integration_tests/part_14_pillar_b.rs");
+include!("integration_tests/part_15_gutted_reply_retry.rs");
 include!("integration_tests/scheduler_flaw.rs");
 include!("integration_tests/intent_classifier_bench.rs");
 include!("integration_tests/background_deliverable_tests.rs");

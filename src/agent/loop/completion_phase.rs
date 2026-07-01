@@ -1860,9 +1860,24 @@ pub(super) async fn run_completion_phase(
             &sanitized_reply,
         );
 
-        // Safety net: if sanitization stripped a non-empty reply to empty or
-        // to a dangling lead-in stub ("Here are the results:"), fall back to
-        // an activity summary instead of sending a contentless message.
+        // Safety net for a gutted reply (sanitization stripped a non-empty
+        // draft to empty or a dangling lead-in stub like "Here are the
+        // results:"). The draft was scaffolding, but the model usually still
+        // holds a real conclusion — give it ONE tool-less restatement retry
+        // before shipping a deterministic activity dump (observed live: the
+        // dump lost an honest "couldn't find that file" conclusion).
+        if gutted_by_sanitization && !empty_response_retry_used {
+            warn!(
+                session_id,
+                iteration, "Sanitization gutted reply — retrying final answer once"
+            );
+            empty_response_retry_used = true;
+            empty_response_retry_pending = true;
+            empty_response_retry_note = Some("final_reply_gutted_by_sanitization".to_string());
+            pending_system_messages.push(SystemDirective::FinalAnswerRejectedInternalMarkers);
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
         let reply = if gutted_by_sanitization {
             warn!(
                 session_id,
