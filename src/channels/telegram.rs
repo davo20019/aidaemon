@@ -469,10 +469,11 @@ impl TelegramChannel {
         // Fetch bot username once at startup
         let bot_username = self.get_bot_username().await;
 
-        let initial_backoff = Duration::from_secs(5);
-        let max_backoff = Duration::from_secs(60);
-        let stable_threshold = Duration::from_secs(60);
-        let mut backoff = initial_backoff;
+        let mut backoff = crate::backoff::ChannelReconnectBackoff::new(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
 
         loop {
             info!(name = %bot_username, "Starting Telegram dispatcher");
@@ -480,20 +481,15 @@ impl TelegramChannel {
             self.clone().start().await;
             let ran_for = started.elapsed();
 
-            // If the dispatcher ran for long enough, it was a stable session —
-            // reset backoff so the next crash recovers quickly.
-            if ran_for >= stable_threshold {
-                backoff = initial_backoff;
-            }
+            let delay = backoff.next_jittered_delay(ran_for, 0.10);
 
             warn!(
                 name = %bot_username,
-                backoff_secs = backoff.as_secs(),
+                backoff_secs = delay.as_secs(),
                 ran_for_secs = ran_for.as_secs(),
                 "Telegram dispatcher stopped, restarting"
             );
-            tokio::time::sleep(backoff).await;
-            backoff = std::cmp::min(backoff * 2, max_backoff);
+            tokio::time::sleep(delay).await;
         }
     }
 

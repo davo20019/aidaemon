@@ -79,7 +79,8 @@ pub struct ConversationTurn {
     pub attachments: Vec<MessageAttachment>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ConversationTurnRole {
     User,
     Assistant,
@@ -88,11 +89,7 @@ pub enum ConversationTurnRole {
 
 impl ConversationTurnRole {
     pub fn as_str(self) -> &'static str {
-        match self {
-            ConversationTurnRole::User => "user",
-            ConversationTurnRole::Assistant => "assistant",
-            ConversationTurnRole::Tool => "tool",
-        }
+        self.into()
     }
 }
 

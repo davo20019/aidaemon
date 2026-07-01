@@ -425,8 +425,11 @@ pub struct DecisionPointData {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum DiagnosticSeverity {
     #[default]
     Info,
@@ -436,11 +439,7 @@ pub enum DiagnosticSeverity {
 
 impl DiagnosticSeverity {
     pub fn as_str(self) -> &'static str {
-        match self {
-            DiagnosticSeverity::Info => "info",
-            DiagnosticSeverity::Warning => "warning",
-            DiagnosticSeverity::Error => "error",
-        }
+        self.into()
     }
 
     pub fn is_warning_or_higher(self) -> bool {
@@ -451,8 +450,9 @@ impl DiagnosticSeverity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum DecisionType {
     SkillMatch,
     MemoryRetrieval,
@@ -481,31 +481,7 @@ pub enum DecisionType {
 
 impl DecisionType {
     pub fn as_str(self) -> &'static str {
-        match self {
-            DecisionType::SkillMatch => "skill_match",
-            DecisionType::MemoryRetrieval => "memory_retrieval",
-            DecisionType::IntentGate => "intent_gate",
-            DecisionType::CoreProfileSelection => "core_profile_selection",
-            DecisionType::ExecutionPlanningGate => "execution_planning_gate",
-            DecisionType::ExecutionCritiquePass => "execution_critique_pass",
-            DecisionType::ExecutionBudgetSelection => "execution_budget_selection",
-            DecisionType::ExecutionStateSnapshot => "execution_state_snapshot",
-            DecisionType::EvidenceGate => "evidence_gate",
-            DecisionType::ExecutionFailureClassification => "execution_failure_classification",
-            DecisionType::PostExecutionValidation => "post_execution_validation",
-            DecisionType::RepetitiveCallDetection => "repetitive_call_detection",
-            DecisionType::SemanticReadDecision => "semantic_read_decision",
-            DecisionType::ConsecutiveSameToolDetection => "consecutive_same_tool_detection",
-            DecisionType::AlternatingPatternDetection => "alternating_pattern_detection",
-            DecisionType::ToolBudgetBlock => "tool_budget_block",
-            DecisionType::RouteDriftAlert => "route_drift_alert",
-            DecisionType::StoppingCondition => "stopping_condition",
-            DecisionType::InstructionsSnapshot => "instructions_snapshot",
-            DecisionType::BudgetAutoExtension => "budget_auto_extension",
-            DecisionType::LlmEfficiencyAlert => "llm_efficiency_alert",
-            DecisionType::GateTelemetry => "gate_telemetry",
-            DecisionType::HandHoldingTelemetry => "hand_holding_telemetry",
-        }
+        self.into()
     }
 }
 

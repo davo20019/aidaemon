@@ -602,7 +602,12 @@ impl Agent {
                     ProviderErrorKind::RateLimit => {
                         let base_wait = provider_err.retry_after_secs.unwrap_or(5);
                         for attempt in 0..Self::MAX_LLM_RETRIES {
-                            let wait = (base_wait * 2u64.pow(attempt)).min(120); // cap at 120s
+                            let wait = crate::backoff::exponential_backoff(
+                                Duration::from_secs(base_wait),
+                                attempt,
+                                Duration::from_secs(120),
+                            )
+                            .as_secs();
                             info!(
                                 wait_secs = wait,
                                 attempt = attempt + 1,
@@ -653,7 +658,12 @@ impl Agent {
                             }
                         }
                         for attempt in 0..Self::MAX_LLM_RETRIES {
-                            let wait = Self::RETRY_BASE_DELAY_SECS * 2u64.pow(attempt); // 2s, 4s, 8s
+                            let wait = crate::backoff::exponential_backoff(
+                                Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
+                                attempt,
+                                Duration::MAX,
+                            )
+                            .as_secs();
                             info!(
                                 wait_secs = wait,
                                 attempt = attempt + 1,
@@ -708,7 +718,14 @@ impl Agent {
                                     options,
                                     provider_label,
                                     Self::MAX_LLM_RETRIES,
-                                    |attempt| Self::RETRY_BASE_DELAY_SECS * 2u64.pow(attempt),
+                                    |attempt| {
+                                        crate::backoff::exponential_backoff(
+                                            Duration::from_secs(Self::RETRY_BASE_DELAY_SECS),
+                                            attempt,
+                                            Duration::MAX,
+                                        )
+                                        .as_secs()
+                                    },
                                     "parse_exponential_backoff",
                                 )
                                 .await?;

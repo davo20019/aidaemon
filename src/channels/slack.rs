@@ -205,10 +205,11 @@ impl SlackChannel {
 
     /// Start the Slack Socket Mode client with automatic retry on crash.
     pub async fn start_with_retry(self: Arc<Self>) {
-        let initial_backoff = Duration::from_secs(5);
-        let max_backoff = Duration::from_secs(60);
-        let stable_threshold = Duration::from_secs(60);
-        let mut backoff = initial_backoff;
+        let mut backoff = crate::backoff::ChannelReconnectBackoff::new(
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
 
         loop {
             info!("Starting Slack Socket Mode client");
@@ -218,17 +219,14 @@ impl SlackChannel {
             }
             let ran_for = started.elapsed();
 
-            if ran_for >= stable_threshold {
-                backoff = initial_backoff;
-            }
+            let delay = backoff.next_jittered_delay(ran_for, 0.10);
 
             warn!(
-                backoff_secs = backoff.as_secs(),
+                backoff_secs = delay.as_secs(),
                 ran_for_secs = ran_for.as_secs(),
                 "Slack client stopped, restarting"
             );
-            tokio::time::sleep(backoff).await;
-            backoff = std::cmp::min(backoff * 2, max_backoff);
+            tokio::time::sleep(delay).await;
         }
     }
 

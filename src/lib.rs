@@ -1,5 +1,6 @@
 mod agent;
 mod agent_handoff;
+mod backoff;
 mod channels;
 mod cli_agent_flags;
 mod config;
@@ -9,6 +10,7 @@ mod cron_utils;
 mod daemon;
 mod dashboard;
 mod db;
+mod duration_format;
 #[allow(dead_code)]
 mod events;
 pub use events::{EventType, TaskEndData, ToolCallData, UserMessageData};

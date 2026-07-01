@@ -73,35 +73,12 @@ impl GoalTraceTool {
         s.chars().take(max).collect()
     }
 
-    fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::parse_from_rfc3339(ts)
-            .ok()
-            .map(|d| d.with_timezone(&chrono::Utc))
-    }
-
     fn format_duration(started_at: Option<&str>, completed_at: Option<&str>) -> String {
-        let Some(start_raw) = started_at else {
-            return "n/a".to_string();
-        };
-        let Some(started) = Self::parse_ts(start_raw) else {
-            return "n/a".to_string();
-        };
-        let Some(end_raw) = completed_at else {
-            return "running".to_string();
-        };
-        let Some(ended) = Self::parse_ts(end_raw) else {
-            return "n/a".to_string();
-        };
-        let secs = (ended - started).num_seconds().max(0);
-        if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m {}s", secs / 60, secs % 60)
-        } else {
-            let h = secs / 3600;
-            let m = (secs % 3600) / 60;
-            format!("{}h {}m", h, m)
-        }
+        crate::duration_format::compact_elapsed_timestamps(
+            started_at,
+            completed_at,
+            crate::duration_format::ZeroUnitStyle::Keep,
+        )
     }
 
     async fn recent_goal_summary(&self, limit: usize) -> anyhow::Result<String> {

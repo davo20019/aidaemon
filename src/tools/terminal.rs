@@ -1184,13 +1184,10 @@ async fn drain_to_buffer<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: Ar
 /// Render an elapsed-seconds count as a friendly duration for user-facing
 /// progress messages (e.g. 65 -> "1m 5s", 40 -> "40s", 3600 -> "1h 0m").
 fn humanize_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    }
+    crate::duration_format::compact_seconds(
+        secs as i64,
+        crate::duration_format::ZeroUnitStyle::Keep,
+    )
 }
 
 /// Condense in-flight background output for a user-facing progress ping.

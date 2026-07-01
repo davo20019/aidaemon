@@ -334,27 +334,10 @@ impl AlertManager {
 
 /// Format a duration in a human-readable way.
 fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.num_seconds();
-
-    if total_secs < 60 {
-        format!("{}s", total_secs)
-    } else if total_secs < 3600 {
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        if secs > 0 {
-            format!("{}m {}s", mins, secs)
-        } else {
-            format!("{}m", mins)
-        }
-    } else {
-        let hours = total_secs / 3600;
-        let mins = (total_secs % 3600) / 60;
-        if mins > 0 {
-            format!("{}h {}m", hours, mins)
-        } else {
-            format!("{}h", hours)
-        }
-    }
+    crate::duration_format::compact_chrono_duration(
+        duration,
+        crate::duration_format::ZeroUnitStyle::Trim,
+    )
 }
 
 #[cfg(test)]

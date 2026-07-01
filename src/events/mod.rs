@@ -94,8 +94,20 @@ impl Event {
 }
 
 /// Types of events that can be stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EventType {
     // === Session Lifecycle ===
     /// A new session started
@@ -155,52 +167,13 @@ pub enum EventType {
 impl EventType {
     /// Returns the string representation for database storage
     pub fn as_str(&self) -> &'static str {
-        match self {
-            EventType::SessionStart => "session_start",
-            EventType::SessionEnd => "session_end",
-            EventType::UserMessage => "user_message",
-            EventType::AssistantResponse => "assistant_response",
-            EventType::ToolCall => "tool_call",
-            EventType::ToolResult => "tool_result",
-            EventType::LlmCall => "llm_call",
-            EventType::ThinkingStart => "thinking_start",
-            EventType::PolicyDecision => "policy_decision",
-            EventType::DecisionPoint => "decision_point",
-            EventType::TaskStart => "task_start",
-            EventType::TaskEnd => "task_end",
-            EventType::Error => "error",
-            EventType::SubAgentSpawn => "sub_agent_spawn",
-            EventType::SubAgentComplete => "sub_agent_complete",
-            EventType::ApprovalRequested => "approval_requested",
-            EventType::ApprovalGranted => "approval_granted",
-            EventType::ApprovalDenied => "approval_denied",
-        }
+        (*self).into()
     }
 
     /// Parse from string (database storage)
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "session_start" => Some(EventType::SessionStart),
-            "session_end" => Some(EventType::SessionEnd),
-            "user_message" => Some(EventType::UserMessage),
-            "assistant_response" => Some(EventType::AssistantResponse),
-            "tool_call" => Some(EventType::ToolCall),
-            "tool_result" => Some(EventType::ToolResult),
-            "llm_call" => Some(EventType::LlmCall),
-            "thinking_start" => Some(EventType::ThinkingStart),
-            "policy_decision" => Some(EventType::PolicyDecision),
-            "decision_point" => Some(EventType::DecisionPoint),
-            "task_start" => Some(EventType::TaskStart),
-            "task_end" => Some(EventType::TaskEnd),
-            "error" => Some(EventType::Error),
-            "sub_agent_spawn" => Some(EventType::SubAgentSpawn),
-            "sub_agent_complete" => Some(EventType::SubAgentComplete),
-            "approval_requested" => Some(EventType::ApprovalRequested),
-            "approval_granted" => Some(EventType::ApprovalGranted),
-            "approval_denied" => Some(EventType::ApprovalDenied),
-            _ => None,
-        }
+        s.parse().ok()
     }
 
     /// Event types that represent conversation messages (for history retrieval)
@@ -221,8 +194,19 @@ impl EventType {
 }
 
 /// Task completion status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum TaskStatus {
     Completed,
     Cancelled,
@@ -230,8 +214,19 @@ pub enum TaskStatus {
 }
 
 /// Semantic outcome delivered by a task execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum TaskOutcome {
     Succeeded,
     Partial,
@@ -240,20 +235,11 @@ pub enum TaskOutcome {
 
 impl TaskOutcome {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            TaskOutcome::Succeeded => "succeeded",
-            TaskOutcome::Partial => "partial",
-            TaskOutcome::Failed => "failed",
-        }
+        (*self).into()
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "succeeded" => Some(TaskOutcome::Succeeded),
-            "partial" => Some(TaskOutcome::Partial),
-            "failed" => Some(TaskOutcome::Failed),
-            _ => None,
-        }
+        s.parse().ok()
     }
 
     /// Maps semantic outcome to learning success signal.
@@ -264,20 +250,11 @@ impl TaskOutcome {
 
 impl TaskStatus {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            TaskStatus::Completed => "completed",
-            TaskStatus::Cancelled => "cancelled",
-            TaskStatus::Failed => "failed",
-        }
+        (*self).into()
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "completed" => Some(TaskStatus::Completed),
-            "cancelled" => Some(TaskStatus::Cancelled),
-            "failed" => Some(TaskStatus::Failed),
-            _ => None,
-        }
+        s.parse().ok()
     }
 }
 

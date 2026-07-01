@@ -310,8 +310,19 @@ impl PlanStep {
 }
 
 /// Overall plan status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PlanStatus {
     /// LLM is generating steps
     Planning,
@@ -329,26 +340,11 @@ pub enum PlanStatus {
 
 impl PlanStatus {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            PlanStatus::Planning => "planning",
-            PlanStatus::InProgress => "in_progress",
-            PlanStatus::Paused => "paused",
-            PlanStatus::Completed => "completed",
-            PlanStatus::Failed => "failed",
-            PlanStatus::Abandoned => "abandoned",
-        }
+        (*self).into()
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "planning" => Some(PlanStatus::Planning),
-            "in_progress" => Some(PlanStatus::InProgress),
-            "paused" => Some(PlanStatus::Paused),
-            "completed" => Some(PlanStatus::Completed),
-            "failed" => Some(PlanStatus::Failed),
-            "abandoned" => Some(PlanStatus::Abandoned),
-            _ => None,
-        }
+        s.parse().ok()
     }
 
     /// Check if this status represents an incomplete/active plan.
@@ -361,8 +357,19 @@ impl PlanStatus {
 }
 
 /// Status of a single step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum StepStatus {
     /// Not yet started
     Pending,
@@ -380,26 +387,11 @@ pub enum StepStatus {
 
 impl StepStatus {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            StepStatus::Pending => "pending",
-            StepStatus::InProgress => "in_progress",
-            StepStatus::Completed => "completed",
-            StepStatus::Failed => "failed",
-            StepStatus::Skipped => "skipped",
-            StepStatus::Deferred => "deferred",
-        }
+        (*self).into()
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(StepStatus::Pending),
-            "in_progress" => Some(StepStatus::InProgress),
-            "completed" => Some(StepStatus::Completed),
-            "failed" => Some(StepStatus::Failed),
-            "skipped" => Some(StepStatus::Skipped),
-            "deferred" => Some(StepStatus::Deferred),
-            _ => None,
-        }
+        s.parse().ok()
     }
 }
 
