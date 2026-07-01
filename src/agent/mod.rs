@@ -41,6 +41,48 @@ pub use crate::types::StatusUpdate;
 #[cfg(test)]
 use crate::traits::Task;
 
+type CorrectionContext = Arc<crate::agent::correction_execution::CorrectionExecutionContext>;
+
+#[derive(Default)]
+struct CorrectionContextRegistry {
+    contexts: HashMap<String, CorrectionContext>,
+    insertion_order: VecDeque<String>,
+}
+
+impl CorrectionContextRegistry {
+    fn insert(&mut self, goal_id: String, ctx: CorrectionContext) {
+        if !self.contexts.contains_key(&goal_id) {
+            self.insertion_order.push_back(goal_id.clone());
+        }
+        self.contexts.insert(goal_id, ctx);
+        self.evict_oldest_until_bounded();
+    }
+
+    fn get(&self, goal_id: &str) -> Option<CorrectionContext> {
+        self.contexts.get(goal_id).cloned()
+    }
+
+    fn remove(&mut self, goal_id: &str) {
+        self.contexts.remove(goal_id);
+        self.insertion_order.retain(|existing| existing != goal_id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.contexts.len()
+    }
+
+    fn evict_oldest_until_bounded(&mut self) {
+        while self.contexts.len() > MAX_CORRECTION_CONTEXTS {
+            if let Some(stale) = self.insertion_order.pop_front() {
+                self.contexts.remove(&stale);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// Constants for stall and repetitive behavior detection
 const MAX_STALL_ITERATIONS: usize = 5;
 const DEFERRED_NO_TOOL_SWITCH_THRESHOLD: usize = 2;
@@ -507,11 +549,7 @@ pub struct Agent {
     ///   to a single unique goal id.
     /// - The map is bounded (oldest entries evicted on insert) so a fire-and-forget
     ///   background spawn that never reports completion cannot leak unboundedly.
-    correction_contexts: Arc<
-        tokio::sync::RwLock<
-            HashMap<String, Arc<crate::agent::correction_execution::CorrectionExecutionContext>>,
-        >,
-    >,
+    correction_contexts: Arc<tokio::sync::RwLock<CorrectionContextRegistry>>,
 }
 
 /// Maximum number of in-flight remediation correction contexts retained in
@@ -637,19 +675,10 @@ impl Agent {
         goal_id: &str,
         ctx: Arc<crate::agent::correction_execution::CorrectionExecutionContext>,
     ) {
-        let mut map = self.correction_contexts.write().await;
-        if !map.contains_key(goal_id) && map.len() >= MAX_CORRECTION_CONTEXTS {
-            // Evict an arbitrary existing entry to stay bounded. Entries are
-            // keyed by unique goal ids, so this can only drop a *different*,
-            // already-running remediation's context — never the one we are about
-            // to insert. The worst case is that a long-running prior remediation
-            // loses its preapproval mid-flight and falls back to normal approval,
-            // which fails *safe*, not open.
-            if let Some(stale) = map.keys().next().cloned() {
-                map.remove(&stale);
-            }
-        }
-        map.insert(goal_id.to_string(), ctx);
+        self.correction_contexts
+            .write()
+            .await
+            .insert(goal_id.to_string(), ctx);
     }
 
     /// Read (clone) the correction-execution context for this agent's current
@@ -665,7 +694,7 @@ impl Agent {
         &self,
     ) -> Option<Arc<crate::agent::correction_execution::CorrectionExecutionContext>> {
         let goal_id = self.goal_id.as_deref()?;
-        self.correction_contexts.read().await.get(goal_id).cloned()
+        self.correction_contexts.read().await.get(goal_id)
     }
 
     /// Remove the correction-execution context for a remediation goal id once the

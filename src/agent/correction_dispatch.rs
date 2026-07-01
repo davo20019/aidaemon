@@ -649,6 +649,7 @@ mod tests {
 
         // Insert well past the cap.
         let total = super::super::MAX_CORRECTION_CONTEXTS + 10;
+        let first_goal_id = "goal-0".to_string();
         let last_goal_id = format!("goal-{}", total - 1);
         for i in 0..total {
             agent
@@ -669,6 +670,12 @@ mod tests {
         assert!(
             peeker.correction_context_for_current_goal().await.is_some(),
             "the just-inserted context must survive bounded eviction"
+        );
+
+        peeker.set_test_goal_id(Some(first_goal_id.clone()));
+        assert!(
+            peeker.correction_context_for_current_goal().await.is_none(),
+            "bounded eviction must remove the oldest-inserted correction context first"
         );
 
         // clear_correction_context removes a specific entry.

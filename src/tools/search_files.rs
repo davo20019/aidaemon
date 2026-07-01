@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde_json::{json, Value};
 
@@ -136,8 +137,8 @@ impl Tool for SearchFilesTool {
             None
         };
 
-        let glob_regex = if let Some(g) = glob_pattern {
-            Some(glob_to_regex(g)?)
+        let glob_matcher = if let Some(g) = glob_pattern {
+            Some(compile_glob(g)?)
         } else {
             None
         };
@@ -148,7 +149,7 @@ impl Tool for SearchFilesTool {
         walk_dir(
             &search_dir,
             &content_regex,
-            &glob_regex,
+            &glob_matcher,
             max_results,
             MAX_ENTRIES_VISITED,
             &mut results,
@@ -290,23 +291,10 @@ impl SearchResult {
     }
 }
 
-fn glob_to_regex(glob: &str) -> anyhow::Result<Regex> {
-    let mut regex = String::from("^");
-    for c in glob.chars() {
-        match c {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '.' => regex.push_str("\\."),
-            '[' => regex.push('['),
-            ']' => regex.push(']'),
-            '{' => regex.push('('),
-            '}' => regex.push(')'),
-            ',' => regex.push('|'),
-            c => regex.push(c),
-        }
-    }
-    regex.push('$');
-    Regex::new(&regex).map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", glob, e))
+fn compile_glob(glob: &str) -> anyhow::Result<GlobMatcher> {
+    Glob::new(glob)
+        .map(|glob| glob.compile_matcher())
+        .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", glob, e))
 }
 
 /// Wall-clock budget for one search walk. Large trees (a whole home
@@ -324,7 +312,7 @@ const MAX_WALK_MILLIS: u128 = 15_000;
 async fn walk_dir(
     root: &Path,
     content_regex: &Option<Regex>,
-    glob_regex: &Option<Regex>,
+    glob_matcher: &Option<GlobMatcher>,
     max_results: usize,
     max_entries: usize,
     results: &mut Vec<SearchResult>,
@@ -378,8 +366,8 @@ async fn walk_dir(
             }
 
             // Check glob match on filename
-            if let Some(ref glob_re) = glob_regex {
-                if !glob_re.is_match(&file_name) {
+            if let Some(ref matcher) = glob_matcher {
+                if !matcher.is_match(&file_name) {
                     continue;
                 }
             }
@@ -441,7 +429,7 @@ mod tests {
         std::fs::create_dir(&shallow).unwrap();
         std::fs::write(shallow.join("target.pdf"), "pdf").unwrap();
 
-        let glob = glob_to_regex("*target.pdf").unwrap();
+        let glob = compile_glob("*target.pdf").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
         walk_dir(
@@ -466,7 +454,7 @@ mod tests {
             std::fs::write(root.path().join(format!("file_{i}.txt")), "x").unwrap();
         }
 
-        let glob = glob_to_regex("*.zzz").unwrap();
+        let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
         walk_dir(
@@ -497,7 +485,7 @@ mod tests {
         // budget via the internal walker — so use walk_dir + render check
         // indirectly: the call() budget is large, so instead assert the
         // note constant is wired by checking a tiny-budget walk + format.
-        let glob = glob_to_regex("*.zzz").unwrap();
+        let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
         walk_dir(
@@ -632,13 +620,25 @@ mod tests {
 
     #[test]
     fn test_glob_to_regex() {
-        let re = glob_to_regex("*.rs").unwrap();
+        let re = compile_glob("*.rs").unwrap();
         assert!(re.is_match("main.rs"));
         assert!(!re.is_match("main.py"));
 
-        let re = glob_to_regex("Cargo.*").unwrap();
+        let re = compile_glob("Cargo.*").unwrap();
         assert!(re.is_match("Cargo.toml"));
         assert!(re.is_match("Cargo.lock"));
+    }
+
+    #[test]
+    fn glob_matches_literal_regex_metacharacters_and_commas() {
+        let re = compile_glob("a+b.txt").unwrap();
+        assert!(re.is_match("a+b.txt"));
+        assert!(!re.is_match("aaab.txt"));
+
+        let re = compile_glob("report,final.txt").unwrap();
+        assert!(re.is_match("report,final.txt"));
+        assert!(!re.is_match("report-draft.txt"));
+        assert!(!re.is_match("final.txt"));
     }
 
     #[tokio::test]
