@@ -421,8 +421,12 @@ impl SearchBackend for BraveBackend {
             // Retry on 429 (rate limited) with exponential backoff
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries - 1
             {
-                let delay_secs = 2u64.pow(attempt as u32); // 1s, 2s, 4s
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                let delay = crate::backoff::exponential_backoff(
+                    Duration::from_secs(1),
+                    attempt as u32,
+                    Duration::MAX,
+                ); // 1s, 2s, 4s
+                tokio::time::sleep(delay).await;
                 continue;
             }
 

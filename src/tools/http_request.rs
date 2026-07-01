@@ -986,7 +986,11 @@ impl HttpRequestTool {
                 && Self::should_retry_idempotent_5xx(&current_method, resp.status())
             {
                 retry_count += 1;
-                let backoff = Duration::from_millis(400 * (1u64 << (retry_count - 1)));
+                let backoff = crate::backoff::exponential_backoff(
+                    Duration::from_millis(400),
+                    (retry_count - 1) as u32,
+                    Duration::MAX,
+                );
                 warn!(
                     method = %current_method,
                     status = resp.status().as_u16(),
