@@ -12,7 +12,13 @@ pub struct SendFileTool {
     media_tx: mpsc::Sender<MediaMessage>,
     outbox_dirs: Vec<PathBuf>,
     inbox_dir: PathBuf,
+    /// How long to wait for the media listener's delivery receipt before
+    /// reporting the file as queued-but-pending. Long enough to cover one
+    /// full channel rate-limit retry sleep (capped at 60s) plus the upload.
+    receipt_timeout: std::time::Duration,
 }
+
+const DELIVERY_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(70);
 
 impl SendFileTool {
     pub fn new(
@@ -32,7 +38,14 @@ impl SendFileTool {
             media_tx,
             outbox_dirs,
             inbox_dir,
+            receipt_timeout: DELIVERY_RECEIPT_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_receipt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.receipt_timeout = timeout;
+        self
     }
 }
 
@@ -164,6 +177,12 @@ impl Tool for SendFileTool {
             format!("{:.0} KB", ready.size_bytes as f64 / 1024.0)
         };
 
+        // Await the media listener's delivery receipt so "File sent" is a
+        // statement of fact, not a queue acknowledgment. Without this the
+        // model tells the user "I've sent it" while the document waits out a
+        // channel rate-limit retry (observed live: ~60s gap), and a shed
+        // delivery would leave the claim standing with no file at all.
+        let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
         self.media_tx
             .send(MediaMessage {
                 session_id: session_id.to_string(),
@@ -172,11 +191,31 @@ impl Tool for SendFileTool {
                     file_path: ready.canonical_path.to_string_lossy().to_string(),
                     filename: ready.filename.clone(),
                 },
-                // Fire-and-forget: send_file does not await a delivery receipt.
-                result_tx: None,
+                result_tx: Some(receipt_tx),
             })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send file: {}", e))?;
+
+        match tokio::time::timeout(self.receipt_timeout, receipt_rx).await {
+            Ok(Ok(Ok(()))) => {} // delivered — fall through to the success text
+            Ok(Ok(Err(reason))) => {
+                return Ok(format!(
+                    "The file {} could not be delivered: {}. Do NOT tell the user it was sent; \
+                     report the delivery failure instead.",
+                    ready.filename, reason
+                ));
+            }
+            // Receipt channel dropped or timed out: the message is still in the
+            // delivery queue (e.g. waiting out a rate-limit retry) — report
+            // pending honestly instead of claiming completion.
+            Ok(Err(_)) | Err(_) => {
+                return Ok(format!(
+                    "File queued for delivery: {} ({}). The channel is congested; it should \
+                     arrive shortly. Phrase your reply as \"sending\" (in progress), not \"sent\".",
+                    ready.filename, size_display
+                ));
+            }
+        }
 
         // Determine success message: resolved_missing_path is detected by comparing
         // the canonical path with a fresh expansion of the requested path.
@@ -214,6 +253,90 @@ mod tests {
     use std::path::Path;
 
     #[tokio::test]
+    async fn send_file_awaits_delivery_receipt_before_claiming_sent() {
+        // Live repro (2026-07-02): send_file enqueued fire-and-forget and
+        // returned "File sent"; the model told the user "I've sent it" while
+        // the document sat behind a Telegram 429 retry for ~a minute. The
+        // tool must only say "File sent" after the media listener confirms
+        // delivery.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let f = inbox.join("report.txt");
+        std::fs::write(&f, b"data").expect("write");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = std::sync::Arc::new(
+            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
+                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+        );
+        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+
+        let call_tool = tool.clone();
+        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        // Deliver the receipt like the hub's media_listener does.
+        let mut msg = rx.recv().await.expect("media message enqueued");
+        let receipt = msg
+            .result_tx
+            .take()
+            .expect("send_file must request a receipt");
+        receipt.send(Ok(())).expect("receipt delivered");
+        let out = call.await.expect("join").expect("call ok");
+        assert!(out.contains("File sent"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn send_file_reports_failed_delivery_honestly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let f = inbox.join("report.txt");
+        std::fs::write(&f, b"data").expect("write");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = std::sync::Arc::new(
+            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
+                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+        );
+        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        let call_tool = tool.clone();
+        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        let mut msg = rx.recv().await.expect("media message enqueued");
+        let receipt = msg.result_tx.take().expect("receipt requested");
+        receipt
+            .send(Err("system overload".to_string()))
+            .expect("receipt delivered");
+        let out = call.await.expect("join").expect("call ok");
+        assert!(
+            out.contains("could not be delivered") && out.contains("system overload"),
+            "must surface the delivery failure to the model, got: {out}"
+        );
+        assert!(!out.contains("File sent"), "must not claim success: {out}");
+    }
+
+    #[tokio::test]
+    async fn send_file_reports_pending_when_receipt_times_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let f = inbox.join("report.txt");
+        std::fs::write(&f, b"data").expect("write");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy())
+            .with_receipt_timeout(std::time::Duration::from_millis(100));
+        let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
+        // Nobody answers the receipt (congested channel) → honest pending text.
+        let out = tool.call(&args).await.expect("call ok");
+        let _keep_queue_alive = rx.recv().await; // message was still enqueued
+        assert!(
+            out.contains("queued for delivery"),
+            "must report pending, not sent: {out}"
+        );
+        assert!(!out.contains("File sent:"), "must not claim sent: {out}");
+    }
+
+    #[tokio::test]
     async fn send_file_recovers_file_outside_allowed_dirs_into_inbox() {
         // Regression: the model created a file in /tmp (outside allowed dirs) and
         // send_file rejected it, causing a retry loop. send_file now copies a
@@ -226,21 +349,30 @@ mod tests {
         std::fs::write(&src, b"latency data").expect("write src");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let tool = SendFileTool::new(tx, &[], &inbox.to_string_lossy());
+        let tool = std::sync::Arc::new(
+            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
+                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+        );
 
         let args = json!({
             "_session_id": "sess-1",
             "file_path": src.to_string_lossy(),
         })
         .to_string();
-        let out = tool.call(&args).await.expect("call ok");
+        let call_tool = tool.clone();
+        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        let mut msg = rx.recv().await.expect("media message sent");
+        msg.result_tx
+            .take()
+            .expect("receipt requested")
+            .send(Ok(()))
+            .expect("receipt delivered");
+        let out = call.await.expect("join").expect("call ok");
         assert!(out.contains("File sent"), "got: {out}");
         assert!(
             out.contains("copied into the inbox"),
             "should note recovery: {out}"
         );
-
-        let msg = rx.try_recv().expect("media message sent");
         match msg.kind {
             MediaKind::Document { file_path, .. } => {
                 assert!(
