@@ -114,6 +114,16 @@ pub fn truncation_notice_with_hint(
     )
 }
 
+/// Render the model-facing truncation notice from structured metadata.
+/// Exactly one call site in the agent loop renders this; tools must not
+/// embed it in their returned output.
+pub fn render_truncation_notice(info: &crate::traits::TruncationInfo) -> String {
+    match info.remediation_hint.as_deref() {
+        Some(hint) => truncation_notice_with_hint(info.shown_chars, info.total_chars, hint),
+        None => truncation_notice(info.shown_chars, info.total_chars),
+    }
+}
+
 /// Whether a line is harness-injected scaffolding (truncation notices,
 /// [SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
 /// tool output. Such lines are addressed to the model and must never be
@@ -309,5 +319,25 @@ mod tests {
                 let _ = truncate_with_note(&s, n);
             }
         }
+    }
+
+    #[test]
+    fn render_truncation_notice_matches_legacy_format() {
+        let info = crate::traits::TruncationInfo {
+            shown_chars: 100,
+            total_chars: 250,
+            remediation_hint: None,
+        };
+        assert_eq!(render_truncation_notice(&info), truncation_notice(100, 250));
+
+        let hinted = crate::traits::TruncationInfo {
+            shown_chars: 100,
+            total_chars: 250,
+            remediation_hint: Some("Re-fetch with a larger max_chars.".to_string()),
+        };
+        assert_eq!(
+            render_truncation_notice(&hinted),
+            truncation_notice_with_hint(100, 250, "Re-fetch with a larger max_chars.")
+        );
     }
 }

@@ -308,6 +308,20 @@ pub struct ReadFileResultMetadata {
     pub truncated: bool,
 }
 
+/// Structured record of tool-output truncation. Populated at the tool
+/// boundary — the instructional notice text is rendered into the
+/// model-visible message by the loop (single site), never embedded in the
+/// tool's returned content, so text-scanning consumers (error-line
+/// extraction, classifiers, summaries) always see clean output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TruncationInfo {
+    pub shown_chars: usize,
+    pub total_chars: usize,
+    /// Tool-specific remediation sentence (see `utils::truncation_notice_with_hint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_hint: Option<String>,
+}
+
 /// Structured execution metadata returned by tools.
 ///
 /// This is intentionally minimal and backward-compatible: tools can continue
@@ -337,6 +351,10 @@ pub struct ToolCallMetadata {
     /// Populated at the tool boundary — not scraped from result text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// Output truncation performed at the tool boundary. Rendered into the
+    /// model-visible text by the loop after ledger/classifier consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
     /// Optional final user-facing reply. When set, the root agent may close the
     /// turn directly from the tool result instead of running another LLM pass.
     #[serde(skip_serializing_if = "Option::is_none")]

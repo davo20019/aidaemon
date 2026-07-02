@@ -50,7 +50,7 @@ pub use tools::{
     AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
     ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolExecutionContext, ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope,
-    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 
