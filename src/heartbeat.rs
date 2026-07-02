@@ -31,6 +31,36 @@ fn is_scheduled_task_description(text: &str) -> bool {
 /// previous day (before the daily reset has run) must NOT block a goal, or an
 /// expensive run can deadlock the goal across the day boundary (the budget gate
 /// keeps deferring it, so it never fires, so it never resets).
+/// Header for the goal-completion notification, derived from the ACTUAL task
+/// rows rather than metadata the task lead may never have written (a
+/// watchdog-killed lead leaves `partial_success` unset). "Goal completed:"
+/// must never accompany incomplete tasks — name what's missing instead.
+fn goal_completion_header(tasks: &[crate::traits::Task]) -> String {
+    if tasks.is_empty() {
+        return "Goal completed:".to_string();
+    }
+    let total = tasks.len();
+    let done = tasks.iter().filter(|t| t.status == "completed").count();
+    if done == total {
+        return "Goal completed:".to_string();
+    }
+    let missing: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status != "completed")
+        .map(|t| {
+            format!(
+                "• {} ({})",
+                t.description.chars().take(80).collect::<String>(),
+                t.status
+            )
+        })
+        .collect();
+    format!(
+        "Goal partially completed ({done}/{total} tasks). Not completed:\n{}\n",
+        missing.join("\n")
+    )
+}
+
 fn daily_budget_exhausted(
     budget_daily: Option<i64>,
     tokens_used_today: i64,
@@ -1008,7 +1038,8 @@ impl HeartbeatCoordinator {
                         (
                             "completed",
                             format!(
-                                "Goal completed:\n\n{}",
+                                "{}\n\n{}",
+                                goal_completion_header(&completed_tasks),
                                 task_results_summary.chars().take(4000).collect::<String>()
                             ),
                         )
@@ -1435,6 +1466,63 @@ mod tests {
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, Task};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn synthetic_task(desc: &str, status: &str) -> Task {
+        Task {
+            id: format!("task-{desc}"),
+            goal_id: "goal-1".to_string(),
+            description: desc.to_string(),
+            status: status.to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: String::new(),
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn goal_completion_header_is_honest_about_incomplete_tasks() {
+        // Live repro (goal df0925b4, 2026-07-02): the watchdog killed the task
+        // lead mid-run, no partial_success metadata was written, and the user
+        // received "Goal completed:" over a summary that itself said "2/4
+        // tasks completed" — two steps silently missing. The header must be
+        // derived from the actual task rows, not from metadata a dead lead
+        // never wrote.
+        let tasks = vec![
+            synthetic_task("check disk space", "completed"),
+            synthetic_task("count rs files", "completed"),
+            synthetic_task("find 3 largest files", "pending"),
+            synthetic_task("write summary report", "pending"),
+        ];
+        let header = goal_completion_header(&tasks);
+        assert!(
+            header.starts_with("Goal partially completed (2/4 tasks)"),
+            "got: {header}"
+        );
+        assert!(header.contains("find 3 largest files"));
+        assert!(header.contains("write summary report"));
+
+        // All tasks done → plain completion header.
+        let done = vec![
+            synthetic_task("a", "completed"),
+            synthetic_task("b", "completed"),
+        ];
+        assert_eq!(goal_completion_header(&done), "Goal completed:");
+
+        // No task rows at all (goal completed without decomposition) → plain.
+        assert_eq!(goal_completion_header(&[]), "Goal completed:");
+    }
 
     #[test]
     fn daily_budget_only_blocks_on_current_day_usage() {

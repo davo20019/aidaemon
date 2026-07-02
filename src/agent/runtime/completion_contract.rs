@@ -365,6 +365,80 @@ pub(super) fn looks_like_question_request(lower_text: &str) -> bool {
         .any(|prefix| lower_text.starts_with(prefix))
 }
 
+/// Mutation-flavored request verbs, split so run-and-report detection can ask
+/// "does this text ask for any change BEYOND merely running something?".
+const CHANGE_KEYWORDS: &[&str] = &[
+    "change",
+    "update",
+    "edit",
+    "write",
+    "rewrite",
+    "overwrite",
+    "modify",
+    "replace",
+    "create",
+    "delete",
+    "remove",
+    "deploy",
+    "build",
+    "connect",
+    "set up",
+    "setup",
+    "install",
+    "restart",
+    "reload",
+    "enable",
+    "disable",
+    "remember",
+    "store",
+    "save",
+    "note",
+    "pull",
+    "push",
+    "fetch",
+    "merge",
+    "start",
+    "stop",
+    "compile",
+    "download",
+    "clone",
+    "migrate",
+    "fix",
+    "retry",
+    "redo",
+    "try again",
+    "do it again",
+];
+
+/// Verbs that only mean "execute something" — mutating ONLY if the executed
+/// thing mutates, which the other keywords capture.
+const RUN_KEYWORDS: &[&str] = &["run", "execute", "rerun", "re-run"];
+
+/// "Run X and tell me what it said" — the deliverable is the OBSERVATION.
+/// True when the text asks to report/return/provide output AND the only
+/// execution verbs are the bare run/execute family (no genuine change verb).
+fn is_run_and_report_only(lower_text: &str) -> bool {
+    let report_intent = text_contains_any_phrase(
+        lower_text,
+        &[
+            "provide the output",
+            "return the output",
+            "report the output",
+            "show the output",
+            "print the output",
+            "provide the result",
+            "return the result",
+            "report the result",
+            "provide the count",
+            "return the count",
+            "report the count",
+        ],
+    );
+    report_intent
+        && text_contains_any_phrase(lower_text, RUN_KEYWORDS)
+        && !text_contains_any_phrase(lower_text, CHANGE_KEYWORDS)
+}
+
 fn infer_completion_signals(
     lower_text: &str,
     verification_targets: &[VerificationTarget],
@@ -421,54 +495,8 @@ fn infer_completion_signals(
             "share",
         ],
     );
-    let asks_change = text_contains_any_phrase(
-        lower_text,
-        &[
-            "change",
-            "update",
-            "edit",
-            "write",
-            "rewrite",
-            "overwrite",
-            "modify",
-            "replace",
-            "create",
-            "delete",
-            "remove",
-            "deploy",
-            "build",
-            "connect",
-            "set up",
-            "setup",
-            "install",
-            "restart",
-            "reload",
-            "enable",
-            "disable",
-            "remember",
-            "store",
-            "save",
-            "note",
-            "pull",
-            "push",
-            "run",
-            "execute",
-            "fetch",
-            "merge",
-            "start",
-            "stop",
-            "compile",
-            "download",
-            "clone",
-            "migrate",
-            "fix",
-            "retry",
-            "redo",
-            "rerun",
-            "try again",
-            "do it again",
-        ],
-    );
+    let asks_change = text_contains_any_phrase(lower_text, CHANGE_KEYWORDS)
+        || text_contains_any_phrase(lower_text, RUN_KEYWORDS);
     let visible_state_problem = text_contains_any_phrase(
         lower_text,
         &[
@@ -750,7 +778,13 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&lower, &verification_targets);
     let connected_content_mode = super::intent_routing::classify_connected_content_mode(current);
-    let task_kind = infer_completion_task_kind(&signals);
+    let mut task_kind = infer_completion_task_kind(&signals);
+    // "Run X and provide the output" is an observation delivered as text —
+    // the bare run verb must not make it a Change (observed live: successful
+    // read-and-report executor tasks scored partial via expects_mutation).
+    if task_kind == CompletionTaskKind::Change && is_run_and_report_only(&lower) {
+        task_kind = CompletionTaskKind::Check;
+    }
     // DraftOnly used to override task_kind to Compose and force
     // expects_mutation=false, but this caused false tool disablement
     // for requests like "create blog posts in ~/projects/X and commit".
@@ -810,6 +844,38 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_and_report_missions_are_checks_not_changes() {
+        // Live repro (executors 3f4c6a8d / bb711de5, 2026-07-02): "Run 'df -h /'
+        // and provide the output." classified Change via the "run" keyword →
+        // expects_mutation=true → a perfectly successful read-and-report
+        // scored partial. Running a command to REPORT its output is an
+        // observation, not a mutation.
+        for mission in [
+            "Run 'df -h /' and provide the output.",
+            "Run 'find ~/projects/aidaemon/src -name \"*.rs\" | wc -l' and return the count.",
+            "Execute 'uptime' and report the output.",
+        ] {
+            let contract = infer_completion_contract(mission, &[]);
+            assert!(
+                !contract.expects_mutation,
+                "{mission:?} must not expect mutation, got kind={:?}",
+                contract.task_kind
+            );
+        }
+
+        // Control: a run-and-report phrasing around a genuinely mutating verb
+        // keeps its mutation expectation. (Backtick-quoted like real task-lead
+        // missions — NOTE: single-quoted commands hide keywords from
+        // contains_keyword_as_words because apostrophes count as word chars;
+        // pre-existing matcher quirk, documented here.)
+        let deploy = infer_completion_contract(
+            "Run `npm run deploy` in ~/projects/example-blog and report the output.",
+            &[],
+        );
+        assert!(deploy.expects_mutation);
+    }
 
     #[test]
     fn verify_only_check_mission_does_not_expect_mutation_despite_live_content_mode() {
