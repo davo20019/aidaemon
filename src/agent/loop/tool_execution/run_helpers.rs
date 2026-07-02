@@ -552,7 +552,12 @@ pub(super) fn has_nonzero_exit_code(text: &str) -> bool {
 
 pub(super) fn build_external_action_completion_ack(result_text: &str) -> String {
     let primary = crate::traits::extract_primary_message_content(result_text, &[]);
-    let excerpt = primary.trim();
+    let filtered: String = primary
+        .lines()
+        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let excerpt = filtered.trim();
     let has_error = has_nonzero_exit_code(excerpt);
     let status = if has_error {
         "The requested action finished with errors."
@@ -740,6 +745,22 @@ mod tests {
             crate::utils::truncation_notice(4000, 4265)
         );
         assert_eq!(extract_error_summary_line(&result_text), None);
+    }
+
+    #[test]
+    fn external_action_ack_excludes_rendered_truncation_notice() {
+        // Live risk: run.rs now renders the truncation notice into
+        // `result_text` before this ack is built. If the ack's embedded
+        // excerpt isn't filtered the same way `extract_error_summary_line`
+        // is, the raw model-facing notice ships verbatim as the user-facing
+        // reply on LLM timeout (finalize_external_action_timeout_ack).
+        let result_text = format!(
+            "Deployed 3 services successfully.\n{}",
+            crate::utils::truncation_notice(4000, 4265)
+        );
+        let ack = build_external_action_completion_ack(&result_text);
+        assert!(ack.contains("Deployed 3 services successfully."));
+        assert!(!ack.contains("OUTPUT TRUNCATED"));
     }
 
     #[test]
