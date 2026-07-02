@@ -1180,7 +1180,6 @@ async fn drain_to_buffer<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: Ar
     }
 }
 
-/// Format combined stdout/stderr output with optional truncation.
 /// Render an elapsed-seconds count as a friendly duration for user-facing
 /// progress messages (e.g. 65 -> "1m 5s", 40 -> "40s", 3600 -> "1h 0m").
 fn humanize_elapsed(secs: u64) -> String {
@@ -1216,7 +1215,18 @@ fn summarize_progress_output(output: &str) -> String {
     }
 }
 
-fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
+/// Format combined stdout/stderr output. Returns the (untruncated-notice)
+/// text plus structured [`TruncationInfo`] when the output was cut down.
+/// Callers decide how the notice reaches the model: foreground call sites
+/// attach it to the outgoing `ToolCallOutcome.metadata.truncation` (rendered
+/// once by the agent loop); background-delivery call sites, which bypass the
+/// loop entirely, render it inline immediately via
+/// `crate::utils::render_truncation_notice`.
+fn format_output(
+    stdout: &str,
+    stderr: &str,
+    max_chars: usize,
+) -> (String, Option<crate::traits::TruncationInfo>) {
     let mut result = String::new();
     if !stdout.is_empty() {
         result.push_str(stdout);
@@ -1230,6 +1240,7 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
     if result.is_empty() {
         result.push_str("(no output)");
     }
+    let mut truncation = None;
     if result.len() > max_chars {
         let total_chars = result.chars().count();
         // Find the nearest valid UTF-8 char boundary at or before max_chars
@@ -1238,11 +1249,13 @@ fn format_output(stdout: &str, stderr: &str, max_chars: usize) -> String {
             truncate_at -= 1;
         }
         result.truncate(truncate_at);
-        let shown_chars = result.chars().count();
-        result.push('\n');
-        result.push_str(&crate::utils::truncation_notice(shown_chars, total_chars));
+        truncation = Some(crate::traits::TruncationInfo {
+            shown_chars: result.chars().count(),
+            total_chars,
+            remediation_hint: None,
+        });
     }
-    result
+    (result, truncation)
 }
 
 /// Upper bound (chars / lines) on a background command's output that is
@@ -1829,7 +1842,7 @@ impl TerminalTool {
         pid: u32,
         proc: RunningProcess,
         reason: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
         proc.notify_on_completion.store(false, Ordering::Relaxed);
         let child_pid = proc.child_id;
         let started_at = proc.started_at;
@@ -1875,8 +1888,9 @@ impl TerminalTool {
             reason,
             command
         );
-        output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
-        Ok(output)
+        let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+        output.push_str(&formatted);
+        Ok((output, truncation))
     }
 
     async fn cleanup_task_processes(&self, task_id: &str) -> anyhow::Result<usize> {
@@ -2069,19 +2083,22 @@ impl TerminalTool {
                 pid,
                 proc.started_at.elapsed().as_secs_f64()
             );
-            output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
+            let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+            output.push_str(&formatted);
             if let Some(code) = exit_code {
                 if code != 0 {
                     output.push_str(&format!("\n[exit code: {}]", code));
                 }
             }
 
+            let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
+            metadata.truncation = truncation;
             let mut completed = self.completed.lock().await;
             completed.insert(
                 pid,
                 CompletedProcess {
                     output,
-                    metadata: tracked_background_metadata(proc.detached, false, exit_code),
+                    metadata,
                     completed_at: Instant::now(),
                 },
             );
@@ -2704,16 +2721,16 @@ impl TerminalTool {
                 let stderr_data = stderr_buf.lock().await;
                 let stdout = String::from_utf8_lossy(&stdout_data);
                 let stderr = String::from_utf8_lossy(&stderr_data);
-                let mut output = format_output(&stdout, &stderr, self.max_output_chars);
+                let (mut output, truncation) =
+                    format_output(&stdout, &stderr, self.max_output_chars);
                 if let Some(code) = exit_code {
                     if code != 0 {
                         output.push_str(&format!("\n[exit code: {}]", code));
                     }
                 }
-                Ok(ToolCallOutcome {
-                    metadata: foreground_terminal_metadata(exit_code),
-                    output,
-                })
+                let mut metadata = foreground_terminal_metadata(exit_code);
+                metadata.truncation = truncation;
+                Ok(ToolCallOutcome { metadata, output })
             }
             Err(_) => {
                 // Timeout — check if this is a daemon/background command where the
@@ -2731,7 +2748,7 @@ impl TerminalTool {
                         let b = stderr_buf.lock().await;
                         String::from_utf8_lossy(&b).to_string()
                     };
-                    let output =
+                    let (formatted, truncation) =
                         format_output(&partial_stdout, &partial_stderr, self.max_output_chars);
                     reader_handle.abort();
                     let output = format!(
@@ -2739,7 +2756,7 @@ impl TerminalTool {
                          The process is running independently and is not task-owned.\n\
                          This detached daemonized process is not tracked by action=\"check\"/\"kill\".\n\n\
                          Initial output:\n{}",
-                        pid, output
+                        pid, formatted
                     );
                     return Ok(ToolCallOutcome {
                         metadata: ToolCallMetadata {
@@ -2747,6 +2764,7 @@ impl TerminalTool {
                             detached: true,
                             timed_out: false,
                             completion_notifications_enabled: false,
+                            truncation,
                             ..ToolCallMetadata::default()
                         },
                         output,
@@ -2917,10 +2935,20 @@ impl TerminalTool {
 
                                         let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
                                         let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
-                                        let output = truncate_with_note(
-                                            &format_output(&stdout, &stderr, max_output_chars),
-                                            2500,
-                                        );
+                                        // Background delivery bypasses the agent loop
+                                        // entirely, so the truncation notice is
+                                        // rendered inline here immediately (the
+                                        // loop's single render site will never see
+                                        // this text).
+                                        let (formatted, truncation) =
+                                            format_output(&stdout, &stderr, max_output_chars);
+                                        let mut with_notice = formatted;
+                                        if let Some(info) = truncation {
+                                            with_notice.push('\n');
+                                            with_notice
+                                                .push_str(&crate::utils::render_truncation_notice(&info));
+                                        }
+                                        let output = truncate_with_note(&with_notice, 2500);
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
 
                                         // Deliverable attribution: if the command produced exactly
@@ -3127,14 +3155,22 @@ impl TerminalTool {
                                                     &stderr_buf.lock().await,
                                                 )
                                                 .to_string();
-                                                let output = truncate_with_note(
-                                                    &format_output(
-                                                        &stdout,
-                                                        &stderr,
-                                                        max_output_chars,
-                                                    ),
-                                                    2500,
-                                                );
+                                                // Background delivery bypasses the agent
+                                                // loop entirely (this feeds a synthesized
+                                                // re-engagement message or a direct
+                                                // fallback notice), so the truncation
+                                                // notice is rendered inline here
+                                                // immediately.
+                                                let (formatted, truncation) =
+                                                    format_output(&stdout, &stderr, max_output_chars);
+                                                let mut with_notice = formatted;
+                                                if let Some(info) = truncation {
+                                                    with_notice.push('\n');
+                                                    with_notice.push_str(
+                                                        &crate::utils::render_truncation_notice(&info),
+                                                    );
+                                                }
+                                                let output = truncate_with_note(&with_notice, 2500);
                                                 let reengage_budget_ok = {
                                                     let mut log =
                                                         reengagements_for_notify.lock().await;
@@ -3857,16 +3893,16 @@ impl TerminalTool {
                 pid,
                 proc.started_at.elapsed().as_secs_f64()
             );
-            output.push_str(&format_output(&stdout, &stderr, self.max_output_chars));
+            let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+            output.push_str(&formatted);
             if let Some(code) = exit_code {
                 if code != 0 {
                     output.push_str(&format!("\n[exit code: {}]", code));
                 }
             }
-            Ok(ToolCallOutcome {
-                output,
-                metadata: tracked_background_metadata(proc.detached, false, exit_code),
-            })
+            let mut metadata = tracked_background_metadata(proc.detached, false, exit_code);
+            metadata.truncation = truncation;
+            Ok(ToolCallOutcome { output, metadata })
         } else {
             // Still running — return tail of buffer.
             let elapsed = proc.started_at.elapsed().as_secs();
@@ -3927,13 +3963,12 @@ impl TerminalTool {
         self.completed.lock().await.remove(&pid);
 
         let detached = proc.detached;
-        let output = self
+        let (output, truncation) = self
             .terminate_running_process(pid, proc, "manual kill")
             .await?;
-        Ok(ToolCallOutcome {
-            output,
-            metadata: tracked_background_metadata(detached, false, None),
-        })
+        let mut metadata = tracked_background_metadata(detached, false, None);
+        metadata.truncation = truncation;
+        Ok(ToolCallOutcome { output, metadata })
     }
 
     /// Shared implementation for `call_with_status_outcome` and `call_with_execution_context`.
@@ -5021,38 +5056,62 @@ mod tests {
     }
 
     #[test]
+    fn format_output_returns_truncation_info_instead_of_embedding_notice() {
+        let long = "x".repeat(5000);
+        let (text, truncation) = format_output(&long, "", 4000);
+        assert!(
+            !text.contains("OUTPUT TRUNCATED"),
+            "notice must not be embedded"
+        );
+        let info = truncation.expect("truncation info for oversized output");
+        assert_eq!(info.total_chars, 5000);
+        assert!(info.shown_chars <= 4000);
+    }
+
+    #[test]
+    fn format_output_no_truncation_for_small_output() {
+        let (text, truncation) = format_output("hello", "", 4000);
+        assert!(text.contains("hello"));
+        assert!(truncation.is_none());
+    }
+
+    #[test]
     fn test_format_stdout_only() {
-        let result = format_output("hello", "", 1000);
+        let (result, truncation) = format_output("hello", "", 1000);
         assert_eq!(result, "hello");
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_stderr_appended() {
-        let result = format_output("out", "err", 1000);
+        let (result, truncation) = format_output("out", "err", 1000);
         assert_eq!(result, "out\n--- stderr ---\nerr");
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_empty_no_output() {
-        let result = format_output("", "", 1000);
+        let (result, truncation) = format_output("", "", 1000);
         assert_eq!(result, "(no output)");
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_truncation() {
         let long_output = "a".repeat(200);
-        let result = format_output(&long_output, "", 100);
-        assert!(
-            result.len() > 100,
-            "truncated output should include the notice"
-        );
-        assert!(result.contains("OUTPUT TRUNCATED"));
-        // The notice must report the omitted amount so the model can't silently
-        // fabricate the rest (100 shown of 200 total).
-        assert!(result.contains("100 of 200"));
-        // The content portion before the notice should be exactly max_chars long
-        let prefix = &result[..100];
-        assert_eq!(prefix, "a".repeat(100));
+        let (result, truncation) = format_output(&long_output, "", 100);
+        // The returned text is the raw content only — no embedded notice.
+        // The notice is rendered by the caller (foreground: from metadata;
+        // background: inline at the delivery site).
+        assert!(!result.contains("OUTPUT TRUNCATED"));
+        assert_eq!(result.len(), 100);
+        assert_eq!(result, "a".repeat(100));
+        // The structured info must report the omitted amount so a caller
+        // rendering the notice can't silently let the model fabricate the
+        // rest (100 shown of 200 total).
+        let info = truncation.expect("truncation info for oversized output");
+        assert_eq!(info.shown_chars, 100);
+        assert_eq!(info.total_chars, 200);
     }
 
     #[test]
@@ -5061,11 +5120,11 @@ mod tests {
         let output = "aé日🎉".repeat(50); // mixed multi-byte chars
                                           // Truncate at various positions that may land mid-char
         for max in [1, 2, 3, 4, 5, 10, 50, 100] {
-            let result = format_output(&output, "", max);
+            let (result, truncation) = format_output(&output, "", max);
             // Must not panic and must be valid UTF-8 (String guarantees this)
             assert!(!result.is_empty());
             if output.len() > max {
-                assert!(result.contains("OUTPUT TRUNCATED"));
+                assert!(truncation.is_some());
             }
         }
     }
