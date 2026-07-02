@@ -110,6 +110,17 @@ impl LiveStatus {
         }
     }
 
+    /// The surface's editable message id, when one exists and editing still
+    /// works this turn. Read before `reset()` — e.g. to register a delivered
+    /// background-handoff reply so a later completion ping can edit it.
+    pub fn surface_message_id(&self) -> Option<String> {
+        if self.edit_supported {
+            self.message_id.clone()
+        } else {
+            None
+        }
+    }
+
     pub fn reset(&mut self) {
         self.message_id = None;
         self.checklist = None;

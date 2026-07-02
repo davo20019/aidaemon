@@ -4572,7 +4572,7 @@ impl TelegramChannel {
         let (live_owner, live_sink): (
             Option<std::sync::Arc<tokio::sync::Mutex<crate::channels::live_status::LiveStatus>>>,
             Option<std::sync::Arc<crate::channels::live_status::HubSurfaceSink>>,
-        ) = if let Some(hub) = status_hub {
+        ) = if let Some(hub) = status_hub.clone() {
             let owner = std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::channels::live_status::LiveStatus::new(),
             ));
@@ -4711,6 +4711,21 @@ impl TelegramChannel {
                             } else {
                                 false
                             };
+                            // A delivered background handoff ("⏳ Still on it — …")
+                            // becomes the session's status surface: the terminal
+                            // notifier EDITS it into the completion ping instead of
+                            // stacking a third message. Registered before reset()
+                            // clears the surface id below.
+                            if handled && crate::agent::is_friendly_background_handoff(&reply) {
+                                if let (Some(hub), Some(live_owner)) =
+                                    (status_hub.as_ref(), live_owner.as_ref())
+                                {
+                                    if let Some(id) = live_owner.lock().await.surface_message_id() {
+                                        hub.register_background_status_surface(&session_id, &id)
+                                            .await;
+                                    }
+                                }
+                            }
                             if !handled {
                                 if let Err(e) =
                                     send_full_or_expandable_reply(&bot, chat_id, &reply).await

@@ -206,6 +206,7 @@ use loop_utils::{
 mod post_task;
 #[path = "runtime/task_outcome.rs"]
 mod task_outcome;
+pub(crate) use post_task::is_friendly_background_handoff;
 use post_task::LearningContext;
 pub(in crate::agent) use post_task::ReplayNoteCategory;
 pub(in crate::agent) use task_outcome::{

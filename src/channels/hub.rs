@@ -41,6 +41,12 @@ pub struct ChannelHub {
     /// file"). Keyed by `(session_id, canonical file path)`; genuinely different
     /// files (different paths) are never suppressed. Photos are never deduped.
     recent_media_deliveries: RwLock<HashMap<String, tokio::time::Instant>>,
+    /// Per-session editable message id of a delivered background-handoff reply
+    /// ("⏳ Still on it — …"). The terminal notifier consumes it (take) so the
+    /// completion ping EDITS that message in place instead of stacking a new
+    /// one. Last writer wins per session; take() removes the entry, so a
+    /// second concurrent background command degrades to a fresh ping message.
+    background_status_surfaces: RwLock<HashMap<String, String>>,
 }
 
 impl ChannelHub {
@@ -53,7 +59,26 @@ impl ChannelHub {
             delivery_note_agent: None,
             last_sent_text: RwLock::new(HashMap::new()),
             recent_media_deliveries: RwLock::new(HashMap::new()),
+            background_status_surfaces: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Register the editable message id of a just-delivered background-handoff
+    /// reply for this session. See `background_status_surfaces`.
+    pub async fn register_background_status_surface(&self, session_id: &str, message_id: &str) {
+        self.background_status_surfaces
+            .write()
+            .await
+            .insert(session_id.to_string(), message_id.to_string());
+    }
+
+    /// Take (and remove) the registered background-handoff message id for this
+    /// session, if any.
+    pub async fn take_background_status_surface(&self, session_id: &str) -> Option<String> {
+        self.background_status_surfaces
+            .write()
+            .await
+            .remove(session_id)
     }
 
     /// How long a delivered document suppresses an identical re-delivery.

@@ -556,6 +556,45 @@ async fn deliver_attributed_background_file(
 /// Send a background status/failure line to the session's channel, falling back
 /// to the durable notification queue when no live channel is available. Mirrors
 /// the hub-then-enqueue pattern used throughout the completion notifier.
+/// Deliver the background completion ping, preferring to EDIT the session's
+/// registered "⏳ Still on it — …" handoff message in place (single evolving
+/// status bubble) over stacking a new message. Falls back to the plain
+/// send/enqueue path on any miss or edit failure, so the ping is never lost.
+/// The final ANSWER (re-engagement reply) intentionally stays a separate
+/// fresh message — edits do not trigger channel notifications.
+pub(crate) async fn deliver_background_completion_ping(
+    hub: Option<&Arc<ChannelHub>>,
+    state: Option<&Arc<dyn crate::traits::StateStore>>,
+    session_id: &str,
+    goal_id: &str,
+    message: &str,
+    pid: u32,
+) {
+    if let Some(hub) = hub {
+        if let Some(surface_id) = hub.take_background_status_surface(session_id).await {
+            match hub.edit_text(session_id, &surface_id, message).await {
+                Ok(true) => {
+                    info!(
+                        pid,
+                        session_id,
+                        "Background completion ping edited into the handoff status message"
+                    );
+                    return;
+                }
+                other => {
+                    info!(
+                        pid,
+                        session_id,
+                        ?other,
+                        "Handoff status edit unavailable; falling back to fresh ping message"
+                    );
+                }
+            }
+        }
+    }
+    deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
+}
+
 async fn deliver_background_text(
     hub: Option<&Arc<ChannelHub>>,
     state: Option<&Arc<dyn crate::traits::StateStore>>,
@@ -3106,47 +3145,18 @@ impl TerminalTool {
                                             answer_follows,
                                         );
 
-                                        let mut delivered = false;
-                                        if let Some(ref hub) = hub_for_notify {
-                                            if let Err(e) = hub.send_text(&session_for_notify, &message).await {
-                                                warn!(
-                                                    pid,
-                                                    error = %e,
-                                                    session_id = %session_for_notify,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier failed direct hub completion delivery"
-                                                );
-                                            } else {
-                                                delivered = true;
-                                            }
-                                        }
-                                        if !delivered {
-                                            if let Some(ref state) = state_for_notify {
-                                                let entry = crate::traits::NotificationEntry::new(
-                                                    &goal_id_for_notify,
-                                                    &session_for_notify,
-                                                    "progress",
-                                                    &message,
-                                                );
-                                                if let Err(e) = state.enqueue_notification(&entry).await {
-                                                    warn!(
-                                                        pid,
-                                                        error = %e,
-                                                        session_id = %session_for_notify,
-                                                        goal_id = %goal_id_for_notify,
-                                                        command = %command_for_notify,
-                                                        "Terminal background notifier failed to enqueue completion notification"
-                                                    );
-                                                }
-                                            } else {
-                                                warn!(
-                                                    pid,
-                                                    session_id = %session_for_notify,
-                                                    command = %command_for_notify,
-                                                    "Terminal background notifier has no fallback queue; completion update dropped"
-                                                );
-                                            }
-                                        }
+                                        // Prefer editing the "⏳ Still on it —" handoff bubble
+                                        // in place (one evolving status message); fall back to
+                                        // the plain send/enqueue path inside the helper.
+                                        deliver_background_completion_ping(
+                                            hub_for_notify.as_ref(),
+                                            state_for_notify.as_ref(),
+                                            &session_for_notify,
+                                            &goal_id_for_notify,
+                                            &message,
+                                            pid,
+                                        )
+                                        .await;
                                         // Save output for agent re-engagement after loop
                                         completion_output_for_agent = Some(output);
                                         break;
