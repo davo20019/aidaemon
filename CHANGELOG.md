@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.18] - 2026-07-02
+
+### Added
+
+- **Structured-answer schema pass**: models listed in `[provider] structured_answer_models` get no-tool final answers re-issued through a strict two-field `{reasoning, response}` JSON schema, draining chain-of-thought that some local models emit as undelimited answer text. Includes truncated-JSON salvage with one retry and a never-ship-raw fallback ladder. Verified live against the challenge-prompt repro.
+- **Truncation notices out-of-band (scaffolding provenance, phase 1)**: tools no longer embed the instructional `[⚠ OUTPUT TRUNCATED …]` notice in their returned output. Truncation is carried as structured `ToolCallMetadata.truncation` (`TruncationInfo`) and rendered into the model-visible text at exactly one loop site — after the outcome ledger, error-summary extraction, and failure classifiers have consumed clean text. Terminal background-delivery paths render inline (they bypass the loop). A source lint forbids reintroducing embedded notices.
+- **Single evolving background status bubble**: the "⏳ Still on it —" handoff reply is registered as the session's status surface and the completion ping now EDITS it in place ("✅ Done — finished in 1m 3s. Writing up the result now…") instead of stacking a new message. The final answer stays a separate fresh message so it still triggers a channel notification. Telegram-first; other channels behave as before.
+- **Shared outbound rate limiter** for Telegram and Slack channel sends.
+- **Fabrication audit** (`db_probe --fabrication-audit`): post-hoc trace check flagging tasks whose final reply claims a side-effecting action while the task made zero tool calls.
+- **Prefill/decode telemetry**: server-reported prefill/decode timing split, per-call prompt composition (system/tools/history tokens), and computer-use observation size are captured through `TokenUsage` → `LlmCallData` → db_probe.
+- Task-end telemetry now logs unresolved required-action counts (keys at debug level) so partial outcomes with fulfilled contracts can be diagnosed post-hoc.
+
+### Changed
+
+- **Completion contracts stopped punishing decomposition**: a verification-only sub-agent mission ("check if the post is live") no longer inherits `expects_mutation` from live-delivery content-mode classification, and executor children no longer carry implicit reverification requirements from mutation-flavored phrases ("deploy") when the parent delegated verification to a sibling task. 29 of 31 partial outcomes in a 72-hour window were this artifact.
+- **Mutation-contract gate narrowed to its real targets**: an honest admission that the requested deliverable could not be produced ("couldn't find that file") now passes completion instead of being blocked and re-generated repeatedly; fabricated success claims and content dumps are still blocked.
+- Final replies gutted by sanitization (model parroted tool-envelope markers) get one tool-less restatement retry before the deterministic activity-summary fallback; the activity summary's search list is deduplicated.
+- Background completion pings only promise a follow-up ("Writing up the result now…") when non-trivial output means a re-engagement turn will actually run.
+- `http_request`/`web_search` retries route through the shared backoff helper.
+- Computer-use flows disable thinking mode and keep the target `app` sticky to stop small-model derailment.
+
+### Fixed
+
+- **Successful answers misclassified as tool failures**: a sub-agent quoting `HTTP/2 200` curl output had its success classified as a semantic failure via the `"http/"` error keyword, injecting "the error says: the blog post is live" coaching into the parent loop. An extracted 2xx/3xx status now suppresses the keyword scan.
+- **Harness scaffolding leaking to users**: the truncation notice's own wording matched the error-line extractor and was shipped verbatim in a reconciliation fallback reply; scaffolding lines are now filtered from error summaries, reconciliation fallbacks, and external-action acknowledgments (shared `is_internal_scaffolding_line`).
+- **Background answers swallowed by sink-path attribution**: `2>/dev/null` stderr redirects were attributed as the command's produced output file, suppressing the completion ping and re-engagement to "deliver" `/dev/null`. Paths under `/dev`, `/proc`, and `/sys` are excluded from deliverable candidates.
+- Single-instance daemon lock stops duplicate daemons racing on the database.
+- Glob matching and bounded correction contexts (correction-registry FIFO cap).
+
+### Removed
+
+- Never-registered tool sources `token_usage.rs` and `scheduled_goals.rs` (born orphaned in v0.7.0/v0.9.27 — never compiled into any build).
+
+
 ## [0.11.17] - 2026-06-28
 
 ### Added
