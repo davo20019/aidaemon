@@ -124,6 +124,35 @@ pub fn render_truncation_notice(info: &crate::traits::TruncationInfo) -> String 
     }
 }
 
+/// Losslessly compact a pretty-printed JSON block embedded in tool-result
+/// text (headers/prefix + JSON body + suffix). Pretty-printed JSON costs
+/// ~2.5-3x the tokens of its compact form with identical information — on a
+/// small-context local model that difference is the compose step timing out
+/// versus answering. Returns `Some(new_text)` only when a parseable JSON
+/// block was found AND compaction actually shrank the text; any doubt
+/// (unparseable, truncated, already compact) returns `None` and the caller
+/// keeps the original.
+pub fn compact_embedded_json(text: &str) -> Option<String> {
+    let start = text.find(['{', '['])?;
+    let open = text.as_bytes()[start] as char;
+    let close = if open == '{' { '}' } else { ']' };
+    let end = text.rfind(close)?;
+    if end <= start {
+        return None;
+    }
+    let candidate = &text[start..=end];
+    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+    let compact = value.to_string();
+    if compact.chars().count() >= candidate.chars().count() {
+        return None;
+    }
+    let mut rebuilt = String::with_capacity(text.len() - candidate.len() + compact.len());
+    rebuilt.push_str(&text[..start]);
+    rebuilt.push_str(&compact);
+    rebuilt.push_str(&text[end + close.len_utf8()..]);
+    Some(rebuilt)
+}
+
 /// Whether a line is harness-injected scaffolding (truncation notices,
 /// [SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
 /// tool output. Such lines are addressed to the model and must never be
@@ -185,6 +214,38 @@ mod tests {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello", 5), "hello");
         assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn compact_embedded_json_shrinks_pretty_api_bodies_losslessly() {
+        // Live repro (task 6331508b): a pretty-printed clinical-trials JSON
+        // response stayed inline (under the spill cap) and its whitespace
+        // inflation helped time out the compose call.
+        let pretty = "HTTP 200 OK\ncontent-type: application/json\n\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Study\",\n    \"locations\": [\n      {\n        \"city\": \"Fairfax\",\n        \"state\": \"Virginia\"\n      }\n    ]\n  }\n]\n";
+        let compacted = compact_embedded_json(pretty).expect("compaction applies");
+        assert!(compacted.chars().count() < pretty.chars().count());
+        assert!(compacted.starts_with("HTTP 200 OK"), "prefix preserved");
+        assert!(
+            compacted.contains("\"nctId\":\"NCT00000000\""),
+            "data intact, compact"
+        );
+        // Lossless: parse both bodies and compare values.
+        let orig_start = pretty.find('[').unwrap();
+        let orig: serde_json::Value =
+            serde_json::from_str(&pretty[orig_start..pretty.rfind(']').unwrap() + 1]).unwrap();
+        let new_start = compacted.find('[').unwrap();
+        let new: serde_json::Value =
+            serde_json::from_str(&compacted[new_start..compacted.rfind(']').unwrap() + 1]).unwrap();
+        assert_eq!(orig, new);
+    }
+
+    #[test]
+    fn compact_embedded_json_leaves_prose_and_broken_json_alone() {
+        assert!(compact_embedded_json("plain command output with no braces").is_none());
+        // Truncated JSON (mid-array cut) must not be touched.
+        assert!(compact_embedded_json("[\n  {\"a\": 1},\n  {\"b\"").is_none());
+        // Already-compact JSON: no shrink, no change.
+        assert!(compact_embedded_json("{\"a\":1}").is_none());
     }
 
     #[test]

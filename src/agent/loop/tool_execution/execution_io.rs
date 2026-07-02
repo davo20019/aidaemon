@@ -223,6 +223,27 @@ pub(super) async fn execute_tool_call_io(
                 }
             }
         } else {
+            // Structured API bodies: pretty-printed JSON costs ~2.5-3x the
+            // tokens of its compact form with identical information (observed
+            // live: an inline clinical-trials response helped time out the
+            // compose call). Compact it losslessly BEFORE the size checks —
+            // this can also keep a result inline that would otherwise spill.
+            // Small bodies stay pretty-printed for model readability.
+            const STRUCTURED_JSON_COMPACT_MIN_CHARS: usize = 2_000;
+            if matches!(tc.name.as_str(), "http_request" | "web_fetch")
+                && !result_is_err
+                && result_text.chars().count() > STRUCTURED_JSON_COMPACT_MIN_CHARS
+            {
+                if let Some(compacted) = crate::utils::compact_embedded_json(&result_text) {
+                    tracing::info!(
+                        tool = %tc.name,
+                        original_chars = result_text.chars().count(),
+                        compact_chars = compacted.chars().count(),
+                        "Losslessly compacted embedded JSON in tool result"
+                    );
+                    result_text = compacted;
+                }
+            }
             // Oversized successful results are spilled to a temp file when the
             // model has a filesystem recovery path (read_file or terminal): it
             // then pages / jq / greps the full data instead of losing the
