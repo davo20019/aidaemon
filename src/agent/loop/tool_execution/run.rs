@@ -1732,6 +1732,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             &mut learning_state,
         )
         .await?;
+        // Render tool-boundary truncation into the model-visible text.
+        // Single render site: everything upstream (error_summary, outcome
+        // ledger, failure classification) consumed clean content.
+        if let Some(info) = result_metadata.truncation.as_ref() {
+            result_text.push('\n');
+            result_text.push_str(&crate::utils::render_truncation_notice(info));
+        }
         if let Some(outcome) = learning_outcome.control_flow {
             commit_state!();
             return Ok(outcome);

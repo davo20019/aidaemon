@@ -739,6 +739,7 @@ pub struct MockTool {
     return_value: String,
     role: ToolRole,
     available: bool,
+    return_metadata: crate::traits::ToolCallMetadata,
 }
 
 #[allow(dead_code)]
@@ -750,6 +751,7 @@ impl MockTool {
             return_value: return_value.to_string(),
             role: ToolRole::Action,
             available: true,
+            return_metadata: Default::default(),
         }
     }
 
@@ -760,6 +762,11 @@ impl MockTool {
 
     pub fn with_availability(mut self, available: bool) -> Self {
         self.available = available;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: crate::traits::ToolCallMetadata) -> Self {
+        self.return_metadata = metadata;
         self
     }
 }
@@ -788,6 +795,18 @@ impl Tool for MockTool {
 
     async fn call(&self, _args: &str) -> anyhow::Result<String> {
         Ok(self.return_value.clone())
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output = self.call_with_status(arguments, status_tx).await?;
+        Ok(crate::traits::ToolCallOutcome {
+            output,
+            metadata: self.return_metadata.clone(),
+        })
     }
 
     fn tool_role(&self) -> ToolRole {

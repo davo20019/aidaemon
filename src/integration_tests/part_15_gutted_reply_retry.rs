@@ -84,3 +84,74 @@ async fn test_gutted_retry_is_one_shot_then_falls_back() {
     assert!(!response.trim().is_empty(), "fallback must not be empty");
     assert_eq!(harness.provider.call_count().await, 3); // no third retry
 }
+
+// ==========================================================================
+// Tool-boundary truncation notice rendering (single loop site)
+//
+// Tools attach `TruncationInfo` as metadata with no embedded notice text.
+// The loop must render the instructional notice into the model-visible tool
+// message AFTER the outcome ledger (error_summary, record_outcome, failure
+// classification) has already consumed the clean content.
+// ==========================================================================
+
+/// A tool whose output was truncated (metadata set, no embedded notice)
+/// must (a) reach the model WITH the rendered notice and (b) leave the
+/// outcome ledger's error_summary free of notice text.
+#[tokio::test]
+async fn test_truncated_tool_output_renders_notice_but_keeps_ledger_clean() {
+    let truncated_tool = Arc::new(
+        MockTool::new(
+            "big_probe",
+            "returns truncated output",
+            "partial output\nError: disk full",
+        )
+        .with_metadata(crate::traits::ToolCallMetadata {
+            truncation: Some(crate::traits::TruncationInfo {
+                shown_chars: 30,
+                total_chars: 900,
+                remediation_hint: None,
+            }),
+            ..Default::default()
+        }),
+    ) as Arc<dyn crate::traits::Tool>;
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("big_probe", "{}"),
+        MockProvider::text_response("The probe failed: disk full."),
+    ]);
+    let harness =
+        setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![truncated_tool], None)
+            .await
+            .unwrap();
+
+    let _ = harness
+        .agent
+        .handle_message(
+            "tg_trunc_meta",
+            "Run the big probe",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // (a) The model saw the rendered notice on the tool message of the
+    // SECOND llm call.
+    let calls = harness.provider.call_log.lock().await;
+    let second = &calls.last().expect("two calls").messages;
+    let tool_msg = second
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("tool message present");
+    let content = tool_msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    assert!(
+        content.contains("OUTPUT TRUNCATED"),
+        "model must see notice"
+    );
+    assert!(content.contains("Error: disk full"));
+}

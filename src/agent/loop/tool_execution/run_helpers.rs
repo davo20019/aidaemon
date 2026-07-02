@@ -722,6 +722,18 @@ mod tests {
     }
 
     #[test]
+    fn error_summary_line_on_clean_content_is_the_real_error() {
+        // After the loop-render migration, tool content reaching the ledger
+        // never embeds a truncation notice — confirm extraction still finds
+        // the real error line on such clean content.
+        let result_text = "partial output\nError: disk full";
+        assert_eq!(
+            extract_error_summary_line(result_text).as_deref(),
+            Some("Error: disk full")
+        );
+    }
+
+    #[test]
     fn error_summary_is_none_when_only_scaffolding_matches() {
         let result_text = format!(
             "{}\nplain output with no failures\n[SYSTEM] IMPORTANT — The error says: \"something\"\n",
