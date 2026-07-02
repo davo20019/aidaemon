@@ -74,6 +74,15 @@ fn extract_absolute_paths(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Paths that are I/O sinks, not files a command "produces": anything under
+/// /dev, /proc, or /sys. `2>/dev/null` matches the redirect regex like any
+/// other redirect, but a device node must never be attributed as the
+/// command's deliverable (observed live: One(/dev/null) suppressed the
+/// finished-ping and re-engagement, swallowing the user's answer).
+fn is_non_deliverable_sink(path: &Path) -> bool {
+    path.starts_with("/dev") || path.starts_with("/proc") || path.starts_with("/sys")
+}
+
 /// Returns absolute paths that appear as output-flag targets in the command line.
 /// Handles: `> path`, `-o path`, `--output path`, `--output=path`.
 fn extract_output_flag_paths(command: &str) -> Vec<PathBuf> {
@@ -103,6 +112,7 @@ fn extract_output_flag_paths(command: &str) -> Vec<PathBuf> {
         }
     }
 
+    results.retain(|p| !is_non_deliverable_sink(p));
     results
 }
 
@@ -257,6 +267,11 @@ pub fn attribute_deliverable(
 
     for p in &all_candidate_paths {
         if executed_scripts.contains(p) {
+            continue;
+        }
+        // Device/proc/sys nodes can carry fresh mtimes; they are sinks, not
+        // produced files — never candidates regardless of the mtime window.
+        if is_non_deliverable_sink(p) {
             continue;
         }
         if let Some(mtime) = stat_mtime(p) {
@@ -420,6 +435,69 @@ mod tests {
 
     fn t0() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn stderr_redirect_to_dev_null_is_not_a_deliverable() {
+        // Live repro (2026-07-02, pid 51980): `du -sh ~/projects/* 2>/dev/null
+        // | sort -hr | head` — the redirect regex captured /dev/null as a
+        // produced-output file, attribution returned One(/dev/null), the
+        // finished-ping and re-engagement were suppressed to "deliver" it,
+        // delivery failed ("not a regular file"), and the user's answer was
+        // swallowed entirely.
+        let start = t0();
+        let end = start + Duration::from_secs(63);
+        let read = |_: &std::path::Path| -> Option<String> { None };
+        // Device nodes can carry fresh mtimes — the exclusion must not rely
+        // on the mtime gate.
+        let stat = |p: &std::path::Path| -> Option<SystemTime> {
+            if p == std::path::Path::new("/dev/null") {
+                Some(start + Duration::from_secs(30))
+            } else {
+                None
+            }
+        };
+        let ctx = attribute_deliverable(
+            "s1",
+            "cd '/Users/synthetic/projects' && du -sh ~/projects/* 2>/dev/null | sort -hr | head -n 5",
+            start,
+            end,
+            &[],
+            &read,
+            &stat,
+        );
+        assert!(
+            matches!(auto_send_decision(&ctx), AutoSendDecision::None),
+            "sink paths must never be deliverables; got candidates {:?}",
+            ctx.produced_candidates
+        );
+    }
+
+    #[test]
+    fn sink_paths_are_never_output_candidates() {
+        let start = t0();
+        let end = start + Duration::from_secs(10);
+        let read = |_: &std::path::Path| -> Option<String> { None };
+        let stat = |_: &std::path::Path| -> Option<SystemTime> { Some(start) };
+        for cmd in [
+            "some_tool --output /dev/stdout",
+            "cmd > /dev/null",
+            "cmd --output=/proc/self/fd/1",
+            "cmd -o /sys/kernel/foo",
+        ] {
+            let ctx = attribute_deliverable("s1", cmd, start, end, &[], &read, &stat);
+            assert!(
+                ctx.produced_candidates.is_empty(),
+                "{cmd:?} must yield no produced candidates, got {:?}",
+                ctx.produced_candidates
+            );
+        }
+        // Control: a real redirect target is still detected.
+        let ctx =
+            attribute_deliverable("s1", "cmd > /tmp/report.txt", start, end, &[], &read, &stat);
+        assert!(ctx
+            .produced_candidates
+            .contains(&PathBuf::from("/tmp/report.txt")));
     }
 
     #[test]

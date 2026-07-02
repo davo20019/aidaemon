@@ -1271,6 +1271,39 @@ const SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES: usize = 4;
 /// True when a (non-empty) background result is short and self-contained
 /// enough to deliver directly rather than re-feed into the agent loop.
 /// The caller must already have excluded empty / "(no output)" results.
+/// Build the background-completion ping. When the output is non-trivial a
+/// re-engagement (or tool-less interpretation) turn follows to compose the
+/// actual answer — on a slow local model that takes minutes, so the ping must
+/// say the answer is still coming instead of reading as terminal ("Done" +
+/// silence). `answer_follows` must be false for trivial output, where no
+/// follow-up happens and the promise would be a lie.
+fn background_completion_ping_message(
+    exit_code: Option<i32>,
+    elapsed_secs: u64,
+    answer_follows: bool,
+) -> String {
+    if exit_code == Some(0) {
+        let mut m = format!("✅ Done — finished in {}.", humanize_elapsed(elapsed_secs));
+        if answer_follows {
+            m.push_str(" Writing up the result now…");
+        }
+        m
+    } else {
+        let mut m = format!(
+            "⚠️ Background command finished with errors in {}",
+            humanize_elapsed(elapsed_secs)
+        );
+        if let Some(code) = exit_code {
+            m.push_str(&format!(" (exit code {})", code));
+        }
+        m.push('.');
+        if answer_follows {
+            m.push_str(" Looking at the output now…");
+        }
+        m
+    }
+}
+
 fn is_short_complete_output(output_trimmed: &str) -> bool {
     output_trimmed.chars().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS
         && output_trimmed.lines().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES
@@ -3059,24 +3092,19 @@ impl TerminalTool {
                                             }
                                         }
 
-                                        // No deliverable — keep the existing friendly status ping
-                                        // and feed the output to agent re-engagement below.
-                                        let message = if exit_code == Some(0) {
-                                            format!(
-                                                "✅ Done — finished in {}.",
-                                                humanize_elapsed(elapsed_secs)
-                                            )
-                                        } else {
-                                            let mut m = format!(
-                                                "⚠️ Background command finished with errors in {}",
-                                                humanize_elapsed(elapsed_secs)
-                                            );
-                                            if let Some(code) = exit_code {
-                                                m.push_str(&format!(" (exit code {})", code));
-                                            }
-                                            m.push('.');
-                                            m
+                                        // No deliverable — friendly status ping, then feed the
+                                        // output to agent re-engagement below. Mirror the
+                                        // post-loop triviality check so the ping only promises
+                                        // a follow-up answer when one will actually be composed.
+                                        let answer_follows = {
+                                            let t = output.trim();
+                                            !(t.is_empty() || t == "(no output)")
                                         };
+                                        let message = background_completion_ping_message(
+                                            exit_code,
+                                            elapsed_secs,
+                                            answer_follows,
+                                        );
 
                                         let mut delivered = false;
                                         if let Some(ref hub) = hub_for_notify {
@@ -5073,6 +5101,32 @@ mod tests {
         let (text, truncation) = format_output("hello", "", 4000);
         assert!(text.contains("hello"));
         assert!(truncation.is_none());
+    }
+
+    #[test]
+    fn completion_ping_promises_followup_only_when_answer_is_coming() {
+        // Live UX repro (2026-07-02): user got "✅ Done — finished in 1m 3s."
+        // then 2 minutes of silence while the re-engagement turn composed the
+        // real answer. The ping must say the answer is still coming — but
+        // only when re-engagement will actually follow (non-trivial output).
+        let with_followup = background_completion_ping_message(Some(0), 63, true);
+        assert!(with_followup.contains("Done — finished in 1m 3s"));
+        assert!(
+            with_followup.contains("Writing up the result now"),
+            "got: {with_followup}"
+        );
+
+        // Trivial output → no re-engagement → no false promise.
+        let no_followup = background_completion_ping_message(Some(0), 63, false);
+        assert!(no_followup.contains("Done — finished in 1m 3s"));
+        assert!(!no_followup.contains("Writing up the result now"));
+
+        // Error case keeps its existing shape, plus the follow-up when the
+        // output will be looked at.
+        let err = background_completion_ping_message(Some(2), 40, true);
+        assert!(err.contains("finished with errors in 40s"));
+        assert!(err.contains("(exit code 2)"));
+        assert!(err.contains("Looking at the output now"));
     }
 
     #[test]
