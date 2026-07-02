@@ -13,4 +13,5 @@ mod types;
 pub(crate) use project_dir::extract_project_dir_hint_with_aliases;
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::run_tool_execution_phase;
+pub(in crate::agent) use run_helpers::user_facing_external_action_ack;
 pub(in crate::agent) use types::{ToolExecutionCtx, ToolExecutionOutcome};

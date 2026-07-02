@@ -575,6 +575,32 @@ pub(super) fn build_external_action_completion_ack(result_text: &str) -> String 
     }
 }
 
+/// Derive the USER-facing form of an external-action ack. The full ack (with
+/// its "Latest result:" excerpt) is model-facing context; when an LLM timeout
+/// forces the ack to ship verbatim as the reply, the excerpt must not be a
+/// raw data dump (observed live: 500 chars of clinical-trials JSON). Keep the
+/// excerpt only when it reads like a short prose result; otherwise replace it
+/// with an honest offer to summarize on request.
+pub(crate) fn user_facing_external_action_ack(ack: &str) -> String {
+    const MARKER: &str = "\n\nLatest result:\n";
+    let Some((status, excerpt)) = ack.split_once(MARKER) else {
+        return ack.to_string();
+    };
+    let excerpt = excerpt.trim();
+    let short_prose = excerpt.chars().count() <= 200
+        && excerpt.lines().count() <= 3
+        && !excerpt.starts_with('{')
+        && !excerpt.starts_with('[')
+        && !excerpt.contains("\":");
+    if short_prose {
+        return ack.to_string();
+    }
+    format!(
+        "{} I wasn't able to finish writing up the details — ask me and I'll summarize the result.",
+        status.trim()
+    )
+}
+
 pub(super) fn should_build_external_action_ack(result_text: &str) -> bool {
     let primary = crate::traits::extract_primary_message_content(result_text, &[]);
     let lower = primary.trim_start().to_ascii_lowercase();
@@ -761,6 +787,34 @@ mod tests {
         let ack = build_external_action_completion_ack(&result_text);
         assert!(ack.contains("Deployed 3 services successfully."));
         assert!(!ack.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn user_facing_ack_drops_structured_data_dumps() {
+        // Live repro (2026-07-02): an LLM timeout after an http_request shipped
+        // the model-facing ack verbatim — "The requested action completed
+        // successfully.\n\nLatest result:\n[ {\"nctId\": ...500 chars of
+        // JSON...]" — straight to the user.
+        let json_result = "Fetched trial data.\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Trial Study of Compound X in Participants With Condition Y\",\n    \"status\": \"COMPLETED\",\n    \"conditions\": [\"Condition Y\"]\n  }\n]";
+        let ack = build_external_action_completion_ack(json_result);
+        assert!(ack.contains("Latest result:"), "model-facing keeps excerpt");
+        let user = user_facing_external_action_ack(&ack);
+        assert!(
+            !user.contains("nctId") && !user.contains("Latest result:"),
+            "user version must not dump structured data: {user}"
+        );
+        assert!(user.contains("completed successfully"));
+        assert!(user.contains("summarize"), "offers a follow-up: {user}");
+    }
+
+    #[test]
+    fn user_facing_ack_keeps_short_prose_results() {
+        let ack = build_external_action_completion_ack("Tweet posted. id=1234567890");
+        let user = user_facing_external_action_ack(&ack);
+        assert!(
+            user.contains("Tweet posted"),
+            "short prose results stay: {user}"
+        );
     }
 
     #[test]

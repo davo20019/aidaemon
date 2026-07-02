@@ -622,6 +622,12 @@ pub(super) async fn run_llm_phase(
                     timeout_secs = timeout_dur.as_secs(),
                     "Returning deterministic completion after post-action LLM timeout"
                 );
+                // The stashed ack is model-facing (carries a "Latest result:"
+                // excerpt). Shipping it verbatim dumped raw JSON at the user;
+                // derive the user-facing form (drops structured-data
+                // excerpts, keeps short prose results).
+                let reply =
+                    crate::agent::tool_execution_phase::user_facing_external_action_ack(&reply);
                 let result = finalize_external_action_timeout_ack(
                     services.agent,
                     emitter,
