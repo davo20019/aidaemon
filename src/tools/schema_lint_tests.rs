@@ -114,17 +114,19 @@ fn schema_payload_budget_stays_bounded() {
 #[test]
 fn tools_do_not_embed_truncation_notices_in_output() {
     // Tools must set ToolCallMetadata.truncation instead of embedding
-    // utils::truncation_notice text — see 2026-07-01 scaffolding-leak
-    // incidents. Background delivery paths render via
-    // utils::render_truncation_notice, which is allowed.
-    // Note: "utils::truncation_notice" (the substring we search for) does NOT
-    // occur within "utils::render_truncation_notice", so this pattern allows
-    // the render function while forbidding direct embeds of the notice text.
+    // truncation_notice text — see 2026-07-01 scaffolding-leak incidents.
+    // Background delivery paths render via render_truncation_notice, which is allowed.
+    // Strip allowed render_truncation_notice call sites first, then any remaining
+    // truncation_notice( / truncation_notice_with_hint( occurrence is a forbidden
+    // direct text-embedding call regardless of import style (fully-qualified, bare,
+    // or braced-group import).
     for file in tool_source_files() {
         let source = fs::read_to_string(&file).expect("read tool source");
+        let stripped = source.replace("render_truncation_notice(", "");
         assert!(
-            !source.contains("utils::truncation_notice"),
-            "{} embeds a truncation notice in tool output; set metadata.truncation instead",
+            !stripped.contains("truncation_notice(") && !stripped.contains("truncation_notice_with_hint("),
+            "{} embeds a truncation notice in tool output; set metadata.truncation instead \
+             (render_truncation_notice is allowed only for delivery paths that bypass the agent loop)",
             file.display()
         );
     }
