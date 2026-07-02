@@ -425,6 +425,13 @@ fn structured_answer_chat_options(base: &ChatOptions) -> ChatOptions {
     // Thinking OFF: the reasoning field replaces the thinking channel instead
     // of duplicating it (duplication doubles decode and drives truncation).
     opts.reasoning_effort_override = Some("off".to_string());
+    // Never inherit the interactive slot. This pass sends no tool schemas, so
+    // its prompt diverges from the main conversation at token one; running it
+    // on the interactive slot replaces that slot's cached KV sequence and the
+    // next real iteration re-prefills the whole conversation cold (measured
+    // live 2026-07-02: 54% -> 0% cached, ~60s per bounce). id_slot=None maps
+    // to the background slot under slot routing.
+    opts.id_slot = None;
     opts
 }
 
@@ -1622,8 +1629,14 @@ mod tests {
         let opts = structured_answer_chat_options(&base);
         assert_eq!(opts.reasoning_effort_override.as_deref(), Some("off"));
         assert_eq!(opts.tool_choice, ToolChoiceMode::None);
-        // Same slot: the second pass shares the first pass's KV prefix.
-        assert_eq!(opts.id_slot, Some(3));
+        // The pass must NOT inherit the interactive slot. Its prompt drops the
+        // tool schemas, so it diverges from the main conversation at token one
+        // — it shares no prefix, and running it on the interactive slot
+        // REPLACES that slot's cached sequence (measured live 2026-07-02:
+        // identical prefix fingerprints across iterations, 54% -> 0% cached
+        // after each schema pass, ~60s of avoidable re-prefill per bounce).
+        // id_slot=None maps to the background slot under slot routing.
+        assert_eq!(opts.id_slot, None);
         assert_eq!(opts.max_tokens_override, Some(1000));
         match &opts.response_mode {
             ResponseMode::JsonSchema { name, strict, .. } => {
