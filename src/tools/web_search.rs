@@ -723,7 +723,7 @@ impl Tool for WebSearchTool {
 /// explicit guard the model assembles "complete" enumerations (rosters, member
 /// lists, counts) out of 8 partial snippets, inventing the entries it cannot
 /// see. Same failure mode as passive truncation markers (see
-/// `utils::truncation_notice`).
+/// truncation_notice patterns in similar tools).
 const SNIPPET_GUARD_FOOTER: &str = "[⚠ SNIPPETS ONLY — the entries above are search-result \
      previews, not full page content. Do NOT enumerate lists, rosters, members, or counts \
      assembled from snippets, and do NOT present a \"complete\" answer built from them — \
