@@ -5,10 +5,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolTargetHintKind, ToolVerificationMode,
 };
+use crate::types::StatusUpdate;
 
 const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_MAX_CHARS: usize = 50_000;
@@ -470,6 +473,41 @@ impl WebFetchTool {
             client: build_browser_client(),
         }
     }
+
+    /// Core implementation shared by `call()` and `call_with_status_outcome()`.
+    /// Returns the formatted output string and truncation info (if the
+    /// extracted text was truncated to `max_chars`).
+    async fn execute(
+        &self,
+        arguments: &str,
+    ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
+        let args: Value = serde_json::from_str(arguments)?;
+        let url = args["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
+        let max_chars = args["max_chars"]
+            .as_u64()
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_CHARS)
+            .clamp(1, MAX_MAX_CHARS);
+
+        // SSRF protection: validate URL before fetching
+        if let Err(reason) = validate_url_for_ssrf(url) {
+            return Ok((format!("Request blocked: {}", reason), None));
+        }
+
+        let resp = self.client.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Ok((
+                format!("Error fetching {}: HTTP {}", url, resp.status()),
+                None,
+            ));
+        }
+        let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
+        let html = String::from_utf8_lossy(&body).into_owned();
+
+        Ok(build_fetch_reply(url, &html, max_chars))
+    }
 }
 
 #[async_trait]
@@ -530,29 +568,23 @@ impl Tool for WebFetchTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        let url = args["url"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
-        let max_chars = args["max_chars"]
-            .as_u64()
-            .map(|n| n as usize)
-            .unwrap_or(DEFAULT_MAX_CHARS)
-            .clamp(1, MAX_MAX_CHARS);
+        self.execute(arguments).await.map(|(output, _)| output)
+    }
 
-        // SSRF protection: validate URL before fetching
-        if let Err(reason) = validate_url_for_ssrf(url) {
-            return Ok(format!("Request blocked: {}", reason));
-        }
-
-        let resp = self.client.get(url).send().await?;
-        if !resp.status().is_success() {
-            return Ok(format!("Error fetching {}: HTTP {}", url, resp.status()));
-        }
-        let (body, _truncated) = read_body_capped(resp, MAX_FETCH_BODY_BYTES).await?;
-        let html = String::from_utf8_lossy(&body).into_owned();
-
-        Ok(build_fetch_reply(url, &html, max_chars))
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+        })
     }
 }
 
@@ -565,7 +597,11 @@ const MIN_HTML_FOR_EXTRACTION_CHECK: usize = 10_000;
 
 /// Full fetch-reply pipeline: strip non-visible blocks, extract readable
 /// text, detect failed extraction, format with truncation honesty.
-fn build_fetch_reply(url: &str, html: &str, max_chars: usize) -> String {
+fn build_fetch_reply(
+    url: &str,
+    html: &str,
+    max_chars: usize,
+) -> (String, Option<crate::traits::TruncationInfo>) {
     let text = extract_page_text(html, url);
     let trimmed = text.trim();
     if trimmed.chars().count() < MIN_EXTRACTED_CHARS && html.len() >= MIN_HTML_FOR_EXTRACTION_CHECK
@@ -574,16 +610,21 @@ fn build_fetch_reply(url: &str, html: &str, max_chars: usize) -> String {
         // of a JavaScript-rendered (or bot-walled) page. Without this notice
         // the model treats the empty result as the page's actual content —
         // or worse, re-fetches the same URL expecting a different outcome.
-        return format!(
-            "Content from {}:\n\n{}\n\n[⚠ EXTRACTION FAILED — this {} KB page yielded only {} \
-             characters of readable text; it is likely JavaScript-rendered or blocking \
-             non-browser clients. Do NOT treat this as the page's content, and do NOT re-fetch \
-             this same URL — the result will not change. Fetch a different source URL from your \
-             search results, or use a browser-based tool on this URL if one is available.]",
-            url,
-            trimmed,
-            html.len() / 1024,
-            trimmed.chars().count(),
+        // This is a distinct extraction-failure signal, not truncation, so it
+        // stays an embedded instructional marker (no TruncationInfo applies).
+        return (
+            format!(
+                "Content from {}:\n\n{}\n\n[⚠ EXTRACTION FAILED — this {} KB page yielded only {} \
+                 characters of readable text; it is likely JavaScript-rendered or blocking \
+                 non-browser clients. Do NOT treat this as the page's content, and do NOT re-fetch \
+                 this same URL — the result will not change. Fetch a different source URL from your \
+                 search results, or use a browser-based tool on this URL if one is available.]",
+                url,
+                trimmed,
+                html.len() / 1024,
+                trimmed.chars().count(),
+            ),
+            None,
         );
     }
     format_fetch_result(url, &text, max_chars)
@@ -659,10 +700,19 @@ fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Format extracted page text, truncating to `max_chars` (bytes, floored to a
-/// char boundary). A truncated result carries an instructional notice — a
-/// passive "[Truncated]" marker is routinely ignored and the model fabricates
-/// the omitted content (e.g. inventing the rest of a roster).
-fn format_fetch_result(url: &str, text: &str, max_chars: usize) -> String {
+/// char boundary). Truncation is reported via the returned `TruncationInfo`,
+/// not embedded in the text — the agent loop renders the instructional
+/// notice from that metadata (see `crate::utils::render_truncation_notice`),
+/// so text-scanning consumers (classifiers, summaries) always see clean
+/// output. A passive "[Truncated]" marker baked into the text is routinely
+/// ignored and the model fabricates the omitted content (e.g. inventing the
+/// rest of a roster) — this is why the notice must reach the model through
+/// the loop's instructional rendering rather than raw tool output.
+fn format_fetch_result(
+    url: &str,
+    text: &str,
+    max_chars: usize,
+) -> (String, Option<crate::traits::TruncationInfo>) {
     let mut result = format!("Content from {}:\n\n", url);
     if text.len() > max_chars {
         // Find a valid UTF-8 char boundary at or before max_chars
@@ -671,18 +721,21 @@ fn format_fetch_result(url: &str, text: &str, max_chars: usize) -> String {
             end -= 1;
         }
         result.push_str(&text[..end]);
-        result.push_str("\n\n");
-        result.push_str(&crate::utils::truncation_notice_with_hint(
-            text[..end].chars().count(),
-            text.chars().count(),
-            "If the answer may be in the omitted part, re-fetch with a larger max_chars \
-             (up to 50000) or fetch a more specific page; if the full content is still \
-             not visible, tell the user the page was longer than you could read.",
-        ));
+        let truncation = crate::traits::TruncationInfo {
+            shown_chars: text[..end].chars().count(),
+            total_chars: text.chars().count(),
+            remediation_hint: Some(
+                "If the answer may be in the omitted part, re-fetch with a larger max_chars \
+                 (up to 50000) or fetch a more specific page; if the full content is still \
+                 not visible, tell the user the page was longer than you could read."
+                    .to_string(),
+            ),
+        };
+        (result, Some(truncation))
     } else {
         result.push_str(text);
+        (result, None)
     }
-    result
 }
 
 #[cfg(test)]
@@ -862,30 +915,50 @@ mod format_tests {
     #[test]
     fn truncated_fetch_carries_instructional_notice() {
         let text = "a".repeat(120);
-        let out = format_fetch_result("https://example.com/page", &text, 50);
+        let (out, truncation) = format_fetch_result("https://example.com/page", &text, 50);
         assert!(out.contains("Content from https://example.com/page"));
-        // Instructional notice, not a passive marker the model ignores.
-        assert!(out.contains("OUTPUT TRUNCATED"));
-        assert!(out.contains("Do NOT enumerate"));
-        // Remediation hint must be fetch-flavored, not terminal-flavored.
-        assert!(out.contains("max_chars"));
-        assert!(!out.contains("wc -l"));
+        // The notice is metadata, not embedded text — text-scanning consumers
+        // (classifiers, summaries) must see clean output.
+        assert!(!out.contains("OUTPUT TRUNCATED"));
         assert!(!out.contains("[Truncated]"));
+        let info = truncation.expect("truncation info");
+        assert_eq!(info.total_chars, 120);
+        assert_eq!(info.shown_chars, 50);
+        // Remediation hint must be fetch-flavored, not terminal-flavored, and
+        // preserved verbatim.
+        let hint = info.remediation_hint.expect("remediation hint");
+        assert!(hint.contains("max_chars"));
+        assert!(!hint.contains("wc -l"));
     }
 
     #[test]
     fn untruncated_fetch_has_no_notice() {
-        let out = format_fetch_result("https://example.com", "short content", 1000);
+        let (out, truncation) = format_fetch_result("https://example.com", "short content", 1000);
         assert!(out.contains("short content"));
         assert!(!out.contains("OUTPUT TRUNCATED"));
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn truncation_respects_char_boundaries() {
         // 4-byte emoji straddling the cap must not panic.
         let text = format!("{}🦀🦀🦀", "x".repeat(49));
-        let out = format_fetch_result("https://example.com", &text, 51);
-        assert!(out.contains("OUTPUT TRUNCATED"));
+        let (_out, truncation) = format_fetch_result("https://example.com", &text, 51);
+        assert!(truncation.is_some());
+    }
+
+    #[test]
+    fn fetch_result_truncation_is_metadata_not_text() {
+        let long = "y".repeat(9000);
+        let (text, truncation) = format_fetch_result("https://example.com", &long, 4000);
+        assert!(!text.contains("OUTPUT TRUNCATED"));
+        let info = truncation.expect("truncation info");
+        assert_eq!(info.total_chars, 9000);
+        assert!(info
+            .remediation_hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("max_chars"));
     }
 }
 
@@ -912,7 +985,7 @@ mod extraction_tests {
 
     #[test]
     fn script_and_style_blocks_never_reach_the_model() {
-        let reply = build_fetch_reply(
+        let (reply, _truncation) = build_fetch_reply(
             "https://en.wikipedia.org/wiki/X",
             &script_heavy_page(),
             2_000,
@@ -937,7 +1010,7 @@ mod extraction_tests {
             "<html><head><script>{}</script></head><body><div id=\"root\"></div></body></html>",
             "z".repeat(20_000)
         );
-        let reply = build_fetch_reply("https://spa.example.com", &html, 20_000);
+        let (reply, truncation) = build_fetch_reply("https://spa.example.com", &html, 20_000);
         assert!(
             reply.contains("EXTRACTION FAILED"),
             "missing notice: {}",
@@ -946,18 +1019,20 @@ mod extraction_tests {
         assert!(reply.contains("different source"));
         // Must not pretend the page was read.
         assert!(!reply.contains("OUTPUT TRUNCATED"));
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn normal_page_has_no_extraction_notice() {
-        let reply = build_fetch_reply("https://example.com", &script_heavy_page(), 20_000);
+        let (reply, _truncation) =
+            build_fetch_reply("https://example.com", &script_heavy_page(), 20_000);
         assert!(!reply.contains("EXTRACTION FAILED"));
     }
 
     #[test]
     fn small_thin_pages_are_not_flagged() {
         // A genuinely tiny page is not an extraction failure.
-        let reply = build_fetch_reply(
+        let (reply, _truncation) = build_fetch_reply(
             "https://example.com",
             "<html><body><p>hi</p></body></html>",
             20_000,

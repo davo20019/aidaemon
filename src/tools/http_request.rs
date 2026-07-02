@@ -15,7 +15,7 @@ use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode,
+    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -396,18 +396,25 @@ impl HttpRequestTool {
             || content_type.contains("octet-stream")
     }
 
-    fn append_truncation_notice(text: &str, max_response_bytes: u64) -> String {
-        if text.is_empty() {
-            format!(
-                "[Truncated: response exceeded {} bytes limit]",
-                max_response_bytes
-            )
-        } else {
-            format!(
-                "{}\n\n[Truncated: response exceeded {} bytes limit]",
-                text, max_response_bytes
-            )
-        }
+    /// Records that `text` was truncated at `max_response_bytes` without
+    /// embedding a notice in the returned body. The body is echoed back
+    /// unchanged; the loop renders the instructional notice from the
+    /// returned `TruncationInfo` (see `crate::utils::render_truncation_notice`)
+    /// instead of a passive marker baked into tool output.
+    fn truncate_marker(text: &str, max_response_bytes: u64) -> (String, Option<TruncationInfo>) {
+        let chars = text.chars().count();
+        (
+            text.to_string(),
+            Some(TruncationInfo {
+                shown_chars: chars,
+                total_chars: chars,
+                remediation_hint: Some(format!(
+                    "Response exceeded the {} byte limit; the omitted remainder is not \
+                     retrievable in this call.",
+                    max_response_bytes
+                )),
+            }),
+        )
     }
 
     fn content_type_is_json(content_type: &str) -> bool {
@@ -483,7 +490,7 @@ impl HttpRequestTool {
         content_type: &str,
         max_response_bytes: u64,
         truncated: bool,
-    ) -> Option<String> {
+    ) -> Option<(String, Option<TruncationInfo>)> {
         let trimmed = text.trim_start();
         if !(Self::content_type_is_json(content_type)
             || trimmed.starts_with('{')
@@ -510,9 +517,10 @@ impl HttpRequestTool {
         };
 
         if truncated {
-            Some(Self::append_truncation_notice(&body, max_response_bytes))
+            let (body, truncation) = Self::truncate_marker(&body, max_response_bytes);
+            Some((body, truncation))
         } else {
-            Some(body)
+            Some((body, None))
         }
     }
 
@@ -522,52 +530,64 @@ impl HttpRequestTool {
         observed_bytes: u64,
         max_response_bytes: u64,
         truncated: bool,
-    ) -> String {
+    ) -> (String, Option<TruncationInfo>) {
         if Self::is_binary_content_type(content_type) {
             if truncated {
-                return format!(
-                    "[Binary response truncated at {} bytes limit, content-type: {}]",
-                    max_response_bytes, content_type
+                return (
+                    format!(
+                        "[Binary response truncated at {} bytes limit, content-type: {}]",
+                        max_response_bytes, content_type
+                    ),
+                    None,
                 );
             }
-            return format!(
-                "[Binary response: {} bytes, content-type: {}]",
-                observed_bytes, content_type
+            return (
+                format!(
+                    "[Binary response: {} bytes, content-type: {}]",
+                    observed_bytes, content_type
+                ),
+                None,
             );
         }
 
         match String::from_utf8(bytes.to_vec()) {
             Ok(text) => {
-                if let Some(json_text) = Self::format_json_response_body(
+                if let Some((json_text, truncation)) = Self::format_json_response_body(
                     &text,
                     content_type,
                     max_response_bytes,
                     truncated,
                 ) {
-                    return json_text;
+                    return (json_text, truncation);
                 }
                 if truncated {
-                    Self::append_truncation_notice(&text, max_response_bytes)
+                    Self::truncate_marker(&text, max_response_bytes)
                 } else {
-                    text
+                    (text, None)
                 }
             }
             Err(err) => {
                 if truncated && err.utf8_error().error_len().is_none() {
                     let valid_up_to = err.utf8_error().valid_up_to();
                     let valid_text = std::str::from_utf8(&bytes[..valid_up_to]).unwrap_or("");
-                    return Self::append_truncation_notice(valid_text, max_response_bytes);
+                    return Self::truncate_marker(valid_text, max_response_bytes);
                 }
 
                 if truncated {
-                    format!(
-                        "[Non-UTF8 response truncated at {} bytes limit, content-type: {}]",
-                        max_response_bytes, content_type
+                    (
+                        format!(
+                            "[Non-UTF8 response truncated at {} bytes limit, content-type: {}]",
+                            max_response_bytes, content_type
+                        ),
+                        None,
                     )
                 } else {
-                    format!(
-                        "[Non-UTF8 response: {} bytes, content-type: {}]",
-                        observed_bytes, content_type
+                    (
+                        format!(
+                            "[Non-UTF8 response: {} bytes, content-type: {}]",
+                            observed_bytes, content_type
+                        ),
+                        None,
                     )
                 }
             }
@@ -1062,7 +1082,8 @@ impl HttpRequestTool {
 
     /// Core implementation shared by `call()`, `call_with_status_outcome()`, and
     /// `call_with_execution_context()`.
-    /// Returns the formatted output string and the HTTP status code (if one was observed).
+    /// Returns the formatted output string, the HTTP status code (if one was
+    /// observed), and truncation info (if the response body was truncated).
     ///
     /// `correction_preapproved` is a Rust-side control-plane flag — it must never be
     /// derived from tool arguments or model output.  When true, the user-approval prompt
@@ -1071,7 +1092,7 @@ impl HttpRequestTool {
         &self,
         arguments: &str,
         correction_preapproved: bool,
-    ) -> anyhow::Result<(String, Option<u16>)> {
+    ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
         // Parse parameters
@@ -1120,13 +1141,14 @@ impl HttpRequestTool {
             return Ok((
                 "Request blocked: only HTTPS URLs are allowed (exception: localhost)".to_string(),
                 None,
+                None,
             ));
         }
 
         // Step 2: SSRF validation (skip for localhost — local dev/testing)
         if !is_localhost {
             if let Err(reason) = validate_url_for_ssrf(&url) {
-                return Ok((format!("Request blocked: {}", reason), None));
+                return Ok((format!("Request blocked: {}", reason), None, None));
             }
         }
 
@@ -1136,7 +1158,7 @@ impl HttpRequestTool {
             return Ok((format!(
                 "Request blocked: tool-only parameters were embedded in the URL ({}). Put them in the top-level `http_request` arguments instead of `url`.",
                 leaked_tool_params.join(", ")
-            ), None));
+            ), None, None));
         }
         if !recovered_tool_params.is_empty() {
             warn!(
@@ -1152,7 +1174,7 @@ impl HttpRequestTool {
             return Ok((format!(
                 "Request blocked: credential-bearing headers are not allowed in `headers` ({}). Configure an auth_profile instead.",
                 blocked_headers.join(", ")
-            ), None));
+            ), None, None));
         }
 
         // Step 5: Resolve auth profile and check domain
@@ -1174,6 +1196,7 @@ impl HttpRequestTool {
                     "Request blocked: domain '{}' is not in the allowed domains for profile '{}'",
                     request_host, name
                 ),
+                    None,
                     None,
                 ));
             }
@@ -1202,6 +1225,7 @@ impl HttpRequestTool {
                 "Request blocked: outbound data appears to contain secrets or credentials. \
                  Review the URL, body, and headers for leaked API keys or tokens."
                     .to_string(),
+                None,
                 None,
             ));
         }
@@ -1257,7 +1281,7 @@ impl HttpRequestTool {
                         .await;
                 }
                 ApprovalResponse::Deny => {
-                    return Ok(("Request denied by user".to_string(), None));
+                    return Ok(("Request denied by user".to_string(), None, None));
                 }
             }
         }
@@ -1269,7 +1293,7 @@ impl HttpRequestTool {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
         if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
-            return Ok((format!("Unsupported method: {}", method), None));
+            return Ok((format!("Unsupported method: {}", method), None, None));
         }
 
         let (mut response, mut redirect_count) = self
@@ -1387,7 +1411,7 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
             }
         }
 
-        let body_str = Self::format_response_body(
+        let (body_str, truncation) = Self::format_response_body(
             &collected_body,
             &content_type_resp,
             observed_bytes,
@@ -1484,6 +1508,7 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
         Ok((
             wrap_untrusted_output("http_request", &result),
             captured_status,
+            truncation,
         ))
     }
 }
@@ -1597,7 +1622,7 @@ impl Tool for HttpRequestTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         self.execute(arguments, false)
             .await
-            .map(|(output, _)| output)
+            .map(|(output, _, _)| output)
     }
 
     async fn call_with_status_outcome(
@@ -1606,11 +1631,12 @@ impl Tool for HttpRequestTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, http_status) = self.execute(arguments, false).await?;
+        let (output, http_status, truncation) = self.execute(arguments, false).await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
                 http_status,
+                truncation,
                 ..Default::default()
             },
         })
@@ -1623,13 +1649,14 @@ impl Tool for HttpRequestTool {
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, http_status) = self
+        let (output, http_status, truncation) = self
             .execute(arguments, exec_ctx.correction_preapproved)
             .await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
                 http_status,
+                truncation,
                 ..Default::default()
             },
         })
@@ -1949,23 +1976,35 @@ mod tests {
     #[test]
     fn test_format_response_body_handles_truncated_utf8_prefix() {
         let bytes = vec![0xC3, 0xA9, 0xC3];
-        let formatted = HttpRequestTool::format_response_body(&bytes, "text/plain", 4, 3, true);
+        let (formatted, truncation) =
+            HttpRequestTool::format_response_body(&bytes, "text/plain", 4, 3, true);
         assert!(formatted.starts_with("é"));
-        assert!(formatted.contains("response exceeded 3 bytes limit"));
+        assert!(!formatted.contains("response exceeded 3 bytes limit"));
         assert!(!formatted.contains('\u{FFFD}'));
+        let info = truncation.expect("truncation info");
+        assert!(info
+            .remediation_hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("3 byte limit"));
     }
 
     #[test]
     fn test_format_response_body_reports_binary_truncation() {
-        let formatted = HttpRequestTool::format_response_body(b"\x89PNG", "image/png", 10, 4, true);
+        let (formatted, truncation) =
+            HttpRequestTool::format_response_body(b"\x89PNG", "image/png", 10, 4, true);
         assert!(formatted.contains("Binary response truncated"));
         assert!(formatted.contains("image/png"));
+        // Binary truncation keeps its embedded marker; only the byte-limit
+        // truncation path (the one that used to call `append_truncation_notice`)
+        // moved its notice to metadata.
+        assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_response_body_pretty_prints_json_with_summary() {
         let raw = br#"{"studies":[{"protocolSection":{"identificationModule":{"briefTitle":"Skin Trial"}}}],"nextPageToken":"abc"}"#;
-        let formatted = HttpRequestTool::format_response_body(
+        let (formatted, truncation) = HttpRequestTool::format_response_body(
             raw,
             "application/json",
             raw.len() as u64,
@@ -1976,6 +2015,20 @@ mod tests {
         assert!(formatted.contains("studies: array(1 item(s))"));
         assert!(formatted.contains("\"briefTitle\": \"Skin Trial\""));
         assert!(formatted.contains('\n'));
+        assert!(truncation.is_none());
+    }
+
+    #[test]
+    fn http_body_truncation_is_metadata_not_text() {
+        let (body, truncation) = HttpRequestTool::truncate_marker("partial body", 1024);
+        assert_eq!(body, "partial body");
+        assert!(!body.contains("[Truncated:"));
+        let info = truncation.expect("truncation info");
+        assert!(info
+            .remediation_hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("1024"));
     }
 
     #[test]
@@ -2433,7 +2486,7 @@ mod tests {
     #[test]
     fn test_small_json_body_is_pretty_printed() {
         let text = r#"{"a":1,"b":2}"#;
-        let out = HttpRequestTool::format_json_response_body(
+        let (out, truncation) = HttpRequestTool::format_json_response_body(
             text,
             "application/json",
             DEFAULT_MAX_RESPONSE_BYTES,
@@ -2445,6 +2498,7 @@ mod tests {
             out.contains("\n  \"a\""),
             "small body should be pretty-printed: {out}"
         );
+        assert!(truncation.is_none());
     }
 
     #[test]
@@ -2460,13 +2514,14 @@ mod tests {
             "fixture must exceed threshold"
         );
 
-        let out = HttpRequestTool::format_json_response_body(
+        let (out, truncation) = HttpRequestTool::format_json_response_body(
             &text,
             "application/json",
             DEFAULT_MAX_RESPONSE_BYTES,
             false,
         )
         .expect("should format JSON");
+        assert!(truncation.is_none());
 
         // Still summarized for the model...
         assert!(out.contains("JSON summary"), "summary should be present");
