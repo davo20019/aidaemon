@@ -407,6 +407,32 @@ pub(super) fn has_action_promise(text: &str) -> bool {
 /// than just deferred-action phrases.  Used to decide whether to accept a
 /// text-only response after repeated deferred-no-tool retries: if the model
 /// finally produced real content (greeting, explanation, joke, etc.) we should
+/// A final reply that is a verbatim read_file page — the harness's own page
+/// header (`File: <path> (lines A-B of N, X bytes...)`) followed by
+/// line-numbered content — is a paste, never an answer. Observed live: after
+/// a large API result was spilled to a file, the model paged it linearly and
+/// shipped page 5 of raw JSON as its reply. The header and `NNN | ` line
+/// format are harness-generated, so this detection is structural, not a
+/// guess about model prose.
+pub(super) fn reply_is_pasted_file_page(reply: &str) -> bool {
+    let has_page_header = reply.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("File: ") && t.contains("(lines ") && t.contains(" bytes")
+    });
+    if !has_page_header {
+        return false;
+    }
+    let numbered_lines = reply
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+            digits >= 1 && t[digits..].trim_start().starts_with('|')
+        })
+        .count();
+    numbered_lines >= 5
+}
+
 /// let it through instead of stalling further.
 ///
 /// The heuristic:

@@ -1878,6 +1878,23 @@ pub(super) async fn run_completion_phase(
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
+        // A verbatim read_file page as the final answer is the spilled-result
+        // paging derailment (model paged the spill file, then shipped a raw
+        // page instead of answering). One-shot retry with a directive to
+        // answer from the data; shares the same retry budget as the gutted
+        // case above.
+        if reply_is_pasted_file_page(&sanitized_reply) && !empty_response_retry_used {
+            warn!(
+                session_id,
+                iteration, "Final reply is a pasted file page — retrying final answer once"
+            );
+            empty_response_retry_used = true;
+            empty_response_retry_pending = true;
+            empty_response_retry_note = Some("final_reply_pasted_file_page".to_string());
+            pending_system_messages.push(SystemDirective::FinalAnswerWasFilePaste);
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
         let reply = if gutted_by_sanitization {
             warn!(
                 session_id,

@@ -85,6 +85,39 @@ async fn test_gutted_retry_is_one_shot_then_falls_back() {
     assert_eq!(harness.provider.call_count().await, 3); // no third retry
 }
 
+/// A final reply that is a verbatim read_file page (spilled-result paging
+/// derailment) gets ONE retry with an answer-don't-paste directive; the
+/// retry's real answer ships.
+#[tokio::test]
+async fn test_pasted_file_page_reply_retries_once_and_ships_answer() {
+    // Real page shape: harness header + line-numbered content (live repro:
+    // page 5 of a spilled clinical-trials JSON shipped as the "answer").
+    let pasted_page = "Done. Here is the output:\n\nFile: /tmp/tool_results/http_request-abc.txt (lines 672-810 of 1066, 39192 bytes, modified 2026-07-02T15:44:38Z)\n672 |         },\n673 |         {\n674 |           \"city\": \"Springfield\",\n675 |           \"country\": \"Freedonia\",\n676 |           \"facility\": \"Synthetic Medical Center ( Site 0001)\"\n677 |         },\n678 |         {\n679 |           \"city\": \"Shelbyville\"\n680 |         }";
+    let clean_answer =
+        "Two trials are near Springfield: Synthetic Medical Center (Site 0001) and one more.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(pasted_page),
+        MockProvider::text_response(clean_answer),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_paste_retry",
+            "Which trials are near Springfield?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, clean_answer, "the retry's answer must ship");
+    assert_eq!(harness.provider.call_count().await, 3);
+}
+
 // ==========================================================================
 // Tool-boundary truncation notice rendering (single loop site)
 //

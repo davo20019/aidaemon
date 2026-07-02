@@ -127,7 +127,7 @@ use response_analysis::sanitize_response_analysis;
 use response_analysis::{
     claims_completed_side_effect, claims_delegation_started, is_substantive_text_response,
     looks_like_deferred_action_response, looks_like_incomplete_retry_plan,
-    looks_like_multi_part_request,
+    looks_like_multi_part_request, reply_is_pasted_file_page,
 };
 #[cfg(test)]
 use response_analysis::{reply_defers_file_access, user_text_references_file};
