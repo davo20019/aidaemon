@@ -129,7 +129,7 @@ else
 fi
 
 # Best-effort: re-assert the flags the local llama-server must carry (e.g.
-# --kv-unified, required for the idle-slot RAM cache during goal runs). The
+# --mlock; see ensure-llama-flags.sh for the current set and rationale). The
 # llama plist is hand-managed and not generated here, so this guards against it
 # being recreated without the flag. Idempotent no-op when already present;
 # never fatal to the daemon deploy.
