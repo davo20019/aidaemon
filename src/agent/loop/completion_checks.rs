@@ -29,6 +29,13 @@ pub(super) fn build_tool_output_completion_reply(
     tool_output: &str,
     artifact_delivered: bool,
 ) -> Option<String> {
+    // A file was delivered this turn: the delivery IS the answer. Never paste
+    // whichever tool output happened to be latest under a "here's the result"
+    // banner (observed live: an `ls -R` of the whole resume tree, NDA
+    // filenames included, shipped after a perfect send_file).
+    if artifact_delivered {
+        return Some(super::stopping_helpers::send_file_completion_reply().to_string());
+    }
     let trimmed = tool_output.trim();
     // Don't use trivially uninformative tool outputs as completion replies.
     // These produce confusing messages like "Here is the latest tool output: (no output)".
@@ -145,6 +152,11 @@ pub(super) fn build_structured_tool_output_completion_reply(
     tool_output: &str,
     artifact_delivered: bool,
 ) -> Option<String> {
+    // Same rule as build_tool_output_completion_reply: a delivered file is
+    // the answer; no output paste under the sent-file banner.
+    if artifact_delivered {
+        return Some(super::stopping_helpers::send_file_completion_reply().to_string());
+    }
     if !tool_output_requires_final_synthesis(tool_name, tool_output) {
         return None;
     }
@@ -908,6 +920,9 @@ mod tests {
 
     #[test]
     fn tool_output_reply_notes_when_artifact_was_also_delivered() {
+        // Behavior change 2026-07-02: when a file was delivered, recovery
+        // returns ONLY the canned closeout — the latest tool output is never
+        // pasted (it may be entirely unrelated to the delivered file).
         let reply = build_tool_output_completion_reply(
             "terminal",
             "test_foo PASSED\ntest_bar PASSED\n2 passed",
@@ -915,18 +930,24 @@ mod tests {
         )
         .unwrap();
         assert!(reply.contains("sent the requested file"));
-        assert!(reply.contains("result"));
-        assert!(reply.contains("test_foo PASSED"));
+        assert!(!reply.contains("test_foo PASSED"));
     }
 
     #[test]
     fn structured_http_tool_output_requires_synthesis() {
+        // Without a delivered artifact, structured HTTP output still defers
+        // to synthesis recovery.
         assert!(build_tool_output_completion_reply(
             "http_request",
             "HTTP 200 OK\n{\"items\":[]}",
-            true
+            false
         )
         .is_none());
+        // With a delivered artifact, the closeout wins over synthesis.
+        let reply =
+            build_tool_output_completion_reply("http_request", "HTTP 200 OK\n{\"items\":[]}", true)
+                .unwrap();
+        assert!(reply.contains("sent the requested file"));
     }
 
     #[test]
@@ -1377,6 +1398,37 @@ mod tests {
         assert!(!reply_admits_unfulfilled_request(
             "All tasks completed successfully! (One asset couldn't be found but I substituted it.)"
         ));
+    }
+
+    #[test]
+    fn artifact_delivered_recovery_never_pastes_tool_output() {
+        // Live repro (task 03bbd378, 2026-07-02): the model found and sent the
+        // right file, its final reply came up empty, and completion recovery
+        // shipped "I sent the requested file. Here's the result:" followed by
+        // a raw `ls -R` of the whole resume tree (NDA filenames included).
+        // When a file was delivered this turn, the recovery reply is the
+        // canned closeout — never a paste of whatever tool output was latest.
+        let ls_output = "/Users/synthetic/projects/resume/NDAs:\nConfidentiality Agreement.pdf\n/Users/synthetic/projects/resume/acme:\nresume.pdf\nresume.typ";
+        let reply = build_tool_output_completion_reply("terminal", ls_output, true)
+            .expect("recovery reply");
+        assert!(
+            !reply.contains("NDAs") && !reply.contains("resume.typ"),
+            "must not paste tool output after delivering a file, got: {reply}"
+        );
+        assert!(
+            reply.contains("sent the requested file"),
+            "keeps the delivery acknowledgment: {reply}"
+        );
+
+        // Same guarantee through the force-text deferred path.
+        let candidate = CompletionRecoveryCandidate {
+            tool_name: "terminal".to_string(),
+            tool_output: ls_output.to_string(),
+            artifact_delivered: true,
+        };
+        let reply =
+            build_force_text_deferred_completion_reply(&candidate, 4).expect("recovery reply");
+        assert!(!reply.contains("NDAs"), "got: {reply}");
     }
 
     #[test]
