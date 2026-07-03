@@ -1436,6 +1436,19 @@ pub(super) async fn run_completion_phase(
         // ladder (bounce -> hard nudge -> force-text) instead of shipping.
         let claims_false_in_progress = !has_tool_attempts
             && crate::agent::response_analysis::reply_is_unbacked_action_promise(&reply);
+        // Terminal unbacked plan: the FINAL reply promises future work ("I'll
+        // try a web search instead") while the task produced zero successful
+        // tool calls and schedules nothing — the promise is broken by
+        // construction, on every tier. Mid-task deferrals remain tier-trusted
+        // (Autonomous doesn't micromanage approach); a task-END promise is
+        // not an approach choice, it is a claim the daemon will not honor
+        // (live repro 2026-07-03, twice in one day: "I'm searching now..."
+        // then "I'll try a different approach by searching the web instead",
+        // both shipped as final answers, nothing ever ran). Harness-composed
+        // background handoffs are exempt: their promise has real pending work.
+        let terminal_unbacked_plan = total_successful_tool_calls == 0
+            && looks_like_deferred_action_response(&reply)
+            && !crate::agent::is_friendly_background_handoff(&reply);
         if !used_identity_prefill
             && !force_text_fast_path_accepted
             && (looks_like_deferred_action_response(&reply)
@@ -1443,13 +1456,15 @@ pub(super) async fn run_completion_phase(
                 || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
-                || claims_false_in_progress)
+                || claims_false_in_progress
+                || terminal_unbacked_plan)
             && (!reply_is_substantive
                 || incomplete_live_work_summary
                 || incomplete_retry_plan
                 || claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
-                || claims_false_in_progress)
+                || claims_false_in_progress
+                || terminal_unbacked_plan)
             // Anti-fabrication triggers (claimed mutation/delegation/current
             // activity with zero tool calls) and structural protocol markers
             // ([INTENT_GATE], [tool_use:]) are correctness guards — enforced
@@ -1458,6 +1473,7 @@ pub(super) async fn run_completion_phase(
             && (claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
                 || claims_false_in_progress
+                || terminal_unbacked_plan
                 || has_structural_markers
                 || agent
                     .supervision_gate_enforced(
