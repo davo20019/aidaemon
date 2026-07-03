@@ -225,10 +225,13 @@ enum SecondPassResolution {
     Suppress,
 }
 
-/// Instruction appended at the END of the message list (not the system
-/// prompt) for the structured second pass, so the llama.cpp prompt cache
-/// reuses the first pass's prefill for the shared prefix — a system-prompt
-/// edit would force a full cold re-prefill of the whole conversation.
+/// Instruction appended at the END of the message list for the re-answer
+/// (full-context) second pass. NOTE: the original hope that this preserves
+/// the first pass's prefill was measured false for tool-calling requests —
+/// the second pass sends no tool schemas, so its prompt diverges from the
+/// first call's at token one regardless of where the instruction sits. This
+/// expensive path now runs only when the draft is leaky/blank/truncated;
+/// clean drafts take the constant-prefix rewrite path instead.
 const STRUCTURED_ANSWER_INSTRUCTION: &str = "Format your reply as a JSON object with two \
 string fields, in this order: \"reasoning\" then \"response\". Put ALL analysis, counting, \
 double-checking, self-correction, and notes about this conversation in \"reasoning\" — none \
@@ -278,6 +281,60 @@ fn append_answer_instruction(messages: &[Value]) -> Vec<Value> {
     }
     out.push(json!({"role": "user", "content": STRUCTURED_ANSWER_INSTRUCTION}));
     out
+}
+
+/// How the structured second pass sources its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredPassMode {
+    /// Clean draft: cheap tool-less rewrite of the draft alone. The prompt is
+    /// a constant instruction plus the draft (~hundreds of tokens), so its
+    /// prefill is near-zero and independent of conversation size.
+    Rewrite,
+    /// Leaky, truncated, or blank draft: the draft can't serve as source
+    /// material, so re-answer over the full conversation (original behavior).
+    Reanswer,
+}
+
+/// System instruction for the rewrite-mode second pass. Field-order contract
+/// is the same as `structured_answer_schema`: `reasoning` drains before
+/// `response`. "Do not add content" is the guard against the model treating
+/// the rewrite as a chance to re-derive (and hallucinate) new detail.
+const STRUCTURED_REWRITE_INSTRUCTION: &str = "You will be given a DRAFT reply meant for a \
+user. Re-emit it as a JSON object with two string fields, in this order: \"reasoning\" then \
+\"response\". Move any stray deliberation, self-correction, notes-to-self, or commentary \
+about the conversation from the draft into \"reasoning\". \"response\" is the only text the \
+user will see: the draft's polished user-facing content, preserved in meaning and tone, with \
+no deliberation and no mention of the draft or these instructions. Do not add facts or \
+content that are not in the draft.";
+
+fn structured_pass_mode(
+    draft: &str,
+    draft_is_leaky: bool,
+    first_truncated: bool,
+) -> StructuredPassMode {
+    if draft_is_leaky || first_truncated || draft.trim().is_empty() {
+        StructuredPassMode::Reanswer
+    } else {
+        StructuredPassMode::Rewrite
+    }
+}
+
+fn build_rewrite_messages(draft: &str) -> Vec<Value> {
+    vec![
+        json!({"role": "system", "content": STRUCTURED_REWRITE_INSTRUCTION}),
+        json!({"role": "user", "content": format!("DRAFT:\n{draft}")}),
+    ]
+}
+
+fn structured_rewrite_chat_options(base: &ChatOptions, draft: &str) -> ChatOptions {
+    let mut opts = structured_answer_chat_options(base);
+    // Output is the draft re-emitted plus a short reasoning field and JSON
+    // escaping overhead: cap at ~2x the draft's token estimate so a runaway
+    // reasoning ramble can't burn decode. The truncation retry ladder still
+    // doubles this if the cap ever bites.
+    let draft_tokens = (draft.len() / 4) as u32;
+    opts.max_tokens_override = Some((draft_tokens * 2 + 256).max(512));
+    opts
 }
 
 /// Best-effort extraction of a string field's value from truncated/invalid
@@ -1106,14 +1163,28 @@ impl OpenAiCompatibleProvider {
     ) -> ProviderResponse {
         let draft = first.content.clone().unwrap_or_default();
         let draft_leak = classify_possible_reasoning_leak(&draft);
+        // response_note is set only for finish_reason=length: a truncated
+        // draft is incomplete source material, so rewrite mode is off the
+        // table for it.
+        let first_truncated = first.response_note.is_some();
+        let mode = structured_pass_mode(&draft, draft_leak.is_some(), first_truncated);
         info!(
             model,
             draft_len = draft.len(),
             draft_leak = ?draft_leak,
+            mode = ?mode,
             "Structured answer pass: re-issuing final answer through schema"
         );
-        let second_messages = append_answer_instruction(messages);
-        let mut second_options = structured_answer_chat_options(options);
+        let (second_messages, mut second_options) = match mode {
+            StructuredPassMode::Rewrite => (
+                build_rewrite_messages(&draft),
+                structured_rewrite_chat_options(options, &draft),
+            ),
+            StructuredPassMode::Reanswer => (
+                append_answer_instruction(messages),
+                structured_answer_chat_options(options),
+            ),
+        };
         let mut usage = first.usage.clone();
         let mut retried = false;
         let resolution = loop {
@@ -1143,8 +1214,12 @@ impl OpenAiCompatibleProvider {
             {
                 SecondPassResolution::RetryLarger => {
                     retried = true;
-                    let bumped = options
+                    // Grow from the cap that actually truncated (rewrite mode
+                    // sets a draft-proportional cap that can exceed the base),
+                    // so the retry can never SHRINK the budget.
+                    let bumped = second_options
                         .max_tokens_override
+                        .or(options.max_tokens_override)
                         .or(self.max_tokens)
                         .unwrap_or(2048)
                         .saturating_mul(2);
@@ -1173,6 +1248,18 @@ impl OpenAiCompatibleProvider {
                         "Structured answer still reasoning-shaped after schema pass"
                     );
                 }
+                // Drift telemetry: in rewrite mode the response should track
+                // the draft's size; a large divergence means the model is
+                // rewriting substance, not just format — the signal for
+                // whether the old full-context re-answer carried quality
+                // value we silently gave up.
+                info!(
+                    model,
+                    mode = ?mode,
+                    draft_len = draft.len(),
+                    response_len = response.len(),
+                    "Structured answer delivered"
+                );
                 let response_note = truncated.then(|| {
                     "Final answer was truncated at the token limit; the delivered text may be \
                      incomplete."
@@ -1643,6 +1730,76 @@ mod tests {
                 assert_eq!(name, "final_answer");
                 assert!(*strict);
             }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_pass_mode_selects_rewrite_for_clean_draft() {
+        assert_eq!(
+            structured_pass_mode("A clean, complete draft.", false, false),
+            StructuredPassMode::Rewrite
+        );
+    }
+
+    #[test]
+    fn structured_pass_mode_selects_reanswer_when_draft_untrustworthy() {
+        // Leaky draft: the draft is reasoning-shaped garbage; the model needs
+        // the conversation to compose a real answer.
+        assert_eq!(
+            structured_pass_mode("The user asks... let me think...", true, false),
+            StructuredPassMode::Reanswer
+        );
+        // Truncated first response: the draft is incomplete source material.
+        assert_eq!(
+            structured_pass_mode("A draft cut mid", false, true),
+            StructuredPassMode::Reanswer
+        );
+        // Blank draft: nothing to rewrite.
+        assert_eq!(
+            structured_pass_mode("   \n", false, false),
+            StructuredPassMode::Reanswer
+        );
+    }
+
+    #[test]
+    fn build_rewrite_messages_contains_only_instruction_and_draft() {
+        let draft = "Line one.\nA \"quoted\" bit and a { brace }.";
+        let msgs = build_rewrite_messages(draft);
+        // The whole point: NO conversation history — constant prefix + draft.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(
+            msgs[0]["content"].as_str().unwrap(),
+            STRUCTURED_REWRITE_INSTRUCTION
+        );
+        assert_eq!(msgs[1]["role"], "user");
+        let user = msgs[1]["content"].as_str().unwrap();
+        assert!(user.starts_with("DRAFT:\n"), "got: {user}");
+        assert!(user.contains(draft), "draft must be embedded verbatim");
+    }
+
+    #[test]
+    fn rewrite_options_cap_tokens_proportional_to_draft() {
+        let base = ChatOptions {
+            id_slot: Some(3),
+            max_tokens_override: Some(4096),
+            ..Default::default()
+        };
+        // Small draft: floor applies.
+        let small = structured_rewrite_chat_options(&base, "short draft");
+        assert_eq!(small.max_tokens_override, Some(512));
+        // Big draft (~6K tokens): cap scales with the draft, not the base.
+        let big_draft = "x".repeat(24_000);
+        let big = structured_rewrite_chat_options(&base, &big_draft);
+        assert_eq!(big.max_tokens_override, Some(24_000 / 4 * 2 + 256));
+        // Inherits the structural second-pass options: schema, no tools,
+        // thinking off, and never the interactive slot.
+        assert_eq!(small.tool_choice, ToolChoiceMode::None);
+        assert_eq!(small.id_slot, None);
+        assert_eq!(small.reasoning_effort_override.as_deref(), Some("off"));
+        match &small.response_mode {
+            ResponseMode::JsonSchema { name, .. } => assert_eq!(name, "final_answer"),
             other => panic!("expected JsonSchema, got {other:?}"),
         }
     }
