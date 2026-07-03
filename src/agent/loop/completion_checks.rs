@@ -807,23 +807,56 @@ pub(super) fn reply_acknowledges_outcome_reconciliation(
 }
 
 pub(super) fn build_outcome_reconciliation_fallback_reply(reconciliation: &str) -> String {
-    // Build a user-friendly summary from the reconciliation data.
-    // Avoid exposing internal system terminology ("verified outcomes",
-    // "previous draft", "system-verified result") — the user should see
-    // a natural-sounding status report, not audit trail language.
-    // Also strip iteration numbers and system prefixes that leak internals.
+    // TRANSLATE the model-facing ledger overview into plain language instead
+    // of echoing it (live repro 2026-07-03: the user received "External
+    // mutation attempt reconciliation: 0 of 2 attempts succeeded, 2 failed."
+    // — honest content, machine voice). Family rule: user-facing fallback
+    // text is model-composed or minimal canned text; never engine jargon.
+    static HEAD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(\d+) of (\d+) attempts succeeded, (\d+) failed").unwrap()
+    });
+    static ITER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r" at iteration \d+").unwrap());
+
+    // Attempt-detail lines, humanized: "  - tool at iteration N (HTTP x): err"
+    // becomes "• tool (HTTP x): err". Scaffolding-contaminated lines never
+    // ship (a truncation notice once reached the user through this path).
+    let detail_lines: Vec<String> = reconciliation
+        .lines()
+        .filter(|l| l.trim_start().starts_with("- ") || l.trim_start().starts_with("  -"))
+        .map(|l| ITER_RE.replace_all(l, "").to_string())
+        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
+        .map(|l| format!("• {}", l.trim_start().trim_start_matches("- ").trim()))
+        .collect();
+
+    if let Some(caps) = HEAD_RE.captures(reconciliation) {
+        let succeeded: usize = caps[1].parse().unwrap_or(0);
+        let total: usize = caps[2].parse().unwrap_or(0);
+        let header = if succeeded == 0 {
+            "I wasn't able to complete that — the changes didn't go through.".to_string()
+        } else {
+            format!(
+                "That partly worked: {} of the {} steps went through, the rest didn't.",
+                succeeded, total
+            )
+        };
+        let mut out = header;
+        if !detail_lines.is_empty() {
+            out.push_str("\n\nWhat failed:\n");
+            out.push_str(&detail_lines.join("\n"));
+        }
+        out.push_str("\n\nWant me to try a different approach?");
+        return out;
+    }
+
+    // Unrecognized overview shape: degrade to the jargon-stripped
+    // passthrough rather than inventing structure that may not be there.
     let cleaned: String = reconciliation
         .lines()
         .map(|line| {
-            // Strip [SYSTEM] prefix
             let l = line.trim_start().strip_prefix("[SYSTEM] ").unwrap_or(line);
-            // Strip "at iteration N" references
-            static RE: std::sync::LazyLock<regex::Regex> =
-                std::sync::LazyLock::new(|| regex::Regex::new(r" at iteration \d+").unwrap());
-            RE.replace_all(l, "").to_string()
+            ITER_RE.replace_all(l, "").to_string()
         })
-        // Attempt-detail lines can carry model-facing scaffolding (e.g. a
-        // truncation notice captured as an error summary) — never ship it.
         .filter(|line| !crate::utils::is_internal_scaffolding_line(line))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1443,13 +1476,63 @@ mod tests {
             crate::utils::truncation_notice(4000, 4265)
         );
         let fallback = build_outcome_reconciliation_fallback_reply(&reconciliation);
-        assert!(fallback.contains("0 of 1 attempts succeeded"));
         assert!(!fallback.contains("OUTPUT TRUNCATED"));
         assert!(!fallback.contains("Do NOT enumerate"));
+        // Humanized: no engine phrasing, honest failure statement instead.
+        assert!(!fallback.contains("attempts succeeded"));
+        assert!(!fallback.contains("reconciliation"));
+        assert!(fallback.contains("didn't go through") || fallback.contains("wasn't able"));
+    }
+
+    #[test]
+    fn fallback_reply_is_human_not_engine_speak() {
+        // Live repro 2026-07-03: the user received "Here's what happened:
+        // External mutation attempt reconciliation: 0 of 2 attempts
+        // succeeded, 2 failed. - terminal: SyntaxError..." — honest content,
+        // machine voice. The fallback must translate the ledger into plain
+        // language while keeping the useful error gist.
+        let reconciliation = "[SYSTEM] External mutation attempt reconciliation: 0 of 2 attempts succeeded, 2 failed.
+  - terminal at iteration 9: SyntaxError: unexpected character after line continuation character
+  - terminal at iteration 11: Error processing file: Expecting value: line 1 column 2 (char 1)";
+        let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
+        // No internal jargon.
+        assert!(!fallback.contains("External mutation attempt reconciliation"));
+        assert!(!fallback.contains("attempts succeeded"));
+        assert!(!fallback.contains("[SYSTEM]"));
+        assert!(!fallback.contains("at iteration"));
+        // Honest all-failed statement plus the error gist survives.
+        assert!(
+            fallback.contains("didn't go through") || fallback.contains("wasn't able"),
+            "plain-language failure statement expected: {fallback:?}"
+        );
+        assert!(
+            fallback.contains("SyntaxError"),
+            "error gist must survive: {fallback:?}"
+        );
+        // Offers a path forward.
+        assert!(
+            fallback.to_lowercase().contains("different approach")
+                || fallback.to_lowercase().contains("try again"),
+            "must offer recovery: {fallback:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_reply_partial_success_states_the_split() {
+        let reconciliation = "[SYSTEM] External mutation attempt reconciliation: 2 of 3 attempts succeeded, 1 failed.
+  - http_request at iteration 4 (HTTP 500): server error";
+        let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
+        assert!(
+            fallback.contains("2 of the 3"),
+            "partial split stated plainly: {fallback:?}"
+        );
+        assert!(!fallback.contains("reconciliation"));
+        assert!(fallback.contains("server error"));
     }
 
     #[test]
     fn fallback_reply_contains_reconciliation() {
+        // Unparseable shape: degrade gracefully (jargon-stripped passthrough).
         let reconciliation = "[SYSTEM] 1 of 3 attempts failed.";
         let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
         assert!(fallback.contains("1 of 3 attempts failed"));
