@@ -1772,7 +1772,7 @@ pub(super) async fn run_stopping_phase(
             if let Some(tool_output) =
                 latest_non_system_tool_output_excerpt(agent, session_id, 2500).await
             {
-                let reply = format!("Done. Here is the output:\n\n{}", tool_output);
+                let reply = last_resort_tool_output_reply(&tool_output);
                 agent
                     .emit_warning_decision_point(
                         emitter,
@@ -2137,4 +2137,59 @@ pub(super) async fn run_stopping_phase(
 
     commit_state!();
     Ok(StoppingPhaseOutcome::Proceed)
+}
+
+/// Last-resort stall recovery surfaces the latest tool output — but only when
+/// it is short human prose. A raw data dump or a spilled-file page is never an
+/// answer (live repro 2026-07-03: "Done. Here is the output:" followed by 87
+/// line-numbered rows of clinical-trial JSON shipped to the user — family
+/// member #8 of the fallback-paste class, via this inline format! that the
+/// named-builder sweep missed). Page-shaped or structured output becomes an
+/// honest handoff instead.
+pub(super) fn last_resort_tool_output_reply(tool_output: &str) -> String {
+    let presentable = crate::agent::response_analysis::is_short_prose_excerpt(tool_output)
+        && !crate::agent::response_analysis::reply_is_pasted_file_page(tool_output);
+    if presentable {
+        format!("Done. Here is the output:\n\n{}", tool_output.trim())
+    } else {
+        "I gathered the data but couldn't finish composing the answer. Ask me again and I'll \
+         summarize what I found."
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod last_resort_reply_tests {
+    use super::last_resort_tool_output_reply;
+
+    #[test]
+    fn short_prose_output_ships_directly() {
+        let reply = last_resort_tool_output_reply("3 recruiting trials found near Fairfax.");
+        assert!(reply.contains("3 recruiting trials found near Fairfax."));
+        assert!(reply.starts_with("Done."));
+    }
+
+    #[test]
+    fn spilled_file_page_never_ships() {
+        // Live repro shape: harness page header + line-numbered JSON.
+        let page = "File: /var/folders/x/T/aidaemon/tool_results/http_request-bfd18bdf.txt (lines 785-871 of 970, 29130 bytes, modified 2026-07-03)\n785 |         },\n786 |         {\n787 |           \"city\": \"Melbourne\",\n788 |           \"contacts\": [\n789 |             {\n790 |               \"name\": \"Damien Kee, MD\",\n791 |             }";
+        let reply = last_resort_tool_output_reply(page);
+        assert!(
+            !reply.contains("785 |"),
+            "page lines must not ship: {reply}"
+        );
+        assert!(!reply.contains("File: /var"), "page header must not ship");
+        assert!(
+            reply.contains("summarize"),
+            "honest handoff expected: {reply}"
+        );
+    }
+
+    #[test]
+    fn structured_json_dump_never_ships() {
+        let dump = "{\"studies\": [{\"city\": \"Melbourne\", \"status\": \"RECRUITING\"}]}";
+        let reply = last_resort_tool_output_reply(dump);
+        assert!(!reply.contains("RECRUITING"));
+        assert!(reply.contains("summarize"));
+    }
 }

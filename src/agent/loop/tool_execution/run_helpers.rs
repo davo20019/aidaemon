@@ -587,11 +587,7 @@ pub(crate) fn user_facing_external_action_ack(ack: &str) -> String {
         return ack.to_string();
     };
     let excerpt = excerpt.trim();
-    let short_prose = excerpt.chars().count() <= 200
-        && excerpt.lines().count() <= 3
-        && !excerpt.starts_with('{')
-        && !excerpt.starts_with('[')
-        && !excerpt.contains("\":");
+    let short_prose = crate::agent::response_analysis::is_short_prose_excerpt(excerpt);
     if short_prose {
         return ack.to_string();
     }

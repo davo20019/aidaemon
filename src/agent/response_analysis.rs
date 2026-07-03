@@ -407,6 +407,19 @@ pub(super) fn has_action_promise(text: &str) -> bool {
 /// than just deferred-action phrases.  Used to decide whether to accept a
 /// text-only response after repeated deferred-no-tool retries: if the model
 /// finally produced real content (greeting, explanation, joke, etc.) we should
+/// Short, human-presentable tool excerpt: at most a few lines of plain prose,
+/// not structured data. The shared discrimination for every "surface the tool
+/// output directly to the user" path (family rule: user-facing fallback text
+/// is model-composed or minimal canned text — NEVER a raw data dump).
+pub(in crate::agent) fn is_short_prose_excerpt(text: &str) -> bool {
+    let t = text.trim();
+    t.chars().count() <= 200
+        && t.lines().count() <= 3
+        && !t.starts_with('{')
+        && !t.starts_with('[')
+        && !t.contains("\":")
+}
+
 /// A final reply that is a verbatim read_file page — the harness's own page
 /// header (`File: <path> (lines A-B of N, X bytes...)`) followed by
 /// line-numbered content — is a paste, never an answer. Observed live: after
