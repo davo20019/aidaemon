@@ -322,3 +322,34 @@ async fn test_double_gutted_no_tool_fallback_is_honest() {
         "fallback must be honest about the failure and offer a path: {response:?}"
     );
 }
+
+/// A final reply that is an inline raw JSON dump (no harness page header —
+/// live repro: 334-study ClinicalTrials JSON behind "Here's the command
+/// output:") gets the same one-shot answer-don't-paste retry.
+#[tokio::test]
+async fn test_inline_json_dump_reply_retries_once() {
+    let dump = format!(
+        "Here's the command output:\n\n{{\"totalCount\":334,\"studies\":[{}]}}",
+        "{\"protocolSection\":{\"identificationModule\":{\"nctId\":\"NCT04305054\",\"briefTitle\":\"Synthetic melanoma study title padding padding padding\"},\"statusModule\":{\"overallStatus\":\"COMPLETED\"},\"locations\":[{\"city\":\"Fairfax\",\"state\":\"Virginia\"}]}},".repeat(4)
+    );
+    let clean_answer = "One of the 334 studies recruits in Fairfax: NCT04305054 (melanoma).";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(&dump),
+        MockProvider::text_response(clean_answer),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_json_dump_retry",
+            "Which trials recruit near Fairfax?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, clean_answer, "the retry's answer must ship");
+}

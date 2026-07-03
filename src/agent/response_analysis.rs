@@ -420,6 +420,25 @@ pub(in crate::agent) fn is_short_prose_excerpt(text: &str) -> bool {
         && !t.contains("\":")
 }
 
+/// A final reply that is a raw structured-data dump: an optional short
+/// lead-in line ("Here's the command output:") followed by a large JSON/
+/// bracket blob. Sibling of the pasted-file-page detector — same disease
+/// (data shipped instead of an answer), no harness page header (live repro
+/// 2026-07-03: 334-study ClinicalTrials JSON pasted inline as the final
+/// answer). One-shot retry, never a hard block: a genuinely-requested JSON
+/// snippet costs one bounce, then ships.
+pub(in crate::agent) fn reply_is_raw_data_dump(reply: &str) -> bool {
+    let t = reply.trim();
+    let body = match t.split_once('\n') {
+        // Tolerate a short lead-in line ending with ':'.
+        Some((first, rest)) if first.trim_end().ends_with(':') && first.chars().count() <= 80 => {
+            rest.trim_start()
+        }
+        _ => t,
+    };
+    (body.starts_with('{') || body.starts_with('[')) && body.chars().count() > 600
+}
+
 /// A final reply that is a verbatim read_file page — the harness's own page
 /// header (`File: <path> (lines A-B of N, X bytes...)`) followed by
 /// line-numbered content — is a paste, never an answer. Observed live: after

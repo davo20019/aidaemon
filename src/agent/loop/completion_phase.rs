@@ -1954,7 +1954,10 @@ pub(super) async fn run_completion_phase(
         // page instead of answering). One-shot retry with a directive to
         // answer from the data; shares the same retry budget as the gutted
         // case above.
-        if reply_is_pasted_file_page(&sanitized_reply) && !empty_response_retry_used {
+        if (reply_is_pasted_file_page(&sanitized_reply)
+            || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized_reply))
+            && !empty_response_retry_used
+        {
             warn!(
                 session_id,
                 iteration, "Final reply is a pasted file page — retrying final answer once"
