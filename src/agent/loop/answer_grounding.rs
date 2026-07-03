@@ -43,7 +43,7 @@ pub(in crate::agent) fn find_ungrounded_list_entities(
                 .split_whitespace()
                 .map(fold_for_match)
                 .filter(|w| w.chars().count() >= MIN_WORD_LEN)
-                .all(|w| corpus.contains(&w))
+                .all(|w| word_grounded_in(&corpus, &w))
         })
         .collect();
     ungrounded.dedup();
@@ -52,6 +52,32 @@ pub(in crate::agent) fn find_ungrounded_list_entities(
     }
     ungrounded.truncate(MAX_REPORTED);
     ungrounded
+}
+
+/// A reply word is grounded if the evidence contains it — or its singular
+/// form. The substring match already tolerates the corpus carrying a LONGER
+/// inflection; this folds the other direction (reply "Treatments" vs source
+/// "treatment", "Malignancies" vs "malignancy"), erring toward NOT flagging,
+/// same as the rest of this check.
+fn word_grounded_in(corpus: &str, word: &str) -> bool {
+    if corpus.contains(word) {
+        return true;
+    }
+    if let Some(stem) = word.strip_suffix("ies") {
+        let mut singular = stem.to_string();
+        singular.push('y');
+        if singular.chars().count() >= MIN_WORD_LEN && corpus.contains(&singular) {
+            return true;
+        }
+    }
+    for suffix in ["es", "s"] {
+        if let Some(stem) = word.strip_suffix(suffix) {
+            if stem.chars().count() >= MIN_WORD_LEN && corpus.contains(stem) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Number of name-like list entities in `reply` — used by the corroboration
@@ -133,7 +159,30 @@ fn is_titlecase_name_word(w: &str) -> bool {
 fn is_leading_stopword(w: &str) -> bool {
     matches!(
         w,
-        "The"
+        // Category-heading modifiers: adjectives that begin section labels
+        // ("Other Malignancies:", "Recent Treatments:") but essentially never
+        // begin a person/org/product name — the guard's actual targets.
+        // Live false positive 2026-07-03; closed grammatical class, not a
+        // content keyword list.
+        "Other"
+            | "Specific"
+            | "Recent"
+            | "Additional"
+            | "General"
+            | "Certain"
+            | "Various"
+            | "Common"
+            | "Main"
+            | "Primary"
+            | "Secondary"
+            | "Related"
+            | "Relevant"
+            | "Required"
+            | "Prior"
+            | "Current"
+            | "Overall"
+            | "Further"
+            | "The"
             | "This"
             | "That"
             | "These"
@@ -298,6 +347,51 @@ mod tests {
     const ROSTER_EVIDENCE: &str = "Ecuador squad preview: Moisés Caicedo (Chelsea) anchors \
          the midfield, with captain Enner Valencia up front and Willian Pacho \
          marshalling the defence. Kendry Páez and Pervis Estupiñán complete the spine.";
+
+    #[test]
+    fn category_heading_lists_are_not_flagged() {
+        // Live false positive 2026-07-03 (task e980517a): a melanoma-trial
+        // eligibility answer used bold category headings — "Other
+        // Malignancies", "Specific Infections", "Recent Treatments" — which
+        // the extractor read as name entities, and the plural headings
+        // failed grounding against the singular source text. Cost a ~50s
+        // grounded-rewrite bounce on a perfectly grounded answer.
+        let evidence = "Exclusion criteria: no other malignancy within 3 years;              no active infection requiring systemic therapy; no prior treatment              with checkpoint inhibitors; no untreated heart infection;              adequate organ function required.";
+        let reply = "Key exclusion criteria:
+             • **Other Malignancies:** none within 3 years.
+             • **Specific Infections:** no active infection needing therapy.
+             • **Recent Treatments:** no prior checkpoint inhibitors.
+             • **Heart Infections:** none untreated.
+             • **Organ Function:** must be adequate.
+";
+        assert!(
+            find_ungrounded_list_entities(reply, &[evidence]).is_empty(),
+            "category headings over grounded content must not be flagged"
+        );
+    }
+
+    #[test]
+    fn plural_reply_words_ground_against_singular_evidence() {
+        // Inflection asymmetry: the substring match already tolerates the
+        // corpus carrying a LONGER form; the reply carrying the plural of a
+        // singular source word must fold the same way.
+        let evidence = "Roster notes: the Quito Ranger appears once;              the Loja Battery is a single unit; one Cuenca Match was played.";
+        let reply = "Found these:
+             • Quito Rangers
+             • Loja Batteries
+             • Cuenca Matches
+             • Quito Rangers Two
+             • Loja Batteries Two
+";
+        // All heads ground via singular folding (s / ies->y / es).
+        let ungrounded = find_ungrounded_list_entities(reply, &[evidence]);
+        assert!(
+            !ungrounded
+                .iter()
+                .any(|e| e.contains("Quito Rangers") && !e.contains("Two")),
+            "plural of grounded singular must not be flagged: {ungrounded:?}"
+        );
+    }
 
     #[test]
     fn fabricated_roster_entries_are_flagged() {
