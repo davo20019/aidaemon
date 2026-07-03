@@ -201,7 +201,7 @@ pub async fn build_core_profile(
     let mut selected_entities = Vec::new();
     let mut new_cache = None;
 
-    if let Some(cached) = cached_ids {
+    if let Some(cached) = cached_ids.as_deref() {
         for entity in entities {
             if cached.contains(&entity.id) {
                 selected_entities.push(entity);
@@ -211,6 +211,8 @@ pub async fn build_core_profile(
         order_entities(&mut entities);
         let top_n = entities.into_iter().take(20).collect::<Vec<_>>();
 
+        // The cache stores ids in salience order at pin time; later renders
+        // follow THIS order, not live salience (see order_selected_entities).
         let ids: Vec<String> = top_n.iter().map(|e| e.id.clone()).collect();
         new_cache = Some(ids);
         selected_entities = top_n;
@@ -220,10 +222,12 @@ pub async fn build_core_profile(
         return Ok((String::new(), new_cache, Vec::new()));
     }
 
-    // Render in a deterministic order regardless of how the cached/ranked path
-    // assembled `selected_entities` (the cached path preserves upstream
-    // HashMap/SQL order). Stable bytes → the core prompt no longer busts the cache.
-    order_entities(&mut selected_entities);
+    // Render in an order that is stable ACROSS renders, not merely
+    // deterministic within one: pinned sessions follow pin order (frozen at
+    // selection time); only a fresh selection orders by live salience.
+    // Sorting the pinned path by live salience busts the prompt cache at
+    // token 0 whenever background recall/recency drift swaps two entities.
+    order_selected_entities(&mut selected_entities, cached_ids.as_deref());
 
     // Per-render digest: (entity id, content hash) in render order. The caller
     // emits this as telemetry so any future core_profile churn self-explains —
@@ -277,6 +281,27 @@ fn order_entities(entities: &mut [RankedEntity]) {
     });
 }
 
+/// Render ordering for the selected entities. Pinned sessions order by PIN
+/// position, never by live salience: salience drifts continuously in the
+/// background (recall_count updates, daily recency decay), so sorting by it is
+/// deterministic per render but NOT stable across renders — adjacent entities
+/// eventually swap and the core prompt's bytes change with zero content
+/// change, invalidating the whole prompt cache (live repro 2026-07-03:
+/// positions 18<->19 swapped, identical content, full re-prefill). Entities
+/// absent from the pin (shouldn't happen: the pinned path filters BY the pin)
+/// sort last, by id, deterministically.
+fn order_selected_entities(entities: &mut [RankedEntity], pin: Option<&[String]>) {
+    match pin {
+        Some(pin) => entities.sort_by_key(|e| {
+            (
+                pin.iter().position(|id| id == &e.id).unwrap_or(usize::MAX),
+                e.id.clone(),
+            )
+        }),
+        None => order_entities(entities),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +329,41 @@ mod tests {
         );
         // salience desc, then id asc for the a/b tie at 2.0.
         assert_eq!(ids(&a), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pinned_order_is_frozen_against_salience_drift() {
+        // Live salience drifts in the background (recall_count voting, daily
+        // recency decay). A pinned session must render in PIN order so the
+        // core prompt's bytes cannot change without a content change.
+        // Live repro 2026-07-03: flat_group_twitter_username swapped positions
+        // 18<->19 with identical content -> core invalidated -> full re-prefill.
+        let pin = vec!["b".to_string(), "a".to_string()];
+        // Salience says a > b — and drifted since pin time.
+        let mut entities = vec![mk("a", 5.0), mk("b", 1.0)];
+        order_selected_entities(&mut entities, Some(&pin));
+        let ids: Vec<_> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"], "pin order wins over live salience");
+
+        // Unpinned (fresh selection): salience ordering as before.
+        let mut fresh = vec![mk("a", 1.0), mk("b", 5.0)];
+        order_selected_entities(&mut fresh, None);
+        let ids: Vec<_> = fresh.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"], "fresh selection orders by salience");
+    }
+
+    #[test]
+    fn pinned_order_ignores_upstream_iteration_order() {
+        // The cached-path filter preserves HashMap/SQL iteration order, which
+        // is nondeterministic — pin order must override it.
+        let pin = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let mut a = vec![mk("z", 1.0), mk("x", 1.0), mk("y", 1.0)];
+        let mut b = vec![mk("y", 1.0), mk("z", 1.0), mk("x", 1.0)];
+        order_selected_entities(&mut a, Some(&pin));
+        order_selected_entities(&mut b, Some(&pin));
+        let ids = |v: &[RankedEntity]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(ids(&a), vec!["x", "y", "z"]);
     }
 
     #[test]
