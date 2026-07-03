@@ -150,6 +150,12 @@ pub(in crate::agent) enum SystemDirective {
     },
     /// Injected before final response when the outcome ledger has mixed results.
     OutcomeReconciliation(String),
+    /// One-shot recovery pass BEFORE the honest failure report: the model
+    /// tried to make an external change, it failed, and the model moved to
+    /// answering anyway. Carries the ledger evidence and demands a DIFFERENT
+    /// approach (the failed commands are visible in the conversation history;
+    /// repeating their shape is explicitly forbidden).
+    ExternalMutationRecoveryRequired(String),
     /// Task plan context injected each iteration so the model sees its plan.
     TaskPlanContext(String),
     /// The completion contract expects a file mutation (write/rewrite/create)
@@ -535,6 +541,10 @@ impl SystemDirective {
                 )
             }
             Self::OutcomeReconciliation(summary) => summary.clone(),
+            Self::ExternalMutationRecoveryRequired(evidence) => format!(
+                "[SYSTEM] The change the user asked for has NOT been made — your earlier attempt(s) failed and were never fixed:\n{}\nYou are NOT done. Try a DIFFERENT approach NOW using tools. Do NOT repeat the same command or method that failed above — change strategy (e.g., if an inline one-liner failed on quoting or parsing, write the code to a file with write_file and run the file; if an API call failed, re-check the payload or endpoint first). If no alternative can possibly work, state plainly what you could not do and why.",
+                evidence
+            ),
             Self::TaskPlanContext(plan) => plan.clone(),
             Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),

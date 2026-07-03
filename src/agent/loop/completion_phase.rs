@@ -1033,6 +1033,31 @@ pub(super) async fn run_completion_phase(
                                 .to_string()
                         });
 
+                // Recovery pass (before any reporting): the model is trying
+                // to finish with unfixed failed mutations. Give it ONE
+                // evidence-fed chance to fix the failure with a different
+                // approach — the immediate ExternalMutationFailed nudge fires
+                // per-failure, but an exit-0-with-error-in-output retry breaks
+                // the failure streak and the model declares itself done (live
+                // repro 2026-07-03, task 2e87a458: python one-liner quoting
+                // failure "succeeded" with a traceback in stdout; the model
+                // answered instead of pivoting; the user got an honest report
+                // when a script-file retry would likely have worked).
+                if !completion_progress.external_mutation_recovery_attempted {
+                    pending_system_messages.push(
+                        SystemDirective::ExternalMutationRecoveryRequired(reconciliation.clone()),
+                    );
+                    completion_progress.mark_external_mutation_recovery_attempted();
+                    execution_state.record_validation_round();
+                    warn!(
+                        session_id,
+                        iteration,
+                        "Unfixed failed external mutations at completion — one recovery pass before reporting"
+                    );
+                    commit_state!();
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                }
+
                 // First pass: send the verified reconciliation facts back through the LLM.
                 if !completion_progress.external_mutation_reconciliation_attempted {
                     pending_system_messages.push(SystemDirective::OutcomeReconciliation(

@@ -453,7 +453,10 @@ impl crate::traits::Tool for UrlProbeTool {
             .get("url")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing url"))?;
-        Ok(format!("Checked {} and confirmed the posts are visible.", url))
+        Ok(format!(
+            "Checked {} and confirmed the posts are visible.",
+            url
+        ))
     }
 }
 
@@ -585,10 +588,7 @@ async fn test_visible_outcome_request_requires_matching_verification_before_comp
             resp
         },
         MockProvider::text_response("Done."),
-        MockProvider::tool_call_response(
-            "url_probe",
-            r#"{"url":"https://blog.aidaemon.ai"}"#,
-        ),
+        MockProvider::tool_call_response("url_probe", r#"{"url":"https://blog.aidaemon.ai"}"#),
         MockProvider::text_response(
             "I checked https://blog.aidaemon.ai and the posts are now visible.",
         ),
@@ -1043,5 +1043,117 @@ async fn test_full_stack_blocked_tool_triggers_stall() {
         !response.contains("stuck") && !response.contains("not making progress"),
         "Blocked non-exempt tool calls should NOT trigger stall detection. Got: {}",
         response.chars().take(400).collect::<String>()
+    );
+}
+
+struct FailingExternalActionTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for FailingExternalActionTool {
+    fn name(&self) -> &str {
+        "failing_external_action"
+    }
+    fn description(&self) -> &str {
+        "Writes to an external service; always fails (testing)."
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "failing_external_action",
+            "description": self.description(),
+            "parameters": {"type": "object", "properties": {}}
+        })
+    }
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+    fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
+        crate::traits::ToolCallSemantics::mutation()
+    }
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        // Real failing tools (terminal, http_request) return Ok with error
+        // text — the classifier marks it failed; a hard Err skips the
+        // result-metadata path entirely.
+        Ok("Error: HTTP 500: JSONDecodeError: Expecting value: line 1 column 2".to_string())
+    }
+}
+
+/// A model that gives up with an UNFIXED failed external mutation gets ONE
+/// evidence-fed recovery pass demanding a different approach BEFORE the
+/// honest failure report (live repro: task 2e87a458 — quoting failure,
+/// retry "succeeded" with a traceback in stdout, model answered, user got
+/// a report when a strategy change would likely have worked).
+#[tokio::test]
+async fn test_failed_mutation_gets_recovery_pass_before_report() {
+    // Uncorrected failed mutations short-circuit straight into the
+    // reconciliation zone, so the recovery pass fires on the FIRST give-up.
+    let give_up = "I couldn't finish creating the record due to a parse error.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("failing_external_action", "{}"),
+        MockProvider::text_response(give_up),
+        // Recovery pass fires here: model pivots to a different tool that works.
+        MockProvider::tool_call_response("external_action", "{}"),
+        MockProvider::text_response(
+            "The first method failed, so I used the alternative service — the record is created (id=abc123).",
+        ),
+        MockProvider::text_response(
+            "1 attempt failed initially, but the retry succeeded — the record is created (id=abc123).",
+        ),
+        MockProvider::text_response(
+            "1 attempt failed initially, but the retry succeeded — the record is created (id=abc123).",
+        ),
+    ]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![
+            std::sync::Arc::new(FailingExternalActionTool)
+                as std::sync::Arc<dyn crate::traits::Tool>,
+            std::sync::Arc::new(ExternalActionTool) as std::sync::Arc<dyn crate::traits::Tool>,
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_mutation_recovery",
+            "Create the record in the external service",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The recovery directive reached the model exactly once.
+    let calls = harness.provider.call_log.lock().await;
+
+    let directive_count = calls
+        .iter()
+        .flat_map(|c| c.messages.iter())
+        .filter(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("Try a DIFFERENT approach"))
+        })
+        .count();
+    assert!(
+        directive_count >= 1,
+        "recovery directive must be injected; got {directive_count}"
+    );
+    drop(calls);
+
+    // The pivot's success ships — not a failure report.
+    assert!(
+        response.contains("record is created") || response.contains("abc123"),
+        "recovered outcome must ship: {response:?}"
     );
 }

@@ -117,6 +117,10 @@ pub(super) struct CompletionProgress {
     pub successful_external_mutation_count: usize,
     /// True after we have already given the LLM one reconciliation-informed retry.
     pub external_mutation_reconciliation_attempted: bool,
+    /// True after the one-shot RECOVERY pass: before asking the model to
+    /// report failed external mutations honestly, it first gets one
+    /// evidence-fed chance to fix them with a DIFFERENT approach.
+    pub external_mutation_recovery_attempted: bool,
     /// Cumulative count of times the verification guard blocked completion.
     /// Unlike `stall_count` (which is shared with other stall mechanisms and
     /// gets reset), this counter only increments and is used as a safety valve
@@ -184,9 +188,14 @@ impl CompletionProgress {
         self.external_mutation_reconciliation_attempted = true;
     }
 
+    pub(super) fn mark_external_mutation_recovery_attempted(&mut self) {
+        self.external_mutation_recovery_attempted = true;
+    }
+
     pub(super) fn clear_failed_external_mutation_gate(&mut self) {
         self.failed_external_mutation_count = 0;
         self.external_mutation_reconciliation_attempted = false;
+        self.external_mutation_recovery_attempted = false;
     }
 }
 
