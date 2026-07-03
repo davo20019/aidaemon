@@ -1917,8 +1917,14 @@ pub(super) async fn run_completion_phase(
                 let refs: Vec<&str> = learning_ctx.tool_calls.iter().map(|s| s.as_str()).collect();
                 build_activity_summary_reply(&refs)
             } else {
-                // Genuine edge case: no tools either.  Use a generic acknowledgement.
-                "Done.".to_string()
+                // No tools ran and both composition attempts gutted: the
+                // model kept echoing scaffolding-wrapped content. A bare
+                // "Done." here is dishonest — nothing was done (live repro
+                // 2026-07-03: "give me the trial details" → "Done."). Say
+                // what happened and offer a recovery path instead.
+                "I ran into a formatting problem composing that answer and couldn't recover \
+                 it. Ask me again and I'll re-gather the details."
+                    .to_string()
             }
         } else {
             sanitized_reply

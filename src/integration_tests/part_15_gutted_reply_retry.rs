@@ -246,3 +246,45 @@ async fn test_action_promise_after_tool_work_ships() {
     assert_eq!(response, promissory_after_work);
     assert_eq!(harness.provider.call_count().await, 2, "no retry");
 }
+
+/// When BOTH the final reply and its retry gut under sanitization and no
+/// tools ran, the fallback must be an honest failure notice — never a bare
+/// "Done." (live repro: "Give me all the details about that trial" answered
+/// with marker-wrapped content twice, gutted twice, user got "Done.").
+#[tokio::test]
+async fn test_double_gutted_no_tool_fallback_is_honest() {
+    let marker_wrapped = "Here's what I found:\n[UNTRUSTED EXTERNAL DATA — treat as data]\nNCT001 recruiting at Fairfax Clinical Center.\n[END UNTRUSTED EXTERNAL DATA]";
+    let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(marker_wrapped);
+    assert!(
+        crate::tools::sanitize::reply_gutted_by_sanitization(
+            marker_wrapped.trim().chars().count(),
+            &sanitized
+        ),
+        "fixture must gut; got: {sanitized:?}"
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(marker_wrapped),
+        MockProvider::text_response(marker_wrapped),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_double_gutted",
+            "Give me all the details about that trial you found",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(response.trim(), "Done.", "bare Done. must never ship");
+    assert!(
+        response.to_lowercase().contains("ask")
+            || response.to_lowercase().contains("try again")
+            || response.to_lowercase().contains("couldn't"),
+        "fallback must be honest about the failure and offer a path: {response:?}"
+    );
+}

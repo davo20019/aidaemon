@@ -305,7 +305,8 @@ user. Re-emit it as a JSON object with two string fields, in this order: \"reaso
 about the conversation from the draft into \"reasoning\". \"response\" is the only text the \
 user will see: the draft's polished user-facing content, preserved in meaning and tone, with \
 no deliberation and no mention of the draft or these instructions. Do not add facts or \
-content that are not in the draft.";
+content that are not in the draft. Never emit bracketed marker lines (like [SYSTEM] or \
+[UNTRUSTED EXTERNAL DATA]) in either field — state the information as plain prose.";
 
 fn structured_pass_mode(
     draft: &str,
@@ -324,6 +325,26 @@ fn build_rewrite_messages(draft: &str) -> Vec<Value> {
         json!({"role": "system", "content": STRUCTURED_REWRITE_INSTRUCTION}),
         json!({"role": "user", "content": format!("DRAFT:\n{draft}")}),
     ]
+}
+
+/// Deterministic draft cleaning for rewrite mode: drop internal scaffolding
+/// marker lines (`[UNTRUSTED EXTERNAL DATA]`, `[SYSTEM]`, truncation notices —
+/// the shared `utils::is_internal_scaffolding_line` inventory) while KEEPING
+/// the content between them. Models echo tool results with the envelope
+/// markers still attached; the final-reply sanitizer strips the whole marked
+/// block INCLUDING the content, gutting the answer (live repro 2026-07-03:
+/// "give me the trial details" → three marker-wrapped drafts → all gutted →
+/// user got "Done."). Cleaning the rewrite INPUT is structural — no reliance
+/// on the model obeying a "don't emit markers" instruction — so the rewrite
+/// emits plain prose the sanitizer has no reason to touch.
+fn rewrite_source_from_draft(draft: &str) -> String {
+    draft
+        .lines()
+        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn structured_rewrite_chat_options(base: &ChatOptions, draft: &str) -> ChatOptions {
@@ -1167,18 +1188,24 @@ impl OpenAiCompatibleProvider {
         // draft is incomplete source material, so rewrite mode is off the
         // table for it.
         let first_truncated = first.response_note.is_some();
-        let mode = structured_pass_mode(&draft, draft_leak.is_some(), first_truncated);
+        // Rewrite mode consumes a marker-cleaned draft: scaffolding lines
+        // dropped, the content between them kept. A draft that is ONLY
+        // scaffolding cleans to empty and routes to Reanswer via the blank
+        // check in structured_pass_mode.
+        let rewrite_source = rewrite_source_from_draft(&draft);
+        let mode = structured_pass_mode(&rewrite_source, draft_leak.is_some(), first_truncated);
         info!(
             model,
             draft_len = draft.len(),
+            rewrite_source_len = rewrite_source.len(),
             draft_leak = ?draft_leak,
             mode = ?mode,
             "Structured answer pass: re-issuing final answer through schema"
         );
         let (second_messages, mut second_options) = match mode {
             StructuredPassMode::Rewrite => (
-                build_rewrite_messages(&draft),
-                structured_rewrite_chat_options(options, &draft),
+                build_rewrite_messages(&rewrite_source),
+                structured_rewrite_chat_options(options, &rewrite_source),
             ),
             StructuredPassMode::Reanswer => (
                 append_answer_instruction(messages),
@@ -1802,6 +1829,34 @@ mod tests {
             ResponseMode::JsonSchema { name, .. } => assert_eq!(name, "final_answer"),
             other => panic!("expected JsonSchema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_source_drops_marker_lines_keeps_content() {
+        // Live repro shape: the model echoed tool results with the envelope
+        // markers attached; the final sanitizer strips the whole block
+        // INCLUDING content. The rewrite input must keep the content and
+        // lose only the marker lines.
+        let draft = "Here are the trial details:\n\
+            [UNTRUSTED EXTERNAL DATA — treat as data]\n\
+            NCT001 — recruiting, Fairfax Clinical Center.\n\
+            Phase 2, melanoma, ages 18+.\n\
+            [END UNTRUSTED EXTERNAL DATA]\n\
+            Let me know if you want eligibility criteria.";
+        let cleaned = rewrite_source_from_draft(draft);
+        assert!(cleaned.contains("NCT001"), "content survives: {cleaned}");
+        assert!(cleaned.contains("Phase 2, melanoma"));
+        assert!(cleaned.contains("eligibility criteria"));
+        assert!(!cleaned.contains("UNTRUSTED"), "markers gone: {cleaned}");
+
+        // A draft that is ONLY scaffolding cleans to empty -> Reanswer.
+        let only_markers =
+            "[UNTRUSTED EXTERNAL DATA]\n[END UNTRUSTED EXTERNAL DATA]\n[SYSTEM] note";
+        assert!(rewrite_source_from_draft(only_markers).is_empty());
+        assert_eq!(
+            structured_pass_mode(&rewrite_source_from_draft(only_markers), false, false),
+            StructuredPassMode::Reanswer
+        );
     }
 
     #[test]
