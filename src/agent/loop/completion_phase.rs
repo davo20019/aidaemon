@@ -1454,8 +1454,13 @@ pub(super) async fn run_completion_phase(
         // then "I'll try a different approach by searching the web instead",
         // both shipped as final answers, nothing ever ran). Harness-composed
         // background handoffs are exempt: their promise has real pending work.
-        let terminal_unbacked_plan = total_successful_tool_calls == 0
-            && looks_like_deferred_action_response(&reply)
+        // 4th live incident (2026-07-03, task ending 18:30): a 750-char
+        // progress narration ending in "I will present the trials shortly"
+        // shipped as the final answer of an ended task — evading BOTH the
+        // detector's short-reply cap and this gate's zero-success scoping.
+        // The scoping goes: successful earlier calls don't make a terminal
+        // promise of FUTURE agent action true; only pending work does.
+        let terminal_unbacked_plan = looks_like_deferred_action_response(&reply)
             && !crate::agent::is_friendly_background_handoff(&reply);
         if !used_identity_prefill
             && !force_text_fast_path_accepted
