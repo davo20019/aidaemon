@@ -1132,3 +1132,79 @@ fn web_source_tracking_counts_distinct_successful_domains() {
     state.record_web_source("terminal", r#"{"command":"ls"}"#, &"z".repeat(600), false);
     assert_eq!(state.web_source_domains.len(), 2);
 }
+
+#[test]
+fn terminal_cross_class_success_corrects_failed_mutation() {
+    // Live repro (task 45a65347): a failed `python3 -c` parse classified as
+    // mutation; the successful `grep | head` retry classified as observation.
+    // Same tool, same goal — the failure must count as corrected.
+    let mut state = test_execution_state();
+    state.record_outcome(OutcomeEntry {
+        tool_name: "terminal".to_string(),
+        success: false,
+        http_status: None,
+        is_external_mutation: true,
+        error_summary: Some("JSONDecodeError: Expecting value".to_string()),
+        iteration: 6,
+        plan_version: None,
+        planned_step_id: None,
+        planned_step_index: None,
+        planned_step_description: None,
+        expected_step_count: None,
+    });
+    state.record_outcome(OutcomeEntry {
+        tool_name: "terminal".to_string(),
+        success: true,
+        http_status: None,
+        is_external_mutation: false, // grep classified as observation
+        error_summary: None,
+        iteration: 9,
+        plan_version: None,
+        planned_step_id: None,
+        planned_step_index: None,
+        planned_step_description: None,
+        expected_step_count: None,
+    });
+    assert!(
+        state.uncorrected_failed_mutations().is_empty(),
+        "terminal cross-class retry success must correct the failure"
+    );
+}
+
+#[test]
+fn http_cross_class_success_does_not_launder_failed_write() {
+    // Precisely-classified tools keep the strict rule: a successful GET can
+    // never correct a failed POST — that would let a read launder a write.
+    let mut state = test_execution_state();
+    state.record_outcome(OutcomeEntry {
+        tool_name: "http_request".to_string(),
+        success: false,
+        http_status: Some(500),
+        is_external_mutation: true,
+        error_summary: Some("HTTP 500".to_string()),
+        iteration: 3,
+        plan_version: None,
+        planned_step_id: None,
+        planned_step_index: None,
+        planned_step_description: None,
+        expected_step_count: None,
+    });
+    state.record_outcome(OutcomeEntry {
+        tool_name: "http_request".to_string(),
+        success: true,
+        http_status: Some(200),
+        is_external_mutation: false, // GET
+        error_summary: None,
+        iteration: 5,
+        plan_version: None,
+        planned_step_id: None,
+        planned_step_index: None,
+        planned_step_description: None,
+        expected_step_count: None,
+    });
+    assert_eq!(
+        state.uncorrected_failed_mutations().len(),
+        1,
+        "a read must never correct a failed write for precisely-classified tools"
+    );
+}

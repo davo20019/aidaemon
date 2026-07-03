@@ -551,7 +551,21 @@ impl ExecutionState {
             .into_iter()
             .filter(|fail| {
                 !self.outcome_ledger.iter().any(|e| {
-                    e.is_external_mutation == external_mutation
+                    // Terminal's mutation classification is a per-command
+                    // heuristic (classify_shell_command): a failed
+                    // `python3 -c` parse lands in the mutation ledger while
+                    // the successful `grep | head` retry classifies as an
+                    // observation — same tool, same goal, different class —
+                    // and the failure read as "uncorrected" forever (live
+                    // repro 2026-07-03, task 45a65347: the recovery pass
+                    // worked, the report still said all-failed). For
+                    // terminal ONLY, a later same-tool success of either
+                    // class corrects; precisely-classified tools (http_request
+                    // POST vs GET) keep the strict same-class rule so a read
+                    // can never launder a failed write.
+                    let class_matches =
+                        e.is_external_mutation == external_mutation || fail.tool_name == "terminal";
+                    class_matches
                         && e.success
                         && e.tool_name == fail.tool_name
                         && e.iteration > fail.iteration
