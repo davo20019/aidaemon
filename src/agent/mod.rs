@@ -118,6 +118,7 @@ const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minut
 /// scheduled goal" meta-queries to avoid accidental schedule creation.
 const ENABLE_SCHEDULE_HEURISTICS: bool = true;
 
+pub mod activity_gate;
 #[path = "response_analysis.rs"]
 mod response_analysis;
 #[cfg(test)]
@@ -930,6 +931,11 @@ impl Agent {
         channel_ctx: ChannelContext,
         heartbeat: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<String> {
+        // Marks an agent task in flight for the entire turn (all recursion
+        // depths route through here: interactive turns, goal-run task leads,
+        // spawned specialists). The background memory pipeline defers its
+        // LLM work while this is held — see activity_gate.
+        let _activity = activity_gate::AgentActivityGuard::acquire();
         let scheduled_goal_to_clear = if let Some(goal_id) = self.goal_id.as_deref() {
             let is_scheduled_goal =
                 goal_has_scheduled_provenance(&self.state, goal_id, self.task_id.as_deref()).await;

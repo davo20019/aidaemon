@@ -71,7 +71,7 @@ impl MemoryManager {
     ) {
         // Embedding generation (every 5s)
         let mgr = self.clone();
-        heartbeat.register_job("embeddings", Duration::from_secs(5), move || {
+        heartbeat.register_deferrable_job("embeddings", Duration::from_secs(5), move || {
             let m = mgr.clone();
             async move {
                 let _ = m.process_embeddings().await?;
@@ -82,7 +82,7 @@ impl MemoryManager {
         // Memory consolidation (configurable interval, default 6h)
         let mgr = self.clone();
         let interval = self.consolidation_interval;
-        heartbeat.register_job("consolidation", interval, move || {
+        heartbeat.register_deferrable_job("consolidation", interval, move || {
             let m = mgr.clone();
             async move { m.consolidate_memories().await }
         });
@@ -107,7 +107,7 @@ impl MemoryManager {
 
         // Episode creation (every 30 minutes) — idle sessions + long-running active sessions
         let mgr = self.clone();
-        heartbeat.register_job("episodes", Duration::from_secs(30 * 60), move || {
+        heartbeat.register_deferrable_job("episodes", Duration::from_secs(30 * 60), move || {
             let m = mgr.clone();
             async move {
                 if let Err(e) = m.create_episodes_for_idle_sessions().await {

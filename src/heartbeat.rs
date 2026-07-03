@@ -205,6 +205,11 @@ pub struct HeartbeatJob {
     pub consecutive_failures: Arc<AtomicU32>,
     /// The async function to call. Runs in a spawned tokio task.
     pub run: HeartbeatRunFn,
+    /// Deferrable LLM work (memory pipeline): skip ticks while an agent task
+    /// is in flight so it can't evict the task's KV prefix or steal compute.
+    /// NEVER set for correctness-critical jobs (watchdogs, goal dispatch,
+    /// orphan reclaim) — those must run while tasks are active.
+    pub defer_while_agent_busy: bool,
 }
 
 /// Coordinates all background periodic tasks in a single tick loop.
@@ -285,9 +290,24 @@ impl HeartbeatCoordinator {
             is_running: Arc::new(AtomicBool::new(false)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             run: Box::new(move || Box::pin(f())),
+            defer_while_agent_busy: false,
         });
         if let Some(telemetry) = &self.telemetry {
             telemetry.register_job(name, interval);
+        }
+    }
+
+    /// Like `register_job`, but the job yields to in-flight agent tasks
+    /// (interactive turns, goal runs, specialists). Use for the deferrable
+    /// memory pipeline only — see `HeartbeatJob::defer_while_agent_busy`.
+    pub fn register_deferrable_job<F, Fut>(&mut self, name: &str, interval: Duration, f: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.register_job(name, interval, f);
+        if let Some(job) = self.jobs.last_mut() {
+            job.defer_while_agent_busy = true;
         }
     }
 
@@ -426,6 +446,22 @@ impl HeartbeatCoordinator {
                 // Skip if previous invocation is still running
                 if job.is_running.load(Ordering::Relaxed) {
                     tracing::debug!(job = %job.name, "Skipping — previous invocation still running");
+                    continue;
+                }
+
+                // Deferrable memory-pipeline work yields to in-flight agent
+                // tasks (KV-slot and compute contention — measured 5x budget
+                // inflation on a goal run, 2026-07-03). `last_run` stays
+                // untouched, so the job remains due and fires on the first
+                // idle tick; the 3x-interval starvation cap inside the policy
+                // lets a long-starved job run regardless.
+                if crate::agent::activity_gate::should_defer_heartbeat_job(
+                    job.defer_while_agent_busy,
+                    crate::agent::activity_gate::agent_busy(),
+                    job.last_run.map(|l| now.duration_since(l)),
+                    job.interval,
+                ) {
+                    tracing::debug!(job = %job.name, "Deferring — agent task in flight");
                     continue;
                 }
 

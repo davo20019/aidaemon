@@ -745,7 +745,7 @@ async fn init_heartbeat_coordinator(
                 sd,
                 config.policy.learning_evidence_gate_enforce,
             ));
-            heartbeat.register_job(
+            heartbeat.register_deferrable_job(
                 "skill_promotion",
                 Duration::from_secs(12 * 3600),
                 move || {
@@ -771,7 +771,7 @@ async fn init_heartbeat_coordinator(
                     state.clone(),
                     config.people.clone(),
                 ));
-            heartbeat.register_job(
+            heartbeat.register_deferrable_job(
                 "people_intelligence",
                 Duration::from_secs(24 * 3600),
                 move || {

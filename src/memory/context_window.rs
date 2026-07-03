@@ -933,6 +933,21 @@ pub fn spawn_progressive_extraction(
         {
             return;
         }
+        // Yield to in-flight agent work (this spawn is detached, so waiting
+        // here means "run after the turn finishes", never a deadlock). LLM
+        // pipeline jobs interleaving with agent tasks evict their llama.cpp
+        // KV prefix and steal compute — measured 5x budget inflation on a
+        // goal run (2026-07-03). Capped: after 10 min we run regardless.
+        if !crate::agent::activity_gate::wait_until_agent_idle(
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            tracing::info!(
+                "Progressive extraction proceeding despite agent activity (10 min wait cap)"
+            );
+        }
 
         match extract_inline_facts(
             &provider,
@@ -1060,6 +1075,17 @@ pub fn spawn_incremental_summarization(
     tokio::spawn(async move {
         if !user_role.can_persist_owner_memory() {
             return;
+        }
+
+        // Yield to in-flight agent work — same rationale and cap as the
+        // extraction spawn above.
+        if !crate::agent::activity_gate::wait_until_agent_idle(
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        {
+            tracing::info!("Summarization proceeding despite agent activity (10 min wait cap)");
         }
 
         let history = match state.get_history(&session_id, 100).await {

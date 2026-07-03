@@ -1232,6 +1232,21 @@ impl OpenAiCompatibleProvider {
                     );
                 }
             };
+            // The pass's usage merges into the parent call, so downstream
+            // telemetry rows (llm_call events, token_usage) show SUMMED
+            // input/cached/output for two physical requests. Log the pass's
+            // own share here so a merged row self-explains — misread twice
+            // in live analysis (2026-07-02/03) as cache regressions and cap
+            // violations that did not exist.
+            if let Some(u) = &second.usage {
+                info!(
+                    model,
+                    pass_input = u.input_tokens,
+                    pass_cached = ?u.cached_input_tokens,
+                    pass_output = u.output_tokens,
+                    "Structured answer pass usage (merged into parent call)"
+                );
+            }
             usage = merge_token_usage(usage, second.usage.clone());
             // parse_chat_response_body sets response_note only for
             // finish_reason=length, so its presence means truncation.
