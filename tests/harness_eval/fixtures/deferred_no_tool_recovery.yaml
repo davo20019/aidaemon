@@ -1,11 +1,23 @@
 name: deferred_no_tool_recovery
-description: Deferred planning text retries without stalling before recovery
+description: Deferred and false-in-progress texts are bounced; the eventual substantive answer ships
+# History note (2026-07-03): this fixture previously scripted three deferred
+# texts and "passed" by shipping the third one ("I'm going to run the search
+# now.") as a Succeeded final answer with zero tools executed — it
+# institutionalized exactly the unbacked-promise fabrication that the
+# false-in-progress guard (claims_false_in_progress, completion_phase) now
+# bounces. Today it pins: promissory texts never ship; the loop keeps
+# retrying until substantive content arrives.
+# Known limitation, documented not hidden: the scripted tool_call lands
+# inside the ladder's force-text window (tool_choice=none; the mock ignores
+# tool_choice), so the call is discarded and the run recovers text-only.
+# The streak-acceptance escape valve then accepts the substantive final
+# text. Whether that valve should also demand observation for success-shaped
+# claims is an open design question, tracked separately.
 session_id: eval_deferred_01
 user_text: Find all Rust files that contain async fn and give me the top 3 files.
 routing_models: true
 mock_responses:
   - text: I'll search for all Rust files with async fn first.
-  - text: Next I'll inspect each file and count async functions.
   - text: I'm going to run the search now.
   - tool_call:
       name: system_info

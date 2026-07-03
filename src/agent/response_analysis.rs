@@ -639,3 +639,143 @@ pub(super) fn sanitize_response_analysis(analysis: &str) -> String {
 
     cleaned.join("\n").trim().to_string()
 }
+
+/// A final reply that PROMISES imminent or in-progress action ("I'm searching
+/// the API now...", "Let me check that.") is only honest if work actually
+/// exists to back it. The caller pairs this detector with the task ledger
+/// (zero tool calls = nothing running, nothing spawned); the detector itself
+/// only classifies the reply text. Live repro 2026-07-03 (task ab7b318d):
+/// "I'm searching the ClinicalTrials.gov API ... now..." shipped as the FINAL
+/// answer of a task with zero tool calls, then the task ended — nothing was
+/// running.
+pub(super) fn reply_is_unbacked_action_promise(reply: &str) -> bool {
+    let t = reply.trim();
+    // A bare promise is short; long analytical answers that happen to contain
+    // intent phrasing are real answers.
+    if t.is_empty() || t.chars().count() > 400 {
+        return false;
+    }
+    // Questions back to the user are legitimate final replies.
+    if t.contains('?') {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    // "Let me know ..." is a closing formula, not an action promise.
+    if lower.starts_with("let me know") {
+        return false;
+    }
+    // PRESENT-PROGRESSIVE claims of current activity only. Future intent
+    // ("I'll ...", "Let me ...") is the existing tier-gated deferred-action
+    // gate's territory (`has_action_promise`): the Autonomous tier chooses to
+    // trust stated plans. A claim that work is happening RIGHT NOW with an
+    // empty tool ledger is not a plan — it is a false status report, and
+    // anti-fabrication guards are never tier-gated.
+    const STATUS_OPENERS: [&str; 6] = [
+        "i'm ",
+        "i am ",
+        "one moment",
+        "give me a moment",
+        "working on ",
+        "on it",
+    ];
+    const PROGRESSIVE_OPENERS: [&str; 9] = [
+        "searching",
+        "checking",
+        "looking",
+        "fetching",
+        "querying",
+        "running",
+        "scanning",
+        "pulling",
+        "starting",
+    ];
+    let opener = STATUS_OPENERS.iter().any(|o| lower.starts_with(o));
+    let progressive = PROGRESSIVE_OPENERS.iter().any(|o| lower.starts_with(o));
+    if !opener && !progressive {
+        return false;
+    }
+    // Imminence: trailing ellipsis, an explicit "now"/"currently", or an
+    // opener that is already an unambiguous in-progress report. Without one
+    // of these, "I'm confident the answer is 42." style replies stay
+    // untouched.
+    t.ends_with("...")
+        || t.ends_with('…')
+        || contains_keyword_as_words(&lower, "now")
+        || contains_keyword_as_words(&lower, "currently")
+        || lower.starts_with("one moment")
+        || lower.starts_with("give me a moment")
+        || lower.starts_with("working on ")
+        || lower.starts_with("on it")
+}
+
+#[cfg(test)]
+mod unbacked_promise_tests {
+    use super::reply_is_unbacked_action_promise;
+
+    #[test]
+    fn fires_on_false_in_progress_status_claims() {
+        // The live repro, verbatim shape.
+        assert!(reply_is_unbacked_action_promise(
+            "I'm searching the ClinicalTrials.gov API specifically for recruiting \
+             skin cancer trials in the Fairfax/Chantilly area now..."
+        ));
+        assert!(reply_is_unbacked_action_promise(
+            "Searching the trials database now..."
+        ));
+        assert!(reply_is_unbacked_action_promise(
+            "Starting the send-resume workflow..."
+        ));
+        assert!(reply_is_unbacked_action_promise("One moment..."));
+        assert!(reply_is_unbacked_action_promise("Working on it."));
+        assert!(reply_is_unbacked_action_promise(
+            "I am currently checking the registry for matches."
+        ));
+    }
+
+    #[test]
+    fn future_intent_is_the_deferred_gates_territory_not_ours() {
+        // "I'll ..." / "Let me ..." are stated PLANS — handled by the
+        // existing tier-gated deferred-action gate (has_action_promise),
+        // where the Autonomous tier deliberately trusts them. This detector
+        // must not re-gate them on all tiers.
+        assert!(!reply_is_unbacked_action_promise(
+            "I'll look into that and get back to you."
+        ));
+        assert!(!reply_is_unbacked_action_promise(
+            "Let me check the deploy logs."
+        ));
+        assert!(!reply_is_unbacked_action_promise(
+            "I will search ClinicalTrials.gov and report back."
+        ));
+    }
+
+    #[test]
+    fn ignores_real_answers_admissions_and_questions() {
+        // Completed answer.
+        assert!(!reply_is_unbacked_action_promise(
+            "I found 3 recruiting trials near Fairfax: NCT001, NCT002, NCT003."
+        ));
+        // Honest inability admission (past tense, no imminence).
+        assert!(!reply_is_unbacked_action_promise(
+            "I'm sorry, I couldn't find any recruiting trials in that area."
+        ));
+        // Confidence statement with an intent-like opener but no imminence.
+        assert!(!reply_is_unbacked_action_promise(
+            "I'm confident the answer is 42."
+        ));
+        // Question back to the user.
+        assert!(!reply_is_unbacked_action_promise(
+            "Should I search ClinicalTrials.gov for recruiting studies now?"
+        ));
+        // Closing formula.
+        assert!(!reply_is_unbacked_action_promise(
+            "Let me know if you need anything else."
+        ));
+        // Long analytical answer containing intent phrasing stays untouched.
+        let long = format!(
+            "I'm going to summarize the findings. {}",
+            "The data shows a consistent pattern across all sites. ".repeat(12)
+        );
+        assert!(!reply_is_unbacked_action_promise(&long));
+    }
+}

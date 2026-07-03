@@ -1401,25 +1401,38 @@ pub(super) async fn run_completion_phase(
             && turn_context.completion_contract.expects_mutation
             && assistant_claimed_mutation;
         let claims_unfulfilled_delegation = !has_tool_attempts && assistant_claimed_delegation;
+        // False in-progress status: the reply asserts work is happening RIGHT
+        // NOW ("I'm searching the API now...") while the task made zero tool
+        // calls — nothing is running, nothing was spawned, and the task is
+        // about to end (live repro: task ab7b318d, 2026-07-03 — the user was
+        // left waiting on a search that did not exist). Unlike future-intent
+        // deferrals ("I'll ..."), this is a fabricated status report, so it
+        // is enforced on every tier and feeds the same no-tool recovery
+        // ladder (bounce -> hard nudge -> force-text) instead of shipping.
+        let claims_false_in_progress = !has_tool_attempts
+            && crate::agent::response_analysis::reply_is_unbacked_action_promise(&reply);
         if !used_identity_prefill
             && !force_text_fast_path_accepted
             && (looks_like_deferred_action_response(&reply)
                 || incomplete_live_work_summary
                 || incomplete_retry_plan
                 || claims_unfulfilled_mutation
-                || claims_unfulfilled_delegation)
+                || claims_unfulfilled_delegation
+                || claims_false_in_progress)
             && (!reply_is_substantive
                 || incomplete_live_work_summary
                 || incomplete_retry_plan
                 || claims_unfulfilled_mutation
-                || claims_unfulfilled_delegation)
-            // Anti-fabrication triggers (claimed mutation/delegation with zero
-            // tool calls) and structural protocol markers ([INTENT_GATE],
-            // [tool_use:]) are correctness guards — enforced on every tier.
-            // Pure deferred-*style* policing is supervision and is
-            // telemetry-only on the Autonomous tier.
+                || claims_unfulfilled_delegation
+                || claims_false_in_progress)
+            // Anti-fabrication triggers (claimed mutation/delegation/current
+            // activity with zero tool calls) and structural protocol markers
+            // ([INTENT_GATE], [tool_use:]) are correctness guards — enforced
+            // on every tier. Pure deferred-*style* policing is supervision
+            // and is telemetry-only on the Autonomous tier.
             && (claims_unfulfilled_mutation
                 || claims_unfulfilled_delegation
+                || claims_false_in_progress
                 || has_structural_markers
                 || agent
                     .supervision_gate_enforced(

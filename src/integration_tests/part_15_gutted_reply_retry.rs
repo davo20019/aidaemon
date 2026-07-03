@@ -188,3 +188,61 @@ async fn test_truncated_tool_output_renders_notice_but_keeps_ledger_clean() {
     );
     assert!(content.contains("Error: disk full"));
 }
+
+/// A final reply that promises imminent action while the task made ZERO tool
+/// calls (live repro: "I'm searching the ClinicalTrials.gov API ... now..."
+/// then task end, nothing running) gets ONE retry directing the model to do
+/// the work or admit inability. The retry's real answer ships.
+#[tokio::test]
+async fn test_unbacked_action_promise_retries_once() {
+    let promissory =
+        "I'm searching the ClinicalTrials.gov API specifically for recruiting skin cancer trials in the Fairfax area now...";
+    let clean_answer = "I couldn't reach ClinicalTrials.gov from here — want me to try the web search tool instead?";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(promissory),
+        MockProvider::text_response(clean_answer),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_promise_retry",
+            "Find recruiting skin cancer trials near Fairfax",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, clean_answer, "the retry's answer must ship");
+    assert_eq!(harness.provider.call_count().await, 2);
+}
+
+/// The same promissory phrasing AFTER real tool work ships untouched — the
+/// gate is scoped to the zero-tool fabrication class only.
+#[tokio::test]
+async fn test_action_promise_after_tool_work_ships() {
+    let promissory_after_work = "Checking the remaining registries now...";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(promissory_after_work),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_promise_with_work",
+            "Find recruiting skin cancer trials near Fairfax",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, promissory_after_work);
+    assert_eq!(harness.provider.call_count().await, 2, "no retry");
+}
