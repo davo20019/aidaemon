@@ -220,16 +220,50 @@ async fn test_unbacked_action_promise_retries_once() {
     assert_eq!(harness.provider.call_count().await, 2);
 }
 
-/// The same promissory phrasing AFTER real tool work ships untouched — the
-/// gate is scoped to the zero-tool fabrication class only.
+/// CONTRACT CHANGE 2026-07-03 (3rd live incident): a present-progressive
+/// status claim as the FINAL answer is false regardless of prior tool work —
+/// completion means nothing is running. "I am currently refining the API
+/// query..." shipped as the last message of an ENDED task that had failed
+/// tool attempts; the old zero-tool scoping let it through. Such replies now
+/// bounce even after tool work; the retry's real answer ships.
 #[tokio::test]
-async fn test_action_promise_after_tool_work_ships() {
-    let promissory_after_work = "Checking the remaining registries now...";
+async fn test_action_promise_after_tool_work_bounces() {
+    struct FailingProbeTool;
+    #[async_trait::async_trait]
+    impl crate::traits::Tool for FailingProbeTool {
+        fn name(&self) -> &str {
+            "failing_probe"
+        }
+        fn description(&self) -> &str {
+            "Probe that fails (testing)."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "name": "failing_probe",
+                "description": self.description(),
+                "parameters": {"type": "object", "properties": {}}
+            })
+        }
+        async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+            Ok("Error: HTTP 400 Bad Request".to_string())
+        }
+    }
+
+    let promissory_after_work =
+        "I am currently refining the API query to only get recruiting trials now...";
+    let real_answer = "The registries I could reach show no additional matches.";
     let provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::tool_call_response("failing_probe", "{}"),
         MockProvider::text_response(promissory_after_work),
+        MockProvider::text_response(real_answer),
     ]);
-    let harness = setup_test_agent(provider).await.unwrap();
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![std::sync::Arc::new(FailingProbeTool) as std::sync::Arc<dyn crate::traits::Tool>],
+        None,
+    )
+    .await
+    .unwrap();
     let response = harness
         .agent
         .handle_message(
@@ -243,8 +277,8 @@ async fn test_action_promise_after_tool_work_ships() {
         .await
         .unwrap();
 
-    assert_eq!(response, promissory_after_work);
-    assert_eq!(harness.provider.call_count().await, 2, "no retry");
+    assert_eq!(response, real_answer, "the retry's real answer must ship");
+    assert!(harness.provider.call_count().await >= 3, "bounce expected");
 }
 
 /// When BOTH the final reply and its retry gut under sanitization and no

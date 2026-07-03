@@ -1434,8 +1434,16 @@ pub(super) async fn run_completion_phase(
         // deferrals ("I'll ..."), this is a fabricated status report, so it
         // is enforced on every tier and feeds the same no-tool recovery
         // ladder (bounce -> hard nudge -> force-text) instead of shipping.
-        let claims_false_in_progress = !has_tool_attempts
-            && crate::agent::response_analysis::reply_is_unbacked_action_promise(&reply);
+        // Present-progressive false status at COMPLETION is dishonest
+        // regardless of tool history: the task is ending, so "I am currently
+        // refining the query..." is false even after earlier attempts (3rd
+        // live incident 2026-07-03, task e5a505af: shipped as the final
+        // answer of an ended task WITH failed tool attempts — the earlier
+        // zero-tool scoping let it through). Background handoffs are exempt:
+        // their in-progress claim has real pending work.
+        let claims_false_in_progress =
+            crate::agent::response_analysis::reply_is_unbacked_action_promise(&reply)
+                && !crate::agent::is_friendly_background_handoff(&reply);
         // Terminal unbacked plan: the FINAL reply promises future work ("I'll
         // try a web search instead") while the task produced zero successful
         // tool calls and schedules nothing — the promise is broken by
@@ -1490,7 +1498,11 @@ pub(super) async fn run_completion_phase(
             // Exception: when force_text is active (tools stripped), a deferred
             // reply like "Let me examine..." is useless — the model can't act.
             // Replace it with an activity summary of what was actually done.
-            if has_tool_attempts && stall_count >= 1 && !incomplete_retry_plan {
+            if has_tool_attempts
+                && stall_count >= 1
+                && !incomplete_retry_plan
+                && !claims_false_in_progress
+            {
                 if force_text_response && !learning_ctx.tool_calls.is_empty() {
                     let mut recovered_tool_output = false;
                     let mut needs_synthesis_retry = false;
