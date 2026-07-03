@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.19] - 2026-07-03
+
+### Fixed
+
+- **Structured-answer pass no longer evicts the interactive KV cache**: the schema pass inherited the caller's llama.cpp slot while sending a tool-less prompt that diverges at token one, replacing the interactive slot's cached sequence — every no-tool answer bounce cost a full cold re-prefill (~60s) on the next iteration. The pass now always routes to the background slot.
+- **Core prompt no longer invalidates on memory-salience drift**: pinned core-profile entities were re-sorted by live salience on every render; background recall-count updates and daily recency decay swapped adjacent entities with identical content, changing the core prompt's bytes and forcing a full prompt re-prefill (~13×/day). Pinned sessions now render in pin order, frozen at selection time; content changes still invalidate.
+- **Artifact-delivered completion recovery never pastes tool output**: after a successful `send_file`, an empty final model reply recovered by pasting the latest raw tool result (e.g., a recursive directory listing) to the user. Both recovery builders now return the canned send-file closeout instead.
+- **LLM-timeout acknowledgements ship a user-facing form**: the model-facing external-action ack ("The requested action completed successfully. Latest result: …" + raw data excerpt) is no longer sent verbatim to the user on compose timeout; short prose results are kept, structured dumps become an offer to summarize.
+- **Pasted file pages never ship as final answers**: a final reply that is a verbatim spilled-tool-result page (harness page header + line-numbered content) gets one answer-don't-paste retry before any fallback.
+- **`send_file` awaits the delivery receipt** before claiming "File sent"; failures and timeouts produce honest phrasing instead of a fabricated success claim.
+- **Goal completion notifications are honest about partial completion**: headers derive from actual task rows ("Goal partially completed (2/4 tasks)" with the unfinished items listed) instead of claiming completion; run-and-report missions ("run X and tell me the result") infer a Check contract instead of a mutation contract, ending false partial scores.
+
+### Changed
+
+- **Structured-answer pass runs a slim rewrite for clean drafts**: instead of re-sending the entire conversation (~20K tokens) and re-answering from scratch on every no-tool answer, a clean draft is re-emitted through the schema with a constant instruction plus the draft alone (~hundreds of tokens, output capped proportional to the draft). Leaky, blank, or truncated drafts keep the full-context re-answer. Measured live: the final-answer step of a multi-step task dropped from ~63s to ~18s, with byte-identical rewrite fidelity.
+- **Pretty-printed JSON in `http_request`/`web_fetch` results is losslessly compacted** before size checks, so large API responses stop overflowing into spill files when whitespace was the bulk.
+- `ensure-llama-flags.sh` no longer requires `--kv-unified`: the idle-slot RAM cache it enabled never restored a saved sequence in practice (306 saves, 0 loads over 2 days) while its idle-save freed the interactive slot's live KV, making every prompt after ~14K-token conversations start fully cold. Per-slot KV isolation (measured: 99.9% cache retention across cross-slot traffic) replaces it; the tradeoff notes live in the script header.
+
+### Added
+
+- Structured-answer pass telemetry: pass mode (rewrite/re-answer) and draft/response lengths are logged per delivery, so rewrite drift and re-answer frequency are measurable.
+
 ## [0.11.18] - 2026-07-02
 
 ### Added
