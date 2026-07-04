@@ -1460,7 +1460,8 @@ pub(super) async fn run_completion_phase(
         // detector's short-reply cap and this gate's zero-success scoping.
         // The scoping goes: successful earlier calls don't make a terminal
         // promise of FUTURE agent action true; only pending work does.
-        let terminal_unbacked_plan = looks_like_deferred_action_response(&reply)
+        let terminal_unbacked_plan = (looks_like_deferred_action_response(&reply)
+            || crate::agent::response_analysis::reply_ends_with_unfulfilled_promise(&reply))
             && !crate::agent::is_friendly_background_handoff(&reply);
         if !used_identity_prefill
             && !force_text_fast_path_accepted

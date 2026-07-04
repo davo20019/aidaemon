@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.20] - 2026-07-03
+
+### Fixed
+
+- **Promise fabrication closed across every dimension**: final answers that claim in-progress work ("I'm searching the API now...") or promise future work ("I'll try a web search instead", "I will present the trials shortly") now bounce into the recovery ladder on every trust tier, regardless of reply length, tense, or the task's tool history — the only pass is genuinely pending background work. A closing line that promises content delivery ("I will answer both clearly.") bounces even when its verb is a knowledge verb; performative acknowledgments ("I'll remember that...") still ship. Four live incidents in one day drove the successive scopings out.
+- **Inline raw JSON dumps never ship as final answers**: a reply that is a short lead-in plus a large JSON blob gets the same one-shot answer-don't-paste retry as the spilled-file-page case (which itself gained coverage for the stopping-phase stall fallback — the last exit path that could paste raw tool output).
+- **Failed work now gets an evidence-fed second chance before the failure report**: when a final answer would ship with uncorrected failed external mutations, the model first receives the ledger evidence and an explicit demand to try a different approach (repeating the failed command shape is forbidden, with a strategy hint). Terminal-command retries that succeed under a different semantic classification (a failed `python -c` parse retried as a successful `grep`) now correct the failure instead of leaving a false all-failed report; precisely-classified tools keep the strict rule so a read can never launder a failed write.
+- **Reconciliation reports speak plainly**: "External mutation attempt reconciliation: 0 of 2 attempts succeeded" became "I wasn't able to complete that — the changes didn't go through", with error gists as bullets and a recovery offer; the bare "Done." fallback was replaced with an honest failure notice.
+- **Marker-echoed drafts survive as content**: drafts that quote tool results with the untrusted-data envelope still attached are cleaned line-wise (markers dropped, content kept) before the structured rewrite, instead of being gutted wholesale by the sanitizer.
+- **Grounding guard stops taxing structured answers**: category headings ("Other Malignancies:") over grounded content no longer read as fabricated entities — plural reply words fold to singular for the evidence match, and leading category adjectives are exempt. Roster-fabrication detection is unchanged.
+
+### Changed
+
+- **Background memory pipeline yields to in-flight agent tasks**: consolidation, extraction, episodes, embeddings, and skill promotion defer while an interactive turn, goal run, or spawned specialist is active (heartbeat jobs skip the tick with a 3x-interval starvation cap; event-driven jobs wait for idle with a 10-minute cap). Stops the pipeline from evicting a goal run's KV-cache prefix mid-run — a measured 5x per-run budget inflation — and stops mid-session history rewrites from breaking the next turn's prompt prefix.
+- The structured-answer pass logs its own token usage before merging into the parent call, so merged telemetry rows self-explain.
+
 ## [0.11.19] - 2026-07-03
 
 ### Fixed

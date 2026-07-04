@@ -420,6 +420,54 @@ pub(in crate::agent) fn is_short_prose_excerpt(text: &str) -> bool {
         && !t.contains("\":")
 }
 
+/// A reply whose LAST line is a promise ("I will answer both clearly.") is
+/// unfulfilled by construction — nothing follows it. The deferred-action
+/// detector exempts knowledge verbs ("answer", "explain") because such
+/// promises normally PRECEDE their delivery in the same reply; that
+/// exemption cannot apply to the closing line (live repro 2026-07-03: a
+/// two-part question answered by half, ending literally with "I will answer
+/// both clearly.").
+pub(in crate::agent) fn reply_ends_with_unfulfilled_promise(reply: &str) -> bool {
+    let Some(last) = reply
+        .trim_end()
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+    else {
+        return false;
+    };
+    let t = last.trim();
+    if t.chars().count() > 120 || t.contains('?') {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    if lower.starts_with("let me know") {
+        return false;
+    }
+    let opener_len = [
+        "i will ",
+        "i'll ",
+        "let me ",
+        "i am going to ",
+        "i'm going to ",
+    ]
+    .iter()
+    .find(|o| lower.starts_with(**o))
+    .map(|o| o.len());
+    let Some(opener_len) = opener_len else {
+        return false;
+    };
+    // Performative acknowledgments self-fulfill in the saying ("I'll
+    // remember that...", "I'll keep that in mind.") — the act already
+    // happened. Content-DELIVERY verbs ("I will answer both clearly.")
+    // promise material that must follow, and nothing follows a closing line.
+    const PERFORMATIVE_ACK_VERBS: [&str; 7] = [
+        "remember", "note", "keep", "bear", "confirm", "recall", "treat",
+    ];
+    let verb = lower[opener_len..].split_whitespace().next().unwrap_or("");
+    !PERFORMATIVE_ACK_VERBS.contains(&verb)
+}
+
 /// A final reply that is a raw structured-data dump: an optional short
 /// lead-in line ("Here's the command output:") followed by a large JSON/
 /// bracket blob. Sibling of the pasted-file-page detector — same disease

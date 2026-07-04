@@ -353,3 +353,30 @@ async fn test_inline_json_dump_reply_retries_once() {
         .unwrap();
     assert_eq!(response, clean_answer, "the retry's answer must ship");
 }
+
+/// A reply ENDING with a promise line gets bounced even when the promised
+/// verb is a knowledge verb — nothing follows a closing line (live repro:
+/// half-answered two-part question ending "I will answer both clearly.").
+#[tokio::test]
+async fn test_closing_promise_line_bounces() {
+    let half_answer = "Counting the letters: the word has 6 r's.\n\nI will answer both clearly.";
+    let full_answer = "The word has 6 r's, and since 9.8 < 9.11 the car wash is 9.8m away — walk.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(half_answer),
+        MockProvider::text_response(full_answer),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            "tg_closing_promise",
+            "How many rs in strawbrrerwrwry and is 9.8 or 9.11 smaller — walk or drive?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, full_answer, "the completed answer must ship");
+}
