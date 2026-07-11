@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.23] - 2026-07-11
+
+### Fixed
+
+- **Final answers that paste raw tool output are caught generally, not per-shape.** The model (a small local model) sometimes ships a recent tool result verbatim instead of answering. The existing guards matched specific *shapes* — a read_file page, a JSON blob — so every new shape it pasted was a fresh hole (latest: a `search_files` list of absolute file paths shipped under "Here are the results:"). A new shape-independent check asks whether the final reply's own content substantially (≥70% of content lines) duplicates the latest tool output — catching path lists, raw terminal output, JSON, or file pages with one detector. On a hit it uses the existing one-shot retry + re-steer ("don't paste raw tool output; name matches by filename or say none matched; deliver files with `send_file`"), and only reads the tool result when the cheap shape checks miss, so there's no per-turn cost otherwise.
+
 ## [0.11.22] - 2026-07-11
 
 ### Fixed
