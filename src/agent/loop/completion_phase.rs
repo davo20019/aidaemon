@@ -1950,22 +1950,40 @@ pub(super) async fn run_completion_phase(
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
-        // A verbatim read_file page as the final answer is the spilled-result
-        // paging derailment (model paged the spill file, then shipped a raw
-        // page instead of answering). One-shot retry with a directive to
-        // answer from the data; shares the same retry budget as the gutted
-        // case above.
-        if (reply_is_pasted_file_page(&sanitized_reply)
-            || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized_reply))
-            && !empty_response_retry_used
-        {
+        // The model shipped a recent tool result verbatim instead of answering.
+        // Two shape-specific checks (a `File: … (lines …)` read_file page, a
+        // large JSON/bracket blob) plus a general check: does the reply's own
+        // content substantially duplicate the latest tool output — regardless of
+        // shape (a search_files path list, raw terminal output, …)? The general
+        // check needs the tool output, so it only runs (one DB read) when the
+        // cheap shape checks miss and we still have a retry to spend. One-shot
+        // retry with a directive to answer from the data; shares the same retry
+        // budget as the gutted case above.
+        let reply_is_shape_paste = reply_is_pasted_file_page(&sanitized_reply)
+            || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized_reply);
+        let mut reply_pastes_tool_output = false;
+        if !reply_is_shape_paste && !empty_response_retry_used {
+            if let Some(latest) =
+                latest_task_tool_result_for_completion(agent, session_id, task_id, 2500).await
+            {
+                reply_pastes_tool_output =
+                    crate::agent::response_analysis::reply_duplicates_tool_output(
+                        &sanitized_reply,
+                        &latest.tool_output,
+                    );
+            }
+        }
+        if (reply_is_shape_paste || reply_pastes_tool_output) && !empty_response_retry_used {
             warn!(
                 session_id,
-                iteration, "Final reply is a pasted file page — retrying final answer once"
+                iteration,
+                shape_paste = reply_is_shape_paste,
+                tool_output_paste = reply_pastes_tool_output,
+                "Final reply pastes tool output instead of answering — retrying final answer once"
             );
             empty_response_retry_used = true;
             empty_response_retry_pending = true;
-            empty_response_retry_note = Some("final_reply_pasted_file_page".to_string());
+            empty_response_retry_note = Some("final_reply_tool_output_paste".to_string());
             pending_system_messages.push(SystemDirective::FinalAnswerWasFilePaste);
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
