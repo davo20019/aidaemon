@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.21] - 2026-07-11
+
+### Fixed
+
+- **Unclosed untrusted-data markers no longer leak raw tool output.** When a final reply echoed a `[UNTRUSTED EXTERNAL DATA …]`-wrapped tool result that was cut off before its `[END …]` tag (e.g. a truncated multi-line dump), the line-bounded fallback sanitizer erased only the marker's own line and shipped every following line of raw content to the user — a real data leak (observed live: a resume-search `mdfind`/`ls` file listing delivered as "Here's the command output: …"). The unclosed-marker rule now strips from the marker to end-of-string, and the existing gutted-reply safety net catches the residual stub and retries into an honest fallback.
+- **Goals no longer repeat a mutating action when only verification fails.** A failed or unavailable verification read (read-restricted API tier, eventual-consistency delay, transient tool error) previously could spawn a remediation task that re-ran the original mutating call — causing duplicate real-world side effects (e.g. duplicate tweets/sends/charges). The task-lead prompt and the heartbeat orphan-reclaim path now treat a mutating executor's own success response (2xx / created id) as the completion signal, and only repeat the mutating action when that original call itself errored — never solely because a downstream read step failed.
+
+### Added
+
+- **`db_probe --dynamic-bots`**: lists connected dynamic bots (channel + `allowed_user_ids`, tokens redacted) for auditing which bots exist and who is allowed to drive them.
+
 ## [0.11.20] - 2026-07-03
 
 ### Fixed
