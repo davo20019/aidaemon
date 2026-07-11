@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.22] - 2026-07-11
+
+### Fixed
+
+- **Dead tasks no longer wedge a recurring goal's completion.** `complete_goal` treated any task not in `completed`/`skipped` as "still incomplete" — including terminal-but-dead states (`failed`/`blocked`/`interrupted`/`cancelled`/`abandoned`). A dead task never advances to `completed`, so one left over from a prior run permanently blocked the goal. Observed live on a daily scheduled goal: watchdog-interrupted tasks from earlier fires blocked every new fire's `complete_goal`, so each fire looped trying to "resolve" them, got interrupted itself, and piled up (178+) dead tasks that never cleared. Completion now blocks only on genuinely-active tasks (`pending`/`running`/`claimed`), via a shared `is_terminal_task_status` that mirrors the heartbeat's terminal classification (the two were inconsistent, which is what caused the wedge).
+
 ## [0.11.21] - 2026-07-11
 
 ### Fixed
