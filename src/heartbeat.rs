@@ -26,6 +26,24 @@ fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+/// Best-effort check that a logged `http_request` tool-call's args used a
+/// mutating HTTP method (anything but GET/HEAD/OPTIONS). `tool_args` is a
+/// (possibly truncated) JSON string; returns `false` — i.e. "not mutating" —
+/// if it can't be parsed or has no `method` field, so a truncated/odd
+/// payload never blocks dispatch on a parse miss.
+fn is_mutating_http_method(tool_args_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(tool_args_json) else {
+        return false;
+    };
+    let Some(method) = value.get("method").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    )
+}
+
 /// Whether a goal's daily token budget is exhausted *for today*. Only usage
 /// recorded on the current UTC day counts: stale `tokens_used_today` from a
 /// previous day (before the daily reset has run) must NOT block a goal, or an
@@ -77,22 +95,31 @@ fn daily_budget_exhausted(
 /// no activity rows). Used to tag stuck-task interrupts so the inactivity
 /// threshold can be tuned from data. Returns 0 if no timestamp parses (never
 /// panics). Both inputs are RFC3339 or SQLite-datetime strings.
+/// Parses a timestamp that may be either RFC3339 (`2026-07-04T13:10:45+00:00`,
+/// how application code writes it) or SQLite's own `datetime()`-coerced form
+/// (`2026-07-04 13:10:45`, space-separated, no offset, second precision —
+/// what columns wrapped in `datetime(?)` at INSERT time read back as, e.g.
+/// `task_activity.created_at`). Returns `None` for anything else rather than
+/// panicking or guessing.
+fn parse_datetime_flexible(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|nd| nd.and_utc())
+        })
+}
+
 fn task_inactivity_secs(
     last_activity: Option<&str>,
     started_at: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> i64 {
-    let parse = |s: &str| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .map(|d| d.with_timezone(&chrono::Utc))
-            .ok()
-            .or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                    .ok()
-                    .map(|nd| nd.and_utc())
-            })
-    };
-    let reference = last_activity.and_then(parse).or_else(|| parse(started_at));
+    let reference = last_activity
+        .and_then(parse_datetime_flexible)
+        .or_else(|| parse_datetime_flexible(started_at));
     match reference {
         Some(ts) => (now - ts).num_seconds().max(0),
         None => 0,
@@ -824,14 +851,23 @@ impl HeartbeatCoordinator {
                 continue;
             }
 
-            let is_scheduled_goal =
-                if let Ok(schedules) = self.state.get_schedules_for_goal(goal_id).await {
-                    !schedules.is_empty()
-                } else {
-                    tasks
-                        .iter()
-                        .any(|task| is_scheduled_task_description(&task.description))
-                };
+            let schedules_for_goal = self.state.get_schedules_for_goal(goal_id).await.ok();
+            let is_scheduled_goal = if let Some(ref schedules) = schedules_for_goal {
+                !schedules.is_empty()
+            } else {
+                tasks
+                    .iter()
+                    .any(|task| is_scheduled_task_description(&task.description))
+            };
+            // Most recent fire time across this goal's schedules, used below as
+            // the "current cycle" boundary for the idempotency check.
+            let current_cycle_since = schedules_for_goal.as_ref().and_then(|schedules| {
+                schedules
+                    .iter()
+                    .filter_map(|s| s.last_run_at.as_deref())
+                    .max()
+                    .map(|s| s.to_string())
+            });
 
             // Daily budget is admission control for scheduled runs, not a reason
             // to abandon already-pending scheduled work.
@@ -895,6 +931,48 @@ impl HeartbeatCoordinator {
             });
             if all_too_new {
                 continue;
+            }
+
+            // Idempotency backstop: these pending tasks are orphaned (nothing's
+            // actively running, and they've sat >60s), which is exactly the
+            // situation that let a scheduled goal's side effect get repeated —
+            // e.g. a task lead posts a tweet, a downstream step (verification,
+            // task tracking) hiccups, the run ends up interrupted, and a fresh
+            // task lead gets dispatched here for what looks like unfinished
+            // work but whose real-world action already succeeded. Before
+            // reclaiming, check whether this goal's current cycle already has
+            // a successful mutating (non-GET) http_request logged; if so, the
+            // goal's job for this cycle is done — close out the leftover
+            // pending tasks instead of spawning another attempt.
+            // See docs/2026-06-30-telegram-edge-case-findings.md (2026-07-04
+            // escalation: 5 duplicate tweets from repeated goal dispatch).
+            if is_scheduled_goal {
+                if let Some(ref since_ts) = current_cycle_since {
+                    if self
+                        .goal_has_recent_mutating_success(goal_id, since_ts)
+                        .await
+                    {
+                        info!(
+                            goal_id = %goal_id,
+                            pending_count = tasks.len(),
+                            "Goal already has a successful mutating action this cycle; \
+                             closing out orphaned pending tasks instead of re-dispatching"
+                        );
+                        for task in tasks {
+                            let mut done = (*task).clone();
+                            done.status = "completed".to_string();
+                            done.result = Some(
+                                "Auto-closed: a mutating action for this goal's current cycle \
+                                 already succeeded (see task_activity log); skipped to avoid a \
+                                 duplicate side effect."
+                                    .to_string(),
+                            );
+                            done.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            let _ = self.state.update_task(&done).await;
+                        }
+                        continue;
+                    }
+                }
             }
 
             // Try to atomically claim the first pending task and spawn a task lead.
@@ -987,6 +1065,59 @@ impl HeartbeatCoordinator {
                 crate::traits::NotificationEntry::new(goal_id, &goal.session_id, "stalled", &msg);
             let _ = self.state.enqueue_notification(&entry).await;
         }
+    }
+
+    /// Idempotency backstop for scheduled goals: returns true if any task
+    /// belonging to `goal_id` has a logged, successful, mutating (non-GET)
+    /// `http_request` activity created at or after `since_ts`.
+    ///
+    /// This is a defense-in-depth check, not the primary fix — it exists so
+    /// that *whatever* caused a scheduled goal's task to look unfinished
+    /// (timeout, tool cooldown, orchestrator misjudgment, a bug nobody's hit
+    /// yet) can never turn into a repeated real-world side effect. It reads
+    /// task_activity rows that are already logged for every tool call
+    /// (`src/agent/loop/tool_execution/run.rs`), so it needs no schema change.
+    /// Fails closed toward "don't block" on any parse/lookup miss — a false
+    /// negative here just falls back to prior behavior, never a false
+    /// positive that would wrongly skip real unfinished work.
+    async fn goal_has_recent_mutating_success(&self, goal_id: &str, since_ts: &str) -> bool {
+        let Some(since) = parse_datetime_flexible(since_ts) else {
+            return false;
+        };
+
+        let tasks = match self.state.get_tasks_for_goal(goal_id).await {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        for task in &tasks {
+            let activities = match self.state.get_task_activities(&task.id).await {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            for activity in activities {
+                if activity.tool_name.as_deref() != Some("http_request") {
+                    continue;
+                }
+                if activity.success != Some(true) {
+                    continue;
+                }
+                let Some(created) = parse_datetime_flexible(&activity.created_at) else {
+                    continue;
+                };
+                if created < since {
+                    continue;
+                }
+                if activity
+                    .tool_args
+                    .as_deref()
+                    .is_some_and(is_mutating_http_method)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Phase 5a: Scan goals that completed/failed and enqueue notifications.
@@ -1500,7 +1631,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{Goal, Task};
+    use crate::traits::{Goal, Task, TaskActivity};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn synthetic_task(desc: &str, status: &str) -> Task {
@@ -2497,6 +2628,234 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].notification_type, "stalled");
         assert_eq!(notifications[0].goal_id, goal.id);
+    }
+
+    #[test]
+    fn mutating_http_method_detection() {
+        assert!(is_mutating_http_method(r#"{"method":"POST","url":"x"}"#));
+        assert!(is_mutating_http_method(r#"{"method":"post","url":"x"}"#));
+        assert!(is_mutating_http_method(r#"{"method":"DELETE","url":"x"}"#));
+        assert!(!is_mutating_http_method(r#"{"method":"GET","url":"x"}"#));
+        assert!(!is_mutating_http_method(r#"{"method":"HEAD","url":"x"}"#));
+        // Missing method / malformed JSON must fail closed (not mutating),
+        // never block dispatch on a parse miss.
+        assert!(!is_mutating_http_method(r#"{"url":"x"}"#));
+        assert!(!is_mutating_http_method("not json"));
+        assert!(!is_mutating_http_method(""));
+    }
+
+    /// Live repro (goal 9a744834, 2026-07-04): a scheduled "post one tweet"
+    /// goal posted 5 real duplicate tweets in one cycle because orphaned
+    /// pending tasks kept getting redispatched after the tweet had already
+    /// posted successfully (downstream verification/task-tracking hiccups
+    /// made it look unfinished). This is the regression test for the fix:
+    /// dispatch_pending_tasks must close out orphaned tasks instead of
+    /// redispatching once a successful mutating http_request is logged for
+    /// the goal's current cycle.
+    #[tokio::test]
+    async fn test_dispatch_skips_redispatch_after_mutating_success_this_cycle() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let goal = Goal::new_finite("Post one tweet", "session-1");
+        state.create_goal(&goal).await.unwrap();
+
+        // Schedule fired 10 minutes ago — that's the current cycle's start.
+        let cycle_start = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: None,
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: Some(cycle_start.to_rfc3339()),
+            next_run_at: (chrono::Utc::now() + chrono::Duration::hours(23)).to_rfc3339(),
+            created_at: cycle_start.to_rfc3339(),
+            updated_at: cycle_start.to_rfc3339(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        // The task lead's original task already posted the tweet successfully.
+        let posted_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Scheduled check: Post one short tweet".to_string(),
+            status: "interrupted".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (cycle_start + chrono::Duration::minutes(1)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&posted_task).await.unwrap();
+        state
+            .log_task_activity(&TaskActivity {
+                id: 0,
+                task_id: posted_task.id.clone(),
+                activity_type: "tool_call".to_string(),
+                tool_name: Some("http_request".to_string()),
+                tool_args: Some(
+                    r#"{"method":"POST","url":"https://api.x.com/2/tweets"}"#.to_string(),
+                ),
+                result: Some("HTTP 201 Created".to_string()),
+                success: Some(true),
+                tokens_used: None,
+                created_at: (cycle_start + chrono::Duration::minutes(2)).to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        // A leftover subtask the orchestrator created before things got
+        // confused, now orphaned (pending, >60s old, nothing running).
+        let orphaned = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Post the tweet".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&orphaned).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        // agent is None — if the gate didn't fire, this would fall through to
+        // the "no agent available" revert-to-pending + stalled-notification path.
+        coordinator.dispatch_pending_tasks().await;
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        let orphaned_after = tasks.iter().find(|t| t.id == orphaned.id).unwrap();
+        assert_eq!(
+            orphaned_after.status, "completed",
+            "orphaned task should be closed out, not redispatched, once a \
+             mutating success is already logged for this cycle"
+        );
+
+        let notifications = state.get_pending_notifications(10).await.unwrap();
+        assert!(
+            notifications
+                .iter()
+                .all(|n| n.notification_type != "stalled"),
+            "should not fall through to the stalled-notification path once the \
+             idempotency gate has closed out the orphaned task"
+        );
+    }
+
+    /// Control for the test above: without any logged mutating success, the
+    /// existing orphan-dispatch behavior (revert to pending + stalled
+    /// notification, since there's no agent) must still happen — the new
+    /// gate must not fire on vibes.
+    #[tokio::test]
+    async fn test_dispatch_still_redispatches_without_prior_mutating_success() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let goal = Goal::new_finite("Post one tweet", "session-1");
+        state.create_goal(&goal).await.unwrap();
+
+        let cycle_start = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: None,
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: Some(cycle_start.to_rfc3339()),
+            next_run_at: (chrono::Utc::now() + chrono::Duration::hours(23)).to_rfc3339(),
+            created_at: cycle_start.to_rfc3339(),
+            updated_at: cycle_start.to_rfc3339(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let orphaned = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Post the tweet".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&orphaned).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.dispatch_pending_tasks().await;
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        let orphaned_after = tasks.iter().find(|t| t.id == orphaned.id).unwrap();
+        assert_eq!(
+            orphaned_after.status, "pending",
+            "without a logged mutating success, normal orphan-dispatch behavior \
+             (revert to pending since there's no agent) must be unchanged"
+        );
+
+        let notifications = state.get_pending_notifications(10).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].notification_type, "stalled");
     }
 
     #[tokio::test]

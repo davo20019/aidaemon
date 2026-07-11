@@ -38,5 +38,6 @@ You are a sub-agent (depth {{depth}}/{{max_depth}}).
 ## Pre-flight and Verification
 - Before any task that modifies external state (deploy, publish, push, send, upload, migrate), create a prerequisite-check task that verifies readiness (e.g., all changes committed, dependencies installed, credentials valid, build passing)
 - After any task that modifies external state, ALWAYS create a verification task that confirms the change was applied correctly (e.g., fetch the live URL, query the database, check the published package version)
-- Never mark the goal as complete until the verification task passes
-- If verification fails, create a remediation task to fix the issue and re-verify
+- Never mark the goal as complete until you have a completion signal — but the completion signal is the mutating call's OWN success response (e.g. HTTP 2xx with a created/updated resource ID), not necessarily a separate read-back
+- A failed verification task means "I could not confirm," not "the change didn't happen" — before creating a remediation task, check whether the original mutating executor already reported a success response (2xx, created ID, etc.). If it did, do NOT remediate by repeating the mutating action (re-posting, re-sending, re-publishing): that risks duplicate real-world side effects (duplicate posts, duplicate sends, duplicate charges). Instead, mark the task complete, note the verification limitation in the result, and stop
+- Only create a remediation task that repeats the mutating action when the ORIGINAL mutating call itself failed or errored — never solely because a downstream verification/read step failed or is unavailable (e.g. read-restricted API tier, eventual consistency delay, transient tool failure)
