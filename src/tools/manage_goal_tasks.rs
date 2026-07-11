@@ -144,6 +144,19 @@ impl ManageGoalTasksTool {
     }
 }
 
+/// A task status is "terminal" when it will never advance to `completed` on its
+/// own — either it already succeeded (`completed`/`skipped`) or it is dead
+/// (`failed`/`blocked`/`interrupted`/`cancelled`/`abandoned`). Terminal tasks
+/// must not block goal completion. The dead set mirrors `heartbeat`'s
+/// `terminal_failed` classification so the two subsystems agree on what "done"
+/// means for a task.
+pub(crate) fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "skipped" | "failed" | "blocked" | "interrupted" | "cancelled" | "abandoned"
+    )
+}
+
 pub(crate) fn goal_completion_summary_indicates_not_finished(summary: &str) -> bool {
     let lower = summary.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -720,12 +733,21 @@ impl ManageGoalTasksTool {
                     .to_string(),
             );
         }
+        // Block only on tasks that are still GENUINELY ACTIVE (pending/running/
+        // claimed). A task in a terminal state — successful (completed/skipped) OR
+        // dead (failed/blocked/interrupted/cancelled/abandoned) — must not block
+        // completion: a dead task never transitions to "completed" on its own, so
+        // counting it as "still incomplete" permanently wedges a recurring goal.
+        // (Observed live on the daily-tweet goal 9a744834: watchdog-interrupted
+        // tasks from prior fires blocked complete_goal, so every new fire looped
+        // trying to "resolve" them, got interrupted in turn, and piled up 178 dead
+        // tasks.) This mirrors heartbeat's own `terminal_failed` classification.
         if let Some(task) = tasks
             .iter()
-            .find(|task| !matches!(task.status.as_str(), "completed" | "skipped"))
+            .find(|task| !is_terminal_task_status(&task.status))
         {
             return Ok(format!(
-                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") while tasks are still incomplete. '{}' is still {}. Finish or explicitly resolve every task first, or use fail_goal if the goal cannot be completed.",
+                "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") while tasks are still incomplete. '{}' is still {}. Finish or explicitly resolve every active task first, or use fail_goal if the goal cannot be completed.",
                 task.description, task.status
             ));
         }
@@ -1085,6 +1107,77 @@ mod tests {
         assert_eq!(
             g.dispatch_failures, 0,
             "a successful run clears the failure streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_goal_not_blocked_by_dead_interrupted_task() {
+        // Regression: the daily-tweet goal 9a744834 accumulated watchdog-
+        // interrupted tasks from prior fires; because complete_goal treated any
+        // non-completed/skipped status as "still incomplete", a dead interrupted
+        // task permanently blocked every new run, which then looped and got
+        // interrupted itself. An interrupted (dead terminal) task must NOT block.
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
+        state.create_goal(&cg).await.unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+
+        // This run's real work: post the tweet (completed).
+        tool.call(&json!({ "action": "create_task", "description": "Post the tweet" }).to_string())
+            .await
+            .unwrap();
+        // A dead task left over from a prior fire.
+        tool.call(
+            &json!({ "action": "create_task", "description": "Prior scheduled fire" }).to_string(),
+        )
+        .await
+        .unwrap();
+        let tasks = state.get_tasks_for_goal(&cg.id).await.unwrap();
+        let mut done = tasks[0].clone();
+        done.status = "completed".to_string();
+        done.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        state.update_task(&done).await.unwrap();
+        let mut dead = tasks[1].clone();
+        dead.status = "interrupted".to_string();
+        state.update_task(&dead).await.unwrap();
+
+        let result = tool
+            .call(&json!({ "action": "complete_goal", "summary": "tweet posted" }).to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            !result.contains("Blocked"),
+            "a dead interrupted task must not block completion: {result}"
+        );
+        assert!(result.contains("run completed"), "got: {result}");
+        let g = state.get_goal(&cg.id).await.unwrap().unwrap();
+        assert_eq!(
+            g.status, "active",
+            "continuous goal stays active after the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_goal_still_blocked_by_active_running_task() {
+        // The guard's remaining purpose: genuinely in-flight work still blocks.
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+        tool.call(&json!({ "action": "create_task", "description": "In-flight work" }).to_string())
+            .await
+            .unwrap();
+        let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap();
+        let mut running = tasks[0].clone();
+        running.status = "running".to_string();
+        state.update_task(&running).await.unwrap();
+
+        let result = tool
+            .call(&json!({ "action": "complete_goal", "summary": "done" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Blocked") && result.contains("still running"),
+            "an active running task must still block completion: {result}"
         );
     }
 
