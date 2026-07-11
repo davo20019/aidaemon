@@ -963,6 +963,44 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = SqlitePool::connect_with(opts).await?;
 
+    if args.iter().any(|a| a == "--dynamic-bots") {
+        let rows = sqlx::query(
+            "SELECT id, channel_type, allowed_user_ids, extra_config, created_at, bot_token, app_token \
+             FROM dynamic_bots ORDER BY created_at ASC",
+        )
+        .fetch_all(&pool)
+        .await?;
+        println!("== Dynamic Bots ({}) — tokens REDACTED ==", rows.len());
+        let redact = |t: &str| -> String {
+            if t.starts_with("keychain:") {
+                "keychain-ref".to_string()
+            } else {
+                format!("<{}-char literal token>", t.len())
+            }
+        };
+        for row in rows {
+            let id: i64 = row.get("id");
+            let channel: String = row.get("channel_type");
+            let allowed: String = row.get("allowed_user_ids");
+            let extra: Option<String> = row.get("extra_config");
+            let created: String = row.get("created_at");
+            let bot_token: String = row.get("bot_token");
+            let app_token: Option<String> = row.get("app_token");
+            println!("- id={} channel={} created={}", id, channel, created);
+            println!("    allowed_user_ids = {}", allowed);
+            println!("    extra_config     = {}", extra.as_deref().unwrap_or("-"));
+            println!(
+                "    bot_token={}  app_token={}",
+                redact(&bot_token),
+                app_token
+                    .as_deref()
+                    .map(redact)
+                    .unwrap_or_else(|| "-".into())
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(hash) = prompt_hash.as_deref() {
         // Prefix match for convenience: `--prompt 4848ae26` finds the full hash.
         let rows = sqlx::query(
