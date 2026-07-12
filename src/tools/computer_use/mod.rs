@@ -86,6 +86,13 @@ this click — it may NOT have taken effect (e.g. the click hit the wrong sub-el
 needs a hover/second step, or the page had not updated). Do NOT assume success: re-read with \
 get_app_state (or a screenshot) and confirm the intended change before reporting done.";
 
+const COORDINATE_UNVERIFIED_NOTICE: &str = "\n[UNVERIFIED] This was a COORDINATE click at a raw \
+point — there is no element identity, so the harness CANNOT tell whether it hit the target or \
+empty space. It is NOT confirmed. Before reporting done, take a fresh screenshot and confirm the \
+intended visual change actually happened (e.g. the Like heart is now filled/red, the count went \
+up). If the target has a stable element_title (check get_app_state), prefer clicking by title \
+instead — those clicks ARE auto-verified.";
+
 /// Whether two element bounds denote the same on-screen control — their centers
 /// fall within a small tolerance. Used to re-identify a clicked element after a
 /// re-render, where indices change but on-screen position does not. `None` bounds
@@ -499,6 +506,12 @@ impl ComputerUseTool {
                 let mut cache = self.cache.lock().await;
                 let snapshot = self.harness.get_app_state(&app, &ctx, &mut cache).await?;
                 let text = format_full_tree(&snapshot);
+                // A deliberate post-click observation: the model re-read the
+                // screen, so any outstanding unverified coordinate click is now
+                // its to confirm from this fresh state.
+                self.pins
+                    .clear_unverified_coordinate_click(&ctx.task_id)
+                    .await;
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await
             }
@@ -552,6 +565,12 @@ impl ComputerUseTool {
                     "Screenshot of {} ({}) captured and sent to the chat.{}",
                     snapshot.app_name, snapshot.bundle_id, generation_hint
                 );
+                // A deliberate re-look after a click: the model now has fresh
+                // pixels to confirm the intended change; clear the unverified
+                // coordinate-click flag.
+                self.pins
+                    .clear_unverified_coordinate_click(&ctx.task_id)
+                    .await;
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await
             }
@@ -694,6 +713,17 @@ impl ComputerUseTool {
                 let mut text = format_condensed_refresh(&snapshot, focus);
                 if target_unchanged {
                     text.push_str(NO_VISIBLE_CHANGE_NOTICE);
+                }
+                // Coordinate clicks have no element identity to auto-verify, so
+                // flag the result as unverified and record an outstanding
+                // unverified mutation on the task — the completion gate blocks a
+                // success claim until a deliberate follow-up observation clears
+                // it (2026-07-12 false-Like incident).
+                if click_method == "coordinate" {
+                    text.push_str(COORDINATE_UNVERIFIED_NOTICE);
+                    self.pins
+                        .mark_unverified_coordinate_click(&ctx.task_id)
+                        .await;
                 }
                 self.build_outcome(text, Some(&snapshot), &ctx.session_id)
                     .await

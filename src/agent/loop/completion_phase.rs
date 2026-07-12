@@ -480,6 +480,42 @@ pub(super) async fn run_completion_phase(
             }
         }
 
+        // GUI coordinate-click verification gate: a coordinate click targets a
+        // raw point with no element identity, so the harness cannot tell a hit
+        // from a miss — only a deliberate follow-up observation can. Don't let a
+        // GUI success claim ship while such a click is unconfirmed (2026-07-12:
+        // an unverified coordinate click at a guessed heart position was
+        // reported as a successful Like). Re-fires each iteration UNTIL the
+        // model runs a verifying get_app_state/screenshot (which clears the
+        // flag) — the block IS the "verify before you claim" invariant, not a
+        // one-shot nudge; the loop is bounded because any observation clears it.
+        #[cfg(feature = "computer_use")]
+        if computer_use_pin_active
+            && agent.depth == 0
+            && assistant_claimed_mutation
+            && !force_text_response
+            && crate::agent::computer_use::task_has_unverified_coordinate_click(task_id).await
+        {
+            consecutive_clean_iterations = 0;
+            pending_system_messages.push(SystemDirective::GuiCoordinateClickUnverified);
+            agent
+                .emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::PostExecutionValidation,
+                    "GUI success claim blocked: unverified coordinate click".to_string(),
+                    json!({ "condition": "gui_coordinate_click_unverified" }),
+                )
+                .await;
+            warn!(
+                session_id,
+                iteration, "Blocked GUI success claim: unverified coordinate click outstanding"
+            );
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
+
         if agent.depth == 0
             && total_successful_tool_calls == 0
             && needs_tools_for_turn

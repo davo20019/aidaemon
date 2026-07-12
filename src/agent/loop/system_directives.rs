@@ -171,6 +171,10 @@ pub(in crate::agent) enum SystemDirective {
     /// paging derailment). Ask it once to answer from the data instead of
     /// pasting it.
     FinalAnswerWasFilePaste,
+    /// A GUI success claim while an unverified coordinate click is outstanding:
+    /// the last click targeted a raw point with no element identity, so it is
+    /// not confirmed. Require a verifying observation before the claim ships.
+    GuiCoordinateClickUnverified,
     /// The model produced a very short response after significant work (many
     /// tool calls) for a multi-part request. Nudge it to provide a comprehensive
     /// response addressing all parts of the user's request.
@@ -548,7 +552,8 @@ impl SystemDirective {
             Self::TaskPlanContext(plan) => plan.clone(),
             Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
-            Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),            Self::ResponseQualityNudge { user_text_hint } => format!(
+            Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
+            Self::GuiCoordinateClickUnverified => "[SYSTEM] You are about to report a GUI action done, but your last click was a COORDINATE click at a raw point — it has no element identity, so it is NOT verified: it may have hit empty space, not the target. Do NOT claim success yet. Call computer_use get_app_state (or screenshot) NOW, look at the fresh screen, and confirm the intended change actually happened (e.g. the Like heart is filled/red, the count changed). If it did not, click again; if the target now shows a stable element_title, click by title (auto-verified). Only report done after you have visually confirmed the change.".to_string(),            Self::ResponseQualityNudge { user_text_hint } => format!(
                 "[SYSTEM] Your response was too brief and did not address the user's full request. \
                  The user asked: \"{}\"\n\n\
                  You completed significant work using multiple tools. Now write a comprehensive response that:\n\
@@ -744,6 +749,14 @@ mod tests {
         let rendered = SystemDirective::SuccessfulToolEvidenceMustBeUsed.render();
         assert!(rendered.contains("successful live tool results"));
         assert!(rendered.contains("answer with concrete findings now"));
+    }
+
+    #[test]
+    fn gui_coordinate_unverified_render_demands_visual_confirmation() {
+        let rendered = SystemDirective::GuiCoordinateClickUnverified.render();
+        assert!(rendered.contains("COORDINATE click"));
+        assert!(rendered.contains("get_app_state"));
+        assert!(rendered.contains("Do NOT claim success"));
     }
 
     #[test]

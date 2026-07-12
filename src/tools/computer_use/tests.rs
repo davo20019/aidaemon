@@ -147,6 +147,71 @@ async fn stale_generation_is_rejected() {
 }
 
 #[tokio::test]
+async fn coordinate_click_flags_unverified_and_observation_clears_it() {
+    use super::pin_registry::ComputerUsePinRegistry;
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    // Unique task id: the pin registry is process-wide (shared OnceLock).
+    let task = "task-coord-verify-1";
+    let reg = ComputerUsePinRegistry::shared();
+
+    let with_meta = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.extend(test_model_args().as_object().unwrap().clone());
+        }
+        v
+    };
+
+    // Pin the task + get a generation.
+    let inspect = with_meta(json!({
+        "action": "get_app_state", "app": "Calculator",
+        "_session_id": "telegram:1", "_task_id": task
+    }));
+    tool.call_with_status_outcome(&inspect.to_string(), None)
+        .await
+        .unwrap();
+    assert!(!reg.has_unverified_coordinate_click(task).await);
+
+    // A coordinate click: flags the result unverified and marks the task.
+    let click = with_meta(json!({
+        "action": "click", "app": "Calculator",
+        "snapshot_generation": 1, "x": 500.0, "y": 500.0,
+        "_session_id": "telegram:1", "_task_id": task
+    }));
+    let outcome = tool
+        .call_with_status_outcome(&click.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        outcome.output.contains("[UNVERIFIED]"),
+        "coordinate click must carry the unverified notice: {}",
+        outcome.output
+    );
+    assert!(
+        reg.has_unverified_coordinate_click(task).await,
+        "coordinate click must mark the task unverified"
+    );
+
+    // A deliberate follow-up observation clears the flag.
+    tool.call_with_status_outcome(&inspect.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !reg.has_unverified_coordinate_click(task).await,
+        "a verifying observation must clear the flag"
+    );
+
+    reg.clear_task(task).await;
+}
+
+#[tokio::test]
 async fn list_apps_works_without_session() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

@@ -153,7 +153,14 @@ impl ComputerHarness for MockHarness {
         }
         let mut snap = self.calculator_snapshot(generation);
         snap.window_title = "Calculator (clicked)".to_string();
-        Ok((cache.store(key, snap), element_index, "mock"))
+        // Mirror the real harness's method tag so tests exercise the
+        // coordinate-vs-element distinction (unverified-click gating).
+        let method = if element_index.is_none() && _x.is_some() && _y.is_some() {
+            "coordinate"
+        } else {
+            "mock"
+        };
+        Ok((cache.store(key, snap), element_index, method))
     }
 
     async fn type_text(
