@@ -166,7 +166,11 @@ impl crate::traits::MessageStore for SqliteStateStore {
 
         // Delete session rows across canonical tables.
         // Some test DBs may not have all tables yet; treat missing tables as best-effort.
-        for table in ["events", "conversation_summaries"] {
+        for table in [
+            "events",
+            "conversation_summaries",
+            "session_context_boundaries",
+        ] {
             let query = format!("DELETE FROM {table} WHERE session_id = ?");
             if let Err(e) = sqlx::query(&query)
                 .bind(session_id)
@@ -177,6 +181,61 @@ impl crate::traits::MessageStore for SqliteStateStore {
                 if !e.to_string().contains(&missing_table) {
                     return Err(e.into());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
+        // Clear the in-memory hot window; it rehydrates from events filtered by
+        // the boundary we set below, so the fresh context excludes prior turns.
+        {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.write(),
+            )
+            .await
+            {
+                Ok(mut wm) => {
+                    wm.remove(session_id);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        session_id,
+                        "clear_session_context: working_memory write lock timed out"
+                    );
+                }
+            }
+        }
+
+        // Record (or advance) the durable boundary at the current max event id.
+        // Context retrieval hides everything with id <= cleared_after_id; NOTHING
+        // is deleted — the events remain for the memory pipeline and audit.
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO session_context_boundaries (session_id, cleared_after_id, cleared_at)
+             VALUES (?1, COALESCE((SELECT MAX(id) FROM events WHERE session_id = ?1), 0), ?2)
+             ON CONFLICT(session_id) DO UPDATE SET
+                cleared_after_id = COALESCE((SELECT MAX(id) FROM events WHERE session_id = ?1), 0),
+                cleared_at = ?2",
+        )
+        .bind(session_id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        // Drop the derived conversation summary: it summarizes now-hidden
+        // messages and is regenerable — not source-of-truth history.
+        if let Err(e) = sqlx::query("DELETE FROM conversation_summaries WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+        {
+            if !e
+                .to_string()
+                .contains("no such table: conversation_summaries")
+            {
+                return Err(e.into());
             }
         }
         Ok(())

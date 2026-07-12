@@ -127,9 +127,18 @@ impl Agent {
         ))
     }
 
-    /// Clear conversation history for a session, preserving facts.
+    /// HARD-clear a session (destructive: deletes events). Backs `/wipe`.
     pub async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
         self.state.clear_session(session_id).await
+    }
+
+    /// Reset a session's conversation context non-destructively (events remain
+    /// for memory + audit). Backs `/clear`. Also drops the in-memory turn
+    /// anchor so the next context build re-initializes past the new boundary.
+    pub async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
+        self.state.clear_session_context(session_id).await?;
+        self.turn_anchors.write().await.remove(session_id);
+        Ok(())
     }
 
     /// List available models from the provider.

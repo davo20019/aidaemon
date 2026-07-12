@@ -33,9 +33,20 @@ pub trait MessageStore: Send + Sync {
         self.get_history(session_id, limit).await
     }
 
-    /// Clear conversation history for a session (working memory + canonical events).
-    /// Facts are preserved.
+    /// HARD-clear a session: delete its canonical events + conversation summary
+    /// (working memory too). Destructive and irreversible — this is `/wipe`.
+    /// Facts already extracted into memory are preserved.
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()>;
+
+    /// Reset a session's conversation CONTEXT without deleting anything. The
+    /// next turn starts fresh (a durable boundary hides prior messages from
+    /// context retrieval), but the event history remains for the memory
+    /// pipeline and audit. This is what `/clear` should do. The default falls
+    /// back to the destructive clear for stores that don't implement a
+    /// boundary (keeps simple/test stores functional).
+    async fn clear_session_context(&self, session_id: &str) -> anyhow::Result<()> {
+        self.clear_session(session_id).await
+    }
 }
 
 /// Durable projection of a session's open request/question state.

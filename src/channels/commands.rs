@@ -81,7 +81,13 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "clear",
-            description: "Start fresh conversation",
+            description: "Start fresh conversation (history kept)",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "wipe",
+            description: "Permanently delete this conversation",
             usage: None,
             category: CommandCategory::Core,
         },
@@ -115,6 +121,7 @@ impl CommandContext {
             "/tasks" => Some(self.handle_tasks(session_id).await),
             "/cancel" => Some(self.handle_cancel(args).await),
             "/clear" => Some(self.handle_clear(session_id).await),
+            "/wipe" => Some(self.handle_wipe(session_id).await),
             "/cost" => Some(self.handle_cost().await),
             _ => None,
         }
@@ -244,19 +251,53 @@ impl CommandContext {
             .cancel_running_for_session(session_id)
             .await;
 
-        match self.agent.clear_session(session_id).await {
+        // Non-destructive: sets a context boundary so the next turn starts
+        // fresh, but the event history remains for memory and audit. Use /wipe
+        // to permanently delete.
+        match self.agent.clear_session_context(session_id).await {
             Ok(_) => {
-                if cancelled.is_empty() {
-                    "Context cleared. Starting fresh.".to_string()
+                let suffix = if cancelled.is_empty() {
+                    String::new()
                 } else {
                     format!(
-                        "Context cleared. Starting fresh. ({} running task{} cancelled.)",
+                        " ({} running task{} cancelled.)",
                         cancelled.len(),
                         if cancelled.len() == 1 { "" } else { "s" }
                     )
-                }
+                };
+                format!(
+                    "Context cleared. Starting fresh — your history is kept (use /wipe to \
+                     permanently delete it).{suffix}"
+                )
             }
             Err(e) => format!("Failed to clear context: {}", e),
+        }
+    }
+
+    async fn handle_wipe(&self, session_id: &str) -> String {
+        let cancelled = self
+            .task_registry
+            .cancel_running_for_session(session_id)
+            .await;
+
+        // Destructive: permanently deletes this session's events + summary.
+        match self.agent.clear_session(session_id).await {
+            Ok(_) => {
+                let suffix = if cancelled.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({} running task{} cancelled.)",
+                        cancelled.len(),
+                        if cancelled.len() == 1 { "" } else { "s" }
+                    )
+                };
+                format!(
+                    "Conversation permanently deleted. This cannot be undone (facts already \
+                     saved to memory are kept).{suffix}"
+                )
+            }
+            Err(e) => format!("Failed to wipe conversation: {}", e),
         }
     }
 

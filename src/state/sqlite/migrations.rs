@@ -526,6 +526,20 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Non-destructive `/clear` boundary: hides events at or before
+    // `cleared_after_id` from CONTEXT retrieval without deleting them, so the
+    // conversation starts fresh while the event history stays intact for memory
+    // and audit. `/wipe` remains the explicit destructive path.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_context_boundaries (
+            session_id TEXT PRIMARY KEY,
+            cleared_after_id INTEGER NOT NULL,
+            cleared_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Dynamic skills table - stores skills added via manage_skills tool
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS dynamic_skills (

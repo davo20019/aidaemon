@@ -41,6 +41,20 @@ pub(crate) async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Non-destructive `/clear` boundary. Created here (alongside events) so the
+    // turn-anchored queries that reference it always find the table, including
+    // in EventStore-only pools; the state-store migration also creates it
+    // idempotently.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_context_boundaries (
+            session_id TEXT PRIMARY KEY,
+            cleared_after_id INTEGER NOT NULL,
+            cleared_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Create indexes for efficient queries
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_session_time

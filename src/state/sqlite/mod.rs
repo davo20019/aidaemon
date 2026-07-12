@@ -214,10 +214,13 @@ impl SqliteStateStore {
             r#"
             SELECT id, session_id, event_type, data, created_at
             FROM events
-            WHERE session_id = ?
+            WHERE session_id = ?1
               AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+              AND id > COALESCE(
+                (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                0)
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT ?2
             "#,
         )
         .bind(session_id)
@@ -1563,6 +1566,7 @@ mod tests;
 mod turn_id_hydration_tests {
     use super::*;
     use crate::events::{Event, EventStore, EventType};
+    use crate::traits::MessageStore;
 
     #[tokio::test]
     async fn hydrate_propagates_turn_id_from_event() {
@@ -1590,5 +1594,86 @@ mod turn_id_hydration_tests {
             .find(|m| m.role == "user")
             .expect("hydrated user message");
         assert_eq!(msg.turn_id.as_deref(), Some("turn-hydrate"));
+    }
+
+    async fn append_user(events: &EventStore, session: &str, text: &str) {
+        events
+            .append(Event::new(
+                session,
+                EventType::UserMessage,
+                serde_json::json!({"content": text, "turn_id": format!("turn-{text}")}),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_context_hides_history_but_keeps_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clear_ctx.db");
+        let db_path = db_path.to_str().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            .await
+            .unwrap();
+        let events = EventStore::new(store.pool()).await.unwrap();
+        let sess = "sess-clear";
+
+        append_user(&events, sess, "before-one").await;
+        append_user(&events, sess, "before-two").await;
+        assert_eq!(store.hydrate(sess).await.unwrap().len(), 2);
+
+        // Non-destructive clear: context is hidden, events remain in the DB.
+        store.clear_session_context(sess).await.unwrap();
+        assert!(
+            store.hydrate(sess).await.unwrap().is_empty(),
+            "context after /clear must start fresh"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE session_id = ?")
+            .bind(sess)
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2, "/clear must NOT delete events");
+
+        // New turns after the boundary ARE visible.
+        append_user(&events, sess, "after-clear").await;
+        let after = store.hydrate(sess).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].content.as_deref(), Some("after-clear"));
+    }
+
+    #[tokio::test]
+    async fn wipe_deletes_events_and_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wipe.db");
+        let db_path = db_path.to_str().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(db_path, 50, None, embedding_service)
+            .await
+            .unwrap();
+        let events = EventStore::new(store.pool()).await.unwrap();
+        let sess = "sess-wipe";
+
+        append_user(&events, sess, "gone-one").await;
+        store.clear_session_context(sess).await.unwrap();
+        append_user(&events, sess, "gone-two").await;
+
+        // Destructive wipe: everything for the session is deleted.
+        store.clear_session(sess).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE session_id = ?")
+            .bind(sess)
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "/wipe must delete events");
+        let boundaries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_context_boundaries WHERE session_id = ?",
+        )
+        .bind(sess)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap();
+        assert_eq!(boundaries, 0, "/wipe must clear the boundary row too");
     }
 }

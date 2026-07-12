@@ -697,6 +697,9 @@ impl EventStore {
                 SELECT turn_id, MIN(id) AS turn_seq
                 FROM events
                 WHERE session_id = ?1 AND turn_id IS NOT NULL
+                  AND id > COALESCE(
+                    (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                    0)
                 GROUP BY turn_id
             ) t ON e.turn_id = t.turn_id
             LEFT JOIN (
@@ -744,6 +747,9 @@ impl EventStore {
                 SELECT turn_id, MIN(id) AS turn_seq
                 FROM events
                 WHERE session_id = ?1 AND turn_id IS NOT NULL
+                  AND id > COALESCE(
+                    (SELECT cleared_after_id FROM session_context_boundaries WHERE session_id = ?1),
+                    0)
                 GROUP BY turn_id
             ),
             selected_turns AS (
