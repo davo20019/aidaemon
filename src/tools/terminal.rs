@@ -1358,6 +1358,20 @@ fn format_short_background_result(output_trimmed: &str) -> String {
     }
 }
 
+/// Serializes background-notifier re-engagements of the agent loop. A
+/// completion arriving while another re-engagement turn is still running must
+/// wait, not spawn a CONCURRENT loop on the same daemon: two racing loops each
+/// launched their own duplicate `find` sweeps and posted their own "Done"
+/// pings (live 2026-07-12). The guard is held across the whole re-engaged
+/// `handle_message` call; later completions then see the earlier turn's
+/// results in history instead of redoing the work.
+static REENGAGE_SERIALIZER: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+
+async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
+    REENGAGE_SERIALIZER.lock().await
+}
+
 /// Build the internal follow-up that re-engages the agent loop after a
 /// background command completes. Beyond replaying the output, it explicitly
 /// steers the model to finish any *deferred deliverable* the user requested
@@ -3246,6 +3260,8 @@ impl TerminalTool {
                                                         output,
                                                         pid
                                                     );
+                                                    let _reengage_slot =
+                                                        acquire_reengagement_slot().await;
                                                     info!(
                                                         pid,
                                                         session_id = %session_for_notify,
@@ -3648,6 +3664,10 @@ impl TerminalTool {
                                             &output,
                                             &unchecked,
                                         );
+                                        // Serialize with any other in-flight re-engagement:
+                                        // completions must process one at a time, not as
+                                        // concurrent racing loops.
+                                        let _reengage_slot = acquire_reengagement_slot().await;
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
@@ -4602,6 +4622,34 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn reengagement_slots_serialize_concurrent_completions() {
+        // Live 2026-07-12: two background completions re-engaged the agent
+        // loop concurrently — two racing loops on the same session, duplicate
+        // find sweeps, duplicate "Done" pings. Slots must serialize.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        static MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(tokio::spawn(async {
+                let _slot = acquire_reengagement_slot().await;
+                let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+                MAX_ACTIVE.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(
+            MAX_ACTIVE.load(Ordering::SeqCst),
+            1,
+            "re-engagements must not run concurrently"
+        );
+    }
 
     #[test]
     fn deliverable_caption_has_no_command() {

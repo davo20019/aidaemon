@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.25] - 2026-07-12
+
+### Fixed
+
+- **Background-completion re-engagements are serialized.** A completion arriving while another re-engagement turn was still running spawned a second, concurrent agent loop on the same session — live: two racing loops each launched their own duplicate `find ~/projects` sweeps and posted their own "✅ Done" pings, and each fresh loop got a fresh execution budget, making the chain self-sustaining. Re-engagements now take a global slot held across the whole re-engaged turn; later completions see the earlier turn's results in history instead of redoing the work.
+- **Checklist bookkeeping no longer satisfies mutation contracts.** `track_requirements` was classified as a state mutation, so one checklist write made `expects_mutation` gates believe the requested action (a send_file, a post) had happened — which is exactly the hole that let a tool-output paste ship in place of the missing action on a "Send me my resume" turn. The tool now declares Administrative call semantics.
+- **Self-contained imperative requests are not "clarification answers."** "Send me my Microsoft resume" arriving right after the assistant's clarifying question about a *different* resume was bound as the answer to that question, injecting the previous topic into the new turn (the model then hunted the wrong directory). An imperative that names its own object (no anaphoric "it/that/one") now classifies as a new request in both the followup classifier and the dialogue-state tracker.
+
 ## [0.11.24] - 2026-07-12
 
 ### Fixed

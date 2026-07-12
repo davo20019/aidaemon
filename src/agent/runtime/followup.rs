@@ -612,6 +612,32 @@ pub(super) fn looks_like_short_command_request(current: &str) -> bool {
     !deictic_only
 }
 
+/// A self-contained imperative request: starts with a request verb and names
+/// its own object (no anaphoric reference back to the assistant's question).
+/// "Send me my Microsoft resume" is a new request even when the assistant just
+/// asked a clarifying question; "Post it." / "send that one" answer it.
+pub(super) fn looks_like_self_contained_imperative_request(trimmed: &str, lower: &str) -> bool {
+    if trimmed.split_whitespace().count() < 2 {
+        return false;
+    }
+    let Some(first) = lower.split_whitespace().next() else {
+        return false;
+    };
+    let first = first.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    const IMPERATIVE_REQUEST_VERBS: &[&str] = &[
+        "send", "give", "get", "fetch", "find", "search", "download", "upload", "create", "make",
+        "write", "draft", "post", "deploy", "build", "run", "open", "show", "list", "check",
+        "delete", "remove", "update", "install",
+    ];
+    if !IMPERATIVE_REQUEST_VERBS.contains(&first) {
+        return false;
+    }
+    const ANAPHORS: &[&str] = &["it", "that", "this", "those", "them", "one", "ones"];
+    !ANAPHORS
+        .iter()
+        .any(|anaphor| contains_keyword_as_words(lower, anaphor))
+}
+
 pub(super) fn looks_like_scope_carryover_ack(current: &str) -> bool {
     let trimmed = current.trim();
     if trimmed.is_empty() || trimmed.ends_with('?') || trimmed.chars().count() > 80 {
@@ -724,12 +750,16 @@ pub(super) fn classify_followup_mode(
     // generic ack heuristics: "Yes do 1, 2" after a menu is an answer to that
     // menu, not a followup to the session's open request. Misrouting it to
     // Followup binds the turn to the (possibly stale) open_request instead of
-    // the question being answered (2026-07-11 incident).
+    // the question being answered (2026-07-11 incident). Self-contained
+    // imperatives that name their own object ("Send me my Microsoft resume")
+    // are NEW requests, not answers — binding them re-injects the previous
+    // topic's question into an unrelated turn (2026-07-12 incident).
     if prev_assistant.is_some_and(|prev| {
         assistant_message_looks_like_clarifying_question(prev)
             && !trimmed.trim_end().ends_with('?')
             && !looks_like_explicit_task_switch(&lower)
             && !looks_like_artifact_inspection_request(&lower)
+            && !looks_like_self_contained_imperative_request(trimmed, &lower)
     }) {
         reasons.push(TurnContextReason::ClarificationAnswer);
         return (FollowupMode::ClarificationAnswer, reasons);
@@ -861,6 +891,29 @@ mod tests {
         let (mode, reasons) = classify_followup_mode(current, Some(prev));
         assert_eq!(mode, FollowupMode::ClarificationAnswer);
         assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));
+    }
+    #[test]
+    fn imperative_request_after_clarifying_question_is_new_task() {
+        // Live 2026-07-12: "Send me my Microsoft resume" right after the
+        // assistant's makpar clarifying question got bound as the ANSWER to
+        // that question, so the new turn carried "Assistant asked: …makpar…"
+        // and the model hunted the wrong resume. A self-contained imperative
+        // that names its own object is a new request, not an answer.
+        let current = "Send me my Microsoft resume";
+        let prev = "I found several other tailored resumes in your ~/projects/resume folder. \
+                    Is it possible the Acme resume is named differently, or should I look \
+                    for a specific file type?";
+        let (mode, _) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+    #[test]
+    fn anaphoric_imperative_still_answers_the_question() {
+        // "Post it." names no object of its own — it refers to the question's
+        // subject and must keep binding as a clarification answer.
+        let current = "Post it.";
+        let prev = "Want me to tweak this or post it?";
+        let (mode, _) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
     }
     #[test]
     fn numbered_ack_after_clarifying_menu_is_clarification_answer() {

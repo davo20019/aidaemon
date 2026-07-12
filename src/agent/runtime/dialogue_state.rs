@@ -197,7 +197,8 @@ fn user_reply_likely_answers_open_question(trimmed: &str, lower: &str) -> bool {
             && !looks_like_explicit_task_switch(lower)
             && !looks_like_standalone_goal_request(lower)
             && !looks_like_self_contained_mutation_request(trimmed, lower)
-            && !looks_like_short_command_request(trimmed))
+            && !looks_like_short_command_request(trimmed)
+            && !super::followup::looks_like_self_contained_imperative_request(trimmed, lower))
 }
 
 fn user_turn_strongly_references_existing_request(
@@ -1166,6 +1167,29 @@ mod tests {
                 .map(|request| request.user_message_id.as_str()),
             Some("u2"),
             "a stale answered request must be superseded by the new request"
+        );
+    }
+
+    #[test]
+    fn fresh_open_question_does_not_capture_imperative_request() {
+        // Live 2026-07-12: the makpar clarifying question was only seconds old
+        // when "Send me my Microsoft resume" arrived; the non-ack fallthrough
+        // captured it as a clarification answer. A self-contained imperative
+        // that names its own object supersedes the question instead.
+        let now = Utc::now();
+        let mut state = DialogueState::new("s1");
+        state.open_question = Some(question_with(now - chrono::Duration::seconds(30), true));
+        apply_user_message(&mut state, "u2", "Send me my Microsoft resume", &[], now);
+        assert_eq!(
+            state.last_user_turn.as_ref().map(|turn| turn.kind),
+            Some(UserTurnKind::NewRequest)
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .map(|request| request.user_message_id.as_str()),
+            Some("u2")
         );
     }
 

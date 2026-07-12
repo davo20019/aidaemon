@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::plans::{PlanStore, StepStatus};
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities};
 
 pub struct TrackRequirementsTool {
     plan_store: Arc<PlanStore>,
@@ -72,6 +72,15 @@ impl Tool for TrackRequirementsTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        // Administrative, never Mutation: the checklist is the agent's own
+        // bookkeeping. Counting it as a mutation satisfied expects_mutation
+        // gates for turns whose REQUESTED mutation (a send_file, a post) never
+        // happened — letting recovery paste tool output in its place
+        // (live 2026-07-12).
+        ToolCallSemantics::administrative()
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -169,6 +178,21 @@ mod tests {
         // The tool only persists checklist state; UI delivery is handled by the
         // agent loop via StatusUpdate::Checklist, so there is no hub to wire here.
         (TrackRequirementsTool::new(plan_store.clone()), plan_store)
+    }
+
+    #[tokio::test]
+    async fn checklist_bookkeeping_is_not_a_contract_mutation() {
+        // Live 2026-07-12: a track_requirements call incremented
+        // completion_progress.mutation_count, which satisfied the "did the
+        // requested mutation happen?" gates for a "Send me my resume" turn —
+        // letting a tool-output paste ship in place of the missing send_file.
+        // The checklist is internal bookkeeping: Administrative, not Mutation.
+        let (tool, _plan_store) = test_tool().await;
+        let semantics = tool.call_semantics(r#"{"items":[{"text":"send the file"}]}"#);
+        assert!(
+            !semantics.mutates_state(),
+            "checklist writes must not count as contract mutations"
+        );
     }
 
     #[tokio::test]
