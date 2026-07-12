@@ -13,6 +13,15 @@ pub struct HarnessRequestContext {
 pub trait ComputerHarness: Send + Sync {
     fn check_permissions(&self) -> Result<(), String>;
 
+    /// True when the OS session reports the screen as locked. Observations
+    /// (screenshots, accessibility reads) still work while locked, so the
+    /// dispatcher stamps this onto observation results — otherwise the model
+    /// only discovers the lock when its first click bounces, and tends to
+    /// route around the error instead of telling the user (live 2026-07-12).
+    fn screen_is_locked(&self) -> bool {
+        false
+    }
+
     async fn list_apps(&self) -> Result<Vec<AppInfo>, String>;
 
     /// Launch an installed app that is not currently running and wait until it

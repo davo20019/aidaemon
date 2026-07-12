@@ -398,12 +398,31 @@ impl ComputerUseTool {
         Ok(())
     }
 
+    /// Stamp the screen-lock state onto an observation result. Reads and
+    /// screenshots succeed while locked, so without this banner the model
+    /// builds a picture of a working session and only hits the lock when its
+    /// first click bounces — then tends to route around the error instead of
+    /// telling the user (live 2026-07-12).
+    fn apply_lock_banner(text: String, locked: bool) -> String {
+        if !locked {
+            return text;
+        }
+        format!(
+            "⚠ SCREEN IS LOCKED: macOS routes all keyboard/mouse input to the lock \
+             screen, so clicks and typing CANNOT work in any app until the user \
+             unlocks the Mac. Do not attempt input actions and do not try to work \
+             around the lock with other tools (AppleScript/System Events is equally \
+             blocked). Stop and tell the user to unlock, then retry.\n\n{text}"
+        )
+    }
+
     async fn build_outcome(
         &self,
         text: String,
         snapshot: Option<&AppSnapshot>,
         session_id: &str,
     ) -> Result<ToolCallOutcome, String> {
+        let text = Self::apply_lock_banner(text, self.harness.screen_is_locked());
         let mut metadata = ToolCallMetadata::default();
         if let Some(snapshot) = snapshot {
             if !snapshot.png.is_empty() {
@@ -455,7 +474,10 @@ impl ComputerUseTool {
                     app.name, app.bundle_id, app.pid
                 ));
             }
-            return Ok(ToolCallOutcome::from_output(lines));
+            return Ok(ToolCallOutcome::from_output(Self::apply_lock_banner(
+                lines,
+                self.harness.screen_is_locked(),
+            )));
         }
 
         let ctx = Self::parse_context(args)?;

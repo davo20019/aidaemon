@@ -826,6 +826,30 @@ fn has_recursive_grep_scope_controls(command: &str) -> bool {
         || lower.contains("-dskip")
 }
 
+/// Detect AppleScript System Events UI scripting (click/keystroke/key code/
+/// set value) driven through the terminal. This is computer-use-by-another-name:
+/// it bypasses the computer_use policy layer entirely — per-app approvals,
+/// prohibited bundles, point-of-action confirmation, screen-lock detection —
+/// and it fails against a locked screen anyway, which is exactly when models
+/// reach for it (live 2026-07-12: four minutes of `osascript … System Events`
+/// flailing after the GUI loop correctly reported the screen locked).
+/// Read-only System Events queries (get name of every process, …) are allowed.
+fn is_system_events_ui_scripting(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("osascript") || !lower.contains("system events") {
+        return false;
+    }
+    [
+        "click",
+        "keystroke",
+        "key code",
+        "set value",
+        "perform action",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
+}
+
 /// Detect `python3 -c "..."` commands that perform file **write** I/O.
 /// Read-only operations (ast.parse, open().read(), json.load) are allowed
 /// since there's no dedicated tool equivalent for validation/syntax checks.
@@ -4140,6 +4164,24 @@ impl TerminalTool {
                     ));
                 }
 
+                // Hard-redirect AppleScript GUI automation to computer_use: the
+                // terminal path has none of its safety layer (approvals, blocked
+                // apps, action confirmation, lock detection) and System Events
+                // input fails against a locked screen exactly like synthetic input.
+                if is_system_events_ui_scripting(command) {
+                    return Ok(ToolCallOutcome::from_output(
+                        "Blocked: AppleScript System Events UI scripting (click/keystroke) \
+                         through the terminal bypasses the computer_use safety layer and \
+                         cannot deliver input when the screen is locked.\n\n\
+                         Use the `computer_use` tool for GUI automation — it is \
+                         approval-gated, lock-aware, and works from screenshots and the \
+                         accessibility tree. If computer_use is unavailable or blocked \
+                         (e.g. the screen is locked), stop and tell the user what you \
+                         need instead of scripting around it."
+                            .to_string(),
+                    ));
+                }
+
                 let daemon_hits = detect_daemonization_primitives(command);
                 let mut daemonization_approved = false;
                 if !daemon_hits.is_empty() {
@@ -4622,6 +4664,32 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn system_events_ui_scripting_detected() {
+        // Live 2026-07-12: lock-screen flailing via osascript after computer_use
+        // correctly refused input.
+        assert!(is_system_events_ui_scripting(
+            r#"osascript -e 'tell application "System Events" to tell process "Calculator" to click button "2" of group 1 of window 1'"#
+        ));
+        assert!(is_system_events_ui_scripting(
+            r#"osascript -e 'tell application "System Events" to keystroke "12+3" & return'"#
+        ));
+        assert!(is_system_events_ui_scripting(
+            r#"osascript -e 'tell application "System Events" to key code 36'"#
+        ));
+    }
+
+    #[test]
+    fn system_events_reads_and_notifications_allowed() {
+        assert!(!is_system_events_ui_scripting(
+            r#"osascript -e 'tell application "System Events" to get name of every process'"#
+        ));
+        assert!(!is_system_events_ui_scripting(
+            r#"osascript -e 'display notification "build done"'"#
+        ));
+        assert!(!is_system_events_ui_scripting("ls -la ~/projects"));
+    }
 
     #[tokio::test]
     async fn reengagement_slots_serialize_concurrent_completions() {

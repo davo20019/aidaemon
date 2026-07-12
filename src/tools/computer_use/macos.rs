@@ -82,6 +82,10 @@ impl MacOsHarness {
 
 #[async_trait]
 impl ComputerHarness for MacOsHarness {
+    fn screen_is_locked(&self) -> bool {
+        screen_is_locked()
+    }
+
     fn check_permissions(&self) -> Result<(), String> {
         // Accessibility — needed for the AX tree walk and AX/enigo input.
         if !is_process_trusted() {

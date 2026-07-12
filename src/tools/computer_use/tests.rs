@@ -6,6 +6,20 @@ use crate::config::ComputerUseConfig;
 use crate::traits::Tool;
 
 #[test]
+fn lock_banner_stamps_observations_when_locked() {
+    // Live 2026-07-12: observations succeed while the screen is locked, so the
+    // model only discovered the lock when input bounced — then flailed via
+    // AppleScript instead of telling the user.
+    let stamped =
+        super::ComputerUseTool::apply_lock_banner("Running apps:\n- Calculator".to_string(), true);
+    assert!(stamped.contains("SCREEN IS LOCKED"), "got: {stamped}");
+    assert!(stamped.contains("Running apps:"));
+    let clean =
+        super::ComputerUseTool::apply_lock_banner("Running apps:\n- Calculator".to_string(), false);
+    assert_eq!(clean, "Running apps:\n- Calculator");
+}
+
+#[test]
 fn bounds_match_reidentifies_control_across_index_renumber() {
     use crate::tools::computer_use::types::ElementBounds;
     let b = |x: f64, y: f64| ElementBounds {
