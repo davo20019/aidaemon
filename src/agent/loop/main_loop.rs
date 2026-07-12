@@ -201,25 +201,22 @@ impl Agent {
             .iter()
             .map(|reason| reason.as_code())
             .collect();
-        let llm_user_text = if turn_context.followup_mode == Some(FollowupMode::Followup) {
-            match self.state.get_dialogue_state(session_id).await {
-                Ok(Some(dialogue_state)) => dialogue_state
-                    .open_request
-                    .as_ref()
-                    .map(|request| request.text.trim())
-                    .filter(|original| {
-                        !original.is_empty() && !original.eq_ignore_ascii_case(user_text.trim())
-                    })
-                    .map(|original| {
-                        format!(
-                            "Original request:\n{}\n\nFollow-up:\n{}",
-                            original,
-                            user_text.trim()
-                        )
-                    })
-                    .unwrap_or_else(|| user_text.to_string()),
-                Ok(None) | Err(_) => user_text.to_string(),
-            }
+        let llm_user_text = if matches!(
+            turn_context.followup_mode,
+            Some(FollowupMode::Followup | FollowupMode::ClarificationAnswer)
+        ) {
+            let dialogue_state = self
+                .state
+                .get_dialogue_state(session_id)
+                .await
+                .ok()
+                .flatten();
+            super::dialogue_state::compose_llm_user_text(
+                turn_context.followup_mode,
+                dialogue_state.as_ref(),
+                user_text,
+                chrono::Utc::now(),
+            )
         } else {
             user_text.to_string()
         };

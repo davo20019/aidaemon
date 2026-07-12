@@ -720,6 +720,21 @@ pub(super) fn classify_followup_mode(
         return (FollowupMode::NewTask, reasons);
     }
 
+    // An answer to the assistant's own clarifying question outranks the
+    // generic ack heuristics: "Yes do 1, 2" after a menu is an answer to that
+    // menu, not a followup to the session's open request. Misrouting it to
+    // Followup binds the turn to the (possibly stale) open_request instead of
+    // the question being answered (2026-07-11 incident).
+    if prev_assistant.is_some_and(|prev| {
+        assistant_message_looks_like_clarifying_question(prev)
+            && !trimmed.trim_end().ends_with('?')
+            && !looks_like_explicit_task_switch(&lower)
+            && !looks_like_artifact_inspection_request(&lower)
+    }) {
+        reasons.push(TurnContextReason::ClarificationAnswer);
+        return (FollowupMode::ClarificationAnswer, reasons);
+    }
+
     let ack_like = contains_keyword_as_words(&lower, "yes")
         || contains_keyword_as_words(&lower, "confirm")
         || contains_keyword_as_words(&lower, "go ahead")
@@ -751,16 +766,6 @@ pub(super) fn classify_followup_mode(
     if prev_assistant.is_some() && looks_like_unanswered_request_reference(&lower) {
         reasons.push(TurnContextReason::ContextDependentQuestion);
         return (FollowupMode::Followup, reasons);
-    }
-
-    if prev_assistant.is_some_and(|prev| {
-        assistant_message_looks_like_clarifying_question(prev)
-            && !trimmed.trim_end().ends_with('?')
-            && !looks_like_explicit_task_switch(&lower)
-            && !looks_like_artifact_inspection_request(&lower)
-    }) {
-        reasons.push(TurnContextReason::ClarificationAnswer);
-        return (FollowupMode::ClarificationAnswer, reasons);
     }
 
     reasons.push(TurnContextReason::DefaultNewTask);
@@ -853,6 +858,21 @@ mod tests {
     fn followup_accepts_answer_to_want_me_to_clarification() {
         let current = "Post it.";
         let prev = "Please answer directly: Want me to tweak this or post it?";
+        let (mode, reasons) = classify_followup_mode(current, Some(prev));
+        assert_eq!(mode, FollowupMode::ClarificationAnswer);
+        assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));
+    }
+    #[test]
+    fn numbered_ack_after_clarifying_menu_is_clarification_answer() {
+        // Regression for the 2026-07-11 incident: "Yes do 1, 2" answers the
+        // menu the assistant just presented. The concise-ack branch must not
+        // outrank the clarification-answer branch, or the turn is routed into
+        // the open_request injection and binds to a stale request instead.
+        let current = "Yes do 1, 2";
+        let prev = "I couldn't find that resume.\n\nWould you like me to:\n\
+                    1. Search your entire machine?\n\
+                    2. Look in other common folders?\n\
+                    3. Send another recent resume instead?";
         let (mode, reasons) = classify_followup_mode(current, Some(prev));
         assert_eq!(mode, FollowupMode::ClarificationAnswer);
         assert!(reasons.contains(&TurnContextReason::ClarificationAnswer));

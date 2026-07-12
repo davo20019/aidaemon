@@ -111,6 +111,11 @@ pub struct DialogueState {
     pub open_request: Option<OpenRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_question: Option<OpenQuestion>,
+    /// The most recent open question that a user reply closed. Kept so the
+    /// turn that ANSWERS a clarifying question can still see the question
+    /// text after ingestion clears `open_question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_closed_question: Option<OpenQuestion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_assistant_turn: Option<AssistantTurnSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +135,7 @@ impl DialogueState {
             revision: 1,
             open_request: None,
             open_question: None,
+            last_closed_question: None,
             last_assistant_turn: None,
             last_user_turn: None,
             active_task: None,

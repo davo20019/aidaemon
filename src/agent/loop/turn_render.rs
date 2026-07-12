@@ -26,7 +26,9 @@ use crate::events::TerminalState;
 use crate::traits::AttachmentProvenance;
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-pub(crate) const RENDERER_VERSION: u32 = 3;
+/// v4: archived clarifying menus keep their actionable tail instead of being
+/// head-truncated to the old-assistant cap.
+pub(crate) const RENDERER_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
@@ -111,6 +113,28 @@ fn truncate_old_assistant(content: &str) -> String {
     } else {
         content.to_string()
     }
+}
+
+/// Truncation for the winning assistant message of an archived turn.
+///
+/// Clarifying questions/menus get a higher cap with head+tail preservation:
+/// the options at the END of the message are the actionable state the next
+/// user turn refers to ("Yes do 1, 2"), so head-truncation to the old
+/// assistant cap would delete exactly what that turn needs (2026-07-11
+/// incident). Everything else keeps the legacy head-truncation.
+fn truncate_winning_assistant(content: &str) -> String {
+    if !super::followup::assistant_message_looks_like_clarifying_question(content) {
+        return truncate_old_assistant(content);
+    }
+    let count = content.chars().count();
+    if count <= MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS {
+        return content.to_string();
+    }
+    const HEAD_CHARS: usize = 400;
+    let tail_chars = MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS - HEAD_CHARS;
+    let head: String = content.chars().take(HEAD_CHARS).collect();
+    let tail: String = content.chars().skip(count - tail_chars).collect();
+    format!("{head}\n…\n{tail}")
 }
 
 /// Set of `tool_call_id`s that have a matching `tool` result in this turn.
@@ -455,10 +479,12 @@ fn render_archived(
             "assistant" => {
                 if Some(idx) == last_substantive_assistant {
                     // Winning assistant: truncated content, tool_calls retained.
+                    // Clarifying menus keep their actionable tail (see
+                    // truncate_winning_assistant).
                     let truncated = m
                         .content
                         .as_deref()
-                        .map(truncate_old_assistant)
+                        .map(truncate_winning_assistant)
                         .unwrap_or_default();
                     let mut obj = json!({
                         "role": "assistant",
@@ -635,6 +661,67 @@ mod tests {
             tool_name: Some(name.to_string()),
             ..Message::runtime_defaults()
         }
+    }
+
+    #[test]
+    fn archived_preserves_clarifying_menu_options_in_full() {
+        // Regression for the 2026-07-11 incident: the previous turn ended with
+        // a clarifying menu; head-truncation to the old-assistant cap cut the
+        // options off, so the next turn's "Yes do 1, 2" had nothing to bind to.
+        let menu = "I couldn't find a file named \"Acme resume\" or any file containing \
+                    the word \"Acme\" in your `~/projects/resume` directory.\n\n\
+                    Since many of your resumes are in PDF or Word format, `grep` might \
+                    not have been able to read them.\n\n\
+                    Would you like me to:\n\
+                    1. Search your entire machine for anything related to \"Acme\"?\n\
+                    2. Look in other common folders like `~/Documents` or `~/Downloads`?\n\
+                    3. Send you one of your other recent resumes instead?";
+        assert!(menu.chars().count() > MAX_OLD_ASSISTANT_CONTENT_CHARS);
+        let turn = vec![user("Send me my Acme resume"), assistant(menu)];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("Send you one of your other recent resumes instead?"),
+            "clarifying menu options must survive archival: {joined}"
+        );
+    }
+
+    #[test]
+    fn archived_clarifying_question_over_cap_keeps_head_and_tail() {
+        let filler = "flag ".repeat(600); // ~3000 chars of middle filler
+        let long_menu = format!(
+            "Would you like me to review these findings?\n{filler}\nOr should I stop at option Z?"
+        );
+        assert!(long_menu.chars().count() > MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS);
+        let turn = vec![user("review the flags"), assistant(&long_menu)];
+        let out = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let joined = serde_json::to_string(&out).unwrap();
+        assert!(
+            joined.contains("Would you like me to review these findings?"),
+            "question head survives"
+        );
+        assert!(
+            joined.contains("Or should I stop at option Z?"),
+            "actionable tail survives"
+        );
+        assert!(
+            !joined.contains(&"flag ".repeat(500)),
+            "middle filler is elided to bound the archived turn"
+        );
     }
 
     #[test]

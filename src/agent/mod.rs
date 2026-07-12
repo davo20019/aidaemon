@@ -110,6 +110,11 @@ const HARD_ITERATION_CAP: usize = 200;
 /// Longer content is truncated with a "[prior turn, truncated]" marker to
 /// prevent stale context from polluting subsequent interactions.
 const MAX_OLD_ASSISTANT_CONTENT_CHARS: usize = 200;
+/// Higher cap for archived assistant messages that end in a clarifying
+/// question/menu: the options ARE the actionable state the next user turn
+/// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
+/// cap keeps the question head and the option tail and elides the middle.
+const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
 /// Window size for detecting alternating tool patterns (A-B-A-B cycles).
 const ALTERNATING_PATTERN_WINDOW: usize = 10;
 const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
