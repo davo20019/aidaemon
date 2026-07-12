@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.24] - 2026-07-12
+
+### Fixed
+
+- **Stale dialogue requests can no longer hijack followup turns.** Live incident: the assistant offered a numbered menu ("Would you like me to: 1… 2… 3…"), the user replied "Yes do 1, 2", and got an answer to a question from two hours earlier that had already been answered — plus "we haven't established a numbered list." Two independent context defects colliding, both fixed:
+  - *Followup injection is now freshness-gated.* A followup turn's "Original request:" injection only carries the dialogue state's open request while it is genuinely pending: answered/superseded requests anchor followups for 10 minutes after resolution, open ones expire after 12 hours. Expired anchors are also dropped at message ingestion, so they can't capture turn classification or tool scoping either (the state previously held requests indefinitely — one session still carried an open request from three weeks prior).
+  - *Archived clarifying menus keep their options.* Archived-turn rendering head-truncated the previous turn's final assistant message to 200 chars, which systematically deleted exactly the actionable tail of clarifying menus (the options) — the model literally never saw the list being answered. Messages that look like clarifying questions now keep up to 2,000 chars verbatim (head + tail preserved beyond that); renderer version bumped to invalidate cached renders.
+- **Acks now bind to the question they answer.** "Yes do 1, 2" after a clarifying menu was classified by the generic concise-ack branch (→ followup → open-request injection) because that branch outranked the clarification-answer check. The order is fixed, and clarification-answer turns finally have a consumer: the prompt carries "Assistant asked: {question}" — readable even though ingestion clears the open question, via a new `last_closed_question` stash (30-minute per-exchange TTL, cleared on topic change; serde-defaulted so stored states migrate cleanly).
+- **Stale clarifying questions can't swallow new requests.** A pending menu older than 30 minutes no longer captures arbitrary short replies ("Send me my makpar resume") as "clarification answers"; ack-like replies still bind regardless of age, since answering a menu after a long pause is normal.
+
 ## [0.11.23] - 2026-07-11
 
 ### Fixed
