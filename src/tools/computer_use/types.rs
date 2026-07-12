@@ -17,6 +17,41 @@ pub struct ElementBounds {
     pub height: f64,
 }
 
+/// Upper bound of the normalized coordinate space the model points in. The
+/// model emits click coordinates as `(x, y)` each in `[0, NORMALIZED_COORD_MAX]`
+/// over the screenshot it was shown — it never has to reason about global
+/// desktop points or Retina pixels, which it cannot derive from a window-cropped
+/// image. The harness translates via `normalized_to_global_point`.
+pub const NORMALIZED_COORD_MAX: f64 = 1000.0;
+
+/// A window's on-screen frame in global display **points** (top-left origin) —
+/// the same coordinate space as `ElementBounds` and the synthetic-cursor click.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowFrame {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Map a normalized image coordinate (each axis in `[0, NORMALIZED_COORD_MAX]`)
+/// to a global display point using the window's point-space frame.
+///
+/// Resolution/Retina-independent by construction: normalization erases the
+/// pixel scale, so the mapping needs only the window's origin and size in
+/// points — never the screenshot's pixel dimensions or a scale factor. This is
+/// what makes vision-driven clicking work: the model points at the image it can
+/// see, and the harness does the geometry it cannot. Out-of-range inputs clamp
+/// to the window so a click can never land off the target window.
+pub fn normalized_to_global_point(nx: f64, ny: f64, frame: WindowFrame) -> (f64, f64) {
+    let fx = (nx / NORMALIZED_COORD_MAX).clamp(0.0, 1.0);
+    let fy = (ny / NORMALIZED_COORD_MAX).clamp(0.0, 1.0);
+    (
+        frame.origin_x + fx * frame.width,
+        frame.origin_y + fy * frame.height,
+    )
+}
+
 /// One accessibility element in a snapshot.
 ///
 /// Only *interactive* elements receive a stable numeric `index` (the model
@@ -108,6 +143,17 @@ pub fn format_full_tree(snapshot: &AppSnapshot) -> String {
     }
     for el in &snapshot.elements {
         out.push_str(&format_element_line(el));
+    }
+    // Web content (browsers) often exposes no addressable AX elements. Point the
+    // model at the coordinate-click fallback instead of leaving it with an empty
+    // list and no path — the historical dead end that drove defection to shell.
+    if !snapshot.elements.iter().any(|el| el.interactive) {
+        out.push_str(
+            "[no addressable accessibility elements — this is normal for web pages and \
+             custom-drawn UIs. To interact, look at the screenshot and click by COORDINATE: \
+             call click with normalized x and y (0-1000 over the screenshot; no \
+             snapshot_generation needed). Do NOT switch to terminal/AppleScript.]\n",
+        );
     }
     tracing::info!(
         kind = "full",
@@ -210,6 +256,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalized_center_maps_to_window_center() {
+        // Window at global origin (100, 200), 800×600 points. Center of the
+        // normalized space (500, 500) → window center in global points.
+        let frame = WindowFrame {
+            origin_x: 100.0,
+            origin_y: 200.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let (gx, gy) = normalized_to_global_point(500.0, 500.0, frame);
+        assert!((gx - 500.0).abs() < 1e-9, "gx={gx}");
+        assert!((gy - 500.0).abs() < 1e-9, "gy={gy}");
+    }
+
+    #[test]
+    fn normalized_maps_are_retina_scale_independent() {
+        // Same window frame in POINTS produces the same global point regardless
+        // of the screenshot's pixel resolution — because normalization erases
+        // the pixel scale. A button 25% across / 75% down a Retina (2×) window
+        // and the same button on a 1× window both map to the same global point.
+        let frame = WindowFrame {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1000.0,
+            height: 1000.0,
+        };
+        let (gx, gy) = normalized_to_global_point(250.0, 750.0, frame);
+        assert!((gx - 250.0).abs() < 1e-9);
+        assert!((gy - 750.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalized_corners_and_out_of_range_clamp_to_window() {
+        let frame = WindowFrame {
+            origin_x: 10.0,
+            origin_y: 20.0,
+            width: 100.0,
+            height: 200.0,
+        };
+        assert_eq!(normalized_to_global_point(0.0, 0.0, frame), (10.0, 20.0));
+        assert_eq!(
+            normalized_to_global_point(1000.0, 1000.0, frame),
+            (110.0, 220.0)
+        );
+        // Out-of-range clamps to the window edges — never clicks off-window.
+        assert_eq!(
+            normalized_to_global_point(-50.0, 5000.0, frame),
+            (10.0, 220.0)
+        );
+    }
+
+    #[test]
     fn browsers_get_a_deeper_walk_budget() {
         let config = ComputerUseConfig {
             ax_max_depth: 12,
@@ -273,6 +371,32 @@ mod tests {
         let text = format_full_tree(&sample_snapshot());
         assert!(text.contains("snapshot_generation=3"));
         assert!(text.contains("1 AXButton \"7\" enabled"));
+        // A tree with addressable elements does NOT nag about coordinates.
+        assert!(!text.contains("click by COORDINATE"));
+    }
+
+    #[test]
+    fn empty_tree_steers_to_coordinate_click() {
+        // Web content case: no addressable elements. The model must be pointed
+        // at coordinate clicking, not left with an empty list (which drove
+        // shell/AppleScript defection on 2026-07-12).
+        let mut snap = sample_snapshot();
+        snap.elements.clear();
+        let text = format_full_tree(&snap);
+        assert!(text.contains("click by COORDINATE"), "got: {text}");
+        assert!(text.contains("normalized x and y"));
+        assert!(text.contains("Do NOT switch to terminal"));
+    }
+
+    #[test]
+    fn non_interactive_only_tree_still_steers_to_coordinate_click() {
+        // Context labels (interactive=false) don't count as addressable.
+        let mut snap = sample_snapshot();
+        for el in &mut snap.elements {
+            el.interactive = false;
+            el.index = 0;
+        }
+        assert!(format_full_tree(&snap).contains("click by COORDINATE"));
     }
 
     #[test]

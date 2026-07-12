@@ -25,7 +25,8 @@ use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
 use super::policy::{is_prohibited_bundle, is_text_input_element};
 use super::types::{
-    is_browser_bundle, AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement,
+    is_browser_bundle, normalized_to_global_point, AppInfo, AppSnapshot, AxWalkLimits,
+    ElementBounds, IndexedElement, WindowFrame,
 };
 
 const ACCESSIBILITY_HELP: &str = "Accessibility permission is required. \
@@ -209,9 +210,12 @@ impl ComputerHarness for MacOsHarness {
     ) -> Result<(AppSnapshot, Option<u32>, &'static str), String> {
         let resolved = resolve_app(app)?;
         let key = snapshot_key(resolved.bundle_id.clone(), ctx);
-        cache.validate_generation(&key, generation)?;
 
         if let Some(index) = element_index {
+            // Element targeting reads the cached snapshot, so the generation
+            // must still be valid. Coordinate clicks (below) don't touch the
+            // cache and skip this — they need no prior get_app_state.
+            cache.validate_generation(&key, generation)?;
             let element = cache.element_by_index(&key, generation, index)?.clone();
             // Make the action visible: move the real pointer onto the target so
             // the user can see where the agent is clicking (AX-press itself moves
@@ -239,12 +243,25 @@ impl ComputerHarness for MacOsHarness {
             return Ok((refreshed, Some(index), method));
         }
 
-        // Raw coordinate clicks can only go through the synthetic cursor, which
-        // requires the target app to be frontmost.
-        let (px, py) = match (x, y) {
+        // Coordinate clicks: the model points in normalized image space
+        // ([0, NORMALIZED_COORD_MAX] per axis) over the screenshot it saw. We
+        // translate through the window's live frame to a global point — the
+        // model never handles global desktop coordinates it can't derive from a
+        // window-cropped image. Goes through the synthetic cursor (needs
+        // frontmost); no accessibility snapshot required.
+        let (nx, ny) = match (x, y) {
             (Some(x), Some(y)) => (x, y),
-            _ => return Err("click requires element_index or both x and y coordinates".to_string()),
+            _ => {
+                return Err(
+                    "click requires either element_index/element_title, or both x and y \
+                     normalized coordinates (0-1000, read off the screenshot)"
+                        .to_string(),
+                )
+            }
         };
+        let frame = window_frame(resolved.pid, &resolved.name)
+            .ok_or_else(|| no_capturable_window_message(resolved.pid, &resolved.name))?;
+        let (px, py) = normalized_to_global_point(nx, ny, frame);
         ensure_foreground(&resolved)?;
         click_global_point(px, py)?;
         Ok((
@@ -771,6 +788,35 @@ fn element_bounds(element: &AXUIElement) -> Option<ElementBounds> {
         y: pos.y,
         width: size.width,
         height: size.height,
+    })
+}
+
+/// The on-screen frame (global points) of the app's primary window — the same
+/// window `capture_window_png` picks, so a normalized coordinate the model read
+/// off the screenshot maps back through the identical frame. Looked up fresh at
+/// click time (not cached) so a moved/resized window can't misdirect the click.
+fn window_frame(pid: i32, app_name: &str) -> Option<WindowFrame> {
+    let windows = Window::all().ok()?;
+    let mut candidates: Vec<Window> = windows
+        .into_iter()
+        .filter(|w| {
+            w.pid().ok() == Some(pid as u32)
+                || w.app_name()
+                    .ok()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(app_name))
+        })
+        .collect();
+    candidates.sort_by_key(|w| {
+        let minimized = w.is_minimized().unwrap_or(false);
+        let area = (w.width().unwrap_or(0) as u64) * (w.height().unwrap_or(0) as u64);
+        (minimized, std::cmp::Reverse(area))
+    });
+    let w = candidates.into_iter().next()?;
+    Some(WindowFrame {
+        origin_x: w.x().ok()? as f64,
+        origin_y: w.y().ok()? as f64,
+        width: w.width().ok()? as f64,
+        height: w.height().ok()? as f64,
     })
 }
 

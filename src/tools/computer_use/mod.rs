@@ -587,9 +587,23 @@ impl ComputerUseTool {
             }
             ComputerActionKind::Click => {
                 let app = self.sticky_app(args).await?;
-                let generation = required_generation(args)?;
                 let x = optional_f64(args, "x");
                 let y = optional_f64(args, "y");
+                // A pure coordinate click (x/y, no element target) needs no
+                // accessibility snapshot, so it does not require a generation —
+                // this is the fallback when the AX tree is empty (web content).
+                let is_coordinate_click = x.is_some()
+                    && y.is_some()
+                    && optional_u32(args, "element_index").is_none()
+                    && args.get("element_title").and_then(|v| v.as_str()).is_none()
+                    && args.get("element_role").and_then(|v| v.as_str()).is_none();
+                let generation = if is_coordinate_click {
+                    args.get("snapshot_generation")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                } else {
+                    required_generation(args)?
+                };
                 let resolved = self.resolve_app(&app).await?;
                 let bundle_id = resolved.bundle_id.clone();
                 let mut cache = self.cache.lock().await;
@@ -1065,7 +1079,11 @@ impl Tool for ComputerUseTool {
          indices renumber on every re-render; use occurrence for repeated labels. type_text focuses \
          the element you target before typing, so always pass element_title/element_index when \
          typing into a specific field (e.g. an address bar). After your final mutating action, call \
-         get_app_state and confirm the visible state matches the goal before reporting success."
+         get_app_state and confirm the visible state matches the goal before reporting success. \
+         When the accessibility tree exposes no addressable elements (common for web pages in a \
+         browser and custom-drawn UIs), click by COORDINATE instead: read the target's position \
+         off the screenshot and call click with normalized x/y (0-1000 each, no snapshot_generation \
+         needed). Never fall back to terminal shell/AppleScript for GUI control."
     }
 
     fn schema(&self) -> Value {
@@ -1115,8 +1133,8 @@ impl Tool for ComputerUseTool {
                         "type": "integer",
                         "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Default 1."
                     },
-                    "x": { "type": "number", "description": "Coordinate click x (global points)" },
-                    "y": { "type": "number", "description": "Coordinate click y (global points)" },
+                    "x": { "type": "number", "description": "Coordinate-click X in NORMALIZED image space 0-1000 (0=left edge, 1000=right edge of the screenshot you were shown). Use this with y to click by pointing at the screenshot when the element list is empty or the target has no stable title/role (common for web pages in a browser). No snapshot_generation needed for a coordinate click." },
+                    "y": { "type": "number", "description": "Coordinate-click Y in NORMALIZED image space 0-1000 (0=top edge, 1000=bottom edge of the screenshot). Pair with x." },
                     "text": { "type": "string", "description": "Text to type. For type_text, also pass element_title (or element_index) to focus that field first; otherwise the text goes to whatever currently has keyboard focus." },
                     "key": { "type": "string", "description": "Key combo such as Return or Command+s" },
                     "direction": {
