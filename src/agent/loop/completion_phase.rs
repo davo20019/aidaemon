@@ -182,6 +182,12 @@ pub(super) async fn run_completion_phase(
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_default();
+        // Snapshot of what the MODEL authored this iteration. Recovery paths
+        // below may replace `reply` with daemon-built text (tool-output
+        // excerpts, fallback summaries); the tool-output-paste guard must only
+        // bounce model-authored pastes — a daemon-built reply is deliberate,
+        // already policy-gated at its build site.
+        let model_authored_reply = reply.clone();
 
         // If we used an identity-attack prefill, prepend it so the user
         // sees the full decline (the API only returns continuation tokens).
@@ -667,6 +673,19 @@ pub(super) async fn run_completion_phase(
                         tool_call_count = learning_ctx.tool_calls.len(),
                         recovered,
                         "Built activity summary instead of read_file output recovery"
+                    );
+                } else if !tool_output_paste_recovery_allowed(
+                    turn_context.completion_contract.expects_mutation,
+                    completion_progress.mutation_count,
+                ) {
+                    // An unfulfilled mutation contract: never substitute a
+                    // tool-output paste for the missing action ("Send me X" →
+                    // empty reply must not ship an `ls` of personal files).
+                    // Fall through to the activity-summary fallback below.
+                    info!(
+                        session_id,
+                        iteration,
+                        "Skipping tool-output paste recovery: mutation contract unfulfilled"
                     );
                 } else if let Some(tool_reply) = build_tool_output_completion_reply(
                     &candidate.tool_name,
@@ -1626,9 +1645,21 @@ pub(super) async fn run_completion_phase(
                 } else {
                     // First post-tool deferral: try recovering from the latest tool
                     // result before burning another LLM iteration on "I'll do X" text.
-                    let candidate =
+                    // NOT when the contract expects a mutation that hasn't happened:
+                    // pasting whatever the last read produced is never the requested
+                    // action (live 2026-07-12: "Send me my resume" → deferral →
+                    // recovery pasted an `ls -R` of personal PDFs while the send_file
+                    // stayed undone). Let the stall path nudge the model instead.
+                    let paste_recovery_allowed = tool_output_paste_recovery_allowed(
+                        turn_context.completion_contract.expects_mutation,
+                        completion_progress.mutation_count,
+                    );
+                    let candidate = if paste_recovery_allowed {
                         latest_task_tool_result_for_completion(agent, session_id, task_id, 2500)
-                            .await;
+                            .await
+                    } else {
+                        None
+                    };
                     if let Some(candidate) = candidate.as_ref() {
                         if candidate.tool_name == "send_file" {
                             reply = super::stopping_phase::send_file_completion_reply().to_string();
@@ -1906,6 +1937,7 @@ pub(super) async fn run_completion_phase(
             }
         }
 
+        let reply_is_model_authored = reply == model_authored_reply;
         // Degeneration guard: collapse runaway repetition loops before anything
         // else. Models (especially local ones) sometimes collapse into emitting
         // the same sentence or line many times in a row once their context fills
@@ -1959,10 +1991,11 @@ pub(super) async fn run_completion_phase(
         // cheap shape checks miss and we still have a retry to spend. One-shot
         // retry with a directive to answer from the data; shares the same retry
         // budget as the gutted case above.
-        let reply_is_shape_paste = reply_is_pasted_file_page(&sanitized_reply)
-            || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized_reply);
+        let reply_is_shape_paste = reply_is_model_authored
+            && (reply_is_pasted_file_page(&sanitized_reply)
+                || crate::agent::response_analysis::reply_is_raw_data_dump(&sanitized_reply));
         let mut reply_pastes_tool_output = false;
-        if !reply_is_shape_paste && !empty_response_retry_used {
+        if reply_is_model_authored && !reply_is_shape_paste && !empty_response_retry_used {
             if let Some(latest) =
                 latest_task_tool_result_for_completion(agent, session_id, task_id, 2500).await
             {

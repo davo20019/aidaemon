@@ -507,13 +507,21 @@ pub(in crate::agent) fn reply_duplicates_tool_output(reply: &str, tool_output: &
         }
         _ => reply.trim(),
     };
+    // Whitespace-normalized line form: internal runs of whitespace collapse to
+    // a single space. Exact equality is too brittle — the user-facing sanitizer
+    // normalizes spacing ("name  .pdf" → "name.pdf" cost a live miss on
+    // 2026-07-12) and weak models drift spaces when reproducing lines. Spacing
+    // must not defeat a verbatim-paste detector.
+    fn normalized_line(line: &str) -> Option<String> {
+        let compact: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Also drop whitespace before a file-extension dot, the one sanitizer
+        // rewrite that deletes (not just collapses) characters mid-line.
+        let compact = compact.replace(" .", ".");
+        (compact.chars().count() >= 8).then_some(compact)
+    }
     // Substantive content lines only — short/blank lines carry no paste signal
     // and would dilute the ratio both ways.
-    let reply_lines: Vec<&str> = reply_body
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.chars().count() >= 8)
-        .collect();
+    let reply_lines: Vec<String> = reply_body.lines().filter_map(normalized_line).collect();
     // Too few lines to be a "dump"; a one-liner that cites a path/value is a real
     // answer, not a paste.
     if reply_lines.len() < 3 {
@@ -522,11 +530,8 @@ pub(in crate::agent) fn reply_duplicates_tool_output(reply: &str, tool_output: &
     // Compare against the raw tool output's lines. The untrusted-data wrapper and
     // system-notice lines simply never match a real content line, so they cost
     // nothing; the pasted content lines (paths, JSON rows, output) match verbatim.
-    let tool_lines: std::collections::HashSet<&str> = tool_output
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.chars().count() >= 8)
-        .collect();
+    let tool_lines: std::collections::HashSet<String> =
+        tool_output.lines().filter_map(normalized_line).collect();
     if tool_lines.is_empty() {
         return false;
     }
@@ -556,6 +561,19 @@ mod tool_output_paste_tests {
     fn catches_raw_terminal_output_paste() {
         let tool = "[UNTRUSTED EXTERNAL DATA from 'terminal' — …]\nAGENTS.md\nCLAUDE.md\nNDAs\ndavid-loor-ai-expert-resume.pdf\ndavid-loor-resume.pdf";
         let reply = "Here's the command output:\n\nAGENTS.md\nCLAUDE.md\nNDAs\ndavid-loor-ai-expert-resume.pdf\ndavid-loor-resume.pdf";
+        assert!(reply_duplicates_tool_output(reply, tool));
+    }
+
+    #[test]
+    fn catches_paste_after_whitespace_drift() {
+        // Live repro (2026-07-12): the completion-recovery excerpt passed
+        // through sanitize_user_facing_reply, which collapsed the stray space
+        // before ".pdf" on half the lines; exact line equality then scored
+        // 4/8 = 50% and the guard silently missed a verbatim paste. Whitespace
+        // differences (sanitizer normalization, model spacing artifacts) must
+        // not defeat the detector.
+        let tool = "[UNTRUSTED EXTERNAL DATA from 'terminal' — …]\n/Users/jordan/projects/acme/benefits:\n2025-2026 Acme Benefits Enrollment Guide.pdf\nAsset Form - IT Onboarding  .pdf\nEmployment Agreement Exempt 6:1:2026 .pdf\nEmployee Handbook .pdf\nTime Off Policy FAQs.pdf\nEmployment Agreement 2 (1).pdf\nFT Benefits Summary.pdf";
+        let reply = "Here's the command output:\n\n/Users/jordan/projects/acme/benefits:\n2025-2026 Acme Benefits Enrollment Guide.pdf\nAsset Form - IT Onboarding.pdf\nEmployment Agreement Exempt 6:1:2026.pdf\nEmployee Handbook.pdf\nTime Off Policy FAQs.pdf\nEmployment Agreement 2 (1).pdf\nFT Benefits Summary.pdf";
         assert!(reply_duplicates_tool_output(reply, tool));
     }
 
