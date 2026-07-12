@@ -27,9 +27,17 @@ const DEFAULT_VISION_MODEL_PATTERNS: &[&str] = &[
     "mistral-large",
 ];
 
-/// OpenAI-compatible multimodal wire format is required for v1 computer_use.
+/// The GUI loop speaks the OpenAI-style multimodal wire format (image_url
+/// content blocks; tool screenshots re-enter as user-role observations).
+/// Providers qualify when their adapter consumes that format: the
+/// openai_compatible adapter natively, and google_genai via its
+/// `openai_content_to_gemini_parts` translation (image_url → inlineData).
+/// Anthropic/xAI native adapters have no verified translation yet.
 pub fn provider_supports_computer_use(kind: ProviderKind) -> bool {
-    matches!(kind, ProviderKind::OpenaiCompatible)
+    matches!(
+        kind,
+        ProviderKind::OpenaiCompatible | ProviderKind::GoogleGenai
+    )
 }
 
 pub fn model_supports_computer_use_vision(model: &str, vision: &VisionConfig) -> bool {
@@ -59,8 +67,9 @@ pub fn pick_capable_model(
 ) -> Result<String, String> {
     if !provider_supports_computer_use(provider_kind) {
         return Err(
-            "computer_use requires an OpenAI-compatible multimodal provider; \
-             native Anthropic/Google/xAI adapters are not supported for GUI loops yet"
+            "computer_use requires a provider whose adapter speaks the OpenAI-style \
+             multimodal wire (openai_compatible or google_genai); native Anthropic/xAI \
+             adapters are not supported for GUI loops yet"
                 .to_string(),
         );
     }
@@ -102,6 +111,28 @@ mod tests {
             &vision(),
             ProviderKind::OpenaiCompatible
         ));
+    }
+
+    #[test]
+    fn google_genai_gemini_meets_floor() {
+        // Live 2026-07-12: with gemini-3.5-flash as primary, computer_use
+        // refused with "requires an OpenAI-compatible multimodal provider" and
+        // the agent fell back to brittle AppleScript. The google_genai adapter
+        // consumes the same OpenAI-style multimodal wire (image_url →
+        // inlineData) and tool screenshots re-enter as user-role observations,
+        // so the GUI loop's requirements are met.
+        assert!(model_meets_computer_use_floor(
+            "gemini-3.5-flash",
+            &vision(),
+            ProviderKind::GoogleGenai
+        ));
+        let picked = pick_capable_model(
+            &["gemini-3.5-flash".to_string()],
+            &vision(),
+            ProviderKind::GoogleGenai,
+        )
+        .unwrap();
+        assert_eq!(picked, "gemini-3.5-flash");
     }
 
     #[test]
