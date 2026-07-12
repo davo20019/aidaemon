@@ -4368,7 +4368,7 @@ impl Drop for TerminalTool {
     fn drop(&mut self) {
         // Best-effort kill of all tracked background processes.
         if let Ok(running) = self.running.try_lock() {
-            for (_, proc) in running.iter() {
+            for proc in running.values() {
                 send_sigterm(proc.child_id);
                 send_sigkill(proc.child_id);
             }
