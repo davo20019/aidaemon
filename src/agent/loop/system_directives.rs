@@ -174,6 +174,8 @@ pub(in crate::agent) enum SystemDirective {
     /// A GUI success claim while an unverified coordinate click is outstanding:
     /// the last click targeted a raw point with no element identity, so it is
     /// not confirmed. Require a verifying observation before the claim ships.
+    /// Only constructed under the `computer_use` feature.
+    #[cfg_attr(not(feature = "computer_use"), allow(dead_code))]
     GuiCoordinateClickUnverified,
     /// The model produced a very short response after significant work (many
     /// tool calls) for a multi-part request. Nudge it to provide a comprehensive

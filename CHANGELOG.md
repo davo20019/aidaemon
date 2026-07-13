@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.26] - 2026-07-12
+
+### Added
+
+- **Vision-driven coordinate clicking for `computer_use`.** GUI automation over web content (a browser) previously dead-ended: the accessibility tree exposes no addressable elements for a web page, so the model was left with an empty list and no path — and defected to brittle terminal AppleScript. Coordinate clicking existed in code but was unusable (it demanded "global points" a model can't derive from a window-cropped Retina screenshot, and required a snapshot the AX walk had just failed to produce). The model now points in normalized image space (0–1000 per axis over the screenshot it was shown); the harness translates to a global point via the window's live frame (resolution/Retina-independent), needs no accessibility snapshot, and the empty-tree result plus tool description steer the model to it.
+- **`/wipe` command** — the explicit destructive "permanently delete this conversation" action (with a cannot-be-undone confirmation), registered across Telegram/Slack/Discord. This is the old `/clear` behavior, now opt-in.
+
+### Fixed
+
+- **`/clear` no longer deletes your history.** It previously hard-`DELETE`d all of a session's events and conversation summary — permanent data loss that also starved the memory pipeline (consolidation/extraction/episodes run off the events table) and destroyed the audit trail. `/clear` is now non-destructive: it records a durable context boundary so the next turn starts fresh while every event stays in the database for memory and audit. Use the new `/wipe` for true deletion.
+- **`computer_use` runs on the native Google provider.** The GUI-loop capability check rejected everything but the OpenAI-compatible provider, so with `gemini-3.5-flash` as primary a desktop task refused and fell back to AppleScript. The `google_genai` adapter speaks the same multimodal wire format (image_url → inlineData) and is now accepted (Anthropic/xAI native adapters remain excluded).
+- **`computer_use` surfaces a locked screen and can't be scripted around it.** Observations (screenshots, accessibility reads) succeed while the Mac is locked, so the model built a picture of a working session and only discovered the lock when its first click bounced — then spent minutes routing around it with terminal `osascript … System Events`. Every observation now carries a "screen is locked" banner, and the terminal blocks AppleScript System Events UI scripting (click/keystroke) as a bypass of the entire computer_use safety layer.
+- **Coordinate clicks are verified before a GUI success is claimed.** A coordinate click targets a raw point with no element identity, so the harness cannot tell a hit from a miss the way it can for element clicks — the click always "succeeds" mechanically. A live "Like the third post" reported success on an unverified guessed click. Coordinate-click results now carry an explicit unverified notice, and a GUI success claim is blocked (with a directive to observe and visually confirm) until a deliberate follow-up screenshot/get_app_state confirms the change.
+
 ## [0.11.25] - 2026-07-12
 
 ### Fixed
