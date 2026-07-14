@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.27] - 2026-07-14
+
+### Fixed
+
+- **Completion contracts no longer over-require tools for answer/read-only turns.** Plain knowledge questions such as "why is it called america?", read-only URL summarization, draft-only content help, and note-finding now avoid false mutation contracts and unnecessary verification-block retries, while genuine diagnostics with observable targets still require observation.
+
 ## [0.11.26] - 2026-07-12
 
 ### Added

@@ -350,11 +350,13 @@ struct CompletionSignals {
     asks_deliver: bool,
     asks_change: bool,
     asks_diagnose: bool,
+    mutation_obligation: bool,
     has_verification_target: bool,
     claimed_side_effect: bool,
     explicit_verification_requested: bool,
     observable_target_request: bool,
     visible_state_problem: bool,
+    read_only_request: bool,
     /// A question whose answer requires observing live external/system state
     /// (e.g. "how many users?", "who are the admins?", "any blocked users?").
     /// These have no file/URL target and no "show me / on this site" phrasing,
@@ -422,6 +424,55 @@ const CHANGE_KEYWORDS: &[&str] = &[
 /// Verbs that only mean "execute something" — mutating ONLY if the executed
 /// thing mutates, which the other keywords capture.
 const RUN_KEYWORDS: &[&str] = &["run", "execute", "rerun", "re-run"];
+
+/// Keywords that are strong enough to arm a mutation contract when they appear
+/// as direct requests. Broader content verbs such as "write" stay out of this
+/// list unless there is an artifact cue; "write a tweet" is reply generation,
+/// while "write a test file" is a filesystem mutation.
+const STRONG_MUTATION_KEYWORDS: &[&str] = &[
+    "change",
+    "update",
+    "edit",
+    "rewrite",
+    "overwrite",
+    "modify",
+    "replace",
+    "create",
+    "delete",
+    "remove",
+    "deploy",
+    "connect",
+    "set up",
+    "setup",
+    "install",
+    "restart",
+    "reload",
+    "enable",
+    "disable",
+    "remember",
+    "store",
+    "save",
+    "pull",
+    "push",
+    "fetch",
+    "merge",
+    "start",
+    "stop",
+    "compile",
+    "download",
+    "clone",
+    "migrate",
+    "fix",
+    "retry",
+    "redo",
+    "try again",
+    "do it again",
+];
+
+const WRITE_ARTIFACT_CUES: &[&str] = &[
+    "file", "script", "test", "tests", "readme", "code", "module", "function", "class", "document",
+    "doc", "page", "record", "database", "db",
+];
 
 /// "Run X and tell me what it said" — the deliverable is the OBSERVATION.
 /// True when the text asks to report/return/provide output AND the only
@@ -495,10 +546,13 @@ fn infer_completion_signals(
             "send",
             "post this",
             "post it",
+            "post a",
+            "post an",
             "post to",
             "post on",
             "upload",
-            "tweet",
+            "tweet this",
+            "tweet it",
             "email",
             "message",
             "share",
@@ -528,25 +582,33 @@ fn infer_completion_signals(
             "go live",
         ],
     );
+    // "why is/isn't" alone is a weak diagnose signal: it matches innocent
+    // knowledge questions ("why is it called america?" scored partial and
+    // paid a verification-block LLM call, task 9ae13321). The interrogative
+    // only counts when the text corroborates an observable problem — a
+    // visible-state complaint, a verification target, or a strong diagnose
+    // verb. The planner refinement layer can still re-arm observation for
+    // genuine diagnostics this heuristic misses.
+    let strong_diagnose_signal = text_contains_any_phrase(
+        lower_text,
+        &[
+            "fix",
+            "fixing",
+            "debug",
+            "diagnose",
+            "troubleshoot",
+            "issue",
+            "problem",
+            "error",
+            "fails to",
+            "failing to",
+        ],
+    );
+    let weak_why_interrogative =
+        text_contains_any_phrase(lower_text, &["why is", "why isnt", "why isn't"]);
     let asks_diagnose = visible_state_problem
-        || text_contains_any_phrase(
-            lower_text,
-            &[
-                "fix",
-                "fixing",
-                "debug",
-                "diagnose",
-                "troubleshoot",
-                "why is",
-                "why isnt",
-                "why isn't",
-                "issue",
-                "problem",
-                "error",
-                "fails to",
-                "failing to",
-            ],
-        );
+        || strong_diagnose_signal
+        || (weak_why_interrogative && has_verification_target);
     let claimed_side_effect = text_contains_any_phrase(
         lower_text,
         &[
@@ -594,13 +656,36 @@ fn infer_completion_signals(
                 "at this link",
             ],
         );
+    let read_only_request = observable_target_request
+        || text_contains_any_phrase(
+            lower_text,
+            &[
+                "read",
+                "open",
+                "summarize",
+                "show me",
+                "tell me",
+                "what's on",
+                "what is on",
+                "what does",
+                "what do you see",
+                "find",
+                "locate",
+                "list",
+                "search for",
+                "look up",
+                "check",
+                "verify",
+                "confirm",
+                "see if",
+                "status",
+            ],
+        );
 
-    // If the message is a question AND the only change-triggering keywords are
-    // memory verbs ("remember", "store", "save", "note"), demote asks_change
-    // to false. "What did I ask you to remember?" is recall, not mutation.
-    let asks_change = if asks_change && is_question {
-        // If only memory verbs triggered asks_change, it's a recall question.
-        // Check if any NON-memory change keyword is present.
+    // If a read-only turn or question only hits memory-flavored change words
+    // ("remember", "store", "save", "note"), demote asks_change. "Find the
+    // note" and "what did I ask you to remember?" are recalls, not mutations.
+    let asks_change = if asks_change && (is_question || read_only_request) {
         text_contains_any_phrase(
             lower_text,
             &[
@@ -673,6 +758,32 @@ fn infer_completion_signals(
                 ],
             ));
 
+    let instructional_question = is_question
+        && text_contains_any_phrase(
+            lower_text,
+            &[
+                "how do i",
+                "how can i",
+                "how should i",
+                "what is the best way",
+                "what's the best way",
+                "why should i",
+            ],
+        )
+        && !text_contains_any_phrase(lower_text, &["can you", "could you", "will you"]);
+    let write_artifact_request = text_contains_any_phrase(lower_text, &["write"])
+        && (has_verification_target || text_contains_any_phrase(lower_text, WRITE_ARTIFACT_CUES));
+    let execution_request =
+        text_contains_any_phrase(lower_text, RUN_KEYWORDS) && !is_run_and_report_only(lower_text);
+    let strong_mutation_request = text_contains_any_phrase(lower_text, STRONG_MUTATION_KEYWORDS)
+        || write_artifact_request
+        || execution_request;
+    let mutation_obligation = !instructional_question
+        && (asks_schedule
+            || asks_monitor
+            || asks_deliver
+            || (strong_mutation_request && asks_change));
+
     CompletionSignals {
         is_question,
         asks_schedule,
@@ -682,11 +793,13 @@ fn infer_completion_signals(
         asks_deliver,
         asks_change,
         asks_diagnose,
+        mutation_obligation,
         has_verification_target,
         claimed_side_effect,
         explicit_verification_requested,
         observable_target_request,
         visible_state_problem,
+        read_only_request,
         live_state_query,
     }
 }
@@ -806,6 +919,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     // read-only request: "check if the post is live" is a Check whose
     // fulfillment is the observation itself, not a delivery.
     let live_delivery_override = connected_content_mode.expects_live_delivery()
+        && !signals.read_only_request
         && !matches!(
             task_kind,
             CompletionTaskKind::Check | CompletionTaskKind::Find
@@ -813,24 +927,16 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     let expects_mutation = if live_delivery_override {
         true
     } else {
-        matches!(
-            task_kind,
-            CompletionTaskKind::Change
-                | CompletionTaskKind::Deliver
-                | CompletionTaskKind::Schedule
-                | CompletionTaskKind::Monitor
-                | CompletionTaskKind::Diagnose
-        )
+        signals.mutation_obligation
     };
     let requires_observation = signals.explicit_verification_requested
         || signals.observable_target_request
         || signals.visible_state_problem
         || signals.live_state_query
         || task_kind == CompletionTaskKind::Diagnose
-        || (matches!(
-            task_kind,
-            CompletionTaskKind::Check | CompletionTaskKind::Find
-        ) && (signals.has_verification_target || signals.claimed_side_effect));
+        || task_kind == CompletionTaskKind::Find
+        || (matches!(task_kind, CompletionTaskKind::Check)
+            && (signals.has_verification_target || signals.claimed_side_effect));
     let requires_reverification_after_mutation = matches!(
         task_kind,
         CompletionTaskKind::Diagnose | CompletionTaskKind::Monitor
@@ -971,6 +1077,44 @@ mod tests {
         assert!(!contract.requires_reverification_after_mutation);
     }
     #[test]
+    fn knowledge_why_questions_are_answers_not_diagnoses() {
+        // Live repro (task 9ae13321, 2026-07-14): "why is it called america?"
+        // matched the "why is" diagnose keyword → task_kind=Diagnose → the
+        // contract armed BOTH requires_observation and expects_mutation for a
+        // plain knowledge question. The correct zero-tool answer then paid a
+        // verification-block retry (a full extra LLM call) and scored partial.
+        // A bare "why is/isn't" is a weak signal: it only means Diagnose when
+        // the text corroborates an observable problem.
+        for question in [
+            "why is it called america?",
+            "why is the sky blue?",
+            "why isn't Pluto a planet?",
+        ] {
+            let contract = infer_completion_contract(question, &[]);
+            assert_eq!(
+                contract.task_kind,
+                CompletionTaskKind::Answer,
+                "{question:?} is a knowledge question, not a diagnosis"
+            );
+            assert!(!contract.requires_observation, "{question:?}");
+            assert!(!contract.expects_mutation, "{question:?}");
+        }
+
+        // Controls: "why is/isn't" plus corroboration must stay Diagnose.
+        let with_target = infer_completion_contract("why is https://blog.aidaemon.ai down?", &[]);
+        assert_eq!(with_target.task_kind, CompletionTaskKind::Diagnose);
+        assert!(with_target.requires_observation);
+
+        let with_strong_keyword =
+            infer_completion_contract("why is the daemon throwing an error?", &[]);
+        assert_eq!(with_strong_keyword.task_kind, CompletionTaskKind::Diagnose);
+        assert!(with_strong_keyword.requires_observation);
+
+        let with_visible_problem = infer_completion_contract("why is the chart not showing?", &[]);
+        assert_eq!(with_visible_problem.task_kind, CompletionTaskKind::Diagnose);
+        assert!(with_visible_problem.requires_observation);
+    }
+    #[test]
     fn still_phrase_alone_does_not_force_diagnose() {
         let contract = infer_completion_contract("I still want you to deploy the app.", &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Change);
@@ -992,15 +1136,15 @@ mod tests {
     }
     #[test]
     fn reading_target_requires_observation_without_change() {
-        // "post" triggers connected content mode DraftThenDeliver (as both
-        // a content delivery resource and a delivery verb), which forces
-        // expects_mutation=true even though task_kind remains Answer.
         let contract = infer_completion_contract(
             "Read https://blog.aidaemon.ai and summarize the latest post.",
             &[],
         );
         assert_eq!(contract.task_kind, CompletionTaskKind::Answer);
-        assert!(contract.expects_mutation);
+        assert!(
+            !contract.expects_mutation,
+            "read-only URL summarization must not inherit a delivery contract from the word 'post'"
+        );
         assert!(contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
     }
@@ -1154,21 +1298,14 @@ mod tests {
     }
     #[test]
     fn connected_content_draft_only_request_preserves_signal_derived_task_kind() {
-        // DraftOnly is advisory only — it no longer overrides task_kind to
-        // Compose or forces expects_mutation=false.  The signal-derived
-        // classification is preserved so that tool blocking decisions are
-        // based on actual intent signals, not keyword-based content mode.
         let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
         assert_eq!(
             contract.connected_content_mode,
             super::super::intent_routing::ConnectedContentMode::DraftOnly
         );
-        // task_kind comes from signals, not content mode override — DraftOnly
-        // no longer forces Compose.
         assert!(
-            contract.expects_mutation
-                || contract.task_kind == CompletionTaskKind::Conversational
-                || contract.task_kind == CompletionTaskKind::Answer
+            !contract.expects_mutation,
+            "draft-only reply generation must not require a filesystem/external mutation"
         );
     }
     #[test]
@@ -1210,13 +1347,14 @@ mod tests {
     }
     #[test]
     fn generic_find_request_does_not_force_verification_without_target() {
-        // "note" triggers asks_change which takes priority over asks_find,
-        // so this is classified as Change with expects_mutation=true.
         let contract =
             infer_completion_contract("Find the most relevant note from last week.", &[]);
-        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
-        assert!(contract.expects_mutation);
-        assert!(!contract.requires_observation);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Find);
+        assert!(
+            !contract.expects_mutation,
+            "finding a note is a read, not a memory/file write"
+        );
+        assert!(contract.requires_observation);
     }
     #[test]
     fn completion_progress_resets_after_mutation_and_clears_after_observation() {

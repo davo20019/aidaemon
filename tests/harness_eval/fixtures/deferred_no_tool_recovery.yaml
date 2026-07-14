@@ -1,5 +1,5 @@
 name: deferred_no_tool_recovery
-description: Deferred and false-in-progress texts are bounced; the eventual substantive answer ships
+description: Deferred and false-in-progress texts are bounced; unsupported success claims stay partial
 # History note (2026-07-03): this fixture previously scripted three deferred
 # texts and "passed" by shipping the third one ("I'm going to run the search
 # now.") as a Succeeded final answer with zero tools executed — it
@@ -10,9 +10,8 @@ description: Deferred and false-in-progress texts are bounced; the eventual subs
 # Known limitation, documented not hidden: the scripted tool_call lands
 # inside the ladder's force-text window (tool_choice=none; the mock ignores
 # tool_choice), so the call is discarded and the run recovers text-only.
-# The streak-acceptance escape valve then accepts the substantive final
-# text. Whether that valve should also demand observation for success-shaped
-# claims is an open design question, tracked separately.
+# The streak-acceptance escape valve no longer upgrades a no-observation
+# success claim for a find request to succeeded.
 session_id: eval_deferred_01
 user_text: Find all Rust files that contain async fn and give me the top 3 files.
 routing_models: true
@@ -25,4 +24,4 @@ mock_responses:
   - text: Found the files and compiled the async summary.
 expect:
   llm_calls_min: 3
-  outcome: succeeded
+  outcome: partial
