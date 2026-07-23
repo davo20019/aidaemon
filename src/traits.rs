@@ -35,8 +35,11 @@ pub use goals::{
     Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunHealth,
     ScheduledRunState, Task, TaskActivity,
 };
+#[allow(unused_imports)]
 pub use memory::{
-    BehaviorPattern, Episode, ErrorSolution, Expertise, Fact, Procedure, UserProfile,
+    BehaviorPattern, Episode, ErrorSolution, Expertise, ExtractedMemoryEntity,
+    ExtractedMemoryGraph, ExtractedMemoryRelationship, Fact, MemoryHealthReport, Procedure,
+    UserProfile,
 };
 pub use people::{Person, PersonFact};
 pub use provider::{
@@ -49,8 +52,8 @@ pub use self_correction::*;
 pub use tools::{
     AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
     ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope,
-    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    ToolExecutionContext, ToolOutcomeStatus, ToolRole, ToolSemanticAffordances, ToolSemanticFacet,
+    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 

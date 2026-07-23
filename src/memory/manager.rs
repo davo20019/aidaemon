@@ -2,7 +2,11 @@ use crate::config::PeopleConfig;
 use crate::events::{Consolidator, EventStore};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::memory::binary::encode_embedding;
+use crate::memory::embedding_index::{
+    content_hash, EmbeddingIndex, EmbeddingItem, MemoryOwner, SqliteEmbeddingIndex,
+};
 use crate::memory::embeddings::EmbeddingService;
+use crate::memory::embeddings::EMBEDDING_MODEL_ID;
 use crate::memory::scoring::calculate_episode_importance;
 use crate::traits::{BehaviorPattern, Message, Person, StateStore, UserProfile};
 use crate::types::{ChannelVisibility, FactPrivacy, UserRole};
@@ -140,8 +144,17 @@ impl MemoryManager {
 
     async fn process_procedure_embeddings(&self) -> anyhow::Result<bool> {
         let rows = sqlx::query(
-            "SELECT id, trigger_pattern FROM procedures WHERE trigger_embedding IS NULL AND trigger_pattern IS NOT NULL LIMIT 10",
+            "SELECT id, trigger_pattern FROM procedures p
+             WHERE trigger_pattern IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_embeddings me
+                   WHERE me.owner_type = 'procedure' AND me.owner_id = CAST(p.id AS TEXT)
+                     AND me.embedding_purpose = 'trigger' AND me.embedding_model = ?
+                     AND me.stale_at IS NULL
+               )
+             LIMIT 10",
         )
+        .bind(EMBEDDING_MODEL_ID)
         .fetch_all(&self.pool)
         .await?;
 
@@ -168,6 +181,18 @@ impl MemoryManager {
                         .bind(id)
                         .execute(&self.pool)
                         .await;
+                    if let Err(error) = SqliteEmbeddingIndex::new(self.pool.clone())
+                        .upsert(EmbeddingItem {
+                            owner: MemoryOwner::new("procedure", id),
+                            purpose: "trigger".to_string(),
+                            model: EMBEDDING_MODEL_ID.to_string(),
+                            content_hash: content_hash(trigger),
+                            embedding,
+                        })
+                        .await
+                    {
+                        warn!(procedure_id = id, %error, "Failed to project procedure embedding");
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -184,8 +209,17 @@ impl MemoryManager {
 
     async fn process_error_solution_embeddings(&self) -> anyhow::Result<bool> {
         let rows = sqlx::query(
-            "SELECT id, error_pattern FROM error_solutions WHERE error_embedding IS NULL AND error_pattern IS NOT NULL LIMIT 10",
+            "SELECT id, error_pattern FROM error_solutions e
+             WHERE error_pattern IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_embeddings me
+                   WHERE me.owner_type = 'error_solution' AND me.owner_id = CAST(e.id AS TEXT)
+                     AND me.embedding_purpose = 'error' AND me.embedding_model = ?
+                     AND me.stale_at IS NULL
+               )
+             LIMIT 10",
         )
+        .bind(EMBEDDING_MODEL_ID)
         .fetch_all(&self.pool)
         .await?;
 
@@ -210,6 +244,18 @@ impl MemoryManager {
                             .bind(id)
                             .execute(&self.pool)
                             .await;
+                    if let Err(error) = SqliteEmbeddingIndex::new(self.pool.clone())
+                        .upsert(EmbeddingItem {
+                            owner: MemoryOwner::new("error_solution", id),
+                            purpose: "error".to_string(),
+                            model: EMBEDDING_MODEL_ID.to_string(),
+                            content_hash: content_hash(pat),
+                            embedding,
+                        })
+                        .await
+                    {
+                        warn!(error_solution_id = id, %error, "Failed to project error-solution embedding");
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -582,8 +628,11 @@ impl MemoryManager {
             std::collections::HashSet::new();
 
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
-            extract durable facts worth remembering long-term. Output ONLY a JSON array: \
-            [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"privacy\": \"...\"}]. \
+            extract durable facts worth remembering long-term. Output ONLY a JSON array. Each item has \
+            category, key, value, privacy, and an optional graph object. Graph entities have local_id, \
+            name, entity_type, aliases, confidence. Relationships have source_id, target_id, relation, \
+            confidence. Use owner for the user. Include graph data only when directly supported by the \
+            owner's words; never infer entity types from category or key names. \
             Categories:\n\
             - user: Personal info about the OWNER (name, location, job)\n\
             - preference: Tool, workflow, and communication preferences\n\
@@ -721,6 +770,41 @@ impl MemoryManager {
                                             "Failed to upsert consolidated fact [{}/{}]: {}",
                                             fact.category, fact.key, e
                                         );
+                                    } else if let Some(state) = &self.state {
+                                        let excerpt =
+                                            crate::utils::truncate_str(&user_messages_text, 200);
+                                        if let Err(e) = sqlx::query(
+                                            "UPDATE facts
+                                             SET first_seen_at = COALESCE(first_seen_at, ?),
+                                                 source_excerpt = COALESCE(source_excerpt, ?)
+                                             WHERE lower(category) = lower(?) AND lower(key) = lower(?)
+                                               AND superseded_at IS NULL",
+                                        )
+                                        .bind(chrono::Utc::now().to_rfc3339())
+                                        .bind(excerpt.as_str())
+                                        .bind(&fact.category)
+                                        .bind(&fact.key)
+                                        .execute(&self.pool)
+                                        .await
+                                        {
+                                            debug!(error = %e, key = fact.key, "Failed to attach consolidated fact provenance");
+                                        }
+                                        if let Err(e) = state
+                                            .refresh_fact_memory(&fact.category, &fact.key)
+                                            .await
+                                        {
+                                            debug!(error = %e, key = fact.key, "Failed to refresh consolidated fact projection");
+                                        } else if let Err(e) = state
+                                            .project_extracted_fact_graph(
+                                                &fact.category,
+                                                &fact.key,
+                                                excerpt.as_str(),
+                                                &fact.graph,
+                                            )
+                                            .await
+                                        {
+                                            debug!(error = %e, key = fact.key, "Failed to project consolidated graph");
+                                        }
                                     }
                                 }
                                 info!(
@@ -1250,6 +1334,11 @@ impl MemoryManager {
                 .bind(episode_id)
                 .execute(&self.pool)
                 .await?;
+            // Keep the canonical span and replaceable embedding index in sync
+            // with the legacy episode column during the rolling migration.
+            if let Some(state) = &self.state {
+                let _ = state.project_episode_memory(episode_id).await;
+            }
         }
 
         // Extract goals
@@ -2135,6 +2224,8 @@ struct ExtractedFact {
     privacy: Option<String>,
     /// For "people" category: the person's name
     person_name: Option<String>,
+    #[serde(default)]
+    graph: crate::traits::ExtractedMemoryGraph,
 }
 
 /// Derive a channel_id from a session_id string.

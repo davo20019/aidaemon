@@ -89,10 +89,13 @@ pub(super) fn is_low_signal_goal_text(goal_user_text: &str) -> bool {
         "as you see fit",
         "use your best judgment",
     ];
-    if generic_phrases.iter().any(|phrase| lower.contains(phrase))
+    if generic_phrases
+        .iter()
+        .any(|phrase| contains_keyword_as_words(&lower, phrase))
         || (lower.starts_with("you are ")
-            && lower.contains("do what")
-            && (lower.contains("best") || lower.contains("judgment")))
+            && contains_keyword_as_words(&lower, "do what")
+            && (contains_keyword_as_words(&lower, "best")
+                || contains_keyword_as_words(&lower, "judgment")))
     {
         return true;
     }
@@ -102,8 +105,8 @@ pub(super) fn is_low_signal_goal_text(goal_user_text: &str) -> bool {
         || lower.contains("file://")
         || lower.contains("http://")
         || lower.contains("https://")
-        || lower.contains("project")
-        || lower.contains("repo")
+        || contains_keyword_as_words(&lower, "project")
+        || contains_keyword_as_words(&lower, "repo")
     {
         return false;
     }

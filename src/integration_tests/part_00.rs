@@ -205,8 +205,8 @@ async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical
 
 #[tokio::test]
 async fn test_llm_call_event_emitted_with_telemetry() {
-    // A normal turn should emit exactly one LlmCall observability event whose
-    // token telemetry matches the mock provider's reported usage (10 in / 5 out).
+    // A normal turn emits one planner call and one response call. The mock
+    // planner response has no usage while the response reports 10 in / 5 out.
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
     harness
@@ -231,9 +231,9 @@ async fn test_llm_call_event_emitted_with_telemetry() {
         .await
         .expect("llm stats should compute");
 
-    assert_eq!(stats.total_calls, 1, "expected one LlmCall event");
-    assert_eq!(stats.avg_input_tokens, 10);
-    assert_eq!(stats.avg_output_tokens, 5);
+    assert_eq!(stats.total_calls, 2, "expected planner and response events");
+    assert_eq!(stats.avg_input_tokens, 5);
+    assert_eq!(stats.avg_output_tokens, 2);
     assert_eq!(stats.fell_back_count, 0);
     // Latency is recorded (may be ~0ms against an instant mock provider).
     assert!(stats.p95_latency_ms >= stats.p50_latency_ms);

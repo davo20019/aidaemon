@@ -4,9 +4,6 @@ pub(in crate::agent) enum ToolResultNotice {
         policy_tool_budget: usize,
         tool_name: String,
     },
-    PersonalMemoryToolsOnly {
-        tool_name: String,
-    },
     ScopeLockBlockedResult {
         tool_name: String,
         reason: String,
@@ -155,12 +152,6 @@ impl ToolResultNotice {
                 "[SYSTEM] Hard tool budget reached: {} calls allowed per turn for this policy profile. \
                      This call to `{}` was blocked. Synthesize and answer now.",
                 policy_tool_budget, tool_name
-            ),
-            Self::PersonalMemoryToolsOnly { tool_name } => format!(
-                "[SYSTEM] Personal-memory recall should only use `manage_people` / `manage_memories` \
-                             unless the user explicitly requested broader verification. \
-                             Do not call `{}` for this query.",
-                tool_name
             ),
             Self::ScopeLockBlockedResult { tool_name, reason } => format!(
                 "[SYSTEM] Scope lock blocked `{}`: {}. Continue with tools that stay inside the active request scope.",

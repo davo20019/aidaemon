@@ -178,6 +178,31 @@ pub trait FactStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Persist a model-extracted semantic graph for an already-written fact.
+    /// Implementations must validate the graph and retain claim provenance.
+    async fn project_extracted_fact_graph(
+        &self,
+        _category: &str,
+        _key: &str,
+        _source_excerpt: &str,
+        _graph: &super::ExtractedMemoryGraph,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Refresh canonical claim/vector projections for the active fact at this key.
+    async fn refresh_fact_memory(&self, _category: &str, _key: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn memory_health_report(&self) -> anyhow::Result<super::MemoryHealthReport> {
+        Ok(super::MemoryHealthReport::default())
+    }
+
+    async fn repair_memory_projections(&self) -> anyhow::Result<super::MemoryHealthReport> {
+        self.memory_health_report().await
+    }
+
     /// Assemble the neighborhood of facts for the given resolved entity names and
     /// initial seed fact IDs (e.g. from an embedding search hit). Expands the set
     /// via namespace, co-mention, and owner-relationship cluster rules.
@@ -197,6 +222,12 @@ pub trait FactStore: Send + Sync {
 /// Episodic memory storage and retrieval.
 #[async_trait]
 pub trait EpisodeStore: Send + Sync {
+    /// Refresh derived canonical-memory projections for an episode. Stores that
+    /// do not maintain secondary indexes may keep the default no-op.
+    async fn project_episode_memory(&self, _episode_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Get episodes relevant to a query.
     async fn get_relevant_episodes(
         &self,

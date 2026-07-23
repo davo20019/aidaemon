@@ -64,6 +64,35 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
 
     info!("Plan store and event store initialized");
 
+    // Canonical memory tables are repairable projections, not authoritative
+    // state. A large legacy event history can take minutes to project, so keep
+    // that migration off the channel-readiness critical path.
+    let projection_state = state.clone();
+    tokio::spawn(async move {
+        match projection_state.backfill_missing_memory_projections().await {
+            Ok((facts, episodes, spans, procedures, error_solutions))
+                if facts > 0
+                    || episodes > 0
+                    || spans > 0
+                    || procedures > 0
+                    || error_solutions > 0 =>
+            {
+                tracing::info!(
+                    facts,
+                    episodes,
+                    spans,
+                    procedures,
+                    error_solutions,
+                    "Backfilled canonical memory projections"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "Canonical memory backfill deferred");
+            }
+        }
+    });
+
     Ok(StoreBundle {
         embedding_service,
         state,

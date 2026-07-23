@@ -1,8 +1,11 @@
 pub mod binary;
 pub mod context_window;
 pub mod core_profile;
+pub mod embedding_index;
 pub mod embeddings;
 pub mod expertise;
+pub mod graph_store;
+pub mod hybrid;
 pub mod manager;
 pub mod math;
 pub mod neighborhood;
@@ -10,6 +13,8 @@ pub mod people_intelligence;
 pub mod proactive;
 pub mod procedures;
 pub mod retention;
+#[cfg(test)]
+pub mod retrieval_eval;
 pub mod scoring;
 pub mod skill_promotion;
 pub mod task_learning;

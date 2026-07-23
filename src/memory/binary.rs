@@ -8,9 +8,6 @@ use anyhow::{bail, Result};
 /// Expected embedding dimension (AllMiniLM-L6-v2).
 const EMBEDDING_DIM: usize = 384;
 
-/// Expected binary blob size: 384 × 4 bytes.
-const BINARY_BLOB_SIZE: usize = EMBEDDING_DIM * 4;
-
 /// Encode an f32 embedding vector as flat little-endian bytes.
 pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(vec.len() * 4);
@@ -25,9 +22,19 @@ pub fn encode_embedding(vec: &[f32]) -> Vec<u8> {
 /// - If starts with `[` → legacy JSON (backward compat)
 /// - Otherwise → error
 pub fn decode_embedding(blob: &[u8]) -> Result<Vec<f32>> {
-    if blob.len() == BINARY_BLOB_SIZE {
+    decode_embedding_with_dim(blob, EMBEDDING_DIM)
+}
+
+/// Decode a vector while validating it against the dimension stored with the
+/// index row. This keeps the legacy 384-dimension API strict while allowing a
+/// future embedding backend to use a different model dimension.
+pub fn decode_embedding_with_dim(blob: &[u8], expected_dim: usize) -> Result<Vec<f32>> {
+    let expected_size = expected_dim
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("embedding dimension overflow"))?;
+    if expected_dim > 0 && blob.len() == expected_size {
         // Binary format: flat little-endian f32
-        let mut vec = Vec::with_capacity(EMBEDDING_DIM);
+        let mut vec = Vec::with_capacity(expected_dim);
         for chunk in blob.chunks_exact(4) {
             vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
@@ -38,8 +45,9 @@ pub fn decode_embedding(blob: &[u8]) -> Result<Vec<f32>> {
         Ok(vec)
     } else {
         bail!(
-            "Unknown embedding format: length={}, first byte={:?}",
+            "Unknown embedding format: length={}, expected_dim={}, first byte={:?}",
             blob.len(),
+            expected_dim,
             blob.first()
         )
     }

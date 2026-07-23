@@ -2824,10 +2824,10 @@ fn default_policy_enforce() -> bool {
     true
 }
 fn default_tool_filter_enforce() -> bool {
-    true
+    false
 }
 fn default_uncertainty_clarify_enforce() -> bool {
-    true
+    false
 }
 fn default_context_refresh_enforce() -> bool {
     true

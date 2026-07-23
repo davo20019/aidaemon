@@ -144,13 +144,11 @@ async fn record_auxiliary_model_call(
 #[allow(dead_code)]
 pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
-    router: &Router,
+    model: &str,
     user_text: &str,
     conversation_context: Option<&str>,
     telemetry: Option<PlannerTelemetryCtx<'_>>,
 ) -> Option<TaskPlan> {
-    let model = router.select(crate::router::Tier::Primary).to_string();
-
     let system = "You are a task planner. Analyze the user request and return a JSON plan. \
                   Return ONLY valid JSON, no markdown fences.";
 
@@ -217,7 +215,7 @@ pub(crate) async fn generate_task_plan(
     let call_start = Instant::now();
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        provider.chat(&model, &messages, &[]),
+        provider.chat(model, &messages, &[]),
     )
     .await
     {
@@ -234,7 +232,7 @@ pub(crate) async fn generate_task_plan(
     record_auxiliary_model_call(
         telemetry,
         "task_planner",
-        &model,
+        model,
         &result,
         call_start.elapsed().as_millis() as u64,
     )
@@ -270,7 +268,9 @@ pub(crate) async fn generate_task_plan(
     if steps.len() < 3 && looks_like_compound_task(user_text) {
         let has_execution_step = steps.iter().any(|s| {
             let d = s.description.to_lowercase();
-            d.contains("run") || d.contains("execute") || d.contains("test")
+            ["run", "execute", "test"]
+                .iter()
+                .any(|word| crate::agent::contains_keyword_as_words(&d, word))
         });
         if !has_execution_step {
             steps.push(TaskPlanStep {
@@ -280,11 +280,15 @@ pub(crate) async fn generate_task_plan(
         }
         let has_fix_step = steps.iter().any(|s| {
             let d = s.description.to_lowercase();
-            d.contains("fix") || d.contains("repair") || d.contains("resolve")
+            ["fix", "repair", "resolve"]
+                .iter()
+                .any(|word| crate::agent::contains_keyword_as_words(&d, word))
         });
         let lower = user_text.to_lowercase();
         if !has_fix_step
-            && (lower.contains("fix") || lower.contains("repair") || lower.contains("resolve"))
+            && ["fix", "repair", "resolve"]
+                .iter()
+                .any(|word| crate::agent::contains_keyword_as_words(&lower, word))
         {
             steps.push(TaskPlanStep {
                 description: "Fix any issues found in the previous step".to_string(),

@@ -1819,5 +1819,195 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await;
 
+    // Canonical long-term memory. Domain tables remain authoritative during
+    // the rolling migration; these tables are durable projections with explicit
+    // provenance, validity, and replaceable search indexes.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_spans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            span_kind TEXT NOT NULL,
+            source_event_id INTEGER,
+            source_episode_id INTEGER UNIQUE,
+            session_id TEXT,
+            channel_id TEXT,
+            role TEXT,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            observed_from TEXT,
+            observed_to TEXT,
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query("ALTER TABLE memory_spans ADD COLUMN observed_from TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE memory_spans ADD COLUMN observed_to TEXT")
+        .execute(pool)
+        .await;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            source_fact_id INTEGER UNIQUE,
+            source_span_id INTEGER,
+            source_event_id INTEGER,
+            provenance TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            superseded_by_claim_id INTEGER,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(source_span_id) REFERENCES memory_spans(id),
+            FOREIGN KEY(superseded_by_claim_id) REFERENCES memory_claims(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(entity_type, canonical_name)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            relation TEXT NOT NULL,
+            source_claim_id INTEGER,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'global',
+            valid_from TEXT NOT NULL,
+            valid_to TEXT,
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(source_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(target_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(source_claim_id) REFERENCES memory_claims(id),
+            UNIQUE(source_entity_id, target_entity_id, relation, source_claim_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_type TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            embedding_purpose TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL CHECK(embedding_dim > 0),
+            content_hash TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            stale_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(owner_type, owner_id, embedding_purpose, embedding_model, content_hash)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_memory_claims_active ON memory_claims(privacy, channel_id, valid_to, deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_spans_active ON memory_spans(privacy, channel_id, valid_to, deleted_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_spans_source_event ON memory_spans(source_event_id) WHERE source_event_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_edges_source ON memory_edges(source_entity_id, valid_to, deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_edges_target ON memory_edges(target_entity_id, valid_to, deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_lookup ON memory_embeddings(embedding_model, embedding_purpose, owner_type, stale_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_owner ON memory_embeddings(owner_type, owner_id, stale_at)",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+
+    // FTS5 is present in standard SQLite and bundled SQLCipher builds. Keep the
+    // daemon usable on custom SQLite builds without it; semantic and lexical
+    // fallback retrieval remain available.
+    if let Err(error) = create_memory_fts(pool).await {
+        tracing::warn!(%error, "SQLite FTS5 unavailable; memory full-text index disabled");
+    }
+
+    Ok(())
+}
+
+async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
+    let claims_fts_existed = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_claims_fts'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    let spans_fts_existed = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_spans_fts'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    sqlx::query(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_claims_fts USING fts5(
+            claim_text, content='memory_claims', content_rowid='id', tokenize='unicode61'
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_spans_fts USING fts5(
+            content, content='memory_spans', content_rowid='id', tokenize='unicode61'
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for statement in [
+        "CREATE TRIGGER IF NOT EXISTS memory_claims_ai AFTER INSERT ON memory_claims BEGIN INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",
+        "CREATE TRIGGER IF NOT EXISTS memory_claims_ad AFTER DELETE ON memory_claims BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); END",
+        "CREATE TRIGGER IF NOT EXISTS memory_claims_au AFTER UPDATE OF claim_text ON memory_claims BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",
+        "CREATE TRIGGER IF NOT EXISTS memory_spans_ai AFTER INSERT ON memory_spans BEGIN INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END",
+        "CREATE TRIGGER IF NOT EXISTS memory_spans_ad AFTER DELETE ON memory_spans BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); END",
+        "CREATE TRIGGER IF NOT EXISTS memory_spans_au AFTER UPDATE OF content ON memory_spans BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+
+    if !claims_fts_existed {
+        sqlx::query("INSERT INTO memory_claims_fts(memory_claims_fts) VALUES ('rebuild')")
+            .execute(pool)
+            .await?;
+    }
+    if !spans_fts_existed {
+        sqlx::query("INSERT INTO memory_spans_fts(memory_spans_fts) VALUES ('rebuild')")
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }

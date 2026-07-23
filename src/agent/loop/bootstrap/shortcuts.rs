@@ -176,24 +176,96 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
     emitter: &crate::events::EventEmitter,
 ) -> anyhow::Result<Option<String>> {
     let early_task_start = Instant::now();
+    let has_ephemeral_proposal =
+        crate::agent::schedule_confirmation::has_pending_schedule_proposal(agent, session_id).await;
     let pending_goals = agent
         .state
         .get_pending_confirmation_goals(session_id)
         .await
         .unwrap_or_default();
 
-    if pending_goals.is_empty() {
+    if !has_ephemeral_proposal && pending_goals.is_empty() {
         return Ok(None);
     }
 
+    let lower_trimmed = user_text
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_lowercase();
+    let is_confirm = matches!(
+        lower_trimmed.as_str(),
+        "confirm" | "yes" | "go ahead" | "schedule it" | "do it"
+    );
+    let is_reject = matches!(
+        lower_trimmed.as_str(),
+        "no" | "cancel" | "never mind" | "nevermind"
+    );
+
     if user_role == UserRole::Owner {
-        let lower_trimmed = user_text.trim().to_lowercase();
-        let is_confirm = ["confirm", "yes", "go ahead", "schedule it", "do it"]
-            .iter()
-            .any(|kw| contains_keyword_as_words(&lower_trimmed, kw));
-        let is_reject = ["no", "cancel", "never mind", "nevermind"]
-            .iter()
-            .any(|kw| contains_keyword_as_words(&lower_trimmed, kw));
+        if has_ephemeral_proposal {
+            if is_confirm {
+                let Some(proposal) =
+                    crate::agent::schedule_confirmation::take_pending_schedule_proposal(
+                        agent, session_id,
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
+                let report =
+                    crate::agent::schedule_confirmation::persist_and_activate_schedule_proposal(
+                        agent, &proposal,
+                    )
+                    .await;
+                let response =
+                    crate::agent::schedule_confirmation::schedule_activation_message(&report);
+                let msg = emit_bootstrap_direct_reply(
+                    agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    early_task_start,
+                    &response,
+                )
+                .await?;
+                return Ok(Some(msg));
+            }
+
+            if is_reject {
+                let proposal = crate::agent::schedule_confirmation::take_pending_schedule_proposal(
+                    agent, session_id,
+                )
+                .await;
+                let count = proposal
+                    .as_ref()
+                    .map(|proposal| proposal.goals_and_schedules.len())
+                    .unwrap_or(0);
+                let response = if count == 1 {
+                    "OK, cancelled the scheduled goal.".to_string()
+                } else {
+                    format!("OK, cancelled {} scheduled goals.", count)
+                };
+                let msg = emit_bootstrap_direct_reply(
+                    agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    early_task_start,
+                    &response,
+                )
+                .await?;
+                return Ok(Some(msg));
+            }
+
+            // A proposal applies only to the next explicit response. Moving on
+            // discards it without ever creating durable state.
+            crate::agent::schedule_confirmation::discard_pending_schedule_proposal(
+                agent, session_id,
+            )
+            .await;
+            return Ok(None);
+        }
 
         if is_confirm {
             let mut activated = Vec::new();
@@ -327,20 +399,7 @@ pub(super) async fn maybe_handle_pending_goal_confirmation(
 
     // Non-owner: if they typed confirm/reject keywords,
     // return owner-only message immediately (no LLM call).
-    let lower_trimmed = user_text.trim().to_lowercase();
-    let is_confirm_or_reject = [
-        "confirm",
-        "yes",
-        "go ahead",
-        "schedule it",
-        "do it",
-        "no",
-        "cancel",
-        "never mind",
-        "nevermind",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower_trimmed, kw));
+    let is_confirm_or_reject = is_confirm || is_reject;
     if is_confirm_or_reject {
         let msg = "Only the owner can confirm or cancel scheduled goals.";
         let msg =

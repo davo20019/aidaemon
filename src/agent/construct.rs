@@ -135,6 +135,7 @@ impl Agent {
             plan_store: RwLock::new(None),
             checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+            pending_schedule_proposals: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             // Seed the in-memory ignore-set from config so a fresh start never
             // forces `tool_choice=required` on a known-bad model. Persisted
@@ -295,6 +296,11 @@ impl Agent {
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
+        pending_schedule_proposals: Arc<
+            tokio::sync::RwLock<
+                HashMap<String, super::schedule_confirmation::PendingScheduleProposal>,
+            >,
+        >,
         billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
         required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
         record_decision_points: bool,
@@ -351,6 +357,7 @@ impl Agent {
             plan_store: RwLock::new(None),
             checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions,
+            pending_schedule_proposals,
             billing_failed_models,
             required_tool_choice_ignored_models,
             self_ref: RwLock::new(None),

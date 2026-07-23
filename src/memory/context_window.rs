@@ -27,6 +27,8 @@ pub struct InlineFact {
     pub category: String,
     pub key: String,
     pub value: String,
+    #[serde(default)]
+    pub graph: crate::traits::ExtractedMemoryGraph,
 }
 
 /// Estimate token count from text using a simple heuristic (~4 chars per token).
@@ -722,7 +724,7 @@ pub async fn extract_inline_facts(
         json!({
             "role": "system",
             "content": "You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
-                        Return a JSON array of objects with 'category', 'key', and 'value' fields.\n\n\
+                        Return a JSON array of objects with 'category', 'key', 'value', and optional 'graph' fields.\n\n\
                         Categories: user (personal info), preference (likes/dislikes), project (project details), technical (technical facts).\n\
                         Use snake_case keys like 'dog_name', 'favorite_color', 'work_company'. Be consistent with naming.\n\n\
                         CORRECTIONS: If the user is correcting or updating previously stated information (e.g., \"actually\", \"not X, it's Y\", \
@@ -731,6 +733,11 @@ pub async fn extract_inline_facts(
                         IDENTITY: The 'user' category is ONLY for facts the user states about THEMSELVES in first person. \
                         Never store another person's name (friend, family member, client, applicant, public figure) under a user \
                         identity key like 'name'. When the user talks about someone else, do not extract a 'user' fact from it.\n\n\
+                        GRAPH: When the fact contains named entities and a useful relationship, include: \
+                        \"graph\":{\"entities\":[{\"local_id\":\"e1\",\"name\":\"...\",\"entity_type\":\"person|project|technology|organization|place|concept\",\"aliases\":[],\"confidence\":0.0}], \
+                        \"relationships\":[{\"source_id\":\"e1\",\"target_id\":\"e2\",\"relation\":\"snake_case_relation\",\"confidence\":0.0}]}. \
+                        Use \"owner\" as the name for the user when needed. Only include entities and relationships directly supported by the user's words. \
+                        Do not infer entity types from fact category/key names, invent entities, or add a relationship unless both endpoints are present.\n\n\
                         If nothing is worth remembering, return an empty array: []\n\n\
                         Examples:\n\
                         - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\"}]\n\
@@ -1017,6 +1024,17 @@ pub fn spawn_progressive_extraction(
                     {
                         warn!(error = %e, key = fact.key, "Failed to store progressive fact");
                     } else {
+                        if let Err(e) = state
+                            .project_extracted_fact_graph(
+                                &fact.category,
+                                &fact.key,
+                                source_excerpt.as_str(),
+                                &fact.graph,
+                            )
+                            .await
+                        {
+                            debug!(error = %e, key = fact.key, "Failed to project extracted graph");
+                        }
                         written.push(json!({
                             "category": fact.category,
                             "key": fact.key,

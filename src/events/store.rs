@@ -309,7 +309,17 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
 
-        Ok(result.last_insert_rowid())
+        let event_id = result.last_insert_rowid();
+        if event_type_str == "user_message" {
+            if let Err(error) =
+                crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await
+            {
+                // Event persistence is canonical and must not fail because an
+                // optional derived memory index is absent or temporarily busy.
+                tracing::debug!(%error, event_id, "Deferred user-message span projection");
+            }
+        }
+        Ok(event_id)
     }
 
     /// Mark events as consolidated

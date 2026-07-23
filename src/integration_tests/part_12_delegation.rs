@@ -201,7 +201,7 @@ async fn test_spawn_child_task_lead_scopes_tools_via_shared_builder() {
 }
 
 #[tokio::test]
-async fn test_hidden_tool_guess_is_blocked_when_not_in_current_tool_defs() {
+async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
     let provider = MockProvider::with_responses(vec![
         ProviderResponse {
             content: None,
@@ -249,29 +249,22 @@ async fn test_hidden_tool_guess_is_blocked_when_not_in_current_tool_defs() {
 
     let first_call_tool_names = extract_tool_names(&calls[0].tools);
     assert!(
-        !first_call_tool_names.contains(&"cli_agent".to_string()),
-        "cli_agent should be hidden by policy filter, got {:?}",
+        first_call_tool_names.contains(&"cli_agent".to_string()),
+        "an advisory policy score must not hide a registered tool, got {:?}",
         first_call_tool_names
     );
 
-    // The hidden cli_agent call is intercepted before tool execution:
-    // either by the text-only prelude check (plain-text redirect for
-    // non-mutation turns) or by the hidden-tool guard. Both inject a
-    // tool-role message for cli_agent that prevents execution.
-    let second_call_has_tool_block = calls[1].messages.iter().any(|message| {
+    let second_call_has_tool_result = calls[1].messages.iter().any(|message| {
         message.get("role").and_then(|role| role.as_str()) == Some("tool")
             && message.get("name").and_then(|name| name.as_str()) == Some("cli_agent")
             && message
                 .get("content")
                 .and_then(|content| content.as_str())
-                .is_some_and(|content| {
-                    content.contains("not available in your current tool list")
-                        || content.contains("should be answered directly in plain text")
-                })
+                .is_some_and(|content| content.contains("cli agent executed"))
     });
     assert!(
-        second_call_has_tool_block,
-        "second call messages did not contain a tool block notice: {:?}",
+        second_call_has_tool_result,
+        "second call messages did not contain the execution result: {:?}",
         calls[1].messages
     );
 }

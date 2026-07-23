@@ -1,7 +1,7 @@
 use super::execution_state::LinearIntentStep;
 use super::*;
 use crate::events::TaskOutcome;
-use crate::execution_policy::{PolicyBundle, VerifyLevel};
+use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
 use serde::{Deserialize, Serialize};
 
@@ -479,16 +479,30 @@ fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
     if turn_is_approval_of_prior_proposal(turn_context) {
         return false;
     }
-    // ConnectedContentMode::DraftOnly is deliberately excluded here.
-    // Keyword-based "authoring only" classification is too brittle —
-    // "create 3 blog posts in ~/projects/X and commit" gets misclassified
-    // as DraftOnly because it matches "create" + "posts".  The LLM is
-    // better at deciding whether tools are needed; hard-blocking them
-    // based on keyword heuristics causes false tool disablement.
-    // The DraftOnly signal is still used downstream for budget/contract
-    // hints, just not for hard tool blocking.
-    !turn_context.completion_contract.expects_mutation
-        && !turn_context.completion_contract.requires_observation
+    // Absence of an inferred mutation/observation is not evidence that a tool
+    // call is drift. Only an explicit user prohibition may arm this redirect;
+    // ordinary text-only classification remains advisory.
+    let lower = turn_context.goal_user_text.trim().to_ascii_lowercase();
+    [
+        "draft only",
+        "answer only",
+        "explain only",
+        "do not post",
+        "don't post",
+        "do not publish",
+        "don't publish",
+        "do not send",
+        "don't send",
+        "do not modify",
+        "don't modify",
+        "do not change",
+        "don't change",
+        "without posting",
+        "without publishing",
+        "without sending",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(&lower, phrase))
 }
 
 /// The text-only drift redirect protects a plain-text turn from drifting
@@ -613,11 +627,41 @@ fn should_run_pre_execution_critique(
     // trigger critique — the interactive approval flow already gates those
     // tools separately.  Routine file writes (write_file, edit_file) were
     // being critiqued on every attempt, causing 7+ min delays for simple tasks.
-    capabilities.high_impact_write
-        || capabilities.external_side_effect
-        || matches!(policy_bundle.policy.verify_level, VerifyLevel::Full)
-        || policy_bundle.risk_score >= 0.67
-        || policy_bundle.uncertainty_score >= 0.45
+    // Critique authority comes from the selected tool's declared capability,
+    // not a lexical risk/uncertainty score over the user's prose.
+    let _ = policy_bundle;
+    capabilities.high_impact_write || capabilities.external_side_effect
+}
+
+fn tool_call_has_concrete_target(tc: &ToolCall) -> bool {
+    let Ok(args) = serde_json::from_str::<Value>(&tc.arguments) else {
+        return false;
+    };
+    [
+        "path",
+        "url",
+        "command",
+        "project",
+        "repo",
+        "repository",
+        "account",
+        "channel",
+        "recipient",
+        "to",
+        "goal_id",
+        "task_id",
+        "name",
+    ]
+    .iter()
+    .any(|key| {
+        args.get(*key).is_some_and(|value| match value {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(values) => !values.is_empty(),
+            Value::Object(values) => !values.is_empty(),
+            Value::Null => false,
+            _ => true,
+        })
+    })
 }
 
 fn should_run_pre_execution_gating(tc: &ToolCall) -> bool {
@@ -988,23 +1032,28 @@ pub(super) async fn run_tool_prelude_phase(
 
     let uncertainty_threshold =
         current_uncertainty_threshold(agent.policy_config.uncertainty_clarify_threshold);
-    if agent.policy_config.uncertainty_clarify_enforce
-        && policy_bundle.uncertainty_score >= uncertainty_threshold
-    {
-        let has_side_effecting_call = resp.tool_calls.iter().any(|tc| {
+    if agent.policy_config.uncertainty_clarify_enforce {
+        let unresolved_side_effecting_call = resp.tool_calls.iter().find(|tc| {
             uncertainty_guard_blocks_tool(
                 &tc.name,
                 tool_call_is_side_effecting(agent, tc, available_capabilities),
-            )
+            ) && !tool_call_has_concrete_target(tc)
         });
-        if has_side_effecting_call
+        if unresolved_side_effecting_call.is_some()
+            && super::policy_signals::user_text_looks_ambiguous(user_text)
             && agent
-                .supervision_gate_enforced(
+                .supervision_gate_enforced_with_context(
                     "uncertainty_clarify_gate",
                     model,
                     emitter,
                     task_id,
                     iteration,
+                    json!({
+                        "reason": "ambiguous_side_effect_without_concrete_target",
+                        "proposed_tool": unresolved_side_effecting_call.map(|tc| tc.name.as_str()),
+                        "uncertainty_score_advisory": policy_bundle.uncertainty_score,
+                        "threshold_advisory": uncertainty_threshold,
+                    }),
                 )
                 .await
         {
@@ -1017,6 +1066,7 @@ pub(super) async fn run_tool_prelude_phase(
                 iteration,
                 uncertainty_score = policy_bundle.uncertainty_score,
                 threshold = uncertainty_threshold,
+                tool = unresolved_side_effecting_call.map(|tc| tc.name.as_str()),
                 clarification = %clarify,
                 "Uncertainty guard triggered before side-effecting tool execution"
             );
@@ -1146,12 +1196,16 @@ pub(super) async fn run_tool_prelude_phase(
         if let Some(first_risky_tool_call) = first_risky_tool_call {
             if should_run_pre_execution_gating(&first_risky_tool_call)
                 && agent
-                    .supervision_gate_enforced(
+                    .supervision_gate_enforced_with_context(
                         "pre_execution_planning",
                         model,
                         emitter,
                         task_id,
                         iteration,
+                        json!({
+                            "proposed_tool": first_risky_tool_call.name.as_str(),
+                            "target": extract_target_preview(&first_risky_tool_call.arguments),
+                        }),
                     )
                     .await
             {
@@ -1614,17 +1668,16 @@ mod tests {
     }
 
     #[test]
-    fn text_only_redirect_only_applies_before_any_tool_has_executed() {
-        // Once observation tools have legitimately run this turn, the turn has
-        // proven it needs tools; redirecting a later call to plain text forces
-        // fabrication mid-chain (the pdftotext-after-read_file failure).
+    fn inferred_text_only_request_does_not_hard_redirect_tools() {
+        // A guessed answer/check classification is advisory. Only an explicit
+        // user constraint such as "answer only" may hard-disable tools.
         let turn = turn_with(
             "Can you read the file and tell me what it's about? Offer Letter (1).pdf",
             vec![],
             false,
             false,
         );
-        assert!(super::text_only_redirect_applies(&turn, 0));
+        assert!(!super::text_only_redirect_applies(&turn, 0));
         assert!(!super::text_only_redirect_applies(&turn, 3));
     }
 
@@ -1735,14 +1788,19 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_gate_unchanged_for_plain_question() {
-        // No affirmation: genuine text-only turn stays text-only.
+    fn plain_question_does_not_hard_disable_tools() {
         let tc = turn_with(
             "what's my name?",
             vec![assistant_proposal_msg()],
             false,
             false,
         );
+        assert!(!turn_prefers_plain_text_completion(&tc));
+    }
+
+    #[test]
+    fn explicit_answer_only_constraint_hard_disables_tools() {
+        let tc = turn_with("Answer only; don't change anything.", vec![], false, false);
         assert!(turn_prefers_plain_text_completion(&tc));
     }
 
@@ -1808,8 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_gate_unchanged_for_bare_yes_without_proposal() {
-        // Affirmation but no prior proposal: stay conservative (text-only).
+    fn bare_yes_without_proposal_does_not_infer_a_hard_tool_ban() {
         let tc = turn_with(
             "yes",
             vec![
@@ -1819,7 +1876,7 @@ mod tests {
             false,
             false,
         );
-        assert!(turn_prefers_plain_text_completion(&tc));
+        assert!(!turn_prefers_plain_text_completion(&tc));
     }
 
     #[test]

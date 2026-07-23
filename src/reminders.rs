@@ -154,6 +154,7 @@ pub fn canonical_description(body: &str) -> String {
 
 /// One-line scheduling confirmation, e.g.
 /// "⏰ Got it — I'll remind you to call your daughter today at 1:46 PM."
+#[cfg(test)]
 pub fn confirmation_message(reminder: &Reminder, when: &str) -> String {
     match reminder.connective {
         Some(conn) => format!(

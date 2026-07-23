@@ -322,12 +322,44 @@ pub struct TruncationInfo {
     pub remediation_hint: Option<String>,
 }
 
+/// Structured outcome of a tool invocation. This separates transport/execution
+/// success from the domain result: a test runner can execute correctly while
+/// reporting failing tests, and a lookup can complete with no matches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcomeStatus {
+    Succeeded,
+    CompletedWithNegativeResult,
+    FailedRetryable,
+    FailedPermanent,
+    Blocked,
+    Backgrounded,
+}
+
+impl ToolOutcomeStatus {
+    pub fn satisfies_requested_condition(self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::FailedRetryable | Self::FailedPermanent | Self::Blocked
+        )
+    }
+}
+
 /// Structured execution metadata returned by tools.
 ///
 /// This is intentionally minimal and backward-compatible: tools can continue
 /// returning plain text while selectively populating structured fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallMetadata {
+    /// Authoritative domain outcome when the tool can provide one. Older tools
+    /// may omit it; the loop then derives a conservative status from structured
+    /// exit/HTTP/transport metadata before falling back to legacy text parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_status: Option<ToolOutcomeStatus>,
     /// Process exit code when applicable (e.g. terminal/run_command style tools).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,

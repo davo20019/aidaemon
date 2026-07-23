@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::specialists::{
     validation as specialist_validation, SpecialistRegistry, SpecialistRenderContext,
 };
+use crate::events::TaskOutcome;
 use crate::traits::SpecialistKind;
 
 struct TaskLeadSpec {
@@ -9,6 +10,38 @@ struct TaskLeadSpec {
     system_prompt: String,
     root_tools: Vec<Arc<dyn Tool>>,
     input_text: String,
+}
+
+async fn latest_child_task_end(
+    event_store: &crate::events::EventStore,
+    child_session: &str,
+) -> Option<TaskEndData> {
+    event_store
+        .query_recent_events(child_session, 30)
+        .await
+        .ok()?
+        .iter()
+        .rev()
+        .find_map(|event| {
+            (event.event_type == EventType::TaskEnd)
+                .then(|| event.parse_data::<TaskEndData>().ok())
+                .flatten()
+        })
+}
+
+fn enforce_child_terminal_outcome(
+    result: anyhow::Result<String>,
+    task_end: Option<&TaskEndData>,
+) -> anyhow::Result<String> {
+    if result.is_ok()
+        && task_end.is_some_and(|data| data.effective_outcome() == TaskOutcome::Failed)
+    {
+        let summary = task_end
+            .and_then(|data| data.error.as_deref().or(data.summary.as_deref()))
+            .unwrap_or("child task ended without a successful outcome");
+        return Err(anyhow::anyhow!("Child task failed: {summary}"));
+    }
+    result
 }
 
 /// Returns the task-lead execution-mode prose for the given `is_scheduled` flag.
@@ -877,6 +910,7 @@ impl Agent {
             self.goal_token_registry.clone(),
             hub,
             self.schedule_approved_sessions.clone(),
+            self.pending_schedule_proposals.clone(),
             self.billing_failed_models.clone(),
             self.required_tool_choice_ignored_models.clone(),
             self.record_decision_points,
@@ -1313,25 +1347,17 @@ impl Agent {
             )),
         };
 
+        let child_task_end =
+            latest_child_task_end(&self.event_store, &child_session_for_events).await;
+        let result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
+
         if self.harness_eval_enabled() {
-            if let Ok(events) = self
-                .event_store
-                .query_recent_events(&child_session_for_events, 30)
-                .await
+            if let Some(child_snapshot) = child_task_end
+                .as_ref()
+                .and_then(|data| data.harness_eval.clone())
             {
-                if let Some(child_snapshot) = events.iter().rev().find_map(|event| {
-                    if event.event_type == EventType::TaskEnd {
-                        event
-                            .parse_data::<TaskEndData>()
-                            .ok()
-                            .and_then(|data| data.harness_eval)
-                    } else {
-                        None
-                    }
-                }) {
-                    self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
-                        .await;
-                }
+                self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
+                    .await;
             }
         }
 
@@ -1354,8 +1380,14 @@ impl Agent {
         {
             let emitter =
                 crate::events::EventEmitter::new(self.event_store.clone(), child_session.clone());
+            let structured_success = child_task_end
+                .as_ref()
+                .map(|data| data.effective_outcome().task_success());
             let (success, summary) = match &result {
-                Ok(response) => (true, response.chars().take(200).collect()),
+                Ok(response) => (
+                    structured_success.unwrap_or(true),
+                    response.chars().take(200).collect(),
+                ),
                 Err(e) => (false, format!("{}", e)),
             };
             let _ = emitter
@@ -1545,25 +1577,17 @@ impl Agent {
                 )
                 .await;
 
+            let child_task_end =
+                latest_child_task_end(&self.event_store, &child_session_for_events).await;
+            let result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
+
             if self.harness_eval_enabled() {
-                if let Ok(events) = self
-                    .event_store
-                    .query_recent_events(&child_session_for_events, 30)
-                    .await
+                if let Some(child_snapshot) = child_task_end
+                    .as_ref()
+                    .and_then(|data| data.harness_eval.clone())
                 {
-                    if let Some(child_snapshot) = events.iter().rev().find_map(|event| {
-                        if event.event_type == EventType::TaskEnd {
-                            event
-                                .parse_data::<TaskEndData>()
-                                .ok()
-                                .and_then(|data| data.harness_eval)
-                        } else {
-                            None
-                        }
-                    }) {
-                        self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
-                            .await;
-                    }
+                    self.with_harness_eval(|eval| eval.rollup_sub_agent(&child_snapshot))
+                        .await;
                 }
             }
 
@@ -1575,8 +1599,14 @@ impl Agent {
                     self.event_store.clone(),
                     child_session.clone(),
                 );
+                let structured_success = child_task_end
+                    .as_ref()
+                    .map(|data| data.effective_outcome().task_success());
                 let (success, summary) = match &result {
-                    Ok(response) => (true, response.chars().take(200).collect()),
+                    Ok(response) => (
+                        structured_success.unwrap_or(true),
+                        response.chars().take(200).collect(),
+                    ),
                     Err(e) => (false, format!("{}", e)),
                 };
                 let _ = emitter

@@ -56,7 +56,11 @@ fn extract_name_from_phrase(value: &str) -> Option<String> {
 }
 
 pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
-    let lower = user_text.trim().to_ascii_lowercase();
+    let lower = user_text
+        .trim()
+        .trim_end_matches(['?', '!', '.'])
+        .trim()
+        .to_ascii_lowercase();
     if lower.is_empty() {
         return None;
     }
@@ -74,21 +78,23 @@ pub(super) fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFact
         return None;
     }
 
-    let asks_owner_name = contains_keyword_as_words(&lower, "what is my name")
-        || contains_keyword_as_words(&lower, "what's my name")
-        || contains_keyword_as_words(&lower, "who am i")
-        || contains_keyword_as_words(&lower, "tell me my name")
-        || contains_keyword_as_words(&lower, "my full name");
+    let asks_owner_name = matches!(
+        lower.as_str(),
+        "what is my name" | "what's my name" | "who am i" | "tell me my name" | "my full name"
+    );
     if asks_owner_name {
         return Some(CriticalFactQuery::OwnerName);
     }
 
-    let asks_assistant_name = contains_keyword_as_words(&lower, "what is your name")
-        || contains_keyword_as_words(&lower, "what's your name")
-        || contains_keyword_as_words(&lower, "who are you")
-        || contains_keyword_as_words(&lower, "what should i call you")
-        || contains_keyword_as_words(&lower, "what is your bot name")
-        || contains_keyword_as_words(&lower, "what's your bot name");
+    let asks_assistant_name = matches!(
+        lower.as_str(),
+        "what is your name"
+            | "what's your name"
+            | "who are you"
+            | "what should i call you"
+            | "what is your bot name"
+            | "what's your bot name"
+    );
     if asks_assistant_name {
         return Some(CriticalFactQuery::AssistantName);
     }
@@ -219,6 +225,7 @@ pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
         || (lower.contains("remembered:") && lower.contains("name"))
 }
 
+#[allow(dead_code)] // Retained as a characterization helper; production no longer hard-filters.
 pub(super) fn filter_tool_defs_for_personal_memory(defs: &[Value]) -> Vec<Value> {
     defs.iter()
         .filter_map(|def| {

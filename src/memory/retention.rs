@@ -29,6 +29,7 @@ pub struct RetentionStats {
     pub procedures_deleted: u64,
     pub error_solutions_deleted: u64,
     pub self_correction_attempts_deleted: u64,
+    pub derived_memory_deleted: u64,
 }
 
 impl RetentionStats {
@@ -42,6 +43,7 @@ impl RetentionStats {
             + self.procedures_deleted
             + self.error_solutions_deleted
             + self.self_correction_attempts_deleted
+            + self.derived_memory_deleted
     }
 }
 
@@ -105,6 +107,11 @@ impl RetentionManager {
         match self.cleanup_self_correction_attempts().await {
             Ok(n) => stats.self_correction_attempts_deleted = n,
             Err(e) => warn!("Retention: self_correction_attempts cleanup failed: {}", e),
+        }
+
+        match self.cleanup_derived_memory().await {
+            Ok(n) => stats.derived_memory_deleted = n,
+            Err(e) => warn!("Retention: derived memory cleanup failed: {}", e),
         }
 
         Ok(stats)
@@ -311,12 +318,108 @@ impl RetentionManager {
         .await?;
         Ok(result.rows_affected())
     }
+
+    /// Remove projections whose authoritative source no longer exists. Derived
+    /// rows are disposable and must not outlive an explicit source deletion.
+    async fn cleanup_derived_memory(&self) -> anyhow::Result<u64> {
+        let has_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_claims'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_tables == 0 {
+            return Ok(0);
+        }
+
+        let mut deleted = 0;
+        deleted += sqlx::query(
+            "DELETE FROM memory_edges
+             WHERE source_claim_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM memory_claims c WHERE c.id = source_claim_id)",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_edges
+             WHERE source_claim_id IN (
+                 SELECT c.id FROM memory_claims c
+                 WHERE c.source_fact_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = c.source_fact_id)
+             )",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_embeddings
+             WHERE (owner_type = 'claim' AND NOT EXISTS (
+                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
+                OR (owner_type = 'span' AND NOT EXISTS (
+                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))
+                OR (owner_type = 'procedure' AND NOT EXISTS (
+                       SELECT 1 FROM procedures p WHERE CAST(p.id AS TEXT) = owner_id))
+                OR (owner_type = 'error_solution' AND NOT EXISTS (
+                       SELECT 1 FROM error_solutions e WHERE CAST(e.id AS TEXT) = owner_id))
+                OR (stale_at IS NOT NULL AND stale_at < datetime('now', '-30 days'))",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_claims
+             WHERE source_fact_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.id = source_fact_id)",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_spans
+             WHERE ((source_event_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM events e WHERE e.id = source_event_id))
+                OR (source_episode_id IS NOT NULL AND NOT EXISTS (
+                       SELECT 1 FROM episodes ep WHERE ep.id = source_episode_id)))
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_claims c WHERE c.source_span_id = memory_spans.id
+               )",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_embeddings
+             WHERE (owner_type = 'claim' AND NOT EXISTS (
+                       SELECT 1 FROM memory_claims c WHERE CAST(c.id AS TEXT) = owner_id))
+                OR (owner_type = 'span' AND NOT EXISTS (
+                       SELECT 1 FROM memory_spans s WHERE CAST(s.id AS TEXT) = owner_id))",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        deleted += sqlx::query(
+            "DELETE FROM memory_entities
+             WHERE canonical_name != 'owner'
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_edges edge
+                   WHERE edge.source_entity_id = memory_entities.id
+                      OR edge.target_entity_id = memory_entities.id
+               )",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
 
     async fn setup_test_db() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -705,5 +808,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(survivor, "new");
+    }
+
+    #[tokio::test]
+    async fn derived_memory_does_not_outlive_deleted_source_fact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention-memory.db");
+        let embeddings = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+            .await
+            .unwrap();
+        let pool = store.pool();
+        let fact_id = sqlx::query(
+            "INSERT INTO facts
+             (category, key, value, source, created_at, updated_at, privacy, recall_count)
+             VALUES ('technical', 'runtime', 'Rust', 'test', datetime('now'), datetime('now'), 'global', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        store.project_fact_memory(fact_id).await.unwrap();
+        sqlx::query("DELETE FROM facts WHERE id = ?")
+            .bind(fact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        assert!(manager.cleanup_derived_memory().await.unwrap() > 0);
+        let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_edges")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let embeddings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_embeddings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((claims, edges, embeddings), (0, 0, 0));
     }
 }

@@ -1,9 +1,8 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::agent::recall_guardrails::{
     detect_critical_fact_query, deterministic_reply_for_critical_query,
-    extract_critical_fact_summary, filter_tool_defs_for_personal_memory, is_personal_memory_tool,
-    looks_like_personal_memory_recall_question, user_is_reaffirmation_challenge,
-    user_requests_external_verification,
+    extract_critical_fact_summary, looks_like_personal_memory_recall_question,
+    user_is_reaffirmation_challenge, user_requests_external_verification,
 };
 use crate::agent::*;
 
@@ -217,6 +216,17 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         )
         .await?;
 
+    // A current schedule proposal owns an exact confirm/cancel response. Check
+    // it before the generic task-cancel shortcut so `cancel` discards the
+    // proposal instead of reporting "No running task to cancel".
+    if let Some(reply) = super::shortcuts::maybe_handle_pending_goal_confirmation(
+        agent, session_id, user_text, user_role, &task_id, &emitter,
+    )
+    .await?
+    {
+        return Ok(BootstrapOutcome::Return(Ok(reply)));
+    }
+
     if let Some(reply) = super::shortcuts::maybe_handle_stop_command(
         agent,
         session_id,
@@ -244,14 +254,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         &task_id,
     )
     .await;
-
-    if let Some(reply) = super::shortcuts::maybe_handle_pending_goal_confirmation(
-        agent, session_id, user_text, user_role, &task_id, &emitter,
-    )
-    .await?
-    {
-        return Ok(BootstrapOutcome::Return(Ok(reply)));
-    }
 
     if let Some(reply) = super::shortcuts::maybe_handle_non_resolving_confirmation_shortcut(
         agent, session_id, user_text, &task_id, &emitter,
@@ -494,21 +496,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             }
         }
 
-        if restrict_to_personal_memory_tools {
-            let before = defs.len();
-            defs = filter_tool_defs_for_personal_memory(&defs);
-            caps.retain(|name, _| is_personal_memory_tool(name));
-            tool_filter_stages.push(GateFilterStage::new(
-                "personal_memory_only",
-                before,
-                defs.len(),
-                if before == defs.len() {
-                    "passed"
-                } else {
-                    "filtered"
-                },
-            ));
-        }
         if restrict_untrusted_external_reference_tools {
             let before = defs.len();
             defs = filter_tool_defs_for_untrusted_external_reference(&defs);
@@ -607,33 +594,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         }
     }
 
-    if restrict_to_personal_memory_tools {
-        let before = tool_defs.len();
-        tool_defs = filter_tool_defs_for_personal_memory(&tool_defs);
-        tool_filter_stages.push(GateFilterStage::new(
-            "personal_memory_only_final",
-            before,
-            tool_defs.len(),
-            if before == tool_defs.len() {
-                "passed"
-            } else {
-                "filtered"
-            },
-        ));
-        let before_base = base_tool_defs.len();
-        base_tool_defs = filter_tool_defs_for_personal_memory(&base_tool_defs);
-        tool_filter_stages.push(GateFilterStage::new(
-            "personal_memory_only_base_final",
-            before_base,
-            base_tool_defs.len(),
-            if before_base == base_tool_defs.len() {
-                "passed"
-            } else {
-                "filtered"
-            },
-        ));
-        available_capabilities.retain(|name, _| is_personal_memory_tool(name));
-    }
     if restrict_untrusted_external_reference_tools {
         let before = tool_defs.len();
         tool_defs = filter_tool_defs_for_untrusted_external_reference(&tool_defs);

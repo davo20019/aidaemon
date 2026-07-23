@@ -4,12 +4,10 @@ session_id: eval_complex_01
 user_text: Refactor the auth module, add tests, and deploy to staging
 orchestrator: true
 mock_responses:
-  - text: I'll break this into steps and start with inspection.
+  - text: "This requires three phases: inspect the auth module, refactor and test it, then deploy the verified result to staging."
 expect:
   llm_calls_min: 1
-  # Contract-aware outcome derivation: the scripted run announces a plan but
-  # performs no mutations/observations against a change+deploy request, so
-  # the honest outcome is partial. This fixture verifies routing, not
-  # completion semantics.
-  outcome: partial
+  # The fixture verifies routing. Request keywords alone must not turn an
+  # informative planning answer into a failed or partial execution claim.
+  outcome: succeeded
   overall_min: 0.4

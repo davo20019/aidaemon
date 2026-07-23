@@ -1,5 +1,4 @@
 use crate::agent::post_task;
-use crate::agent::recall_guardrails::filter_tool_defs_for_personal_memory;
 use crate::agent::tool_loop_state::{IterationProgress, ToolLoopState};
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
@@ -12,7 +11,6 @@ pub(super) struct PostToolIterationInputs<'a> {
     pub task_tokens_used: u64,
     pub successful_tool_calls: usize,
     pub iteration_had_tool_failures: bool,
-    pub restrict_to_personal_memory_tools: bool,
     pub base_tool_defs: &'a [Value],
     pub available_capabilities: &'a HashMap<String, ToolCapabilities>,
     pub policy_bundle: &'a PolicyBundle,
@@ -186,7 +184,6 @@ pub(super) fn apply_post_tool_iteration_controls(
         task_tokens_used,
         successful_tool_calls,
         iteration_had_tool_failures,
-        restrict_to_personal_memory_tools,
         base_tool_defs,
         available_capabilities,
         policy_bundle,
@@ -337,11 +334,6 @@ pub(super) fn apply_post_tool_iteration_controls(
         widened =
             agent.ensure_connected_api_tools_exposed(inputs.user_text, &widened, base_tool_defs);
         widened.truncate(20);
-        let widened = if restrict_to_personal_memory_tools {
-            filter_tool_defs_for_personal_memory(&widened)
-        } else {
-            widened
-        };
         if !widened.is_empty() {
             POLICY_METRICS
                 .fallback_expansion_total

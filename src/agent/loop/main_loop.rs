@@ -403,53 +403,42 @@ impl Agent {
                         Some(ctx_parts.join("\n"))
                     }
                 };
-                let plan_opt = if let Some(ref router) = llm_router {
-                    self.emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        crate::events::DecisionType::HandHoldingTelemetry,
-                        "Task planner attempted".to_string(),
-                        super::hand_holding_telemetry::planner_result_metadata(
-                            "attempted",
-                            &model,
-                            planner_trust_tier,
-                            super::hand_holding_telemetry::PlannerResultStats::empty(),
-                            None,
-                        ),
-                    )
-                    .await;
-                    generate_task_plan(
-                        llm_provider.clone(),
-                        router,
-                        user_text,
-                        planner_context.as_deref(),
-                        Some(super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
-                            emitter: &emitter,
-                            state: self.state.as_ref(),
-                            session_id,
-                            task_id: &task_id,
-                        }),
-                    )
-                    .await
-                } else {
-                    self.emit_decision_point(
-                        &emitter,
-                        &task_id,
-                        0,
-                        crate::events::DecisionType::HandHoldingTelemetry,
-                        "Task planner unavailable".to_string(),
-                        super::hand_holding_telemetry::planner_result_metadata(
-                            "no_plan",
-                            &model,
-                            planner_trust_tier,
-                            super::hand_holding_telemetry::PlannerResultStats::empty(),
-                            Some("no_router"),
-                        ),
-                    )
-                    .await;
-                    None
-                };
+                let planner_model = llm_router
+                    .as_ref()
+                    .map(|router| router.select(crate::router::Tier::Primary))
+                    .unwrap_or(model.as_str());
+                self.emit_decision_point(
+                    &emitter,
+                    &task_id,
+                    0,
+                    crate::events::DecisionType::HandHoldingTelemetry,
+                    "Task planner attempted".to_string(),
+                    super::hand_holding_telemetry::planner_result_metadata(
+                        "attempted",
+                        planner_model,
+                        planner_trust_tier,
+                        super::hand_holding_telemetry::PlannerResultStats::empty(),
+                        None,
+                    ),
+                )
+                .await;
+                // Single-model deployments still run the planner. The router
+                // chooses a model when present; otherwise the active model
+                // reads the request instead of leaving lexical inference as
+                // the only contract classifier.
+                let plan_opt = generate_task_plan(
+                    llm_provider.clone(),
+                    planner_model,
+                    user_text,
+                    planner_context.as_deref(),
+                    Some(super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
+                        emitter: &emitter,
+                        state: self.state.as_ref(),
+                        session_id,
+                        task_id: &task_id,
+                    }),
+                )
+                .await;
                 if let Some(plan) = plan_opt {
                     let before_contract = turn_context.completion_contract.clone();
                     // The planner read the actual request (any language), so
@@ -535,7 +524,7 @@ impl Agent {
                         step_count,
                         "Task plan installed and budget evaluated"
                     );
-                } else if llm_router.is_some() {
+                } else {
                     self.emit_decision_point(
                         &emitter,
                         &task_id,
@@ -1110,7 +1099,6 @@ impl Agent {
                         available_capabilities: &mut available_capabilities,
                         policy_bundle: &mut policy_bundle,
                         tools_allowed_for_user,
-                        restrict_to_personal_memory_tools,
                         llm_provider: llm_provider.clone(),
                         llm_router: llm_router.clone(),
                         model: &model,
@@ -1411,7 +1399,6 @@ impl Agent {
                     available_capabilities: &mut available_capabilities,
                     policy_bundle: &mut policy_bundle,
                     tools_allowed_for_user,
-                    restrict_to_personal_memory_tools,
                     is_personal_memory_recall_turn,
                     is_reaffirmation_challenge_turn,
                     requests_external_verification,

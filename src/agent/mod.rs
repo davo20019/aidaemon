@@ -202,7 +202,7 @@ mod recall_guardrails;
 #[path = "policy/trust_tier.rs"]
 pub(crate) mod trust_tier;
 use loop_utils::{
-    build_task_boundary_hint, classify_execution_failure_kind,
+    build_task_boundary_hint, classify_execution_failure_kind, classify_tool_outcome_status,
     classify_tool_result_failure_with_context, extract_command_from_args,
     extract_file_path_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
     fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
@@ -261,6 +261,8 @@ mod orchestration_phase;
 mod parent_delivery;
 #[path = "runtime/project_scope.rs"]
 mod project_scope;
+#[path = "runtime/schedule_confirmation.rs"]
+mod schedule_confirmation;
 pub(crate) mod specialists;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
@@ -451,6 +453,10 @@ pub struct Agent {
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Unconfirmed schedule proposals. Kept per agent runtime so request-text
+    /// classification cannot create durable state before explicit confirmation.
+    pending_schedule_proposals:
+        Arc<tokio::sync::RwLock<HashMap<String, schedule_confirmation::PendingScheduleProposal>>>,
     /// Models that recently returned 402 billing errors. Maps model name → failure time.
     /// Shared across parent/child agents. Entries expire after BILLING_FAIL_CACHE_TTL.
     billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,

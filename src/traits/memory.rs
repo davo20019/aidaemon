@@ -37,6 +37,56 @@ fn default_fact_privacy() -> FactPrivacy {
     FactPrivacy::Global
 }
 
+/// An entity proposed by the memory extraction model. `local_id` is scoped to
+/// one extraction result and is used by relationships to avoid name ambiguity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMemoryEntity {
+    pub local_id: String,
+    pub name: String,
+    pub entity_type: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default = "default_extraction_confidence")]
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMemoryRelationship {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: String,
+    #[serde(default = "default_extraction_confidence")]
+    pub confidence: f32,
+}
+
+/// Optional semantic graph attached to a fact extraction. Fact persistence is
+/// independent: invalid graph output is ignored rather than poisoning memory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtractedMemoryGraph {
+    #[serde(default)]
+    pub entities: Vec<ExtractedMemoryEntity>,
+    #[serde(default)]
+    pub relationships: Vec<ExtractedMemoryRelationship>,
+}
+
+fn default_extraction_confidence() -> f32 {
+    0.5
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryHealthReport {
+    pub spans: i64,
+    pub active_claims: i64,
+    pub entities: i64,
+    pub active_edges: i64,
+    pub active_embeddings: i64,
+    pub stale_embeddings: i64,
+    pub facts_missing_claims: i64,
+    pub episodes_missing_spans: i64,
+    pub orphan_edges: i64,
+    pub embedding_dimension_mismatches: i64,
+}
+
 /// An episode representing a session summary (episodic memory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {

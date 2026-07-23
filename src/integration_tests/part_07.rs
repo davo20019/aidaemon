@@ -458,7 +458,7 @@ async fn test_compound_message_with_challenge_keyword_skips_reaffirmation_anchor
 }
 
 #[tokio::test]
-async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
+async fn test_orchestration_scheduled_one_shot_stays_ephemeral_until_confirmation() {
     // Deterministic schedule heuristics route before any LLM call.
     let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -486,16 +486,7 @@ async fn test_orchestration_scheduled_one_shot_creates_pending_confirmation() {
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].goal_type, "finite");
-    assert_eq!(goals[0].status, "pending_confirmation");
-    let schedules = harness
-        .state
-        .get_schedules_for_goal(&goals[0].id)
-        .await
-        .unwrap();
-    assert_eq!(schedules.len(), 1);
-    assert!(schedules[0].is_one_shot);
+    assert!(goals.is_empty(), "unconfirmed proposal must not be durable");
 }
 
 #[tokio::test]
@@ -528,19 +519,11 @@ async fn test_orchestration_scheduled_malformed_schedule_recovers_from_user_text
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].status, "pending_confirmation");
-    let schedules = harness
-        .state
-        .get_schedules_for_goal(&goals[0].id)
-        .await
-        .unwrap();
-    assert_eq!(schedules.len(), 1);
-    assert!(schedules[0].is_one_shot);
+    assert!(goals.is_empty(), "unconfirmed proposal must not be durable");
 }
 
 #[tokio::test]
-async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
+async fn test_orchestration_scheduled_recurring_stays_ephemeral_until_confirmation() {
     // Deterministic schedule heuristics route before any LLM call.
     let provider = MockProvider::new();
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
@@ -568,22 +551,11 @@ async fn test_orchestration_scheduled_recurring_creates_pending_confirmation() {
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].goal_type, "continuous");
-    assert_eq!(goals[0].status, "pending_confirmation");
-    assert_eq!(goals[0].budget_per_check, Some(100_000));
-    assert_eq!(goals[0].budget_daily, Some(500_000));
-    let schedules = harness
-        .state
-        .get_schedules_for_goal(&goals[0].id)
-        .await
-        .unwrap();
-    assert_eq!(schedules.len(), 1);
-    assert!(!schedules[0].is_one_shot);
+    assert!(goals.is_empty(), "unconfirmed proposal must not be durable");
 }
 
 #[tokio::test]
-async fn test_orchestration_scheduled_multi_segment_creates_two_pending_goals() {
+async fn test_orchestration_scheduled_multi_segment_stays_ephemeral() {
     let provider = MockProvider::new(); // Deterministic schedule heuristics path
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
@@ -614,19 +586,7 @@ async fn test_orchestration_scheduled_multi_segment_creates_two_pending_goals() 
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 2);
-    assert!(
-        goals.iter().all(|goal| goal.status == "pending_confirmation"),
-        "All goals should await confirmation"
-    );
-    assert!(
-        goals.iter().any(|goal| goal.description == "Check server health"),
-        "Expected cleaned recurring description"
-    );
-    assert!(
-        goals.iter().any(|goal| goal.description == "Send status report"),
-        "Expected cleaned one-shot description"
-    );
+    assert!(goals.is_empty(), "unconfirmed batch must not be durable");
 }
 
 #[tokio::test]
@@ -695,7 +655,7 @@ async fn test_orchestration_scheduled_multi_segment_confirm_and_cancel() {
         .await
         .unwrap();
     assert!(
-        cancel_response.contains("cancelled 2 goals"),
+        cancel_response.contains("cancelled 2 scheduled goals"),
         "Expected batch cancellation, got: {cancel_response}"
     );
     let cancel_goals = harness
@@ -703,16 +663,14 @@ async fn test_orchestration_scheduled_multi_segment_confirm_and_cancel() {
         .get_goals_for_session("test_session_cancel")
         .await
         .unwrap();
-    assert_eq!(cancel_goals.len(), 2);
     assert!(
-        cancel_goals
-            .iter()
-            .all(|goal| goal.status == "cancelled")
+        cancel_goals.is_empty(),
+        "cancelled proposal must never create goal rows"
     );
 }
 
 #[tokio::test]
-async fn test_orchestration_scheduled_multi_segment_auto_confirms_when_session_preapproved() {
+async fn test_orchestration_scheduled_multi_segment_prior_approval_does_not_auto_confirm() {
     let provider = MockProvider::new(); // Deterministic schedule heuristics path
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
     harness
@@ -733,22 +691,18 @@ async fn test_orchestration_scheduled_multi_segment_auto_confirms_when_session_p
         .await
         .unwrap();
 
-    assert!(
-        response.contains("Scheduled 2 goals"),
-        "Expected auto-confirmed batch activation, got: {response}"
-    );
+    assert!(response.contains("Reply **confirm**"), "got: {response}");
 
     let goals = harness
         .state
         .get_goals_for_session("test_session_preapproved_multi")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 2);
-    assert!(goals.iter().all(|goal| goal.status == "active"));
+    assert!(goals.is_empty());
     assert_eq!(
         harness.provider.call_count().await,
         0,
-        "Auto-approved scheduling should not require LLM calls"
+        "Schedule proposal should not require LLM calls"
     );
 }
 
@@ -937,6 +891,19 @@ async fn test_orchestration_scheduled_single_description_uses_current_turn_task_
         .await
         .unwrap();
 
+    let _ = harness
+        .agent
+        .handle_message(
+            "test_session_description_contamination",
+            "confirm",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
     let goals = harness
         .state
         .get_goals_for_session("test_session_description_contamination")
@@ -950,7 +917,7 @@ async fn test_orchestration_scheduled_single_description_uses_current_turn_task_
         !goals[0].description.contains("daily budget"),
         "Description should not include unrelated prior turn text"
     );
-    // Plain one-shot reminders are auto-confirmed (no approval gate).
+    // The exact current-turn confirmation persists and activates it.
     assert_eq!(goals[0].status, "active");
 }
 
@@ -1042,8 +1009,7 @@ async fn test_orchestration_schedule_cancel_removes_goal() {
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].status, "cancelled");
+    assert!(goals.is_empty(), "cancelled proposal must not create a row");
 }
 
 #[tokio::test]
@@ -1157,8 +1123,7 @@ async fn test_orchestration_schedule_new_message_cancels_pending() {
         .get_goals_for_session("test_session")
         .await
         .unwrap();
-    assert_eq!(goals.len(), 1);
-    assert_eq!(goals[0].status, "cancelled");
+    assert!(goals.is_empty(), "moving on should discard the proposal");
 }
 
 #[tokio::test]

@@ -1470,7 +1470,7 @@ async fn test_route_failsafe_does_not_turn_plain_text_draft_into_tool_required_l
 }
 
 #[tokio::test]
-async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool() {
+async fn test_inferred_text_only_turn_does_not_override_model_tool_decision() {
     let temp_path = std::env::temp_dir().join(format!(
         "aidaemon-text-only-drift-{}.txt",
         uuid::Uuid::new_v4()
@@ -1503,8 +1503,9 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
     ]);
 
     let harness = setup_full_stack_test_agent(provider).await.unwrap();
-    // Use a conversational question that doesn't trigger expects_mutation
-    // or requires_observation, so the text-only prelude fires.
+    // A conversational question alone is not an explicit no-tools contract.
+    // The model's tool decision remains subject to the normal capability and
+    // approval layers instead of a keyword-derived text-only override.
     let response = harness
         .agent
         .handle_message(
@@ -1532,12 +1533,13 @@ async fn test_text_only_turn_recovers_when_model_drifts_to_side_effecting_tool()
     );
     assert_eq!(
         call_log[1].options.tool_choice,
-        crate::traits::ToolChoiceMode::None
+        crate::traits::ToolChoiceMode::Auto
     );
     assert!(
-        !temp_path.exists(),
-        "side-effecting terminal drift should be blocked before execution"
+        temp_path.exists(),
+        "an inferred text-only classification must not block an otherwise allowed tool call"
     );
+    let _ = std::fs::remove_file(&temp_path);
 }
 
 struct SpawnAgentMock;

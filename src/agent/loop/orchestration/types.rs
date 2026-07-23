@@ -15,7 +15,6 @@ pub(in crate::agent) struct OrchestrationCtx<'a> {
     pub available_capabilities: &'a mut HashMap<String, ToolCapabilities>,
     pub policy_bundle: &'a mut PolicyBundle,
     pub tools_allowed_for_user: bool,
-    pub restrict_to_personal_memory_tools: bool,
     pub llm_provider: Arc<dyn ModelProvider>,
     pub llm_router: Option<Router>,
     pub model: &'a String,

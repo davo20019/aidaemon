@@ -22,7 +22,7 @@ use crate::events::{
 };
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolVerificationMode,
+    ToolExecutionContext, ToolOutcomeStatus, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
@@ -2870,6 +2870,7 @@ impl TerminalTool {
                     );
                     return Ok(ToolCallOutcome {
                         metadata: ToolCallMetadata {
+                            outcome_status: Some(ToolOutcomeStatus::Backgrounded),
                             background_started: true,
                             detached: true,
                             timed_out: false,
@@ -3931,6 +3932,7 @@ impl TerminalTool {
                 }
                 Ok(ToolCallOutcome {
                     metadata: ToolCallMetadata {
+                        outcome_status: Some(ToolOutcomeStatus::Backgrounded),
                         background_started: true,
                         timed_out: true,
                         detached: detach,
@@ -4488,6 +4490,13 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
 
 fn foreground_terminal_metadata(exit_code: Option<i32>) -> ToolCallMetadata {
     ToolCallMetadata {
+        outcome_status: exit_code.map(|code| {
+            if code == 0 {
+                ToolOutcomeStatus::Succeeded
+            } else {
+                ToolOutcomeStatus::CompletedWithNegativeResult
+            }
+        }),
         exit_code,
         timed_out: false,
         background_started: false,
@@ -4508,6 +4517,7 @@ fn tracked_background_metadata(
     exit_code: Option<i32>,
 ) -> ToolCallMetadata {
     ToolCallMetadata {
+        outcome_status: Some(ToolOutcomeStatus::Backgrounded),
         exit_code,
         timed_out: true,
         background_started: true,

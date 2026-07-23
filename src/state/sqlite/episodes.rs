@@ -2,6 +2,10 @@ use super::*;
 
 #[async_trait]
 impl crate::traits::EpisodeStore for SqliteStateStore {
+    async fn project_episode_memory(&self, episode_id: i64) -> anyhow::Result<()> {
+        SqliteStateStore::project_episode_memory(self, episode_id).await
+    }
+
     async fn get_relevant_episodes(
         &self,
         query: &str,
@@ -21,7 +25,7 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
         // Episodes without channel_id (legacy) are accessible everywhere
         let rows = sqlx::query(
             "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id, embedding
-             FROM episodes WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500"
+             FROM episodes ORDER BY created_at DESC LIMIT 500"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -34,6 +38,10 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
             Ok(v) => v,
             Err(_) => return Ok(vec![]),
         };
+        let indexed_scores = self
+            .episode_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
 
         let mut scored: Vec<(Episode, f32)> = Vec::new();
         for row in rows {
@@ -50,20 +58,22 @@ impl crate::traits::EpisodeStore for SqliteStateStore {
                 continue;
             }
 
-            let embedding: Option<Vec<u8>> = row.get("embedding");
-            if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
-                    let similarity = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                    let episode = self.row_to_episode(&row)?;
-                    let score = crate::memory::scoring::memory_score(
-                        similarity,
-                        episode.created_at,
-                        episode.recall_count,
-                        episode.last_recalled_at,
-                    );
-                    if score > 0.3 {
-                        scored.push((episode, score));
-                    }
+            let episode_id: i64 = row.get("id");
+            let similarity = indexed_scores.get(&episode_id).copied().or_else(|| {
+                row.get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            if let Some(similarity) = similarity {
+                let episode = self.row_to_episode(&row)?;
+                let score = crate::memory::scoring::memory_score(
+                    similarity,
+                    episode.created_at,
+                    episode.recall_count,
+                    episode.last_recalled_at,
+                );
+                if score > 0.3 {
+                    scored.push((episode, score));
                 }
             }
         }

@@ -496,37 +496,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         };
         let is_personal_memory_tool_call = is_personal_memory_tool(&tc.name);
 
-        if restrict_to_personal_memory_tools {
-            if !is_personal_memory_tool_call {
-                let result_text = ToolResultNotice::PersonalMemoryToolsOnly {
-                    tool_name: tc.name.clone(),
-                }
-                .render();
-                let tool_msg = Message {
-                    id: Uuid::new_v4().to_string(),
-                    session_id: session_id.to_string(),
-                    role: "tool".to_string(),
-                    content: Some(result_text),
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls_json: None,
-                    created_at: Utc::now(),
-                    importance: 0.1,
-                    ..Message::runtime_defaults()
-                };
-                agent
-                    .append_tool_message_with_result_event(
-                        emitter,
-                        &tool_msg,
-                        true,
-                        0,
-                        None,
-                        Some(task_id),
-                    )
-                    .await?;
-                continue;
-            }
-
+        if restrict_to_personal_memory_tools && is_personal_memory_tool_call {
             if personal_memory_tool_calls >= personal_memory_tool_call_cap {
                 force_text_response = true;
                 pending_system_messages.push(SystemDirective::PersonalMemoryRecheckLimitReached);
@@ -985,7 +955,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 // use write_file" from "model keeps retrying the same blocked
                 // tool every iteration."
                 hard_block_streak += 1;
-                if hard_block_streak >= 3 {
+                if unknown_tools.contains(&tc.name) || hard_block_streak >= 3 {
                     // Model is stuck retrying blocked tools — force text.
                     force_text_response = true;
                     pending_system_messages.push(SystemDirective::HardToolLimitReached);
@@ -1479,7 +1449,14 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             Some(&result_metadata),
             false,
         );
-        let is_error = failure_class.is_some();
+        let tool_outcome_status = classify_tool_outcome_status(
+            &tc.name,
+            &result_text,
+            Some(&effective_arguments),
+            Some(&result_metadata),
+        );
+        let is_error = tool_outcome_status.is_failure();
+        let outcome_satisfied = tool_outcome_status.satisfies_requested_condition();
 
         // ── Correction gate finalization (Step 13) ───────────────────────────
         // Record transport-level executed vs failure AFTER io completes and
@@ -1595,7 +1572,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .map(|plan| plan.plan_version);
             execution_state.record_outcome(OutcomeEntry {
                 tool_name: tc.name.clone(),
-                success: !is_error,
+                success: outcome_satisfied,
                 http_status: result_metadata.http_status,
                 is_external_mutation,
                 error_summary,
@@ -1607,7 +1584,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 expected_step_count,
             });
             // Advance linear intent step pointer on successful external mutation
-            if !is_error && planned_step.is_some() {
+            if outcome_satisfied && planned_step.is_some() {
                 execution_state.advance_linear_intent_step_after_external_success();
             }
             // Retain raw output for the answer-grounding gate (completion
@@ -1636,6 +1613,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     "execution_state": execution_state.clone(),
                     "background_detached": background_detached,
                     "is_error": is_error,
+                    "tool_outcome_status": tool_outcome_status,
                 }),
             )
             .await;
@@ -1679,13 +1657,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let learning_env = ResultLearningEnv {
             attempted_required_file_recheck,
             send_file_key,
-            restrict_to_personal_memory_tools,
             is_reaffirmation_challenge_turn,
             session_id,
             task_id,
             emitter,
             task_start,
             iteration,
+            restrict_to_personal_memory_tools,
             tool_arguments: &effective_arguments,
             tool_summary: &tool_summary,
         };
@@ -1726,6 +1704,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tc,
             &mut result_text,
             is_error,
+            outcome_satisfied,
             failure_class,
             execution_failure_kind,
             &learning_env,
@@ -1743,7 +1722,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             commit_state!();
             return Ok(outcome);
         }
-        if !is_error {
+        if outcome_satisfied {
             reconcile_successful_tool_checklist(
                 agent,
                 session_id,
@@ -1791,7 +1770,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
-        if !is_error {
+        if outcome_satisfied {
             // Each successful tool execution extends the budget so
             // productive multi-step runs are never artificially stopped.
             execution_state.extend_budget_on_progress();
@@ -1922,7 +1901,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
-        if !is_error {
+        if outcome_satisfied {
             if let Ok(events) = agent
                 .event_store
                 .query_task_events_for_session(session_id, task_id)
@@ -1981,7 +1960,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             )
             .await?;
 
-        if !is_error && tc.name == "report_blocker" && agent.task_id.is_some() {
+        if outcome_satisfied && tc.name == "report_blocker" && agent.task_id.is_some() {
             // Capture the raw structured summary — the untrusted-data wrapper
             // would be stripped by reply sanitization, leaving an empty reply.
             executor_blocker_summary = Some(
@@ -1989,7 +1968,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             );
         }
 
-        let direct_response = if !is_error
+        let direct_response = if outcome_satisfied
             && agent.depth == 0
             && resp.tool_calls.len() == 1
             && !background_detached
@@ -2065,7 +2044,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 tool_name: Some(tc.name.clone()),
                 tool_args: Some(effective_arguments.chars().take(1000).collect()),
                 result: Some(result_text.chars().take(2000).collect()),
-                success: Some(!is_error),
+                success: Some(outcome_satisfied),
                 tokens_used: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
@@ -2134,7 +2113,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             task_tokens_used,
             successful_tool_calls,
             iteration_had_tool_failures,
-            restrict_to_personal_memory_tools,
             base_tool_defs,
             available_capabilities,
             policy_bundle,
@@ -2167,8 +2145,7 @@ mod correction_gate_tests {
     use crate::agent::correction_execution::{
         build_correction_execution_context, CorrectionDispatchMode,
     };
-    use crate::agent::correction_sandbox::{CorrectionSubjectContext, IntendedAccount};
-    use crate::agent::self_correction::AttemptDecision;
+    use crate::agent::correction_sandbox::CorrectionSubjectContext;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::SelfCorrectionSubjectKind;
     use std::sync::Arc;

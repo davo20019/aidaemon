@@ -155,10 +155,33 @@ impl crate::agent::Agent {
         task_id: &str,
         iteration: usize,
     ) -> bool {
+        self.supervision_gate_enforced_with_context(
+            heuristic,
+            model,
+            emitter,
+            task_id,
+            iteration,
+            serde_json::Value::Null,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn supervision_gate_enforced_with_context(
+        &self,
+        heuristic: &'static str,
+        model: &str,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        context: serde_json::Value,
+    ) -> bool {
         let tier = self.trust_tier_for_model(model);
         let action = gate_action_for_tier(tier);
-        self.persist_gate_fire(emitter, task_id, iteration, heuristic, model, tier, action)
-            .await;
+        self.persist_gate_fire_with_context(
+            emitter, task_id, iteration, heuristic, model, tier, action, context,
+        )
+        .await;
         matches!(action, HeuristicAction::Enforced)
     }
 
@@ -177,6 +200,31 @@ impl crate::agent::Agent {
         tier: ModelTrustTier,
         action: HeuristicAction,
     ) {
+        self.persist_gate_fire_with_context(
+            emitter,
+            task_id,
+            iteration,
+            heuristic,
+            model,
+            tier,
+            action,
+            serde_json::Value::Null,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_gate_fire_with_context(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        task_id: &str,
+        iteration: usize,
+        heuristic: &str,
+        model: &str,
+        tier: ModelTrustTier,
+        action: HeuristicAction,
+        context: serde_json::Value,
+    ) {
         global().record(heuristic, model, tier, action);
         self.emit_decision_point(
             emitter,
@@ -190,6 +238,7 @@ impl crate::agent::Agent {
                 "action": action.as_str(),
                 "tier": tier.as_str(),
                 "model": model,
+                "context": context,
             }),
         )
         .await;

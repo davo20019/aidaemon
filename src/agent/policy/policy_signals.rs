@@ -330,9 +330,28 @@ pub(super) fn build_policy_bundle(
 }
 
 pub(super) fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str, bool)> {
-    let lower = text.to_ascii_lowercase();
-    let positives = ["thanks", "perfect", "got it", "that worked"];
-    if positives.iter().any(|p| lower.contains(p)) {
+    let lower = text.trim().to_ascii_lowercase();
+    // Feedback learning must not reinterpret a substantive new request just
+    // because it contains a courtesy word (for example, "thanks to X, deploy
+    // Y"). Restrict automatic labels to short feedback-shaped turns.
+    if lower.chars().count() > 240 {
+        return None;
+    }
+
+    let normalized = lower
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .trim();
+    let exact_positives = ["thanks", "thank you", "perfect", "got it", "that worked"];
+    let explicit_positive_result = [
+        "that worked",
+        "it worked",
+        "works now",
+        "looks good",
+        "exactly what i needed",
+    ]
+    .iter()
+    .any(|phrase| contains_keyword_as_words(normalized, phrase));
+    if exact_positives.contains(&normalized) || explicit_positive_result {
         return Some(("positive", true));
     }
     let negatives = [
@@ -341,7 +360,10 @@ pub(super) fn detect_explicit_outcome_signal(text: &str) -> Option<(&'static str
         "not what i asked",
         "you misunderstood",
     ];
-    if negatives.iter().any(|n| lower.contains(n)) {
+    if negatives
+        .iter()
+        .any(|phrase| contains_keyword_as_words(normalized, phrase))
+    {
         return Some(("negative", false));
     }
     None

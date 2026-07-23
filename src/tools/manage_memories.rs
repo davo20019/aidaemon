@@ -349,13 +349,13 @@ struct ManageArgs {
 fn manage_memories_schema() -> Value {
     json!({
         "name": "manage_memories",
-        "description": "Memories & goals (goal id prefix ok). 'search'=facts; 'search_episodes'=past conversations (omit query=recent). Store via remember_fact.",
+        "description": "Memories and goals. search=facts; search_episodes=past conversations. Store via remember_fact.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "forget", "set_privacy", "search", "search_episodes", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled", "trigger_now"]
+                    "enum": ["list", "health", "repair", "forget", "set_privacy", "search", "search_episodes", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled", "trigger_now"]
                 },
                 "limit": { "type": "integer" },
                 "category": { "type": "string" },
@@ -396,6 +396,14 @@ impl Tool for ManageMemoriesTool {
         let args: ManageArgs = serde_json::from_str(arguments)?;
 
         match args.action.as_str() {
+            "health" => {
+                let report = self.state.memory_health_report().await?;
+                Ok(serde_json::to_string_pretty(&report)?)
+            }
+            "repair" => {
+                let report = self.state.repair_memory_projections().await?;
+                Ok(serde_json::to_string_pretty(&report)?)
+            }
             "list" => {
                 let facts = self.state.get_all_facts_with_provenance().await?;
                 if facts.is_empty() {

@@ -240,25 +240,25 @@ impl Agent {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Always enrich goal_user_text with prior user message, regardless of
-        // classification. The sliding window provides conversational context to
-        // the main LLM, and the enriched goal_user_text provides it to the task
-        // planner. Without this, short follow-ups like "the ones within 20 miles"
-        // are useless for planning.
-        if let Some(prev_user_text) = prev_user
-            .as_deref()
-            .filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
-        {
-            let mut combined = String::new();
-            combined.push_str("Original request:\n");
-            combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
-            combined.push_str("\n\nCurrent request:\n");
-            combined.push_str(if authored_current.is_empty() {
-                stored_current
-            } else {
-                &authored_current
-            });
-            goal_user_text = combined;
+        // Enrich only genuine follow-ups. New tasks already receive recent
+        // conversation context separately; concatenating the previous request
+        // here leaks stale instructions into contracts, schedules, and goals.
+        if followup_mode != FollowupMode::NewTask {
+            if let Some(prev_user_text) = prev_user
+                .as_deref()
+                .filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
+            {
+                let mut combined = String::new();
+                combined.push_str("Original request:\n");
+                combined.push_str(&truncate_for_resume(prev_user_text.trim(), 2000));
+                combined.push_str("\n\nCurrent request:\n");
+                combined.push_str(if authored_current.is_empty() {
+                    stored_current
+                } else {
+                    &authored_current
+                });
+                goal_user_text = combined;
+            }
         }
         // Sanitize carryover blocks regardless of mode (they can appear in any message)
         {

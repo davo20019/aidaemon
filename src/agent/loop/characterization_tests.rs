@@ -4,6 +4,7 @@ use crate::testing::{
     setup_test_agent_root_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
     MockProvider, MockTool,
 };
+use crate::traits::store_prelude::*;
 use crate::traits::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata,
     ToolCallOutcome, ToolCallSemantics, ToolChoiceMode, ToolTargetHintKind, ToolVerificationMode,
@@ -90,6 +91,56 @@ async fn response_metrics_capture_direct_return_and_fallthrough_paths() {
         before.response_fallthrough_total,
         after.response_fallthrough_total
     );
+}
+
+#[tokio::test]
+async fn schedule_is_not_persisted_until_exact_next_turn_confirmation() {
+    let provider = MockProvider::with_responses(vec![]);
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+    let session_id = "ephemeral_schedule_confirmation";
+
+    let proposal = harness
+        .agent
+        .handle_message(
+            session_id,
+            "Check deployment tomorrow at 9am",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        proposal.contains("Reply **confirm** to proceed"),
+        "unexpected proposal response: {proposal}"
+    );
+    assert!(harness
+        .state
+        .get_pending_confirmation_goals(session_id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let confirmation = harness
+        .agent
+        .handle_message(
+            session_id,
+            "confirm",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(confirmation.contains("✅ Scheduled"));
+    let scheduled = harness.state.get_scheduled_goals().await.unwrap();
+    assert!(scheduled
+        .iter()
+        .any(|goal| goal.session_id == session_id && goal.status == "active"));
 }
 
 #[tokio::test]

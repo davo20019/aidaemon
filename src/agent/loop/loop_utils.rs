@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use crate::traits::ToolOutcomeStatus;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -697,6 +698,37 @@ pub(super) fn classify_tool_result_failure_with_context(
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
 }
 
+pub(super) fn classify_tool_outcome_status(
+    tool_name: &str,
+    result_text: &str,
+    tool_arguments: Option<&str>,
+    metadata: Option<&crate::traits::ToolCallMetadata>,
+) -> ToolOutcomeStatus {
+    if let Some(status) = metadata.and_then(|meta| meta.outcome_status) {
+        return status;
+    }
+    if metadata.is_some_and(|meta| meta.background_started || meta.detached) {
+        return ToolOutcomeStatus::Backgrounded;
+    }
+    match classify_tool_result_failure_with_context(
+        tool_name,
+        result_text,
+        tool_arguments,
+        metadata,
+    ) {
+        Some(ToolFailureClass::Transient) => return ToolOutcomeStatus::FailedRetryable,
+        Some(ToolFailureClass::Semantic) => return ToolOutcomeStatus::FailedPermanent,
+        None => {}
+    }
+    if metadata
+        .and_then(|meta| meta.exit_code)
+        .is_some_and(|code| code != 0)
+    {
+        return ToolOutcomeStatus::CompletedWithNegativeResult;
+    }
+    ToolOutcomeStatus::Succeeded
+}
+
 pub(super) fn classify_execution_failure_kind(
     tool_name: &str,
     result_text: &str,
@@ -1195,6 +1227,39 @@ mod tool_error_detection_tests {
             Some(&metadata),
         );
         assert_eq!(classified, Some(ToolFailureClass::Semantic));
+    }
+
+    #[test]
+    fn test_runner_negative_result_is_not_counted_as_success() {
+        let metadata = crate::traits::ToolCallMetadata {
+            exit_code: Some(1),
+            ..Default::default()
+        };
+        let status = super::classify_tool_outcome_status(
+            "terminal",
+            "2 tests failed",
+            Some(r#"{"command":"cargo test"}"#),
+            Some(&metadata),
+        );
+        assert_eq!(
+            status,
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+        );
+        assert!(!status.satisfies_requested_condition());
+        assert!(!status.is_failure());
+    }
+
+    #[test]
+    fn tool_supplied_outcome_status_is_authoritative() {
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::classify_tool_outcome_status("terminal", "success", None, Some(&metadata)),
+            crate::traits::ToolOutcomeStatus::Blocked
+        );
     }
 
     #[test]

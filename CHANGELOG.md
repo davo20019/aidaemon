@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.28] - 2026-07-22
+
+### Added
+
+- **Canonical memory projections and hybrid retrieval foundations.** Durable facts and episodes now project into provenance-linked spans, claims, entities, relationships, and versioned embeddings. SQLite FTS5 indexes, bounded graph traversal, calibrated semantic/lexical/graph scoring, visibility checks, idempotent startup backfill, and derived-data retention provide a safer base for higher-quality recall without replacing the authoritative legacy records.
+- **Memory health and repair actions.** `manage_memories` can report projection health and rebuild missing canonical-memory projections, including stale or absent embeddings.
+- **Structured tool outcomes.** Tools can distinguish successful results, completed negative results, failures, blocks, and background execution. Terminal exit codes and HTTP statuses now populate the structured outcome ledger instead of relying only on response text.
+
+### Changed
+
+- **Schedule proposals stay ephemeral until explicit owner confirmation.** Detecting scheduling intent no longer writes pending goals or schedules to durable storage. The exact next-turn `confirm`/`yes`/`go ahead` response persists and activates the proposal; rejection or an unrelated reply discards it.
+- **Policy heuristics are advisory by default.** Tool filtering and uncertainty-driven clarification no longer hide registered tools or force clarification for new installations; deterministic permission, safety, and completion gates remain enforced.
+
+### Fixed
+
+- **Completion enforcement is evidence-first.** Inferred task labels no longer create hard mutation or observation obligations by themselves. Concrete targets and explicit verification requests still enforce completion, while any assistant claim of a completed side effect is checked against the mutation ledger even if request classification missed it.
+- **Negative tool results and failed child tasks no longer count as success.** Non-zero command exits, unsuccessful HTTP statuses, tool-supplied negative outcomes, and structured child `TaskEnd` failures propagate into task and delegation outcomes.
+- **New tasks no longer inherit stale prior instructions.** Previous user text is added to planner/goal input only for genuine follow-ups, preventing unrelated earlier requests from leaking into schedules, contracts, and delegated work.
+- **Single-model deployments run the task planner.** Planning now uses the active model when no multi-model router exists.
+- **Feedback learning no longer consumes substantive requests containing courtesy words.** Phrases such as “thanks to …, deploy …” remain new requests rather than being mislabeled as positive feedback.
+- **Personal-memory and identity heuristics no longer over-constrain turns.** Memory questions retain the normal tool roster, and deterministic identity shortcuts require exact question shapes instead of matching broader requests that merely contain similar phrases.
+
 ## [0.11.27] - 2026-07-14
 
 ### Fixed

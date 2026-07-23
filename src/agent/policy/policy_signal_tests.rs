@@ -19,6 +19,12 @@ fn ignores_non_explicit_feedback() {
 }
 
 #[test]
+fn courtesy_word_inside_new_request_is_not_outcome_feedback() {
+    let detected = detect_explicit_outcome_signal("thanks to the cache fix, deploy the app now");
+    assert!(detected.is_none());
+}
+
+#[test]
 fn risk_scoring_prefers_word_boundary_action_terms() {
     let caps = std::collections::HashMap::new();
     let direct = build_policy_bundle("please deploy to production", &caps, false).risk_score;

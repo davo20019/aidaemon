@@ -6,6 +6,10 @@ use tokio::sync::OnceCell;
 use tokio::task;
 use tracing::info;
 
+/// Stable identifier persisted beside every derived embedding. Changing the
+/// model creates a new index generation instead of silently mixing vectors.
+pub const EMBEDDING_MODEL_ID: &str = "fastembed/all-MiniLM-L6-v2";
+
 /// fastembed 5.x's `TextEmbedding::embed` requires `&mut self`. We wrap the
 /// model in a `std::sync::Mutex` so blocking-thread callers can take it,
 /// embed, and release. Calls serialize, but embedding itself is CPU-bound

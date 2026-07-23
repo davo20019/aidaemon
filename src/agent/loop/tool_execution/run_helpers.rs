@@ -624,12 +624,38 @@ pub(super) fn tool_result_contains_verifiable_evidence(
         )
 }
 
-pub(super) fn normalized_target_value(value: &str) -> String {
-    value
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches(['.', ',', ';'])
-        .to_ascii_lowercase()
+fn normalized_path_value(value: &str) -> Option<String> {
+    let raw = value.trim().replace('\\', "/");
+    if raw.is_empty() {
+        return None;
+    }
+    let absolute = raw.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    let joined = parts.join("/");
+    Some(if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    })
+}
+
+fn normalized_url_value(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value.trim()).ok()?;
+    url.set_fragment(None);
+    if url.path() != "/" {
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&path);
+    }
+    Some(url.to_string())
 }
 
 pub(super) fn tool_target_hint_matches_contract_target(
@@ -657,45 +683,59 @@ pub(super) fn tool_target_hint_matches_contract_target(
         return false;
     }
 
-    let hint = normalized_target_value(&target_hint.value);
-    let contract = normalized_target_value(&contract_target.value);
-    if hint.is_empty() || contract.is_empty() {
-        return false;
+    match (target_hint.kind, contract_target.kind) {
+        (ToolTargetHintKind::Url, VerificationTargetKind::Url) => {
+            normalized_url_value(&target_hint.value) == normalized_url_value(&contract_target.value)
+        }
+        (ToolTargetHintKind::Path, VerificationTargetKind::Path)
+        | (ToolTargetHintKind::ProjectScope, VerificationTargetKind::ProjectScope) => {
+            normalized_path_value(&target_hint.value)
+                == normalized_path_value(&contract_target.value)
+        }
+        (ToolTargetHintKind::Path, VerificationTargetKind::ProjectScope) => {
+            let Some(hint) = normalized_path_value(&target_hint.value) else {
+                return false;
+            };
+            let Some(scope) = normalized_path_value(&contract_target.value) else {
+                return false;
+            };
+            hint == scope
+                || hint
+                    .strip_prefix(&scope)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+        // Observing a project root is not evidence that a particular child
+        // path was observed.
+        (ToolTargetHintKind::ProjectScope, VerificationTargetKind::Path) => false,
+        _ => false,
     }
-
-    hint == contract || hint.contains(&contract) || contract.contains(&hint)
 }
 
 pub(super) fn verification_target_matches_haystack(
     target: &VerificationTarget,
     haystack: &str,
 ) -> bool {
-    let haystack = haystack.to_ascii_lowercase();
-    let needle = normalized_target_value(&target.value);
+    let haystack = haystack.replace('\\', "/");
+    let needle = match target.kind {
+        VerificationTargetKind::Url => normalized_url_value(&target.value),
+        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path => {
+            normalized_path_value(&target.value)
+        }
+    };
+    let Some(needle) = needle else {
+        return false;
+    };
     if needle.is_empty() {
         return false;
     }
-
-    if haystack.contains(&needle) {
-        return true;
-    }
-
-    match target.kind {
-        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path => target
-            .value
-            .rsplit(['/', '\\'])
-            .find(|segment| !segment.is_empty())
-            .map(normalized_target_value)
-            .is_some_and(|tail| !tail.is_empty() && haystack.contains(&tail)),
-        VerificationTargetKind::Url => false,
-    }
+    haystack.contains(&needle)
 }
 
 pub(super) fn observation_matches_completion_contract(
     contract: &CompletionContract,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
-    result_text: &str,
+    _result_text: &str,
 ) -> bool {
     if contract.verification_targets.is_empty() {
         return true;
@@ -710,11 +750,11 @@ pub(super) fn observation_matches_completion_contract(
         return true;
     }
 
-    let mut haystacks = vec![
-        raw_arguments.to_string(),
-        crate::traits::extract_primary_message_content(result_text, &[]).to_string(),
-        result_text.to_string(),
-    ];
+    // Arguments are harness-controlled structured evidence. Free-form result
+    // prose is not used for target identity because it may mention another
+    // file/URL with the same basename or quote the requested target without
+    // actually observing it.
+    let mut haystacks = vec![raw_arguments.to_string()];
     if let Some(command) = extract_command_from_args(raw_arguments) {
         haystacks.push(command);
     }
@@ -959,6 +999,31 @@ mod tests {
             "{}",
             "Latest post title: Scheduled reflection"
         ));
+    }
+
+    #[test]
+    fn same_basename_in_different_directory_does_not_verify_target() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::Path,
+            value: "/tmp/project-a/config.toml".to_string(),
+        };
+        let hint =
+            ToolTargetHint::new(ToolTargetHintKind::Path, "/tmp/project-b/config.toml").unwrap();
+        assert!(!tool_target_hint_matches_contract_target(&hint, &target));
+        assert!(!verification_target_matches_haystack(
+            &target,
+            "read /tmp/project-b/config.toml"
+        ));
+    }
+
+    #[test]
+    fn project_scope_hint_cannot_verify_a_specific_file() {
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::Path,
+            value: "/tmp/project-a/config.toml".to_string(),
+        };
+        let hint = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, "/tmp/project-a").unwrap();
+        assert!(!tool_target_hint_matches_contract_target(&hint, &target));
     }
 
     #[test]

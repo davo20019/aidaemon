@@ -312,7 +312,11 @@ impl SqliteStateStore {
         .bind(episode.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        let id = result.last_insert_rowid();
+        if let Err(error) = self.project_episode_memory(id).await {
+            tracing::warn!(%error, episode_id = id, "Deferred episode memory projection");
+        }
+        Ok(id)
     }
 
     /// Get episodes relevant to a query using embedding similarity.
@@ -321,10 +325,11 @@ impl SqliteStateStore {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Episode>> {
-        // First get all episodes with embeddings
+        // Load recent episodes; semantic vectors live in the replaceable side
+        // index, with the legacy column retained only as a per-row fallback.
         let rows = sqlx::query(
             "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, embedding
-             FROM episodes WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500"
+             FROM episodes ORDER BY created_at DESC LIMIT 500"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -344,23 +349,29 @@ impl SqliteStateStore {
         // Lowered from 0.5 to 0.3 to match fact retrieval threshold — 0.5 was too
         // aggressive and caused useful episodes to be filtered out.
         const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.3;
+        let indexed_scores = self
+            .episode_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
 
         let mut scored: Vec<(Episode, f32)> = Vec::new();
         for row in rows {
-            let embedding: Option<Vec<u8>> = row.get("embedding");
-            if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
-                    let similarity = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                    let episode = self.row_to_episode(&row)?;
-                    let score = crate::memory::scoring::memory_score(
-                        similarity,
-                        episode.created_at,
-                        episode.recall_count,
-                        episode.last_recalled_at,
-                    );
-                    if score > EPISODE_SIMILARITY_THRESHOLD {
-                        scored.push((episode, score));
-                    }
+            let episode_id: i64 = row.get("id");
+            let similarity = indexed_scores.get(&episode_id).copied().or_else(|| {
+                row.get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            if let Some(similarity) = similarity {
+                let episode = self.row_to_episode(&row)?;
+                let score = crate::memory::scoring::memory_score(
+                    similarity,
+                    episode.created_at,
+                    episode.recall_count,
+                    episode.last_recalled_at,
+                );
+                if score > EPISODE_SIMILARITY_THRESHOLD {
+                    scored.push((episode, score));
                 }
             }
         }
@@ -426,6 +437,9 @@ impl SqliteStateStore {
             .bind(episode_id)
             .execute(&self.pool)
             .await?;
+        if let Err(error) = self.project_episode_memory(episode_id).await {
+            tracing::warn!(%error, episode_id, "Deferred episode memory projection");
+        }
         Ok(())
     }
 
@@ -456,6 +470,9 @@ impl SqliteStateStore {
                         .bind(id)
                         .execute(&self.pool)
                         .await?;
+                    if let Err(error) = self.project_episode_memory(id).await {
+                        tracing::warn!(%error, episode_id = id, "Deferred episode memory projection");
+                    }
                     backfilled += 1;
                 }
                 Err(e) => {
@@ -500,6 +517,9 @@ impl SqliteStateStore {
                         .bind(id)
                         .execute(&self.pool)
                         .await?;
+                    if let Err(error) = self.project_fact_memory(id).await {
+                        tracing::warn!(%error, fact_id = id, "Deferred fact memory projection");
+                    }
                     backfilled += 1;
                 }
                 Err(e) => {
@@ -842,13 +862,13 @@ impl SqliteStateStore {
         let steps_json = serde_json::to_string(&procedure.steps)?;
         // Best-effort embedding for semantic retrieval. This runs off the hot-path
         // (learning is background) and will be backfilled by MemoryManager if missing.
-        let trigger_embedding = self
+        let trigger_vector = self
             .embedding_service
             .embed(procedure.trigger_pattern.clone())
             .await
-            .ok()
-            .map(|v| encode_embedding(&v));
-        let result = sqlx::query(
+            .ok();
+        let trigger_embedding = trigger_vector.as_deref().map(encode_embedding);
+        let id: i64 = sqlx::query_scalar(
             "INSERT INTO procedures (name, trigger_pattern, trigger_embedding, steps, success_count, failure_count, avg_duration_secs, last_used_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET
@@ -859,7 +879,12 @@ impl SqliteStateStore {
                 avg_duration_secs = COALESCE(excluded.avg_duration_secs, procedures.avg_duration_secs),
                 last_used_at = COALESCE(excluded.last_used_at, procedures.last_used_at),
                 updated_at = excluded.updated_at,
-                trigger_embedding = COALESCE(trigger_embedding, excluded.trigger_embedding)"
+                trigger_embedding = CASE
+                    WHEN procedures.trigger_pattern != excluded.trigger_pattern
+                    THEN excluded.trigger_embedding
+                    ELSE COALESCE(procedures.trigger_embedding, excluded.trigger_embedding)
+                END
+             RETURNING id"
         )
         .bind(&procedure.name)
         .bind(&procedure.trigger_pattern)
@@ -871,9 +896,23 @@ impl SqliteStateStore {
         .bind(procedure.last_used_at.map(|t| t.to_rfc3339()))
         .bind(procedure.created_at.to_rfc3339())
         .bind(procedure.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        if let Some(vector) = trigger_vector {
+            if let Err(error) = self
+                .upsert_owner_embedding(
+                    "procedure",
+                    id,
+                    "trigger",
+                    &procedure.trigger_pattern,
+                    vector,
+                )
+                .await
+            {
+                tracing::warn!(%error, procedure_id = id, "Deferred procedure embedding projection");
+            }
+        }
+        Ok(id)
     }
 
     /// Get procedures relevant to a query.
@@ -907,13 +946,28 @@ impl SqliteStateStore {
                 return Ok(procedures);
             }
         };
+        let indexed_scores: std::collections::HashMap<i64, f32> = self
+            .search_embedding_owners(&query_vec, "procedure", "trigger", rows.len())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|hit| {
+                hit.owner
+                    .owner_id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|id| (id, hit.score))
+            })
+            .collect();
 
         let mut scored: Vec<(Procedure, f32)> = Vec::new();
         for row in rows {
             let embedding: Option<Vec<u8>> = row.get("trigger_embedding");
             let procedure = self.row_to_procedure(&row)?;
 
-            let score = if let Some(blob) = embedding {
+            let score = if let Some(score) = indexed_scores.get(&procedure.id) {
+                *score
+            } else if let Some(blob) = embedding {
                 if let Ok(vec) = decode_embedding(&blob) {
                     crate::memory::math::cosine_similarity(&query_vec, &vec)
                 } else {
@@ -1204,12 +1258,12 @@ impl SqliteStateStore {
             .as_ref()
             .map(|s| serde_json::to_string(s).unwrap_or_default());
         // Best-effort embedding for semantic retrieval. Backfilled by MemoryManager if missing.
-        let error_embedding = self
+        let error_vector = self
             .embedding_service
             .embed(error_pattern.clone())
             .await
-            .ok()
-            .map(|v| encode_embedding(&v));
+            .ok();
+        let error_embedding = error_vector.as_deref().map(encode_embedding);
         let now = Utc::now();
         let row: (i64,) = sqlx::query_as(
             r#"
@@ -1238,6 +1292,14 @@ impl SqliteStateStore {
         .bind(solution.created_at.to_rfc3339())
         .fetch_one(&self.pool)
         .await?;
+        if let Some(vector) = error_vector {
+            if let Err(error) = self
+                .upsert_owner_embedding("error_solution", row.0, "error", &error_pattern, vector)
+                .await
+            {
+                tracing::warn!(%error, error_solution_id = row.0, "Deferred error-solution embedding projection");
+            }
+        }
         Ok(row.0)
     }
 
@@ -1275,13 +1337,28 @@ impl SqliteStateStore {
                 return Ok(solutions);
             }
         };
+        let indexed_scores: std::collections::HashMap<i64, f32> = self
+            .search_embedding_owners(&query_vec, "error_solution", "error", rows.len())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|hit| {
+                hit.owner
+                    .owner_id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|id| (id, hit.score))
+            })
+            .collect();
 
         let mut scored: Vec<(ErrorSolution, f32)> = Vec::new();
         for row in rows {
             let embedding: Option<Vec<u8>> = row.get("error_embedding");
             let solution = self.row_to_error_solution(&row)?;
 
-            let score = if let Some(blob) = embedding {
+            let score = if let Some(score) = indexed_scores.get(&solution.id) {
+                *score
+            } else if let Some(blob) = embedding {
                 if let Ok(vec) = decode_embedding(&blob) {
                     crate::memory::math::cosine_similarity(&query_vec, &vec)
                 } else {
@@ -1548,6 +1625,7 @@ mod facts;
 mod goals;
 mod health_checks;
 mod learning;
+pub(crate) mod memory;
 mod messages;
 pub(crate) mod migrations;
 mod notifications;

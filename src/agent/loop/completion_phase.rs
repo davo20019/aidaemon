@@ -1,5 +1,4 @@
 use super::completion_checks::*;
-use super::recall_guardrails::filter_tool_defs_for_personal_memory;
 use super::response_phase::ResponsePhaseOutcome;
 use super::*;
 use crate::execution_policy::PolicyBundle;
@@ -20,7 +19,6 @@ pub(super) struct CompletionCtx<'a> {
     pub base_tool_defs: &'a mut Vec<Value>,
     pub available_capabilities: &'a mut HashMap<String, ToolCapabilities>,
     pub policy_bundle: &'a mut PolicyBundle,
-    pub restrict_to_personal_memory_tools: bool,
     pub llm_provider: Arc<dyn ModelProvider>,
     pub llm_router: Option<Router>,
     pub model: &'a mut String,
@@ -122,7 +120,6 @@ pub(super) async fn run_completion_phase(
     let base_tool_defs = &*ctx.base_tool_defs;
     let available_capabilities = &*ctx.available_capabilities;
     let policy_bundle = &mut *ctx.policy_bundle;
-    let restrict_to_personal_memory_tools = ctx.restrict_to_personal_memory_tools;
     let llm_provider = ctx.llm_provider.clone();
     let llm_router = ctx.llm_router.clone();
     let mut model = ctx.model.clone();
@@ -407,19 +404,29 @@ pub(super) async fn run_completion_phase(
         let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
         let assistant_claimed_mutation = claims_completed_side_effect(&reply);
         let assistant_claimed_delegation = claims_delegation_started(&reply);
-        let mutation_gate_relevant =
-            turn_context.completion_contract.expects_mutation || assistant_claimed_mutation;
+        let unbacked_mutation_claim = super::completion_checks::mutation_claim_lacks_evidence(
+            assistant_claimed_mutation,
+            completion_progress.mutation_count,
+        );
+        let concrete_mutation_required =
+            super::completion_checks::contract_has_concrete_mutation_target(
+                &turn_context.completion_contract,
+            );
+        let unfulfilled_concrete_mutation =
+            concrete_mutation_required && completion_progress.mutation_count == 0;
+        // The completion contract is an intent hint, not proof of a required
+        // side effect. Hard enforcement starts when the assistant itself
+        // claims that a mutation happened; that claim can be checked exactly
+        // against mutation semantics recorded in the tool ledger.
+        let mutation_gate_relevant = assistant_claimed_mutation || concrete_mutation_required;
         if mutation_gate_relevant {
             let mutation_gate_block_condition = !force_text_fast_path_accepted
                 && !force_text_response
                 && agent.depth == 0
-                && turn_context.completion_contract.expects_mutation
-                && completion_progress.mutation_count == 0
+                && (unbacked_mutation_claim || unfulfilled_concrete_mutation)
                 && has_tool_attempts
                 && stall_count < 2;
-            let zero_tool_claim_condition = !has_tool_attempts
-                && turn_context.completion_contract.expects_mutation
-                && assistant_claimed_mutation;
+            let zero_tool_claim_condition = !has_tool_attempts && unbacked_mutation_claim;
             let (outcome, skip_reason) = if force_text_fast_path_accepted {
                 ("skipped_force_text_fast_path", Some("force_text_fast_path"))
             } else if force_text_response {
@@ -428,8 +435,6 @@ pub(super) async fn run_completion_phase(
                 ("blocked_claimed_mutation_without_tool", None)
             } else if agent.depth != 0 {
                 ("skipped_non_root_agent", Some("non_root_agent"))
-            } else if !turn_context.completion_contract.expects_mutation {
-                ("not_expected", Some("completion_contract_no_mutation"))
             } else if completion_progress.mutation_count > 0 {
                 ("passed", None)
             } else if mutation_gate_block_condition {
@@ -1383,11 +1388,10 @@ pub(super) async fn run_completion_phase(
             }
         }
 
-        // Mutation-contract guard: if the completion contract expects file
-        // mutations (write/rewrite/create/save) but no mutation tools were
-        // actually called, nudge the model to complete the file modification.
-        // This catches the case where the model reads files and generates
-        // analysis text but never calls write_file to save the result.
+        // Evidence-first mutation guard: if the assistant claims a completed
+        // side effect but no mutation tool actually ran, nudge the model to
+        // perform the action or report the limitation honestly. The inferred
+        // completion contract remains advisory and cannot arm this hard gate.
         //
         // An honest admission that the deliverable could not be produced or
         // found is NOT a fabricated completion — blocking it only forces the
@@ -1398,18 +1402,23 @@ pub(super) async fn run_completion_phase(
         if !force_text_fast_path_accepted
             && !force_text_response
             && agent.depth == 0
-            && turn_context.completion_contract.expects_mutation
-            && completion_progress.mutation_count == 0
+            && (unbacked_mutation_claim || unfulfilled_concrete_mutation)
             && has_tool_attempts
             && stall_count < 2
             && !super::completion_checks::reply_admits_unfulfilled_request(&reply)
             && agent
-                .supervision_gate_enforced(
+                .supervision_gate_enforced_with_context(
                     "mutation_contract_block",
                     &model,
                     emitter,
                     task_id,
                     iteration,
+                    json!({
+                        "assistant_claimed_mutation": assistant_claimed_mutation,
+                        "concrete_mutation_required": concrete_mutation_required,
+                        "mutation_count": completion_progress.mutation_count,
+                        "tool_attempt_count": learning_ctx.tool_calls.len(),
+                    }),
                 )
                 .await
         {
@@ -1422,11 +1431,11 @@ pub(super) async fn run_completion_phase(
                     task_id,
                     iteration,
                     DecisionType::PostExecutionValidation,
-                    "Blocked completion: expects_mutation=true but no mutation tools called"
-                        .to_string(),
+                    "Blocked completion: side-effect claim has no mutation evidence".to_string(),
                     json!({
-                        "condition": "mutation_contract_unsatisfied",
-                        "expects_mutation": true,
+                        "condition": "claimed_mutation_without_evidence",
+                        "expects_mutation_hint": turn_context.completion_contract.expects_mutation,
+                        "assistant_claimed_mutation": true,
                         "mutation_count": completion_progress.mutation_count,
                         "total_successful_tool_calls": total_successful_tool_calls,
                         "stall_count": stall_count,
@@ -1438,7 +1447,7 @@ pub(super) async fn run_completion_phase(
                 iteration,
                 stall_count,
                 total_successful_tool_calls,
-                "Blocked completion: expects_mutation=true but mutation_count=0"
+                "Blocked completion: side-effect claim has mutation_count=0"
             );
             commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
@@ -1471,15 +1480,12 @@ pub(super) async fn run_completion_phase(
         let incomplete_retry_plan = looks_like_incomplete_retry_plan(&reply);
         // Fabricated-action guard: a reply that claims a completed side
         // effect ("I have deleted the folder") in a task that made ZERO
-        // tool calls cannot be truthful when the completion contract
-        // expects a mutation. Treat it like a deferred action so the
+        // tool calls cannot be truthful. Treat it like a deferred action so the
         // no-tool recovery machinery (hard tool-call nudge, fallback
         // expansion, model switch) gets a chance to make it real. The
         // substantive-text bypass must not rescue such replies either —
         // length is no evidence of truth.
-        let claims_unfulfilled_mutation = !has_tool_attempts
-            && turn_context.completion_contract.expects_mutation
-            && assistant_claimed_mutation;
+        let claims_unfulfilled_mutation = !has_tool_attempts && unbacked_mutation_claim;
         let claims_unfulfilled_delegation = !has_tool_attempts && assistant_claimed_delegation;
         // False in-progress status: the reply asserts work is happening RIGHT
         // NOW ("I'm searching the API now...") while the task made zero tool
@@ -1833,11 +1839,6 @@ pub(super) async fn run_completion_phase(
                                 &widened,
                                 base_tool_defs,
                             );
-                            let widened = if restrict_to_personal_memory_tools {
-                                filter_tool_defs_for_personal_memory(&widened)
-                            } else {
-                                widened
-                            };
                             if !widened.is_empty() {
                                 POLICY_METRICS
                                     .fallback_expansion_total

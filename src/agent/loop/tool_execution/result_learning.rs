@@ -222,6 +222,7 @@ pub(super) async fn apply_result_learning(
     tc: &ToolCall,
     result_text: &mut String,
     is_error: bool,
+    outcome_satisfied: bool,
     failure_class: Option<ToolFailureClass>,
     execution_failure_kind: Option<ExecutionFailureKind>,
     env: &ResultLearningEnv<'_>,
@@ -684,9 +685,11 @@ pub(super) async fn apply_result_learning(
             .push(SystemDirective::NoEvidenceRespondKnownUnknown);
     }
 
-    *state.successful_tool_calls += 1;
-    *state.total_successful_tool_calls += 1;
-    if tc.name == "send_file" {
+    if outcome_satisfied {
+        *state.successful_tool_calls += 1;
+        *state.total_successful_tool_calls += 1;
+    }
+    if outcome_satisfied && tc.name == "send_file" {
         if let Some(key) = env.send_file_key.as_ref().cloned() {
             state.successful_send_file_keys.insert(key);
         }

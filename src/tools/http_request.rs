@@ -15,7 +15,8 @@ use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    ToolExecutionContext, ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode,
+    TruncationInfo,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -1635,6 +1636,13 @@ impl Tool for HttpRequestTool {
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
+                outcome_status: http_status.map(|status| {
+                    if (200..400).contains(&status) {
+                        ToolOutcomeStatus::Succeeded
+                    } else {
+                        ToolOutcomeStatus::CompletedWithNegativeResult
+                    }
+                }),
                 http_status,
                 truncation,
                 ..Default::default()
@@ -1655,6 +1663,13 @@ impl Tool for HttpRequestTool {
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
+                outcome_status: http_status.map(|status| {
+                    if (200..400).contains(&status) {
+                        ToolOutcomeStatus::Succeeded
+                    } else {
+                        ToolOutcomeStatus::CompletedWithNegativeResult
+                    }
+                }),
                 http_status,
                 truncation,
                 ..Default::default()

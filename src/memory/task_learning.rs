@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::traits::{ModelProvider, StateStore, Task};
 use crate::types::FactPrivacy;
@@ -98,10 +98,10 @@ pub async fn extract_task_knowledge(
 
     let system_prompt = "You are a knowledge extraction system. Given a completed task and its activity log, \
         extract durable knowledge worth remembering. Output ONLY a JSON object:\n\
-        {\n  \"facts\": [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\"}],\n  \
+        {\n  \"facts\": [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"graph\": {\"entities\": [], \"relationships\": []}}],\n  \
         \"procedures\": [{\"name\": \"...\", \"trigger_pattern\": \"...\", \"steps\": [\"...\"]}],\n  \
         \"error_solutions\": [{\"error_pattern\": \"...\", \"solution_summary\": \"...\", \"domain\": \"...\"}]\n}\n\
-        Categories for facts: project, technical, preference, behavior.\n\
+        Categories for facts: project, technical, preference, behavior. Graph entities use local_id, name, entity_type, aliases, confidence; relationships use source_id, target_id, relation, confidence. Only include graph data directly supported by the task evidence. Never infer entity types from category or key names.\n\
         Only extract knowledge that would be useful for FUTURE tasks. If nothing worth remembering, return empty arrays.";
 
     let user_prompt = format!(
@@ -156,6 +156,18 @@ pub async fn extract_task_knowledge(
         {
             warn!(error = %e, "Failed to store extracted fact");
         } else {
+            let excerpt = crate::utils::truncate_str(&user_prompt, 1000);
+            if let Err(e) = state
+                .project_extracted_fact_graph(
+                    &fact.category,
+                    &fact.key,
+                    excerpt.as_str(),
+                    &fact.graph,
+                )
+                .await
+            {
+                debug!(error = %e, key = fact.key, "Failed to project task-learning graph");
+            }
             stored += 1;
         }
     }
@@ -242,6 +254,8 @@ struct ExtractedFact {
     key: String,
     #[serde(default)]
     value: String,
+    #[serde(default)]
+    graph: crate::traits::ExtractedMemoryGraph,
 }
 
 #[derive(Debug, Deserialize)]

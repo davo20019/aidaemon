@@ -190,14 +190,25 @@ fn completion_contract_is_fulfilled(
     contract: &CompletionContract,
     progress: &CompletionProgress,
 ) -> bool {
-    if contract.requires_observation && progress.observation_count == 0 {
+    // Keyword/planner classifications guide execution, but do not by
+    // themselves prove that a turn was incomplete. Only explicit,
+    // evidence-grounded obligations affect the persisted outcome. Concrete
+    // side-effect claims are checked against the mutation ledger before the
+    // reply is accepted in completion_phase.
+    let observation_is_hard_requirement =
+        contract.explicit_verification_requested || !contract.verification_targets.is_empty();
+    if observation_is_hard_requirement
+        && contract.requires_observation
+        && progress.observation_count == 0
+    {
         return false;
     }
-    if contract.expects_mutation && progress.mutation_count == 0 {
+    if super::completion_checks::contract_has_concrete_mutation_target(contract)
+        && progress.mutation_count == 0
+    {
         return false;
     }
-    let verification_required =
-        contract.explicit_verification_requested || contract.requires_reverification_after_mutation;
+    let verification_required = contract.explicit_verification_requested;
     if verification_required
         && (progress.verification_count == 0 || progress.verification_block_count > 2)
     {
@@ -356,12 +367,65 @@ mod tests {
     }
 
     #[test]
-    fn expected_mutation_without_mutation_is_partial() {
+    fn inferred_mutation_without_ledger_evidence_is_not_scored_partial() {
         let validation = ValidationState::default();
         let execution = empty_execution_state();
         let completion = CompletionProgress::default();
         let contract = CompletionContract {
             expects_mutation: true,
+            ..CompletionContract::default()
+        };
+
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &completion,
+            &contract,
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+
+        assert_eq!(outcome, TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn explicit_observation_without_evidence_is_partial() {
+        let validation = ValidationState::default();
+        let execution = empty_execution_state();
+        let completion = CompletionProgress::default();
+        let contract = CompletionContract {
+            requires_observation: true,
+            explicit_verification_requested: true,
+            ..CompletionContract::default()
+        };
+
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &completion,
+            &contract,
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+
+        assert_eq!(outcome, TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn concrete_mutation_target_without_evidence_is_partial() {
+        let validation = ValidationState::default();
+        let execution = empty_execution_state();
+        let completion = CompletionProgress::default();
+        let contract = CompletionContract {
+            expects_mutation: true,
+            verification_targets: vec![crate::agent::VerificationTarget {
+                kind: crate::agent::VerificationTargetKind::Path,
+                value: "/tmp/result.txt".to_string(),
+            }],
             ..CompletionContract::default()
         };
 

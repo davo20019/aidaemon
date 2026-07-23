@@ -56,6 +56,31 @@ fn build_dedup_key_text(category: &str, key: &str) -> String {
     )
 }
 
+fn hybrid_fact_score(
+    fact: &Fact,
+    semantic: f32,
+    lexical: f32,
+    graph_match: bool,
+    freshness: f32,
+) -> f32 {
+    crate::memory::hybrid::fused_score(crate::memory::hybrid::HybridSignals {
+        semantic,
+        lexical,
+        graph: if graph_match { 1.0 } else { 0.0 },
+        freshness: (freshness / FACT_FRESHNESS_MAX_BOOST).clamp(0.0, 1.0),
+        confidence: if fact.source == "consolidation" {
+            0.7
+        } else {
+            1.0
+        },
+        provenance: if fact.source_excerpt.is_some() {
+            1.0
+        } else {
+            0.3
+        },
+    })
+}
+
 /// Build a natural-language embedding text for a fact.
 ///
 /// Instead of `[project] inter_service: gRPC`, this produces something like:
@@ -123,7 +148,7 @@ fn fact_freshness_boost(now: DateTime<Utc>, updated_at: DateTime<Utc>) -> f32 {
     FACT_FRESHNESS_MAX_BOOST * (1.0 - (age_hours / FACT_FRESHNESS_DECAY_HOURS).min(1.0))
 }
 
-fn is_stopword(token: &str) -> bool {
+pub(super) fn is_stopword(token: &str) -> bool {
     matches!(
         token,
         "a" | "an"
@@ -219,6 +244,41 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
 
 #[async_trait]
 impl crate::traits::FactStore for SqliteStateStore {
+    async fn memory_health_report(&self) -> anyhow::Result<crate::traits::MemoryHealthReport> {
+        self.canonical_memory_health().await
+    }
+
+    async fn repair_memory_projections(&self) -> anyhow::Result<crate::traits::MemoryHealthReport> {
+        self.backfill_missing_memory_projections().await?;
+        self.canonical_memory_health().await
+    }
+
+    async fn refresh_fact_memory(&self, category: &str, key: &str) -> anyhow::Result<()> {
+        if let Some(id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM facts WHERE lower(category) = lower(?) AND lower(key) = lower(?)
+             AND superseded_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(category)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            self.project_fact_memory(id).await?;
+        }
+        Ok(())
+    }
+
+    async fn project_extracted_fact_graph(
+        &self,
+        category: &str,
+        key: &str,
+        source_excerpt: &str,
+        graph: &crate::traits::ExtractedMemoryGraph,
+    ) -> anyhow::Result<()> {
+        self.persist_extracted_fact_graph(category, key, source_excerpt, graph)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn upsert_fact_with_provenance(
         &self,
@@ -781,6 +841,9 @@ impl crate::traits::FactStore for SqliteStateStore {
             }
         }
 
+        if let Err(error) = self.sync_fact_memory_category(category_clean).await {
+            tracing::warn!(%error, category = category_clean, "Deferred fact memory projection");
+        }
         Ok(())
     }
 
@@ -854,37 +917,93 @@ impl crate::traits::FactStore for SqliteStateStore {
         let now = Utc::now();
         let query_lower = query.to_lowercase();
         let tokens = query_tokens(&query_lower);
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
+        let fts_fact_ids: std::collections::HashSet<i64> = self
+            .search_memory_claims(
+                query,
+                None,
+                ChannelVisibility::Internal,
+                true,
+                max.saturating_mul(4).max(16),
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|claim| claim.source_fact_id)
+            .collect();
+        let graph_fact_ids = self
+            .graph_fact_ids_for_query(query)
+            .await
+            .unwrap_or_default();
 
         // Score facts using stored embeddings, with a small recency boost for sorting.
         // IMPORTANT: the recency boost must not change which facts pass the semantic threshold.
         let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(rows.len());
-        let mut unembedded: Vec<usize> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             let fact = &all_facts[i];
             let freshness = fact_freshness_boost(now, fact.updated_at);
 
-            let embedding: Option<Vec<u8>> = row.get("embedding");
-            if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
-                    let semantic = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                    if semantic > FACT_SEMANTIC_MIN_SCORE {
-                        candidates.push((i, semantic, semantic + freshness, true));
-                        continue;
-                    }
-                    // Below semantic threshold — try lexical as fallback for keyword matches
-                    let lexical = lexical_fallback_score(&query_lower, &tokens, fact);
-                    let best = semantic.max(lexical);
-                    let is_semantic = best == semantic;
-                    candidates.push((i, best, best + freshness, is_semantic));
+            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
+                row.get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            let lexical = if fts_fact_ids.contains(&fact.id) {
+                FACT_LEXICAL_MAX_SCORE
+            } else {
+                lexical_fallback_score(&query_lower, &tokens, fact)
+            };
+            if let Some(semantic) = semantic {
+                if semantic > FACT_SEMANTIC_MIN_SCORE {
+                    candidates.push((
+                        i,
+                        semantic,
+                        hybrid_fact_score(
+                            fact,
+                            semantic,
+                            lexical,
+                            graph_fact_ids.contains(&fact.id),
+                            freshness,
+                        ),
+                        true,
+                    ));
                     continue;
                 }
+                // Below semantic threshold — try lexical as fallback for keyword matches
+                let best = semantic.max(lexical);
+                let is_semantic = best == semantic;
+                candidates.push((
+                    i,
+                    best,
+                    hybrid_fact_score(
+                        fact,
+                        semantic,
+                        lexical,
+                        graph_fact_ids.contains(&fact.id),
+                        freshness,
+                    ),
+                    is_semantic,
+                ));
+                continue;
             }
 
             // Missing/invalid embedding: fall back to cheap lexical relevance so
             // freshly saved facts can still be retrieved during embedding backfill.
-            let lexical = lexical_fallback_score(&query_lower, &tokens, fact);
-            candidates.push((i, lexical, lexical + freshness, false));
-            unembedded.push(i);
+            candidates.push((
+                i,
+                lexical,
+                hybrid_fact_score(
+                    fact,
+                    0.0,
+                    lexical,
+                    graph_fact_ids.contains(&fact.id),
+                    freshness,
+                ),
+                false,
+            ));
         }
         candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -904,18 +1023,6 @@ impl crate::traits::FactStore for SqliteStateStore {
                 if seen_ids.insert(fact.id) {
                     relevant.push(fact);
                 }
-            }
-        }
-
-        // Preserve prior behavior: include unembedded facts (during backfill) if
-        // we still have space, even if lexical relevance was low.
-        for i in unembedded {
-            if relevant.len() >= max {
-                break;
-            }
-            let fact = all_facts[i].clone();
-            if seen_ids.insert(fact.id) {
-                relevant.push(fact);
             }
         }
 
@@ -970,16 +1077,22 @@ impl crate::traits::FactStore for SqliteStateStore {
         // enter the candidate pool, then cap the pool by cosine so reranking
         // stays bounded. The pool must be deep enough that a weakly-scoring but
         // correct fact (measured: the answer can sit ~rank 30) isn't dropped.
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
         let mut scored: Vec<(Fact, f32)> = Vec::new();
         for row in &rows {
-            let embedding: Option<Vec<u8>> = row.get("embedding");
-            let Some(blob) = embedding else { continue };
-            let Ok(vec) = decode_embedding(&blob) else {
-                continue;
-            };
-            let semantic = crate::memory::math::cosine_similarity(&query_vec, &vec);
-            if semantic > EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE {
-                scored.push((Self::row_to_fact(row), semantic));
+            let fact = Self::row_to_fact(row);
+            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
+                row.get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            if let Some(semantic) = semantic {
+                if semantic > EXPLICIT_SEARCH_SEMANTIC_MIN_SCORE {
+                    scored.push((fact, semantic));
+                }
             }
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1139,33 +1252,90 @@ impl crate::traits::FactStore for SqliteStateStore {
         let now = Utc::now();
         let query_lower = query.to_lowercase();
         let tokens = query_tokens(&query_lower);
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, rows.len())
+            .await
+            .unwrap_or_default();
+        let fts_fact_ids: std::collections::HashSet<i64> = self
+            .search_memory_claims(
+                query,
+                channel_id,
+                visibility,
+                requester_is_owner,
+                max.saturating_mul(4).max(16),
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|claim| claim.source_fact_id)
+            .collect();
+        let graph_fact_ids = self
+            .graph_fact_ids_for_query(query)
+            .await
+            .unwrap_or_default();
 
         let mut candidates: Vec<(usize, f32, f32, bool)> = Vec::with_capacity(filtered.len());
-        let mut unembedded: Vec<usize> = Vec::new();
         for (fi, &ri) in filtered_indices.iter().enumerate() {
             let fact = &filtered[fi];
             let freshness = fact_freshness_boost(now, fact.updated_at);
 
-            let embedding: Option<Vec<u8>> = rows[ri].get("embedding");
-            if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
-                    let semantic = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                    if semantic > FACT_SEMANTIC_MIN_SCORE {
-                        candidates.push((fi, semantic, semantic + freshness, true));
-                        continue;
-                    }
-                    // Below semantic threshold — try lexical as fallback for keyword matches
-                    let lexical = lexical_fallback_score(&query_lower, &tokens, fact);
-                    let best = semantic.max(lexical);
-                    let is_semantic = best == semantic;
-                    candidates.push((fi, best, best + freshness, is_semantic));
+            let semantic = indexed_scores.get(&fact.id).copied().or_else(|| {
+                rows[ri]
+                    .get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            let lexical = if fts_fact_ids.contains(&fact.id) {
+                FACT_LEXICAL_MAX_SCORE
+            } else {
+                lexical_fallback_score(&query_lower, &tokens, fact)
+            };
+            if let Some(semantic) = semantic {
+                if semantic > FACT_SEMANTIC_MIN_SCORE {
+                    candidates.push((
+                        fi,
+                        semantic,
+                        hybrid_fact_score(
+                            fact,
+                            semantic,
+                            lexical,
+                            graph_fact_ids.contains(&fact.id),
+                            freshness,
+                        ),
+                        true,
+                    ));
                     continue;
                 }
+                // Below semantic threshold — try lexical as fallback for keyword matches
+                let best = semantic.max(lexical);
+                let is_semantic = best == semantic;
+                candidates.push((
+                    fi,
+                    best,
+                    hybrid_fact_score(
+                        fact,
+                        semantic,
+                        lexical,
+                        graph_fact_ids.contains(&fact.id),
+                        freshness,
+                    ),
+                    is_semantic,
+                ));
+                continue;
             }
 
-            let lexical = lexical_fallback_score(&query_lower, &tokens, fact);
-            candidates.push((fi, lexical, lexical + freshness, false));
-            unembedded.push(fi);
+            candidates.push((
+                fi,
+                lexical,
+                hybrid_fact_score(
+                    fact,
+                    0.0,
+                    lexical,
+                    graph_fact_ids.contains(&fact.id),
+                    freshness,
+                ),
+                false,
+            ));
         }
         candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1185,16 +1355,6 @@ impl crate::traits::FactStore for SqliteStateStore {
                 if seen_ids.insert(fact.id) {
                     relevant.push(fact);
                 }
-            }
-        }
-
-        for fi in unembedded {
-            if relevant.len() >= max {
-                break;
-            }
-            let fact = filtered[fi].clone();
-            if seen_ids.insert(fact.id) {
-                relevant.push(fact);
             }
         }
 
@@ -1262,13 +1422,18 @@ impl crate::traits::FactStore for SqliteStateStore {
         };
 
         let mut scored: Vec<(usize, f32)> = Vec::new();
+        let indexed_scores = self
+            .fact_embedding_scores(&query_vec, filtered_rows.len().saturating_mul(8).max(64))
+            .await
+            .unwrap_or_default();
         for (i, row) in filtered_rows.iter().enumerate() {
-            let embedding: Option<Vec<u8>> = row.get("embedding");
-            if let Some(blob) = embedding {
-                if let Ok(vec) = decode_embedding(&blob) {
-                    let score = crate::memory::math::cosine_similarity(&query_vec, &vec);
-                    scored.push((i, score));
-                }
+            let score = indexed_scores.get(&facts[i].id).copied().or_else(|| {
+                row.get::<Option<Vec<u8>>, _>("embedding")
+                    .and_then(|blob| decode_embedding(&blob).ok())
+                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
+            });
+            if let Some(score) = score {
+                scored.push((i, score));
             }
             // Facts without embeddings are skipped for cross-channel hints (conservative)
         }
@@ -1291,6 +1456,9 @@ impl crate::traits::FactStore for SqliteStateStore {
             .bind(fact_id)
             .execute(&self.pool)
             .await?;
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred fact privacy projection");
+        }
         Ok(())
     }
 
@@ -1301,6 +1469,9 @@ impl crate::traits::FactStore for SqliteStateStore {
             .bind(fact_id)
             .execute(&self.pool)
             .await?;
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred deleted-fact projection");
+        }
         Ok(())
     }
 
@@ -1309,6 +1480,13 @@ impl crate::traits::FactStore for SqliteStateStore {
         // Canonicalize: lowercase, trim, strip [brackets]
         let cat_clean = category.trim().to_lowercase();
         let key_clean = key.trim().to_lowercase();
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM facts WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+        )
+        .bind(&cat_clean)
+        .bind(&key_clean)
+        .fetch_all(&self.pool)
+        .await?;
         let result = sqlx::query(
             "UPDATE facts SET superseded_at = ? WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
         )
@@ -1317,6 +1495,11 @@ impl crate::traits::FactStore for SqliteStateStore {
         .bind(&key_clean)
         .execute(&self.pool)
         .await?;
+        for id in ids {
+            if let Err(error) = self.project_fact_memory(id).await {
+                tracing::warn!(%error, fact_id = id, "Deferred deleted-fact projection");
+            }
+        }
         Ok(result.rows_affected() > 0)
     }
 
