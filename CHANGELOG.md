@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.29] - 2026-07-25
+
+### Added
+
+- **ChatGPT subscription as a model provider.** A ChatGPT Plus/Pro/Business plan can now back the agent instead of metered OpenAI API billing. `aidaemon auth login openai` runs an OAuth 2.0 + PKCE sign-in against `auth.openai.com` (with `--paste` for headless and remote installs where no browser can reach the registered `localhost:1455` redirect), and `aidaemon auth status` / `aidaemon auth logout openai` manage the connection. Credentials are stored in the OS keychain, or the env file under `AIDAEMON_NO_KEYCHAIN=1`, and refreshed automatically ahead of expiry with rotated refresh tokens persisted on every exchange.
+- **`openai_chatgpt` provider kind.** Selects the subscription-backed Codex backend, which speaks the Responses API over SSE; the provider translates the agent loop's chat-completions messages, tool definitions, and tool results in both directions. Usable anywhere a provider is configured, including `[[provider.fallbacks]]`. Usage-limit responses surface as rate limits so configured fallbacks take over instead of failing the turn.
+- **Setup wizard option for subscription sign-in.** The provider picker offers "OpenAI (ChatGPT subscription — sign in, no API key)" and runs the login inline, continuing setup with instructions if sign-in is deferred.
+
 ## [0.11.28] - 2026-07-22
 
 ### Added

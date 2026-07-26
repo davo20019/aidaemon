@@ -51,6 +51,19 @@ const PRESETS: &[ProviderPreset] = &[
         supports_gateway_token: false,
     },
     ProviderPreset {
+        name: "OpenAI (ChatGPT subscription — sign in, no API key)",
+        base_url: "",
+        kind: "openai_chatgpt",
+        primary: "gpt-5.1-codex",
+        fast: "gpt-5.1-codex-mini",
+        smart: "gpt-5.1-codex",
+        needs_key: false,
+        key_url: "",
+        key_hint: "Uses your ChatGPT Plus/Pro/Business plan instead of per-token API billing.",
+        prompt_base_url: false,
+        supports_gateway_token: false,
+    },
+    ProviderPreset {
         name: "xAI (Grok)",
         base_url: "https://api.x.ai/v1",
         kind: "xai_native",
@@ -780,8 +793,26 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
             .interact_text()?;
     }
 
-    // API key with guidance
-    let api_key = if preset.needs_key {
+    // Subscription sign-in: no key to paste, an OAuth round trip instead.
+    let api_key = if preset.kind == "openai_chatgpt" {
+        println!();
+        println!("  {}", preset.key_hint);
+        println!();
+        let paste = !Confirm::new()
+            .with_prompt("Can a browser on this machine reach http://localhost:1455 ?")
+            .default(true)
+            .interact()?;
+        match crate::run_chatgpt_login(paste) {
+            Ok(()) => {}
+            Err(e) => {
+                println!();
+                println!("  Sign-in did not complete: {e}");
+                println!("  Setup will continue — finish later with:");
+                println!("    aidaemon auth login openai");
+            }
+        }
+        String::new()
+    } else if preset.needs_key {
         println!();
         if !preset.key_url.is_empty() {
             println!("  Get your API key here: {}", preset.key_url);
@@ -1058,7 +1089,14 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     // ── Store secrets in OS keychain if available ───────────────────────
     let mut any_secret_in_keychain = false;
 
-    let (api_key_config, api_stored) = secret_config_value("api_key", &api_key);
+    // Subscription providers authenticate with stored OAuth credentials, so
+    // there is no key to stash — writing an empty one into the keychain would
+    // just leave a dead entry that later resolves to "".
+    let (api_key_config, api_stored) = if preset.kind == "openai_chatgpt" {
+        ("\"\"".to_string(), false)
+    } else {
+        secret_config_value("api_key", &api_key)
+    };
     if api_stored {
         any_secret_in_keychain = true;
         println!("  API key stored in OS keychain.");

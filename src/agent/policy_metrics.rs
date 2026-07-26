@@ -117,6 +117,7 @@ pub(in crate::agent) fn provider_kind_metric_label(
         crate::config::ProviderKind::XaiNative => "xai_native",
         crate::config::ProviderKind::GoogleGenai => "google_genai",
         crate::config::ProviderKind::Anthropic => "anthropic",
+        crate::config::ProviderKind::OpenaiChatgpt => "openai_chatgpt",
     }
 }
 

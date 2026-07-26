@@ -538,6 +538,9 @@ pub enum ProviderKind {
     XaiNative,
     GoogleGenai,
     Anthropic,
+    /// ChatGPT Plus/Pro/Business subscription via Codex OAuth. Uses stored
+    /// OAuth credentials rather than `api_key`.
+    OpenaiChatgpt,
 }
 
 fn default_true() -> bool {
@@ -622,6 +625,7 @@ impl ModelsConfig {
             ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
             ProviderKind::XaiNative => "grok-4".to_string(),
             ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
+            ProviderKind::OpenaiChatgpt => "gpt-5.1-codex".to_string(),
         };
 
         let default_model = if !self.default_model.trim().is_empty() {

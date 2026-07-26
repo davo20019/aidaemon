@@ -70,6 +70,10 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
             &config.provider.api_key,
         )),
+        ProviderKind::OpenaiChatgpt => Arc::new(
+            crate::providers::OpenAiChatGptProvider::new(None, config.provider.max_tokens)
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+        ),
     };
 
     // Temp DB for isolation
@@ -268,6 +272,10 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         ProviderKind::Anthropic => Arc::new(crate::providers::AnthropicNativeProvider::new(
             &config.provider.api_key,
         )),
+        ProviderKind::OpenaiChatgpt => Arc::new(
+            crate::providers::OpenAiChatGptProvider::new(None, config.provider.max_tokens)
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+        ),
     };
 
     let db_file = tempfile::NamedTempFile::new()?;

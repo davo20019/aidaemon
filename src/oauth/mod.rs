@@ -1,3 +1,4 @@
+pub mod chatgpt_codex;
 pub mod providers;
 
 use std::collections::HashMap;

@@ -186,6 +186,9 @@ pub fn run() -> anyhow::Result<()> {
                 println!(
                     "  opencode [cwd] [-- ...] Shortcut for: aidaemon agent start opencode ..."
                 );
+                println!("  auth login openai     Connect a ChatGPT subscription (Codex OAuth)");
+                println!("  auth status           Show connected model subscriptions");
+                println!("  auth logout openai    Disconnect the ChatGPT subscription");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -240,6 +243,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "keychain" => {
                 return handle_keychain_command(&args[2..]);
+            }
+            "auth" => {
+                return handle_auth_command(&args[2..]);
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -535,6 +541,132 @@ fn handle_agent_command(args: &[String]) -> anyhow::Result<()> {
         }
         other => anyhow::bail!("Unknown agent command: {other}"),
     }
+}
+
+/// `aidaemon auth …` — manage subscription-based model logins.
+fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    match action {
+        "login" => match auth_provider_alias(args.get(1)) {
+            Some(AuthProvider::OpenAiChatGpt) => {
+                let paste = args.iter().any(|a| a == "--paste");
+                run_chatgpt_login(paste)
+            }
+            None => anyhow::bail!("Usage: aidaemon auth login openai [--paste]"),
+        },
+        "logout" => match auth_provider_alias(args.get(1)) {
+            Some(AuthProvider::OpenAiChatGpt) => run_chatgpt_logout(),
+            None => anyhow::bail!("Usage: aidaemon auth logout openai"),
+        },
+        "status" => {
+            match crate::oauth::chatgpt_codex::load_credentials() {
+                Some(creds) => {
+                    let state = if creds.needs_refresh(chrono::Utc::now()) {
+                        "refresh due"
+                    } else {
+                        "valid"
+                    };
+                    println!("openai (ChatGPT subscription): connected");
+                    println!("  access token: {state} (expires {})", creds.expires_at);
+                }
+                None => {
+                    println!("openai (ChatGPT subscription): not connected");
+                    println!("  connect with: aidaemon auth login openai");
+                }
+            }
+            Ok(())
+        }
+        "-h" | "--help" | "" => {
+            println!("Usage:");
+            println!("  aidaemon auth login openai [--paste]");
+            println!("  aidaemon auth logout openai");
+            println!("  aidaemon auth status");
+            println!();
+            println!(
+                "Connects a ChatGPT Plus/Pro/Business subscription so aidaemon can use it as a"
+            );
+            println!("model provider. Use --paste when no browser can reach this machine's");
+            println!("localhost (containers, remote servers, headless installs).");
+            Ok(())
+        }
+        other => anyhow::bail!("Unknown auth command: {other}"),
+    }
+}
+
+enum AuthProvider {
+    OpenAiChatGpt,
+}
+
+fn auth_provider_alias(raw: Option<&String>) -> Option<AuthProvider> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("openai") | Some("chatgpt") | Some("openai_chatgpt") | Some("codex") => {
+            Some(AuthProvider::OpenAiChatGpt)
+        }
+        _ => None,
+    }
+}
+
+/// Build a small runtime for one-shot CLI auth work.
+fn auth_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?)
+}
+
+fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
+    use crate::oauth::chatgpt_codex::{self, CallbackMode};
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let mode = if paste {
+        CallbackMode::Paste(Box::new(|_url| {
+            println!();
+            println!(
+                "After approving, your browser will land on a localhost URL that will not load."
+            );
+            println!("Copy that URL from the address bar and paste it here, then press Enter:");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            Ok(line.trim().to_string())
+        }))
+    } else {
+        CallbackMode::Loopback
+    };
+
+    let creds = auth_runtime()?.block_on(chatgpt_codex::login(&client, mode, |url| {
+        println!("Open this URL to authorize aidaemon with your ChatGPT account:");
+        println!();
+        println!("  {url}");
+        println!();
+        if !paste {
+            println!("Waiting for the redirect… (Ctrl-C to cancel)");
+        }
+    }))?;
+
+    println!();
+    println!("Connected. Access token valid until {}.", creds.expires_at);
+    println!("Point your config at it with:");
+    println!();
+    println!("  [provider]");
+    println!("  kind = \"openai_chatgpt\"");
+    println!("  models = {{ default_model = \"gpt-5.1-codex\" }}");
+    Ok(())
+}
+
+fn run_chatgpt_logout() -> anyhow::Result<()> {
+    if !crate::oauth::chatgpt_codex::is_connected() {
+        println!("No ChatGPT subscription is connected.");
+        return Ok(());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    auth_runtime()?.block_on(crate::oauth::chatgpt_codex::logout(&client))?;
+    println!("Disconnected the ChatGPT subscription.");
+    Ok(())
 }
 
 pub(crate) fn normalize_terminal_agent_name(raw: &str) -> Option<&'static str> {

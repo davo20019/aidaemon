@@ -89,6 +89,40 @@ The built-in policy profiles `cheap`, `balanced`, and `strong` are execution pre
 
 Model supervision is trust-tiered. By default (`trust_tier = "auto"` under `[policy]`), recognized frontier models (Claude, GPT-4/5, o-series, Gemini 2.5+, Grok 3/4) run a thin loop where behavioral supervision gates are telemetry-only, while every other model gets the full supervision scaffolding. The auto list matches known model families, so a capable open model it doesn't recognize (for example kimi-k2.5 or a large qwen/deepseek variant) lands in the supervised tier, where a gate misfire can cost extra LLM round-trips before an answer is accepted. If you run such a model, set `trust_tier = "autonomous"` to opt out of the supervision gates; anti-fabrication checks and hard safety caps (iteration/token/wall-clock limits, repetition guards) remain active on every tier. The override is global — it applies to every configured model, including fallbacks — so keep `"auto"` if your fallback chain mixes a strong cloud model with a small local one. See [`config.toml.example`](config.toml.example) for details.
 
+### Using a ChatGPT subscription instead of an API key
+
+aidaemon can run on a ChatGPT Plus/Pro/Business plan rather than metered OpenAI
+API billing. Sign in once:
+
+```bash
+aidaemon auth login openai          # add --paste for headless/remote installs
+aidaemon auth status
+aidaemon auth logout openai
+```
+
+The setup wizard offers the same option. Then point the provider at it:
+
+```toml
+[provider]
+kind = "openai_chatgpt"
+api_key = ""                        # unused; credentials come from the OAuth store
+
+[provider.models]
+primary = "gpt-5.1-codex"
+```
+
+Sign-in is OAuth 2.0 + PKCE against `auth.openai.com`, with the redirect landing
+on `http://localhost:1455/auth/callback` (the port is fixed by OpenAI's client
+registration — use `--paste` when no local browser can reach it). Tokens are
+stored in the OS keychain and refreshed automatically. Requests identify
+themselves with an `originator: aidaemon` header.
+
+Subscription plans meter usage: when a cap is hit, the provider reports a rate
+limit and the configured fallbacks take over. Background goals and heartbeats
+pointed at a subscription model will reach that cap faster than interactive use
+alone. These credentials do not work with OpenAI's Realtime endpoints, which
+still need a Platform API key.
+
 Secrets (API keys, bot tokens) are stored in your OS keychain by default — not in config files.
 
 If you prefer env-only secrets, set `AIDAEMON_NO_KEYCHAIN=1`. In that mode:

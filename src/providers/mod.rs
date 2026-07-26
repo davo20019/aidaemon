@@ -2,6 +2,7 @@ mod anthropic_native;
 mod error;
 mod google_genai;
 pub(crate) mod multimodal;
+mod openai_chatgpt;
 mod openai_compatible;
 pub(crate) mod streaming;
 mod xai_native;
@@ -17,6 +18,7 @@ pub use anthropic_native::AnthropicNativeProvider;
 pub use error::is_provider_infra_error_text;
 pub use error::{MalformedResponseReason, ProviderError, ProviderErrorKind};
 pub use google_genai::GoogleGenAiProvider;
+pub use openai_chatgpt::OpenAiChatGptProvider;
 pub use openai_compatible::OpenAiCompatibleProvider;
 pub use xai_native::XaiNativeProvider;
 
