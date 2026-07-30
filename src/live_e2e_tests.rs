@@ -71,7 +71,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
             &config.provider.api_key,
         )),
         ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None, config.provider.max_tokens)
+            crate::providers::OpenAiChatGptProvider::new(None)
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         ),
     };
@@ -273,7 +273,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
             &config.provider.api_key,
         )),
         ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(None, config.provider.max_tokens)
+            crate::providers::OpenAiChatGptProvider::new(None)
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         ),
     };

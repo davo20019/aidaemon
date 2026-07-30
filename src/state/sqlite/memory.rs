@@ -440,7 +440,10 @@ impl SqliteStateStore {
             let ids: Vec<i64> = sqlx::query_scalar(
                 "SELECT f.id FROM facts f
                  LEFT JOIN memory_claims c ON c.source_fact_id = f.id
-                 WHERE c.id IS NULL OR (f.superseded_at IS NOT NULL AND c.valid_to IS NULL)
+                 WHERE (f.superseded_at IS NULL AND c.id IS NULL)
+                    OR (f.superseded_at IS NOT NULL
+                        AND c.id IS NOT NULL
+                        AND c.valid_to IS NULL)
                  ORDER BY f.id LIMIT ?",
             )
             .bind(BATCH_SIZE)
@@ -1567,6 +1570,38 @@ mod tests {
         assert_eq!(first_count, 1_001);
         assert_eq!(second_count, 0);
         assert_eq!(spans, 1_001);
+    }
+
+    #[tokio::test]
+    async fn startup_backfill_skips_unprojected_superseded_facts() {
+        let (_dir, store) = test_store().await;
+        let fact_id = insert_fact(&store, "private").await;
+        sqlx::query(
+            "UPDATE facts
+             SET superseded_at = '2026-01-02T00:00:00Z'
+             WHERE id = ?",
+        )
+        .bind(fact_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.backfill_missing_memory_projections(),
+        )
+        .await
+        .expect("backfill must not loop on an unprojected superseded fact")
+        .unwrap();
+
+        assert_eq!(result.0, 0);
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_claims WHERE source_fact_id = ?")
+                .bind(fact_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(claim_count, 0);
     }
 
     #[tokio::test]

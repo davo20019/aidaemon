@@ -38,8 +38,9 @@ pub use goals::{
 #[allow(unused_imports)]
 pub use memory::{
     BehaviorPattern, Episode, ErrorSolution, Expertise, ExtractedMemoryEntity,
-    ExtractedMemoryGraph, ExtractedMemoryRelationship, Fact, MemoryHealthReport, Procedure,
-    UserProfile,
+    ExtractedMemoryGraph, ExtractedMemoryRelationship, Fact, MemoryHealthReport,
+    PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate, PersonalMemoryWrite,
+    PersonalMemoryWriteResult, PersonalRelationshipCandidate, Procedure, UserProfile,
 };
 pub use people::{Person, PersonFact};
 pub use provider::{

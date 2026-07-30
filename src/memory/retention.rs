@@ -404,6 +404,23 @@ impl RetentionManager {
                    SELECT 1 FROM memory_edges edge
                    WHERE edge.source_entity_id = memory_entities.id
                       OR edge.target_entity_id = memory_entities.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_aliases alias
+                   WHERE alias.entity_id = memory_entities.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_entity_facts fact
+                   WHERE fact.subject_entity_id = memory_entities.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_relationships relationship
+                   WHERE relationship.source_entity_id = memory_entities.id
+                      OR relationship.target_entity_id = memory_entities.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_write_audit audit
+                   WHERE audit.entity_id = memory_entities.id
                )",
         )
         .execute(&self.pool)
@@ -850,5 +867,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((claims, edges, embeddings), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn derived_cleanup_preserves_structured_entities_with_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention-structured-memory.db");
+        let embeddings = Arc::new(EmbeddingService::new().unwrap());
+        let store = SqliteStateStore::new(path.to_str().unwrap(), 20, None, embeddings)
+            .await
+            .unwrap();
+        let pool = store.pool();
+
+        let entity_id = sqlx::query(
+            "INSERT INTO memory_entities
+             (entity_type, canonical_name, display_name, aliases_json, privacy, status, is_owner)
+             VALUES ('person', 'isabella', 'Isabella', '[]', 'private', 'active', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO memory_aliases
+             (entity_id, alias_type, value, normalized_value, source, privacy,
+              asserted_at, created_at, updated_at)
+             VALUES (?, 'nickname', 'Bella', 'bella', 'test', 'private',
+                     datetime('now'), datetime('now'), datetime('now'))",
+        )
+        .bind(entity_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        manager.cleanup_derived_memory().await.unwrap();
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_entities WHERE id = ?")
+                .bind(entity_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 1);
     }
 }

@@ -50,7 +50,11 @@ pub const SERVICE: &str = "openai_chatgpt";
 const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 
 /// How long to wait for the user to complete the browser sign-in.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+///
+/// 15 minutes, matching Codex's own device-auth window. Five was not enough in
+/// practice: signing in to ChatGPT, clearing 2FA, and approving can easily
+/// outlast it, and the failure costs the user the whole flow.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Refresh this far ahead of actual expiry so an in-flight request cannot
 /// straddle the boundary.

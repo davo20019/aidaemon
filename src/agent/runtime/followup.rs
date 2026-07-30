@@ -183,6 +183,21 @@ pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -
         return false;
     }
 
+    let source_followup_prefixes = [
+        "what's the source",
+        "what is the source",
+        "where did that come from",
+        "where did this come from",
+        "source for that",
+        "source for this",
+    ];
+    if source_followup_prefixes
+        .iter()
+        .any(|prefix| lower_text.starts_with(prefix))
+    {
+        return true;
+    }
+
     let status_followup_prefixes = [
         "did you ",
         "were you able",
@@ -945,6 +960,17 @@ mod tests {
         let (mode, reasons) = classify_followup_mode(followup, Some(prev));
         assert_eq!(mode, FollowupMode::Followup);
         assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
+    }
+
+    #[test]
+    fn followup_accepts_deictic_source_question() {
+        for prompt in [
+            "what's the source of that?",
+            "what is the source for this?",
+            "where did that come from?",
+        ] {
+            assert!(looks_like_context_dependent_followup_question(prompt));
+        }
     }
     #[test]
     fn generic_explanation_question_without_context_markers_stays_new_task() {

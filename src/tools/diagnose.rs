@@ -1650,6 +1650,17 @@ Rules: no invented event IDs; confidence 0..1.",
                 ""
             }
         ));
+        if summary.failed_calls > 0 {
+            out.push_str(&format!(
+                "- ⚠️ Failed calls: {}{}\n",
+                summary.failed_calls,
+                summary
+                    .last_error
+                    .as_deref()
+                    .map(|error| format!(" — latest: {error}"))
+                    .unwrap_or_default(),
+            ));
+        }
         out.push_str(&format!(
             "- Latency: avg {}ms, p50 {}ms, p95 {}ms, max {}ms (slowest at iteration {})\n",
             summary.avg_latency_ms,

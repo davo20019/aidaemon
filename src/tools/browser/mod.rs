@@ -1796,7 +1796,7 @@ impl Tool for BrowserTool {
                     },
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector for the target element (for click, fill, get_text, wait, screenshot)"
+                        "description": "Stable CSS selector for click/fill/get_text/wait/screenshot. Prefer id, data-*, name, or aria attributes. Never convert a querySelectorAll array index into :nth-of-type(); DOM indexes go stale and :nth-of-type is sibling-relative. Re-observe after page changes."
                     },
                     "full_page": {
                         "type": "boolean",
@@ -1887,36 +1887,98 @@ impl Tool for BrowserTool {
             .and_then(|value| value.get("url"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let selector = args
+            .as_ref()
+            .and_then(|value| value.get("selector"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let script = args
+            .as_ref()
+            .and_then(|value| value.get("script"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
 
-        match action.as_deref() {
-            Some("navigate") => {
-                ToolCallSemantics::observation().with_target_hint(ToolTargetHintKind::Url, url)
-            }
-            Some("get_text") => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-            Some("scroll") => ToolCallSemantics::observation(),
-            Some("wait") => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-            Some("screenshot") => ToolCallSemantics::observation(),
-            // list_tabs just reads the session's tab set — pure observation.
-            Some("list_tabs") => ToolCallSemantics::observation(),
-            Some("get_console_logs" | "get_network_errors") => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-            // new_tab/switch_tab change which page subsequent actions target,
-            // mirroring navigate's observation classification (they don't mutate
-            // page content, they reposition the session).
-            Some("new_tab" | "switch_tab") => ToolCallSemantics::observation(),
-            Some("click" | "fill" | "execute_js") => ToolCallSemantics::mutation(),
-            // close_tab tears down session state — administrative, like close.
-            Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
-            _ => ToolCallSemantics::mutation(),
-        }
+        browser_call_semantics(action.as_deref(), url, selector, script)
     }
+}
+
+fn browser_call_semantics(
+    action: Option<&str>,
+    url: &str,
+    selector: &str,
+    script: &str,
+) -> ToolCallSemantics {
+    match action {
+        Some("navigate") => {
+            ToolCallSemantics::observation().with_target_hint(ToolTargetHintKind::Url, url)
+        }
+        Some("get_text") => ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        Some("scroll") => ToolCallSemantics::observation(),
+        Some("wait") => ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        Some("screenshot") => ToolCallSemantics::observation(),
+        Some("list_tabs") => ToolCallSemantics::observation(),
+        Some("get_console_logs" | "get_network_errors") => ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent),
+        Some("new_tab" | "switch_tab") => ToolCallSemantics::observation(),
+        // A browser click usually changes only local navigation/UI state.
+        // Count it as an external mutation only when its target carries a
+        // consequential action signal; otherwise a stale tab selector in a
+        // read-only investigation must not trigger mutation reconciliation.
+        Some("click") => {
+            let risk = policy::classify("click", Some(selector), None);
+            if risk.consequential {
+                ToolCallSemantics::mutation()
+            } else {
+                ToolCallSemantics::observation()
+            }
+        }
+        Some("fill") => ToolCallSemantics::mutation(),
+        Some("execute_js") => {
+            if browser_script_has_mutation_signal(script) {
+                ToolCallSemantics::mutation()
+            } else {
+                ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent)
+            }
+        }
+        Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
+        _ => ToolCallSemantics::mutation(),
+    }
+}
+
+fn browser_script_has_mutation_signal(script: &str) -> bool {
+    let compact = script.to_ascii_lowercase().replace(char::is_whitespace, "");
+    [
+        ".click(",
+        ".submit(",
+        ".remove(",
+        ".append(",
+        ".appendchild(",
+        ".insertbefore(",
+        ".setattribute(",
+        ".dispatchevent(",
+        "fetch(",
+        "xmlhttprequest",
+        "localstorage.setitem(",
+        "sessionstorage.setitem(",
+        "document.cookie=",
+        "window.location=",
+        "location.href=",
+        ".innerhtml=",
+        ".textcontent=",
+        ".value=",
+    ]
+    .iter()
+    .any(|signal| compact.contains(signal))
 }
 
 #[cfg(test)]
 mod prompt_tests {
-    use super::format_browser_approval_prompt;
+    use super::{
+        browser_call_semantics, browser_script_has_mutation_signal, format_browser_approval_prompt,
+    };
     use crate::tools::browser::policy::{self, BrowserRiskClass};
 
     fn sample_risk() -> policy::BrowserActionRisk {
@@ -1925,6 +1987,28 @@ mod prompt_tests {
             sensitive: false,
             consequential: false,
         }
+    }
+
+    #[test]
+    fn read_only_dom_extraction_is_observation_semantics() {
+        let script =
+            "JSON.stringify([...document.querySelectorAll('button')].map((b,i)=>({i,text:b.innerText})))";
+        let semantics = browser_call_semantics(Some("execute_js"), "", "", script);
+        assert!(semantics.observes_state());
+        assert!(!semantics.mutates_state());
+        assert!(!browser_script_has_mutation_signal(script));
+    }
+
+    #[test]
+    fn consequential_browser_actions_remain_mutations() {
+        assert!(browser_script_has_mutation_signal(
+            "document.querySelector('#publish').click()"
+        ));
+        assert!(browser_call_semantics(Some("click"), "", "#publish", "").mutates_state());
+        assert!(
+            browser_call_semantics(Some("click"), "", "button:nth-of-type(197)", "")
+                .observes_state()
+        );
     }
 
     #[test]

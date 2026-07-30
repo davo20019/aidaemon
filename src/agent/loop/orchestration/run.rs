@@ -89,13 +89,17 @@ pub(in crate::agent) async fn run_orchestration_phase(
 
     // Orchestration routing (always-on).
     let complexity = classify_intent_complexity(ctx.user_text);
-    let (route, tools_required) = orchestration_route_label(&complexity);
+    let (route, route_requires_tools) = orchestration_route_label(&complexity);
+    let tools_required = route_requires_tools
+        || ctx.intent_gate.needs_tools.unwrap_or(false)
+        || ctx.turn_context.completion_contract.expects_mutation
+        || ctx.turn_context.completion_contract.requires_observation;
 
     // Per-turn intent-classification telemetry: record the gate result + complexity
     // + route for every (non-cancel) turn so the determination is queryable via the
     // event store. Gated internally by `record_decision_points`; severity Info.
     let (intent_summary, intent_metadata) = intent_decision_telemetry(
-        ctx.intent_gate.needs_tools.unwrap_or(false),
+        tools_required,
         &complexity,
         route,
         ctx.user_text.chars().count(),

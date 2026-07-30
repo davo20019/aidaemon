@@ -568,6 +568,50 @@ pub(super) async fn run_llm_phase(
     let effective_model = pin_model.as_deref().unwrap_or(model);
     #[cfg(not(feature = "computer_use"))]
     let effective_model = model;
+    let offered_tools: Vec<String> = effective_tools
+        .iter()
+        .filter_map(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let base_llm_call = LlmCallData {
+        call_id: None,
+        call_purpose: None,
+        task_id: task_id.to_string(),
+        iteration: Some(iteration as u32),
+        model: model.to_string(),
+        final_model: None,
+        fell_back: false,
+        attempts: 0,
+        latency_ms: 0,
+        prompt_ms: None,
+        decode_ms: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        fresh_input_tokens: None,
+        est_input_tokens: Some(est_input_tokens),
+        tool_calls_count: 0,
+        offered_tools,
+        chosen_tools: Vec::new(),
+        build_ms: Some(build_ms),
+        prefix_hash_system: Some(prefix_fp.hash_system.clone()),
+        prefix_hash_pre_boundary: Some(prefix_fp.hash_pre_boundary.clone()),
+        tool_defs_hash: Some(prefix_fp.tool_defs_hash.clone()),
+        session_summary_hash: Some(prefix_fp.session_summary_hash.clone()),
+        tail_hash: Some(prefix_fp.tail_hash.clone()),
+        prefix_hash_archived: Some(prefix_fp.prefix_hash_archived.clone()),
+        boundary_pos: Some(prefix_fp.boundary_pos),
+        message_count: Some(prefix_fp.message_count),
+        force_text: prefix_fp.force_text,
+        token_usage_present: false,
+        failed: false,
+        error: None,
+    };
     // Keep the heartbeat alive for the duration of the LLM call so the
     // channel stale-watchdog does not cancel a slow-but-progressing
     // generation.  Auto-aborted on drop; bounded by the LLM timeout.
@@ -587,8 +631,47 @@ pub(super) async fn run_llm_phase(
     )
     .await
     {
-        Ok(result) => result?,
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            drop(_llm_heartbeat_keeper);
+            touch_heartbeat(heartbeat);
+            let error_message = error.to_string();
+            let mut failed_call = base_llm_call.clone();
+            failed_call.final_model = Some(if llm_telemetry.final_model.is_empty() {
+                effective_model.to_string()
+            } else {
+                llm_telemetry.final_model.clone()
+            });
+            failed_call.fell_back = llm_telemetry.fell_back;
+            failed_call.attempts = llm_telemetry.attempts.max(1);
+            failed_call.latency_ms = llm_call_start.elapsed().as_millis() as u64;
+            failed_call.failed = true;
+            failed_call.error = Some(error_message.clone());
+            crate::events::record_model_call_telemetry(
+                emitter,
+                services.agent.state.as_ref(),
+                crate::events::ModelCallTelemetryInput {
+                    session_id: session_id.to_string(),
+                    task_id: task_id.to_string(),
+                    call_purpose: None,
+                    iteration: Some(iteration as u32),
+                    llm_call: failed_call,
+                    token_usage: None,
+                },
+            )
+            .await;
+            let _ = emitter
+                .emit(
+                    EventType::Error,
+                    ErrorData::llm_error(error_message, Some(task_id.to_string()))
+                        .with_context("llm_call_failed"),
+                )
+                .await;
+            return Err(error);
+        }
         Err(_elapsed) => {
+            drop(_llm_heartbeat_keeper);
+            touch_heartbeat(heartbeat);
             // Record the timeout duration so the wall-clock budget
             // can exclude time lost to provider slowness.
             *provider_timeout_ms += timeout_dur.as_millis() as u64;
@@ -598,14 +681,36 @@ pub(super) async fn run_llm_phase(
                 timeout_secs = timeout_dur.as_secs(),
                 "LLM call timed out"
             );
+            let timeout_message = format!("LLM call timed out after {}s", timeout_dur.as_secs());
+            let mut failed_call = base_llm_call.clone();
+            failed_call.final_model = Some(if llm_telemetry.final_model.is_empty() {
+                effective_model.to_string()
+            } else {
+                llm_telemetry.final_model.clone()
+            });
+            failed_call.fell_back = llm_telemetry.fell_back;
+            failed_call.attempts = llm_telemetry.attempts.max(1);
+            failed_call.latency_ms = llm_call_start.elapsed().as_millis() as u64;
+            failed_call.failed = true;
+            failed_call.error = Some(timeout_message.clone());
+            crate::events::record_model_call_telemetry(
+                emitter,
+                services.agent.state.as_ref(),
+                crate::events::ModelCallTelemetryInput {
+                    session_id: session_id.to_string(),
+                    task_id: task_id.to_string(),
+                    call_purpose: None,
+                    iteration: Some(iteration as u32),
+                    llm_call: failed_call,
+                    token_usage: None,
+                },
+            )
+            .await;
             let _ = emitter
                 .emit(
                     EventType::Error,
-                    ErrorData::llm_error(
-                        format!("LLM call timed out after {}s", timeout_dur.as_secs()),
-                        Some(task_id.to_string()),
-                    )
-                    .with_context("llm_call_timeout"),
+                    ErrorData::llm_error(timeout_message, Some(task_id.to_string()))
+                        .with_context("llm_call_timeout"),
                 )
                 .await;
             learning_ctx.errors.push((
@@ -702,11 +807,6 @@ pub(super) async fn run_llm_phase(
                 call_purpose: None,
                 iteration: Some(iteration as u32),
                 llm_call: LlmCallData {
-                    call_id: None,
-                    call_purpose: None,
-                    task_id: task_id.to_string(),
-                    iteration: Some(iteration as u32),
-                    model: model.to_string(),
                     final_model: Some(final_model),
                     fell_back: llm_telemetry.fell_back,
                     attempts: llm_telemetry.attempts,
@@ -718,33 +818,14 @@ pub(super) async fn run_llm_phase(
                     cached_input_tokens,
                     cache_creation_input_tokens,
                     fresh_input_tokens,
-                    est_input_tokens: Some(est_input_tokens),
                     tool_calls_count: resp.tool_calls.len() as u32,
                     // The exact tools offered to the model on this call (post
                     // policy/force-text/budget) and what it chose — so a single
                     // db_probe query can show whether a tool was available when
                     // the model fell back to another one.
-                    offered_tools: effective_tools
-                        .iter()
-                        .filter_map(|d| {
-                            d.get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|n| n.as_str())
-                                .map(str::to_string)
-                        })
-                        .collect(),
                     chosen_tools: resp.tool_calls.iter().map(|tc| tc.name.clone()).collect(),
-                    build_ms: Some(build_ms),
-                    prefix_hash_system: Some(prefix_fp.hash_system.clone()),
-                    prefix_hash_pre_boundary: Some(prefix_fp.hash_pre_boundary.clone()),
-                    tool_defs_hash: Some(prefix_fp.tool_defs_hash.clone()),
-                    session_summary_hash: Some(prefix_fp.session_summary_hash.clone()),
-                    tail_hash: Some(prefix_fp.tail_hash.clone()),
-                    prefix_hash_archived: Some(prefix_fp.prefix_hash_archived.clone()),
-                    boundary_pos: Some(prefix_fp.boundary_pos),
-                    message_count: Some(prefix_fp.message_count),
-                    force_text: prefix_fp.force_text,
                     token_usage_present: resp.usage.is_some(),
+                    ..base_llm_call.clone()
                 },
                 token_usage: resp.usage.clone(),
             },
@@ -882,7 +963,7 @@ pub(super) async fn run_llm_phase(
                                     )
                                     .await;
                                     let alert_msg = format!(
-                                        "Token alert: scheduled run for goal '{}' hit per-run budget (used {} / limit {}). Execution was stopped because the run no longer appeared productive.",
+                                        "Token alert: scheduled run for goal '{}' hit its per-run budget (used {} / limit {}). The run stopped safely before completion.",
                                         goal_id, tokens_used, budget_per_check
                                     );
                                     services

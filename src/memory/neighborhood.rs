@@ -283,7 +283,7 @@ mod tests {
 
         // Test: "Ana" should not pull the banana fact.
         let out_ana = select_neighborhood_facts(
-            &[banana_fact.clone()],
+            std::slice::from_ref(&banana_fact),
             &["Ana".into()],
             false,
             &empty,
@@ -296,7 +296,7 @@ mod tests {
 
         // Test: "Frank" should pull the frank fact.
         let out_frank = select_neighborhood_facts(
-            &[frank_fact.clone()],
+            std::slice::from_ref(&frank_fact),
             &["Frank".into()],
             false,
             &empty,

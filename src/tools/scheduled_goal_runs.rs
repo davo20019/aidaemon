@@ -331,9 +331,9 @@ impl ScheduledGoalRunsTool {
             result: None,
             error: None,
             blocker: None,
-            idempotent: goal.goal_type == "continuous",
+            idempotent: false,
             retry_count: 0,
-            max_retries: 1,
+            max_retries: 0,
             created_at: now.clone(),
             started_at: None,
             completed_at: None,
@@ -838,6 +838,9 @@ mod tests {
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
+        assert!(!tasks[0].idempotent);
+        assert_eq!(tasks[0].max_retries, 0);
+        assert!(tasks[0].description.starts_with("Manual scheduled run:"));
     }
 
     #[tokio::test]

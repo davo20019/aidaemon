@@ -1142,8 +1142,10 @@ async fn test_vision_disabled_sends_text_stub_only() {
         "I received your file but cannot view images while vision is disabled.",
     )]);
     let mut harness = setup_test_agent(provider).await.unwrap();
-    let mut files = FilesConfig::default();
-    files.vision_enabled = false;
+    let files = FilesConfig {
+        vision_enabled: false,
+        ..Default::default()
+    };
     harness
         .agent
         .set_test_vision_config(VisionConfig::from_files(&files));
@@ -1256,8 +1258,10 @@ async fn test_audio_disabled_sends_text_stub_only() {
         "I received your audio but cannot process it while audio is disabled.",
     )]);
     let mut harness = setup_test_agent(provider).await.unwrap();
-    let mut files = FilesConfig::default();
-    files.audio_enabled = false;
+    let files = FilesConfig {
+        audio_enabled: false,
+        ..Default::default()
+    };
     harness
         .agent
         .set_test_audio_config(AudioConfig::from_files(&files));
@@ -1582,7 +1586,7 @@ async fn test_attachment_stub_metadata_does_not_force_tool_required_loop() {
         "image/jpeg".to_string(),
         9,
     );
-    let inbound_text = build_inbound_text("", &[attachment.clone()]);
+    let inbound_text = build_inbound_text("", std::slice::from_ref(&attachment));
 
     let vision_reply = MockProvider::text_response("This image looks like a small PNG file.");
     let provider = MockProvider::with_responses(vec![

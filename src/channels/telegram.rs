@@ -99,6 +99,10 @@ struct SetupLoginResult {
     urls: Vec<String>,
 }
 
+fn should_send_standalone_task_error(is_stale_watchdog: bool, has_live_surface: bool) -> bool {
+    !is_stale_watchdog && !has_live_surface
+}
+
 use crate::wizard::CloudflaredZoneValidation;
 
 use crate::cli_agent_flags::{self, AGENT_FLAGS_CACHE_TTL_SECS, SUPPORTED_TERMINAL_AGENTS};
@@ -4748,6 +4752,9 @@ impl TelegramChannel {
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
+                        let is_stale_watchdog =
+                            error_msg.starts_with("Task auto-cancelled due to inactivity");
+                        let has_live_surface = live_owner.is_some() && live_sink.is_some();
                         // Cancellation: fail immediately and exit (queue already
                         // cleared by the /cancel handler).
                         if error_msg == "Task cancelled" {
@@ -4759,12 +4766,11 @@ impl TelegramChannel {
                         // while we send the error message (same race-prevention
                         // logic as the Ok path).
                         task_error = Some(error_msg.clone());
-                        if error_msg.starts_with("Task auto-cancelled due to inactivity") {
+                        if is_stale_watchdog {
                             info!("Task #{} auto-cancelled by stale watchdog", current_task_id);
                             let _ = bot.send_message(chat_id, format!("⚠️ {}", error_msg)).await;
                         } else {
                             warn!("Agent error: {}", e);
-                            let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                         }
                         if let (Some(live_owner), Some(live_sink)) =
                             (live_owner.as_ref(), live_sink.as_ref())
@@ -4779,6 +4785,11 @@ impl TelegramChannel {
                             live_owner.lock().await.reset();
                         } else if let Some(live_owner) = live_owner.as_ref() {
                             live_owner.lock().await.reset();
+                        }
+                        if should_send_standalone_task_error(is_stale_watchdog, has_live_surface) {
+                            // No live "Working" surface exists to finalize, so
+                            // deliver one standalone terminal error.
+                            let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                         }
                     }
                 }
@@ -6003,6 +6014,13 @@ mod tests {
     fn fallback_session_namespace_sanitizes_invalid_chars() {
         let ns = fallback_session_namespace_from_token("12$34:^secret");
         assert_eq!(ns, "tg1234");
+    }
+
+    #[test]
+    fn terminal_error_uses_exactly_one_delivery_surface() {
+        assert!(!should_send_standalone_task_error(false, true));
+        assert!(should_send_standalone_task_error(false, false));
+        assert!(!should_send_standalone_task_error(true, false));
     }
 
     #[test]

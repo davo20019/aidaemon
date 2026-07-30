@@ -1,8 +1,9 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::agent::recall_guardrails::{
     detect_critical_fact_query, deterministic_reply_for_critical_query,
-    extract_critical_fact_summary, looks_like_personal_memory_recall_question,
-    user_is_reaffirmation_challenge, user_requests_external_verification,
+    extract_critical_fact_summary, filter_tool_defs_for_personal_memory, is_personal_memory_tool,
+    looks_like_personal_memory_recall_question, user_is_reaffirmation_challenge,
+    user_requests_external_verification,
 };
 use crate::agent::*;
 
@@ -512,6 +513,41 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             ));
         }
 
+        if restrict_to_personal_memory_tools {
+            let before = defs.len();
+            defs = filter_tool_defs_for_personal_memory(&defs);
+            caps.retain(|name, _| is_personal_memory_tool(name));
+            tool_filter_stages.push(GateFilterStage::new(
+                "personal_memory_allowlist",
+                before,
+                defs.len(),
+                if before == defs.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
+        }
+
+        if matches!(
+            classify_intent_complexity(user_text),
+            IntentComplexity::Simple
+        ) {
+            let before = defs.len();
+            defs.retain(|definition| {
+                Agent::tool_name_from_definition(definition) != Some("track_requirements")
+            });
+            caps.remove("track_requirements");
+            if before != defs.len() {
+                tool_filter_stages.push(GateFilterStage::new(
+                    "simple_turn_no_checklist",
+                    before,
+                    defs.len(),
+                    "filtered",
+                ));
+            }
+        }
+
         available_capabilities = caps;
         base_tool_defs = defs.clone();
         tool_defs = defs;
@@ -805,6 +841,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         turn_id: Some(user_msg_id.clone()),
         depth: agent.depth as u32,
         parent_task_id: agent.task_id.clone(),
+        goal_id: agent.goal_id.clone(),
+        durable_task_id: agent.task_id.clone(),
         completion_task_kind: "conversational".to_string(),
         followup_mode: None,
         config: agent.harness_eval_config.clone(),

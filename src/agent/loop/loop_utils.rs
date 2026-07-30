@@ -463,7 +463,7 @@ fn is_external_data_tool(tool_name: &str) -> bool {
     matches!(tool_name, "web_fetch" | "http_request")
 }
 
-fn manage_memories_list_output_is_report(result_text: &str, tool_arguments: Option<&str>) -> bool {
+fn manage_memories_read_output_is_report(result_text: &str, tool_arguments: Option<&str>) -> bool {
     let action = tool_arguments
         .and_then(|args| serde_json::from_str::<Value>(args).ok())
         .and_then(|args| {
@@ -471,13 +471,29 @@ fn manage_memories_list_output_is_report(result_text: &str, tool_arguments: Opti
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-    if action.as_deref() != Some("list") {
+    if !matches!(
+        action.as_deref(),
+        Some(
+            "list"
+                | "health"
+                | "search"
+                | "search_episodes"
+                | "list_goals"
+                | "list_scheduled"
+                | "list_scheduled_matching"
+                | "diagnose_scheduled"
+        )
+    ) {
         return false;
     }
 
     let cleaned = strip_appended_diagnostics(result_text);
     let trimmed = cleaned.trim_start();
-    trimmed.starts_with("**Stored Memories**") || trimmed == "No memories stored."
+    !trimmed.starts_with("ERROR:")
+        && !trimmed.starts_with("Error:")
+        && !trimmed.starts_with("Failed to ")
+        && !trimmed.starts_with("Request blocked:")
+        && !trimmed.starts_with("Blocked:")
 }
 
 pub(super) fn classify_tool_result_failure(
@@ -582,7 +598,7 @@ pub(super) fn classify_tool_result_failure_with_args(
     tool_arguments: Option<&str>,
 ) -> Option<ToolFailureClass> {
     if tool_name == "manage_memories"
-        && manage_memories_list_output_is_report(result_text, tool_arguments)
+        && manage_memories_read_output_is_report(result_text, tool_arguments)
     {
         return None;
     }
@@ -1130,6 +1146,20 @@ mod tool_error_detection_tests {
         let classified =
             classify_tool_result_failure_with_args("manage_memories", result, Some(args));
         assert_eq!(classified, None);
+    }
+
+    #[test]
+    fn manage_memories_search_results_can_contain_error_words() {
+        let args = r#"{"action":"search","query":"home residence"}"#;
+        let result = "══ Stored facts matching 'home residence' ══\n\
+                      • [technical] past_failure → \"Failed to connect: error: timeout\"\n\
+                      • [user] residence → \"Exampletown, VA\"";
+        let classified =
+            classify_tool_result_failure_with_args("manage_memories", result, Some(args));
+        assert_eq!(
+            classified, None,
+            "successful read output is data even when a stored value contains error words"
+        );
     }
 
     #[test]

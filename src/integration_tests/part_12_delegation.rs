@@ -218,13 +218,14 @@ async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
         MockProvider::text_response("Used the currently exposed tools instead."),
     ]);
     let extra_tools = vec![Arc::new(HighImpactCliAgentMock) as Arc<dyn crate::traits::Tool>];
-    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
-        provider,
-        extra_tools,
-        None,
-    )
-    .await
-    .unwrap();
+    let policy_config = crate::config::PolicyConfig {
+        tool_filter_enforce: false,
+        ..Default::default()
+    };
+    let harness =
+        crate::testing::setup_test_agent_with_policy(provider, policy_config, extra_tools)
+            .await
+            .unwrap();
 
     let response = harness
         .agent

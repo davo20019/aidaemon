@@ -107,9 +107,17 @@ The setup wizard offers the same option. Then point the provider at it:
 kind = "openai_chatgpt"
 api_key = ""                        # unused; credentials come from the OAuth store
 
+reasoning_effort = "medium"         # none | minimal | low | medium | high | xhigh | max | ultra
+
 [provider.models]
-primary = "gpt-5.1-codex"
+primary = "gpt-5.6-terra"           # sol = flagship, terra = balanced, luna = fast
+fast = "gpt-5.6-luna"
+smart = "gpt-5.6-sol"
 ```
+
+Model and reasoning effort are both yours to pick. Effort is passed through
+verbatim, so newly added levels work without a client update; each model
+supports its own subset and the API rejects ones it doesn't.
 
 Sign-in is OAuth 2.0 + PKCE against `auth.openai.com`, with the redirect landing
 on `http://localhost:1455/auth/callback` (the port is fixed by OpenAI's client

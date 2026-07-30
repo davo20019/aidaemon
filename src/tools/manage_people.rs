@@ -800,10 +800,25 @@ impl ManagePeopleTool {
     async fn handle_status(&self) -> anyhow::Result<String> {
         let enabled = self.is_people_enabled().await;
         let people_count = self.state.get_all_people().await.unwrap_or_default().len();
+        let canonical = self
+            .state
+            .get_canonical_memory_facts()
+            .await
+            .unwrap_or_default();
+        let relationship_edges = canonical
+            .iter()
+            .filter(|fact| fact.category == "relationships")
+            .count();
+        let canonical_attributes = canonical.len().saturating_sub(relationship_edges);
         Ok(format!(
-            "People Intelligence: **{}**\nPeople tracked: {}",
+            "Legacy People Intelligence: **{}**\n\
+             Legacy contact records: {}\n\
+             Structured personal memory: {} active facts/aliases, {} active directed relationship edges\n\
+             These are separate compatibility layers. Do not describe legacy contact rows as populated structured graph edges.",
             if enabled { "enabled" } else { "disabled" },
-            people_count
+            people_count,
+            canonical_attributes,
+            relationship_edges,
         ))
     }
 }
@@ -843,6 +858,18 @@ mod tests {
         state.set_setting("people_enabled", "true").await.unwrap();
         std::mem::forget(db_file);
         ManagePeopleTool::new(state as Arc<dyn StateStore>)
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_legacy_people_from_structured_edges() {
+        let tool = setup_tool().await;
+        let result = tool
+            .call(&json!({"action": "status"}).to_string())
+            .await
+            .unwrap();
+        assert!(result.contains("Legacy contact records:"));
+        assert!(result.contains("active directed relationship edges"));
+        assert!(result.contains("separate compatibility layers"));
     }
 
     #[tokio::test]

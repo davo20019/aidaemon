@@ -66,6 +66,23 @@ pub trait DialogueStateStore: Send + Sync {
 /// Layer-2 facts storage and retrieval (including privacy + channel provenance).
 #[async_trait]
 pub trait FactStore: Send + Sync {
+    /// Reconcile an entity-aware personal-memory write atomically.
+    async fn reconcile_personal_memory(
+        &self,
+        _write: &super::PersonalMemoryWrite,
+        _source: &str,
+        _source_excerpt: Option<&str>,
+        _channel_id: Option<&str>,
+        _privacy: FactPrivacy,
+    ) -> anyhow::Result<super::PersonalMemoryWriteResult> {
+        anyhow::bail!("structured personal memory is not supported by this store")
+    }
+
+    /// Compatibility projection of active canonical facts and relationships.
+    async fn get_canonical_memory_facts(&self) -> anyhow::Result<Vec<super::Fact>> {
+        Ok(Vec::new())
+    }
+
     /// Upsert a fact with channel provenance and privacy level.
     async fn upsert_fact(
         &self,
@@ -867,6 +884,7 @@ pub trait TaskStore: Send + Sync {
     }
 
     /// Count completed/skipped tasks for a goal (used by progress-based circuit breaker).
+    #[allow(dead_code)] // Retained for stores and diagnostics; run-scoped code filters task rows.
     async fn count_completed_tasks_for_goal(&self, _goal_id: &str) -> anyhow::Result<i64> {
         Ok(0)
     }
@@ -970,7 +988,8 @@ pub trait GoalScheduleStore: Send + Sync {
 /// Goal token budget persistence and accounting.
 #[async_trait]
 pub trait GoalBudgetStore: Send + Sync {
-    /// Reset tokens_used_today to 0 for all active goals.
+    /// Reset tokens_used_today only for active goals whose usage belongs to a
+    /// prior UTC day. Safe to call repeatedly or at process startup.
     async fn reset_daily_token_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
     }

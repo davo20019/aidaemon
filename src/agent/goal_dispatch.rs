@@ -214,7 +214,13 @@ pub(in crate::agent) async fn active_scheduled_root_task_id(
         .filter(|task| {
             !matches!(
                 task.status.as_str(),
-                "completed" | "failed" | "cancelled" | "skipped"
+                "completed"
+                    | "failed"
+                    | "cancelled"
+                    | "skipped"
+                    | "blocked"
+                    | "interrupted"
+                    | "abandoned"
             )
         })
         .max_by(|a, b| a.created_at.cmp(&b.created_at))
@@ -255,11 +261,12 @@ pub(in crate::agent) async fn persist_scheduled_run_state(
     status: &GoalRunBudgetStatus,
 ) {
     let existing = state.get_scheduled_run_state(goal_id).await.ok().flatten();
-    let existing_created_at = existing.as_ref().map(|record| record.created_at.clone());
-    let root_task_id = if let Some(record) = existing.as_ref() {
-        Some(record.root_task_id.clone())
-    } else if let Some(root_task_id) = root_task_id_hint {
+    // A caller-provided root always identifies the current run. Reusing the
+    // prior persisted root here mixed token accounting across separate fires.
+    let root_task_id = if let Some(root_task_id) = root_task_id_hint {
         Some(root_task_id.to_string())
+    } else if let Some(record) = existing.as_ref() {
+        Some(record.root_task_id.clone())
     } else {
         active_scheduled_root_task_id(state, goal_id).await
     };
@@ -269,6 +276,11 @@ pub(in crate::agent) async fn persist_scheduled_run_state(
     };
 
     let now = chrono::Utc::now().to_rfc3339();
+    let created_at = existing
+        .as_ref()
+        .filter(|record| record.root_task_id == root_task_id)
+        .map(|record| record.created_at.clone())
+        .unwrap_or_else(|| now.clone());
     let record = ScheduledRunState {
         goal_id: goal_id.to_string(),
         root_task_id,
@@ -276,7 +288,7 @@ pub(in crate::agent) async fn persist_scheduled_run_state(
         tokens_used: status.tokens_used,
         budget_extensions_count: status.budget_extensions_count,
         health: status.health.clone(),
-        created_at: existing_created_at.unwrap_or_else(|| now.clone()),
+        created_at,
         updated_at: now,
     };
     let _ = state.upsert_scheduled_run_state(&record).await;
@@ -670,7 +682,7 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
 
     let mut successful: Vec<&Task> = tasks
         .iter()
-        .filter(|t| t.status == "completed" && t.error.is_none())
+        .filter(|t| t.completed_successfully())
         .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
         // Skip the parent "Execute scheduled goal: <goal>" task: its description
         // is the full goal text (plus internal [SYSTEM: …] markers) and its

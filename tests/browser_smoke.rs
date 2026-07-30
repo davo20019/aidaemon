@@ -10,5 +10,4 @@
 fn browser_smoke_entrypoint_documentation() {
     // Keeps this integration-test target present for CI discovery; the ignored
     // real-Chrome suite is `browser_smoke_real_chrome` in the library tests.
-    assert!(true);
 }

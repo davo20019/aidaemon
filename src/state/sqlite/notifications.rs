@@ -34,9 +34,11 @@ impl crate::traits::NotificationStore for SqliteStateStore {
              FROM notification_queue
              WHERE delivered_at IS NULL
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+               AND attempts < 10
+               AND datetime(created_at) > datetime('now', '-24 hours')
              ORDER BY
                CASE priority WHEN 'critical' THEN 0 ELSE 1 END ASC,
-               created_at ASC
+               created_at DESC
              LIMIT ?",
         )
         .bind(limit)

@@ -43,6 +43,8 @@ pub struct HarnessEvalSeed {
     pub turn_id: Option<String>,
     pub depth: u32,
     pub parent_task_id: Option<String>,
+    pub goal_id: Option<String>,
+    pub durable_task_id: Option<String>,
     pub completion_task_kind: String,
     pub followup_mode: Option<String>,
     pub config: HarnessEvalConfig,
@@ -88,6 +90,8 @@ pub struct ProgressSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct ContractSnapshot {
     pub expects_mutation: bool,
+    pub forbids_mutation: bool,
+    pub forbidden_mutation_attempts: u32,
     pub mutation_count: u32,
     pub requires_observation: bool,
     pub observation_count: u32,
@@ -286,9 +290,20 @@ impl HarnessEvalAccumulator {
 
     pub fn record_completion_contract(&mut self, contract: &CompletionContract) {
         self.contract.expects_mutation = contract.expects_mutation;
+        self.contract.forbids_mutation = contract.forbids_mutation;
         self.contract.requires_observation = contract.requires_observation;
         self.contract.verification_required = contract.explicit_verification_requested
             || contract.requires_reverification_after_mutation;
+    }
+
+    pub fn record_forbidden_mutation_attempt(&mut self) {
+        self.contract.forbidden_mutation_attempts =
+            self.contract.forbidden_mutation_attempts.saturating_add(1);
+    }
+
+    pub fn record_plan_progress(&mut self, completed: u32, total: u32) {
+        self.progress.plan_steps_completed = Some(completed);
+        self.progress.plan_steps_total = Some(total);
     }
 
     pub fn record_completion_progress(&mut self, progress: &CompletionProgress) {
@@ -361,7 +376,7 @@ impl HarnessEvalAccumulator {
     ) -> HarnessEvalSnapshot {
         let mut acc = self;
         acc.progress.iterations = acc.progress.iterations.max(iterations);
-        acc.progress.tool_calls_succeeded = acc.progress.tool_calls_succeeded.max(tool_calls_count);
+        acc.progress.tool_calls_attempted = acc.progress.tool_calls_attempted.max(tool_calls_count);
         if tool_calls_count > 0 {
             acc.tools_actually_used = true;
         }
@@ -376,6 +391,15 @@ impl HarnessEvalAccumulator {
         }
         if acc.direct_return_attempted && !acc.direct_return_succeeded {
             acc.stop_reason = StopReason::Error;
+        }
+        if outcome == TaskOutcome::Failed {
+            let failed_calls = acc
+                .progress
+                .tool_calls_attempted
+                .saturating_sub(acc.progress.tool_calls_succeeded);
+            if failed_calls > 0 {
+                acc.unrecovered_errors = acc.unrecovered_errors.saturating_add(failed_calls);
+            }
         }
 
         let routing = RoutingSnapshot {
@@ -422,6 +446,8 @@ impl HarnessEvalAccumulator {
             turn_id: acc.seed.turn_id,
             depth: acc.seed.depth,
             parent_task_id: acc.seed.parent_task_id,
+            goal_id: acc.seed.goal_id,
+            durable_task_id: acc.seed.durable_task_id,
             completion_task_kind: acc.seed.completion_task_kind,
             orchestration_route: acc.orchestration_route,
             followup_mode: acc.seed.followup_mode,
@@ -494,6 +520,8 @@ impl From<ContractSnapshot> for crate::events::ContractFulfillmentPayload {
     fn from(value: ContractSnapshot) -> Self {
         Self {
             expects_mutation: value.expects_mutation,
+            forbids_mutation: value.forbids_mutation,
+            forbidden_mutation_attempts: value.forbidden_mutation_attempts,
             mutation_count: value.mutation_count,
             requires_observation: value.requires_observation,
             observation_count: value.observation_count,
@@ -539,6 +567,8 @@ mod tests {
             turn_id: None,
             depth: 1,
             parent_task_id: Some("parent".to_string()),
+            goal_id: Some("goal".to_string()),
+            durable_task_id: Some("durable-child".to_string()),
             completion_task_kind: "conversational".to_string(),
             orchestration_route: "default_continue".to_string(),
             followup_mode: None,
@@ -577,6 +607,8 @@ mod tests {
                 stop_reason: "completed".to_string(),
                 contract: ContractFulfillmentPayload {
                     expects_mutation: false,
+                    forbids_mutation: false,
+                    forbidden_mutation_attempts: 0,
                     mutation_count: 0,
                     requires_observation: false,
                     observation_count: 0,
@@ -618,6 +650,8 @@ mod tests {
             turn_id: None,
             depth: 0,
             parent_task_id: None,
+            goal_id: Some("goal".to_string()),
+            durable_task_id: None,
             completion_task_kind: "conversational".to_string(),
             followup_mode: None,
             config: HarnessEvalConfig::default(),

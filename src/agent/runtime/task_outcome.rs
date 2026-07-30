@@ -6,7 +6,7 @@ use super::goal_dispatch::is_low_signal_task_lead_reply;
 use super::validation_state::ValidationState;
 use crate::events::TaskOutcome;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Why a task terminated before natural completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,51 +29,26 @@ pub struct RequestedActionSummary {
 
 impl RequestedActionSummary {
     pub fn from_completion_state(
-        validation: &ValidationState,
+        _validation: &ValidationState,
         execution: &ExecutionState,
         completion: &CompletionProgress,
     ) -> Self {
-        let matched_criteria: BTreeSet<String> = validation
-            .matched_success_criteria
-            .iter()
-            .map(|criterion| action_key(criterion))
-            .filter(|criterion| !criterion.is_empty())
-            .collect();
-        let mut actions: BTreeMap<String, bool> = validation
-            .active_success_criteria
-            .iter()
-            .map(|criterion| action_key(criterion))
-            .filter(|criterion| !criterion.is_empty())
-            .map(|criterion| {
-                let satisfied = matched_criteria.contains(&criterion);
-                (criterion, satisfied)
-            })
-            .collect();
-
-        if let Some(plan) = execution.active_linear_intent_plan.as_ref() {
-            for step in &plan.steps {
-                let description_key = action_key(&step.description);
-                let key = if description_key.is_empty() {
-                    format!("plan-step:{}", step.step_id)
-                } else {
-                    description_key
-                };
-                actions
-                    .entry(key)
-                    .and_modify(|satisfied| *satisfied |= step.completed)
-                    .or_insert(step.completed);
-            }
-        }
+        // Planner-generated success criteria and linear-plan steps are
+        // advisory execution aids. They are not user-authored acceptance
+        // requirements and must not turn a fulfilled answer into `partial`
+        // merely because the plan cursor was never advanced.
+        let mut actions: BTreeMap<String, bool> = BTreeMap::new();
 
         if completion.verification_pending {
             actions.insert("verification:pending".to_string(), false);
         }
 
-        for entry in execution
-            .uncorrected_failed_required_observations()
-            .into_iter()
-            .chain(execution.uncorrected_failed_mutations())
-        {
+        // A failed exploratory observation is not itself an unresolved user
+        // requirement. Required verification is represented by
+        // `verification_pending` and the completion contract. Preserve failed
+        // external mutations here because they can represent an uncompleted
+        // requested action.
+        for entry in execution.uncorrected_failed_mutations() {
             let Some(step_id) = entry.planned_step_id.as_deref() else {
                 continue;
             };
@@ -504,9 +479,11 @@ mod tests {
 
     #[test]
     fn incidental_tool_failure_does_not_block_informational_success() {
-        let mut validation = ValidationState::default();
-        validation.active_success_criteria = vec!["answer the question".to_string()];
-        validation.matched_success_criteria = vec!["answer the question".to_string()];
+        let validation = ValidationState {
+            active_success_criteria: vec!["answer the question".to_string()],
+            matched_success_criteria: vec!["answer the question".to_string()],
+            ..Default::default()
+        };
 
         let mut execution = empty_execution_state();
         execution.outcome_ledger.push(OutcomeEntry {
@@ -583,8 +560,10 @@ mod tests {
 
     #[test]
     fn unrelated_completed_plan_step_does_not_satisfy_unmatched_criterion() {
-        let mut validation = ValidationState::default();
-        validation.active_success_criteria = vec!["publish the release".to_string()];
+        let validation = ValidationState {
+            active_success_criteria: vec!["publish the release".to_string()],
+            ..Default::default()
+        };
 
         let mut execution = empty_execution_state();
         execution.install_linear_intent_plan(
@@ -608,14 +587,7 @@ mod tests {
             &CompletionProgress::default(),
         );
 
-        assert_eq!(
-            summary,
-            RequestedActionSummary {
-                required: 2,
-                satisfied: 1,
-                unresolved: 1,
-            }
-        );
+        assert_eq!(summary, RequestedActionSummary::default());
     }
 
     #[test]
@@ -647,8 +619,10 @@ mod tests {
 
     #[test]
     fn duplicate_criterion_and_plan_step_are_counted_once() {
-        let mut validation = ValidationState::default();
-        validation.active_success_criteria = vec!["inspect the homepage".to_string()];
+        let validation = ValidationState {
+            active_success_criteria: vec!["inspect the homepage".to_string()],
+            ..Default::default()
+        };
 
         let mut execution = empty_execution_state();
         execution.install_linear_intent_plan(
@@ -672,14 +646,60 @@ mod tests {
             &CompletionProgress::default(),
         );
 
-        assert_eq!(
-            summary,
-            RequestedActionSummary {
-                required: 1,
-                satisfied: 1,
-                unresolved: 0,
-            }
+        assert_eq!(summary, RequestedActionSummary::default());
+    }
+
+    #[test]
+    fn advisory_answer_plan_does_not_make_fulfilled_turn_partial() {
+        let validation = ValidationState {
+            active_success_criteria: vec![
+                "retrieve the stored relationship".to_string(),
+                "answer the user directly".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut execution = empty_execution_state();
+        execution.install_linear_intent_plan(
+            1,
+            vec![
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "lookup".to_string(),
+                    step_index: 1,
+                    tool: "manage_memories".to_string(),
+                    target: String::new(),
+                    description: "retrieve the stored relationship".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+                crate::agent::execution_state::LinearIntentStep {
+                    step_id: "answer".to_string(),
+                    step_index: 2,
+                    tool: String::new(),
+                    target: String::new(),
+                    description: "answer the user directly".to_string(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                },
+            ],
         );
+
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &CompletionProgress::default(),
+            &CompletionContract::default(),
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+
+        assert_eq!(outcome, TaskOutcome::Succeeded);
     }
 
     #[test]

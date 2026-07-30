@@ -378,6 +378,16 @@ fn manage_memories_schema() -> Value {
     })
 }
 
+fn canonical_personal_display_key(key: &str) -> String {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
+        "current_residence" | "home" | "location" => "residence".to_string(),
+        "place_of_birth" => "birthplace".to_string(),
+        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[async_trait]
 impl Tool for ManageMemoriesTool {
     fn name(&self) -> &str {
@@ -405,7 +415,23 @@ impl Tool for ManageMemoriesTool {
                 Ok(serde_json::to_string_pretty(&report)?)
             }
             "list" => {
-                let facts = self.state.get_all_facts_with_provenance().await?;
+                let mut facts = self.state.get_canonical_memory_facts().await?;
+                let canonical_owner_keys: std::collections::HashSet<String> = facts
+                    .iter()
+                    .filter(|fact| fact.category == "user")
+                    .map(|fact| canonical_personal_display_key(&fact.key))
+                    .collect();
+                facts.extend(
+                    self.state
+                        .get_all_facts_with_provenance()
+                        .await?
+                        .into_iter()
+                        .filter(|fact| {
+                            fact.category != "user"
+                                || !canonical_owner_keys
+                                    .contains(&canonical_personal_display_key(&fact.key))
+                        }),
+                );
                 if facts.is_empty() {
                     return Ok("No memories stored.".to_string());
                 }
@@ -577,7 +603,23 @@ impl Tool for ManageMemoriesTool {
                 // Pass 1 — keyword (lexical) search. High precision for exact
                 // keys/values (port numbers, names, structured keys). Uses
                 // word-boundary token matching so "port" doesn't match "report".
-                let facts = self.state.get_all_facts_with_provenance().await?;
+                let mut facts = self.state.get_canonical_memory_facts().await?;
+                let canonical_owner_keys: std::collections::HashSet<String> = facts
+                    .iter()
+                    .filter(|fact| fact.category == "user")
+                    .map(|fact| canonical_personal_display_key(&fact.key))
+                    .collect();
+                facts.extend(
+                    self.state
+                        .get_all_facts_with_provenance()
+                        .await?
+                        .into_iter()
+                        .filter(|fact| {
+                            fact.category != "user"
+                                || !canonical_owner_keys
+                                    .contains(&canonical_personal_display_key(&fact.key))
+                        }),
+                );
                 let query_lower = query.to_lowercase();
                 let query_words: Vec<&str> = query_lower
                     .split_whitespace()
@@ -1968,7 +2010,10 @@ impl Tool for ManageMemoriesTool {
                 let task = crate::traits::Task {
                     id: uuid::Uuid::new_v4().to_string(),
                     goal_id: resolved_goal_id.clone(),
-                    description: goal.description.clone(),
+                    description: format!(
+                        "Manual scheduled run: {} [SYSTEM: already scheduled and firing now; do not reschedule.]",
+                        goal.description
+                    ),
                     status: "pending".to_string(),
                     priority: "high".to_string(),
                     task_order: 0,
@@ -1979,9 +2024,9 @@ impl Tool for ManageMemoriesTool {
                     result: None,
                     error: None,
                     blocker: None,
-                    idempotent: true,
+                    idempotent: false,
                     retry_count: 0,
-                    max_retries: 3,
+                    max_retries: 0,
                     created_at: now.clone(),
                     started_at: None,
                     completed_at: None,
@@ -3121,8 +3166,8 @@ mod tests {
         assert_eq!(goal.status, "pending_confirmation");
         assert_eq!(goal.domain, "orchestration");
         assert_eq!(goal.goal_type, "continuous");
-        assert_eq!(goal.budget_per_check, Some(100_000));
-        assert_eq!(goal.budget_daily, Some(500_000));
+        assert_eq!(goal.budget_per_check, Some(400_000));
+        assert_eq!(goal.budget_daily, Some(1_000_000));
 
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert_eq!(schedules.len(), 1);

@@ -143,6 +143,76 @@ fn canonicalize_fact_key(key: &str) -> String {
     }
 }
 
+fn canonical_personal_key(key: &str) -> String {
+    match canonicalize_fact_key(key).as_str() {
+        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
+        "current_residence" | "home" | "location" => "residence".to_string(),
+        "place_of_birth" => "birthplace".to_string(),
+        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn prefer_canonical_facts(
+    mut canonical: Vec<Fact>,
+    legacy: Vec<Fact>,
+    query: &str,
+    max: usize,
+) -> Vec<Fact> {
+    let query_lower = query.to_lowercase();
+    let query_words = query_tokens(&query_lower);
+    if !query.trim().is_empty() && !is_exhaustive_query(query) {
+        canonical.retain(|fact| {
+            lexical_fallback_score(&query_lower, &query_words, fact) > 0.0
+                || fact.value.to_lowercase().contains(query_lower.trim())
+        });
+    }
+
+    let canonical_owner_keys: std::collections::HashSet<String> = canonical
+        .iter()
+        .filter(|fact| fact.category == "user")
+        .map(|fact| canonical_personal_key(&fact.key))
+        .collect();
+    let has_relationships = canonical
+        .iter()
+        .any(|fact| fact.category == "relationships");
+    canonical.extend(legacy.into_iter().filter(|fact| {
+        !(fact.category == "user"
+            && canonical_owner_keys.contains(&canonical_personal_key(&fact.key))
+            || has_relationships
+                && matches!(
+                    canonicalize_fact_key(&fact.key).as_str(),
+                    "daughter"
+                        | "son"
+                        | "child"
+                        | "mother"
+                        | "father"
+                        | "parent"
+                        | "daughter_name"
+                        | "son_name"
+                        | "child_name"
+                        | "mother_name"
+                        | "father_name"
+                ))
+    }));
+    // Preserve semantic/graph ranking within each group, but always surface an
+    // exact structured-key hit before loosely related embedding matches. This
+    // is critical for short profile questions such as "my dad" (`dad_name`) or
+    // "my mom" (`mom_name`), where generic identity facts otherwise outrank the
+    // answer-bearing record.
+    canonical.sort_by_key(|fact| {
+        let key = fact.key.to_ascii_lowercase();
+        std::cmp::Reverse(
+            query_words
+                .iter()
+                .filter(|word| contains_word(&key, word))
+                .count(),
+        )
+    });
+    canonical.truncate(max);
+    canonical
+}
+
 fn fact_freshness_boost(now: DateTime<Utc>, updated_at: DateTime<Utc>) -> f32 {
     let age_hours = (now - updated_at).num_hours().max(0) as f32;
     FACT_FRESHNESS_MAX_BOOST * (1.0 - (age_hours / FACT_FRESHNESS_DECAY_HOURS).min(1.0))
@@ -244,6 +314,28 @@ fn lexical_fallback_score(query_lower: &str, tokens: &[&str], fact: &Fact) -> f3
 
 #[async_trait]
 impl crate::traits::FactStore for SqliteStateStore {
+    async fn reconcile_personal_memory(
+        &self,
+        write: &crate::traits::PersonalMemoryWrite,
+        source: &str,
+        source_excerpt: Option<&str>,
+        channel_id: Option<&str>,
+        privacy: FactPrivacy,
+    ) -> anyhow::Result<crate::traits::PersonalMemoryWriteResult> {
+        self.reconcile_structured_personal_memory(
+            write,
+            source,
+            source_excerpt,
+            channel_id,
+            privacy,
+        )
+        .await
+    }
+
+    async fn get_canonical_memory_facts(&self) -> anyhow::Result<Vec<Fact>> {
+        self.canonical_personal_facts().await
+    }
+
     async fn memory_health_report(&self) -> anyhow::Result<crate::traits::MemoryHealthReport> {
         self.canonical_memory_health().await
     }
@@ -291,6 +383,12 @@ impl crate::traits::FactStore for SqliteStateStore {
         first_seen_at: Option<DateTime<Utc>>,
         source_excerpt: Option<&str>,
     ) -> anyhow::Result<()> {
+        // The legacy flat-fact API performs a read/reconcile/write sequence.
+        // Serialize that sequence so two concurrent writes for the same key
+        // cannot both supersede the active row and race through the unique
+        // active-fact constraint. Structured personal-memory writes use their
+        // own explicit SQL transaction and do not take this compatibility lock.
+        let _upsert_guard = self.fact_upsert_lock.lock().await;
         let now = Utc::now().to_rfc3339();
         let privacy_str = privacy.to_string();
 
@@ -882,7 +980,8 @@ impl crate::traits::FactStore for SqliteStateStore {
             let mut facts = all_facts;
             facts.truncate(max);
             bump_fact_recall(&self.pool, &facts).await;
-            return Ok(facts);
+            let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+            return Ok(prefer_canonical_facts(canonical, facts, query, max));
         }
 
         // Exhaustive queries ("tell me everything", "what do you know about me")
@@ -896,7 +995,8 @@ impl crate::traits::FactStore for SqliteStateStore {
             let mut facts = all_facts;
             facts.truncate(max);
             bump_fact_recall(&self.pool, &facts).await;
-            return Ok(facts);
+            let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+            return Ok(prefer_canonical_facts(canonical, facts, query, max));
         }
 
         // Embed the query
@@ -910,7 +1010,8 @@ impl crate::traits::FactStore for SqliteStateStore {
                 let mut facts = all_facts;
                 facts.truncate(max);
                 bump_fact_recall(&self.pool, &facts).await;
-                return Ok(facts);
+                let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+                return Ok(prefer_canonical_facts(canonical, facts, query, max));
             }
         };
 
@@ -1043,7 +1144,8 @@ impl crate::traits::FactStore for SqliteStateStore {
         }
 
         bump_fact_recall(&self.pool, &relevant).await;
-        Ok(relevant)
+        let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+        Ok(prefer_canonical_facts(canonical, relevant, query, max))
     }
 
     async fn search_facts_semantic(

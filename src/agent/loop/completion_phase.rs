@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use super::completion_checks::*;
 use super::response_phase::ResponsePhaseOutcome;
 use super::*;
@@ -966,8 +968,7 @@ pub(super) async fn run_completion_phase(
                     )
                     .await?;
 
-                let has_unrecovered_errors =
-                    learning_ctx.errors.iter().any(|(_, recovered)| !*recovered);
+                let has_unrecovered_errors = learning_ctx.has_unrecovered_model_error();
                 let outcome = TaskOutcomeDerivation::from_completion_state(
                     &validation_state,
                     execution_state,
@@ -2202,9 +2203,10 @@ pub(super) async fn run_completion_phase(
         }
 
         // Search-before-deny gate: the reply denies or asserts a specific
-        // personal fact about an entity the user named, but no memory lookup
-        // grounded it this turn. Classifier-gated and owner-DM-gated; bounded
-        // to one fire per turn so it can never loop indefinitely.
+        // personal fact about an entity the user named (or an owner-relative
+        // such as "my dad"), but no memory lookup grounded it this turn.
+        // Classifier-gated and owner-DM-gated; bounded to one fire per turn so
+        // it can never loop indefinitely.
         // Only fires in private DMs (owner 1-on-1) — never in public channels,
         // group chats, or sub-agent internal sessions.
         let is_owner_dm = user_role == UserRole::Owner
@@ -2218,11 +2220,8 @@ pub(super) async fn run_completion_phase(
             let memory_lookup_fired_this_turn = learning_ctx.tool_calls.iter().any(|call| {
                 call.starts_with("manage_memories(") || call.starts_with("manage_people(")
             });
-            // Scope the denial gate with the named-person relational check
-            // (possessive + relational noun), not generic ego-centric recall
-            // ("what about pets?"): the gate is for specific named-person queries
-            // ("who is Caro's spouse?") where a no-search denial is unambiguous;
-            // generic recall queries are handled by other paths.
+            // Scope the denial gate to a specific named-person or owner-relative
+            // relational query, where a no-search denial is unambiguous.
             if !memory_lookup_fired_this_turn
                 && crate::agent::relational_prefilter::user_text_is_named_person_relational_query(
                     user_text,
@@ -2314,7 +2313,7 @@ pub(super) async fn run_completion_phase(
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
-        let has_unrecovered_errors = learning_ctx.errors.iter().any(|(_, recovered)| !*recovered);
+        let has_unrecovered_errors = learning_ctx.has_unrecovered_model_error();
         let (sanitization_summary, sanitization_metadata) = build_final_sanitization_gate_telemetry(
             original_final_reply_chars,
             reply.trim().chars().count(),

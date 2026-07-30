@@ -246,9 +246,16 @@ impl CommandContext {
     async fn handle_clear(&self, session_id: &str) -> String {
         // Cancel any running tasks for this session so the agent loop aborts
         // immediately instead of continuing to burn tokens after /clear.
-        let cancelled = self
+        let cancelled_tasks = self
             .task_registry
             .cancel_running_for_session(session_id)
+            .await;
+        // Also cancel finite orchestration goals associated with this
+        // conversation. Recurring schedules and personal goals intentionally
+        // survive a context clear.
+        let cancelled_goals = self
+            .agent
+            .cancel_active_finite_work_for_session(session_id)
             .await;
 
         // Non-destructive: sets a context boundary so the next turn starts
@@ -256,14 +263,25 @@ impl CommandContext {
         // to permanently delete.
         match self.agent.clear_session_context(session_id).await {
             Ok(_) => {
-                let suffix = if cancelled.is_empty() {
+                let mut cancellations = Vec::new();
+                if !cancelled_tasks.is_empty() {
+                    cancellations.push(format!(
+                        "{} running task{}",
+                        cancelled_tasks.len(),
+                        if cancelled_tasks.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                if !cancelled_goals.is_empty() {
+                    cancellations.push(format!(
+                        "{} background goal{}",
+                        cancelled_goals.len(),
+                        if cancelled_goals.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                let suffix = if cancellations.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        " ({} running task{} cancelled.)",
-                        cancelled.len(),
-                        if cancelled.len() == 1 { "" } else { "s" }
-                    )
+                    format!(" ({} cancelled.)", cancellations.join(" and "))
                 };
                 format!(
                     "Context cleared. Starting fresh — your history is kept (use /wipe to \

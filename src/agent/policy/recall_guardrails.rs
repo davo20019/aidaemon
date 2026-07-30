@@ -225,7 +225,6 @@ pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
         || (lower.contains("remembered:") && lower.contains("name"))
 }
 
-#[allow(dead_code)] // Retained as a characterization helper; production no longer hard-filters.
 pub(super) fn filter_tool_defs_for_personal_memory(defs: &[Value]) -> Vec<Value> {
     defs.iter()
         .filter_map(|def| {
@@ -320,8 +319,12 @@ pub(crate) fn looks_like_personal_memory_recall_question(user_text: &str) -> boo
 
     let mentions_personal_entities = contains_keyword_as_words(&lower, "daughter")
         || contains_keyword_as_words(&lower, "daughters")
+        || contains_keyword_as_words(&lower, "daughter's")
+        || contains_keyword_as_words(&lower, "daughters'")
         || contains_keyword_as_words(&lower, "son")
         || contains_keyword_as_words(&lower, "sons")
+        || contains_keyword_as_words(&lower, "son's")
+        || contains_keyword_as_words(&lower, "sons'")
         || contains_keyword_as_words(&lower, "kid")
         || contains_keyword_as_words(&lower, "kids")
         || contains_keyword_as_words(&lower, "child")
@@ -335,11 +338,40 @@ pub(crate) fn looks_like_personal_memory_recall_question(user_text: &str) -> boo
         || contains_keyword_as_words(&lower, "husband")
         || contains_keyword_as_words(&lower, "mom")
         || contains_keyword_as_words(&lower, "dad")
+        || contains_keyword_as_words(&lower, "mom's")
+        || contains_keyword_as_words(&lower, "dad's")
         || contains_keyword_as_words(&lower, "mother")
         || contains_keyword_as_words(&lower, "father");
 
+    let explicitly_about_owner = contains_keyword_as_words(&lower, "my")
+        || contains_keyword_as_words(&lower, "i")
+        || contains_keyword_as_words(&lower, "me");
+    let mentions_owner_profile = contains_keyword_as_words(&lower, "birthday")
+        || contains_keyword_as_words(&lower, "birth date")
+        || contains_keyword_as_words(&lower, "live")
+        || contains_keyword_as_words(&lower, "residence")
+        || contains_keyword_as_words(&lower, "work")
+        || contains_keyword_as_words(&lower, "employer")
+        || contains_keyword_as_words(&lower, "job")
+        || contains_keyword_as_words(&lower, "username")
+        || contains_keyword_as_words(&lower, "handle");
+    let recall_question = contains_keyword_as_words(&lower, "who is")
+        || contains_keyword_as_words(&lower, "who's")
+        || contains_keyword_as_words(&lower, "what is")
+        || contains_keyword_as_words(&lower, "what's")
+        || contains_keyword_as_words(&lower, "where is")
+        || contains_keyword_as_words(&lower, "where's")
+        || contains_keyword_as_words(&lower, "where does")
+        || contains_keyword_as_words(&lower, "where do")
+        || contains_keyword_as_words(&lower, "what are")
+        || contains_keyword_as_words(&lower, "what do")
+        || contains_keyword_as_words(&lower, "do i");
+
     contains_keyword_as_words(&lower, "what do you know about me")
         || contains_keyword_as_words(&lower, "about me")
+        || (explicitly_about_owner
+            && (mentions_personal_entities || mentions_owner_profile)
+            && recall_question)
         || (contains_keyword_as_words(&lower, "do i have") && mentions_personal_entities)
         || (contains_keyword_as_words(&lower, "what about") && mentions_personal_entities)
         || (contains_keyword_as_words(&lower, "do i") && mentions_personal_entities)
@@ -840,6 +872,27 @@ mod tests {
             .filter_map(|n| n.as_str())
             .collect();
         assert_eq!(names, vec!["manage_people", "manage_memories"]);
+    }
+
+    #[test]
+    fn detects_direct_first_person_relationship_recall() {
+        for prompt in [
+            "What's my dad's name?",
+            "Who is my mom?",
+            "What are my daughters' names?",
+            "Where does my father live?",
+            "Where do I live?",
+            "Where do I work?",
+            "What's my birthday?",
+        ] {
+            assert!(
+                looks_like_personal_memory_recall_question(prompt),
+                "prompt should be personal recall: {prompt}"
+            );
+        }
+        assert!(!looks_like_personal_memory_recall_question(
+            "Send me my daughter's resume"
+        ));
     }
 
     #[test]

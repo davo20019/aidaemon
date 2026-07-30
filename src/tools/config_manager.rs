@@ -203,6 +203,25 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
         requires_custom_base_url: false,
     },
     ProviderPreset {
+        id: "openai_chatgpt",
+        aliases: &[
+            "chatgpt",
+            "chatgptsubscription",
+            "codex",
+            "openaisubscription",
+        ],
+        display_name: "OpenAI (ChatGPT subscription)",
+        kind: "openai_chatgpt",
+        base_url: "",
+        primary: "gpt-5.6-terra",
+        fast: "gpt-5.6-luna",
+        smart: "gpt-5.6-sol",
+        // Credentials come from the ChatGPT OAuth store, not an API key.
+        needs_api_key: false,
+        supports_gateway_token: false,
+        requires_custom_base_url: false,
+    },
+    ProviderPreset {
         id: "custom_openai_compatible",
         aliases: &["custom", "openaicompatible"],
         display_name: "Custom (OpenAI Compatible)",
@@ -640,10 +659,14 @@ impl ConfigManagerTool {
             }
             value
         } else {
-            toml::Value::String(if selection.api_key.is_empty() {
-                "ollama".to_string()
-            } else {
+            toml::Value::String(if !selection.api_key.is_empty() {
                 selection.api_key.clone()
+            } else if selection.preset.kind == "openai_chatgpt" {
+                // Subscription auth: an "ollama" placeholder here would be
+                // actively misleading about where the credentials live.
+                String::new()
+            } else {
+                "ollama".to_string()
             })
         };
         provider_table.insert("api_key".to_string(), api_key_value);

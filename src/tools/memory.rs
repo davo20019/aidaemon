@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::traits::{FactStore, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{
+    FactStore, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
+    PersonalMemoryWrite, Tool, ToolCapabilities, ToolRole,
+};
 use crate::types::FactPrivacy;
 
 pub struct RememberFactTool {
@@ -30,6 +33,8 @@ struct RememberArgs {
     value: Option<String>,
     #[serde(default)]
     facts: Option<Vec<FactEntry>>,
+    #[serde(default)]
+    personal_memory: Option<PersonalMemoryWrite>,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +95,7 @@ impl Tool for RememberFactTool {
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store one or more stable, long-term facts about the user or their environment. Use this when the user asks you to learn, remember, or save facts for later. Facts are injected into your system prompt on every request, so only store things that are persistently useful — user preferences, personal info, environment details, communication patterns. Do NOT store task-scoped research, reference data gathered for a specific project, or content being built (e.g., product prices, API docs, website copy). Do NOT use this for personal goals or scheduled work; use the manage_memories tool (create_personal_goal / create_scheduled_goal) for goals. For multiple facts, use the 'facts' array parameter instead of making separate calls.",
+            "description": "Store stable long-term user/environment facts. Exclude task-scoped research, reference data, generated content, goals, and schedules. Use facts for batches. Use personal_memory for identity, aliases, people, dates, and relationships.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -104,11 +109,11 @@ impl Tool for RememberFactTool {
                     },
                     "value": {
                         "type": "string",
-                        "description": "The fact to remember. To DELETE a fact, set value to empty string or 'delete' — this removes the fact entirely."
+                        "description": "Value; empty or 'delete' removes it."
                     },
                     "facts": {
                         "type": "array",
-                        "description": "Batch mode: an array of facts to store at once. Use this when the user mentions multiple facts in one message.",
+                        "description": "Batch of legacy/general facts.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -122,11 +127,75 @@ impl Tool for RememberFactTool {
                                 },
                                 "value": {
                                     "type": "string",
-                                    "description": "The fact to remember. To DELETE a fact, set value to empty string or 'delete'."
+                                    "description": "Value; empty or 'delete' removes it."
                                 }
                             },
                             "required": ["category", "key", "value"]
                         }
+                    },
+                    "personal_memory": {
+                        "type": "object",
+                        "description": "Canonical entity-aware personal/profile memory.",
+                        "properties": {
+                            "entities": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "local_id": {"type": "string"},
+                                        "entity_type": {"type": "string", "enum": ["person", "organization", "project", "place", "account"]},
+                                        "canonical_name": {"type": "string"},
+                                        "is_reference": {"type": "boolean", "description": "Resolve existing alias/name; false declares."},
+                                        "canonical_name_confirmed": {"type": "boolean"}
+                                    },
+                                    "required": ["local_id", "entity_type", "canonical_name"]
+                                }
+                            },
+                            "aliases": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "entity_local_id": {"type": "string"},
+                                        "value": {"type": "string"},
+                                        "alias_type": {"type": "string", "enum": ["legal_name_variant", "preferred_name", "nickname", "username", "online_handle", "account_name"]}
+                                    },
+                                    "required": ["entity_local_id", "value", "alias_type"]
+                                }
+                            },
+                            "facts": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "subject_local_id": {"type": "string"},
+                                        "predicate": {"type": "string"},
+                                        "value": {"type": "string"},
+                                        "display_value": {"type": "string"},
+                                        "valid_from": {"type": "string"},
+                                        "valid_to": {"type": "string"}
+                                    },
+                                    "required": ["subject_local_id", "predicate", "value"]
+                                }
+                            },
+                            "relationships": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source_local_id": {"type": "string"},
+                                        "relationship_type": {"type": "string", "enum": ["PARENT_OF", "CHILD_OF", "LIVES_WITH", "LIVES_IN", "USES_ALIAS", "USES_HANDLE", "HAS_ACCOUNT"]},
+                                        "target_local_id": {"type": "string"},
+                                        "valid_from": {"type": "string"},
+                                        "valid_to": {"type": "string"}
+                                    },
+                                    "required": ["source_local_id", "relationship_type", "target_local_id"]
+                                }
+                            },
+                            "direct_user_statement": {"type": "boolean"},
+                            "correction": {"type": "boolean"}
+                        },
+                        "additionalProperties": false
                     }
                 },
                 "additionalProperties": false
@@ -140,6 +209,22 @@ impl Tool for RememberFactTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: RememberArgs = serde_json::from_str(arguments)?;
+        let channel_id = self.current_channel_id.read().await.clone();
+
+        if let Some(mut personal) = args.personal_memory {
+            personal.direct_user_statement = true;
+            let result = self
+                .state
+                .reconcile_personal_memory(
+                    &personal,
+                    "agent",
+                    None,
+                    channel_id.as_deref(),
+                    FactPrivacy::Private,
+                )
+                .await?;
+            return Ok(format!("Personal memory: {}", result.concise_summary()));
+        }
 
         // Build the list of facts to store (batch or single)
         let entries: Vec<FactEntry> = if let Some(facts) = args.facts {
@@ -165,10 +250,116 @@ impl Tool for RememberFactTool {
             }]
         };
 
-        let channel_id = self.current_channel_id.read().await.clone();
-        let mut results = Vec::new();
+        let mut structured = PersonalMemoryWrite {
+            direct_user_statement: true,
+            ..Default::default()
+        };
+        let mut owner_added = false;
+        let mut structured_indices = std::collections::BTreeSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if !matches!(
+                entry.category.trim().to_ascii_lowercase().as_str(),
+                "user" | "personal" | "profile"
+            ) {
+                continue;
+            }
+            let key = entry.key.trim().to_ascii_lowercase();
+            let supported = matches!(
+                key.as_str(),
+                "name"
+                    | "full_name"
+                    | "preferred_name"
+                    | "nickname"
+                    | "username"
+                    | "online_nickname"
+                    | "online_handle"
+                    | "handle"
+                    | "birthday"
+                    | "birth_date"
+                    | "date_of_birth"
+                    | "residence"
+                    | "current_residence"
+                    | "birthplace"
+                    | "place_of_birth"
+            );
+            if !supported || entry.value.trim().is_empty() {
+                continue;
+            }
+            if !owner_added {
+                structured.entities.push(PersonalEntityCandidate {
+                    local_id: "owner".to_string(),
+                    entity_type: "person".to_string(),
+                    canonical_name: if matches!(key.as_str(), "name" | "full_name") {
+                        entry.value.clone()
+                    } else {
+                        "Owner".to_string()
+                    },
+                    is_reference: false,
+                    canonical_name_confirmed: matches!(key.as_str(), "name" | "full_name"),
+                });
+                owner_added = true;
+            } else if matches!(key.as_str(), "name" | "full_name") {
+                if let Some(owner) = structured.entities.first_mut() {
+                    owner.canonical_name = entry.value.clone();
+                    owner.canonical_name_confirmed = true;
+                }
+            }
+            match key.as_str() {
+                "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
+                    entity_local_id: "owner".to_string(),
+                    value: entry.value.clone(),
+                    alias_type: "legal_name_variant".to_string(),
+                }),
+                "preferred_name" | "nickname" => structured.aliases.push(PersonalAliasCandidate {
+                    entity_local_id: "owner".to_string(),
+                    value: entry.value.clone(),
+                    alias_type: key,
+                }),
+                "username" | "online_nickname" | "online_handle" | "handle" => {
+                    structured.aliases.push(PersonalAliasCandidate {
+                        entity_local_id: "owner".to_string(),
+                        value: entry.value.clone(),
+                        alias_type: "online_handle".to_string(),
+                    })
+                }
+                _ => structured.facts.push(PersonalFactCandidate {
+                    subject_local_id: "owner".to_string(),
+                    predicate: key,
+                    value: entry.value.clone(),
+                    display_value: None,
+                    valid_from: None,
+                    valid_to: None,
+                }),
+            }
+            structured_indices.insert(index);
+        }
 
-        for entry in &entries {
+        let mut results = Vec::new();
+        if !structured.entities.is_empty() {
+            let result = self
+                .state
+                .reconcile_personal_memory(
+                    &structured,
+                    "agent",
+                    None,
+                    channel_id.as_deref(),
+                    FactPrivacy::Private,
+                )
+                .await?;
+            results.push(format!("Personal memory: {}", result.concise_summary()));
+            for index in &structured_indices {
+                let entry = &entries[*index];
+                results.push(format!(
+                    "Remembered: [{}] {} = {} (canonical)",
+                    entry.category, entry.key, entry.value
+                ));
+            }
+        }
+
+        for (index, entry) in entries.iter().enumerate() {
+            if structured_indices.contains(&index) {
+                continue;
+            }
             // Reject persona/identity manipulation saves
             if is_persona_manipulation(&entry.category, &entry.key, &entry.value) {
                 results.push(format!(
@@ -237,7 +428,7 @@ impl Tool for RememberFactTool {
             read_only: false,
             external_side_effect: false,
             needs_approval: false,
-            idempotent: false,
+            idempotent: true,
             high_impact_write: false,
         }
     }

@@ -540,7 +540,7 @@ mod tests {
     /// param; tool_roster comes from the session-static roster), two assemblies
     /// with the SAME role/visibility/skills/etc. must produce identical aggregate
     /// + bytes regardless of any per-turn query. We assert that property at the
-    /// assembly+decision boundary: identical CoreInputs → HIT.
+    ///   assembly+decision boundary: identical CoreInputs → HIT.
     #[test]
     fn core_cache_decision_query_independent() {
         use crate::types::{ChannelContext, UserRole};

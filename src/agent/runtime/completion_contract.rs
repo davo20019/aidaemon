@@ -44,6 +44,10 @@ pub(super) struct VerificationTarget {
 pub(super) struct CompletionContract {
     pub task_kind: CompletionTaskKind,
     pub expects_mutation: bool,
+    /// The user explicitly constrained this turn to observation/reporting.
+    /// Unlike `expects_mutation = false`, this is a hard negative obligation:
+    /// mutation attempts are contract violations and must be blocked.
+    pub forbids_mutation: bool,
     pub requires_observation: bool,
     pub requires_reverification_after_mutation: bool,
     pub explicit_verification_requested: bool,
@@ -90,8 +94,13 @@ pub(super) fn apply_planned_contract_signals(
         contract.task_kind = kind;
     }
     if let Some(mutation) = expects_mutation {
-        contract.expects_mutation = mutation;
-        if !mutation {
+        if contract.forbids_mutation {
+            contract.expects_mutation = false;
+            contract.requires_reverification_after_mutation = false;
+        } else {
+            contract.expects_mutation = mutation;
+        }
+        if !contract.expects_mutation {
             // No mutation expected → nothing to re-verify after one.
             contract.requires_reverification_after_mutation = false;
         }
@@ -103,6 +112,42 @@ pub(super) fn apply_planned_contract_signals(
             contract.requires_observation = false;
         }
     }
+}
+
+fn explicitly_forbids_mutation(lower: &str) -> bool {
+    text_contains_any_phrase(
+        lower,
+        &[
+            "do not modify",
+            "don't modify",
+            "do not change",
+            "don't change",
+            "do not edit",
+            "don't edit",
+            "do not write",
+            "don't write",
+            "do not create",
+            "don't create",
+            "do not delete",
+            "don't delete",
+            "do not deploy",
+            "don't deploy",
+            "do not publish",
+            "don't publish",
+            "do not post",
+            "don't post",
+            "do not send",
+            "don't send",
+            "without modifying",
+            "without changing",
+            "without writing",
+            "read-only",
+            "read only",
+            "inspect-only",
+            "inspect only",
+            "report only",
+        ],
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -896,6 +941,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     // observable.
     let current = current_request_segment(trimmed);
     let lower = current.to_ascii_lowercase();
+    let forbids_mutation = explicitly_forbids_mutation(&lower);
 
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&lower, &verification_targets);
@@ -924,7 +970,9 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
             task_kind,
             CompletionTaskKind::Check | CompletionTaskKind::Find
         );
-    let expects_mutation = if live_delivery_override {
+    let expects_mutation = if forbids_mutation {
+        false
+    } else if live_delivery_override {
         true
     } else {
         signals.mutation_obligation
@@ -948,6 +996,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     CompletionContract {
         task_kind,
         expects_mutation,
+        forbids_mutation,
         requires_observation,
         requires_reverification_after_mutation,
         explicit_verification_requested: signals.explicit_verification_requested,
@@ -1480,6 +1529,25 @@ mod tests {
             "Open all four files and tell me which two are most similar in length.",
             &[],
         );
+        assert!(!contract.expects_mutation);
+    }
+
+    #[test]
+    fn explicit_negative_mutation_constraint_is_hard_and_planner_cannot_override_it() {
+        let mut contract = infer_completion_contract(
+            "Inspect the repository and report only. Do not modify files or deploy.",
+            &[],
+        );
+        assert!(contract.forbids_mutation);
+        assert!(!contract.expects_mutation);
+
+        apply_planned_contract_signals(
+            &mut contract,
+            Some(true),
+            Some(true),
+            Some(CompletionTaskKind::Change),
+        );
+        assert!(contract.forbids_mutation);
         assert!(!contract.expects_mutation);
     }
 

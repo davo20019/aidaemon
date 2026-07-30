@@ -357,6 +357,69 @@ pub(super) fn extract_explicit_path_scopes_from_text(
     extract_project_scopes_from_text_inner(text, scopes, max_scopes, alias_roots, true);
 }
 
+/// Extract explicit paths that are instructions to operate on, excluding paths
+/// mentioned in nearby negative clauses such as "do not write in /repo-a".
+/// This is intentionally used for autonomous dispatch missions, where treating
+/// an excluded repository as the write scope is unsafe.
+pub(super) fn extract_positive_explicit_path_scopes_from_text(
+    text: &str,
+    scopes: &mut Vec<String>,
+    max_scopes: usize,
+    alias_roots: &[String],
+) {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (index, raw) in words.iter().enumerate() {
+        if scopes.len() >= max_scopes {
+            break;
+        }
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\''
+                            | '"'
+                            | ','
+                            | ';'
+                            | ':'
+                            | '.'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+            })
+            .trim();
+        if token.is_empty()
+            || token.contains("://")
+            || !token_looks_like_project_scope_path(token, alias_roots)
+        {
+            continue;
+        }
+
+        let context_start = index.saturating_sub(5);
+        let preceding = words[context_start..index].join(" ").to_ascii_lowercase();
+        let negative = preceding.split_whitespace().any(|word| {
+            matches!(
+                word.trim_matches(|c: char| !c.is_ascii_alphabetic()),
+                "not" | "never" | "exclude" | "excluding" | "outside" | "avoid"
+            )
+        }) || preceding.contains("don't")
+            || preceding.contains("do not");
+        if negative {
+            continue;
+        }
+
+        if let Some(scope) = normalize_project_scope_path_with_aliases(token, alias_roots) {
+            push_project_scope(scopes, scope, max_scopes);
+        }
+    }
+}
+
 fn extract_project_scopes_from_text_inner(
     text: &str,
     scopes: &mut Vec<String>,
@@ -443,6 +506,7 @@ pub(super) fn unify_current_turn_scopes(scopes: &[String]) -> Option<String> {
     if scopes.len() <= 1 {
         return scopes.first().cloned();
     }
+
     // Fast path: if one scope is a parent of ALL others, use it directly
     for scope in scopes {
         let prefix = format!("{}/", scope.trim_end_matches('/'));
@@ -804,6 +868,45 @@ mod tests {
         // This is OK because for such shallow paths, multi_project_scope
         // should handle the case.
         assert_eq!(unify_current_turn_scopes(&scopes), Some("/tmp".to_string()));
+    }
+    #[test]
+    fn positive_scope_extraction_ignores_excluded_project_regardless_of_order() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let blog = workspace.path().join("blog");
+        let daemon = workspace.path().join("daemon");
+        std::fs::create_dir_all(&blog).expect("blog dir");
+        std::fs::create_dir_all(&daemon).expect("daemon dir");
+        std::fs::write(blog.join("package.json"), "{}").expect("blog marker");
+        std::fs::write(daemon.join("Cargo.toml"), "[package]\nname = \"daemon\"\n")
+            .expect("daemon marker");
+
+        let blog_text = blog.to_string_lossy();
+        let daemon_text = daemon.to_string_lossy();
+        for prompt in [
+            format!("Do not write in {daemon_text}; only write in {blog_text}"),
+            format!("Write in {blog_text}; never use {daemon_text}"),
+        ] {
+            let mut scopes = Vec::new();
+            extract_positive_explicit_path_scopes_from_text(
+                &prompt,
+                &mut scopes,
+                8,
+                &[workspace.path().to_string_lossy().to_string()],
+            );
+            assert_eq!(scopes, vec![blog_text.to_string()]);
+        }
+    }
+
+    #[test]
+    fn legitimate_multiple_projects_are_not_arbitrarily_reduced_to_first() {
+        let scopes = vec![
+            "/Users/david/projects/blog".to_string(),
+            "/Users/david/projects/daemon".to_string(),
+        ];
+        assert_eq!(
+            unify_current_turn_scopes(&scopes),
+            Some("/Users/david/projects".to_string())
+        );
     }
     #[test]
     fn unify_scopes_three_paths_same_project() {

@@ -625,7 +625,7 @@ impl ModelsConfig {
             ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
             ProviderKind::XaiNative => "grok-4".to_string(),
             ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
-            ProviderKind::OpenaiChatgpt => "gpt-5.1-codex".to_string(),
+            ProviderKind::OpenaiChatgpt => "gpt-5.6-terra".to_string(),
         };
 
         let default_model = if !self.default_model.trim().is_empty() {
@@ -2828,7 +2828,7 @@ fn default_policy_enforce() -> bool {
     true
 }
 fn default_tool_filter_enforce() -> bool {
-    false
+    true
 }
 fn default_uncertainty_clarify_enforce() -> bool {
     false
@@ -4459,10 +4459,12 @@ session_isolation = "incognito"
     fn browser_timeouts_clamp_out_of_range_values() {
         // Zero is clamped up to the per-field minimum (1s) so navigation/wait
         // never gives up before it can start.
-        let mut cfg = BrowserConfig::default();
-        cfg.nav_timeout_secs = 0;
-        cfg.element_timeout_secs = 0;
-        cfg.action_timeout_secs = 0;
+        let mut cfg = BrowserConfig {
+            nav_timeout_secs: 0,
+            element_timeout_secs: 0,
+            action_timeout_secs: 0,
+            ..Default::default()
+        };
         assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(1));
         assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(1));
         assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(1));
@@ -4479,10 +4481,12 @@ session_isolation = "incognito"
 
     #[test]
     fn browser_timeouts_in_range_pass_through() {
-        let mut cfg = BrowserConfig::default();
-        cfg.nav_timeout_secs = 45;
-        cfg.element_timeout_secs = 5;
-        cfg.action_timeout_secs = 90;
+        let cfg = BrowserConfig {
+            nav_timeout_secs: 45,
+            element_timeout_secs: 5,
+            action_timeout_secs: 90,
+            ..Default::default()
+        };
         assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(45));
         assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(5));
         assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(90));

@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1410,8 +1412,10 @@ pub async fn test_tool(config: ComputerUseConfig, inbox: PathBuf) -> ComputerUse
     use crate::config::FilesConfig;
     use crate::tools::ApprovalBroker;
 
-    let mut files = FilesConfig::default();
-    files.vision_enabled = true;
+    let files = FilesConfig {
+        vision_enabled: true,
+        ..Default::default()
+    };
     let (media_tx, _media_rx) = mpsc::channel(1);
     let (approval_tx, _approval_rx) = mpsc::channel(1);
     let tool = ComputerUseTool::new(

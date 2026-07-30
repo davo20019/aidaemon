@@ -54,6 +54,7 @@ impl Tool for ReadFileTool {
                     },
                     "tail_lines": {
                         "type": "integer",
+                        "minimum": 1,
                         "description": "Read the last N lines of the file. Useful for large logs."
                     }
                 },
@@ -186,11 +187,11 @@ impl ReadFileTool {
             .as_u64()
             .or_else(|| args["last_lines"].as_u64())
             .or_else(|| args["last_n_lines"].as_u64())
+            // Be tolerant of older/smaller models that emit zero to mean
+            // "no tail selection". The schema prevents new strict calls from
+            // doing so, while this fallback avoids a useless retry loop.
+            .filter(|n| *n > 0)
             .map(|n| n as usize);
-
-        if matches!(tail_lines, Some(0)) {
-            anyhow::bail!("tail_lines must be at least 1");
-        }
 
         let uses_subset = start > 0 || end != usize::MAX || tail_lines.is_some();
         // Oversized full reads no longer error: the per-call cap below

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, ProviderConfig, ProviderKind};
 use crate::llm_runtime::ProviderRuntimeTarget;
@@ -71,11 +71,21 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
             .with_reasoning_effort(config.reasoning_effort.clone()),
         ),
         // Credentials come from the ChatGPT OAuth store, not `api_key`.
-        ProviderKind::OpenaiChatgpt => Arc::new(
-            crate::providers::OpenAiChatGptProvider::new(provider_base_override, config.max_tokens)
-                .map_err(|e| anyhow::anyhow!("{}", e))?
-                .with_reasoning_effort(config.reasoning_effort.clone()),
-        ),
+        ProviderKind::OpenaiChatgpt => {
+            // The Codex backend rejects every output-cap parameter, so say so
+            // rather than letting a configured cap look effective.
+            if config.max_tokens.is_some() {
+                warn!(
+                    "provider.max_tokens is ignored by the ChatGPT subscription provider; \
+                     the Codex backend accepts no output cap"
+                );
+            }
+            Arc::new(
+                crate::providers::OpenAiChatGptProvider::new(provider_base_override)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?
+                    .with_reasoning_effort(config.reasoning_effort.clone()),
+            )
+        }
     };
 
     let router = Router::new(config.models.clone());

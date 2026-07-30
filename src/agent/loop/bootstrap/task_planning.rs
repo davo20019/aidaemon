@@ -129,6 +129,8 @@ async fn record_auxiliary_model_call(
                 message_count: None,
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
+                failed: false,
+                error: None,
             },
             token_usage: response.usage.clone(),
         },
@@ -353,9 +355,9 @@ fn looks_like_compound_task(user_text: &str) -> bool {
 }
 
 /// Determine whether the task-start planning call should be skipped.
-/// Only skip for acknowledgments and control commands.
-/// Do NOT skip based on task_kind — even "conversational" queries like
-/// "what time is it in tokyo?" may need tools and benefit from a plan.
+///
+/// Simple turns can still use tools in the normal loop; they do not need a
+/// separate model call that restates the question as a two-step plan first.
 #[cfg(test)]
 fn should_skip_planning(
     _task_kind: &crate::agent::CompletionTaskKind,
@@ -398,6 +400,42 @@ pub(crate) fn planning_skip_reason(
     ];
     if control_commands.iter().any(|cmd| lower == *cmd) {
         return Some("control_command");
+    }
+
+    let planning_worthy_markers = [
+        "analyze",
+        "audit",
+        "build",
+        "change",
+        "create",
+        "debug",
+        "deploy",
+        "diagnose",
+        "figure out",
+        "fix",
+        "implement",
+        "inspect",
+        "install",
+        "investigate",
+        "repair",
+        "run",
+        "send",
+        "test",
+        "update",
+        "write",
+    ];
+    let planning_worthy = planning_worthy_markers
+        .iter()
+        .any(|marker| crate::agent::contains_keyword_as_words(&lower, marker));
+
+    if !planning_worthy
+        && !looks_like_compound_task(user_text)
+        && matches!(
+            crate::agent::classify_intent_complexity(user_text),
+            crate::agent::IntentComplexity::Simple
+        )
+    {
+        return Some("simple_turn");
     }
 
     None
@@ -515,11 +553,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_does_not_skip_conversational_with_enough_text() {
+    fn test_skips_simple_conversational_turn() {
         use crate::agent::CompletionTaskKind;
-        // Conversational task_kind no longer causes skip — even simple
-        // queries may need tools (e.g., "what time is it in tokyo?").
-        assert!(!should_skip_planning(
+        assert!(should_skip_planning(
             &CompletionTaskKind::Conversational,
             "hello there how are you doing today",
             false
@@ -527,12 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_skip_short_text() {
+    fn test_should_skip_simple_short_text() {
         use crate::agent::CompletionTaskKind;
-        // Short text no longer skips — "fix bug" or "deploy it" are valid tasks.
-        assert!(!should_skip_planning(
-            &CompletionTaskKind::Find,
-            "hi",
+        assert!(should_skip_planning(&CompletionTaskKind::Find, "hi", false));
+    }
+
+    #[test]
+    fn test_should_skip_direct_recall_question() {
+        use crate::agent::CompletionTaskKind;
+        assert_eq!(
+            planning_skip_reason("What's my dad's name?", false),
+            Some("simple_turn")
+        );
+        assert!(should_skip_planning(
+            &CompletionTaskKind::Answer,
+            "What's the source of that?",
             false
         ));
     }
@@ -602,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_skip_real_task() {
+    fn test_should_not_skip_investigative_question() {
         use crate::agent::CompletionTaskKind;
         assert!(!should_skip_planning(
             &CompletionTaskKind::Find,

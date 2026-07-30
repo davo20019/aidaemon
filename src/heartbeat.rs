@@ -26,6 +26,16 @@ fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+fn timestamp_is_at_or_after(value: &str, lower_bound: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(value),
+        chrono::DateTime::parse_from_rfc3339(lower_bound),
+    ) {
+        (Ok(value), Ok(lower_bound)) => value >= lower_bound,
+        _ => value >= lower_bound,
+    }
+}
+
 /// Best-effort check that a logged `http_request` tool-call's args used a
 /// mutating HTTP method (anything but GET/HEAD/OPTIONS). `tool_args` is a
 /// (possibly truncated) JSON string; returns `false` — i.e. "not mutating" —
@@ -89,6 +99,22 @@ fn daily_budget_exhausted(
         Some(budget) => tokens_used_day == today && tokens_used_today >= budget,
         None => false,
     }
+}
+
+fn daily_budget_has_run_capacity(
+    budget_daily: Option<i64>,
+    budget_per_check: Option<i64>,
+    tokens_used_today: i64,
+    tokens_used_day: &str,
+    today: &str,
+) -> bool {
+    let (Some(daily), Some(per_run)) = (budget_daily, budget_per_check) else {
+        return true;
+    };
+    if tokens_used_day != today {
+        return true;
+    }
+    daily.saturating_sub(tokens_used_today) >= per_run.max(0)
 }
 
 /// Seconds since a task's most recent activity (or its `started_at` when it has
@@ -386,8 +412,32 @@ impl HeartbeatCoordinator {
                         continue;
                     }
 
+                    // A recurring goal remains active between fires, so goal
+                    // status alone is not enough to authorize recovery. Only
+                    // retry work that belongs to its explicitly persisted
+                    // active run. Otherwise a restart can resurrect a child
+                    // from a closed/cancelled cycle and repeat side effects.
+                    let schedules = self
+                        .state
+                        .get_schedules_for_goal(&task.goal_id)
+                        .await
+                        .unwrap_or_default();
+                    if !schedules.is_empty() {
+                        let active_run = self
+                            .state
+                            .get_scheduled_run_state(&task.goal_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if active_run.as_ref().is_none_or(|run| {
+                            !timestamp_is_at_or_after(&task.created_at, &run.created_at)
+                        }) {
+                            continue;
+                        }
+                    }
+
                     // Auto-retry idempotent tasks that haven't exceeded max retries
-                    if task.idempotent && task.retry_count < 3 {
+                    if task.idempotent && task.retry_count < task.max_retries {
                         let mut retry_task = task.clone();
                         retry_task.status = "pending".to_string();
                         retry_task.retry_count += 1;
@@ -762,8 +812,35 @@ impl HeartbeatCoordinator {
                 Ok(t) => t,
                 Err(_) => continue,
             };
+            let schedules = self
+                .state
+                .get_schedules_for_goal(&goal.id)
+                .await
+                .unwrap_or_default();
+            let scheduled_run = if schedules.is_empty() {
+                None
+            } else {
+                self.state
+                    .get_scheduled_run_state(&goal.id)
+                    .await
+                    .ok()
+                    .flatten()
+            };
+
+            // Scheduled goals intentionally stay active between runs. Without
+            // an active run record there is no retryable cycle, regardless of
+            // whether old child tasks were individually marked idempotent.
+            if !schedules.is_empty() && scheduled_run.is_none() {
+                continue;
+            }
 
             for task in &tasks {
+                if scheduled_run
+                    .as_ref()
+                    .is_some_and(|run| !timestamp_is_at_or_after(&task.created_at, &run.created_at))
+                {
+                    continue;
+                }
                 if task.status == "failed" && task.idempotent && task.retry_count < task.max_retries
                 {
                     let mut retry_task = task.clone();
@@ -868,6 +945,64 @@ impl HeartbeatCoordinator {
                     .max()
                     .map(|s| s.to_string())
             });
+            let active_scheduled_run = if is_scheduled_goal {
+                self.state
+                    .get_scheduled_run_state(goal_id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let mut eligible_tasks: Vec<&crate::traits::Task> = Vec::with_capacity(tasks.len());
+            for task in tasks.iter().copied() {
+                let eligible = if !is_scheduled_goal {
+                    true
+                } else if let Some(run) = active_scheduled_run.as_ref() {
+                    timestamp_is_at_or_after(&task.created_at, &run.created_at)
+                } else {
+                    // Before a task lead starts there is a brief window where
+                    // the newly-fired root is pending but no run state exists.
+                    // Only that root may be dispatched in this state; child
+                    // work necessarily belongs to a closed run.
+                    is_scheduled_task_description(&task.description)
+                        && current_cycle_since
+                            .as_deref()
+                            .is_none_or(|since| timestamp_is_at_or_after(&task.created_at, since))
+                };
+                if eligible {
+                    eligible_tasks.push(task);
+                    continue;
+                }
+
+                let mut retired = task.clone();
+                retired.status = "cancelled".to_string();
+                retired.idempotent = false;
+                retired.max_retries = 0;
+                retired.error = Some(
+                    "Cancelled stale task from a closed scheduled run; a future schedule fire \
+                     will create a fresh root task."
+                        .to_string(),
+                );
+                retired.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                if let Err(error) = self.state.update_task(&retired).await {
+                    warn!(
+                        task_id = %task.id,
+                        goal_id = %goal_id,
+                        %error,
+                        "Failed to retire stale scheduled-run task"
+                    );
+                } else {
+                    info!(
+                        task_id = %task.id,
+                        goal_id = %goal_id,
+                        "Retired stale task from closed scheduled run"
+                    );
+                }
+            }
+            if eligible_tasks.is_empty() {
+                continue;
+            }
 
             // Daily budget is admission control for scheduled runs, not a reason
             // to abandon already-pending scheduled work.
@@ -899,6 +1034,19 @@ impl HeartbeatCoordinator {
             // should not block dispatch forever.
             let stale_threshold_secs: i64 = 600; // 10 minutes
             let has_active_nonstale = all_tasks.iter().any(|t| {
+                let belongs_to_current_run = if !is_scheduled_goal {
+                    true
+                } else if let Some(run) = active_scheduled_run.as_ref() {
+                    timestamp_is_at_or_after(&t.created_at, &run.created_at)
+                } else {
+                    is_scheduled_task_description(&t.description)
+                        && current_cycle_since
+                            .as_deref()
+                            .is_none_or(|since| timestamp_is_at_or_after(&t.created_at, since))
+                };
+                if !belongs_to_current_run {
+                    return false;
+                }
                 if t.status != "running" && t.status != "claimed" {
                     return false;
                 }
@@ -921,7 +1069,7 @@ impl HeartbeatCoordinator {
             // This prevents racing with a task lead that just created the tasks
             // but hasn't started dispatching them yet.
             let min_age_secs = 60;
-            let all_too_new = tasks.iter().all(|t| {
+            let all_too_new = eligible_tasks.iter().all(|t| {
                 chrono::DateTime::parse_from_rfc3339(&t.created_at)
                     .map(|dt| {
                         let age = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
@@ -954,11 +1102,11 @@ impl HeartbeatCoordinator {
                     {
                         info!(
                             goal_id = %goal_id,
-                            pending_count = tasks.len(),
+                            pending_count = eligible_tasks.len(),
                             "Goal already has a successful mutating action this cycle; \
                              closing out orphaned pending tasks instead of re-dispatching"
                         );
-                        for task in tasks {
+                        for task in &eligible_tasks {
                             let mut done = (*task).clone();
                             done.status = "completed".to_string();
                             done.result = Some(
@@ -976,7 +1124,7 @@ impl HeartbeatCoordinator {
             }
 
             // Try to atomically claim the first pending task and spawn a task lead.
-            let first_task = tasks[0];
+            let first_task = eligible_tasks[0];
             let agent_id = format!("heartbeat-dispatch-{}", uuid::Uuid::new_v4());
 
             let claimed = match self.state.claim_task(&first_task.id, &agent_id).await {
@@ -995,7 +1143,7 @@ impl HeartbeatCoordinator {
             info!(
                 goal_id = %goal_id,
                 task_id = %first_task.id,
-                pending_count = tasks.len(),
+                pending_count = eligible_tasks.len(),
                 "Claimed orphaned task, dispatching task lead"
             );
 
@@ -1046,7 +1194,7 @@ impl HeartbeatCoordinator {
             warn!(
                 goal_id = %goal_id,
                 task_id = %first_task.id,
-                pending_count = tasks.len(),
+                pending_count = eligible_tasks.len(),
                 "No agent available for dispatch — reverting claim and notifying user"
             );
             let mut reverted = first_task.clone();
@@ -1059,7 +1207,7 @@ impl HeartbeatCoordinator {
                 "Goal stalled: \"{}\" has {} pending task(s) but no active agent. \
                  You can re-trigger this by asking me about it again.",
                 goal.description.chars().take(200).collect::<String>(),
-                tasks.len(),
+                eligible_tasks.len(),
             );
             let entry =
                 crate::traits::NotificationEntry::new(goal_id, &goal.session_id, "stalled", &msg);
@@ -1254,7 +1402,25 @@ impl HeartbeatCoordinator {
         for entry in &pending {
             let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
                 let message = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
-                hub.send_text(&entry.session_id, &message).await.is_ok()
+                // A channel adapter is external I/O. It must never be allowed to
+                // pin the heartbeat forever because this same loop admits due
+                // schedules and dispatches pending tasks on the next tick.
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    hub.send_text(&entry.session_id, &message),
+                )
+                .await
+                {
+                    Ok(result) => result.is_ok(),
+                    Err(_) => {
+                        warn!(
+                            notification_id = %entry.id,
+                            session_id = %entry.session_id,
+                            "Notification delivery timed out"
+                        );
+                        false
+                    }
+                }
             } else {
                 false
             };
@@ -1407,9 +1573,78 @@ impl HeartbeatCoordinator {
             &goal.tokens_used_day,
             &budget_today,
         ) {
-            schedule.next_run_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+            schedule.last_run_at = Some(now_ts.clone());
+            schedule.next_run_at = if schedule.is_one_shot {
+                (now + chrono::Duration::hours(24)).to_rfc3339()
+            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+                next.to_rfc3339()
+            } else {
+                (now + chrono::Duration::hours(24)).to_rfc3339()
+            };
             schedule.updated_at = now_ts.clone();
             let _ = self.state.update_goal_schedule(&schedule).await;
+            let msg = format!(
+                "Skipped the scheduled run for \"{}\" because today's daily token budget \
+                 ({}) is exhausted. No work was started. The schedule remains active and \
+                 will try again at its next normal fire after the counter resets.",
+                crate::tools::sanitize::short_goal_label(&goal.description),
+                goal.budget_daily.unwrap_or_default(),
+            );
+            let entry = crate::traits::NotificationEntry::new(
+                &goal.id,
+                &goal.session_id,
+                "token_alert",
+                &msg,
+            );
+            let _ = self.state.enqueue_notification(&entry).await;
+            return Ok(());
+        }
+        if !daily_budget_has_run_capacity(
+            goal.budget_daily,
+            goal.budget_per_check,
+            goal.tokens_used_today,
+            &goal.tokens_used_day,
+            &budget_today,
+        ) {
+            let remaining = goal
+                .budget_daily
+                .unwrap_or_default()
+                .saturating_sub(goal.tokens_used_today)
+                .max(0);
+            let required = goal.budget_per_check.unwrap_or_default().max(0);
+            schedule.last_run_at = Some(now_ts.clone());
+            schedule.next_run_at = if schedule.is_one_shot {
+                (now + chrono::Duration::minutes(15)).to_rfc3339()
+            } else if let Ok(next) = crate::cron_utils::compute_next_run(&schedule.cron_expr) {
+                next.to_rfc3339()
+            } else {
+                (now + chrono::Duration::hours(24)).to_rfc3339()
+            };
+            schedule.updated_at = now_ts.clone();
+            let _ = self.state.update_goal_schedule(&schedule).await;
+
+            let msg = format!(
+                "Skipped the scheduled run for \"{}\" because only {} daily-budget tokens \
+                 remain and a full run is allowed up to {}. No work was started. The schedule \
+                 remains active and will try again at its next normal fire after the daily \
+                 counter resets.",
+                crate::tools::sanitize::short_goal_label(&goal.description),
+                remaining,
+                required,
+            );
+            let entry = crate::traits::NotificationEntry::new(
+                &goal.id,
+                &goal.session_id,
+                "token_alert",
+                &msg,
+            );
+            let _ = self.state.enqueue_notification(&entry).await;
+            info!(
+                goal_id = %goal.id,
+                remaining,
+                required,
+                "Skipped scheduled run before admission because remaining daily budget cannot fund one full run"
+            );
             return Ok(());
         }
 
@@ -1531,9 +1766,13 @@ impl HeartbeatCoordinator {
             result: None,
             error: None,
             blocker: None,
-            idempotent: goal.goal_type == "continuous",
+            // A scheduled root can perform externally visible writes. Retrying
+            // the whole orchestration after an ambiguous failure can duplicate
+            // those writes, so only individual, explicitly idempotent child
+            // tasks may be retried.
+            idempotent: false,
             retry_count: 0,
-            max_retries: 1,
+            max_retries: 0,
             created_at: now_ts.clone(),
             started_at: None,
             completed_at: None,
@@ -1713,6 +1952,28 @@ mod tests {
         ));
         // No daily budget configured -> never exhausted.
         assert!(!daily_budget_exhausted(None, 999_999, today, today));
+
+        assert!(!daily_budget_has_run_capacity(
+            Some(1_000_000),
+            Some(400_000),
+            798_965,
+            today,
+            today,
+        ));
+        assert!(daily_budget_has_run_capacity(
+            Some(1_000_000),
+            Some(400_000),
+            598_965,
+            today,
+            today,
+        ));
+        assert!(daily_budget_has_run_capacity(
+            Some(1_000_000),
+            Some(400_000),
+            999_999,
+            "2026-06-27",
+            today,
+        ));
     }
 
     async fn test_state_store() -> Arc<dyn StateStore> {
@@ -2104,6 +2365,11 @@ mod tests {
             tasks[0].description.starts_with("Execute scheduled goal:"),
             "Task description should indicate scheduled execution"
         );
+        assert!(
+            !tasks[0].idempotent,
+            "scheduled orchestration roots must never auto-retry after ambiguous writes"
+        );
+        assert_eq!(tasks[0].max_retries, 0);
 
         let sched = state.get_goal_schedule(&schedule.id).await.unwrap();
         assert!(
@@ -2531,12 +2797,16 @@ mod tests {
         let goal = Goal::new_continuous("Test budget goal", "system", Some(5000), Some(20000));
         state.create_goal(&goal).await.unwrap();
 
-        // Manually set tokens_used_today > 0 via the concrete pool
-        sqlx::query("UPDATE goals SET tokens_used_today = 1500 WHERE id = ?")
-            .bind(&goal.id)
-            .execute(&sqlite_state.pool())
-            .await
-            .unwrap();
+        // Manually set prior-day usage via the concrete pool.
+        sqlx::query(
+            "UPDATE goals
+             SET tokens_used_today = 1500, tokens_used_day = date('now', '-1 day')
+             WHERE id = ?",
+        )
+        .bind(&goal.id)
+        .execute(&sqlite_state.pool())
+        .await
+        .unwrap();
 
         // Reset
         let count = state.reset_daily_token_budgets().await.unwrap();
@@ -2548,6 +2818,39 @@ mod tests {
             updated.tokens_used_today, 0,
             "tokens_used_today should be reset to 0"
         );
+    }
+
+    #[tokio::test]
+    async fn test_daily_budget_reset_preserves_same_day_usage() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let sqlite_state = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+        let state: Arc<dyn StateStore> = sqlite_state.clone();
+        let goal = Goal::new_continuous("Same-day budget", "system", Some(5000), Some(20000));
+        state.create_goal(&goal).await.unwrap();
+        sqlx::query(
+            "UPDATE goals
+             SET tokens_used_today = 1500, tokens_used_day = date('now')
+             WHERE id = ?",
+        )
+        .bind(&goal.id)
+        .execute(&sqlite_state.pool())
+        .await
+        .unwrap();
+
+        let count = state.reset_daily_token_budgets().await.unwrap();
+        assert_eq!(count, 0);
+        let updated = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(updated.tokens_used_today, 1500);
     }
 
     #[tokio::test]
@@ -2628,6 +2931,99 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].notification_type, "stalled");
         assert_eq!(notifications[0].goal_id, goal.id);
+    }
+
+    #[tokio::test]
+    async fn closed_scheduled_run_children_are_neither_retried_nor_dispatched() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Publish a daily post", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cycle_start = now - chrono::Duration::hours(2);
+        state
+            .create_goal_schedule(&GoalSchedule {
+                id: uuid::Uuid::new_v4().to_string(),
+                goal_id: goal.id.clone(),
+                cron_expr: "0 8 * * *".to_string(),
+                tz: "local".to_string(),
+                original_schedule: None,
+                fire_policy: "coalesce".to_string(),
+                is_one_shot: false,
+                is_paused: false,
+                last_run_at: Some(cycle_start.to_rfc3339()),
+                next_run_at: (now + chrono::Duration::hours(22)).to_rfc3339(),
+                created_at: cycle_start.to_rfc3339(),
+                updated_at: cycle_start.to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let failed = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Deploy the post".to_string(),
+            status: "failed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: Some("ambiguous deploy result".to_string()),
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (cycle_start + chrono::Duration::minutes(5)).to_rfc3339(),
+            started_at: None,
+            completed_at: Some((cycle_start + chrono::Duration::minutes(6)).to_rfc3339()),
+        };
+        state.create_task(&failed).await.unwrap();
+        let pending = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Verify the old deployment".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 2,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (cycle_start + chrono::Duration::minutes(7)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&pending).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.auto_retry_failed_tasks().await;
+        coordinator.dispatch_pending_tasks().await;
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.id == failed.id)
+                .unwrap()
+                .status,
+            "failed",
+            "closed-run failures must not be promoted back to pending"
+        );
+        let pending_after = tasks.iter().find(|task| task.id == pending.id).unwrap();
+        assert_eq!(pending_after.status, "cancelled");
+        assert!(!pending_after.idempotent);
+        assert_eq!(pending_after.max_retries, 0);
     }
 
     #[test]
@@ -2752,6 +3148,19 @@ mod tests {
             completed_at: None,
         };
         state.create_task(&orphaned).await.unwrap();
+        state
+            .upsert_scheduled_run_state(&crate::traits::ScheduledRunState {
+                goal_id: goal.id.clone(),
+                root_task_id: posted_task.id.clone(),
+                effective_budget_per_check: 5000,
+                tokens_used: 0,
+                budget_extensions_count: 0,
+                health: Default::default(),
+                created_at: cycle_start.to_rfc3339(),
+                updated_at: cycle_start.to_rfc3339(),
+            })
+            .await
+            .unwrap();
 
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
         let coordinator =
@@ -2839,6 +3248,19 @@ mod tests {
             completed_at: None,
         };
         state.create_task(&orphaned).await.unwrap();
+        state
+            .upsert_scheduled_run_state(&crate::traits::ScheduledRunState {
+                goal_id: goal.id.clone(),
+                root_task_id: orphaned.id.clone(),
+                effective_budget_per_check: 5000,
+                tokens_used: 0,
+                budget_extensions_count: 0,
+                health: Default::default(),
+                created_at: cycle_start.to_rfc3339(),
+                updated_at: cycle_start.to_rfc3339(),
+            })
+            .await
+            .unwrap();
 
         let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
         let coordinator =

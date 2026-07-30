@@ -59,6 +59,14 @@ pub(super) struct LearningContext {
 }
 
 impl LearningContext {
+    pub(super) fn has_unrecovered_model_error(&self) -> bool {
+        self.errors.iter().any(|(error, recovered)| {
+            !*recovered
+                && (error.starts_with("LLM call ")
+                    || error.starts_with("All model attempts failed"))
+        })
+    }
+
     pub(super) fn record_replay_note(
         &mut self,
         category: ReplayNoteCategory,
@@ -1512,6 +1520,17 @@ mod tests {
             task_outcome: None,
             replay_notes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn task_outcome_model_error_filter_ignores_tool_failures() {
+        let tool_error = ctx_with_single_error("Error: selector did not match");
+        assert!(!tool_error.has_unrecovered_model_error());
+
+        let mut model_error = ctx_with_single_error("LLM call timed out after 300s");
+        assert!(model_error.has_unrecovered_model_error());
+        model_error.errors[0].1 = true;
+        assert!(!model_error.has_unrecovered_model_error());
     }
 
     #[test]

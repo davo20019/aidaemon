@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.30] - 2026-07-29
+
+### Added
+
+- **Entity-aware personal memory.** Canonical entities, typed aliases, temporal/provenance-aware facts, directed relationship edges with reverse traversal, transactional reconciliation, conflict history, idempotent writes, structured retrieval preference, and a conservative legacy backfill now extend the existing flat-memory system without deleting or hiding legacy records.
+- **Scheduled-run budget and completion telemetry.** Goal runs retain explicit terminal outcomes, report budget exhaustion and blockers to the owner, and expose enough task/model telemetry to diagnose stalls instead of silently stopping.
+
+### Changed
+
+- **Simple turns use a smaller harness.** Direct conversation and personal-memory recall skip the separate planning call when no planning is warranted, enforce a focused memory-tool roster, and omit unrelated requirement-tracking schemas.
+- **Personal-memory prompting favors canonical reconciliation.** Corrections supersede prior values with audit history, aliases remain attached to their canonical person, and relationship/status reporting distinguishes legacy contact rows from populated structured edges.
+
+### Fixed
+
+- **Successful answers no longer become `partial` because advisory plan steps were unfinished.** Only hard completion-contract requirements, verification debt, and linked failed mutations affect the final outcome.
+- **Follow-up source questions retain their referent.** Retrieval receives the prior request and answer for deictic prompts such as “what’s the source of that?”
+- **Browser reads no longer count as external mutations.** Read-only DOM extraction and ordinary navigation clicks use observational semantics, while consequential actions remain mutations; selector guidance also avoids brittle global-index-to-`nth-of-type` conversions.
+- **Legacy relationship memories backfill safely and idempotently.** Unambiguous parent, partner, and child facts create typed edges; explicit owner/child full-name records can promote previously migrated short names while retaining nicknames; malformed combined-parent values and ambiguous aliases remain reviewable rather than being guessed or merged.
+- **Memory search results no longer fail because stored text contains error words.** Read-only memory reports are classified by their action and response envelope, and task completion distinguishes actual model failures from incidental tool errors that did not prevent a useful, contract-fulfilling answer.
+- **Startup memory repair tolerates transient database writers.** SQLite connections wait on short write locks and the idempotent structured-memory backfill retries before deferring, so retention/projection overlap does not leave safe migrations unapplied.
+- **The release test harness no longer leaks SQLCipher WAL sidecars.** Unit-test databases use delete journaling while production retains WAL, and legacy flat-fact reconciliation is serialized to prevent concurrent active-key uniqueness races.
+
 ## [0.11.29] - 2026-07-25
 
 ### Added

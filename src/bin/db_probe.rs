@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use anyhow::Context;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};

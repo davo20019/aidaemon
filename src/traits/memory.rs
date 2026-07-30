@@ -73,6 +73,117 @@ fn default_extraction_confidence() -> f32 {
     0.5
 }
 
+/// A canonical entity proposed by the personal-memory extractor.
+///
+/// `local_id` only links records inside one write. `is_reference` distinguishes
+/// a mention of an already-known alias from a declaration of a new entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalEntityCandidate {
+    pub local_id: String,
+    pub entity_type: String,
+    pub canonical_name: String,
+    #[serde(default)]
+    pub is_reference: bool,
+    #[serde(default)]
+    pub canonical_name_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalAliasCandidate {
+    pub entity_local_id: String,
+    pub value: String,
+    pub alias_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalFactCandidate {
+    pub subject_local_id: String,
+    pub predicate: String,
+    pub value: String,
+    #[serde(default)]
+    pub display_value: Option<String>,
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    #[serde(default)]
+    pub valid_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalRelationshipCandidate {
+    pub source_local_id: String,
+    pub relationship_type: String,
+    pub target_local_id: String,
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    #[serde(default)]
+    pub valid_to: Option<String>,
+}
+
+/// One atomic, entity-aware personal-memory write plan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersonalMemoryWrite {
+    #[serde(default)]
+    pub entities: Vec<PersonalEntityCandidate>,
+    #[serde(default)]
+    pub aliases: Vec<PersonalAliasCandidate>,
+    #[serde(default)]
+    pub facts: Vec<PersonalFactCandidate>,
+    #[serde(default)]
+    pub relationships: Vec<PersonalRelationshipCandidate>,
+    /// True only when the owner directly supplied the information.
+    #[serde(default)]
+    pub direct_user_statement: bool,
+    /// True when the owner explicitly corrected a previously stored value.
+    #[serde(default)]
+    pub correction: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersonalMemoryWriteResult {
+    pub created_entities: usize,
+    pub updated_entities: usize,
+    pub created_aliases: usize,
+    pub confirmed_aliases: usize,
+    pub created_facts: usize,
+    pub confirmed_facts: usize,
+    pub superseded_facts: usize,
+    pub disputed_facts: usize,
+    pub created_relationships: usize,
+    pub confirmed_relationships: usize,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+}
+
+impl PersonalMemoryWriteResult {
+    pub fn concise_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (count, label) in [
+            (self.created_entities, "entities created"),
+            (self.updated_entities, "entities updated"),
+            (self.created_aliases, "aliases created"),
+            (self.confirmed_aliases, "aliases confirmed"),
+            (self.created_facts, "facts created"),
+            (self.confirmed_facts, "facts confirmed"),
+            (self.superseded_facts, "facts superseded"),
+            (self.disputed_facts, "facts disputed"),
+            (self.created_relationships, "relationships created"),
+            (self.confirmed_relationships, "relationships confirmed"),
+        ] {
+            if count > 0 {
+                parts.push(format!("{count} {label}"));
+            }
+        }
+        if !self.unresolved.is_empty() {
+            parts.push(format!("{} unresolved", self.unresolved.len()));
+        }
+        if parts.is_empty() {
+            "No changes (already current).".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryHealthReport {
     pub spans: i64,

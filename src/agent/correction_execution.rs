@@ -256,7 +256,7 @@ mod tests {
         });
         let field: Option<Arc<CorrectionExecutionContext>> = Some(Arc::clone(&ctx));
         assert!(field.is_some());
-        assert!(!field.unwrap().bypass_approvals);
+        assert!(!field.as_ref().is_some_and(|value| value.bypass_approvals));
     }
 
     /// P2.1 TDD: ToolExecutionIoCtx per-call flags are false by default on

@@ -11,6 +11,16 @@ struct RankedEntity {
     salience: f32,
 }
 
+fn canonical_profile_key(key: &str) -> String {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
+        "current_residence" | "home" | "location" => "residence".to_string(),
+        "place_of_birth" => "birthplace".to_string(),
+        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Build the core profile string containing relationships and other core identity facts.
 /// Computes salience per entity and selects the top N.
 pub async fn build_core_profile(
@@ -69,7 +79,24 @@ pub async fn build_core_profile(
         }
     }
 
-    let flat_facts = state.get_facts(None).await.unwrap_or_default();
+    let canonical_facts = state.get_canonical_memory_facts().await.unwrap_or_default();
+    let canonical_owner_keys: std::collections::HashSet<String> = canonical_facts
+        .iter()
+        .filter(|fact| fact.category == "user")
+        .map(|fact| canonical_profile_key(&fact.key))
+        .collect();
+    let mut flat_facts = canonical_facts;
+    flat_facts.extend(
+        state
+            .get_facts(None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fact| {
+                fact.category != "user"
+                    || !canonical_owner_keys.contains(&canonical_profile_key(&fact.key))
+            }),
+    );
     // BTreeMap (not HashMap) so group iteration order is deterministic — combined
     // with `order_entities` before render, the same data yields byte-identical output.
     let mut flat_groups: BTreeMap<String, Vec<Fact>> = BTreeMap::new();

@@ -727,6 +727,27 @@ impl Agent {
         }
     }
 
+    fn same_alert_destination(left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+        let is_non_telegram = |value: &str| {
+            value.contains("slack:")
+                || value.contains("discord:")
+                || value.starts_with("specialist:")
+        };
+        if is_non_telegram(left) || is_non_telegram(right) {
+            return false;
+        }
+        match (
+            crate::session::telegram_chat_id_from_session(left),
+            crate::session::telegram_chat_id_from_session(right),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+    }
+
     /// Fan-out token alerts to owner sessions plus the triggering session.
     pub(super) async fn fanout_token_alert(
         &self,
@@ -735,8 +756,35 @@ impl Agent {
         message: &str,
         suppress_session_id: Option<&str>,
     ) {
+        // Background goal runs deliver one consolidated terminal outcome from
+        // the task lead. Child and task-lead budget checks can fire at nearly
+        // the same instant; fanning out here produced duplicate alerts, often
+        // addressed to internal specialist sessions. Defer those alerts to the
+        // run finalizer, which has the originating user session and full task
+        // outcome.
+        if goal_id.is_some() && self.depth > 0 {
+            info!(
+                depth = self.depth,
+                goal_id = goal_id.unwrap_or_default(),
+                "Deferring background goal budget alert to terminal run notification"
+            );
+            return;
+        }
+
         let mut targets = self.load_default_alert_sessions().await;
-        targets.push(trigger_session_id.to_string());
+        let goal_session = if let Some(goal_id) = goal_id {
+            self.state
+                .get_goal(goal_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|goal| goal.session_id)
+        } else {
+            None
+        };
+        let primary_session = goal_session.as_deref().unwrap_or(trigger_session_id);
+        targets.retain(|target| !Self::same_alert_destination(target, primary_session));
+        targets.push(primary_session.to_string());
         targets = Self::dedupe_alert_sessions(targets);
 
         let goal_ref = goal_id.map(ToString::to_string).unwrap_or_else(|| {
@@ -1320,5 +1368,17 @@ mod tests {
             ),
             Some(200)
         );
+    }
+
+    #[test]
+    fn alert_destination_dedupes_legacy_and_namespaced_telegram_sessions() {
+        assert!(Agent::same_alert_destination(
+            "301753035",
+            "aidaemon_coding_bot:301753035"
+        ));
+        assert!(!Agent::same_alert_destination(
+            "slack:U018EAFV5QR",
+            "aidaemon_coding_bot:301753035"
+        ));
     }
 }

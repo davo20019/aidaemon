@@ -421,7 +421,7 @@ pub async fn run(config: AppConfig, config_path: std::path::PathBuf) -> anyhow::
     channel_bundle.send_startup_notifications(&config).await;
 
     // 16. Start channels
-    info!("Starting aidaemon v0.1.0");
+    info!("Starting aidaemon v{}", env!("CARGO_PKG_VERSION"));
     channel_bundle.spawn_all();
     #[cfg(feature = "terminal-bridge")]
     crate::terminal_bridge::spawn_if_configured(&config, state.clone());

@@ -1,0 +1,17 @@
+name: read_only_contract_no_mutation
+description: Explicit no-write request remains observational and never reaches mutation tools
+session_id: eval_read_only_contract_01
+user_text: Cargo.toml package name? Read only; don't modify.
+orchestrator: true
+mock_responses:
+  - text: I inspected Cargo.toml without modifying anything.
+expect:
+  tools_required_predicted: true
+  tools_not_used:
+    - write_file
+    - terminal
+  outcome: failed
+  stop_reason: error
+  llm_calls_max: 7
+  tool_calls_max: 0
+  forbidden_mutation_attempts_max: 0

@@ -264,6 +264,34 @@ impl Agent {
         // Fetch memory components — channel-scoped retrieval
         let inject_personal = channel_ctx.should_inject_personal_memory();
 
+        // Anaphoric follow-ups need the subject of the preceding exchange in
+        // the retrieval query. Searching only "what's the source of that?"
+        // ranks generic `source` memories and drops the actual award/entity.
+        let retrieval_query = if super::followup::looks_like_context_dependent_followup_question(
+            &user_text.trim().to_ascii_lowercase(),
+        ) {
+            let history = self
+                .state
+                .get_history(session_id, 8)
+                .await
+                .unwrap_or_default();
+            let (previous_assistant, previous_user) =
+                super::followup::find_previous_turns(&history, user_text);
+            let mut parts = vec![user_text.to_string()];
+            if let Some(previous_user) = previous_user {
+                parts.push(format!("Previous request: {previous_user}"));
+            }
+            if let Some(previous_assistant) = previous_assistant {
+                parts.push(format!(
+                    "Previous answer: {}",
+                    crate::utils::truncate_str(&previous_assistant, 1200)
+                ));
+            }
+            parts.join("\n")
+        } else {
+            user_text.to_string()
+        };
+
         // Facts: always use channel-scoped semantic retrieval.
         // Previously the owner_dm_fact_cache (all facts) was used here, but
         // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
@@ -271,7 +299,7 @@ impl Agent {
         let facts = self
             .state
             .get_relevant_facts_for_channel(
-                user_text,
+                &retrieval_query,
                 self.limits.max_facts,
                 channel_ctx.channel_id.as_deref(),
                 channel_ctx.visibility,
@@ -1081,9 +1109,10 @@ impl Agent {
              Do NOT just acknowledge it in conversation — actually store it so it persists across sessions. \
              When multiple facts are shared at once, store them all in a single batch call. \
              **When correcting wrong facts:** First SEARCH existing memories to find ALL related wrong entries. \
-             Then DELETE each wrong fact by setting its value to empty string or 'delete' (remember_fact treats empty \
-             values as deletion). Then store the correct facts with appropriate keys. Old keys like 'dog_name' must be \
-             explicitly deleted — storing a NEW key like 'cat1_name' does NOT remove the old 'dog_name' entry.\n\
+             Then write the correction through the personal-memory pipeline so the previous value is superseded, \
+             not erased. Preserve aliases, provenance, and history; never manufacture a second person merely because \
+             a corrected name or nickname differs. Deactivate legacy duplicate keys only when the canonical entity \
+             and predicate have been resolved unambiguously.\n\
              6. **Never claim you lack capabilities you have.** \
              You have tools listed in your tool definitions. Never tell the user you \"don't have access\" to memory, \
              file operations, web search, or any other capability that appears in your available tools. \
@@ -1112,7 +1141,10 @@ impl Agent {
              Do not ask the user where secrets are stored (.env, keychain, config file path) until you have first checked the available \
              config/auth tools for existing credentials or connection state. If reconnecting an OAuth service, verify whether client credentials \
              are already stored before asking the user for them again. Prefer `connect` for OAuth reauthorization; do not call `remove` unless the user explicitly wants the service disconnected. \
-             Do not answer from static knowledge or stale memory.\n\
+             For stable stored personal, project, organization, and relationship facts, answer from relevant memory \
+             when it directly contains the requested value. Browse only when the user asks for verification/current \
+             information, the subject is time-sensitive, or memory lacks enough evidence. Do not perform redundant \
+             web searches merely to restate a stable fact already present in the current context.\n\
              9. **Wait for background services to become ready before testing.** \
              When you start a server or service in the background (e.g., `python3 app.py &`), \
              add `sleep 2` before making requests to it. Services need a moment to bind their ports.\n\
@@ -1351,9 +1383,8 @@ mod tests {
             None,
         );
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
-        for needle in ["[Current Date & Time]"] {
-            assert!(tail.contains(needle), "missing {needle}");
-        }
+        let needle = "[Current Date & Time]";
+        assert!(tail.contains(needle), "missing {needle}");
     }
 
     /// Spec §Tail: the resume checkpoint MOVES from the core to the tail.

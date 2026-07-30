@@ -587,8 +587,7 @@ pub(super) async fn run_stopping_phase(
                         None,
                     )
                     .await?;
-                let has_unrecovered_errors =
-                    learning_ctx.errors.iter().any(|(_, recovered)| !recovered);
+                let has_unrecovered_errors = learning_ctx.has_unrecovered_model_error();
                 let outcome = TaskOutcomeDerivation::from_completion_state(
                     &validation_state,
                     execution_state,
@@ -1038,7 +1037,7 @@ pub(super) async fn run_stopping_phase(
                         )
                         .await;
                     let alert_msg = format!(
-                            "Token alert: scheduled run for goal '{}' hit per-run budget (used {} / limit {}). Execution was stopped because the run no longer appeared productive.",
+                            "Token alert: scheduled run for goal '{}' hit its per-run budget (used {} / limit {}). The run stopped safely before completion.",
                             goal_id, tokens_used, budget_per_check
                         );
                     agent
@@ -1891,7 +1890,7 @@ pub(super) async fn run_stopping_phase(
                 completion_progress,
                 &turn_context.completion_contract,
                 response_has_user_value(&reply, total_successful_tool_calls),
-                unrecovered_errors > 0,
+                learning_ctx.has_unrecovered_model_error(),
                 None,
             )
             .derive_outcome();

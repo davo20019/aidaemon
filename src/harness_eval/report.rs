@@ -66,8 +66,10 @@ pub fn format_eval_task_report(row: &EvalTaskRow) -> String {
     ));
     let contract = &eval.quality.contract;
     out.push_str(&format!(
-        "- contract: expects_mutation={} mutations={} requires_observation={} observations={} verification_required={} verifications={} verification_blocks={} fulfilled={}\n",
+        "- contract: expects_mutation={} forbids_mutation={} forbidden_attempts={} mutations={} requires_observation={} observations={} verification_required={} verifications={} verification_blocks={} fulfilled={}\n",
         contract.expects_mutation,
+        contract.forbids_mutation,
+        contract.forbidden_mutation_attempts,
         contract.mutation_count,
         contract.requires_observation,
         contract.observation_count,
@@ -205,6 +207,25 @@ fn routing_mismatch_warnings(eval: &HarnessEvalSnapshot) -> String {
         out.push_str(
             "- ⚠️ routing mismatch: tools required but none used on non-success outcome\n",
         );
+    }
+    if !eval.routing.tools_required_predicted && eval.routing.tools_actually_used {
+        out.push_str("- ⚠️ routing mismatch: tools were used although routing predicted none\n");
+    }
+    if eval.quality.contract.forbidden_mutation_attempts > 0 {
+        out.push_str(
+            "- ⚠️ negative-contract violation: a forbidden mutation was attempted and blocked\n",
+        );
+    }
+    if let Some(total) = eval.progress.plan_steps_total.filter(|total| *total > 0) {
+        let completed = eval.progress.plan_steps_completed.unwrap_or(0);
+        if completed < total {
+            out.push_str(&format!(
+                "- ⚠️ plan incomplete: {completed}/{total} planned steps recorded complete\n"
+            ));
+        }
+    }
+    if eval.scores.cost_efficiency < 0.15 {
+        out.push_str("- ⚠️ severe cost inefficiency: overall score is hard-capped\n");
     }
     if eval.routing.route_drift_failsafe {
         out.push_str("- ⚠️ route drift failsafe was active this turn\n");

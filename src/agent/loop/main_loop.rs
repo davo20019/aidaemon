@@ -304,8 +304,11 @@ impl Agent {
         let mut approach_pivots_used: usize = 0;
         const MAX_BUDGET_EXTENSIONS: usize = 3;
         const HARD_TOKEN_CAP: i64 = 2_000_000;
-        const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 12;
-        const SCHEDULED_HARD_TOKEN_CAP: i64 = 20_000_000;
+        // Scheduled work must stop at the user-approved per-run budget. Any
+        // increase requires an explicit approval instead of silently doubling
+        // the budget for an unattended run.
+        const SCHEDULED_MAX_BUDGET_EXTENSIONS: usize = 0;
+        const SCHEDULED_HARD_TOKEN_CAP: i64 = 2_000_000;
 
         let iteration_limits = match &self.limits.iteration_config {
             IterationLimitConfig::Unlimited => super::loop_state::IterationLimitSettings {
@@ -810,6 +813,15 @@ impl Agent {
         loop {
             let iteration = turn_state.counters.advance_iteration();
             touch_heartbeat(&heartbeat);
+            let plan_progress = execution_state
+                .active_linear_intent_plan
+                .as_ref()
+                .map(|plan| {
+                    (
+                        plan.steps.iter().filter(|step| step.completed).count() as u32,
+                        plan.steps.len() as u32,
+                    )
+                });
             #[cfg(feature = "computer_use")]
             {
                 model =
@@ -825,6 +837,9 @@ impl Agent {
                         turn_state.evidence.evidence_gain_count() as u32,
                         false,
                     );
+                    if let Some((completed, total)) = plan_progress {
+                        eval.record_plan_progress(completed, total);
+                    }
                 })
                 .await;
 

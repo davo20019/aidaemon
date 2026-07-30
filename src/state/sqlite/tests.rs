@@ -733,6 +733,30 @@ async fn test_get_relevant_facts_increments_recall() {
 }
 
 #[tokio::test]
+async fn test_exact_relationship_key_outranks_generic_profile_facts() {
+    let (store, _db) = setup_test_store().await;
+    for (key, value) in [
+        ("full_name", "Alice Rivera"),
+        ("preferred_name", "Alice"),
+        ("dad_name", "Jordan Rivera"),
+    ] {
+        store
+            .upsert_fact("user", key, value, "user", None, FactPrivacy::Private)
+            .await
+            .unwrap();
+    }
+
+    let facts = store
+        .get_relevant_facts("What's my dad's name?", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        facts.first().map(|fact| fact.key.as_str()),
+        Some("dad_name")
+    );
+}
+
+#[tokio::test]
 async fn test_fact_privacy_channel_scoped() {
     let (store, _db) = setup_test_store().await;
 
@@ -2788,6 +2812,41 @@ async fn test_notification_queue_priority_ordering() {
 }
 
 #[tokio::test]
+async fn test_notification_queue_does_not_starve_recent_entries() {
+    let (store, _file) = setup_test_store().await;
+    let goal_id = "goal-notification-fairness";
+    let now = chrono::Utc::now();
+
+    let mut exhausted =
+        crate::traits::NotificationEntry::new(goal_id, "stale-session", "token_alert", "old");
+    exhausted.created_at = now.to_rfc3339();
+    exhausted.attempts = 10;
+    store.enqueue_notification(&exhausted).await.unwrap();
+
+    let mut stale =
+        crate::traits::NotificationEntry::new(goal_id, "stale-session", "token_alert", "stale");
+    stale.created_at = (now - chrono::Duration::days(2)).to_rfc3339();
+    store.enqueue_notification(&stale).await.unwrap();
+
+    let mut earlier =
+        crate::traits::NotificationEntry::new(goal_id, "old-session", "token_alert", "old");
+    earlier.created_at = (now - chrono::Duration::hours(1)).to_rfc3339();
+    store.enqueue_notification(&earlier).await.unwrap();
+
+    let mut recent =
+        crate::traits::NotificationEntry::new(goal_id, "recent-session", "token_alert", "recent");
+    recent.created_at = now.to_rfc3339();
+    store.enqueue_notification(&recent).await.unwrap();
+
+    let pending = store.get_pending_notifications(10).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].id, recent.id);
+    assert_eq!(pending[1].id, earlier.id);
+    assert!(!pending.iter().any(|entry| entry.id == exhausted.id));
+    assert!(!pending.iter().any(|entry| entry.id == stale.id));
+}
+
+#[tokio::test]
 async fn test_notification_queue_cleanup_expired() {
     let (store, _file) = setup_test_store().await;
 
@@ -2890,6 +2949,10 @@ async fn test_cleanup_stale_goals() {
     let g = store.get_goal("stale-finite").await.unwrap().unwrap();
     assert_eq!(g.status, "failed");
     assert!(g.completed_at.is_some());
+    assert!(
+        g.notified_at.is_some(),
+        "administrative stale cleanup must not enqueue a restart failure alert"
+    );
 
     let g = store.get_goal("recent-finite").await.unwrap().unwrap();
     assert_eq!(g.status, "active");
@@ -3633,6 +3696,100 @@ async fn prompt_snapshot_roundtrip_and_dedup() {
         Some("You are aidaemon. Core prompt v1.")
     );
     assert_eq!(store.get_prompt_snapshot("missing").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn prompt_snapshot_retention_is_bounded() {
+    let (store, _db_file) = setup_test_store().await;
+    for index in 0..505 {
+        store
+            .save_prompt_snapshot(
+                &format!("snapshot-{index:04}"),
+                &format!("prompt content {index}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompt_snapshots")
+        .fetch_one(&store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 500);
+}
+
+#[tokio::test]
+async fn reopening_store_prunes_legacy_prompt_snapshots() {
+    let (store, db_file) = setup_test_store().await;
+    for index in 0..505 {
+        sqlx::query(
+            "INSERT INTO prompt_snapshots (hash, content, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(format!("legacy-snapshot-{index:04}"))
+        .bind(format!("prompt content {index}"))
+        .bind(format!(
+            "2026-01-01T00:{:02}:{:02}Z",
+            index / 60,
+            index % 60
+        ))
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    }
+    drop(store);
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let reopened = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompt_snapshots")
+        .fetch_one(&reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 500);
+}
+
+#[tokio::test]
+async fn reopening_store_allows_existing_multiple_episodes_per_session() {
+    let (store, db_file) = setup_test_store().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for summary in ["first episode", "second episode"] {
+        sqlx::query(
+            "INSERT INTO episodes
+             (session_id, summary, start_time, end_time, created_at)
+             VALUES ('same-session', ?, ?, ?, ?)",
+        )
+        .bind(summary)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    }
+    drop(store);
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let reopened = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .expect("migration must not recreate the obsolete unique session index");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE session_id = 'same-session'")
+            .fetch_one(&reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
 }
 
 #[tokio::test]

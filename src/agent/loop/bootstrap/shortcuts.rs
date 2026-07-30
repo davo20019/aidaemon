@@ -151,7 +151,9 @@ pub(super) async fn maybe_cancel_work_for_mid_task_pivot(
         }
     };
 
-    let cancelled_goals = agent.cancel_active_goals_for_session(session_id).await;
+    let cancelled_goals = agent
+        .cancel_active_finite_work_for_session(session_id)
+        .await;
     let cli_cancelled_any = cli_cancel_msg
         .as_deref()
         .is_some_and(|m| !m.contains("No running CLI agents"));
@@ -599,6 +601,8 @@ pub(super) async fn emit_bootstrap_direct_reply(
             turn_id,
             depth: agent.depth as u32,
             parent_task_id: agent.task_id.clone(),
+            goal_id: agent.goal_id.clone(),
+            durable_task_id: agent.task_id.clone(),
             completion_task_kind: "conversational".to_string(),
             followup_mode: None,
             config: agent.harness_eval_config.clone(),
@@ -773,6 +777,9 @@ mod tests {
         ));
         assert!(looks_like_mid_task_pivot(
             "Cancel that and instead generate a static page."
+        ));
+        assert!(looks_like_mid_task_pivot(
+            "actually never mind, forget that question"
         ));
     }
 

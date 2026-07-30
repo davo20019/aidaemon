@@ -91,6 +91,33 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
                 tracing::warn!(%error, "Canonical memory backfill deferred");
             }
         }
+        const STRUCTURED_BACKFILL_ATTEMPTS: usize = 3;
+        for attempt in 1..=STRUCTURED_BACKFILL_ATTEMPTS {
+            match projection_state.backfill_structured_personal_memory().await {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "Backfilled safe structured personal memories");
+                    }
+                    break;
+                }
+                Err(error) if attempt < STRUCTURED_BACKFILL_ATTEMPTS => {
+                    tracing::info!(
+                        %error,
+                        attempt,
+                        "Structured personal-memory backfill busy; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64))
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        attempts = STRUCTURED_BACKFILL_ATTEMPTS,
+                        "Structured personal-memory backfill deferred"
+                    );
+                }
+            }
+        }
     });
 
     Ok(StoreBundle {

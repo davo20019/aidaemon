@@ -62,6 +62,8 @@ pub struct ExpectBlock {
     #[serde(default)]
     pub tools_used: Vec<String>,
     #[serde(default)]
+    pub tools_not_used: Vec<String>,
+    #[serde(default)]
     pub outcome: Option<String>,
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -73,6 +75,12 @@ pub struct ExpectBlock {
     pub tool_calls_min: Option<u32>,
     #[serde(default)]
     pub tool_calls_max: Option<u32>,
+    #[serde(default)]
+    pub weighted_tokens_max: Option<u64>,
+    #[serde(default)]
+    pub forbidden_mutation_attempts_max: Option<u32>,
+    #[serde(default)]
+    pub plan_steps_completed_min: Option<u32>,
     #[serde(default)]
     pub routing_accuracy_min: Option<f32>,
     #[serde(default)]
@@ -250,6 +258,14 @@ pub fn assert_expectations(
             );
         }
     }
+    for tool in &expect.tools_not_used {
+        anyhow::ensure!(
+            !result.tool_names.iter().any(|name| name == tool),
+            "[{}] tools_not_used: {tool} was called; got {:?}",
+            fixture.name,
+            result.tool_names
+        );
+    }
 
     if let Some(expected) = &expect.outcome {
         let actual = result.task_end.effective_outcome().as_str();
@@ -289,6 +305,30 @@ pub fn assert_expectations(
         anyhow::ensure!(
             tool_calls <= max,
             "[{}] tool_calls_max: expected <= {max}, got {tool_calls}",
+            fixture.name
+        );
+    }
+    if let Some(max) = expect.weighted_tokens_max {
+        anyhow::ensure!(
+            eval.cost.weighted_tokens <= max,
+            "[{}] weighted_tokens_max: expected <= {max}, got {}",
+            fixture.name,
+            eval.cost.weighted_tokens
+        );
+    }
+    if let Some(max) = expect.forbidden_mutation_attempts_max {
+        anyhow::ensure!(
+            eval.quality.contract.forbidden_mutation_attempts <= max,
+            "[{}] forbidden_mutation_attempts_max: expected <= {max}, got {}",
+            fixture.name,
+            eval.quality.contract.forbidden_mutation_attempts
+        );
+    }
+    if let Some(min) = expect.plan_steps_completed_min {
+        let actual = eval.progress.plan_steps_completed.unwrap_or(0);
+        anyhow::ensure!(
+            actual >= min,
+            "[{}] plan_steps_completed_min: expected >= {min}, got {actual}",
             fixture.name
         );
     }
@@ -429,12 +469,18 @@ pub fn build_recorded_fixture(
             orchestration_route: Some(eval.orchestration_route.clone()),
             tools_required_predicted: Some(eval.routing.tools_required_predicted),
             tools_used: tool_names.to_vec(),
+            tools_not_used: Vec::new(),
             outcome: Some(task_end.effective_outcome().as_str().to_string()),
             stop_reason: Some(eval.quality.stop_reason.clone()),
             llm_calls_min: None,
             llm_calls_max: Some(eval.cost.llm_calls),
             tool_calls_min: None,
             tool_calls_max: Some(task_end.tool_calls_count),
+            weighted_tokens_max: Some(eval.cost.weighted_tokens),
+            forbidden_mutation_attempts_max: Some(
+                eval.quality.contract.forbidden_mutation_attempts,
+            ),
+            plan_steps_completed_min: eval.progress.plan_steps_completed,
             routing_accuracy_min: Some(round_score(eval.scores.routing_accuracy)),
             progress_yield_min: Some(round_score(eval.scores.progress_yield)),
             contract_fulfillment_min: Some(round_score(eval.scores.contract_fulfillment)),

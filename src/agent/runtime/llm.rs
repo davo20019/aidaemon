@@ -507,6 +507,7 @@ impl Agent {
                                 );
                                 let mut reduced_options = options.clone();
                                 reduced_options.max_tokens_override = Some(reduced);
+                                telemetry.attempts += 1;
                                 match tokio::time::timeout(
                                     Self::CASCADE_ATTEMPT_TIMEOUT,
                                     provider.chat_with_options(
@@ -566,6 +567,11 @@ impl Agent {
                         .await
                     }
                     ProviderErrorKind::BadRequest => {
+                        if crate::providers::multimodal::messages_contain_multimodal_blocks(
+                            messages,
+                        ) {
+                            telemetry.attempts += 1;
+                        }
                         if let Some(resp) = self
                             .try_text_only_vision_fallback(
                                 &provider, model, messages, tool_defs, options,
@@ -581,6 +587,7 @@ impl Agent {
                                 tool_choice = ?options.tool_choice,
                                 "Provider rejected advanced chat options; retrying once with default options"
                             );
+                            telemetry.attempts += 1;
                             match provider.chat(model, messages, tool_defs).await {
                                 Ok(resp) => {
                                     self.stamp_lastgood().await;

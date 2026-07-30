@@ -1827,6 +1827,67 @@ async fn test_relational_denial_is_blocked_then_corrected() {
     );
 }
 
+/// First-person relationship questions need the same search-before-deny
+/// protection as named-person questions. This is the regression case for the
+/// model ignoring a retrieved `user/dad_name` fact and claiming it was absent.
+#[tokio::test]
+async fn test_owner_relationship_denial_is_blocked_then_corrected() {
+    let denial = "I don't have your father's name recorded. What's his name?";
+    let classifier_json = r#"{"intent":"relational","entities":["father"]}"#;
+    let corrected = "Your father's name is Morgan Example.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(denial),
+        MockProvider::text_response(classifier_json),
+        MockProvider::text_response(corrected),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    harness
+        .state
+        .upsert_fact(
+            "user",
+            "dad_name",
+            "Morgan Example",
+            "test",
+            None,
+            crate::types::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "owner_denial_gate_session",
+            "Who's my dad?",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response.to_ascii_lowercase().contains("don't have"),
+        "the unsearched denial must not reach the user: {response}"
+    );
+    assert!(response.contains("Morgan Example"));
+
+    let calls = harness.provider.call_log.lock().await;
+    assert!(
+        calls.iter().any(|call| {
+            call.messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("did not search memory"))
+            })
+        }),
+        "the follow-up must receive the memory-search directive"
+    );
+    assert_eq!(calls.len(), 3);
+}
+
 /// Grounded-partial answers must NOT be blocked by the denial gate.
 ///
 /// A reply like "I don't have Juan's phone number, but he's your coworker"

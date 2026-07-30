@@ -29,6 +29,8 @@ pub struct InlineFact {
     pub value: String,
     #[serde(default)]
     pub graph: crate::traits::ExtractedMemoryGraph,
+    #[serde(default)]
+    pub personal_memory: Option<crate::traits::PersonalMemoryWrite>,
 }
 
 /// Estimate token count from text using a simple heuristic (~4 chars per token).
@@ -724,9 +726,9 @@ pub async fn extract_inline_facts(
         json!({
             "role": "system",
             "content": "You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
-                        Return a JSON array of objects with 'category', 'key', 'value', and optional 'graph' fields.\n\n\
+                        Return a JSON array of objects with 'category', 'key', 'value', and optional 'graph' or 'personal_memory' fields.\n\n\
                         Categories: user (personal info), preference (likes/dislikes), project (project details), technical (technical facts).\n\
-                        Use snake_case keys like 'dog_name', 'favorite_color', 'work_company'. Be consistent with naming.\n\n\
+                        Use snake_case keys for non-personal facts. For personal/profile facts involving names, aliases, handles, birth dates, residence, accounts, or family relationships, include a 'personal_memory' write plan and do not encode identity in a dynamic key. The plan has entities [{local_id,entity_type,canonical_name,is_reference,canonical_name_confirmed}], aliases [{entity_local_id,value,alias_type}], facts [{subject_local_id,predicate,value,display_value,valid_from,valid_to}], relationships [{source_local_id,relationship_type,target_local_id,valid_from,valid_to}], direct_user_statement, and correction. Use local_id 'owner' for the user. A later alias mention uses is_reference=true; a newly declared person uses false. Relationship types are PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT.\n\n\
                         CORRECTIONS: If the user is correcting or updating previously stated information (e.g., \"actually\", \"not X, it's Y\", \
                         \"I changed\", \"I meant\"), extract the CORRECTED fact using the same key format as the original would have used. \
                         The corrected value will automatically supersede the old one.\n\n\
@@ -743,7 +745,7 @@ pub async fn extract_inline_facts(
                         - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\"}]\n\
                         - \"Actually my dog's name is Max, not Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\"}]\n\
                         - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"dark mode\"}]\n\
-                        - \"My sister lives in Tokyo, not Paris\" → [{\"category\":\"user\",\"key\":\"sister_location\",\"value\":\"Tokyo\"}]\n\
+                        - \"My sister Alice lives in Tokyo, not Paris\" → emit personal_memory entities for Alice and Tokyo plus a LIVES_IN relationship; do not create sister_location\n\
                         - \"How's the weather?\" → []\n\n\
                         IMPORTANT: Return ONLY the JSON array, no other text."
         }),
@@ -974,6 +976,30 @@ pub fn spawn_progressive_extraction(
                 let existing_facts = state.get_facts(None).await.unwrap_or_default();
                 let mut written: Vec<serde_json::Value> = Vec::new();
                 for fact in facts {
+                    if let Some(mut personal) = fact.personal_memory.clone() {
+                        personal.direct_user_statement = true;
+                        match state
+                            .reconcile_personal_memory(
+                                &personal,
+                                "progressive",
+                                Some(source_excerpt.as_str()),
+                                channel_id.as_deref(),
+                                crate::types::FactPrivacy::Private,
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                written.push(json!({
+                                    "structured_personal_memory": result.concise_summary(),
+                                    "unresolved": result.unresolved,
+                                }));
+                            }
+                            Err(error) => {
+                                warn!(%error, "Failed to reconcile progressive personal memory");
+                            }
+                        }
+                        continue;
+                    }
                     // Identity facts (user.name etc.) must be evidenced by the
                     // user's own words — third-party names mentioned in
                     // conversation are not the user's identity.

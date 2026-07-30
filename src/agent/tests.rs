@@ -23,3 +23,12 @@ mod tool_scoping_tests;
 
 #[path = "tools/file_path_extraction_tests.rs"]
 mod file_path_extraction_tests;
+
+#[test]
+fn nested_scheduled_agents_do_not_clear_the_shared_run_budget() {
+    assert!(agent_return_owns_scheduled_run_cleanup(0, true, true));
+    assert!(!agent_return_owns_scheduled_run_cleanup(1, true, true));
+    assert!(!agent_return_owns_scheduled_run_cleanup(2, true, true));
+    assert!(agent_return_owns_scheduled_run_cleanup(1, false, true));
+    assert!(!agent_return_owns_scheduled_run_cleanup(0, true, false));
+}

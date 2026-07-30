@@ -652,7 +652,7 @@ fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
     println!();
     println!("  [provider]");
     println!("  kind = \"openai_chatgpt\"");
-    println!("  models = {{ default_model = \"gpt-5.1-codex\" }}");
+    println!("  models = {{ default_model = \"gpt-5.6-terra\" }}");
     Ok(())
 }
 

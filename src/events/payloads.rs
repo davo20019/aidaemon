@@ -307,6 +307,12 @@ pub struct LlmCallData {
     /// Whether provider token usage was available for this call.
     #[serde(default)]
     pub token_usage_present: bool,
+    /// Whether the provider call ultimately failed after recovery was exhausted.
+    #[serde(default)]
+    pub failed: bool,
+    /// Final provider/recovery error for failed calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // =============================================================================
@@ -623,6 +629,10 @@ pub struct HarnessEvalSnapshot {
     pub depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_task_id: Option<String>,
     pub completion_task_kind: String,
     pub orchestration_route: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,6 +717,10 @@ pub struct QualityEvalPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractFulfillmentPayload {
     pub expects_mutation: bool,
+    #[serde(default)]
+    pub forbids_mutation: bool,
+    #[serde(default)]
+    pub forbidden_mutation_attempts: u32,
     pub mutation_count: u32,
     pub requires_observation: bool,
     pub observation_count: u32,
@@ -1051,6 +1065,8 @@ mod tests {
             message_count: Some(18),
             force_text: true,
             token_usage_present: true,
+            failed: false,
+            error: None,
         };
         let json = serde_json::to_value(&data).expect("serialize");
         let back: LlmCallData = serde_json::from_value(json).expect("deserialize");
@@ -1080,6 +1096,8 @@ mod tests {
         assert_eq!(back.boundary_pos, Some(12));
         assert_eq!(back.message_count, Some(18));
         assert!(back.force_text);
+        assert!(!back.failed);
+        assert!(back.error.is_none());
     }
 
     #[test]
@@ -1108,6 +1126,8 @@ mod tests {
         assert!(data.tail_hash.is_none());
         assert!(data.prefix_hash_archived.is_none());
         assert!(data.boundary_pos.is_none());
+        assert!(!data.failed);
+        assert!(data.error.is_none());
         assert!(data.message_count.is_none());
         assert!(!data.force_text);
     }

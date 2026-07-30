@@ -225,6 +225,15 @@ fn user_visible_side_effect_guard_blocks_tool(tool_name: &str, is_side_effecting
     is_side_effecting && tool_name != "spawn_agent"
 }
 
+fn negative_contract_blocks_tool(
+    contract: &CompletionContract,
+    tool_name: &str,
+    is_side_effecting: bool,
+) -> bool {
+    contract.forbids_mutation
+        && user_visible_side_effect_guard_blocks_tool(tool_name, is_side_effecting)
+}
+
 fn first_plain_text_blocked_tool_call<'a>(
     agent: &Agent,
     resp: &'a ProviderResponse,
@@ -876,6 +885,54 @@ pub(super) async fn run_tool_prelude_phase(
         )
         .await?;
 
+    // Hard negative contract: an executor instructed to inspect/report only
+    // must never drift into a write. This is enforced before execution rather
+    // than merely scored after the damage is done.
+    if let Some(blocked) = resp.tool_calls.iter().find(|tc| {
+        negative_contract_blocks_tool(
+            &turn_context.completion_contract,
+            &tc.name,
+            tool_call_is_side_effecting(agent, tc, available_capabilities),
+        )
+    }) {
+        agent
+            .with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
+            .await;
+        validation_state.note_replan();
+        agent
+            .emit_warning_decision_point(
+                emitter,
+                task_id,
+                iteration,
+                DecisionType::ExecutionStateSnapshot,
+                format!(
+                    "Blocked {} because the user explicitly forbade mutation",
+                    blocked.name
+                ),
+                json!({
+                    "condition": "negative_completion_contract",
+                    "tool": blocked.name,
+                    "forbids_mutation": true,
+                }),
+            )
+            .await;
+        inject_prelude_retry_messages(
+            agent,
+            emitter,
+            session_id,
+            task_id,
+            &resp.tool_calls,
+            format!(
+                "[SYSTEM] Blocked `{}`: this task has an explicit read-only/report-only contract. \
+                 Do not modify files, create artifacts, deploy, publish, post, send, or otherwise \
+                 mutate state. Continue only with observation tools, then report findings.",
+                blocked.name
+            ),
+        )
+        .await?;
+        return Ok(ToolPreludeOutcome::ContinueLoop);
+    }
+
     // Intent gate: on first iteration, require narration before tool calls.
     // Forces the agent to "show its work" so the user can catch misunderstandings.
     if iteration == 1
@@ -1262,6 +1319,14 @@ pub(super) async fn run_tool_prelude_phase(
                                         })
                                         .collect(),
                                 );
+                                agent
+                                    .with_harness_eval(|eval| {
+                                        eval.record_plan_progress(
+                                            0,
+                                            plan.planned_steps.len() as u32,
+                                        )
+                                    })
+                                    .await;
                             }
                             validation_state.set_plan(plan.version, &plan.success_criteria);
                             validation_state.clear_loop_repetition_reason();

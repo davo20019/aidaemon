@@ -55,6 +55,7 @@ pub struct ToolStats {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LlmStats {
     pub total_calls: u64,
+    pub failed_calls: u64,
     pub avg_latency_ms: u64,
     pub p50_latency_ms: u64,
     pub p95_latency_ms: u64,
@@ -69,6 +70,9 @@ pub struct LlmStats {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskLlmSummary {
     pub total_calls: u64,
+    pub failed_calls: u64,
+    /// Most recent terminal provider error, when any call failed.
+    pub last_error: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cached_input_tokens: u64,
@@ -103,8 +107,8 @@ impl TaskLlmSummary {
     }
 
     /// Whether this turn looks notably inefficient and worth flagging.
-    /// Tuned to be quiet on healthy turns: fires on retries/fallback, heavy
-    /// iteration loops, or large est-vs-actual token drift.
+    /// Tuned to be quiet on healthy turns: fires on terminal provider failure,
+    /// retries/fallback, heavy iteration loops, or large est-vs-actual token drift.
     pub fn is_inefficient(&self) -> bool {
         let retried = self.total_attempts > self.total_calls;
         let looped = self.total_calls >= 8;
@@ -115,7 +119,7 @@ impl TaskLlmSummary {
             0.0
         };
         let big_drift = self.est_samples > 0 && drift_ratio >= 0.30;
-        self.fell_back_count > 0 || retried || looped || big_drift
+        self.failed_calls > 0 || self.fell_back_count > 0 || retried || looped || big_drift
     }
 }
 
@@ -1132,6 +1136,7 @@ impl EventStore {
         let mut input_sum: u128 = 0;
         let mut output_sum: u128 = 0;
         let mut fell_back_count = 0u64;
+        let mut failed_calls = 0u64;
 
         for row in rows {
             let data_str: String = row.get("data");
@@ -1145,6 +1150,9 @@ impl EventStore {
             output_sum += call.output_tokens as u128;
             if call.fell_back {
                 fell_back_count += 1;
+            }
+            if call.failed {
+                failed_calls += 1;
             }
         }
 
@@ -1166,6 +1174,7 @@ impl EventStore {
 
         Ok(LlmStats {
             total_calls,
+            failed_calls,
             avg_latency_ms: (latency_sum / total_calls as u128) as u64,
             p50_latency_ms: percentile(&latencies, 50.0),
             p95_latency_ms: percentile(&latencies, 95.0),
@@ -1205,6 +1214,12 @@ impl EventStore {
                 Err(_) => continue,
             };
             summary.total_calls += 1;
+            if call.failed {
+                summary.failed_calls += 1;
+                if call.error.is_some() {
+                    summary.last_error = call.error.clone();
+                }
+            }
             summary.total_input_tokens += call.input_tokens as u64;
             summary.total_output_tokens += call.output_tokens as u64;
             if let Some(cached) = call.cached_input_tokens {
@@ -2474,6 +2489,8 @@ mod tests {
             message_count: None,
             force_text: false,
             token_usage_present: true,
+            failed: false,
+            error: None,
         };
         append_event_at(
             store,
@@ -2566,6 +2583,42 @@ mod tests {
         assert_eq!(s.final_model.as_deref(), Some("fallback-model"));
         // Fallback + retries ⇒ flagged inefficient.
         assert!(s.is_inefficient());
+    }
+
+    #[tokio::test]
+    async fn get_task_llm_stats_surfaces_failed_call_error() {
+        let (store, _db_file) = setup_store().await;
+        let task = "task-llm-failed";
+        append_event_at(
+            &store,
+            "s-llm-failed",
+            EventType::LlmCall,
+            json!({
+                "task_id": task,
+                "iteration": 8,
+                "model": "gpt-test",
+                "final_model": "gpt-test",
+                "attempts": 2,
+                "latency_ms": 42,
+                "failed": true,
+                "error": "LLM request was malformed (400)"
+            }),
+            Utc::now(),
+        )
+        .await;
+
+        let summary = store
+            .get_task_llm_stats(task)
+            .await
+            .expect("failed-call stats");
+        assert_eq!(summary.total_calls, 1);
+        assert_eq!(summary.failed_calls, 1);
+        assert_eq!(summary.total_attempts, 2);
+        assert_eq!(
+            summary.last_error.as_deref(),
+            Some("LLM request was malformed (400)")
+        );
+        assert!(summary.is_inefficient());
     }
 
     #[test]

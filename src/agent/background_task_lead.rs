@@ -4,6 +4,7 @@
 //! free function (kept as a free fn to satisfy `Send` bounds for the spawned
 //! background future).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -15,12 +16,12 @@ use crate::types::{ChannelContext, UserRole};
 use super::parent_delivery;
 use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
-    build_goal_task_results_summary, effective_goal_daily_budget, extract_file_paths_from_text,
-    goal_completion_response_indicates_incomplete_work, goal_has_scheduled_provenance,
-    is_group_session, is_low_signal_task_lead_reply, is_scheduled_task_description,
-    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
-    salvageable_task_lead_result, strip_leading_wait, truncate_goal_result_text,
-    user_facing_task_description, Agent,
+    build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
+    extract_file_paths_from_text, goal_completion_response_indicates_incomplete_work,
+    goal_has_scheduled_provenance, is_group_session, is_low_signal_task_lead_reply,
+    is_scheduled_task_description, parse_goal_leading_wait, parse_wait_task_seconds,
+    persist_scheduled_run_state, salvageable_task_lead_result, strip_leading_wait,
+    truncate_goal_result_text, user_facing_task_description, Agent,
 };
 
 /// Progress-heartbeat wait schedule: quick early updates, then exponential
@@ -32,6 +33,124 @@ fn heartbeat_wait_secs(interval_count: u32) -> u64 {
         .get(interval_count as usize)
         .copied()
         .unwrap_or(900)
+}
+
+fn count_successful_completed_work(
+    tasks: &[crate::traits::Task],
+    dispatch_trigger_task_id: Option<&str>,
+) -> usize {
+    tasks
+        .iter()
+        .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id)
+        .filter(|task| task.completed_successfully())
+        .count()
+}
+
+fn tasks_for_current_run(
+    tasks: Vec<crate::traits::Task>,
+    run_started_at: Option<&str>,
+) -> Vec<crate::traits::Task> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            run_started_at.is_none_or(|started_at| task.created_at.as_str() >= started_at)
+        })
+        .collect()
+}
+
+fn work_tasks_for_current_run(
+    tasks: Vec<crate::traits::Task>,
+    run_started_at: Option<&str>,
+    dispatch_trigger_task_id: Option<&str>,
+) -> Vec<crate::traits::Task> {
+    tasks_for_current_run(tasks, run_started_at)
+        .into_iter()
+        .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id)
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecurringRunTerminalOutcome {
+    Completed,
+    Failed,
+}
+
+fn recurring_run_terminal_outcome(
+    trigger_status: Option<&str>,
+) -> Option<RecurringRunTerminalOutcome> {
+    match trigger_status {
+        Some("completed") => Some(RecurringRunTerminalOutcome::Completed),
+        Some("failed") => Some(RecurringRunTerminalOutcome::Failed),
+        _ => None,
+    }
+}
+
+fn dispatch_trigger_succeeded(
+    task_lead_succeeded: bool,
+    work_tasks: &[crate::traits::Task],
+) -> bool {
+    if work_tasks.is_empty() {
+        return task_lead_succeeded;
+    }
+    work_tasks
+        .iter()
+        .all(|task| task.satisfies_run_completion())
+}
+
+fn failed_run_summary(tasks: &[crate::traits::Task], fallback: Option<&str>) -> String {
+    let failures = tasks
+        .iter()
+        .filter(|task| !task.satisfies_run_completion())
+        .take(3)
+        .map(|task| {
+            let detail = task
+                .error
+                .as_deref()
+                .filter(|error| !error.trim().is_empty())
+                .or_else(|| {
+                    task.blocker
+                        .as_deref()
+                        .filter(|blocker| !blocker.trim().is_empty())
+                })
+                .unwrap_or(task.status.as_str());
+            format!("{}: {}", task.description, detail)
+        })
+        .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        return failures.join("\n");
+    }
+    fallback
+        .filter(|error| !error.trim().is_empty())
+        .unwrap_or("The run ended before every required task completed.")
+        .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuousDispatchOutcome {
+    Progress,
+    ErrorWithoutProgress,
+    Blocked,
+    NoProgress,
+}
+
+fn classify_continuous_dispatch_outcome(
+    dispatch_made_progress: bool,
+    task_lead_errored: bool,
+    all_remaining_blocked: bool,
+) -> ContinuousDispatchOutcome {
+    if dispatch_made_progress {
+        ContinuousDispatchOutcome::Progress
+    } else if task_lead_errored {
+        ContinuousDispatchOutcome::ErrorWithoutProgress
+    } else if all_remaining_blocked {
+        ContinuousDispatchOutcome::Blocked
+    } else {
+        ContinuousDispatchOutcome::NoProgress
+    }
+}
+
+fn run_completion_should_close_goal(goal_type: &str, all_done: bool) -> bool {
+    all_done && goal_type == "finite"
 }
 
 /// Emit a progress update onto a SINGLE self-editing surface: the first update
@@ -90,14 +209,39 @@ pub fn spawn_background_task_lead(
         // (success OR error) instead of leaking until bounded FIFO eviction.
         let teardown_agent = agent.clone();
         let teardown_goal_id = goal.id.clone();
+        let teardown_state = state.clone();
+        let teardown_goal_token_registry = goal_token_registry.clone();
+        let finalize_scheduled_run = Arc::new(AtomicBool::new(false));
+        let body_finalize_scheduled_run = finalize_scheduled_run.clone();
 
         let body = async move {
             let goal_id = goal.id.clone();
             let mission = goal.description.clone();
+            let run_started_at = if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref()
+            {
+                state
+                    .get_task(trigger_task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|task| task.created_at)
+            } else {
+                None
+            };
             // Clone channel_ctx and user_role for potential direct fallback and auto-dispatch
             let fallback_channel_ctx = channel_ctx.clone();
             let dispatch_channel_ctx = channel_ctx.clone();
             let fallback_user_role = user_role;
+            let dispatch_project_scope = {
+                let mut scopes = Vec::new();
+                super::project_scope::extract_positive_explicit_path_scopes_from_text(
+                    &mission,
+                    &mut scopes,
+                    8,
+                    &agent.path_aliases.projects,
+                );
+                super::project_scope::unify_current_turn_scopes(&scopes)
+            };
 
             // Heartbeat dispatch claims a "trigger" task before spawning this background
             // lead. Keep it in "running" state (not "pending") so dispatch_pending_tasks
@@ -141,6 +285,18 @@ pub fn spawn_background_task_lead(
                 }
             }
 
+            // Snapshot genuine completed work before this dispatch. The scheduled
+            // trigger task is bookkeeping and is finalized below, so it must not
+            // count as progress by itself.
+            let completed_work_before = state
+                .get_tasks_for_goal(&goal_id)
+                .await
+                .map(|tasks| {
+                    let tasks = tasks_for_current_run(tasks, run_started_at.as_deref());
+                    count_successful_completed_work(&tasks, dispatch_trigger_task_id.as_deref())
+                })
+                .unwrap_or(0);
+
             // Prevent duplicate concurrent task leads (and duplicate heartbeats) for the same goal.
             // Multiple codepaths can attempt to dispatch work for a goal (initial spawn, heartbeat
             // orphan recovery, auto-dispatch). This in-memory guard keeps progress messages sane
@@ -160,6 +316,56 @@ pub fn spawn_background_task_lead(
             } else {
                 None
             };
+            // This background lead owns the complete scheduled cycle: planning,
+            // child execution, trigger finalization, and terminal notification.
+            // Nested Agent turns must not clear the shared budget when they
+            // return, because later siblings still belong to this same cycle.
+            if dispatch_trigger_task_id.is_some()
+                && goal_has_scheduled_provenance(
+                    &state,
+                    &goal_id,
+                    dispatch_trigger_task_id.as_deref(),
+                )
+                .await
+            {
+                body_finalize_scheduled_run.store(true, Ordering::Release);
+            }
+
+            // The watchdog considers recent task activity, not merely a live
+            // Tokio future. Record a lightweight heartbeat for the scheduled
+            // root while its task lead is running so a valid long LLM/tool call
+            // is not interrupted and then mistaken for retryable work.
+            let (keepalive_cancel_tx, mut keepalive_cancel_rx) =
+                tokio::sync::oneshot::channel::<()>();
+            let keepalive_state = state.clone();
+            let keepalive_task_id = dispatch_trigger_task_id.clone();
+            let keepalive_handle = tokio::spawn(async move {
+                let Some(task_id) = keepalive_task_id else {
+                    let _ = keepalive_cancel_rx.await;
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            let activity = crate::traits::TaskActivity {
+                                id: 0,
+                                task_id: task_id.clone(),
+                                activity_type: "status_change".to_string(),
+                                tool_name: None,
+                                tool_args: None,
+                                result: Some("task lead keepalive".to_string()),
+                                success: None,
+                                tokens_used: None,
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                            };
+                            if let Err(error) = keepalive_state.log_task_activity(&activity).await {
+                                warn!(task_id = %task_id, %error, "Failed to record task-lead keepalive");
+                            }
+                        }
+                        _ = &mut keepalive_cancel_rx => break,
+                    }
+                }
+            });
 
             // Progress heartbeat: send periodic status updates while the task lead works.
             // This prevents the "goal appears abandoned" UX problem where the user sees
@@ -172,6 +378,8 @@ pub fn spawn_background_task_lead(
             let heartbeat_session = session_id.clone();
             let heartbeat_state = state.clone();
             let heartbeat_goal_id = goal_id.clone();
+            let heartbeat_run_started_at = run_started_at.clone();
+            let heartbeat_trigger_task_id = dispatch_trigger_task_id.clone();
             let heartbeat_initial_surface = initial_surface_id;
             let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) =
                 tokio::sync::oneshot::channel::<()>();
@@ -200,10 +408,14 @@ pub fn spawn_background_task_lead(
                     interval_count += 1;
 
                     // Build progress message from task statuses
-                    let tasks = heartbeat_state
-                        .get_tasks_for_goal(&heartbeat_goal_id)
-                        .await
-                        .unwrap_or_default();
+                    let tasks = work_tasks_for_current_run(
+                        heartbeat_state
+                            .get_tasks_for_goal(&heartbeat_goal_id)
+                            .await
+                            .unwrap_or_default(),
+                        heartbeat_run_started_at.as_deref(),
+                        heartbeat_trigger_task_id.as_deref(),
+                    );
                     if tasks.is_empty() {
                         // Tasks not yet created — send one planning message on the
                         // first empty-tasks heartbeat. If planning is still running
@@ -221,10 +433,7 @@ pub fn spawn_background_task_lead(
                         }
                     } else {
                         // Count genuinely completed tasks (exclude cancelled ones with errors)
-                        let completed = tasks
-                            .iter()
-                            .filter(|t| t.status == "completed" && t.error.is_none())
-                            .count();
+                        let completed = tasks.iter().filter(|t| t.completed_successfully()).count();
                         let started = tasks.iter().filter(|t| t.status != "pending").count();
                         let total = tasks.len();
                         let in_progress: Vec<String> = tasks
@@ -311,6 +520,8 @@ pub fn spawn_background_task_lead(
                     // Pure wait goal with nothing after — mark complete, skip LLM entirely.
                     let _ = heartbeat_cancel_tx.send(());
                     let _ = heartbeat_handle.await;
+                    let _ = keepalive_cancel_tx.send(());
+                    let _ = keepalive_handle.await;
                     let now = chrono::Utc::now().to_rfc3339();
                     let msg = format!("Waited for {} second(s).", wait_secs);
                     if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
@@ -325,7 +536,7 @@ pub fn spawn_background_task_lead(
                     // Finalize any non-terminal tasks so we don't leave pending rows behind
                     // after a local pure-wait short-circuit.
                     if let Ok(tasks) = state.get_tasks_for_goal(&goal_id).await {
-                        for task in tasks {
+                        for task in tasks_for_current_run(tasks, run_started_at.as_deref()) {
                             if task.status != "completed"
                                 && task.status != "failed"
                                 && task.status != "cancelled"
@@ -399,12 +610,15 @@ pub fn spawn_background_task_lead(
             // unblock dependent tasks that weren't dispatchable in the previous pass.
             {
                 let max_dispatch_rounds = 4; // safety limit — keep low to bound token usage
-                const AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS: usize = 12;
-                const AUTO_DISPATCH_HARD_TOKEN_CAP: i64 = 20_000_000;
+                const AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS: usize = 0;
+                const AUTO_DISPATCH_HARD_TOKEN_CAP: i64 = 2_000_000;
                 let mut budget_exhausted = false;
                 for _round in 0..max_dispatch_rounds {
-                    let all_tasks: Vec<crate::traits::Task> =
-                        state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+                    let all_tasks = work_tasks_for_current_run(
+                        state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                        run_started_at.as_deref(),
+                        dispatch_trigger_task_id.as_deref(),
+                    );
 
                     // Build set of completed task IDs for dependency checking
                     let completed_ids: std::collections::HashSet<String> = all_tasks
@@ -587,7 +801,7 @@ pub fn spawn_background_task_lead(
                         // Spawn executor
                         let exec_result = agent
                             .spawn_child(
-                                &task.description,
+                                &mission,
                                 &task.description,
                                 None,
                                 dispatch_channel_ctx.clone(),
@@ -595,7 +809,7 @@ pub fn spawn_background_task_lead(
                                 Some(AgentRole::Executor),
                                 Some(goal_id.as_str()),
                                 Some(task.id.as_str()),
-                                None,
+                                dispatch_project_scope.as_deref(),
                                 None, // arg_specialist (task-lead dispatch — not from LLM tool call)
                             )
                             .await;
@@ -698,20 +912,44 @@ pub fn spawn_background_task_lead(
             // Mark the trigger task as completed now that the task lead and auto-dispatch
             // have finished. The trigger task was kept in "running" to prevent duplicate
             // dispatch; now finalize it so it doesn't appear stuck.
+            let tasks_before_trigger_finalization = tasks_for_current_run(
+                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                run_started_at.as_deref(),
+            );
+            let completed_work_after = count_successful_completed_work(
+                &tasks_before_trigger_finalization,
+                dispatch_trigger_task_id.as_deref(),
+            );
+            let dispatch_made_progress = completed_work_after > completed_work_before;
+            let trigger_work_tasks = tasks_before_trigger_finalization
+                .iter()
+                .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id.as_deref())
+                .cloned()
+                .collect::<Vec<_>>();
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
                 if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
                     if trigger_task.status == "running" || trigger_task.status == "claimed" {
                         let mut updated = trigger_task;
-                        let success = result.is_ok();
+                        let success =
+                            dispatch_trigger_succeeded(result.is_ok(), &trigger_work_tasks);
                         updated.status = if success {
                             "completed".to_string()
                         } else {
                             "failed".to_string()
                         };
                         updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        if !success {
-                            updated.error = result.as_ref().err().map(|e| e.to_string());
-                        }
+                        updated.error = if success {
+                            None
+                        } else {
+                            Some(failed_run_summary(
+                                &trigger_work_tasks,
+                                result
+                                    .as_ref()
+                                    .err()
+                                    .map(|error| error.to_string())
+                                    .as_deref(),
+                            ))
+                        };
                         if let Err(e) = state.update_task(&updated).await {
                             warn!(
                                 task_id = %trigger_task_id,
@@ -727,6 +965,8 @@ pub fn spawn_background_task_lead(
             // Stop the heartbeat
             let _ = heartbeat_cancel_tx.send(());
             let _ = heartbeat_handle.await;
+            let _ = keepalive_cancel_tx.send(());
+            let _ = keepalive_handle.await;
 
             // Check the actual goal status from DB — the task lead may have already
             // set it via complete_goal/fail_goal. Only update if still "active".
@@ -740,16 +980,17 @@ pub fn spawn_background_task_lead(
                 // Task lead returned without explicitly completing/failing the goal.
                 // Use progress-based circuit breaker: compare completed task count
                 // before vs after to detect whether the dispatch made progress.
-                let completed_after = state
-                    .count_completed_tasks_for_goal(&goal_id)
-                    .await
-                    .unwrap_or(0);
-
-                let tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
-                let all_done = !tasks.is_empty()
-                    && tasks
-                        .iter()
-                        .all(|t| t.status == "completed" || t.status == "skipped");
+                let tasks = work_tasks_for_current_run(
+                    state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                    run_started_at.as_deref(),
+                    dispatch_trigger_task_id.as_deref(),
+                );
+                let completed_after = tasks
+                    .iter()
+                    .filter(|task| task.completed_successfully())
+                    .count();
+                let all_done =
+                    !tasks.is_empty() && tasks.iter().all(|t| t.satisfies_run_completion());
 
                 let mut updated_goal = match state.get_goal(&goal_id).await {
                     Ok(Some(g)) => g,
@@ -785,9 +1026,12 @@ pub fn spawn_background_task_lead(
                 let no_tasks_completed_finite = is_finite && !tasks.is_empty() && !any_completed;
 
                 if all_done {
-                    // All tasks finished — goal is complete
-                    updated_goal.status = "completed".to_string();
-                    updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    // A recurring goal completes a run, not the goal itself.
+                    // Keep it active for the next schedule fire.
+                    if run_completion_should_close_goal(&updated_goal.goal_type, all_done) {
+                        updated_goal.status = "completed".to_string();
+                        updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
                     updated_goal.dispatch_failures = 0;
                 } else if scheduled_run_budget_exhausted {
                     updated_goal.dispatch_failures = 0;
@@ -825,27 +1069,17 @@ pub fn spawn_background_task_lead(
                         failed,
                         "Finite goal failed: no tasks completed after dispatch"
                     );
-                } else if result.is_err() {
-                    // Task lead crashed — count as no progress
-                    updated_goal.dispatch_failures += 1;
-                    info!(
-                        goal_id = %goal_id,
-                        dispatch_failures = updated_goal.dispatch_failures,
-                        "Task lead errored, incrementing dispatch_failures"
-                    );
                 } else if is_finite {
                     // Finite goal with some tasks completed but others remain.
                     // Since finite goals have no re-dispatch, mark as completed
                     // (partial success) rather than leaving it stuck.
-                    let completed_count = tasks
-                        .iter()
-                        .filter(|t| t.status == "completed" && t.error.is_none())
-                        .count();
+                    let completed_count =
+                        tasks.iter().filter(|t| t.completed_successfully()).count();
                     let failed_count = tasks.iter().filter(|t| t.status == "failed").count();
                     let blocked_count = tasks.iter().filter(|t| t.status == "blocked").count();
                     let remaining = tasks
                         .iter()
-                        .filter(|t| t.status != "completed" && t.status != "skipped")
+                        .filter(|t| !t.satisfies_run_completion())
                         .count();
                     updated_goal.status = "completed".to_string();
                     updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -870,49 +1104,58 @@ pub fn spawn_background_task_lead(
                         "Finite goal partially completed after dispatch"
                     );
                 } else {
-                    // Continuous goal: task lead returned Ok but tasks remain.
-                    // Check if any tasks were completed recently during this dispatch.
-                    let recently_completed = tasks.iter().any(|t| {
-                        t.status == "completed"
-                            && t.completed_at.as_ref().is_some_and(|ca| {
-                                chrono::DateTime::parse_from_rfc3339(ca)
-                                    .map(|dt| {
-                                        let age =
-                                            chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
-                                        age.num_minutes() < 30
-                                    })
-                                    .unwrap_or(false)
-                            })
-                    });
-
+                    // Continuous goal: evaluate progress made by this dispatch,
+                    // not merely the task lead's final Result. A child can return
+                    // a partial/error outcome after completing useful tasks; that
+                    // must reset the consecutive no-progress breaker.
                     // Check if all remaining non-completed tasks are blocked
                     // (waiting on external input/dependencies). Blocked tasks are
                     // waiting, not failing — don't count as "no progress".
                     let all_remaining_blocked = tasks
                         .iter()
-                        .filter(|t| t.status != "completed" && t.status != "skipped")
+                        .filter(|t| !t.satisfies_run_completion())
                         .all(|t| t.status == "blocked");
 
-                    if recently_completed {
-                        // Progress was made — reset failures
-                        updated_goal.dispatch_failures = 0;
-                    } else if all_remaining_blocked && !tasks.is_empty() {
-                        // All remaining tasks are blocked — don't increment failures
-                        info!(
-                            goal_id = %goal_id,
-                            blocked_tasks = tasks.iter().filter(|t| t.status == "blocked").count(),
-                            "All remaining tasks are blocked — not incrementing dispatch_failures"
-                        );
-                    } else {
-                        // No progress this cycle
-                        updated_goal.dispatch_failures += 1;
-                        info!(
-                            goal_id = %goal_id,
-                            dispatch_failures = updated_goal.dispatch_failures,
-                            completed_tasks = completed_after,
-                            remaining_tasks = tasks.iter().filter(|t| t.status == "pending" || t.status == "claimed").count(),
-                            "No progress this dispatch cycle"
-                        );
+                    match classify_continuous_dispatch_outcome(
+                        dispatch_made_progress,
+                        result.is_err(),
+                        all_remaining_blocked && !tasks.is_empty(),
+                    ) {
+                        ContinuousDispatchOutcome::Progress => {
+                            updated_goal.dispatch_failures = 0;
+                            info!(
+                                goal_id = %goal_id,
+                                completed_work_before,
+                                completed_work_after,
+                                task_lead_errored = result.is_err(),
+                                "Dispatch made progress; reset dispatch_failures"
+                            );
+                        }
+                        ContinuousDispatchOutcome::ErrorWithoutProgress => {
+                            updated_goal.dispatch_failures += 1;
+                            info!(
+                                goal_id = %goal_id,
+                                dispatch_failures = updated_goal.dispatch_failures,
+                                "Task lead errored without completing work"
+                            );
+                        }
+                        ContinuousDispatchOutcome::Blocked => {
+                            info!(
+                                goal_id = %goal_id,
+                                blocked_tasks = tasks.iter().filter(|t| t.status == "blocked").count(),
+                                "All remaining tasks are blocked — not incrementing dispatch_failures"
+                            );
+                        }
+                        ContinuousDispatchOutcome::NoProgress => {
+                            updated_goal.dispatch_failures += 1;
+                            info!(
+                                goal_id = %goal_id,
+                                dispatch_failures = updated_goal.dispatch_failures,
+                                completed_tasks = completed_after,
+                                remaining_tasks = tasks.iter().filter(|t| t.status == "pending" || t.status == "claimed").count(),
+                                "No progress this dispatch cycle"
+                            );
+                        }
                     }
                 }
 
@@ -965,34 +1208,118 @@ pub fn spawn_background_task_lead(
                 .and_then(|g| g.as_ref())
                 .map(|g| g.status.as_str())
                 .unwrap_or("unknown");
-            // Only notify for terminal states — "active" means it's still in progress
+            let final_run_tasks = work_tasks_for_current_run(
+                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                run_started_at.as_deref(),
+                dispatch_trigger_task_id.as_deref(),
+            );
+            let trigger_status = if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref()
+            {
+                state
+                    .get_task(trigger_task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|task| task.status)
+            } else {
+                None
+            };
+
+            // A recurring goal stays active after each cycle, but an individual
+            // cycle can still complete or fail. Surface that terminal run outcome instead
+            // of silently treating the durable goal's active status as
+            // "nothing to notify."
             if status == "active" || status == "pending" {
-                // Goal still in progress: optionally relay substantive task-lead text,
-                // but only if executor results haven't already been sent inline
-                // (which would cover the same content).
-                if !any_executor_results_sent {
-                    if let Some(response) = task_lead_response.as_ref() {
-                        if !is_low_signal_task_lead_reply(response) {
-                            if let Err(err) = agent
-                                .deliver_parent_text_result(
-                                    hub.as_ref(),
-                                    &session_id,
-                                    response,
-                                    parent_delivery::ParentDeliveryKind::TaskLeadResult,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    session_id = %session_id,
-                                    error = %err,
-                                    "Failed to record parent-mediated task-lead result"
-                                );
+                let terminal_notification = match recurring_run_terminal_outcome(
+                    trigger_status.as_deref(),
+                ) {
+                    Some(RecurringRunTerminalOutcome::Failed) => {
+                        let task_lead_error = result.as_ref().err().map(|error| error.to_string());
+                        Some((
+                                "failed",
+                                format!(
+                                    "Scheduled run failed before completion; the recurring schedule remains active.\n\n{}",
+                                    failed_run_summary(
+                                        &final_run_tasks,
+                                        task_lead_error.as_deref()
+                                    )
+                                ),
+                            ))
+                    }
+                    Some(RecurringRunTerminalOutcome::Completed) => {
+                        let summary = build_goal_task_results_summary(
+                            &final_run_tasks,
+                            "All required tasks completed.",
+                        );
+                        Some((
+                                "completed",
+                                format!(
+                                    "Scheduled run completed successfully; the recurring schedule remains active.\n\n{}",
+                                    truncate_goal_result_text(&summary, 3500)
+                                ),
+                            ))
+                    }
+                    None => None,
+                };
+
+                if let Some((notification_type, msg)) = terminal_notification {
+                    let entry = crate::traits::NotificationEntry::new(
+                        &goal_id,
+                        &session_id,
+                        notification_type,
+                        &msg,
+                    );
+                    let notification_id = entry.id.clone();
+                    let _ = state.enqueue_notification(&entry).await;
+                    match agent
+                        .deliver_parent_text_result(
+                            hub.as_ref(),
+                            &session_id,
+                            &msg,
+                            parent_delivery::ParentDeliveryKind::GoalNotification,
+                        )
+                        .await
+                    {
+                        Ok(outcome) if outcome.sent => {
+                            let _ = state.mark_notification_delivered(&notification_id).await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                session_id = %session_id,
+                                notification_id = %notification_id,
+                                %error,
+                                "Failed to deliver recurring-run terminal notification"
+                            );
+                        }
+                    }
+                } else {
+                    // Goal still in progress: optionally relay substantive task-lead text,
+                    // but only if executor results haven't already been sent inline
+                    // (which would cover the same content).
+                    if !any_executor_results_sent {
+                        if let Some(response) = task_lead_response.as_ref() {
+                            if !is_low_signal_task_lead_reply(response) {
+                                if let Err(err) = agent
+                                    .deliver_parent_text_result(
+                                        hub.as_ref(),
+                                        &session_id,
+                                        response,
+                                        parent_delivery::ParentDeliveryKind::TaskLeadResult,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        session_id = %session_id,
+                                        error = %err,
+                                        "Failed to record parent-mediated task-lead result"
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
-                // Goal is still active, no notification needed.
                 // Clean up cancellation token and return.
                 if let Some(ref registry) = goal_token_registry {
                     registry.remove(&goal_id).await;
@@ -1124,8 +1451,11 @@ pub fn spawn_background_task_lead(
                         }
                         _ => {
                             // Direct handling also failed — give detailed info
-                            let tasks =
-                                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+                            let tasks = work_tasks_for_current_run(
+                                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                                run_started_at.as_deref(),
+                                dispatch_trigger_task_id.as_deref(),
+                            );
                             let task_summary: String = tasks
                                 .iter()
                                 .take(5)
@@ -1151,7 +1481,11 @@ pub fn spawn_background_task_lead(
                     }
                 }
             } else {
-                let completed_tasks = state.get_tasks_for_goal(&goal_id).await.unwrap_or_default();
+                let completed_tasks = work_tasks_for_current_run(
+                    state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
+                    run_started_at.as_deref(),
+                    dispatch_trigger_task_id.as_deref(),
+                );
                 let task_lead_error = result.as_ref().err().map(|e| e.to_string());
                 match status {
                     "completed" => {
@@ -1325,6 +1659,18 @@ pub fn spawn_background_task_lead(
 
         body.await;
 
+        // Run-budget state belongs to the whole scheduled cycle, not to any
+        // individual task-lead/executor turn. Clear it exactly once after the
+        // body has finalized all required work and the trigger task. The marker
+        // stays false for duplicate spawns that returned before acquiring the
+        // per-goal run guard, so they cannot disrupt the active owner.
+        if finalize_scheduled_run.load(Ordering::Acquire) {
+            if let Some(registry) = teardown_goal_token_registry.as_ref() {
+                registry.clear_run_budget(&teardown_goal_id).await;
+            }
+            clear_scheduled_run_state(&teardown_state, &teardown_goal_id).await;
+        }
+
         // Self-correction bridge teardown (3c P3b.3): clear any correction-
         // execution context registered under this goal id. Idempotent — for the
         // overwhelming majority of (non-remediation) goals the key was never
@@ -1354,5 +1700,127 @@ mod tests {
         // ...settling at 15 minutes forever: long goals never go silent.
         assert_eq!(heartbeat_wait_secs(6), 900);
         assert_eq!(heartbeat_wait_secs(100), 900);
+    }
+
+    #[test]
+    fn progress_count_ignores_trigger_and_cancelled_completion_rows() {
+        let completed_task = |id: &str, description: &str| crate::traits::Task {
+            id: id.to_string(),
+            goal_id: "goal-1".to_string(),
+            description: description.to_string(),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        let trigger = completed_task("trigger-1", "Scheduled check");
+        let mut completed = completed_task("work-1", "Write artifact");
+        // Existing SQLite rows commonly deserialize a missing error as Some("").
+        completed.error = Some(String::new());
+        let mut cancelled = completed_task("work-2", "Publish artifact");
+        cancelled.error = Some("Cancelled after stall".to_string());
+
+        assert_eq!(
+            count_successful_completed_work(&[trigger, completed, cancelled], Some("trigger-1")),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_work_wins_over_task_lead_error_for_stall_accounting() {
+        assert_eq!(
+            classify_continuous_dispatch_outcome(true, true, false),
+            ContinuousDispatchOutcome::Progress
+        );
+        assert_eq!(
+            classify_continuous_dispatch_outcome(false, true, false),
+            ContinuousDispatchOutcome::ErrorWithoutProgress
+        );
+    }
+
+    #[test]
+    fn trigger_requires_every_created_work_task_to_succeed() {
+        let task = |id: &str, status: &str, error: Option<&str>| crate::traits::Task {
+            id: id.to_string(),
+            goal_id: "goal-1".to_string(),
+            description: format!("Required work {id}"),
+            status: status.to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: error.map(str::to_string),
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        let completed = task("research", "completed", None);
+        let failed = task(
+            "publish",
+            "failed",
+            Some("per-run processing budget used 109976 / 100000 tokens"),
+        );
+        let mut superseded = failed.clone();
+        superseded.status = "superseded".to_string();
+        superseded.error = None;
+        superseded.result =
+            Some("Replaced by task 01234567, which completed the publish directly.".to_string());
+
+        assert!(!dispatch_trigger_succeeded(
+            false,
+            &[completed.clone(), failed.clone()]
+        ));
+        assert!(!dispatch_trigger_succeeded(
+            true,
+            &[completed.clone(), failed.clone()]
+        ));
+        assert!(dispatch_trigger_succeeded(true, &[completed]));
+        assert!(dispatch_trigger_succeeded(
+            true,
+            &[task("review", "completed", None), superseded]
+        ));
+        assert!(dispatch_trigger_succeeded(true, &[]));
+        assert!(!dispatch_trigger_succeeded(false, &[]));
+        assert!(failed_run_summary(&[failed], None).contains("109976 / 100000"));
+    }
+
+    #[test]
+    fn completed_recurring_run_keeps_goal_open_for_next_fire() {
+        assert!(!run_completion_should_close_goal("continuous", true));
+        assert!(run_completion_should_close_goal("finite", true));
+        assert!(!run_completion_should_close_goal("finite", false));
+    }
+
+    #[test]
+    fn recurring_run_always_has_an_explicit_terminal_outcome() {
+        assert_eq!(
+            recurring_run_terminal_outcome(Some("completed")),
+            Some(RecurringRunTerminalOutcome::Completed)
+        );
+        assert_eq!(
+            recurring_run_terminal_outcome(Some("failed")),
+            Some(RecurringRunTerminalOutcome::Failed)
+        );
+        assert_eq!(recurring_run_terminal_outcome(Some("running")), None);
+        assert_eq!(recurring_run_terminal_outcome(None), None);
     }
 }

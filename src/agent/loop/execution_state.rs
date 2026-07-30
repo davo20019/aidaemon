@@ -594,30 +594,6 @@ impl ExecutionState {
         uncorrected
     }
 
-    /// Failed non-mutation observation attempts (navigation, read, search) that
-    /// were not corrected by a later success of the same tool.
-    pub fn uncorrected_failed_observations(&self) -> Vec<&OutcomeEntry> {
-        self.uncorrected_failed_entries(false)
-    }
-
-    /// Uncorrected failed observations that remain required because planned
-    /// steps are still incomplete or the entry is linked to a planned step.
-    pub fn uncorrected_failed_required_observations(&self) -> Vec<&OutcomeEntry> {
-        let has_incomplete_steps = self
-            .active_linear_intent_plan
-            .as_ref()
-            .is_some_and(|plan| plan.steps.iter().any(|step| !step.completed));
-
-        self.uncorrected_failed_observations()
-            .into_iter()
-            .filter(|entry| {
-                has_incomplete_steps
-                    || entry.planned_step_id.is_some()
-                    || entry.planned_step_index.is_some()
-            })
-            .collect()
-    }
-
     pub(crate) fn build_attempt_reconciliation_overview(&self) -> Option<ReconciliationOverview> {
         let uncorrected = self.uncorrected_failed_mutations();
         if uncorrected.is_empty() {

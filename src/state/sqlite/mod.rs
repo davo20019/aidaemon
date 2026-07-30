@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::traits::{
     BehaviorPattern, ConversationSummary, Episode, ErrorSolution, Expertise, Fact, Goal,
@@ -139,6 +139,7 @@ async fn migrate_facts_history_schema(pool: &SqlitePool) -> anyhow::Result<()> {
 pub struct SqliteStateStore {
     pool: SqlitePool,
     working_memory: Arc<RwLock<HashMap<String, VecDeque<Message>>>>,
+    fact_upsert_lock: Arc<Mutex<()>>,
     cap: usize,
     embedding_service: Arc<EmbeddingService>,
 }
@@ -150,10 +151,24 @@ impl SqliteStateStore {
         encryption_key: Option<&str>,
         embedding_service: Arc<EmbeddingService>,
     ) -> anyhow::Result<Self> {
+        // Unit tests create thousands of NamedTempFile-backed databases. WAL
+        // sidecars outlive the already-unlinked main file until every pooled
+        // connection closes and can consume tens of gigabytes in one suite.
+        // Delete journaling keeps test databases self-contained; production
+        // retains WAL concurrency and crash behavior.
+        let journal_mode = if cfg!(test) {
+            sqlx::sqlite::SqliteJournalMode::Delete
+        } else {
+            sqlx::sqlite::SqliteJournalMode::Wal
+        };
         let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .journal_mode(journal_mode)
+            // Startup projection/backfill and retention tasks can briefly
+            // overlap. Wait for the writer instead of failing immediately
+            // with SQLITE_BUSY and silently deferring an idempotent repair.
+            .busy_timeout(std::time::Duration::from_secs(30))
             // synchronous=NORMAL is the recommended pairing with WAL: durable across
             // app crashes, only loses the very last transaction on an OS/power crash,
             // and avoids an fsync on every commit (the dominant write cost under FULL).
@@ -200,6 +215,7 @@ impl SqliteStateStore {
         Ok(Self {
             pool,
             working_memory: Arc::new(RwLock::new(HashMap::new())),
+            fact_upsert_lock: Arc::new(Mutex::new(())),
             cap,
             embedding_service,
         })
@@ -1635,6 +1651,7 @@ mod prompt_snapshots;
 mod session_channels;
 mod settings;
 mod skills;
+mod structured_memory;
 mod token_usage;
 
 #[cfg(test)]

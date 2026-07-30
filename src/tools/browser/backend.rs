@@ -1429,6 +1429,7 @@ impl MockBackend {
     /// [`MockBackend::script_popup_with_opener`] with that session's active
     /// target id. The given `url` is used verbatim so tests can assert origin
     /// redaction (e.g. include a path + query string).
+    #[allow(dead_code)]
     pub async fn script_popup(&self, target_id: &str, title: &str, url: &str) {
         self.script_popup_with_opener(target_id, title, url, None)
             .await;
@@ -1508,6 +1509,7 @@ struct MockPage {
     /// Shared scripted element state for the `wait`-condition tests.
     element_state: Arc<Mutex<MockElementState>>,
     /// Shared click-navigation flag for the click nav-race tests.
+    #[allow(dead_code)]
     click_navigates: Arc<AtomicBool>,
     /// Shared never-settles flag: when `true`, `wait_for_navigation` sleeps the
     /// full timeout (opt-in for bounded-timeout tests under paused clock).

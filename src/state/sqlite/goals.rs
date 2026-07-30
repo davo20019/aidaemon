@@ -472,6 +472,18 @@ impl crate::traits::GoalStore for SqliteStateStore {
 #[async_trait]
 impl crate::traits::TaskStore for SqliteStateStore {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
+        let result = task
+            .result
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let error = task
+            .error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let blocker = task
+            .blocker
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
         sqlx::query(
             "INSERT INTO tasks (id, goal_id, description, status, priority, task_order,
              parallel_group, depends_on, agent_id, context, result, error, blocker,
@@ -488,9 +500,9 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.depends_on)
         .bind(&task.agent_id)
         .bind(&task.context)
-        .bind(&task.result)
-        .bind(&task.error)
-        .bind(&task.blocker)
+        .bind(result)
+        .bind(error)
+        .bind(blocker)
         .bind(task.idempotent as i32)
         .bind(task.retry_count)
         .bind(task.max_retries)
@@ -537,6 +549,18 @@ impl crate::traits::TaskStore for SqliteStateStore {
     }
 
     async fn update_task(&self, task: &Task) -> anyhow::Result<()> {
+        let result = task
+            .result
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let error = task
+            .error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let blocker = task
+            .blocker
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
         sqlx::query(
             "UPDATE tasks SET description = ?, status = ?, priority = ?, task_order = ?,
              parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
@@ -552,9 +576,9 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.depends_on)
         .bind(&task.agent_id)
         .bind(&task.context)
-        .bind(&task.result)
-        .bind(&task.error)
-        .bind(&task.blocker)
+        .bind(result)
+        .bind(error)
+        .bind(blocker)
         .bind(task.idempotent as i32)
         .bind(task.retry_count)
         .bind(task.max_retries)
@@ -568,7 +592,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
         // goal's freshness so the >30-day idle auto-skip never mis-fires on a
         // goal that's actively completing work. (A 0-row match if the goal is
         // gone is not an error.)
-        if task.status == "completed" {
+        if task.completed_successfully() {
             let now = chrono::Utc::now().to_rfc3339();
             sqlx::query("UPDATE goals SET last_useful_action = ?, updated_at = ? WHERE id = ?")
                 .bind(&now)
@@ -1030,7 +1054,9 @@ impl crate::traits::GoalBudgetStore for SqliteStateStore {
         let result = sqlx::query(
             "UPDATE goals
              SET tokens_used_today = 0, tokens_used_day = date('now')
-             WHERE domain = 'orchestration' AND status = 'active'",
+             WHERE domain = 'orchestration'
+               AND status = 'active'
+               AND tokens_used_day <> date('now')",
         )
         .execute(&self.pool)
         .await?;
@@ -1406,9 +1432,13 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Finite orchestration goals without schedules: stale active/pending -> failed.
+        // This is administrative recovery for abandoned work, not a live task
+        // failure. Mark it notified in the same atomic update so restart
+        // recovery cannot flood the user with one misleading alert per row.
         let result = sqlx::query(
             "UPDATE goals
-             SET status = 'failed', updated_at = ?, completed_at = ?
+             SET status = 'failed', updated_at = ?, completed_at = ?,
+                 notified_at = COALESCE(notified_at, ?)
              WHERE domain = 'orchestration'
                AND status IN ('active', 'pending')
                AND goal_type = 'finite'
@@ -1417,6 +1447,7 @@ impl crate::traits::GoalNotificationStore for SqliteStateStore {
                    SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id
                )",
         )
+        .bind(&now)
         .bind(&now)
         .bind(&now)
         .bind(&cutoff)

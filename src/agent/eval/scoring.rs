@@ -64,6 +64,9 @@ pub fn compute_routing_accuracy(routing: &RoutingSnapshot) -> f32 {
     {
         score -= 0.3;
     }
+    if !routing.tools_required_predicted && routing.tools_actually_used {
+        score -= 0.35;
+    }
     if routing.route_drift_failsafe {
         score -= 0.2;
     }
@@ -91,11 +94,19 @@ pub fn compute_progress_yield(progress: &ProgressSnapshot) -> f32 {
     if progress.stall_guard_fires > 2 {
         score *= 0.8;
     }
+    // Planner progress is advisory telemetry. Completion-contract evidence and
+    // semantic task outcome determine success; a stale plan cursor must not
+    // cap the progress score for otherwise productive work.
     score.clamp(0.0, 1.0)
 }
 
 /// Whether all active completion-contract obligations were satisfied.
 pub fn contract_is_fulfilled(contract: &ContractSnapshot) -> bool {
+    if contract.forbids_mutation
+        && (contract.forbidden_mutation_attempts > 0 || contract.mutation_count > 0)
+    {
+        return false;
+    }
     let mut checks = 0_u32;
     let mut passed = 0_u32;
     if contract.requires_observation {
@@ -120,6 +131,11 @@ pub fn contract_is_fulfilled(contract: &ContractSnapshot) -> bool {
 }
 
 pub fn compute_contract_fulfillment(contract: &ContractSnapshot, outcome: TaskOutcome) -> f32 {
+    if contract.forbids_mutation
+        && (contract.forbidden_mutation_attempts > 0 || contract.mutation_count > 0)
+    {
+        return 0.0;
+    }
     if !contract.expects_mutation
         && !contract.requires_observation
         && !contract.verification_required
@@ -176,11 +192,20 @@ pub fn compute_cost_efficiency(cost: &CostSnapshot, outcome: TaskOutcome) -> f32
 }
 
 pub fn compute_overall(scores: HarnessScores, config: &HarnessEvalConfig) -> f32 {
-    (config.weight_routing * scores.routing_accuracy
+    let weighted = config.weight_routing * scores.routing_accuracy
         + config.weight_progress * scores.progress_yield
         + config.weight_quality * scores.contract_fulfillment
-        + config.weight_cost * scores.cost_efficiency)
-        .clamp(0.0, 1.0)
+        + config.weight_cost * scores.cost_efficiency;
+    // A severe routing, contract, or cost failure cannot be averaged away by
+    // lots of bookkeeping tool calls.
+    let hard_cap = if scores.cost_efficiency < 0.15 {
+        0.55
+    } else if scores.routing_accuracy < 0.5 {
+        0.60
+    } else {
+        1.0
+    };
+    weighted.clamp(0.0, hard_cap)
 }
 
 pub fn build_scores(
@@ -202,7 +227,14 @@ pub fn build_scores(
         cost_efficiency,
         overall: 0.0,
     };
-    let overall = compute_overall(partial, config);
+    let mut overall = compute_overall(partial, config);
+    let negative_contract_violation = contract.forbids_mutation
+        && (contract.forbidden_mutation_attempts > 0 || contract.mutation_count > 0);
+    if negative_contract_violation
+        || (outcome != TaskOutcome::Succeeded && !contract_is_fulfilled(contract))
+    {
+        overall = overall.min(0.35);
+    }
     HarnessScores { overall, ..partial }
 }
 
@@ -248,6 +280,48 @@ mod tests {
     }
 
     #[test]
+    fn routing_penalizes_unpredicted_tool_use() {
+        let mut routing = default_routing();
+        routing.tools_actually_used = true;
+        assert!(compute_routing_accuracy(&routing) <= 0.65);
+    }
+
+    #[test]
+    fn forbidden_mutation_attempt_fails_contract_and_caps_overall() {
+        let contract = ContractSnapshot {
+            forbids_mutation: true,
+            forbidden_mutation_attempts: 1,
+            ..ContractSnapshot::default()
+        };
+        assert!(!contract_is_fulfilled(&contract));
+        assert_eq!(
+            compute_contract_fulfillment(&contract, TaskOutcome::Succeeded),
+            0.0
+        );
+        let scores = build_scores(
+            &default_routing(),
+            &ProgressSnapshot::default(),
+            &contract,
+            &CostSnapshot::default(),
+            TaskOutcome::Succeeded,
+            &HarnessEvalConfig::default(),
+        );
+        assert!(scores.overall <= 0.35);
+    }
+
+    #[test]
+    fn advisory_plan_does_not_cap_evidence_yield() {
+        let progress = ProgressSnapshot {
+            iterations: 10,
+            tool_calls_succeeded: 30,
+            plan_steps_completed: Some(0),
+            plan_steps_total: Some(5),
+            ..ProgressSnapshot::default()
+        };
+        assert_eq!(compute_progress_yield(&progress), 1.0);
+    }
+
+    #[test]
     fn cost_efficiency_penalizes_failed_outcomes() {
         let cost = CostSnapshot {
             total_input_tokens: 5000,
@@ -275,9 +349,11 @@ mod tests {
 
     #[test]
     fn contract_is_fulfilled_requires_mutation_when_expected() {
-        let mut contract = ContractSnapshot::default();
-        contract.expects_mutation = true;
-        contract.mutation_count = 0;
+        let mut contract = ContractSnapshot {
+            expects_mutation: true,
+            mutation_count: 0,
+            ..Default::default()
+        };
         assert!(!contract_is_fulfilled(&contract));
         contract.mutation_count = 1;
         assert!(contract_is_fulfilled(&contract));

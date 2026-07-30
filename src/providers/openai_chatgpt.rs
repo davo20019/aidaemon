@@ -41,18 +41,31 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Models reachable with a ChatGPT subscription. The backend exposes no
 /// `/models` listing, so this is a static catalog; unknown ids still pass
 /// through to the API, which is the authority on what an account can use.
+///
+/// Tiers: `sol` is the flagship, `terra` balanced, `luna` fast/low-cost.
 const KNOWN_MODELS: &[&str] = &[
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1",
-    "gpt-5",
-    "codex-mini-latest",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6-pro",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+];
+
+/// Reasoning-effort values the backend accepts, weakest to strongest.
+///
+/// Passed through verbatim from `reasoning_effort` in config (or a per-call
+/// override) — not validated here, because each model advertises its own
+/// supported subset and the API is the authority on which apply.
+pub const REASONING_EFFORT_LEVELS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
 pub struct OpenAiChatGptProvider {
     client: Client,
     base_url: String,
-    max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     /// Cached credentials. The mutex also serializes refresh so concurrent
     /// agent turns cannot each burn a rotation of the refresh token.
@@ -60,7 +73,10 @@ pub struct OpenAiChatGptProvider {
 }
 
 impl OpenAiChatGptProvider {
-    pub fn new(base_url: Option<&str>, max_tokens: Option<u32>) -> Result<Self, String> {
+    /// No `max_tokens` parameter: the Codex backend accepts no output-cap field
+    /// (see [`build_request_body`]), so taking one would only imply a limit this
+    /// provider cannot enforce.
+    pub fn new(base_url: Option<&str>) -> Result<Self, String> {
         let client = super::build_http_client(DEFAULT_TIMEOUT)?;
         let base_url = base_url
             .map(str::trim)
@@ -71,14 +87,33 @@ impl OpenAiChatGptProvider {
         Ok(Self {
             client,
             base_url,
-            max_tokens,
             reasoning_effort: None,
             credentials: Arc::new(Mutex::new(None)),
         })
     }
 
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
-        self.reasoning_effort = effort.filter(|e| !e.trim().is_empty());
+        let effort = effort.filter(|e| !e.trim().is_empty());
+        // Warn but still send it: a typo like "hgh" would otherwise come back as
+        // an opaque 400, while a genuinely new level must keep working without a
+        // client update.
+        if let Some(level) = effort.as_deref() {
+            // `off` is aidaemon's provider-neutral "disable thinking" sentinel.
+            // The ChatGPT backend spells that level `none`; it is normalized
+            // when the request body is built.
+            if level == "off" {
+                self.reasoning_effort = effort;
+                return self;
+            }
+            if !REASONING_EFFORT_LEVELS.contains(&level) {
+                warn!(
+                    effort = level,
+                    known = REASONING_EFFORT_LEVELS.join(", "),
+                    "Unrecognized reasoning_effort for the ChatGPT provider; sending it anyway"
+                );
+            }
+        }
+        self.reasoning_effort = effort;
         self
     }
 
@@ -135,7 +170,6 @@ impl OpenAiChatGptProvider {
             messages,
             tools,
             options,
-            options.max_tokens_override.or(self.max_tokens),
             options
                 .reasoning_effort_override
                 .as_deref()
@@ -219,9 +253,17 @@ fn annotate_error_body(status: u16, body: &str) -> String {
 /// Accumulates Responses stream events into a single response.
 #[derive(Default)]
 struct ResponseCollector {
-    /// Text assembled from deltas, used when no terminal event arrives.
+    /// Text assembled from deltas, used when no output item carries text.
     delta_text: String,
-    /// The authoritative payload from `response.completed`.
+    /// Completed output items, gathered from `response.output_item.done`.
+    ///
+    /// These are the real payload on the Codex backend: it closes the stream
+    /// with `response.completed` carrying `"output": []` (it echoes no
+    /// assembled output when `store` is false), so reading only the terminal
+    /// event yields an empty answer with no tool calls.
+    items: Vec<Value>,
+    /// The terminal `response.completed` payload — authoritative for usage and
+    /// for `output` when the endpoint actually populates it.
     completed: Option<Value>,
     failure: Option<String>,
 }
@@ -235,6 +277,11 @@ impl ResponseCollector {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     self.delta_text.push_str(delta);
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    self.items.push(item.clone());
                 }
             }
             "response.completed" => {
@@ -269,10 +316,24 @@ impl ResponseCollector {
     }
 
     fn finish(self) -> Result<ProviderResponse, ProviderError> {
-        if let Some(response) = self.completed {
-            return Ok(parse_response_payload(&response));
+        let ResponseCollector {
+            delta_text,
+            items,
+            completed,
+            failure,
+        } = self;
+
+        if let Some(response) = completed {
+            let mut parsed = parse_output_items(&terminal_output(&response, items));
+            // Deltas are the last resort: some item shapes carry no text field
+            // even though text streamed through.
+            if parsed.content.is_none() && parsed.tool_calls.is_empty() && !delta_text.is_empty() {
+                parsed.content = Some(delta_text);
+            }
+            parsed.usage = parse_usage(&response);
+            return Ok(parsed);
         }
-        if let Some(failure) = self.failure {
+        if let Some(failure) = failure {
             // Not a server outage: a failed/incomplete response is usually a
             // content filter, refusal, or truncation. `Unknown` keeps the real
             // reason in the user-facing message instead of replacing it with a
@@ -286,19 +347,18 @@ impl ResponseCollector {
                 affordable_tokens: None,
             });
         }
-        if !self.delta_text.is_empty() {
-            // Stream died mid-response but text arrived. Hand back what we have
-            // rather than discarding a partial answer.
-            return Ok(ProviderResponse {
-                content: Some(self.delta_text),
-                tool_calls: Vec::new(),
-                usage: None,
-                thinking: None,
-                response_note: Some(
-                    "Codex stream ended without a completion event; response may be truncated."
-                        .to_string(),
-                ),
-            });
+        // Stream died before the completion event. Hand back whatever arrived
+        // rather than discarding a partial answer.
+        let mut parsed = parse_output_items(&items);
+        if parsed.content.is_none() && !delta_text.is_empty() {
+            parsed.content = Some(delta_text);
+        }
+        if parsed.content.is_some() || !parsed.tool_calls.is_empty() {
+            parsed.response_note = Some(
+                "Codex stream ended without a completion event; response may be truncated."
+                    .to_string(),
+            );
+            return Ok(parsed);
         }
         Err(ProviderError::malformed_shape(
             "Codex stream ended with no response events",
@@ -306,18 +366,26 @@ impl ResponseCollector {
     }
 }
 
-/// Convert a completed Responses payload into a [`ProviderResponse`].
-fn parse_response_payload(response: &Value) -> ProviderResponse {
+/// Pick the output items to parse: the terminal event's own `output` when the
+/// endpoint populated it, else the items gathered from the stream.
+///
+/// The public Responses API echoes the assembled output in `response.completed`;
+/// the Codex backend sends `"output": []` and relies on the per-item events.
+fn terminal_output(response: &Value, streamed: Vec<Value>) -> Vec<Value> {
+    match response.get("output").and_then(Value::as_array) {
+        Some(output) if !output.is_empty() => output.clone(),
+        _ => streamed,
+    }
+}
+
+/// Convert Responses output items into a [`ProviderResponse`] (usage excluded;
+/// it lives on the terminal event, not the items — see [`parse_usage`]).
+fn parse_output_items(items: &[Value]) -> ProviderResponse {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
 
-    for item in response
-        .get("output")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
+    for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
                 for part in item
@@ -372,7 +440,18 @@ fn parse_response_payload(response: &Value) -> ProviderResponse {
         }
     }
 
-    let usage = response.get("usage").map(|u| TokenUsage {
+    ProviderResponse {
+        content: (!content.is_empty()).then_some(content),
+        tool_calls,
+        usage: None,
+        thinking: (!thinking.is_empty()).then_some(thinking),
+        response_note: None,
+    }
+}
+
+/// Read token usage off a terminal `response.completed` payload.
+fn parse_usage(response: &Value) -> Option<TokenUsage> {
+    response.get("usage").map(|u| TokenUsage {
         input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
         output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
         cached_input_tokens: u
@@ -386,15 +465,7 @@ fn parse_response_payload(response: &Value) -> ProviderResponse {
             .unwrap_or_default()
             .to_string(),
         ..Default::default()
-    });
-
-    ProviderResponse {
-        content: (!content.is_empty()).then_some(content),
-        tool_calls,
-        usage,
-        thinking: (!thinking.is_empty()).then_some(thinking),
-        response_note: None,
-    }
+    })
 }
 
 /// Extract plain text from a chat message `content` field, which may be a
@@ -554,12 +625,18 @@ fn build_tool_choice(mode: &ToolChoiceMode) -> Value {
 }
 
 /// Assemble the full request body for `POST /responses`.
+///
+/// The Codex backend is a restricted Responses proxy, not the public API: it
+/// allowlists parameters and answers anything else with
+/// `400 {"detail":"Unsupported parameter: …"}`. `max_output_tokens` is one of
+/// the rejected fields, so no output cap is sent here — configured
+/// `provider.max_tokens` and per-call `max_tokens_override` cannot be honored
+/// on this backend, and the model's own limits apply instead.
 fn build_request_body(
     model: &str,
     messages: &[Value],
     tools: &[Value],
     options: &ChatOptions,
-    max_tokens: Option<u32>,
     reasoning_effort: Option<&str>,
 ) -> Value {
     let (instructions, input) = build_input(messages);
@@ -584,10 +661,11 @@ fn build_request_body(
             );
         }
     }
-    if let Some(limit) = max_tokens {
-        body.insert("max_output_tokens".into(), json!(limit));
-    }
     if let Some(effort) = reasoning_effort {
+        // Internal agent-loop recovery and computer-use paths use `off` for
+        // providers such as llama.cpp/Gemma. The ChatGPT Responses backend
+        // rejects `off` with HTTP 400 and uses `none` for the same semantics.
+        let effort = if effort == "off" { "none" } else { effort };
         body.insert("reasoning".into(), json!({"effort": effort}));
     }
 
@@ -751,19 +829,53 @@ mod tests {
     #[test]
     fn request_body_carries_stream_and_no_store() {
         let body = build_request_body(
-            "gpt-5.1-codex",
+            "gpt-5.6-terra",
             &[json!({"role": "user", "content": "hi"})],
             &[],
             &options(),
-            Some(1024),
             Some("low"),
         );
-        assert_eq!(body["model"], "gpt-5.1-codex");
+        assert_eq!(body["model"], "gpt-5.6-terra");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["max_output_tokens"], 1024);
         assert_eq!(body["reasoning"]["effort"], "low");
         assert!(body.get("tools").is_none());
+    }
+
+    /// Regression: the Codex backend rejects `max_output_tokens` outright with
+    /// `400 {"detail":"Unsupported parameter: max_output_tokens"}`, which broke
+    /// every request whenever `provider.max_tokens` was configured.
+    #[test]
+    fn request_body_never_sends_an_output_cap() {
+        let opts = ChatOptions {
+            max_tokens_override: Some(1024),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "gpt-5.6-terra",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            &opts,
+            None,
+        );
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "output cap leaked into the Codex request body: {body}"
+        );
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn request_body_maps_internal_off_reasoning_to_none() {
+        let body = build_request_body(
+            "gpt-5.6-terra",
+            &[json!({"role": "user", "content": "continue"})],
+            &[],
+            &options(),
+            Some("off"),
+        );
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert_ne!(body["reasoning"]["effort"], "off");
     }
 
     #[test]
@@ -790,7 +902,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let body = build_request_body("m", &[], &[], &opts, None, None);
+        let body = build_request_body("m", &[], &[], &opts, None);
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "answer");
         assert_eq!(body["text"]["format"]["strict"], true);
@@ -799,7 +911,7 @@ mod tests {
     #[test]
     fn parses_text_and_usage() {
         let response = json!({
-            "model": "gpt-5.1-codex",
+            "model": "gpt-5.6-terra",
             "output": [{
                 "type": "message",
                 "content": [{"type": "output_text", "text": "Hello there."}]
@@ -810,13 +922,13 @@ mod tests {
                 "input_tokens_details": {"cached_tokens": 8}
             }
         });
-        let parsed = parse_response_payload(&response);
+        let parsed = parse_output_items(&terminal_output(&response, Vec::new()));
         assert_eq!(parsed.content.as_deref(), Some("Hello there."));
-        let usage = parsed.usage.unwrap();
+        let usage = parse_usage(&response).unwrap();
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cached_input_tokens, Some(8));
-        assert_eq!(usage.model, "gpt-5.1-codex");
+        assert_eq!(usage.model, "gpt-5.6-terra");
     }
 
     #[test]
@@ -828,7 +940,7 @@ mod tests {
                 {"type": "function_call", "call_id": "c2", "name": "b", "arguments": "{}"}
             ]
         });
-        let parsed = parse_response_payload(&response);
+        let parsed = parse_output_items(&terminal_output(&response, Vec::new()));
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "c1");
         assert_eq!(parsed.tool_calls[0].name, "a");
@@ -843,7 +955,34 @@ mod tests {
         let response = json!({
             "output": [{"type": "function_call", "call_id": "c1", "arguments": "{}"}]
         });
-        assert!(parse_response_payload(&response).tool_calls.is_empty());
+        let parsed = parse_output_items(&terminal_output(&response, Vec::new()));
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    /// Regression: the Codex backend closes the stream with `"output": []` and
+    /// delivers the real payload in `response.output_item.done`, so parsing only
+    /// the terminal event returned empty answers and swallowed every tool call.
+    #[test]
+    fn completed_with_empty_output_falls_back_to_streamed_items() {
+        let stream = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Paris\"}]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Quito\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-terra\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":5}}}\n\n",
+        );
+        let parsed = collect(stream).expect("stream should parse");
+        assert_eq!(parsed.content.as_deref(), Some("Paris"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        // Usage still comes from the terminal event, which is where it lives.
+        let usage = parsed.usage.expect("usage missing");
+        assert_eq!(usage.input_tokens, 9);
+        assert_eq!(usage.model, "gpt-5.6-terra");
+        // A completed stream is not a truncated one.
+        assert!(parsed.response_note.is_none());
     }
 
     /// Drive the collector the way the transport does: frame raw SSE bytes,
@@ -914,9 +1053,163 @@ mod tests {
 
     #[test]
     fn base_url_defaults_and_trims() {
-        let provider = OpenAiChatGptProvider::new(None, None).unwrap();
+        let provider = OpenAiChatGptProvider::new(None).unwrap();
         assert_eq!(provider.base_url, DEFAULT_BASE_URL);
-        let custom = OpenAiChatGptProvider::new(Some("https://example.test/api/"), None).unwrap();
+        let custom = OpenAiChatGptProvider::new(Some("https://example.test/api/")).unwrap();
         assert_eq!(custom.base_url, "https://example.test/api");
+    }
+
+    // ── Live smoke tests ────────────────────────────────────────────────
+    //
+    // These hit the real Codex backend with your stored subscription
+    // credentials. Everything above is fixture-level; these are what actually
+    // prove the request mapping and SSE parsing match the live API.
+    //
+    //   aidaemon auth login openai
+    //   AIDAEMON_LIVE_TEST=1 cargo test --lib openai_chatgpt::tests::live \
+    //       -- --ignored --nocapture --test-threads=1
+    //
+    // Override the model with AIDAEMON_LIVE_MODEL=<id>.
+
+    fn live_enabled() -> bool {
+        std::env::var("AIDAEMON_LIVE_TEST").as_deref() == Ok("1")
+    }
+
+    fn live_model() -> String {
+        std::env::var("AIDAEMON_LIVE_MODEL").unwrap_or_else(|_| "gpt-5.6-terra".to_string())
+    }
+
+    /// Skip loudly rather than passing silently, so a misconfigured run cannot
+    /// look like a successful one.
+    fn live_preconditions() -> bool {
+        if !live_enabled() {
+            eprintln!("SKIPPED: set AIDAEMON_LIVE_TEST=1 to run live tests");
+            return false;
+        }
+        if !crate::oauth::chatgpt_codex::is_connected() {
+            eprintln!("SKIPPED: no ChatGPT login found — run `aidaemon auth login openai`");
+            return false;
+        }
+        true
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the real ChatGPT backend; run with --ignored"]
+    async fn live_plain_text_round_trip() {
+        if !live_preconditions() {
+            return;
+        }
+        let provider = OpenAiChatGptProvider::new(None).unwrap();
+        let messages = vec![
+            json!({"role": "system", "content": "Answer with a single word."}),
+            json!({"role": "user", "content": "What is the capital of France?"}),
+        ];
+
+        let response = provider
+            .chat(&live_model(), &messages, &[])
+            .await
+            .expect("live chat call failed");
+
+        let content = response.content.unwrap_or_default();
+        eprintln!("content: {content}");
+        eprintln!("usage: {:?}", response.usage);
+        assert!(!content.trim().is_empty(), "model returned no text");
+        assert!(
+            content.to_lowercase().contains("paris"),
+            "unexpected answer: {content}"
+        );
+        let usage = response.usage.expect("no usage reported");
+        assert!(usage.input_tokens > 0, "input tokens not reported");
+        assert!(usage.output_tokens > 0, "output tokens not reported");
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the real ChatGPT backend; run with --ignored"]
+    async fn live_tool_call_round_trip() {
+        if !live_preconditions() {
+            return;
+        }
+        let provider = OpenAiChatGptProvider::new(None).unwrap();
+        let tools = vec![json!({
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        })];
+        let messages = vec![json!({
+            "role": "user",
+            "content": "Use the get_weather tool to check the weather in Quito."
+        })];
+
+        let response = provider
+            .chat(&live_model(), &messages, &tools)
+            .await
+            .expect("live tool call failed");
+
+        eprintln!("tool_calls: {:?}", response.tool_calls);
+        let call = response
+            .tool_calls
+            .first()
+            .expect("model returned no tool call — request mapping may be wrong");
+        assert_eq!(call.name, "get_weather");
+        assert!(!call.id.is_empty(), "tool call has no id to reply against");
+        let args: Value =
+            serde_json::from_str(&call.arguments).expect("tool arguments are not valid JSON");
+        assert!(args.get("city").is_some(), "missing city argument: {args}");
+    }
+
+    /// The round trip that matters most: send a tool result back and confirm
+    /// the model continues the conversation from it.
+    #[tokio::test]
+    #[ignore = "hits the real ChatGPT backend; run with --ignored"]
+    async fn live_tool_result_continuation() {
+        if !live_preconditions() {
+            return;
+        }
+        let provider = OpenAiChatGptProvider::new(None).unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "What is the weather in Quito?"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_live_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Quito\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_live_1",
+                "content": "18C and raining"
+            }),
+        ];
+        let tools = vec![json!({
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        })];
+
+        let response = provider
+            .chat(&live_model(), &messages, &tools)
+            .await
+            .expect("live continuation failed");
+
+        let content = response.content.unwrap_or_default();
+        eprintln!("continuation: {content}");
+        assert!(
+            content.contains("18") || content.to_lowercase().contains("rain"),
+            "model did not use the tool result: {content}"
+        );
     }
 }

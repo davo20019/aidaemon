@@ -172,6 +172,8 @@ pub async fn record_background_model_call_telemetry(
                 message_count: None,
                 force_text: false,
                 token_usage_present: response.usage.is_some(),
+                failed: false,
+                error: None,
             },
             token_usage: response.usage.clone(),
         },

@@ -44,6 +44,30 @@ fn enforce_child_terminal_outcome(
     result
 }
 
+fn task_references_parent_context(task: &str) -> bool {
+    let normalized = task.to_ascii_lowercase();
+    [
+        "completed task results",
+        "prior knowledge",
+        "parent context",
+        "prompt context",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn bounded_completed_task_results_context(ctx_json: &str, max_results: usize) -> Option<String> {
+    let value: Value = serde_json::from_str(ctx_json).ok()?;
+    let results = value.get("task_results")?.as_array()?;
+    if results.is_empty() {
+        return None;
+    }
+    let start = results.len().saturating_sub(max_results.max(1));
+    let bounded = json!({ "task_results": results[start..].to_vec() });
+    let formatted = format_goal_context(&bounded.to_string());
+    (!formatted.trim().is_empty()).then_some(formatted)
+}
+
 /// Returns the task-lead execution-mode prose for the given `is_scheduled` flag.
 ///
 /// This is the single source of truth for the two variants of the task-lead
@@ -263,6 +287,13 @@ impl Agent {
             execution_mode,
         };
         let mut prompt = registry.render(SpecialistKind::TaskLead, &ctx);
+        // Markdown templates conventionally end in a newline while the legacy
+        // builder's base string does not. Normalize before appending dynamic
+        // sections so `\n\n## ...` produces exactly one blank line in either
+        // path; a single final newline is restored below.
+        while prompt.ends_with('\n') {
+            prompt.pop();
+        }
 
         if let Some(ctx_text) = goal_context {
             prompt.push_str(&format!(
@@ -286,6 +317,9 @@ impl Agent {
             );
         }
 
+        if !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
         prompt
     }
 
@@ -418,45 +452,34 @@ impl Agent {
         child_depth: usize,
         wrap_input: bool,
     ) -> TaskLeadSpec {
-        // Scheduled goals are pre-authorized by the user, so the TaskLead needs
-        // full tool access (including Action tools like terminal, write_file, etc.)
-        // to complete work autonomously without human intervention.
         let is_scheduled = goal_has_scheduled_provenance(&self.state, goal_id, None).await;
 
-        let mut tools: Vec<Arc<dyn Tool>> = if is_scheduled {
-            // Scheduled goals: include Action tools so TaskLead can execute directly
-            full_tools.to_vec()
-        } else {
-            // Start with Management + Universal tools.
-            let mut base: Vec<Arc<dyn Tool>> = full_tools
-                .iter()
-                .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
-                .cloned()
-                .collect();
-            // Always include essential Action tools as a direct-execution fallback.
-            // When cli_agent or spawn_agent fail (auth errors, budget blocks, depth
-            // limits), the TaskLead needs basic file and terminal access to avoid
-            // wasting iterations retrying broken delegation paths.
-            const ESSENTIAL_ACTION_TOOLS: &[&str] = &[
-                "read_file",
-                "write_file",
-                "edit_file",
-                "terminal",
-                "search_files",
-                "web_search",
-                "web_fetch",
-                "project_inspect",
-            ];
-            for tool in full_tools {
-                if tool.tool_role() == ToolRole::Action
-                    && ESSENTIAL_ACTION_TOOLS.contains(&tool.name())
-                    && !base.iter().any(|t| t.name() == tool.name())
-                {
-                    base.push(tool.clone());
-                }
+        // Task leads orchestrate and delegate; executors retain the full action
+        // tool set. Keeping only a small direct-execution fallback here avoids
+        // sending thousands of irrelevant schema tokens on every planning turn.
+        let mut tools: Vec<Arc<dyn Tool>> = full_tools
+            .iter()
+            .filter(|t| matches!(t.tool_role(), ToolRole::Management | ToolRole::Universal))
+            .cloned()
+            .collect();
+        const ESSENTIAL_ACTION_TOOLS: &[&str] = &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "terminal",
+            "search_files",
+            "web_search",
+            "web_fetch",
+            "project_inspect",
+        ];
+        for tool in full_tools {
+            if tool.tool_role() == ToolRole::Action
+                && ESSENTIAL_ACTION_TOOLS.contains(&tool.name())
+                && !tools.iter().any(|t| t.name() == tool.name())
+            {
+                tools.push(tool.clone());
             }
-            base
-        };
+        }
 
         let has_cli_agent = if let Some(cli_tool) = full_tools
             .iter()
@@ -470,10 +493,24 @@ impl Agent {
             false
         };
 
-        tools.push(Arc::new(crate::tools::ManageGoalTasksTool::new(
-            goal_id.to_string(),
-            self.state.clone(),
-        )));
+        let run_started_at = if is_scheduled {
+            if let Some(root_task_id) = active_scheduled_root_task_id(&self.state, goal_id).await {
+                self.state
+                    .get_task(&root_task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|task| task.created_at)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        tools.push(Arc::new(
+            crate::tools::ManageGoalTasksTool::new(goal_id.to_string(), self.state.clone())
+                .with_run_started_at(run_started_at),
+        ));
 
         let goal_context = self
             .state
@@ -1065,7 +1102,7 @@ impl Agent {
                         mission,
                         task,
                     );
-                    let prompt = Self::compose_executor_prompt_from_registry(
+                    let mut prompt = Self::compose_executor_prompt_from_registry(
                         &self.specialists,
                         specialist_kind,
                         task,
@@ -1076,6 +1113,33 @@ impl Agent {
                         task_id,
                         inherited_project_scope,
                     );
+                    // Normally the Task Lead must inline prerequisite evidence in
+                    // the delegated task. Keep a bounded compatibility path for
+                    // explicit references to parent-only context so an executor
+                    // cannot be assigned to inspect a section it never received.
+                    if task_references_parent_context(task) {
+                        let referenced_context = match goal_id {
+                            Some(gid) => self
+                                .state
+                                .get_goal(gid)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|goal| goal.context)
+                                .and_then(|context| {
+                                    bounded_completed_task_results_context(&context, 8)
+                                }),
+                            None => None,
+                        };
+                        if let Some(context) = referenced_context {
+                            prompt.push_str(
+                                "\n\n## Referenced Parent Context\n\
+                                 The delegated task explicitly refers to parent context. Use this \
+                                 bounded excerpt as evidence:\n",
+                            );
+                            prompt.push_str(&context);
+                        }
+                    }
                     // Executors never get SpawnAgentTool
                     return self
                         .spawn_child_inner(
@@ -1666,12 +1730,21 @@ impl Agent {
                 - Always pass the task_id so executor activity is tracked\n\
              4. After each executor returns, update: manage_goal_tasks(update_task, task_id, status, result)\n\
              5. If a task fails and is idempotent: manage_goal_tasks(retry_task, task_id) then re-spawn\n\
-                - If not idempotent or max retries exceeded: create alternative task or fail the goal\n\
-             6. When all tasks complete: manage_goal_tasks(complete_goal, summary)\n\n\
+                - If not idempotent or max retries exceeded: create an alternative task or fail the goal\n\
+                - If an alternative task successfully replaces failed work, update the original task to \
+                  status `superseded`; its result MUST name the replacement task ID and explain why the \
+                  replacement satisfies the original requirement\n\
+                - Never leave a replaced failure in `failed`: that incorrectly poisons the run result\n\
+             6. When every required task is completed/skipped and every obsolete task is explicitly \
+                superseded: manage_goal_tasks(complete_goal, summary)\n\n\
              ## Rules\n\
              - Keep each planning step small: 2-5 tasks at a time, then iterate\n\
              - Spawn executors one at a time (sequential execution)\n\
              - Each executor gets a single, focused task\n\
+             - Executors do not automatically see this Task Lead's prompt. If a task depends on \
+               Prior Knowledge, Completed Task Results, or another context section, copy the \
+               necessary evidence into the task text; never tell an executor to inspect context \
+               it was not given\n\
              - Always check list_tasks before spawning the next executor\n\
              - If an executor reports a blocker, inspect the recorded task status/result and resolve it or adjust the plan\n\
              - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
@@ -1720,6 +1793,9 @@ impl Agent {
             );
         }
 
+        if !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
         prompt
     }
 
@@ -1860,9 +1936,24 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::Agent;
+    use super::{bounded_completed_task_results_context, task_references_parent_context, Agent};
     use crate::traits::{AgentRole, SpecialistKind};
     use uuid::Uuid;
+
+    #[test]
+    fn executor_parent_context_reference_gets_bounded_recent_results() {
+        assert!(task_references_parent_context(
+            "Review Completed Task Results and select one event"
+        ));
+        let ctx = serde_json::json!({
+            "task_results": (0..12).map(|i| format!("result-{i}")).collect::<Vec<_>>()
+        });
+        let formatted = bounded_completed_task_results_context(&ctx.to_string(), 3).unwrap();
+        assert!(formatted.contains("### Completed Task Results"));
+        assert!(!formatted.contains("result-8"));
+        assert!(formatted.contains("result-9"));
+        assert!(formatted.contains("result-11"));
+    }
 
     #[test]
     fn specialist_arg_wins_over_heuristic() {

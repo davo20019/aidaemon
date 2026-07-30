@@ -629,10 +629,10 @@ impl MemoryManager {
 
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array. Each item has \
-            category, key, value, privacy, and an optional graph object. Graph entities have local_id, \
+            category, key, value, privacy, and an optional graph or personal_memory object. Graph entities have local_id, \
             name, entity_type, aliases, confidence. Relationships have source_id, target_id, relation, \
             confidence. Use owner for the user. Include graph data only when directly supported by the \
-            owner's words; never infer entity types from category or key names. \
+            owner's words; never infer entity types from category or key names. For names, aliases, handles, dates of birth, residence, accounts, or family relationships, emit personal_memory with entities, aliases, facts, relationships, direct_user_statement, and correction instead of dynamic person-name keys. Use owner as the owner's local_id, stable entity references, ISO dates, and typed relationships PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT. \
             Categories:\n\
             - user: Personal info about the OWNER (name, location, job)\n\
             - preference: Tool, workflow, and communication preferences\n\
@@ -651,10 +651,12 @@ impl MemoryManager {
             - Names and relationships mentioned (e.g., \"my wife Alice\", \"coworker Juan\")\n\
             - Personal details about others (birthdays, preferences, interests, jobs)\n\
             - Important dates related to people\n\
-            - Format the key as \"person_name:detail_type\" (e.g., \"alice:birthday\", \"juan:job\")\n\
-            - Include a \"person_name\" field with just the person's name\n\
+            - Always include personal_memory; never encode a person's name in key\n\
+            - Give each person a local entity ID, store nicknames/handles as aliases, attach dates/properties as facts, and model family/residence links as relationships\n\
+            - Keep separate people as separate entities and normalize dates to YYYY-MM-DD\n\
+            - Set person_name only as a legacy display hint, not as an identity key\n\
             - NEVER extract health info, financial details, political opinions, or religious beliefs about people\n\
-            Example: {\"category\": \"people\", \"key\": \"alice:birthday\", \"value\": \"March 15\", \"privacy\": \"private\", \"person_name\": \"Alice\"}\n\n\
+            Example: represent \"My daughter Alice, nicknamed Allie, was born March 15, 2015\" with one Alice entity, an Allie nickname alias, a 2015-03-15 birth_date fact, and PARENT_OF(owner, Alice)\n\n\
             Also classify each fact's privacy:\n\
             - \"global\": General facts useful anywhere (name, job, timezone, tech preferences)\n\
             - \"channel\": Context-specific facts from this conversation\n\
@@ -729,9 +731,36 @@ impl MemoryManager {
                                 let ch_id =
                                     crate::memory::derive_channel_id_from_session(session_id);
                                 for fact in &facts {
+                                    if let (Some(state), Some(personal)) =
+                                        (&self.state, &fact.personal_memory)
+                                    {
+                                        let excerpt =
+                                            crate::utils::truncate_str(&user_messages_text, 200);
+                                        let privacy = fact
+                                            .privacy
+                                            .as_deref()
+                                            .map(FactPrivacy::from_str_lossy)
+                                            .unwrap_or(FactPrivacy::Private);
+                                        if let Err(error) = state
+                                            .reconcile_personal_memory(
+                                                personal,
+                                                "consolidation",
+                                                Some(excerpt.as_str()),
+                                                ch_id.as_deref(),
+                                                privacy,
+                                            )
+                                            .await
+                                        {
+                                            warn!(%error, "Failed to reconcile consolidated personal memory");
+                                        }
+                                        continue;
+                                    }
                                     // Route "people" facts to the person_facts table
                                     if fact.category == "people" {
-                                        self.route_people_fact(fact).await;
+                                        warn!(
+                                            key = fact.key,
+                                            "Skipping unstructured people fact; extractor must emit personal_memory"
+                                        );
                                         continue;
                                     }
 
@@ -929,6 +958,7 @@ impl MemoryManager {
     }
 
     /// Route a "people" category fact to the person_facts table.
+    #[allow(dead_code)]
     async fn route_people_fact(&self, fact: &ExtractedFact) {
         let state = match &self.state {
             Some(s) => s,
@@ -2226,6 +2256,8 @@ struct ExtractedFact {
     person_name: Option<String>,
     #[serde(default)]
     graph: crate::traits::ExtractedMemoryGraph,
+    #[serde(default)]
+    personal_memory: Option<crate::traits::PersonalMemoryWrite>,
 }
 
 /// Derive a channel_id from a session_id string.

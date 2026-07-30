@@ -2495,7 +2495,9 @@ mod tests {
             ABSOLUTE_MAX_RESPONSE_BYTES
         );
         // The default sits at or below the absolute ceiling.
-        assert!(DEFAULT_MAX_RESPONSE_BYTES <= ABSOLUTE_MAX_RESPONSE_BYTES);
+        const {
+            assert!(DEFAULT_MAX_RESPONSE_BYTES <= ABSOLUTE_MAX_RESPONSE_BYTES);
+        }
     }
 
     #[test]

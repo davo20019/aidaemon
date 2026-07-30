@@ -11,11 +11,53 @@ use crate::traits::{StateStore, Task, Tool, ToolCapabilities, ToolRole};
 pub struct ManageGoalTasksTool {
     goal_id: String,
     state: Arc<dyn StateStore>,
+    run_started_at: Option<String>,
 }
 
 impl ManageGoalTasksTool {
     pub fn new(goal_id: String, state: Arc<dyn StateStore>) -> Self {
-        Self { goal_id, state }
+        Self {
+            goal_id,
+            state,
+            run_started_at: None,
+        }
+    }
+
+    pub fn with_run_started_at(mut self, run_started_at: Option<String>) -> Self {
+        self.run_started_at = run_started_at;
+        self
+    }
+
+    fn task_in_scope(&self, task: &Task) -> bool {
+        task.goal_id == self.goal_id
+            && !Self::is_scheduled_root_task(task)
+            && self
+                .run_started_at
+                .as_deref()
+                .is_none_or(|started_at| task.created_at.as_str() >= started_at)
+    }
+
+    fn is_scheduled_root_task(task: &Task) -> bool {
+        let description = task.description.trim_start().to_ascii_lowercase();
+        description.starts_with("execute scheduled goal:")
+            || description.starts_with("scheduled check:")
+            || description.starts_with("manual scheduled run:")
+    }
+
+    async fn scoped_tasks(&self) -> anyhow::Result<Vec<Task>> {
+        Ok(self
+            .state
+            .get_tasks_for_goal(&self.goal_id)
+            .await?
+            .into_iter()
+            .filter(|task| self.task_in_scope(task))
+            .collect())
+    }
+
+    fn out_of_scope_message(&self, task_id: &str) -> String {
+        format!(
+            "Task {task_id} belongs to an earlier run and cannot be changed by the current run. Use manage_goal_tasks(action=\"list_tasks\") for current task IDs."
+        )
     }
 
     async fn task_not_found_message(&self, task_id: &str) -> String {
@@ -40,11 +82,13 @@ impl ManageGoalTasksTool {
             return task_id.to_string();
         }
         // Try exact lookup first
-        if let Ok(Some(_)) = self.state.get_task(task_id).await {
-            return task_id.to_string();
+        if let Ok(Some(task)) = self.state.get_task(task_id).await {
+            if self.task_in_scope(&task) {
+                return task_id.to_string();
+            }
         }
         // Prefix-match against all tasks in this goal
-        if let Ok(tasks) = self.state.get_tasks_for_goal(&self.goal_id).await {
+        if let Ok(tasks) = self.scoped_tasks().await {
             let matches: Vec<&Task> = tasks.iter().filter(|t| t.id.starts_with(task_id)).collect();
             if matches.len() == 1 {
                 return matches[0].id.clone();
@@ -63,14 +107,14 @@ impl ManageGoalTasksTool {
     }
 
     async fn build_completed_task_result_excerpt(&self) -> anyhow::Result<Option<String>> {
-        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
+        let tasks = self.scoped_tasks().await?;
         if tasks.is_empty() {
             return Ok(None);
         }
 
         let mut successful: Vec<&Task> = tasks
             .iter()
-            .filter(|t| t.status == "completed" && t.error.is_none())
+            .filter(|t| t.completed_successfully())
             .filter(|t| t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
             .collect();
         if successful.is_empty() {
@@ -145,7 +189,8 @@ impl ManageGoalTasksTool {
 }
 
 /// A task status is "terminal" when it will never advance to `completed` on its
-/// own — either it already succeeded (`completed`/`skipped`) or it is dead
+/// own — either it already succeeded (`completed`/`skipped`), was explicitly
+/// replaced (`superseded`), or it is dead
 /// (`failed`/`blocked`/`interrupted`/`cancelled`/`abandoned`). Terminal tasks
 /// must not block goal completion. The dead set mirrors `heartbeat`'s
 /// `terminal_failed` classification so the two subsystems agree on what "done"
@@ -153,7 +198,14 @@ impl ManageGoalTasksTool {
 pub(crate) fn is_terminal_task_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "skipped" | "failed" | "blocked" | "interrupted" | "cancelled" | "abandoned"
+        "completed"
+            | "skipped"
+            | "superseded"
+            | "failed"
+            | "blocked"
+            | "interrupted"
+            | "cancelled"
+            | "abandoned"
     )
 }
 
@@ -272,8 +324,8 @@ impl Tool for ManageGoalTasksTool {
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "running", "completed", "failed", "blocked"],
-                        "description": "New status (for update_task)"
+                        "enum": ["pending", "running", "completed", "failed", "blocked", "skipped", "superseded"],
+                        "description": "New status (for update_task). Use superseded only when another named task replaced this task's required work."
                     },
                     "result": {
                         "type": "string",
@@ -458,7 +510,7 @@ impl ManageGoalTasksTool {
         // Validate dependencies don't create cycles
         if let Some(ref dep_ids) = args.depends_on {
             if !dep_ids.is_empty() {
-                let existing = self.state.get_tasks_for_goal(&self.goal_id).await?;
+                let existing = self.scoped_tasks().await?;
                 if let Err(reason) = validate_no_cycles(&existing, &task_id, dep_ids) {
                     return Ok(format!("Cannot create task: {}", reason));
                 }
@@ -503,7 +555,7 @@ impl ManageGoalTasksTool {
     }
 
     async fn list_tasks(&self) -> anyhow::Result<String> {
-        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
+        let tasks = self.scoped_tasks().await?;
 
         if tasks.is_empty() {
             return Ok(format!("No tasks for goal {}", self.goal_id));
@@ -578,6 +630,9 @@ impl ManageGoalTasksTool {
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
         }
+        if !self.task_in_scope(&task) {
+            return Ok(self.out_of_scope_message(task_id));
+        }
 
         // Dependency enforcement: prevent moving to "running" or "claimed" if deps unmet
         if let Some(ref new_status) = args.status {
@@ -593,7 +648,10 @@ impl ManageGoalTasksTool {
 
         if let Some(status) = &args.status {
             task.status = status.clone();
-            if status == "completed" || status == "failed" {
+            if matches!(
+                status.as_str(),
+                "completed" | "failed" | "blocked" | "skipped" | "superseded"
+            ) {
                 task.completed_at = Some(chrono::Utc::now().to_rfc3339());
             }
             if status == "running" {
@@ -604,7 +662,7 @@ impl ManageGoalTasksTool {
             task.result = Some(result.clone());
         }
         if let Some(error) = &args.error {
-            task.error = Some(error.clone());
+            task.error = (!error.trim().is_empty()).then(|| error.clone());
         }
 
         self.state.update_task(&task).await?;
@@ -637,6 +695,9 @@ impl ManageGoalTasksTool {
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
+        }
+        if !self.task_in_scope(&task) {
+            return Ok(self.out_of_scope_message(task_id));
         }
 
         // Check dependency satisfaction
@@ -671,6 +732,9 @@ impl ManageGoalTasksTool {
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
+        }
+        if !self.task_in_scope(&task) {
+            return Ok(self.out_of_scope_message(task_id));
         }
         if task.status != "failed" && task.status != "blocked" {
             return Ok(format!(
@@ -726,7 +790,7 @@ impl ManageGoalTasksTool {
             );
         }
 
-        let tasks = self.state.get_tasks_for_goal(&self.goal_id).await?;
+        let tasks = self.scoped_tasks().await?;
         if tasks.is_empty() {
             return Ok(
                 "Blocked: do not call manage_goal_tasks(action=\"complete_goal\") before creating and completing concrete tasks for this goal. Create the task plan first, then complete the goal only after the task list is actually done."
@@ -764,6 +828,18 @@ impl ManageGoalTasksTool {
         let is_continuous = goal.goal_type == "continuous";
         if is_continuous {
             goal.dispatch_failures = 0;
+            if let Some(raw_context) = goal.context.as_deref() {
+                if let Ok(mut context) = serde_json::from_str::<Value>(raw_context) {
+                    if let Some(object) = context.as_object_mut() {
+                        object.remove("failure_summary");
+                        goal.context = if object.is_empty() {
+                            None
+                        } else {
+                            Some(context.to_string())
+                        };
+                    }
+                }
+            }
         } else {
             goal.status = "completed".to_string();
             goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
@@ -852,6 +928,9 @@ impl ManageGoalTasksTool {
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
+        }
+        if !self.task_in_scope(&task) {
+            return Ok(self.out_of_scope_message(task_id));
         }
         if task.status != "blocked" {
             return Ok(format!(
@@ -956,11 +1035,7 @@ impl ManageGoalTasksTool {
         }
 
         // Cancel remaining pending/claimed tasks so they don't get re-dispatched
-        let tasks = self
-            .state
-            .get_tasks_for_goal(&self.goal_id)
-            .await
-            .unwrap_or_default();
+        let tasks = self.scoped_tasks().await.unwrap_or_default();
         let mut cancelled = 0;
         for task in &tasks {
             if task.status == "pending" || task.status == "claimed" {
@@ -1015,6 +1090,83 @@ mod tests {
         // We need to keep db_file alive, but for tests we'll leak it
         std::mem::forget(db_file);
         (state as Arc<dyn StateStore>, goal.id)
+    }
+
+    fn test_task(goal_id: &str, id: &str, description: &str, created_at: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            goal_id: goal_id.to_string(),
+            description: description.to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: created_at.to_string(),
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_tool_isolates_current_run_and_hides_root() {
+        let (state, goal_id) = setup_test_state().await;
+        let prior = test_task(
+            &goal_id,
+            "11111111-1111-1111-1111-111111111111",
+            "Prior run task",
+            "2026-07-27T12:00:00Z",
+        );
+        let root = test_task(
+            &goal_id,
+            "22222222-2222-2222-2222-222222222222",
+            "Manual scheduled run: publish the blog",
+            "2026-07-28T12:00:00Z",
+        );
+        let current = test_task(
+            &goal_id,
+            "33333333-3333-3333-3333-333333333333",
+            "Current run task",
+            "2026-07-28T12:00:01Z",
+        );
+        state.create_task(&prior).await.unwrap();
+        state.create_task(&root).await.unwrap();
+        state.create_task(&current).await.unwrap();
+
+        let tool = ManageGoalTasksTool::new(goal_id, state.clone())
+            .with_run_started_at(Some(root.created_at.clone()));
+        let listed = tool
+            .call(&json!({ "action": "list_tasks" }).to_string())
+            .await
+            .unwrap();
+        assert!(listed.contains("Current run task"));
+        assert!(!listed.contains("Prior run task"));
+        assert!(!listed.contains("Manual scheduled run"));
+
+        let update = tool
+            .call(
+                &json!({
+                    "action": "update_task",
+                    "task_id": prior.id,
+                    "status": "completed"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(update.contains("earlier run"));
+        assert_eq!(
+            state.get_task(&prior.id).await.unwrap().unwrap().status,
+            "pending"
+        );
     }
 
     #[tokio::test]

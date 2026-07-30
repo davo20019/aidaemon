@@ -195,9 +195,12 @@ impl Goal {
             conditions: None,
             context: None,
             resources: None,
-            // Apply defaults if caller omitted budgets.
-            budget_per_check: budget_per_check.or(Some(100_000)),
-            budget_daily: budget_daily.or(Some(500_000)),
+            // Scheduled work carries task-lead and executor context overhead in
+            // addition to the action itself. Observed write/build/deploy/verify
+            // cycles exceed 300k even when healthy. Keep the budget bounded,
+            // but leave headroom for one complete cycle and two daily attempts.
+            budget_per_check: budget_per_check.or(Some(400_000)),
+            budget_daily: budget_daily.or(Some(1_000_000)),
             tokens_used_today: 0,
             tokens_used_day: day,
             last_useful_action: None,
@@ -257,7 +260,8 @@ pub struct Task {
     pub id: String,
     pub goal_id: String,
     pub description: String,
-    /// "pending", "claimed", "running", "completed", "failed", "blocked"
+    /// "pending", "claimed", "running", "completed", "failed", "blocked",
+    /// "skipped", or "superseded"
     pub status: String,
     /// "low", "medium", "high"
     pub priority: String,
@@ -284,6 +288,28 @@ pub struct Task {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+}
+
+impl Task {
+    /// SQLite contains legacy task rows whose optional error field is an empty
+    /// string instead of NULL. Treat blank error text as absent everywhere task
+    /// success is evaluated.
+    pub fn has_error(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty())
+    }
+
+    pub fn completed_successfully(&self) -> bool {
+        self.status == "completed" && !self.has_error()
+    }
+
+    /// True when this task no longer represents required work for the current
+    /// run. A superseded task is not itself a success, but a successful
+    /// replacement means it must not poison the run's terminal outcome.
+    pub fn satisfies_run_completion(&self) -> bool {
+        self.completed_successfully() || matches!(self.status.as_str(), "skipped" | "superseded")
+    }
 }
 
 /// A task activity log entry — records tool calls and results within a task.

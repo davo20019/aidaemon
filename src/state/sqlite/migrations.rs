@@ -258,13 +258,6 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
 
-    // Prevent concurrent episode creation for the same session
-    let _ = sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_session_unique ON episodes(session_id)",
-    )
-    .execute(pool)
-    .await;
-
     // 8. Create user_profile table
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS user_profile (
@@ -1708,6 +1701,35 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Apply the retention bound during startup as well as on new writes. An
+    // idle deployment may not save another prompt snapshot for a long time,
+    // so write-time pruning alone leaves legacy databases permanently above
+    // the cap.
+    sqlx::query(
+        "DELETE FROM prompt_snapshots
+         WHERE hash NOT IN (
+             SELECT hash FROM prompt_snapshots
+             ORDER BY created_at DESC, hash DESC
+             LIMIT 500
+         )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Normalize legacy optional task fields. Empty strings caused completed
+    // tasks to be misclassified as failures by callers expecting NULL.
+    sqlx::query(
+        "UPDATE tasks
+         SET result = NULLIF(TRIM(result), ''),
+             error = NULLIF(TRIM(error), ''),
+             blocker = NULLIF(TRIM(blocker), '')
+         WHERE (result IS NOT NULL AND TRIM(result) = '')
+            OR (error IS NOT NULL AND TRIM(error) = '')
+            OR (blocker IS NOT NULL AND TRIM(blocker) = '')",
+    )
+    .execute(pool)
+    .await?;
+
     // Migration: deduplicate people entries and add unique index on LOWER(name).
     // Keeps the row with the lowest id for each name, merging interaction counts.
     let _ = sqlx::query(
@@ -1895,6 +1917,142 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    for statement in [
+        "ALTER TABLE memory_entities ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        "ALTER TABLE memory_entities ADD COLUMN merged_into_entity_id INTEGER",
+        "ALTER TABLE memory_entities ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = sqlx::query(statement).execute(pool).await;
+    }
+
+    // Entity-aware personal memory. These tables extend the rolling canonical
+    // projection without changing or deleting the legacy facts/people tables.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            alias_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES memory_entities(id),
+            UNIQUE(entity_id, alias_type, normalized_value)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_entity_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_entity_id INTEGER NOT NULL,
+            predicate TEXT NOT NULL,
+            value_type TEXT NOT NULL DEFAULT 'text',
+            value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            display_value TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            source_fact_id INTEGER,
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            supersedes_fact_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(subject_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(source_fact_id) REFERENCES facts(id),
+            FOREIGN KEY(supersedes_fact_id) REFERENCES memory_entity_facts(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL,
+            relationship_type TEXT NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            inverse_relationship_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL,
+            provenance TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            source_fact_id INTEGER,
+            channel_id TEXT,
+            privacy TEXT NOT NULL DEFAULT 'private',
+            asserted_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            last_confirmed_at TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(source_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(target_entity_id) REFERENCES memory_entities(id),
+            FOREIGN KEY(inverse_relationship_id) REFERENCES memory_relationships(id),
+            FOREIGN KEY(source_fact_id) REFERENCES facts(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_resolution_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_kind TEXT NOT NULL,
+            normalized_reference TEXT,
+            candidate_entity_ids_json TEXT NOT NULL DEFAULT '[]',
+            payload_json TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_fact_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE(review_kind, normalized_reference, payload_json, status)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_write_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            entity_id INTEGER,
+            record_type TEXT NOT NULL,
+            record_id INTEGER,
+            prior_state_json TEXT,
+            new_state_json TEXT,
+            source TEXT NOT NULL,
+            source_fact_id INTEGER,
+            provenance TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES memory_entities(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS memory_edges (
@@ -1946,6 +2104,17 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_memory_edges_target ON memory_edges(target_entity_id, valid_to, deleted_at)",
         "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_lookup ON memory_embeddings(embedding_model, embedding_purpose, owner_type, stale_at)",
         "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_owner ON memory_embeddings(owner_type, owner_id, stale_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entities_status ON memory_entities(entity_type, status, canonical_name)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_entities_one_owner ON memory_entities(is_owner) WHERE is_owner = 1 AND status = 'active'",
+        "CREATE INDEX IF NOT EXISTS idx_memory_aliases_lookup ON memory_aliases(normalized_value, alias_type, status)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_aliases_entity ON memory_aliases(entity_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entity_facts_subject ON memory_entity_facts(subject_entity_id, predicate, status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_entity_facts_active_exact ON memory_entity_facts(subject_entity_id, predicate, normalized_value) WHERE status = 'active' AND valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_relationships_source ON memory_relationships(source_entity_id, relationship_type, status)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_relationships_target ON memory_relationships(target_entity_id, relationship_type, status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_relationships_active_exact ON memory_relationships(source_entity_id, relationship_type, target_entity_id) WHERE status = 'active' AND valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_reviews_status ON memory_resolution_reviews(status, review_kind)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_audit_entity ON memory_write_audit(entity_id, created_at)",
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
