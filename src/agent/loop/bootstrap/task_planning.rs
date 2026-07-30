@@ -402,6 +402,16 @@ pub(crate) fn planning_skip_reason(
         return Some("control_command");
     }
 
+    if crate::agent::recognized_artifact_creation_request(user_text)
+        && !looks_like_compound_task(user_text)
+        && matches!(
+            crate::agent::classify_intent_complexity(user_text),
+            crate::agent::IntentComplexity::Simple
+        )
+    {
+        return Some("straightforward_artifact_creation");
+    }
+
     let planning_worthy_markers = [
         "analyze",
         "audit",
@@ -580,6 +590,16 @@ mod tests {
             "What's the source of that?",
             false
         ));
+    }
+
+    #[test]
+    fn exact_school_presentation_request_skips_llm_planning() {
+        let request = "Can you create a pptx about Ecuador. Make it beautiful as I will present in my daughter's school.";
+
+        assert_eq!(
+            planning_skip_reason(request, false),
+            Some("straightforward_artifact_creation")
+        );
     }
 
     #[test]

@@ -84,6 +84,13 @@ pub(crate) fn extract_project_dir_hint_with_aliases(
 }
 
 fn normalize_project_dir(raw_path: &str) -> Option<String> {
+    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
+        let mut path = crate::execution::normalize_active_path_lexically(raw_path).ok()?;
+        if crate::tools::fs_utils::path_points_to_file(raw_path) {
+            path = path.parent()?;
+        }
+        return Some(path.to_string());
+    }
     crate::tools::fs_utils::normalize_project_scope_path(raw_path)
         .ok()
         .map(|path| path.to_string_lossy().to_string())
@@ -125,6 +132,9 @@ fn quote_shell_token(value: &str) -> String {
 }
 
 fn resolve_injected_working_dir(project_dir: &str) -> String {
+    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
+        return project_dir.to_string();
+    }
     let resolved = crate::tools::fs_utils::validate_path(project_dir).ok();
     if let Some(path) = resolved {
         if !path.is_dir() {
@@ -136,6 +146,23 @@ fn resolve_injected_working_dir(project_dir: &str) -> String {
         }
     }
     project_dir.to_string()
+}
+
+fn workspace_policy_allows_injected_working_dir(
+    candidate: &str,
+    workspace_root: &str,
+    allow_outside_workspace: bool,
+) -> bool {
+    allow_outside_workspace || std::path::Path::new(candidate).starts_with(workspace_root)
+}
+
+fn active_workspace_policy_allows_injected_working_dir(candidate: &str) -> bool {
+    let backend = crate::execution::active_execution_backend();
+    workspace_policy_allows_injected_working_dir(
+        candidate,
+        backend.workspace_root().as_str(),
+        backend.allows_outside_workspace(),
+    )
 }
 
 fn collect_project_dirs_from_value(
@@ -256,6 +283,13 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
             return None;
         }
         let injected_dir = resolve_injected_working_dir(project_dir);
+        // A shell command may safely reference paths outside a confined
+        // workspace while still running from the workspace itself. Do not turn
+        // that valid command into a rejected one by auto-prepending `cd` to an
+        // out-of-scope inferred path.
+        if !active_workspace_policy_allows_injected_working_dir(&injected_dir) {
+            return None;
+        }
         obj.insert(
             "command".to_string(),
             json!(format!(
@@ -309,6 +343,17 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
 /// Used to relax the project scope lock: when the bot intentionally navigates
 /// to a *different* but legitimate project, the scope lock should not block it.
 pub(super) fn is_recognized_project_root(candidate_path: &str) -> bool {
+    let backend = crate::execution::active_execution_backend();
+    if backend.kind() != crate::execution::BackendKind::Local {
+        return crate::execution::normalize_active_path_lexically(candidate_path).is_ok_and(
+            |candidate| {
+                let root = std::path::Path::new(backend.workspace_root().as_str());
+                let candidate = std::path::Path::new(candidate.as_str());
+                candidate.starts_with(root)
+                    && !crate::tools::fs_utils::path_points_to_file(candidate_path)
+            },
+        );
+    }
     let Ok(path) = crate::tools::fs_utils::validate_path(candidate_path) else {
         return false;
     };
@@ -319,11 +364,29 @@ pub(super) fn is_recognized_project_root(candidate_path: &str) -> bool {
 }
 
 pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
-    let Some(scope) = crate::tools::fs_utils::validate_path(scope_path).ok() else {
-        return true;
-    };
-    let Some(candidate) = crate::tools::fs_utils::validate_path(candidate_path).ok() else {
-        return true;
+    let backend = crate::execution::active_execution_backend();
+    let (scope, candidate) = if backend.kind() == crate::execution::BackendKind::Local {
+        let Some(scope) = crate::tools::fs_utils::validate_path(scope_path).ok() else {
+            return true;
+        };
+        let Some(candidate) = crate::tools::fs_utils::validate_path(candidate_path).ok() else {
+            return true;
+        };
+        (scope, candidate)
+    } else {
+        let Some(scope) = crate::execution::normalize_active_path_lexically(scope_path)
+            .ok()
+            .map(|path| std::path::PathBuf::from(path.as_str()))
+        else {
+            return false;
+        };
+        let Some(candidate) = crate::execution::normalize_active_path_lexically(candidate_path)
+            .ok()
+            .map(|path| std::path::PathBuf::from(path.as_str()))
+        else {
+            return false;
+        };
+        (scope, candidate)
     };
     // Allow descendant paths (original behavior)
     if candidate.starts_with(&scope) {
@@ -597,6 +660,31 @@ mod tests {
             "cd '{}' && pwd && ls dist",
             project.to_string_lossy()
         )));
+    }
+
+    #[test]
+    fn confined_workspace_rejects_parent_as_injected_working_dir() {
+        let workspace = "/workspace/projects/agent";
+        assert!(workspace_policy_allows_injected_working_dir(
+            "/workspace/projects/agent/src",
+            workspace,
+            false
+        ));
+        assert!(!workspace_policy_allows_injected_working_dir(
+            "/workspace/projects",
+            workspace,
+            false
+        ));
+        assert!(!workspace_policy_allows_injected_working_dir(
+            "/workspace/projects-other",
+            workspace,
+            false
+        ));
+        assert!(workspace_policy_allows_injected_working_dir(
+            "/workspace/projects",
+            workspace,
+            true
+        ));
     }
 
     #[test]

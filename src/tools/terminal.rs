@@ -20,6 +20,9 @@ use crate::config::SelfCorrectionConfig;
 use crate::events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
 };
+use crate::execution::{
+    active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
+};
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
     ToolExecutionContext, ToolOutcomeStatus, ToolVerificationMode,
@@ -31,7 +34,7 @@ use super::command_patterns::{find_matching_pattern, record_approval, record_den
 use super::command_risk::{classify_command, hard_block_reason, PermissionMode, RiskLevel};
 use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
-use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
+use super::process_control::{send_sigkill, send_sigterm};
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -223,7 +226,7 @@ struct RunningProcess {
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
     reader_handle: JoinHandle<Option<i32>>,
-    child_id: u32,
+    process_handle: ProcessHandle,
     notify_on_completion: Arc<AtomicBool>,
     /// True only when the background notifier tokio task was actually spawned
     /// and is actively monitoring this process for completion/progress delivery.
@@ -361,19 +364,15 @@ async fn attribute_background_deliverable(
         },
         None => Vec::new(),
     };
-    let read_script = |p: &std::path::Path| -> Option<String> { std::fs::read_to_string(p).ok() };
-    let stat_mtime = |p: &std::path::Path| -> Option<std::time::SystemTime> {
-        std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
-    };
-    let ctx = crate::tools::background_deliverable::attribute_deliverable(
+    let ctx = crate::tools::background_deliverable::attribute_deliverable_backend(
+        active_execution_backend(),
         session_id,
         command,
         command_start,
         command_end,
         &checklist_text,
-        &read_script,
-        &stat_mtime,
-    );
+    )
+    .await;
     match crate::tools::background_deliverable::auto_send_decision(&ctx) {
         crate::tools::background_deliverable::AutoSendDecision::One(p) => {
             DeliverableAttribution::One(p)
@@ -443,9 +442,46 @@ async fn deliver_attributed_background_file(
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let backend = active_execution_backend();
+    let mut delivery_path = path.to_path_buf();
+    if backend.kind() != BackendKind::Local {
+        let backend_path = match backend.resolve_path(&path.to_string_lossy()).await {
+            Ok(path) => path,
+            Err(error) => {
+                let msg = format!(
+                    "⚠️ The background command finished and referenced `{original_name}`, \
+                     but its execution-side path was invalid: {error}."
+                );
+                deliver_background_text(hub, state, session_id, goal_id, &msg, pid).await;
+                return;
+            }
+        };
+        let canonical = backend
+            .canonicalize(&backend_path)
+            .await
+            .unwrap_or(backend_path);
+        if crate::tools::file_delivery::is_path_blocked(std::path::Path::new(canonical.as_str())) {
+            let msg = format!(
+                "⚠️ The background command produced `{original_name}`, but that path is blocked \
+                 from delivery for security reasons."
+            );
+            deliver_background_text(hub, state, session_id, goal_id, &msg, pid).await;
+            return;
+        }
+        delivery_path = inbox_dir.join(canonical.file_name().unwrap_or(original_name.as_str()));
+        if let Err(error) = backend.export_local_file(&canonical, &delivery_path).await {
+            let msg = format!(
+                "⚠️ The background command produced `{original_name}`, but exporting it from \
+                 the {} execution backend failed: {error}.",
+                backend.kind().as_str()
+            );
+            deliver_background_text(hub, state, session_id, goal_id, &msg, pid).await;
+            return;
+        }
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ready = match crate::tools::file_delivery::prepare_delivery(
-        &path.to_string_lossy(),
+        &delivery_path.to_string_lossy(),
         &cwd,
         inbox_dir,
         outbox_dirs,
@@ -633,6 +669,8 @@ async fn deliver_background_text(
 }
 
 pub struct TerminalTool {
+    /// Immutable target shared by terminal, file, Git, and CLI-agent tools.
+    backend: SharedExecutionBackend,
     /// Permanently allowed prefixes (from config + DB)
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
     /// Session-only allowed prefixes (cleared on restart)
@@ -1023,8 +1061,7 @@ fn is_broad_scan_root(path: &str) -> bool {
 /// Expand a leading `~` / `$HOME` in a shell path operand to the absolute home
 /// directory. Returns `None` if `HOME` is unset. UTF-8-safe (operates on
 /// `char`/`str` boundaries, never raw byte indices).
-fn expand_home_in_operand(operand: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
+fn expand_home_in_operand(operand: &str, home: &str) -> Option<String> {
     if home.is_empty() {
         return None;
     }
@@ -1059,10 +1096,14 @@ fn expand_home_in_operand(operand: &str) -> Option<String> {
 fn derive_correction_scope_from_command(command: &str) -> std::path::PathBuf {
     let fallback = || TerminalTool::correction_working_dir();
 
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| h.trim_end_matches('/').to_string());
+    let backend = active_execution_backend();
+    let home = Some(
+        backend
+            .home_hint()
+            .as_str()
+            .trim_end_matches('/')
+            .to_string(),
+    );
 
     // Walk every chained segment; take the first segment that has a usable path
     // operand, preferring the broadest scope it implies.
@@ -1084,18 +1125,29 @@ fn derive_correction_scope_from_command(command: &str) -> std::path::PathBuf {
                 // `~`, `$HOME`, or the literal home path → home dir.
                 if let Some(h) = &home {
                     let p = std::path::PathBuf::from(h);
-                    return std::fs::canonicalize(&p).unwrap_or(p);
+                    return if backend.kind() == BackendKind::Local {
+                        std::fs::canonicalize(&p).unwrap_or(p)
+                    } else {
+                        p
+                    };
                 }
                 return fallback();
             }
 
             // A glob/path beneath home (e.g. `~/*`, `$HOME/*`, `<home>/*`).
             // Strip a trailing glob component so `~/*` resolves to home itself.
-            let expanded = expand_home_in_operand(tok).unwrap_or_else(|| tok.to_string());
+            let expanded = home
+                .as_deref()
+                .and_then(|home| expand_home_in_operand(tok, home))
+                .unwrap_or_else(|| tok.to_string());
             let scope = scope_dir_from_path_operand(&expanded, home.as_deref());
             if let Some(dir) = scope {
                 let p = std::path::PathBuf::from(&dir);
-                return std::fs::canonicalize(&p).unwrap_or(p);
+                return if backend.kind() == BackendKind::Local {
+                    std::fs::canonicalize(&p).unwrap_or(p)
+                } else {
+                    p
+                };
             }
         }
     }
@@ -1452,6 +1504,7 @@ impl TerminalTool {
         permission_mode: PermissionMode,
         pool: SqlitePool,
     ) -> Self {
+        let backend = active_execution_backend();
         // Log permission mode on startup
         match permission_mode {
             PermissionMode::Yolo => {
@@ -1472,9 +1525,37 @@ impl TerminalTool {
         if permission_mode == PermissionMode::Yolo && !merged.contains(&"*".to_string()) {
             merged.push("*".to_string());
         }
-        match sqlx::query_scalar::<_, String>("SELECT prefix FROM terminal_allowed_prefixes")
-            .fetch_all(&pool)
-            .await
+        if let Err(error) = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS terminal_backend_allowed_prefixes (
+                backend_scope TEXT NOT NULL,
+                prefix TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (backend_scope, prefix)
+            )",
+        )
+        .execute(&pool)
+        .await
+        {
+            warn!(%error, "Failed to initialize backend-scoped terminal approvals");
+        }
+
+        // Preserve historical local approvals only for the local target. They
+        // are deliberately never inherited by Docker or SSH.
+        if backend.kind() == BackendKind::Local {
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                    (backend_scope, prefix)
+                 SELECT 'local', prefix FROM terminal_allowed_prefixes",
+            )
+            .execute(&pool)
+            .await;
+        }
+        match sqlx::query_scalar::<_, String>(
+            "SELECT prefix FROM terminal_backend_allowed_prefixes WHERE backend_scope = ?",
+        )
+        .bind(backend.approval_scope())
+        .fetch_all(&pool)
+        .await
         {
             Ok(persisted) => {
                 for p in persisted {
@@ -1490,6 +1571,7 @@ impl TerminalTool {
         }
 
         Self {
+            backend,
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             permission_mode,
@@ -1672,9 +1754,18 @@ impl TerminalTool {
         session_id: &str,
         command: &str,
         risk_level: RiskLevel,
-        warnings: Vec<String>,
+        mut warnings: Vec<String>,
         task_id: Option<&str>,
     ) -> anyhow::Result<ApprovalResponse> {
+        warnings.insert(
+            0,
+            format!(
+                "Execution target: {} ({}) workspace {}",
+                self.backend.kind().as_str(),
+                self.backend.id(),
+                self.backend.workspace_root()
+            ),
+        );
         if let Some(store) = &self.event_store {
             let emitter = crate::events::EventEmitter::new(store.clone(), session_id.to_string());
             let _ = emitter
@@ -1840,8 +1931,10 @@ impl TerminalTool {
                 // Persist to SQLite
                 if let Some(ref pool) = self.pool {
                     if let Err(e) = sqlx::query(
-                        "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES (?)",
+                        "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                            (backend_scope, prefix) VALUES (?, ?)",
                     )
+                    .bind(self.backend.approval_scope())
                     .bind(&key)
                     .execute(pool)
                     .await
@@ -1954,32 +2047,31 @@ impl TerminalTool {
         reason: &str,
     ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
         proc.notify_on_completion.store(false, Ordering::Relaxed);
-        let child_pid = proc.child_id;
         let started_at = proc.started_at;
         let command = proc.command.clone();
         let stdout_buf = proc.stdout_buf.clone();
         let stderr_buf = proc.stderr_buf.clone();
         let reader_handle = proc.reader_handle;
+        let process_handle = proc.process_handle;
 
         if !reader_handle.is_finished() {
-            let term_sent = send_sigterm(child_pid);
-            if term_sent {
-                let finished = tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        if reader_handle.is_finished() {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+            self.backend
+                .terminate(&process_handle, Duration::from_secs(2))
+                .await
+                .ok();
+            let finished = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if reader_handle.is_finished() {
+                        return;
                     }
-                })
-                .await;
-
-                if finished.is_err() && !reader_handle.is_finished() {
-                    send_sigkill(child_pid);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            } else {
-                send_sigkill(child_pid);
+            })
+            .await;
+            if finished.is_err() && !reader_handle.is_finished() {
+                if let Some(pid) = process_handle.local_pid() {
+                    send_sigkill(pid);
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
@@ -2117,8 +2209,10 @@ impl TerminalTool {
                     // Persist to database
                     if let Some(ref pool) = self.pool {
                         if let Err(e) = sqlx::query(
-                            "INSERT OR IGNORE INTO terminal_allowed_prefixes (prefix) VALUES ('*')",
+                            "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+                                (backend_scope, prefix) VALUES (?, '*')",
                         )
+                        .bind(self.backend.approval_scope())
                         .execute(pool)
                         .await
                         {
@@ -2234,6 +2328,10 @@ impl TerminalTool {
     /// equality checks (`== "/"`, `== $HOME`) fire reliably. If canonicalization
     /// fails (path missing), we fall back to the raw cwd so the guard still runs.
     fn correction_working_dir() -> std::path::PathBuf {
+        let backend = active_execution_backend();
+        if backend.kind() != BackendKind::Local {
+            return std::path::PathBuf::from(backend.workspace_root().as_str());
+        }
         let raw = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
         std::fs::canonicalize(&raw).unwrap_or(raw)
     }
@@ -2503,14 +2601,19 @@ impl TerminalTool {
                 .copied()
                 .unwrap_or((c.last_cpu_ms, c.last_io_bytes));
 
-            let made_progress = process_made_progress(
-                c.last_cpu_ms,
-                cpu_ms,
-                c.last_io_bytes,
-                io_bytes,
-                c.last_progress_len,
-                len,
-            );
+            // A local ssh/docker client is only a transport process; its host
+            // CPU/IO says nothing about remote work. Treat a live remote
+            // transport as progress for the stall policy while retaining the
+            // absolute max-runtime backstop.
+            let made_progress = self.backend.kind() != BackendKind::Local
+                || process_made_progress(
+                    c.last_cpu_ms,
+                    cpu_ms,
+                    c.last_io_bytes,
+                    io_bytes,
+                    c.last_progress_len,
+                    len,
+                );
 
             let total_runtime = c.started_at.elapsed();
             let no_progress_elapsed = if made_progress {
@@ -2647,7 +2750,11 @@ impl TerminalTool {
                     .await
                     {
                         DeliverableAttribution::One(path) => {
-                            let file_appeared = std::fs::metadata(&path).is_ok();
+                            let file_appeared =
+                                match self.backend.resolve_path(&path.to_string_lossy()).await {
+                                    Ok(path) => self.backend.metadata(&path).await.is_ok(),
+                                    Err(_) => false,
+                                };
                             let already_delivered = self
                                 .delivered_deliverables
                                 .lock()
@@ -2783,18 +2890,12 @@ impl TerminalTool {
             )));
         }
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        configure_command_for_process_group(&mut cmd);
-        let mut child = cmd.spawn()?;
-
-        let pid = child.id().unwrap_or(0);
-
-        let stdout_pipe = child.stdout.take().expect("stdout piped");
-        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        let mut spawned = self.backend.spawn(ExecutionRequest::shell(command)).await?;
+        let process_handle = spawned.handle().clone();
+        let pid = process_handle.display_id();
+        let stdout_pipe = spawned.take_stdout().expect("stdout piped");
+        let stderr_pipe = spawned.take_stderr().expect("stderr piped");
+        let mut child = spawned.into_child();
 
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
@@ -2907,7 +3008,7 @@ impl TerminalTool {
                     stdout_buf,
                     stderr_buf,
                     reader_handle,
-                    child_id: pid,
+                    process_handle,
                     notify_on_completion: notify_on_completion.clone(),
                     notifier_active: false,
                     notify_session_id: notify_session_id.trim().to_string(),
@@ -4408,6 +4509,12 @@ impl TerminalTool {
                     }
                 }
 
+                // The checkpoint belongs after every command-safety and
+                // user-approval gate, but immediately before process spawn.
+                if let Some(manager) = crate::checkpoints::active_manager() {
+                    manager.begin_for_tool("terminal", arguments).await?;
+                }
+
                 self.handle_run(
                     command,
                     &notify_session_id,
@@ -4433,8 +4540,10 @@ impl Drop for TerminalTool {
         // Best-effort kill of all tracked background processes.
         if let Ok(running) = self.running.try_lock() {
             for proc in running.values() {
-                send_sigterm(proc.child_id);
-                send_sigkill(proc.child_id);
+                if let Some(pid) = proc.process_handle.local_pid() {
+                    send_sigterm(pid);
+                    send_sigkill(pid);
+                }
             }
         }
     }
@@ -4539,13 +4648,13 @@ impl Tool for TerminalTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. If a command is not pre-approved, the user will be asked to authorize it."
+        "Execute a shell command in the configured execution workspace. If a command is not pre-approved for that backend, the user will be asked to authorize it."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Run shell commands on this machine. Commands may require user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
+            "description": "Run shell commands in the configured local, Docker, or SSH execution workspace. Commands may require backend-scoped user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
             "parameters": {
                 "type": "object",
                 "properties": {

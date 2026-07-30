@@ -323,6 +323,14 @@ impl EventStore {
                 tracing::debug!(%error, event_id, "Deferred user-message span projection");
             }
         }
+        if matches!(event_type_str, "user_message" | "assistant_response") {
+            if let Err(error) =
+                crate::state::sqlite::history_search::project_event(&self.pool, event_id).await
+            {
+                // Never couple the canonical append transaction to FTS health.
+                tracing::debug!(%error, event_id, "Deferred exact-history projection");
+            }
+        }
         Ok(event_id)
     }
 
@@ -346,19 +354,6 @@ impl EventStore {
         q.execute(&self.pool).await?;
 
         Ok(())
-    }
-
-    /// Delete old consolidated events (for pruning)
-    pub async fn delete_old_consolidated(&self, before: DateTime<Utc>) -> anyhow::Result<u64> {
-        let before_str = before.to_rfc3339();
-
-        let result =
-            sqlx::query("DELETE FROM events WHERE consolidated_at IS NOT NULL AND created_at < ?")
-                .bind(&before_str)
-                .execute(&self.pool)
-                .await?;
-
-        Ok(result.rows_affected())
     }
 
     // =========================================================================

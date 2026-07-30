@@ -89,11 +89,12 @@ pub(in crate::agent) async fn run_orchestration_phase(
 
     // Orchestration routing (always-on).
     let complexity = classify_intent_complexity(ctx.user_text);
-    let (route, route_requires_tools) = orchestration_route_label(&complexity);
-    let tools_required = route_requires_tools
-        || ctx.intent_gate.needs_tools.unwrap_or(false)
-        || ctx.turn_context.completion_contract.expects_mutation
-        || ctx.turn_context.completion_contract.requires_observation;
+    let (route, _) = orchestration_route_label(&complexity);
+    let tools_required = ctx.execution_requirement.requires_execution();
+    let tool_control_enforced = agent.trust_tier_for_model(ctx.model)
+        == crate::agent::trust_tier::ModelTrustTier::Guided
+        && ctx.execution_requirement.requires_execution();
+    let requirement_reasons = ctx.execution_requirement.reason_codes();
 
     // Per-turn intent-classification telemetry: record the gate result + complexity
     // + route for every (non-cancel) turn so the determination is queryable via the
@@ -103,6 +104,8 @@ pub(in crate::agent) async fn run_orchestration_phase(
         &complexity,
         route,
         ctx.user_text.chars().count(),
+        tool_control_enforced,
+        &requirement_reasons,
     );
     agent
         .emit_decision_point(
@@ -133,6 +136,8 @@ fn intent_decision_telemetry(
     complexity: &IntentComplexity,
     route: &str,
     user_text_len: usize,
+    tool_control_enforced: bool,
+    requirement_reasons: &[&str],
 ) -> (String, Value) {
     let complexity_label = match complexity {
         IntentComplexity::Simple => "simple",
@@ -149,6 +154,8 @@ fn intent_decision_telemetry(
         "complexity": complexity_label,
         "route": route,
         "user_text_len": user_text_len,
+        "tool_control_enforced": tool_control_enforced,
+        "requirement_reasons": requirement_reasons,
     });
     (summary, metadata)
 }
@@ -179,8 +186,14 @@ mod intent_telemetry_tests {
 
     #[test]
     fn intent_telemetry_maps_fields_and_summary() {
-        let (summary, meta) =
-            intent_decision_telemetry(true, &IntentComplexity::Complex, "tools_required", 42);
+        let (summary, meta) = intent_decision_telemetry(
+            true,
+            &IntentComplexity::Complex,
+            "tools_required",
+            42,
+            true,
+            &["mutation_contract"],
+        );
         assert!(summary.contains("needs_tools=true"), "summary: {summary}");
         assert!(summary.contains("complexity=complex"), "summary: {summary}");
         assert!(
@@ -192,6 +205,8 @@ mod intent_telemetry_tests {
         assert_eq!(meta["complexity"], "complex");
         assert_eq!(meta["route"], "tools_required");
         assert_eq!(meta["user_text_len"], 42);
+        assert_eq!(meta["tool_control_enforced"], true);
+        assert_eq!(meta["requirement_reasons"][0], "mutation_contract");
     }
 
     #[test]
@@ -212,7 +227,14 @@ mod intent_telemetry_tests {
             ),
         ];
         for (complexity, label) in cases {
-            let (_s, meta) = intent_decision_telemetry(false, &complexity, "default_continue", 0);
+            let (_s, meta) = intent_decision_telemetry(
+                false,
+                &complexity,
+                "default_continue",
+                0,
+                false,
+                &["none"],
+            );
             assert_eq!(meta["complexity"], label, "variant should map to {label}");
         }
     }

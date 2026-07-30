@@ -147,7 +147,7 @@ pub mod llm_classifier;
 pub mod relational_prefilter;
 use intent_routing::{
     classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
-    is_internal_maintenance_intent, IntentComplexity,
+    is_internal_maintenance_intent, recognized_artifact_creation_request, IntentComplexity,
 };
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
@@ -271,9 +271,11 @@ pub(crate) use parent_delivery::ParentDeliveryKind;
 mod response_phase;
 #[path = "loop/services.rs"]
 mod services;
+pub(in crate::agent) use history::completion_contract_allows_force_text;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
+pub(in crate::agent) use history::ExecutionRequirement;
 pub(in crate::agent) use history::FollowupMode;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
@@ -972,10 +974,47 @@ impl Agent {
             None
         };
 
+        let backend = crate::execution::active_execution_backend();
+        let mut execution_user_text = user_text.to_string();
+        if backend.kind() != crate::execution::BackendKind::Local {
+            for attachment in attachments {
+                let safe_name: String = attachment
+                    .filename
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                        {
+                            character
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let destination = backend
+                    .workspace_root()
+                    .join(".aidaemon")
+                    .join("inbox")
+                    .join(format!("{}-{}", uuid::Uuid::new_v4(), safe_name));
+                let imported = backend
+                    .import_local_file(std::path::Path::new(&attachment.local_path), &destination)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to import attachment {:?} into the {} execution workspace: {}",
+                            attachment.filename,
+                            backend.kind().as_str(),
+                            error
+                        )
+                    })?;
+                execution_user_text =
+                    execution_user_text.replace(&attachment.local_path, imported.as_str());
+            }
+        }
+
         let reply = self
             .handle_message_impl(
                 session_id,
-                user_text,
+                &execution_user_text,
                 attachments,
                 status_tx,
                 user_role,
@@ -1240,7 +1279,9 @@ mod final_reply_marker_tests {
         let reply = "I am a large language model, trained by Google. How can I help?";
         let sanitized = Agent::sanitize_final_reply_markers(reply);
         assert!(!sanitized.contains("trained by Google"));
-        assert!(sanitized.contains("aidaemon"));
+        assert!(sanitized.contains("your personal AI assistant"));
+        assert!(!sanitized.contains("ChatGPT"));
+        assert!(!sanitized.contains("Gemini"));
     }
 
     #[test]

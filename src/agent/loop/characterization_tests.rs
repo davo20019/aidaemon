@@ -718,7 +718,7 @@ async fn truncation_characterization_keeps_prefix_when_short_tail_repeats_earlie
 }
 
 #[tokio::test]
-async fn background_ack_characterization_forces_text_with_handoff_directive() {
+async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_change() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("background_task", r#"{"job":"long-running"}"#),
         MockProvider::text_response("This model text should be ignored."),
@@ -754,9 +754,8 @@ async fn background_ack_characterization_forces_text_with_handoff_directive() {
     );
     assert!(
         call_log.last().is_some_and(|call| !call.tools.is_empty()
-            && call.options.tool_choice == crate::traits::ToolChoiceMode::None),
-        "background detach retains tool defs (prompt-prefix stability) and \
-         disables calling via tool_choice=none on the forced text pass"
+            && call.options.tool_choice != crate::traits::ToolChoiceMode::None),
+        "an unfulfilled Change contract must retain tool definitions and execution capability"
     );
     assert!(
         call_log.last().is_some_and(|call| {
@@ -1115,16 +1114,13 @@ async fn replay_trace_deferred_planning_text_does_not_stall_before_first_tool_ca
             .any(|entry| matches!(entry.options.response_mode, ResponseMode::JsonSchema { .. })),
         "text-only schema pass should be disabled"
     );
-    // NOTE: ToolChoiceMode::Required is only set when the user text itself is
-    // deterministically classified as needing tools (infer_intent_gate returns
-    // needs_tools=true). For generic queries like this one the INTENT_GATE JSON
-    // in the LLM response does not retroactively flip that flag. Deferred-action
-    // retries still fire (they rely on deferred_no_tool_streak), but they do not
-    // use Required mode unless tools_required_for_turn was already true.
+    // Generic complexity is advisory, so it cannot force a tool call by itself.
+    // Only a finalized mutation/observation contract or the narrow deterministic
+    // intent signal can support guided-model forced recovery.
 }
 
 #[tokio::test]
-async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_call() {
+async fn generic_deferred_no_tool_recovery_does_not_force_required() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(
             "Need to inspect first.\n\
@@ -1156,16 +1152,9 @@ async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_cal
 
     assert_eq!(reply, "Final summary: system inspection completed.");
 
-    // ToolChoiceMode::Required is only set when the user text itself triggers
-    // infer_intent_gate to return needs_tools=true (e.g. explicit filesystem
-    // paths, local execution requests). For a generic user text like
-    // "Inspect my system and summarize it." the deterministic intent gate does
-    // not flag needs_tools, so Required mode is never activated regardless of
-    // the INTENT_GATE JSON embedded in the LLM response. Deferred-action
-    // retries still fire via deferred_no_tool_streak, driving the agent toward
-    // the tool call, but they use the default ToolChoiceMode rather than Required.
-    //
-    // Verify the agent still reached the tool call and produced the final reply.
+    // No finalized concrete tool requirement exists for this generic request.
+    // Deferred-action recovery can still drive the model toward a tool, but it
+    // must not force provider-level Required mode.
     let call_log = harness.provider.call_log.lock().await.clone();
     assert!(
         !call_log.is_empty(),
@@ -1176,6 +1165,132 @@ async fn deferred_no_tool_forced_required_resets_after_first_successful_tool_cal
             .iter()
             .all(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
         "expected no Required tool-choice for a non-tool-classified user text"
+    );
+}
+
+#[tokio::test]
+async fn guided_model_forces_required_only_after_concrete_no_tool_deferral() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("I'll run the command now."),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Command inspection completed."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "guided_concrete_tool_recovery",
+            "Run the command pwd on this machine and summarize the result.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Command inspection completed.");
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log
+            .iter()
+            .any(|entry| matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
+        "guided recovery should force one tool call after the observed deferral"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_model_never_forces_required_after_concrete_no_tool_deferral() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("I'll run the command now."),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("Command inspection completed."),
+    ]);
+
+    let harness = setup_test_agent_with_models(provider, "gpt-5-codex", "gpt-5-codex")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "autonomous_concrete_tool_recovery",
+            "Run the command pwd on this machine and summarize the result.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Command inspection completed.");
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log
+            .iter()
+            .all(|entry| !matches!(entry.options.tool_choice, ToolChoiceMode::Required)),
+        "autonomous models must remain on model-directed tool choice"
+    );
+}
+
+#[tokio::test]
+async fn planner_refined_observation_contract_requires_execution_until_observed() {
+    let mut provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            r#"{
+                "goal": "Compare two approaches using current system evidence",
+                "steps": [
+                    {"description": "Inspect current system evidence", "tool_hint": "system_info"},
+                    {"description": "Compare the approaches", "tool_hint": null}
+                ],
+                "success_criteria": ["The comparison cites inspected evidence"],
+                "contract": {
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true
+                }
+            }"#,
+        ),
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(
+            "Based on the inspected system evidence, approach A is faster; approach B is safer.",
+        ),
+    ]);
+    provider.skip_planning_calls = false;
+
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "planner_refined_contract_tool_state",
+            "Write a comprehensive comparison of approach A and approach B with recommendations.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reply,
+        "Based on the inspected system evidence, approach A is faster; approach B is safer."
+    );
+    let call_log = harness.provider.call_log.lock().await.clone();
+    assert!(
+        call_log.iter().any(|entry| entry
+            .tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "system_info")),
+        "the finalized observation contract must remain execution-required until evidence exists"
     );
 }
 

@@ -172,6 +172,7 @@ pub(in crate::agent) fn summarize_tool_args(name: &str, arguments: &str) -> Stri
             }
         }
         "manage_memories" => get_str("action").unwrap_or("").to_string(),
+        "search_history" => get_str("action").unwrap_or("").to_string(),
 
         // --- Skills ---
         "use_skill" => get_str("skill_name").unwrap_or("").to_string(),
@@ -516,7 +517,18 @@ pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) ->
     ];
 
     for raw in user_text.as_str().split_whitespace() {
-        let token = raw.trim_matches(|c: char| c.is_ascii_punctuation());
+        // Strip prose delimiters without erasing filesystem anchors. Using
+        // `is_ascii_punctuation` here removed the leading `~/`, `/`, `./`, or
+        // `\\` from directory-only paths before the checks below could see it.
+        let token = raw
+            .trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                    )
+            })
+            .trim_end_matches(['.', '!', '?']);
         if token.is_empty() {
             continue;
         }

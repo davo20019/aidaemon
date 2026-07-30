@@ -699,7 +699,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
         .agent
         .handle_message(
             "test_session",
-            "Create a page",
+            "Explain how pagination works",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),

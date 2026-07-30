@@ -1617,6 +1617,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }),
             )
             .await;
+        let result_log_preview = result_metadata
+            .persistent_output
+            .as_deref()
+            .unwrap_or(&result_text)
+            .chars()
+            .take(80)
+            .collect::<String>();
         info!(
             session_id,
             iteration,
@@ -1624,7 +1631,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             is_error,
             execution_failure_kind = ?execution_failure_kind,
             result_len = result_text.len(),
-            result_preview = &result_text.chars().take(80).collect::<String>() as &str,
+            result_preview = %result_log_preview,
             "Tool execution completed"
         );
         if let Some(execution_failure_kind) = execution_failure_kind {
@@ -1946,7 +1953,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
         };
         agent
-            .append_tool_message_with_result_event(
+            .append_tool_message_with_result_event_policy(
                 emitter,
                 &tool_msg,
                 !is_error,
@@ -1957,6 +1964,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     None
                 },
                 Some(task_id),
+                result_metadata.persistent_output.as_deref(),
             )
             .await?;
 
@@ -2043,7 +2051,11 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 activity_type: "tool_call".to_string(),
                 tool_name: Some(tc.name.clone()),
                 tool_args: Some(effective_arguments.chars().take(1000).collect()),
-                result: Some(result_text.chars().take(2000).collect()),
+                result: if result_metadata.suppress_activity_result {
+                    result_metadata.persistent_output.clone()
+                } else {
+                    Some(result_text.chars().take(2000).collect())
+                },
                 success: Some(outcome_satisfied),
                 tokens_used: None,
                 created_at: chrono::Utc::now().to_rfc3339(),

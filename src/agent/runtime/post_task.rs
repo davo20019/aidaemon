@@ -905,6 +905,7 @@ pub(in crate::agent) fn display_tool_call(call: &str) -> String {
     };
     let display_name = match name {
         "manage_memories" => "Searched memories",
+        "search_history" => "Searched exact history",
         "remember_fact" => "Saved to memory",
         "search_files" => "Searched files",
         "read_file" => "Read file",

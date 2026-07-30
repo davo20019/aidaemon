@@ -393,8 +393,12 @@ impl ConfigManagerTool {
         let expanded = crate::config::expand_env_vars(content).map_err(|e| format!("{}", e))?;
 
         // Then check it deserializes into our AppConfig
-        toml::from_str::<AppConfig>(&expanded)
+        let config = toml::from_str::<AppConfig>(&expanded)
             .map_err(|e| format!("Invalid config structure: {}", e))?;
+        config
+            .agent
+            .validated_name()
+            .map_err(|e| format!("Invalid agent configuration: {}", e))?;
 
         Ok(())
     }
@@ -1459,6 +1463,14 @@ fn default_true() -> bool {
     true
 }
 
+fn apply_instruction_for_key(key: &str) -> &'static str {
+    if key == "agent" || key.starts_with("agent.") {
+        "Restart aidaemon to apply agent identity or persona changes."
+    } else {
+        "Run /reload to apply changes."
+    }
+}
+
 fn manage_config_schema() -> Value {
     json!({
         "name": "manage_config",
@@ -1617,9 +1629,10 @@ impl Tool for ConfigManagerTool {
                 tokio::fs::write(&self.config_path, &new_content).await?;
                 set_owner_only_permissions(&self.config_path);
 
+                let apply_instruction = apply_instruction_for_key(&args.key);
                 Ok(format!(
-                    "Updated {} = {}\n\nBackup saved to config.toml.bak. Config validated and saved. Run /reload to apply changes.",
-                    args.key, args.value
+                    "Updated {} = {}\n\nBackup saved to config.toml.bak. Config validated and saved. {}",
+                    args.key, args.value, apply_instruction
                 ))
             }
             "restore" => match self.restore_backup().await {
@@ -1787,6 +1800,13 @@ mod tests {
             bytes <= 950,
             "manage_config schema is {bytes} bytes, budget is 950"
         );
+    }
+
+    #[test]
+    fn agent_config_changes_require_restart() {
+        assert!(apply_instruction_for_key("agent.name").starts_with("Restart"));
+        assert!(apply_instruction_for_key("agent.persona_file").starts_with("Restart"));
+        assert!(apply_instruction_for_key("provider.models.default").starts_with("Run /reload"));
     }
 
     #[test]

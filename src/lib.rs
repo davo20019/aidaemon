@@ -2,6 +2,7 @@ mod agent;
 mod agent_handoff;
 mod backoff;
 mod channels;
+mod checkpoints;
 mod cli_agent_flags;
 mod config;
 mod conversation;
@@ -14,6 +15,7 @@ mod duration_format;
 #[allow(dead_code)]
 mod events;
 pub use events::{EventType, TaskEndData, ToolCallData, UserMessageData};
+pub(crate) mod execution;
 mod execution_policy;
 mod goal_tokens;
 pub mod harness_eval;

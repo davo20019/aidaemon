@@ -1,10 +1,13 @@
 /target
 *.db
+*.db.*
+*.db-*
 *.db.lock
 *.db-shm
 *.db-wal
 .env
 config.toml
+config.toml.*backup*
 *.bak
 *.bak.*
 *.lastgood

@@ -1026,7 +1026,7 @@ pub fn build_system_prompt_with_memory(
         }
         if profile.asks_before_acting {
             prompt.push_str(
-                "- User prefers confirmation before destructive or system-modifying actions (file deletion, deployment, config changes). For read-only exploration (searching files, listing directories, reading code), proceed directly without asking. For multi-step modification tasks, briefly state your plan and confirm before executing.\n",
+                "- An explicit request to create or modify a safe, local, reversible artifact is already authorization: proceed without asking again. Ask for confirmation only before destructive, irreversible, high-impact, or externally visible actions that the user did not explicitly request. Read-only exploration also proceeds directly.\n",
             );
         }
     }
@@ -1144,6 +1144,26 @@ mod tests {
             dir_path: None,
             resources: vec![],
         }
+    }
+
+    #[test]
+    fn explicit_safe_artifact_request_is_pre_authorized_even_for_confirmation_preferring_user() {
+        let profile = UserProfile {
+            asks_before_acting: true,
+            ..UserProfile::default()
+        };
+        let memory = MemoryContext {
+            profile: Some(&profile),
+            ..MemoryContext::default()
+        };
+
+        let prompt =
+            build_system_prompt_with_memory("", &[], &[], &memory, 0, None, &HashMap::new());
+
+        assert!(prompt.contains(
+            "An explicit request to create or modify a safe, local, reversible artifact is already authorization"
+        ));
+        assert!(!prompt.contains("confirm before executing"));
     }
 
     #[test]

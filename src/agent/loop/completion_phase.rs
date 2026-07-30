@@ -41,7 +41,7 @@ pub(super) struct CompletionCtx<'a> {
     pub require_file_recheck_before_answer: &'a mut bool,
     pub completion_progress: &'a mut CompletionProgress,
     pub turn_context: &'a TurnContext,
-    pub needs_tools_for_turn: bool,
+    pub execution_requirement: &'a ExecutionRequirement,
     pub force_text_response: &'a mut bool,
     pub execution_state: &'a mut ExecutionState,
     pub validation_state: &'a mut ValidationState,
@@ -143,8 +143,15 @@ pub(super) async fn run_completion_phase(
     let mut completion_progress = ctx.completion_progress.clone();
     let mut validation_state = ctx.validation_state.clone();
     let turn_context = ctx.turn_context;
-    let needs_tools_for_turn = ctx.needs_tools_for_turn;
-    let mut force_text_response = *ctx.force_text_response;
+    let execution_requirement = ctx.execution_requirement;
+    let guided_tool_recovery = agent.trust_tier_for_model(&model)
+        == crate::agent::trust_tier::ModelTrustTier::Guided
+        && execution_requirement.requires_execution();
+    let force_text_allowed = completion_contract_allows_force_text(
+        &turn_context.completion_contract,
+        &completion_progress,
+    );
+    let mut force_text_response = *ctx.force_text_response && force_text_allowed;
     let mut force_text_fast_path_accepted = false;
     let execution_state = &mut *ctx.execution_state;
     #[cfg(feature = "computer_use")]
@@ -327,10 +334,11 @@ pub(super) async fn run_completion_phase(
             // Fall through to the normal completion path (sanitize + return)
         } else if should_enforce_no_tool_text_when_tools_required(
             &reply,
-            needs_tools_for_turn,
+            guided_tool_recovery,
             learning_ctx.tool_calls.len(),
             agent.depth,
-        ) {
+        ) && !reply_admits_unfulfilled_request(&reply)
+        {
             if tool_defs.is_empty() || force_text_response {
                 if !force_text_response {
                     // Only show the "no tools available" message when tools are genuinely
@@ -525,7 +533,7 @@ pub(super) async fn run_completion_phase(
 
         if agent.depth == 0
             && total_successful_tool_calls == 0
-            && needs_tools_for_turn
+            && execution_requirement.requires_execution()
             && !used_identity_prefill
             && looks_like_deferred_action_response(&reply)
             && !is_substantive_text_response(&reply, 200)
@@ -1797,15 +1805,17 @@ pub(super) async fn run_completion_phase(
                             // A claimed-but-unexecuted mutation always needs a
                             // tool call — never downgrade it to plain-text mode,
                             // which would accept the fabrication next iteration.
-                            if needs_tools_for_turn
+                            if execution_requirement.requires_execution()
                                 || response_claims_needs_tools
                                 || claims_unfulfilled_mutation
                                 || claims_unfulfilled_delegation
                             {
                                 SystemDirective::DeferredToolCallRequired
-                            } else {
+                            } else if force_text_allowed {
                                 force_text_response = true;
                                 SystemDirective::ToolModeDisabledPlainText
+                            } else {
+                                SystemDirective::DeferredToolCallRequired
                             }
                         } else if incomplete_live_work_summary || incomplete_retry_plan {
                             SystemDirective::LiveWorkPivotRequired

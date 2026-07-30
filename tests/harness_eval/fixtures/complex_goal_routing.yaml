@@ -7,7 +7,6 @@ mock_responses:
   - text: "This requires three phases: inspect the auth module, refactor and test it, then deploy the verified result to staging."
 expect:
   llm_calls_min: 1
-  # The fixture verifies routing. Request keywords alone must not turn an
-  # informative planning answer into a failed or partial execution claim.
-  outcome: succeeded
-  overall_min: 0.4
+  # This mutation/deploy contract did not execute any mutation, so an
+  # informative planning answer must not be persisted as success.
+  outcome: failed

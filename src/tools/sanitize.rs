@@ -167,12 +167,16 @@ static MODEL_IDENTITY_LEAKS: Lazy<Vec<Regex>> = Lazy::new(|| {
     ]
 });
 
-/// Strip model identity leak phrases from a reply, replacing with aidaemon identity.
+/// Strip underlying-model identity leak phrases from a reply.
+///
+/// Keep the replacement name-neutral because the user-facing agent identity is
+/// configurable and this sanitizer is also used by background delivery paths
+/// that do not carry the active agent profile.
 pub fn strip_model_identity_leaks(content: &str) -> String {
     let mut result = content.to_string();
     for pattern in MODEL_IDENTITY_LEAKS.iter() {
         result = pattern
-            .replace_all(&result, "I'm aidaemon, your personal AI assistant.")
+            .replace_all(&result, "I'm your personal AI assistant.")
             .to_string();
     }
     result
@@ -681,6 +685,7 @@ fn friendly_tool_label(name: &str) -> String {
         "terminal" | "run_command" => "running a command",
         "web_search" => "searching the web",
         "web_fetch" => "fetching a page",
+        "search_history" => "checking exact history",
         "manage_memories" | "remember_fact" | "manage_people" => "updating memory",
         other => other,
     }
@@ -775,6 +780,7 @@ const INTERNAL_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "remember_fact",
     "manage_memories",
+    "search_history",
     "system_info",
     "send_file",
     "search_files",
@@ -858,7 +864,7 @@ static STANDALONE_WRAPPED_TOOL_NAME: Lazy<Regex> = Lazy::new(|| {
 
 fn tool_capability_label(name: &str) -> &'static str {
     match name {
-        "goal_trace" | "tool_trace" => "execution history",
+        "goal_trace" | "tool_trace" | "search_history" => "execution history",
         "system_info" => "system information",
         "check_environment" => "environment checks",
         "manage_config" | "config_manager" => "configuration management",

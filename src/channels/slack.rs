@@ -848,7 +848,7 @@ impl SlackChannel {
             let session_id = self.build_session_id(&channel_id, thread_ts.as_deref());
             let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
             let (reply, buttons) = self
-                .dispatch_command_with_buttons(&agent_text, &session_id)
+                .dispatch_command_with_buttons(&agent_text, &session_id, user_role)
                 .await;
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
             let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
@@ -1618,7 +1618,9 @@ impl SlackChannel {
                     .and_then(|v| v.as_str());
                 let session_id = self.build_session_id(channel_id, thread_ts);
                 let cmd_text = format!("/{}", command);
-                let reply = self.dispatch_command(&cmd_text, &session_id).await;
+                let reply = self
+                    .dispatch_command(&cmd_text, &session_id, UserRole::Owner)
+                    .await;
 
                 // Respond via response_url to update the message
                 if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
@@ -1715,7 +1717,9 @@ impl SlackChannel {
         };
 
         let session_id = self.build_session_id(channel_id, None);
-        let reply = self.dispatch_command(&cmd_text, &session_id).await;
+        let reply = self
+            .dispatch_command(&cmd_text, &session_id, UserRole::Owner)
+            .await;
 
         // Respond via response_url if available
         if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
@@ -1732,7 +1736,7 @@ impl SlackChannel {
 
     /// Dispatch a command string and return the reply text.
     /// Accepts both `/command` and `!command` syntax (Slack reserves `/` for native slash commands).
-    async fn dispatch_command(&self, text: &str, session_id: &str) -> String {
+    async fn dispatch_command(&self, text: &str, session_id: &str, user_role: UserRole) -> String {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
         // Normalize !prefix to /prefix so !restart works like /restart in Slack
         let normalized_cmd = if let Some(stripped) = parts[0].strip_prefix('!') {
@@ -1750,7 +1754,7 @@ impl SlackChannel {
             task_registry: Arc::clone(&self.task_registry),
             config_path: self.config_path.clone(),
         };
-        if let Some(reply) = ctx.dispatch(cmd, arg, session_id).await {
+        if let Some(reply) = ctx.dispatch(cmd, arg, session_id, user_role).await {
             return reply;
         }
 
@@ -1773,8 +1777,9 @@ impl SlackChannel {
         &self,
         text: &str,
         session_id: &str,
+        user_role: UserRole,
     ) -> (String, Vec<Value>) {
-        let reply = self.dispatch_command(text, session_id).await;
+        let reply = self.dispatch_command(text, session_id, user_role).await;
 
         // Normalize the command to determine which buttons to show
         let parts: Vec<&str> = text.splitn(2, ' ').collect();

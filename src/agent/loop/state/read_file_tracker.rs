@@ -100,13 +100,15 @@ async fn canonical_path_from_value(args: &Value) -> Option<String> {
     let path = ["path", "file_path", "file", "filename"]
         .iter()
         .find_map(|key| args.get(*key).and_then(Value::as_str))?;
-    let normalized = fs_utils::validate_path(path).ok()?;
+    let backend = crate::execution::active_execution_backend();
+    let normalized = backend.resolve_path(path).await.ok()?;
     Some(
-        tokio::fs::canonicalize(&normalized)
+        backend
+            .canonicalize(&normalized)
             .await
             .unwrap_or(normalized)
-            .to_string_lossy()
-            .into_owned(),
+            .as_str()
+            .to_string(),
     )
 }
 

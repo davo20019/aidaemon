@@ -1,41 +1,30 @@
 use crate::traits::Message;
-use chrono::{DateTime, Utc};
 
-/// Calculate a memory score that combines similarity, recency, and recall patterns.
-///
-/// This function implements a decay-and-reinforcement model where:
-/// - Recent memories are more accessible
-/// - Frequently recalled memories are stronger
-/// - Recently recalled memories get a boost
-///
-/// Returns a score between 0.0 and 1.0+ (can exceed 1.0 with high recall counts).
-pub fn memory_score(
-    similarity: f32,
-    created_at: DateTime<Utc>,
-    recall_count: i32,
-    last_recalled: Option<DateTime<Utc>>,
-) -> f32 {
-    let now = Utc::now();
+/// Episodic search ranking should express semantic relevance, not make an old
+/// conversation effectively undiscoverable. Recall adds only a small bounded
+/// reinforcement and age is intentionally absent.
+pub fn episode_search_score(similarity: f32, recall_count: i32) -> f32 {
+    let recall_boost = 1.0 + ((recall_count.max(0) as f32 + 1.0).ln() * 0.04).min(0.16);
+    similarity * recall_boost
+}
 
-    // Recency decay: memories lose relevance over time
-    // Half-life of roughly 10 days
-    let days_since_created = (now - created_at).num_hours() as f32 / 24.0;
-    let recency_decay = 1.0 / (1.0 + days_since_created * 0.1);
-
-    // Recall boost: frequently recalled memories are stronger
-    // Capped at 50% boost (after 5 recalls)
-    let recall_boost = 1.0 + (recall_count as f32 * 0.1).min(0.5);
-
-    // Recall recency: recently recalled memories get an additional boost
-    // Decays over time since last recall
-    let recall_recency = last_recalled
-        .map(|t| {
-            let days_since_recall = (now - t).num_hours() as f32 / 24.0;
-            1.0 / (1.0 + days_since_recall * 0.05)
-        })
-        .unwrap_or(1.0);
-
-    similarity * recency_decay * recall_boost * recall_recency
+/// Deterministic degraded-mode relevance when the embedding service is
+/// unavailable. Short terms are retained and only exact word overlap scores.
+pub fn lexical_relevance(query: &str, text: &str) -> f32 {
+    let tokens = |value: &str| {
+        value
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let query_tokens = tokens(query);
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let text_tokens = tokens(text);
+    query_tokens.intersection(&text_tokens).count() as f32 / query_tokens.len() as f32
 }
 
 /// Calculate episode importance based on various factors.

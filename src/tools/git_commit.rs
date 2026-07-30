@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::active_execution_backend;
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 use super::fs_utils;
@@ -69,16 +70,19 @@ impl Tool for GitCommitTool {
                 .collect()
         });
         let path_str = args["path"].as_str().unwrap_or(".");
-        let repo_dir = fs_utils::validate_path(path_str)?;
+        let backend = active_execution_backend();
+        let repo_dir = backend.resolve_path(path_str).await?;
 
         // Verify git repo
-        let check = fs_utils::run_cmd("git rev-parse --git-dir", Some(&repo_dir), 5).await?;
+        let check =
+            fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&repo_dir), 5).await?;
         if check.exit_code != 0 {
             anyhow::bail!("Not a git repository: {}", path_str);
         }
 
         // Check for changes
-        let status = fs_utils::run_cmd("git status --porcelain", Some(&repo_dir), 5).await?;
+        let status =
+            fs_utils::run_cmd_backend("git status --porcelain", Some(&repo_dir), 5).await?;
         if status.exit_code != 0 {
             anyhow::bail!("Failed to get git status: {}", status.stderr);
         }
@@ -95,13 +99,13 @@ impl Tool for GitCommitTool {
             }
             for file in specific_files {
                 let add_cmd = format!("git add -- '{}'", file.replace('\'', "'\\''"));
-                let add_result = fs_utils::run_cmd(&add_cmd, Some(&repo_dir), 5).await?;
+                let add_result = fs_utils::run_cmd_backend(&add_cmd, Some(&repo_dir), 5).await?;
                 if add_result.exit_code != 0 {
                     anyhow::bail!("Failed to stage '{}': {}", file, add_result.stderr);
                 }
             }
         } else {
-            let add_result = fs_utils::run_cmd("git add -A", Some(&repo_dir), 10).await?;
+            let add_result = fs_utils::run_cmd_backend("git add -A", Some(&repo_dir), 10).await?;
             if add_result.exit_code != 0 {
                 anyhow::bail!("Failed to stage changes: {}", add_result.stderr);
             }
@@ -110,7 +114,7 @@ impl Tool for GitCommitTool {
         // Commit
         let escaped_message = message.replace('\'', "'\\''");
         let commit_cmd = format!("git commit -m '{}'", escaped_message);
-        let commit_result = fs_utils::run_cmd(&commit_cmd, Some(&repo_dir), 30).await?;
+        let commit_result = fs_utils::run_cmd_backend(&commit_cmd, Some(&repo_dir), 30).await?;
 
         if commit_result.exit_code != 0 {
             anyhow::bail!("Commit failed: {}", commit_result.stderr);
@@ -118,7 +122,7 @@ impl Tool for GitCommitTool {
 
         // Get commit hash
         let hash_result =
-            fs_utils::run_cmd("git log -1 --format='%H %h %s'", Some(&repo_dir), 5).await?;
+            fs_utils::run_cmd_backend("git log -1 --format='%H %h %s'", Some(&repo_dir), 5).await?;
 
         let mut output = String::new();
         output.push_str("Commit successful!\n\n");

@@ -881,7 +881,7 @@ async fn test_high_risk_critique_pass_replans_before_external_execution() {
             r#"{"verdict":"replan","issues":["Missing evidence: the plan jumps straight to an external write without first inspecting the current target state."],"summary":"The plan should inspect the target state before performing the external write."}"#,
         ),
         MockProvider::text_response(
-            "I need to inspect the target state before I perform the external write.",
+            "I couldn't complete the requested external write safely because the required target-state evidence was unavailable.",
         ),
     ]);
 
@@ -906,8 +906,8 @@ async fn test_high_risk_critique_pass_replans_before_external_execution() {
         .unwrap();
 
     assert!(
-        !response.is_empty(),
-        "expected the loop to return a non-empty retry response after critique rejection"
+        response.contains("couldn't complete"),
+        "expected an honest partial response after critique rejection, got {response:?}"
     );
 
     let call_log = harness.provider.call_log.lock().await.clone();

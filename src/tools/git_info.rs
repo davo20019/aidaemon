@@ -1,8 +1,7 @@
-use std::path::Path;
-
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, BackendPath};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 use super::fs_utils;
@@ -63,18 +62,13 @@ impl Tool for GitInfoTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let path_str = args["path"].as_str().unwrap_or(".");
-        let repo_dir = fs_utils::validate_path(path_str)?;
+        let backend = active_execution_backend();
+        let repo_dir = backend.resolve_path(path_str).await?;
 
-        if !repo_dir.join(".git").exists() && !repo_dir.join("../.git").exists() {
-            // Check if we're in a subdirectory of a git repo
-            if let Ok(out) = fs_utils::run_cmd("git rev-parse --git-dir", Some(&repo_dir), 5).await
-            {
-                if out.exit_code != 0 {
-                    anyhow::bail!("Not a git repository: {}", path_str);
-                }
-            } else {
-                anyhow::bail!("Not a git repository: {}", path_str);
-            }
+        let check =
+            fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&repo_dir), 5).await?;
+        if check.exit_code != 0 {
+            anyhow::bail!("Not a git repository: {}", path_str);
         }
 
         let sections: Vec<String> = if let Some(arr) = args["include"].as_array() {
@@ -119,18 +113,20 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-async fn get_status(dir: &Path) -> String {
+async fn get_status(dir: &BackendPath) -> String {
     let mut result = String::new();
 
     // Branch
-    if let Ok(out) = fs_utils::run_cmd("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await {
+    if let Ok(out) =
+        fs_utils::run_cmd_backend("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
+    {
         if out.exit_code == 0 {
             result.push_str(&format!("Branch: {}\n", out.stdout.trim()));
         }
     }
 
     // Status
-    if let Ok(out) = fs_utils::run_cmd("git status --porcelain", Some(dir), 5).await {
+    if let Ok(out) = fs_utils::run_cmd_backend("git status --porcelain", Some(dir), 5).await {
         if out.exit_code == 0 {
             let lines: Vec<&str> = out.stdout.lines().collect();
             if lines.is_empty() {
@@ -148,7 +144,7 @@ async fn get_status(dir: &Path) -> String {
     }
 
     // Ahead/behind
-    if let Ok(out) = fs_utils::run_cmd(
+    if let Ok(out) = fs_utils::run_cmd_backend(
         "git rev-list --left-right --count HEAD...@{upstream}",
         Some(dir),
         5,
@@ -170,8 +166,8 @@ async fn get_status(dir: &Path) -> String {
     result
 }
 
-async fn get_log(dir: &Path) -> String {
-    if let Ok(out) = fs_utils::run_cmd(
+async fn get_log(dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(
         "git log --oneline -10 --format='%h %s (%cr, %an)'",
         Some(dir),
         5,
@@ -185,8 +181,8 @@ async fn get_log(dir: &Path) -> String {
     String::new()
 }
 
-async fn get_branches(dir: &Path) -> String {
-    if let Ok(out) = fs_utils::run_cmd(
+async fn get_branches(dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend(
         "git branch -a --format='%(refname:short) %(upstream:short) %(upstream:track)'",
         Some(dir),
         5,
@@ -200,8 +196,8 @@ async fn get_branches(dir: &Path) -> String {
     String::new()
 }
 
-async fn get_remotes(dir: &Path) -> String {
-    if let Ok(out) = fs_utils::run_cmd("git remote -v", Some(dir), 5).await {
+async fn get_remotes(dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend("git remote -v", Some(dir), 5).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
@@ -209,8 +205,8 @@ async fn get_remotes(dir: &Path) -> String {
     String::new()
 }
 
-async fn get_diff(dir: &Path) -> String {
-    if let Ok(out) = fs_utils::run_cmd("git diff --stat", Some(dir), 10).await {
+async fn get_diff(dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend("git diff --stat", Some(dir), 10).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }
@@ -218,8 +214,8 @@ async fn get_diff(dir: &Path) -> String {
     String::new()
 }
 
-async fn get_stash(dir: &Path) -> String {
-    if let Ok(out) = fs_utils::run_cmd("git stash list", Some(dir), 5).await {
+async fn get_stash(dir: &BackendPath) -> String {
+    if let Ok(out) = fs_utils::run_cmd_backend("git stash list", Some(dir), 5).await {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             return out.stdout.clone();
         }

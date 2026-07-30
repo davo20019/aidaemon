@@ -164,25 +164,101 @@ impl crate::traits::MessageStore for SqliteStateStore {
             }
         }
 
-        // Delete session rows across canonical tables.
-        // Some test DBs may not have all tables yet; treat missing tables as best-effort.
+        // Remove every active-database projection that can contain verbatim
+        // conversation text. Keep the logical deletion atomic: a damaged FTS
+        // index or foreign-key failure rolls everything back instead of
+        // reporting a successful partial wipe.
+        let mut tx = self.pool.begin().await?;
+        super::history_search::remove_session_projection_in_tx(&mut tx, session_id).await?;
+        sqlx::query(
+            "UPDATE facts SET source_excerpt = NULL
+             WHERE id IN (
+                 SELECT source_fact_id FROM memory_claims
+                 WHERE source_fact_id IS NOT NULL
+                   AND (
+                       source_span_id IN (
+                           SELECT id FROM memory_spans WHERE session_id = ?
+                       )
+                       OR source_event_id IN (
+                           SELECT id FROM events WHERE session_id = ?
+                       )
+                   )
+             )",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE memory_claims
+             SET source_span_id = NULL, source_event_id = NULL,
+                 provenance = CASE
+                     WHEN provenance = '' THEN 'source_session_wiped'
+                     ELSE provenance || ';source_session_wiped'
+                 END
+             WHERE source_span_id IN (
+                       SELECT id FROM memory_spans WHERE session_id = ?
+                   )
+                OR source_event_id IN (
+                       SELECT id FROM events WHERE session_id = ?
+                   )",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM memory_embeddings
+             WHERE owner_type = 'span'
+               AND owner_id IN (
+                   SELECT CAST(id AS TEXT) FROM memory_spans WHERE session_id = ?
+               )",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        // Durable goals survive the wipe, but cannot retain a foreign-key
+        // pointer back to an erased episode.
+        sqlx::query(
+            "UPDATE goals SET source_episode_id = NULL
+             WHERE source_episode_id IN (
+                 SELECT id FROM episodes WHERE session_id = ?
+             )",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+
         for table in [
+            "memory_spans",
+            "episodes",
             "events",
             "conversation_summaries",
             "session_context_boundaries",
+            "dialogue_states",
+            "task_plans",
+            "notification_queue",
+            "cli_agent_invocations",
+            "session_channels",
+            "pending_oauth_flows",
         ] {
-            let query = format!("DELETE FROM {table} WHERE session_id = ?");
-            if let Err(e) = sqlx::query(&query)
-                .bind(session_id)
-                .execute(&self.pool)
-                .await
-            {
-                let missing_table = format!("no such table: {table}");
-                if !e.to_string().contains(&missing_table) {
-                    return Err(e.into());
-                }
+            let table_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            )
+            .bind(table)
+            .fetch_one(&mut *tx)
+            .await?;
+            if table_exists == 0 {
+                continue;
             }
+            let query = format!("DELETE FROM {table} WHERE session_id = ?");
+            sqlx::query(&query)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
         }
+        tx.commit().await?;
+        super::history_search::checkpoint_after_wipe(&self.pool).await?;
         Ok(())
     }
 

@@ -370,6 +370,7 @@ impl Agent {
             "terminal",
             "remember_fact",
             "manage_memories",
+            "search_history",
             "manage_people",
             "web_search",
             "web_fetch",
@@ -467,6 +468,60 @@ impl Agent {
     /// internal/system sessions, never in group or public conversations.
     const DESKTOP_CONTROL_TOOLS: &'static [&'static str] = &["computer_use"];
 
+    fn request_has_explicit_desktop_control_cue(user_message: &str) -> bool {
+        const DESKTOP_CUES: &[&str] = &[
+            "computer use",
+            "computer_use",
+            "desktop",
+            "gui",
+            "screen",
+            "screenshot",
+            "window",
+            "click",
+            "tap",
+            "mouse",
+            "keyboard",
+            "button",
+            "menu",
+            "scroll",
+            "drag",
+            "application",
+            "app",
+            "finder",
+            "calculator",
+            "textedit",
+            "preview",
+            "safari",
+            "chrome",
+            "xcode",
+            "system settings",
+        ];
+        DESKTOP_CUES
+            .iter()
+            .any(|cue| contains_keyword_as_words(user_message, cue))
+    }
+
+    /// A concrete local path does not imply a GUI task. Keep desktop automation
+    /// out of the model's fallback set for filesystem-only requests, while
+    /// preserving it when the user explicitly names a GUI/app interaction.
+    pub(crate) fn restrict_desktop_control_for_request(
+        defs: &mut Vec<Value>,
+        caps: &mut HashMap<String, ToolCapabilities>,
+        user_message: &str,
+    ) {
+        if !user_text_references_filesystem_path(user_message)
+            || Self::request_has_explicit_desktop_control_cue(user_message)
+        {
+            return;
+        }
+        defs.retain(|d| {
+            Self::tool_name_from_definition(d)
+                .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
+                .unwrap_or(true)
+        });
+        caps.retain(|name, _| !Self::DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
+    }
+
     /// Whether desktop-control tools may be exposed in a conversation of this
     /// visibility. Only direct messages (`Private`) and internal/system sessions
     /// (`Internal`, e.g. the scheduler or spawned sub-agents) qualify. Group and
@@ -518,6 +573,7 @@ impl Agent {
         // Desktop control is owner-machine-only: never expose it outside DMs and
         // internal sessions, so a shared-channel message can't trigger it.
         Self::restrict_desktop_control_for_visibility(&mut defs, &mut caps, channel_visibility);
+        Self::restrict_desktop_control_for_request(&mut defs, &mut caps, user_message);
 
         let base_defs = defs.clone();
         defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
@@ -669,6 +725,50 @@ mod tests {
             );
             assert!(caps.contains_key("computer_use"));
         }
+    }
+
+    #[test]
+    fn filesystem_only_request_strips_computer_use_but_keeps_terminal() {
+        let mut defs = vec![named_tool_def("computer_use"), named_tool_def("terminal")];
+        let mut caps = HashMap::from([
+            ("computer_use".to_string(), ToolCapabilities::default()),
+            ("terminal".to_string(), ToolCapabilities::default()),
+        ]);
+
+        Agent::restrict_desktop_control_for_request(
+            &mut defs,
+            &mut caps,
+            "How many projects do I have at ~/projects?",
+        );
+
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(Agent::tool_name_from_definition)
+            .collect();
+        assert!(!names.contains(&"computer_use"));
+        assert!(names.contains(&"terminal"));
+        assert!(!caps.contains_key("computer_use"));
+        assert!(caps.contains_key("terminal"));
+    }
+
+    #[test]
+    fn explicit_finder_request_keeps_computer_use_for_local_path() {
+        let mut defs = vec![named_tool_def("computer_use")];
+        let mut caps = HashMap::from([("computer_use".to_string(), ToolCapabilities::default())]);
+
+        Agent::restrict_desktop_control_for_request(
+            &mut defs,
+            &mut caps,
+            "Open ~/projects in Finder",
+        );
+
+        assert_eq!(
+            defs.iter()
+                .filter_map(Agent::tool_name_from_definition)
+                .collect::<Vec<_>>(),
+            vec!["computer_use"]
+        );
+        assert!(caps.contains_key("computer_use"));
     }
 
     proptest! {

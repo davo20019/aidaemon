@@ -21,12 +21,12 @@ use crate::tools::ComputerUseTool;
 use crate::tools::ReadChannelHistoryTool;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ManageApiTool,
-    ManageCliAgentsTool, ManageHttpAuthTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool,
-    ManagePeopleTool, PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool,
-    RunCommandTool, ScheduledGoalRunsTool, SearchFilesTool, SendFileTool, ServiceStatusTool,
-    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
+    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMcpTool,
+    ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ProjectInspectTool,
+    ReadFileTool, RememberFactTool, RunCommandTool, ScheduledGoalRunsTool, SearchFilesTool,
+    SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool, SpawnAgentTool,
+    SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::traits::store_prelude::*;
 use crate::traits::Tool;
@@ -34,6 +34,7 @@ use crate::types::MediaMessage;
 
 pub struct BaseToolsBundle {
     pub tools: Vec<Arc<dyn Tool>>,
+    pub execution_backend: crate::execution::SharedExecutionBackend,
     pub approval_tx: ApprovalBroker,
     pub approval_rx: mpsc::Receiver<ApprovalRequest>,
     pub media_tx: mpsc::Sender<MediaMessage>,
@@ -59,6 +60,7 @@ enum BaseToolId {
     RememberFact,
     ShareMemory,
     ManageMemories,
+    SearchHistory,
     ScheduledGoalRuns,
     GoalTrace,
     ToolTrace,
@@ -103,6 +105,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
         name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::SearchHistory,
+        name: "search_history",
     },
     BaseToolSpec {
         id: BaseToolId::ScheduledGoalRuns,
@@ -395,6 +401,24 @@ pub async fn build_base_tools(
     approval_queue_capacity: usize,
     media_queue_capacity: usize,
 ) -> anyhow::Result<BaseToolsBundle> {
+    let execution_backend = crate::execution::install_execution_backend(
+        crate::execution::build_execution_backend(&config.execution, &config_path).await?,
+    )?;
+    info!(
+        backend = execution_backend.kind().as_str(),
+        backend_id = execution_backend.id(),
+        workspace = execution_backend.workspace_root().as_str(),
+        confined = !execution_backend.allows_outside_workspace(),
+        "Initialized agent execution environment"
+    );
+    let checkpoint_manager = crate::checkpoints::install_manager(
+        &config.checkpoints,
+        state.pool(),
+        event_store.clone(),
+        execution_backend.clone(),
+    )
+    .await?;
+
     let (approval_tx, approval_rx) = mpsc::channel(approval_queue_capacity);
     let approval_tx = ApprovalBroker::new(approval_tx);
     let (media_tx, media_rx) = mpsc::channel::<MediaMessage>(media_queue_capacity);
@@ -428,9 +452,14 @@ pub async fn build_base_tools(
         }
         tools.push(built.tool);
     }
+    if checkpoint_manager.is_some() && config.tools.is_enabled("list_checkpoints") {
+        tools.push(Arc::new(ListCheckpointsTool));
+        info!("Registered list_checkpoints for the enabled checkpoint manager");
+    }
 
     Ok(BaseToolsBundle {
         tools,
+        execution_backend,
         approval_tx,
         approval_rx,
         media_tx,
@@ -864,6 +893,13 @@ async fn build_base_tool(
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
             tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            terminal_tool: None,
+        },
+        BaseToolId::SearchHistory => BuiltBaseTool {
+            tool: Arc::new(SearchHistoryTool::new(
+                state,
+                config.state.retention.messages_days,
+            )),
             terminal_tool: None,
         },
         BaseToolId::ScheduledGoalRuns => BuiltBaseTool {

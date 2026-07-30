@@ -10,6 +10,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use crate::execution::{active_execution_backend, BackendKind, WriteMode};
+
 /// Base directory for spilled tool results, under the OS temp dir
 /// (`std::env::temp_dir()` honors `TMPDIR`/`%TEMP%`, cross-platform). Spilled
 /// results are ephemeral scratch read within the session, not persistent state,
@@ -47,6 +49,75 @@ pub fn build_spilled_preview(
     max_chars: usize,
 ) -> Option<String> {
     build_spilled_preview_in(spill_dir()?, tool_name, session_id, full_text, max_chars)
+}
+
+/// Backend-aware spill used by the agent loop. Local execution preserves the
+/// historical OS-temp behavior; Docker/SSH store the recovery artifact inside
+/// the execution workspace so both `read_file` and `terminal` can see it.
+pub async fn build_spilled_preview_for_backend(
+    tool_name: &str,
+    session_id: &str,
+    full_text: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let backend = active_execution_backend();
+    if backend.kind() == BackendKind::Local {
+        return build_spilled_preview(tool_name, session_id, full_text, max_chars);
+    }
+
+    let pure_json_value: Option<serde_json::Value> = serde_json::from_str(full_text).ok();
+    let (stored_text, extension, pure_json) = if let Some(ref value) = pure_json_value {
+        (
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| full_text.to_string()),
+            "json",
+            true,
+        )
+    } else {
+        (full_text.to_string(), "txt", false)
+    };
+    let embedded_value;
+    let summary_value = if pure_json {
+        pure_json_value.as_ref()
+    } else {
+        embedded_value = extract_embedded_json(full_text);
+        embedded_value.as_ref()
+    };
+    let short_id: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect();
+    let path = backend
+        .workspace_root()
+        .join(".aidaemon")
+        .join("tool_results")
+        .join(sanitize_session_id(session_id))
+        .join(format!("{tool_name}-{short_id}.{extension}"));
+    backend
+        .write(&path, stored_text.as_bytes(), WriteMode::Overwrite, true)
+        .await
+        .ok()?;
+
+    let total_chars = stored_text.chars().count();
+    let head_chars = max_chars
+        .saturating_sub(SPILL_ANNOTATION_RESERVE)
+        .max(256)
+        .min(max_chars);
+    let head: String = stored_text.chars().take(head_chars).collect();
+    let shown_chars = head.chars().count();
+    let summary = summary_value
+        .map(json_structure_summary)
+        .unwrap_or_default();
+    let summary_block = if summary.is_empty() {
+        String::new()
+    } else {
+        format!("{summary}\n\n")
+    };
+    Some(format!(
+        "{head}\n\n{summary_block}{}",
+        spill_notice(shown_chars, total_chars, path.as_str(), pure_json)
+    ))
 }
 
 /// Try to extract the first complete JSON value embedded anywhere in `text`.
@@ -268,6 +339,68 @@ pub fn prune_spill_dir() {
     }
     for path in files_to_evict(entries, now, SPILL_MAX_AGE, SPILL_MAX_TOTAL_BYTES) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Prune spill files from the same filesystem that stores them.
+pub async fn prune_spill_dir_for_backend() {
+    let backend = active_execution_backend();
+    if backend.kind() == BackendKind::Local {
+        prune_spill_dir();
+        return;
+    }
+
+    let root = backend
+        .workspace_root()
+        .join(".aidaemon")
+        .join("tool_results");
+    let Ok(sessions) = backend.read_dir(&root).await else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    for session in sessions {
+        if !session.metadata.is_dir() {
+            continue;
+        }
+        let Ok(files) = backend.read_dir(&session.path).await else {
+            continue;
+        };
+        for file in files {
+            if file.metadata.is_file() {
+                entries.push((
+                    file.path,
+                    file.metadata.modified.unwrap_or(now),
+                    file.metadata.len,
+                ));
+            }
+        }
+    }
+
+    let mut evicted = Vec::new();
+    entries.retain(|(path, modified, _)| {
+        let too_old = now
+            .duration_since(*modified)
+            .map(|age| age > SPILL_MAX_AGE)
+            .unwrap_or(false);
+        if too_old {
+            evicted.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    entries.sort_by_key(|(_, modified, _)| *modified);
+    let mut total: u64 = entries.iter().map(|(_, _, size)| *size).sum();
+    for (path, _, size) in entries {
+        if total <= SPILL_MAX_TOTAL_BYTES {
+            break;
+        }
+        total = total.saturating_sub(size);
+        evicted.push(path);
+    }
+    for path in evicted {
+        let _ = backend.remove_file(&path).await;
     }
 }
 

@@ -263,6 +263,17 @@ pub trait EpisodeStore: Send + Sync {
     ) -> anyhow::Result<Vec<super::Episode>> {
         Ok(vec![])
     }
+
+    /// Get episodes only from one canonical session (used by untrusted
+    /// internal/sub-agent origins).
+    async fn get_relevant_episodes_for_session(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _session_id: &str,
+    ) -> anyhow::Result<Vec<super::Episode>> {
+        Ok(vec![])
+    }
 }
 
 /// Token usage persistence.

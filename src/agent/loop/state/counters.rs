@@ -12,7 +12,6 @@ pub(in crate::agent) struct LoopCounters {
     deferred_no_tool_streak: usize,
     deferred_no_tool_model_switches: usize,
     personal_memory_tool_calls: usize,
-    needs_tools_for_turn: bool,
 }
 
 pub(in crate::agent) struct StoppingCountersState<'a> {
@@ -24,14 +23,12 @@ pub(in crate::agent) struct StoppingCountersState<'a> {
 pub(in crate::agent) struct LlmCountersState {
     pub total_successful_tool_calls: usize,
     pub deferred_no_tool_streak: usize,
-    pub tools_required_for_turn: bool,
 }
 
 pub(in crate::agent) struct ResponseCountersState<'a> {
     pub total_successful_tool_calls: usize,
     pub deferred_no_tool_streak: &'a mut usize,
     pub deferred_no_tool_model_switches: &'a mut usize,
-    pub needs_tools_for_turn: &'a mut bool,
 }
 
 pub(in crate::agent) struct ToolExecutionCountersState<'a> {
@@ -45,13 +42,6 @@ pub(in crate::agent) struct ToolExecutionCountersState<'a> {
 }
 
 impl LoopCounters {
-    pub(in crate::agent) fn new(needs_tools_for_turn: bool) -> Self {
-        Self {
-            needs_tools_for_turn,
-            ..Self::default()
-        }
-    }
-
     pub(in crate::agent) fn for_stopping_phase(&mut self) -> StoppingCountersState<'_> {
         StoppingCountersState {
             deferred_no_tool_streak: self.deferred_no_tool_streak,
@@ -64,7 +54,6 @@ impl LoopCounters {
         LlmCountersState {
             total_successful_tool_calls: self.total_successful_tool_calls,
             deferred_no_tool_streak: self.deferred_no_tool_streak,
-            tools_required_for_turn: self.needs_tools_for_turn,
         }
     }
 
@@ -73,7 +62,6 @@ impl LoopCounters {
             total_successful_tool_calls: self.total_successful_tool_calls,
             deferred_no_tool_streak: &mut self.deferred_no_tool_streak,
             deferred_no_tool_model_switches: &mut self.deferred_no_tool_model_switches,
-            needs_tools_for_turn: &mut self.needs_tools_for_turn,
         }
     }
 
@@ -163,14 +151,6 @@ impl LoopCounters {
         self.deferred_no_tool_model_switches
     }
 
-    pub(in crate::agent) fn needs_tools_for_turn(&self) -> bool {
-        self.needs_tools_for_turn
-    }
-
-    pub(in crate::agent) fn set_needs_tools_for_turn(&mut self, needs_tools: bool) {
-        self.needs_tools_for_turn = needs_tools;
-    }
-
     pub(in crate::agent) fn insert_tool_result_cache(
         &mut self,
         key: u64,
@@ -212,7 +192,7 @@ mod tests {
 
     #[test]
     fn tracks_iteration_increment() {
-        let mut counters = LoopCounters::new(false);
+        let mut counters = LoopCounters::default();
 
         assert_eq!(counters.iteration(), 0);
         assert_eq!(counters.advance_iteration(), 1);
@@ -222,7 +202,7 @@ mod tests {
 
     #[test]
     fn accumulates_tool_call_counts() {
-        let mut counters = LoopCounters::new(false);
+        let mut counters = LoopCounters::default();
 
         counters.record_tool_attempt();
         counters.record_tool_attempt();
@@ -239,7 +219,7 @@ mod tests {
 
     #[test]
     fn tracks_send_file_keys() {
-        let mut counters = LoopCounters::new(false);
+        let mut counters = LoopCounters::default();
 
         assert!(!counters.has_successful_send_file_key("telegram:file.txt"));
         counters.record_successful_send_file_key("telegram:file.txt");
@@ -250,7 +230,7 @@ mod tests {
 
     #[test]
     fn counts_personal_memory_tool_calls() {
-        let mut counters = LoopCounters::new(false);
+        let mut counters = LoopCounters::default();
 
         counters.record_personal_memory_tool_call();
         counters.record_personal_memory_tool_call();
@@ -259,10 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn tracks_deferred_no_tool_state_and_tool_need() {
-        let mut counters = LoopCounters::new(true);
+    fn tracks_deferred_no_tool_state() {
+        let mut counters = LoopCounters::default();
 
-        assert!(counters.needs_tools_for_turn());
         assert_eq!(counters.deferred_no_tool_streak(), 0);
         counters.increment_deferred_no_tool_streak();
         counters.increment_deferred_no_tool_streak();
@@ -272,15 +251,13 @@ mod tests {
         assert_eq!(counters.deferred_no_tool_model_switches(), 1);
 
         counters.reset_deferred_no_tool_streak();
-        counters.set_needs_tools_for_turn(false);
 
         assert_eq!(counters.deferred_no_tool_streak(), 0);
-        assert!(!counters.needs_tools_for_turn());
     }
 
     #[test]
     fn inserts_and_takes_tool_result_cache_entries() {
-        let mut counters = LoopCounters::new(false);
+        let mut counters = LoopCounters::default();
 
         counters.insert_tool_result_cache(10, "first".to_string(), 2);
         counters.insert_tool_result_cache(20, "second".to_string(), 2);

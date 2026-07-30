@@ -165,21 +165,18 @@ fn completion_contract_is_fulfilled(
     contract: &CompletionContract,
     progress: &CompletionProgress,
 ) -> bool {
-    // Keyword/planner classifications guide execution, but do not by
-    // themselves prove that a turn was incomplete. Only explicit,
-    // evidence-grounded obligations affect the persisted outcome. Concrete
-    // side-effect claims are checked against the mutation ledger before the
-    // reply is accepted in completion_phase.
+    // Expected mutation is an outcome obligation, not merely a routing hint.
+    // A task cannot be persisted as Succeeded when its mutation ledger is
+    // empty, even if the model produced a useful explanatory response.
+    if contract.expects_mutation && progress.mutation_count == 0 {
+        return false;
+    }
+
     let observation_is_hard_requirement =
         contract.explicit_verification_requested || !contract.verification_targets.is_empty();
     if observation_is_hard_requirement
         && contract.requires_observation
         && progress.observation_count == 0
-    {
-        return false;
-    }
-    if super::completion_checks::contract_has_concrete_mutation_target(contract)
-        && progress.mutation_count == 0
     {
         return false;
     }
@@ -342,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_mutation_without_ledger_evidence_is_not_scored_partial() {
+    fn expected_mutation_without_ledger_evidence_is_partial() {
         let validation = ValidationState::default();
         let execution = empty_execution_state();
         let completion = CompletionProgress::default();
@@ -362,7 +359,7 @@ mod tests {
         )
         .derive_outcome();
 
-        assert_eq!(outcome, TaskOutcome::Succeeded);
+        assert_eq!(outcome, TaskOutcome::Partial);
     }
 
     #[test]

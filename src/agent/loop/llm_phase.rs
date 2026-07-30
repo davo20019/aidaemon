@@ -142,7 +142,8 @@ pub(super) struct LlmPhaseCtx<'a> {
     pub empty_response_retry_note: &'a mut Option<String>,
     pub identity_prefill_text: &'a mut Option<String>,
     pub deferred_no_tool_streak: usize,
-    pub tools_required_for_turn: bool,
+    pub execution_requirement: &'a ExecutionRequirement,
+    pub force_text_allowed: bool,
     pub max_budget_extensions: usize,
     pub hard_token_cap: i64,
     /// Accumulated text from a previous truncated text response.  When set,
@@ -228,7 +229,7 @@ pub(super) async fn run_llm_phase(
     let session_id = ctx.session_id;
     let user_text = ctx.user_text;
     let iteration = ctx.iteration;
-    let force_text_response = ctx.force_text_response;
+    let force_text_response = ctx.force_text_response && ctx.force_text_allowed;
     let task_start = ctx.task_start;
     let task_tokens_used = &mut *ctx.task_tokens_used;
     let learning_ctx = &mut *ctx.learning_ctx;
@@ -254,7 +255,8 @@ pub(super) async fn run_llm_phase(
     let empty_response_retry_note = &mut *ctx.empty_response_retry_note;
     let identity_prefill_text = &mut *ctx.identity_prefill_text;
     let deferred_no_tool_streak = ctx.deferred_no_tool_streak;
-    let tools_required_for_turn = ctx.tools_required_for_turn;
+    let execution_requirement = ctx.execution_requirement;
+    let force_text_allowed = ctx.force_text_allowed;
     let max_budget_extensions = ctx.max_budget_extensions;
     let hard_token_cap = ctx.hard_token_cap;
     let truncated_text_prefix = &mut *ctx.truncated_text_prefix;
@@ -416,14 +418,18 @@ pub(super) async fn run_llm_phase(
                 );
             }
             _ => {
-                // Third+ retry: disable reasoning AND force text-only
+                // Third+ retry: disable reasoning. Text-only mode is only
+                // permitted once a Change/Deliver mutation is fulfilled.
                 llm_options.reasoning_effort_override = Some("off".to_string());
-                llm_options.tool_choice = ToolChoiceMode::None;
+                if force_text_allowed {
+                    llm_options.tool_choice = ToolChoiceMode::None;
+                }
                 warn!(
                     session_id,
                     iteration,
                     count = *thinking_truncation_count,
-                    "Thinking truncation retry: forcing text-only with no reasoning"
+                    force_text_allowed,
+                    "Thinking truncation retry: disabling reasoning"
                 );
             }
         }
@@ -443,7 +449,19 @@ pub(super) async fn run_llm_phase(
     }
     if force_text_response {
         llm_options.tool_choice = ToolChoiceMode::None;
-    } else if tools_required_for_turn
+    } else if should_require_initial_execution_call(
+        execution_requirement,
+        total_successful_tool_calls,
+        effective_tools,
+    ) {
+        llm_options.tool_choice = ToolChoiceMode::Required;
+        info!(
+            session_id,
+            iteration, "Artifact execution: requiring an initial tool call"
+        );
+    } else if services.agent.trust_tier_for_model(model)
+        == crate::agent::trust_tier::ModelTrustTier::Guided
+        && execution_requirement.requires_execution()
         && deferred_no_tool_streak > 0
         && deferred_no_tool_streak < DEFERRED_NO_TOOL_ACCEPT_THRESHOLD
         && total_successful_tool_calls == 0
@@ -1410,6 +1428,16 @@ fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &
     tool_defs
 }
 
+fn should_require_initial_execution_call(
+    requirement: &ExecutionRequirement,
+    total_successful_tool_calls: usize,
+    effective_tools: &[Value],
+) -> bool {
+    requirement.requires_initial_tool_call()
+        && total_successful_tool_calls == 0
+        && !effective_tools.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,6 +1477,31 @@ mod tests {
         let tools = vec![serde_json::json!({"name": "t1"})];
         assert_eq!(effective_tools_for_call(true, &tools), tools.as_slice());
         assert_eq!(effective_tools_for_call(false, &tools), tools.as_slice());
+    }
+
+    #[test]
+    fn exact_school_presentation_request_requires_initial_execution_tool_call() {
+        let request = "Can you create a pptx about Ecuador. Make it beautiful as I will present in my daughter's school.";
+        let contract = crate::agent::history::infer_completion_contract(request, &[]);
+        let lexical_need = crate::agent::infer_intent_gate(request, "").needs_tools;
+        let requirement = ExecutionRequirement::from_finalized_contract(
+            &contract,
+            lexical_need,
+            false,
+            crate::agent::recognized_artifact_creation_request(request),
+        );
+        let tools = vec![serde_json::json!({"name": "write_file"})];
+
+        assert!(should_require_initial_execution_call(
+            &requirement,
+            0,
+            &tools
+        ));
+        assert!(!should_require_initial_execution_call(
+            &requirement,
+            1,
+            &tools
+        ));
     }
 
     #[test]

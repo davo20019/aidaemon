@@ -280,6 +280,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
+    let straightforward_artifact_task = recognized_artifact_creation_request(user_text)
+        && matches!(
+            classify_intent_complexity(user_text),
+            IntentComplexity::Simple
+        );
+
     // Deterministic critical-fact resolver for high-trust identity/profile recall.
     // This avoids model drift when context is compressed or the fast model is selected.
     let critical_fact_query = detect_critical_fact_query(user_text);
@@ -289,6 +295,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let owner_dm_fact_cache = if agent.depth == 0
         && user_role == UserRole::Owner
         && channel_ctx.should_inject_personal_memory()
+        && !straightforward_artifact_task
     {
         let mut identity_facts = Vec::new();
         for cat in &[
@@ -313,28 +320,15 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     if agent.depth == 0
         && user_role == UserRole::Owner
         && channel_ctx.should_inject_personal_memory()
+        && !straightforward_artifact_task
     {
         if let Some(query) = critical_fact_query {
             let facts = owner_dm_fact_cache.as_deref().unwrap_or(&[]);
             let mut summary = extract_critical_fact_summary(facts);
-            if summary.assistant_name.is_none() {
-                summary.assistant_name = agent.system_prompt.lines().find_map(|line| {
-                    let trimmed = line.trim();
-                    let rest = trimmed.strip_prefix("You are ")?;
-                    let candidate = rest
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches(|c: char| matches!(c, '.' | ',' | '"' | '\'' | '`'));
-                    if candidate.is_empty()
-                        || candidate.len() > 40
-                        || matches!(candidate.to_ascii_lowercase().as_str(), "a" | "an" | "the")
-                    {
-                        None
-                    } else {
-                        Some(candidate.to_string())
-                    }
-                });
+            if let Some(configured_name) =
+                crate::agent::system_prompt::infer_assistant_name_from_prompt(&agent.system_prompt)
+            {
+                summary.assistant_name = Some(configured_name);
             }
             let reply = deterministic_reply_for_critical_query(query, &summary);
             let reply = super::shortcuts::emit_bootstrap_direct_reply(
@@ -490,6 +484,19 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             if before != defs.len() {
                 tool_filter_stages.push(GateFilterStage::new(
                     "desktop_control_visibility",
+                    before,
+                    defs.len(),
+                    "filtered",
+                ));
+            }
+        }
+
+        {
+            let before = defs.len();
+            Agent::restrict_desktop_control_for_request(&mut defs, &mut caps, user_text);
+            if before != defs.len() {
+                tool_filter_stages.push(GateFilterStage::new(
+                    "desktop_control_request_scope",
                     before,
                     defs.len(),
                     "filtered",
@@ -792,7 +799,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // 2a. Load conversation summary BEFORE building the prompt. Pillar A: the
     // session summary now participates in the per-task context tail, so it must
     // be available when `build_system_prompt_for_message` compiles the tail.
-    let session_summary = if agent.context_window_config.enabled {
+    let session_summary = if agent.context_window_config.enabled && !straightforward_artifact_task {
         agent
             .state
             .get_conversation_summary(session_id)

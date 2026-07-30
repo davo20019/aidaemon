@@ -127,6 +127,20 @@ pub enum EventType {
     /// Tool execution completed
     ToolResult,
 
+    // === Filesystem Checkpoints ===
+    /// A pre-mutation workspace checkpoint was created.
+    CheckpointCreated,
+    /// A checkpoint's post-task tree was captured.
+    CheckpointFinalized,
+    /// Checkpointing was skipped or failed before a mutation.
+    CheckpointSkipped,
+    /// A confirmed rollback started.
+    RollbackStarted,
+    /// A rollback completed, possibly with preserved conflicts.
+    RollbackCompleted,
+    /// A rollback failed before completion.
+    RollbackFailed,
+
     // === LLM Lifecycle ===
     /// A single LLM provider call completed (with latency + token telemetry)
     LlmCall,

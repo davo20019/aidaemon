@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{StateStore, Tool, ToolCapabilities};
-use crate::types::{ApprovalKind, FactPrivacy};
+use crate::types::{ApprovalKind, ChannelVisibility, FactPrivacy};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
 /// boundary. Structured fact keys carry their words behind `_`, `-`, `:` and
@@ -344,6 +344,10 @@ struct ManageArgs {
     _user_role: Option<String>,
     #[serde(default)]
     _channel_visibility: Option<String>,
+    #[serde(default)]
+    _channel_id: Option<String>,
+    #[serde(default)]
+    _trusted_session: bool,
 }
 
 fn manage_memories_schema() -> Value {
@@ -764,11 +768,42 @@ impl Tool for ManageMemoriesTool {
                 // Facts answer "what is X"; episodes answer "what did we discuss /
                 // do, and when". With a query → semantic search; without one →
                 // most-recent conversations (browse). This tool is owner-only (the
-                // session tool roster is empty for non-owners), so it inherits the
-                // owner's full-history access — no extra privacy gate needed here.
+                // session tool roster is empty for non-owners), with explicit
+                // channel/session scoping for non-private origins.
                 let query = args.query.as_deref().unwrap_or("").trim();
                 let limit = args.limit.unwrap_or(8).clamp(1, 50);
-                let episodes = self.state.get_relevant_episodes(query, limit).await?;
+                let visibility = ChannelVisibility::from_str_lossy(
+                    args._channel_visibility.as_deref().unwrap_or("internal"),
+                );
+                let episodes = match visibility {
+                    ChannelVisibility::Private => {
+                        self.state.get_relevant_episodes(query, limit).await?
+                    }
+                    ChannelVisibility::PrivateGroup | ChannelVisibility::Public => {
+                        self.state
+                            .get_relevant_episodes_for_channel(
+                                query,
+                                limit,
+                                args._channel_id.as_deref(),
+                            )
+                            .await?
+                    }
+                    ChannelVisibility::PublicExternal => {
+                        return Ok(
+                            "Past-conversation recall is disabled in public-external channels."
+                                .to_string(),
+                        );
+                    }
+                    ChannelVisibility::Internal if args._trusted_session => {
+                        self.state.get_relevant_episodes(query, limit).await?
+                    }
+                    ChannelVisibility::Internal => {
+                        let session_id = args._session_id.as_deref().unwrap_or("");
+                        self.state
+                            .get_relevant_episodes_for_session(query, limit, session_id)
+                            .await?
+                    }
+                };
                 if episodes.is_empty() {
                     return Ok(if query.is_empty() {
                         "No past conversations recorded yet.".to_string()
@@ -778,10 +813,13 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 let header = if query.is_empty() {
-                    format!("══ Recent conversations ({}) ══\n\n", episodes.len())
+                    format!(
+                        "══ Generated episode summaries: recent conversations ({}) ══\n\n",
+                        episodes.len()
+                    )
                 } else {
                     format!(
-                        "══ Past conversations matching '{}' ({}) ══\n\n",
+                        "══ Generated episode summaries matching '{}' ({}) ══\n\n",
                         query,
                         episodes.len()
                     )
@@ -798,6 +836,10 @@ impl Tool for ManageMemoriesTool {
                     }
                     output.push('\n');
                 }
+                output.push_str(
+                    "\nThese are semantic, generated summaries. Use search_history for exact \
+                     retained user/assistant wording, anchored context, and message paging.\n",
+                );
                 Ok(output)
             }
             "list_goals" => {
@@ -2518,7 +2560,14 @@ mod tests {
 
         // Empty query → recency browse (no embedding dependency).
         let result = tool
-            .call(&json!({"action": "search_episodes"}).to_string())
+            .call(
+                &json!({
+                    "action": "search_episodes",
+                    "_session_id": "test",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+            )
             .await
             .unwrap();
 

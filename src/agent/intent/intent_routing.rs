@@ -391,6 +391,7 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
         || user_text_requires_local_tool_execution(&user_text)
         || user_text_requests_auth_or_integration_management(&user_text)
         || classify_connected_api_intent(&user_text).is_some()
+        || recognized_artifact_creation_request(&user_text)
     {
         return IntentGateDecision {
             needs_tools: Some(true),
@@ -400,6 +401,51 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
 
     // No lexical guessing fallback: missing signals simply stay None.
     IntentGateDecision::default()
+}
+
+/// Deterministic lexical recognition for straightforward file/artifact
+/// creation. It deliberately requires both an authoring action and an explicit
+/// artifact type so ordinary questions about writing or presentations do not
+/// get routed into execution.
+pub(crate) fn recognized_artifact_creation_request(user_text: &str) -> bool {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let creation_action = [
+        "create", "make", "generate", "build", "produce", "prepare", "export",
+    ]
+    .iter()
+    .any(|keyword| contains_keyword_as_words(&lower, keyword));
+    if !creation_action {
+        return false;
+    }
+
+    [
+        "file",
+        "document",
+        "docx",
+        "pdf",
+        "spreadsheet",
+        "workbook",
+        "xlsx",
+        "csv",
+        "presentation",
+        "powerpoint",
+        "pptx",
+        "slide deck",
+        "slides",
+        "report",
+        "image",
+        "png",
+        "jpeg",
+        "jpg",
+        "archive",
+        "zip",
+    ]
+    .iter()
+    .any(|keyword| contains_keyword_as_words(&lower, keyword))
 }
 
 fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
@@ -1560,6 +1606,22 @@ mod intent_routing_path_override_tests {
             "local filesystem request must still require tools, got {:?}",
             d.needs_tools
         );
+    }
+
+    #[test]
+    fn exact_school_presentation_request_requires_execution() {
+        let request = "Can you create a pptx about Ecuador. Make it beautiful as I will present in my daughter's school.";
+
+        assert!(recognized_artifact_creation_request(request));
+        assert_eq!(infer_intent_gate(request, "").needs_tools, Some(true));
+    }
+
+    #[test]
+    fn presentation_advice_does_not_require_artifact_execution() {
+        let request = "How do I make presentations beautiful for a school audience?";
+
+        assert!(!recognized_artifact_creation_request(request));
+        assert_eq!(infer_intent_gate(request, "").needs_tools, None);
     }
 
     #[test]

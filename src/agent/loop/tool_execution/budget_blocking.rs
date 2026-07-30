@@ -56,6 +56,7 @@ fn generic_budget_exempt(tool_name: &str) -> bool {
             | "search_files"
             | "remember_fact"
             | "manage_memories"
+            | "search_history"
             | "web_fetch"
             | "manage_goal_tasks"
     ) || tool_name.contains("__")

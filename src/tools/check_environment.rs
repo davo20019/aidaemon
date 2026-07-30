@@ -1,8 +1,7 @@
-use std::path::Path;
-
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, BackendPath, SharedExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 use super::fs_utils;
@@ -101,12 +100,20 @@ impl Tool for CheckEnvironmentTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
         let path_str = args["path"].as_str().unwrap_or(".");
-        let check_dir = fs_utils::validate_path(path_str)?;
+        let backend = active_execution_backend();
+        let check_dir = backend.resolve_path(path_str).await?;
 
         let mut output = String::new();
+        output.push_str("## Execution Environment\n\n");
+        output.push_str(&format!(
+            "  Backend             {} ({})\n  Workspace           {}\n\n",
+            backend.kind().as_str(),
+            backend.id(),
+            backend.workspace_root()
+        ));
 
         if let Some(runtime_context) = format_daemon_runtime_context(std::env::var) {
-            output.push_str("## Daemon Runtime Context\n\n");
+            output.push_str("## Local Daemon Control Plane\n\n");
             output.push_str(&runtime_context);
             output.push('\n');
         }
@@ -118,7 +125,10 @@ impl Tool for CheckEnvironmentTool {
         for (tool, flag) in TOOLS_TO_CHECK {
             let tool = tool.to_string();
             let flag = flag.to_string();
-            handles.push(tokio::spawn(async move { check_tool(&tool, &flag).await }));
+            let backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                check_tool(backend, &tool, &flag).await
+            }));
         }
 
         let results = futures::future::join_all(handles).await;
@@ -143,7 +153,7 @@ impl Tool for CheckEnvironmentTool {
         }
 
         // Check config files
-        let configs = check_config_files(&check_dir).await;
+        let configs = check_config_files(backend, &check_dir).await;
         if !configs.is_empty() {
             output.push_str("\n## Config Files\n\n");
             for (file, desc, content) in &configs {
@@ -206,15 +216,8 @@ where
     }
 }
 
-async fn check_tool(name: &str, flag: &str) -> Option<String> {
-    // First check if tool exists
-    let which_result = tokio::process::Command::new("which")
-        .arg(name)
-        .output()
-        .await
-        .ok()?;
-
-    if !which_result.status.success() {
+async fn check_tool(backend: SharedExecutionBackend, name: &str, flag: &str) -> Option<String> {
+    if !backend.executable_exists(name).await.ok()? {
         return None;
     }
 
@@ -245,12 +248,15 @@ async fn check_tool(name: &str, flag: &str) -> Option<String> {
     }
 }
 
-async fn check_config_files(dir: &Path) -> Vec<(String, String, Option<String>)> {
+async fn check_config_files(
+    backend: SharedExecutionBackend,
+    dir: &BackendPath,
+) -> Vec<(String, String, Option<String>)> {
     let mut configs = Vec::new();
 
     for (file, desc) in CONFIG_FILES {
         let path = dir.join(file);
-        if path.exists() {
+        if backend.metadata(&path).await.is_ok() {
             // Read small config files for their content
             let content = if *file == ".nvmrc"
                 || *file == ".node-version"
@@ -258,10 +264,12 @@ async fn check_config_files(dir: &Path) -> Vec<(String, String, Option<String>)>
                 || *file == ".ruby-version"
                 || *file == "rust-toolchain"
             {
-                tokio::fs::read_to_string(&path)
+                backend
+                    .read(&path)
                     .await
                     .ok()
-                    .map(|c| c.trim().to_string())
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|content| content.trim().to_string())
             } else {
                 None
             };
@@ -336,14 +344,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_tool_git() {
-        let result = check_tool("git", "--version").await;
+        let result = check_tool(active_execution_backend(), "git", "--version").await;
         assert!(result.is_some());
         assert!(result.unwrap().contains("git"));
     }
 
     #[tokio::test]
     async fn test_check_tool_nonexistent() {
-        let result = check_tool("nonexistent_tool_xyz_12345", "--version").await;
+        let result = check_tool(
+            active_execution_backend(),
+            "nonexistent_tool_xyz_12345",
+            "--version",
+        )
+        .await;
         assert!(result.is_none());
     }
 

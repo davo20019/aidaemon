@@ -1083,12 +1083,37 @@ impl Consolidator {
             .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default());
 
+        let bounds = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events WHERE session_id = ?
+               AND event_type IN ('user_message','assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(&episode.session_id)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        let start_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("start_event_id").ok())
+            .flatten();
+        let end_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
+            .flatten();
+        let channel_id = episode
+            .channel_id
+            .clone()
+            .or_else(|| crate::memory::derive_channel_id_from_session(&episode.session_id));
+
         sqlx::query(
             r#"
             INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome,
-                                  importance, recall_count, message_count, start_time, end_time, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#
+                                  importance, recall_count, message_count, start_time, end_time,
+                                  created_at, channel_id, start_event_id, end_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
         )
         .bind(&episode.session_id)
         .bind(&episode.summary)
@@ -1101,6 +1126,9 @@ impl Consolidator {
         .bind(episode.start_time.to_rfc3339())
         .bind(episode.end_time.to_rfc3339())
         .bind(episode.created_at.to_rfc3339())
+        .bind(channel_id)
+        .bind(start_event_id)
+        .bind(end_event_id)
         .execute(&self.pool)
         .await?;
 
@@ -1108,7 +1136,8 @@ impl Consolidator {
     }
 }
 
-/// Pruner for cleaning up old consolidated events
+/// Consolidates old event sessions so the configured retention manager can
+/// later remove eligible rows. It does not own retention policy.
 pub struct Pruner {
     event_store: Arc<EventStore>,
     consolidator: Arc<Consolidator>,
@@ -1128,7 +1157,8 @@ impl Pruner {
         }
     }
 
-    /// Prune old events (consolidate first if needed, then delete)
+    /// Consolidate old events. Deletion is exclusively owned by
+    /// `RetentionManager`, including the `messages_days = 0` permanent mode.
     pub async fn prune(&self) -> anyhow::Result<PruneStats> {
         let cutoff = Utc::now() - Duration::days(self.retention_days as i64);
 
@@ -1149,17 +1179,14 @@ impl Pruner {
             }
         }
 
-        // Now prune consolidated events older than cutoff
-        let deleted = self.event_store.delete_old_consolidated(cutoff).await?;
-
         info!(
-            deleted,
+            deleted = 0,
             retention_days = self.retention_days,
-            "Event pruning complete"
+            "Event consolidation pass complete; retention manager owns deletion"
         );
 
         Ok(PruneStats {
-            deleted,
+            deleted: 0,
             consolidation_errors,
         })
     }

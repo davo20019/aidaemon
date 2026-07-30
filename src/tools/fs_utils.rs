@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::execution::{active_execution_backend, BackendKind, BackendPath, ExecutionRequest};
 use once_cell::sync::Lazy;
-use tokio::io::AsyncReadExt;
-
-use super::process_control::{configure_command_for_process_group, terminate_process_tree};
 
 /// Directories to skip during recursive file walks.
 pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
@@ -80,6 +78,7 @@ pub const PROJECT_ROOT_MARKERS: &[&str] = &[
 /// When a relative path doesn't exist under cwd, this checks `~/projects/<path>`
 /// before giving up. This avoids expensive `find ~` searches when the user
 /// references a project by name (e.g., "blog.aidaemon.ai").
+#[allow(dead_code)]
 pub fn resolve_project_dir(path: &str) -> anyhow::Result<PathBuf> {
     let direct = validate_path(path)?;
     if direct.exists() && direct.is_dir() {
@@ -114,6 +113,12 @@ pub fn resolve_project_dir(path: &str) -> anyhow::Result<PathBuf> {
 
 /// Resolves `~` and validates path safety. Returns canonical path.
 pub fn validate_path(path: &str) -> anyhow::Result<PathBuf> {
+    if active_execution_backend().kind() != BackendKind::Local {
+        return Ok(PathBuf::from(
+            crate::execution::normalize_active_path_lexically(path)?.as_str(),
+        ));
+    }
+
     let expanded = shellexpand::tilde(path).to_string();
     let p = PathBuf::from(&expanded);
 
@@ -192,6 +197,16 @@ pub fn find_nearest_project_root(path: &Path) -> Option<PathBuf> {
 /// If the path points into an existing project subtree, promote it to the nearest
 /// recognizable project root so builds/deploys can reach repo-level files.
 pub fn normalize_project_scope_path(path: &str) -> anyhow::Result<PathBuf> {
+    if active_execution_backend().kind() != BackendKind::Local {
+        let mut normalized = validate_path(path)?;
+        if path_points_to_file(path.trim_end_matches('/')) {
+            if let Some(parent) = normalized.parent() {
+                normalized = parent.to_path_buf();
+            }
+        }
+        return Ok(normalized);
+    }
+
     let mut normalized = validate_path(path)?;
     if !first_dir_component_exists(&normalized) {
         anyhow::bail!(
@@ -284,6 +299,22 @@ fn project_root_directory_entries(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 pub fn project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
+    if active_execution_backend().kind() != BackendKind::Local {
+        let mut roots = Vec::new();
+        for raw_root in alias_roots {
+            if let Ok(root) = validate_path(raw_root) {
+                if !roots.iter().any(|existing| existing == &root) {
+                    roots.push(root);
+                }
+            }
+        }
+        let workspace = PathBuf::from(active_execution_backend().workspace_root().as_str());
+        if !roots.iter().any(|existing| existing == &workspace) {
+            roots.push(workspace);
+        }
+        return roots;
+    }
+
     let mut roots = Vec::new();
     for raw_root in alias_roots {
         let Ok(root) = validate_path(raw_root) else {
@@ -331,6 +362,9 @@ pub fn resolve_projects_folder_alias(raw_path: &str, alias_roots: &[String]) -> 
         } else {
             root.join(suffix.replace('\\', "/"))
         };
+        if active_execution_backend().kind() != BackendKind::Local {
+            return normalize_project_scope_path(candidate.to_string_lossy().as_ref()).ok();
+        }
         if candidate.parent().is_some_and(|parent| parent.is_dir()) {
             return Some(candidate);
         }
@@ -375,6 +409,16 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
     }
 
     let target = token.to_ascii_lowercase();
+    if active_execution_backend().kind() != BackendKind::Local {
+        return project_search_roots(alias_roots)
+            .into_iter()
+            .find_map(|root| {
+                root.file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&target))
+                    .then_some(root)
+            });
+    }
+
     for root in project_search_roots(alias_roots) {
         let direct = root.join(token);
         if direct.is_dir() {
@@ -397,6 +441,13 @@ pub fn resolve_named_project_root(raw_name: &str, alias_roots: &[String]) -> Opt
 }
 
 fn explicit_project_search_roots(alias_roots: &[String]) -> Vec<PathBuf> {
+    if active_execution_backend().kind() != BackendKind::Local {
+        return alias_roots
+            .iter()
+            .filter_map(|root| validate_path(root).ok())
+            .collect();
+    }
+
     let mut roots = Vec::new();
     for raw_root in alias_roots {
         let Ok(root) = validate_path(raw_root) else {
@@ -425,6 +476,13 @@ fn resolve_contextual_project_nickname_across_roots(
         || token.chars().all(|c| c.is_ascii_digit())
     {
         return None;
+    }
+
+    if active_execution_backend().kind() != BackendKind::Local {
+        return roots.into_iter().find(|root| {
+            root.file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&token))
+        });
     }
 
     let mut matches = Vec::new();
@@ -487,6 +545,9 @@ pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Opt
     let looks_path_like =
         token_is_absolute_like(trimmed) || trimmed.contains('/') || trimmed.contains('\\');
     if looks_path_like {
+        if active_execution_backend().kind() != BackendKind::Local {
+            return normalize_project_scope_path(trimmed).ok();
+        }
         let path_for_resolution = if token_is_absolute_like(trimmed) {
             trimmed.to_string()
         } else {
@@ -537,6 +598,7 @@ pub fn is_sensitive_path(path: &Path) -> bool {
 }
 
 /// Check if a file appears to be binary by reading first 8KB and looking for null bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn is_binary_file(path: &Path) -> anyhow::Result<bool> {
     use tokio::io::AsyncReadExt;
     let mut file = tokio::fs::File::open(path).await?;
@@ -573,78 +635,35 @@ pub async fn run_cmd(
     working_dir: Option<&Path>,
     timeout_secs: u64,
 ) -> anyhow::Result<CommandOutput> {
-    let start = std::time::Instant::now();
-
-    let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(cmd);
-    if let Some(dir) = working_dir {
-        command.current_dir(dir);
-    }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    command.kill_on_drop(true);
-    configure_command_for_process_group(&mut command);
-
-    let mut child = command.spawn()?;
-    let child_pid = child.id().unwrap_or(0);
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
-
-    let stdout_task = tokio::spawn(async move {
-        let mut reader = stdout;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = stderr;
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    });
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let mut timed_out = false;
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(e)) => anyhow::bail!("Command failed to execute: {}", e),
-        Err(_) => {
-            timed_out = true;
-            terminate_process_tree(child_pid, &mut child, Duration::from_secs(2)).await;
-            None
-        }
+    let backend = active_execution_backend();
+    let working_dir = match working_dir {
+        Some(dir) => Some(backend.resolve_path(&dir.to_string_lossy()).await?),
+        None => None,
     };
+    run_cmd_backend(cmd, working_dir.as_ref(), timeout_secs).await
+}
 
-    if timed_out {
-        stdout_task.abort();
-        stderr_task.abort();
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+/// Run a command in the configured execution environment using an opaque
+/// backend path for its working directory.
+pub async fn run_cmd_backend(
+    cmd: &str,
+    working_dir: Option<&BackendPath>,
+    timeout_secs: u64,
+) -> anyhow::Result<CommandOutput> {
+    let backend = active_execution_backend();
+    let mut request = ExecutionRequest::shell(cmd);
+    request.cwd = working_dir.cloned();
+    let output = backend
+        .execute(request, Duration::from_secs(timeout_secs))
+        .await?;
+    if output.timed_out {
         anyhow::bail!("Command timed out after {}s", timeout_secs);
     }
-
-    let stdout = match stdout_task.await {
-        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-        _ => String::new(),
-    };
-    let stderr = match stderr_task.await {
-        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-        _ => String::new(),
-    };
-    let status = status.expect("status must exist when command did not time out");
-
-    let duration_ms = start.elapsed().as_millis() as u64;
     Ok(CommandOutput {
-        exit_code: status.code().unwrap_or(-1),
-        stdout,
-        stderr,
-        duration_ms,
+        exit_code: output.exit_code,
+        stdout: output.stdout_lossy(),
+        stderr: output.stderr_lossy(),
+        duration_ms: output.duration_ms,
     })
 }
 

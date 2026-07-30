@@ -8,9 +8,11 @@
 //! I/O is injected via closures (`read_script`, `stat_mtime`) for full
 //! unit-testability — this module does no real I/O of its own.
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use crate::execution::SharedExecutionBackend;
 
 /// Context built at command completion describing which paths were produced.
 #[derive(Debug)]
@@ -405,6 +407,69 @@ pub fn attribute_deliverable(
         unconfirmed_candidates,
         pattern_hints,
     }
+}
+
+/// Backend-aware adapter for [`attribute_deliverable`].
+///
+/// It preloads the finite set of command/script/checklist paths through the
+/// configured execution backend, then runs the same pure attribution policy.
+/// This keeps background result discovery on the same filesystem as the
+/// terminal process without making the policy itself transport-aware.
+pub async fn attribute_deliverable_backend(
+    backend: SharedExecutionBackend,
+    session_id: &str,
+    command: &str,
+    command_start: SystemTime,
+    command_end: SystemTime,
+    checklist_text: &[String],
+) -> BackgroundDeliverableContext {
+    let executed_scripts = identify_executed_scripts(command);
+    let mut candidate_paths: HashSet<PathBuf> = extract_absolute_paths(command)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    candidate_paths.extend(extract_output_flag_paths(command));
+    for line in checklist_text {
+        candidate_paths.extend(extract_absolute_paths(line).into_iter().map(PathBuf::from));
+    }
+
+    let mut scripts = HashMap::new();
+    for script in &executed_scripts {
+        let Ok(backend_path) = backend.resolve_path(&script.to_string_lossy()).await else {
+            continue;
+        };
+        if let Ok(bytes) = backend.read(&backend_path).await {
+            if let Ok(text) = String::from_utf8(bytes) {
+                let (writes, _) = parse_script_for_writes(&text);
+                candidate_paths.extend(writes);
+                candidate_paths
+                    .extend(extract_absolute_paths(&text).into_iter().map(PathBuf::from));
+                scripts.insert(script.clone(), text);
+            }
+        }
+    }
+
+    let mut mtimes = HashMap::new();
+    for path in candidate_paths {
+        let Ok(backend_path) = backend.resolve_path(&path.to_string_lossy()).await else {
+            continue;
+        };
+        if let Ok(metadata) = backend.metadata(&backend_path).await {
+            if let Some(modified) = metadata.modified {
+                mtimes.insert(path, modified);
+            }
+        }
+    }
+
+    attribute_deliverable(
+        session_id,
+        command,
+        command_start,
+        command_end,
+        checklist_text,
+        &|path| scripts.get(path).cloned(),
+        &|path| mtimes.get(path).copied(),
+    )
 }
 
 /// Decide whether to auto-send and which file.

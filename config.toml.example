@@ -10,6 +10,62 @@
 # Optional: set AIDAEMON_ENV_FILE=/absolute/path/.env to choose the env file path.
 # In no-keychain mode, secret updates (including OAuth token refresh rotation) are written to that env file.
 
+[agent]
+# User-facing assistant identity. The setup wizard creates an editable persona.md.
+name = "aidaemon"
+# Relative paths resolve next to config.toml. Absolute paths are also supported.
+# persona_file = "persona.md"
+
+# Agent-visible files and processes. The default keeps today's local behavior:
+# relative paths start at the daemon working directory and paths outside it are
+# allowed. Set allow_outside_workspace = false to scope path-based tools and
+# command working directories to one workspace. Shell commands still have the
+# authority of the selected local/SSH account or container.
+[execution]
+backend = "local" # local | docker | ssh
+# workspace_root = "/absolute/path/to/workspace"
+# allow_outside_workspace = true # path tools: defaults true locally, false remotely
+
+# Docker is optional and requires a binary built with:
+#   cargo install aidaemon --features execution-docker
+# The backend creates/reuses one persistent container and bind-mounts a host
+# workspace. Network access is disabled unless explicitly enabled.
+# [execution.docker]
+# container = "aidaemon-execution"
+# image = "ubuntu:24.04"
+# workspace_root = "/workspace"
+# host_workspace = "/absolute/path/to/workspace" # relative paths resolve next to config.toml
+# create_if_missing = true
+# network = "none" # use "bridge" if remote API-backed CLI agents need network access
+# user = "1000:1000"
+# env_allowlist = ["OPENAI_API_KEY"]
+
+# SSH uses the local OpenSSH client, so aliases, ssh-agent, ProxyJump,
+# known_hosts, and hardware-backed keys continue to work.
+# [execution.ssh]
+# host = "buildbox" # host or ~/.ssh/config alias
+# workspace_root = "~/aidaemon-workspace"
+# port = 22
+# identity_file = "~/.ssh/id_ed25519"
+# extra_args = ["-J", "bastion"]
+# connect_timeout_secs = 10
+# create_workspace = true
+# env_allowlist = ["OPENAI_API_KEY"]
+
+# Beta: create one external shadow-Git checkpoint before the first local
+# workspace mutation in each agent turn. Disabled by default. The object store
+# is owner-only but contains plaintext copies of eligible source files.
+[checkpoints]
+enabled = false
+# storage_dir = "~/.local/share/aidaemon/checkpoints"
+retention_days = 14
+max_per_root = 30
+max_store_bytes = 2147483648 # 2 GiB across all project roots
+max_root_bytes = 524288000   # 500 MiB of eligible files per root
+max_file_bytes = 10485760    # files above 10 MiB are excluded
+max_paths = 50000
+snapshot_timeout_secs = 10
+
 [provider]
 # Provider type: openai_compatible, xai_native, google_genai, or anthropic
 api_key = "keychain"
@@ -114,6 +170,13 @@ working_memory_cap = 50
 # consolidation_interval_hours = 6  # How often to run memory consolidation (extract durable facts from conversations)
 # encryption_key = "keychain"       # Optional override; default startup uses AIDAEMON_ENCRYPTION_KEY from .env
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
+
+# Exact user/assistant recall follows this canonical-event retention window.
+# Set messages_days = 0 for opt-in permanent active-database history.
+# Diagnostic/tool events use a separate, shorter lifecycle.
+# [state.retention]
+# messages_days = 90
+# diagnostic_events_days = 7
 
 # Optional per-model total context windows (input plus output tokens).
 # Use the exact model identifier configured under [provider.models].

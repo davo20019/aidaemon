@@ -319,6 +319,43 @@ async fn activate_app_without_generation_succeeds() {
 }
 
 #[tokio::test]
+async fn activate_app_treats_zero_generation_as_omitted() {
+    // Repro from live telemetry (2026-07-30): the model adapter serialized an
+    // optional snapshot_generation as 0. Activation then tried to validate a
+    // nonexistent generation and failed before it could recover a windowless
+    // Calculator process.
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    let mut args = json!({
+        "action": "activate_app",
+        "app": "Calculator",
+        "snapshot_generation": 0,
+        "_session_id": "telegram:1",
+        "_task_id": "task-activate-zero"
+    });
+    if let Some(obj) = args.as_object_mut() {
+        obj.extend(test_model_args().as_object().unwrap().clone());
+    }
+    let outcome = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+    assert!(
+        !outcome.output.starts_with("Error:"),
+        "zero should mean no optional generation for activate_app: {}",
+        outcome.output
+    );
+    assert!(outcome.output.contains("Calculator"));
+}
+
+#[tokio::test]
 async fn missing_app_error_is_instructional() {
     let dir = TempDir::new().unwrap();
     let tool = test_tool(

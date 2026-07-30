@@ -919,7 +919,9 @@ impl TelegramChannel {
             config_path: self.config_path.clone(),
         };
         let session_id = self.session_id(msg.chat.id.0).await;
-        if let Some(reply) = ctx.dispatch(cmd, arg, &session_id).await {
+        let user_id = msg.from.as_ref().map(|user| user.id.0).unwrap_or(0);
+        let user_role = determine_role(&self.owner_user_ids, user_id);
+        if let Some(reply) = ctx.dispatch(cmd, arg, &session_id, user_role).await {
             for chunk in split_message(&reply, 4096) {
                 let _ = bot.send_message(msg.chat.id, chunk).await;
             }

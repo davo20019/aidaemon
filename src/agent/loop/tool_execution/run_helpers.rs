@@ -76,7 +76,7 @@ pub(super) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemant
         }
         "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
         | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
-        "read_channel_history" => Some(ToolSemanticScope::ConversationHistory),
+        "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
         "remember_fact" | "manage_memories" | "share_memory" => Some(ToolSemanticScope::UserMemory),
         "scheduled_goals" | "manage_goal_tasks" => Some(ToolSemanticScope::GoalState),
         "system_info" => Some(ToolSemanticScope::HostLocal),
@@ -288,6 +288,19 @@ pub(super) fn allow_scaffold_parent_dir_for_target(
 ) -> bool {
     if tool_name != "run_command" {
         return false;
+    }
+    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
+        let Some(scope_path) =
+            crate::execution::normalize_active_path_lexically(&allowed_target.value).ok()
+        else {
+            return false;
+        };
+        let Some(candidate_path) =
+            crate::execution::normalize_active_path_lexically(&candidate_target.value).ok()
+        else {
+            return false;
+        };
+        return scope_path.parent().as_ref() == Some(&candidate_path);
     }
     let Some(scope_path) = crate::tools::fs_utils::validate_path(&allowed_target.value).ok() else {
         return false;
@@ -728,7 +741,42 @@ pub(super) fn verification_target_matches_haystack(
     if needle.is_empty() {
         return false;
     }
-    haystack.contains(&needle)
+    if haystack.contains(&needle) {
+        return true;
+    }
+
+    // Completion targets are normalized to absolute paths, while shell calls
+    // commonly preserve an equivalent home-relative spelling. Treat those
+    // spellings as the same target so a successful command such as
+    // `find "$HOME/projects" ...` can satisfy a contract inferred from
+    // `~/projects`.
+    if matches!(
+        target.kind,
+        VerificationTargetKind::ProjectScope | VerificationTargetKind::Path
+    ) {
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+        let Some(home) = normalized_path_value(&home.to_string_lossy()) else {
+            return false;
+        };
+        let Some(relative) = needle
+            .strip_prefix(&home)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .filter(|suffix| !suffix.is_empty())
+        else {
+            return false;
+        };
+        return [
+            format!("$HOME/{relative}"),
+            format!("${{HOME}}/{relative}"),
+            format!("~/{relative}"),
+        ]
+        .iter()
+        .any(|spelling| haystack.contains(spelling));
+    }
+
+    false
 }
 
 pub(super) fn observation_matches_completion_contract(
@@ -1013,6 +1061,31 @@ mod tests {
         assert!(!verification_target_matches_haystack(
             &target,
             "read /tmp/project-b/config.toml"
+        ));
+    }
+
+    #[test]
+    fn shell_home_reference_verifies_normalized_home_target() {
+        let home = dirs::home_dir().expect("home directory");
+        let target = VerificationTarget {
+            kind: VerificationTargetKind::ProjectScope,
+            value: home.join("projects").to_string_lossy().into_owned(),
+        };
+        let contract = CompletionContract {
+            requires_observation: true,
+            verification_targets: vec![target],
+            ..CompletionContract::default()
+        };
+        let semantics = ToolCallSemantics::observation()
+            .with_verification_mode(crate::traits::ToolVerificationMode::ResultContent);
+        let arguments = serde_json::json!({
+            "action": "run",
+            "command": "find \"$HOME/projects\" -mindepth 1 -maxdepth 1 -type d | wc -l"
+        })
+        .to_string();
+
+        assert!(observation_matches_completion_contract(
+            &contract, &semantics, &arguments, "213"
         ));
     }
 

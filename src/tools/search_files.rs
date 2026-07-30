@@ -1,10 +1,11 @@
-use std::path::{Path, PathBuf};
-
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::execution::{
+    active_execution_backend, BackendFileType, BackendPath, SharedExecutionBackend,
+};
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
@@ -106,8 +107,9 @@ impl Tool for SearchFilesTool {
             anyhow::bail!("At least one of 'pattern' (content regex) or 'glob' (filename pattern) is required");
         }
 
-        let mut search_dir = fs_utils::validate_path(path_str)?;
-        if !search_dir.exists() {
+        let backend = active_execution_backend();
+        let mut search_dir = backend.resolve_path(path_str).await?;
+        if backend.metadata(&search_dir).await.is_err() {
             // Paths copy-pasted from prose or earlier tool output often carry
             // trailing punctuation ("…/projects)" from a parenthesized
             // mention). Only fall back when the literal path is missing and
@@ -117,18 +119,23 @@ impl Tool for SearchFilesTool {
                 .trim_end_matches([')', ':', ',', ';', '.'])
                 .trim_end();
             if trimmed != path_str && !trimmed.is_empty() {
-                if let Ok(candidate) = fs_utils::validate_path(trimmed) {
-                    if candidate.is_dir() {
+                if let Ok(candidate) = backend.resolve_path(trimmed).await {
+                    if backend
+                        .metadata(&candidate)
+                        .await
+                        .is_ok_and(|metadata| metadata.is_dir())
+                    {
                         search_dir = candidate;
                     }
                 }
             }
         }
-        if !search_dir.exists() {
-            anyhow::bail!("Directory not found: {}", search_dir.display());
-        }
-        if !search_dir.is_dir() {
-            anyhow::bail!("Not a directory: {}", search_dir.display());
+        let search_metadata = backend
+            .metadata(&search_dir)
+            .await
+            .map_err(|_| anyhow::anyhow!("Directory not found: {}", search_dir))?;
+        if !search_metadata.is_dir() {
+            anyhow::bail!("Not a directory: {}", search_dir);
         }
 
         let content_regex = if let Some(pat) = content_pattern {
@@ -147,6 +154,7 @@ impl Tool for SearchFilesTool {
         let mut stats = SearchStats::default();
 
         walk_dir(
+            backend,
             &search_dir,
             &content_regex,
             &glob_matcher,
@@ -160,7 +168,7 @@ impl Tool for SearchFilesTool {
         let default_path_note = used_default_path.then(|| {
             format!(
                 "Note: no 'path' was provided, so search_files defaulted to current directory: {}",
-                search_dir.display()
+                search_dir
             )
         });
 
@@ -169,8 +177,7 @@ impl Tool for SearchFilesTool {
             // into later calls, and a glued ")" produces invalid paths.
             let mut output = format!(
                 "No matches found. {} files scanned in {}",
-                stats.files_scanned,
-                search_dir.display()
+                stats.files_scanned, search_dir
             );
             if stats.truncated {
                 output.push('\n');
@@ -205,7 +212,7 @@ impl Tool for SearchFilesTool {
             results.len(),
             if results.len() == 1 { "" } else { "es" },
             stats.files_scanned,
-            search_dir.display()
+            search_dir
         ));
         if stats.oversized_files_skipped > 0 {
             output.push_str(&oversized_note(stats.oversized_files_skipped));
@@ -238,7 +245,7 @@ fn oversized_note(count: usize) -> String {
 }
 
 struct SearchResult {
-    path: PathBuf,
+    path: BackendPath,
     matches: Vec<(usize, String)>, // (line_number, line_content)
 }
 
@@ -279,7 +286,7 @@ impl SearchResult {
     fn format(&self) -> String {
         let path_str = self.path.display();
         if self.matches.is_empty() {
-            format!("{}", path_str)
+            path_str.to_string()
         } else {
             let mut s = format!("{}:", path_str);
             for (line_num, line) in &self.matches {
@@ -309,8 +316,10 @@ const MAX_WALK_MILLIS: u128 = 15_000;
 /// (~/Library) holds hundreds of thousands — depth-first got lost in the
 /// deep tree and timed out. `max_entries` bounds total entries visited;
 /// exceeding it (or the time budget) sets `stats.truncated`.
+#[allow(clippy::too_many_arguments)]
 async fn walk_dir(
-    root: &Path,
+    backend: SharedExecutionBackend,
+    root: &BackendPath,
     content_regex: &Option<Regex>,
     glob_matcher: &Option<GlobMatcher>,
     max_results: usize,
@@ -319,20 +328,21 @@ async fn walk_dir(
     stats: &mut SearchStats,
 ) {
     let started = std::time::Instant::now();
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0));
+    let mut queue: std::collections::VecDeque<(BackendPath, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.clone(), 0));
 
     while let Some((dir, depth)) = queue.pop_front() {
         if results.len() >= max_results || stats.files_scanned >= MAX_FILES_SCANNED {
             return;
         }
 
-        let mut entries = match tokio::fs::read_dir(&dir).await {
+        let entries = match backend.read_dir(&dir).await {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        for entry in entries {
             if results.len() >= max_results || stats.files_scanned >= MAX_FILES_SCANNED {
                 return;
             }
@@ -344,24 +354,20 @@ async fn walk_dir(
                 return;
             }
 
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path;
+            let file_name = path.file_name().unwrap_or_default().to_string();
 
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    if depth < MAX_DEPTH
-                        && !fs_utils::should_skip_dir(&file_name)
-                        && !file_name.starts_with('.')
-                    {
-                        queue.push_back((path, depth + 1));
-                    }
-                    continue;
+            if entry.metadata.file_type == BackendFileType::Directory {
+                if depth < MAX_DEPTH
+                    && !fs_utils::should_skip_dir(&file_name)
+                    && !file_name.starts_with('.')
+                {
+                    queue.push_back((path, depth + 1));
                 }
+                continue;
+            }
 
-                if !file_type.is_file() {
-                    continue;
-                }
-            } else {
+            if entry.metadata.file_type != BackendFileType::File {
                 continue;
             }
 
@@ -376,13 +382,12 @@ async fn walk_dir(
 
             // If content pattern specified, search contents
             if let Some(ref content_re) = content_regex {
-                if let Ok(metadata) = entry.metadata().await {
-                    if metadata.len() > MAX_CONTENT_SEARCH_FILE_SIZE {
-                        stats.oversized_files_skipped += 1;
-                        continue;
-                    }
+                if entry.metadata.len > MAX_CONTENT_SEARCH_FILE_SIZE {
+                    stats.oversized_files_skipped += 1;
+                    continue;
                 }
-                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Ok(bytes) = backend.read(&path).await {
+                    let content = String::from_utf8_lossy(&bytes);
                     let mut matches = Vec::new();
                     for (i, line) in content.lines().enumerate() {
                         if content_re.is_match(line) {
@@ -393,16 +398,13 @@ async fn walk_dir(
                         }
                     }
                     if !matches.is_empty() {
-                        results.push(SearchResult {
-                            path: path.clone(),
-                            matches,
-                        });
+                        results.push(SearchResult { path, matches });
                     }
                 }
             } else {
                 // Glob-only: just list the file
                 results.push(SearchResult {
-                    path: path.clone(),
+                    path,
                     matches: vec![],
                 });
             }
@@ -432,8 +434,14 @@ mod tests {
         let glob = compile_glob("*target.pdf").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
+        let backend = active_execution_backend();
+        let root_path = backend
+            .resolve_path(&root.path().to_string_lossy())
+            .await
+            .unwrap();
         walk_dir(
-            root.path(),
+            backend,
+            &root_path,
             &None,
             &Some(glob),
             10,
@@ -444,7 +452,7 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 1, "shallow file must be found under budget");
-        assert!(results[0].path.ends_with("target.pdf"));
+        assert!(results[0].path.as_str().ends_with("target.pdf"));
     }
 
     #[tokio::test]
@@ -457,8 +465,14 @@ mod tests {
         let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
+        let backend = active_execution_backend();
+        let root_path = backend
+            .resolve_path(&root.path().to_string_lossy())
+            .await
+            .unwrap();
         walk_dir(
-            root.path(),
+            backend,
+            &root_path,
             &None,
             &Some(glob),
             10,
@@ -488,8 +502,14 @@ mod tests {
         let glob = compile_glob("*.zzz").unwrap();
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
+        let backend = active_execution_backend();
+        let root_path = backend
+            .resolve_path(&dir.path().to_string_lossy())
+            .await
+            .unwrap();
         walk_dir(
-            dir.path(),
+            backend,
+            &root_path,
             &None,
             &Some(glob),
             10,

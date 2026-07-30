@@ -87,6 +87,9 @@ fn test_user_text_references_filesystem_path_detects_common_paths_and_files() {
     ));
     assert!(user_text_references_filesystem_path("~/project/file.txt"));
     assert!(user_text_references_filesystem_path(
+        "How many projects are at ~/projects?"
+    ));
+    assert!(user_text_references_filesystem_path(
         "src/agent/main_loop.rs"
     ));
     assert!(user_text_references_filesystem_path("Cargo.toml"));

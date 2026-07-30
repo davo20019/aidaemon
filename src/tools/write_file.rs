@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, WriteMode};
 use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind};
 
 use super::fs_utils;
@@ -108,23 +109,28 @@ impl Tool for WriteFileTool {
             );
         }
 
-        let path = fs_utils::validate_path(path_str)?;
+        let backend = active_execution_backend();
+        let path = backend.resolve_path(path_str).await?;
 
         // Block sensitive paths
-        if fs_utils::is_sensitive_path(&path) {
+        if fs_utils::is_sensitive_path(std::path::Path::new(path.as_str())) {
             anyhow::bail!("Cannot write to sensitive path: {}", path_str);
         }
 
         // Create parent dirs if requested
         if create_dirs {
             if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                backend.create_dir_all(&parent).await?;
             }
         } else if let Some(parent) = path.parent() {
-            if !parent.exists() {
+            if !backend
+                .metadata(&parent)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
                 anyhow::bail!(
                     "Parent directory does not exist: {}. Set create_dirs=true to create it.",
-                    parent.display()
+                    parent
                 );
             }
         }
@@ -141,18 +147,14 @@ impl Tool for WriteFileTool {
         }
 
         if mode == "append" {
-            use tokio::io::AsyncWriteExt;
-            let existing_size = tokio::fs::metadata(&path)
+            let existing_size = backend
+                .metadata(&path)
                 .await
-                .map(|m| m.len())
+                .map(|metadata| metadata.len)
                 .unwrap_or(0);
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
+            backend
+                .write(&path, content.as_bytes(), WriteMode::Append, create_dirs)
                 .await?;
-            file.write_all(content.as_bytes()).await?;
-            file.flush().await?;
 
             let appended = content.len();
             let appended_lines = content.lines().count();
@@ -166,28 +168,28 @@ impl Tool for WriteFileTool {
         }
 
         // Backup existing file
-        let existed = path.exists();
+        let existing_metadata = backend.metadata(&path).await.ok();
+        let existed = existing_metadata.is_some();
         let old_size = if existed {
-            let meta = tokio::fs::metadata(&path).await?;
-            let size = meta.len();
+            let size = existing_metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.len);
             // Create backup
-            let backup = path.with_extension(format!(
+            let backup_extension = format!(
                 "{}.bak",
-                path.extension()
-                    .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            ));
+                path.extension().map(str::to_string).unwrap_or_default()
+            );
+            let backup = path.with_extension(&backup_extension);
             // Only keep one backup
-            let _ = tokio::fs::copy(&path, &backup).await;
+            let _ = backend.copy(&path, &backup).await;
             Some(size)
         } else {
             None
         };
 
-        // Atomic write: write to temp file then rename
-        let tmp_path = path.with_extension("tmp_write");
-        tokio::fs::write(&tmp_path, content).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
+        backend
+            .write(&path, content.as_bytes(), WriteMode::Overwrite, create_dirs)
+            .await?;
 
         let new_size = content.len();
         let line_count = content.lines().count();
@@ -199,7 +201,8 @@ impl Tool for WriteFileTool {
             String::new()
         };
 
-        let diagnostics = fs_utils::post_write_diagnostics(&path).await;
+        let diagnostics =
+            fs_utils::post_write_diagnostics(std::path::Path::new(path.as_str())).await;
 
         Ok(format!(
             "{} {}\n{} bytes, {} lines{}{}",

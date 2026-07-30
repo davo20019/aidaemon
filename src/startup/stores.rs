@@ -69,6 +69,46 @@ pub async fn build_stores(config: &AppConfig) -> anyhow::Result<StoreBundle> {
     // that migration off the channel-readiness critical path.
     let projection_state = state.clone();
     tokio::spawn(async move {
+        match crate::state::sqlite::history_search::repair_and_backfill(
+            &projection_state.pool(),
+            20,
+        )
+        .await
+        {
+            Ok(stats)
+                if stats.projected > 0
+                    || stats.orphans_removed > 0
+                    || stats.fts_rebuilt
+                    || stats.episodes_repaired > 0 =>
+            {
+                tracing::info!(
+                    projected = stats.projected,
+                    orphans_removed = stats.orphans_removed,
+                    fts_rebuilt = stats.fts_rebuilt,
+                    episodes_repaired = stats.episodes_repaired,
+                    pending = stats.pending,
+                    "Repaired exact-history projection"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "Exact-history projection repair deferred"),
+        }
+        // Continue large legacy backfills incrementally off the readiness
+        // path. Each round is bounded and yields between batches.
+        for _ in 0..20 {
+            match crate::state::sqlite::history_search::backfill(&projection_state.pool(), 20).await
+            {
+                Ok((_, 0)) => break,
+                Ok((projected, pending)) => {
+                    tracing::info!(projected, pending, "Continuing exact-history backfill");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Exact-history incremental backfill deferred");
+                    break;
+                }
+            }
+        }
         match projection_state.backfill_missing_memory_projections().await {
             Ok((facts, episodes, spans, procedures, error_solutions))
                 if facts > 0

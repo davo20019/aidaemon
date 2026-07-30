@@ -357,14 +357,35 @@ impl MemoryManager {
         &self,
         session_id: &str,
     ) -> anyhow::Result<bool> {
-        let last_episode_end: Option<String> =
-            sqlx::query_scalar("SELECT MAX(end_time) FROM episodes WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten();
+        let last_episode = sqlx::query(
+            "SELECT end_event_id, end_time FROM episodes
+             WHERE session_id = ?
+             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        let rows = if let Some(ref since) = last_episode_end {
+        let rows = if let Some(end_event_id) = last_episode
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
+            .flatten()
+        {
+            sqlx::query(
+                "SELECT data FROM events
+                 WHERE session_id = ?
+                   AND event_type = 'user_message'
+                   AND id > ?
+                 ORDER BY id ASC",
+            )
+            .bind(session_id)
+            .bind(end_event_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else if let Some(since) = last_episode
+            .as_ref()
+            .and_then(|row| row.try_get::<String, _>("end_time").ok())
+        {
             sqlx::query(
                 "SELECT data FROM events
                  WHERE session_id = ?
@@ -373,7 +394,7 @@ impl MemoryManager {
                  ORDER BY created_at ASC",
             )
             .bind(session_id)
-            .bind(since)
+            .bind(&since)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -1320,13 +1341,31 @@ impl MemoryManager {
             .map(|m| m.created_at)
             .unwrap_or_else(Utc::now);
         let now = Utc::now();
+        let bounds = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events
+             WHERE session_id = ?
+               AND event_type IN ('user_message', 'assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(session_id)
+        .bind(start_time.to_rfc3339())
+        .bind(end_time.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        let start_event_id: Option<i64> = bounds.try_get("start_event_id").unwrap_or(None);
+        let end_event_id: Option<i64> = bounds.try_get("end_event_id").unwrap_or(None);
+        let channel_id = crate::memory::derive_channel_id_from_session(session_id);
 
         // Insert episode. Multiple episodes per session are allowed (mid-session
         // episodes for long-running conversations + final idle-session episode).
         let topics_json = serde_json::to_string(&analysis.topics).ok();
         let result = sqlx::query(
-            "INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome, importance, recall_count, message_count, start_time, end_time, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)"
+            "INSERT INTO episodes
+                (session_id, summary, topics, emotional_tone, outcome, importance,
+                 recall_count, message_count, start_time, end_time, created_at,
+                 channel_id, start_event_id, end_event_id)
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(&analysis.summary)
@@ -1338,6 +1377,9 @@ impl MemoryManager {
         .bind(start_time.to_rfc3339())
         .bind(end_time.to_rfc3339())
         .bind(now.to_rfc3339())
+        .bind(channel_id)
+        .bind(start_event_id)
+        .bind(end_event_id)
         .execute(&self.pool)
         .await?;
 
@@ -1985,21 +2027,46 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         Ok(())
     }
 
-    /// Fetch messages for a session since its last episode's end_time.
+    /// Fetch messages after the last stable canonical event bound. Legacy
+    /// episodes without bounds fall back to end_time.
     /// If no episode exists, returns all session messages up to `limit`.
     async fn fetch_session_messages_since_last_episode(
         &self,
         session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Message>> {
-        let last_episode_end: Option<String> =
-            sqlx::query_scalar("SELECT MAX(end_time) FROM episodes WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten();
+        let last_episode = sqlx::query(
+            "SELECT end_event_id, end_time FROM episodes
+             WHERE session_id = ?
+             ORDER BY COALESCE(end_event_id, 0) DESC, end_time DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        let rows = if let Some(ref since) = last_episode_end {
+        let rows = if let Some(end_event_id) = last_episode
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
+            .flatten()
+        {
+            sqlx::query(
+                "SELECT id, session_id, event_type, data, created_at
+                 FROM events
+                 WHERE session_id = ?
+                   AND event_type IN ('user_message', 'assistant_response', 'tool_result')
+                   AND id > ?
+                 ORDER BY id ASC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(end_event_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else if let Some(since) = last_episode
+            .as_ref()
+            .and_then(|row| row.try_get::<String, _>("end_time").ok())
+        {
             sqlx::query(
                 "SELECT id, session_id, event_type, data, created_at
                  FROM events
@@ -2010,7 +2077,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
                  LIMIT ?",
             )
             .bind(session_id)
-            .bind(since)
+            .bind(&since)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?

@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, ExecutionRequest, SharedExecutionBackend};
 use crate::traits::{Tool, ToolCapabilities, ToolRole};
 
 pub struct SystemInfoTool;
@@ -12,13 +15,13 @@ impl Tool for SystemInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get system information including CPU and memory usage"
+        "Get system information for the configured execution environment"
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "system_info",
-            "description": "Get system information including CPU and memory usage",
+            "description": "Get system information for the configured execution environment, including hostname, OS, uptime, and memory",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -43,61 +46,69 @@ impl Tool for SystemInfoTool {
     }
 
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
-        let mut info = String::new();
+        let backend = active_execution_backend();
+        let mut info = format!(
+            "Execution target: {} ({})\nWorkspace: {}\n",
+            backend.kind().as_str(),
+            backend.id(),
+            backend.workspace_root()
+        );
 
         // Current date and time
-        if let Ok(output) = tokio::process::Command::new("date").output().await {
-            let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(date) = command_output(backend.clone(), "date", &[]).await {
             info.push_str(&format!("Date: {}\n", date));
         }
 
         // Hostname
-        if let Ok(output) = tokio::process::Command::new("hostname").output().await {
-            let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(hostname) = command_output(backend.clone(), "hostname", &[]).await {
             info.push_str(&format!("Hostname: {}\n", hostname));
         }
 
         // OS info
-        if let Ok(output) = tokio::process::Command::new("uname")
-            .arg("-a")
-            .output()
-            .await
-        {
-            let uname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(uname) = command_output(backend.clone(), "uname", &["-a"]).await {
             info.push_str(&format!("OS: {}\n", uname));
         }
 
         // Uptime
-        if let Ok(output) = tokio::process::Command::new("uptime").output().await {
-            let uptime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(uptime) = command_output(backend.clone(), "uptime", &[]).await {
             info.push_str(&format!("Uptime: {}\n", uptime));
         }
 
-        // Memory (works on both Linux and macOS)
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(output) = tokio::process::Command::new("free")
-                .arg("-h")
-                .output()
-                .await
-            {
-                let mem = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info.push_str(&format!("Memory:\n{}\n", mem));
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = tokio::process::Command::new("vm_stat").output().await {
-                let mem = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                info.push_str(&format!("Memory:\n{}\n", mem));
-            }
-        }
-
-        if info.is_empty() {
-            info.push_str("Could not retrieve system information.");
+        // Probe the execution target rather than compiling this decision for
+        // the daemon host's operating system.
+        let memory = if backend.executable_exists("free").await.unwrap_or(false) {
+            command_output(backend.clone(), "free", &["-h"]).await
+        } else if backend.executable_exists("vm_stat").await.unwrap_or(false) {
+            command_output(backend, "vm_stat", &[]).await
+        } else {
+            None
+        };
+        if let Some(memory) = memory {
+            info.push_str(&format!("Memory:\n{}\n", memory));
         }
 
         Ok(info)
     }
+}
+
+async fn command_output(
+    backend: SharedExecutionBackend,
+    program: &str,
+    args: &[&str],
+) -> Option<String> {
+    let output = backend
+        .execute(
+            ExecutionRequest::argv(
+                program,
+                args.iter()
+                    .map(|argument| (*argument).to_string())
+                    .collect(),
+            ),
+            Duration::from_secs(5),
+        )
+        .await
+        .ok()?;
+    (output.exit_code == 0)
+        .then(|| output.stdout_lossy().trim().to_string())
+        .filter(|text| !text.is_empty())
 }

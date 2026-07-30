@@ -16,7 +16,10 @@ pub(super) struct CriticalFactSummary {
 }
 
 pub(super) fn is_personal_memory_tool(name: &str) -> bool {
-    matches!(name, "manage_people" | "manage_memories" | "remember_fact")
+    matches!(
+        name,
+        "manage_people" | "manage_memories" | "remember_fact" | "search_history"
+    )
 }
 
 fn normalize_name_candidate(raw: &str) -> Option<String> {

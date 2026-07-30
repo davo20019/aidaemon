@@ -269,7 +269,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             typical_session_length INTEGER,
             active_hours TEXT,
             common_workflows TEXT,
-            asks_before_acting INTEGER DEFAULT 1,
+            asks_before_acting INTEGER DEFAULT 0,
             prefers_explanations INTEGER DEFAULT 1,
             likes_suggestions INTEGER DEFAULT 0,
             updated_at TEXT NOT NULL
@@ -393,6 +393,26 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             prefix TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Backend-scoped terminal approvals. Historical approvals apply only to
+    // local execution; Docker and SSH targets must establish their own trust.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS terminal_backend_allowed_prefixes (
+            backend_scope TEXT NOT NULL,
+            prefix TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (backend_scope, prefix)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
+            (backend_scope, prefix)
+         SELECT 'local', prefix FROM terminal_allowed_prefixes",
     )
     .execute(pool)
     .await?;
@@ -760,6 +780,20 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN channel_id TEXT")
         .execute(pool)
         .await;
+    // Stable canonical bounds avoid timestamp-tie duplication when creating
+    // multiple episodes for a long-running session.
+    let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN start_event_id INTEGER")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN end_event_id INTEGER")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_episodes_session_end_event
+         ON episodes(session_id, end_event_id)",
+    )
+    .execute(pool)
+    .await;
 
     // --- Binary Embedding Storage Migration ---
     // Add embedding column to facts table for pre-computed embeddings
@@ -2125,6 +2159,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     if let Err(error) = create_memory_fts(pool).await {
         tracing::warn!(%error, "SQLite FTS5 unavailable; memory full-text index disabled");
     }
+    if let Err(error) = super::history_search::migrate_history_search(pool).await {
+        // Conversation events are authoritative. Exact-history search is a
+        // replaceable projection and must never prevent the daemon starting.
+        tracing::warn!(%error, "SQLite FTS5 unavailable; exact history search disabled");
+    }
 
     Ok(())
 }
@@ -2156,6 +2195,21 @@ async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // FTS shadow tables need their own secure-delete setting. This complements
+    // SQLite `PRAGMA secure_delete=ON` so explicit source deletion does not
+    // leave old terms in mergeable FTS segments.
+    let _ = sqlx::query(
+        "INSERT INTO memory_claims_fts(memory_claims_fts, rank)
+         VALUES('secure-delete', 1)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "INSERT INTO memory_spans_fts(memory_spans_fts, rank)
+         VALUES('secure-delete', 1)",
+    )
+    .execute(pool)
+    .await;
 
     for statement in [
         "CREATE TRIGGER IF NOT EXISTS memory_claims_ai AFTER INSERT ON memory_claims BEGIN INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",

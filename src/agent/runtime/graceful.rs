@@ -168,6 +168,16 @@ impl Agent {
                 );
             }
         }
+        if let Some(manager) = crate::checkpoints::active_manager() {
+            if let Err(error) = manager.finalize_task(task_id, session_id).await {
+                warn!(
+                    task_id,
+                    session_id,
+                    error = %error,
+                    "Failed to finalize filesystem checkpoint"
+                );
+            }
+        }
     }
 
     /// Ask the owner to approve a one-time budget extension for the current run.

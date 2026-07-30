@@ -111,6 +111,7 @@ impl Agent {
                 }
         };
         let user_role = ctx.user_role;
+        let turn_id = self.current_turn_ids.read().await.get(session_id).cloned();
 
         if user_role != UserRole::Owner {
             anyhow::bail!("Tool access denied: only owners can use tools.");
@@ -131,6 +132,9 @@ impl Agent {
                 }
                 if let Some(tid) = task_id {
                     map.insert("_task_id".to_string(), json!(tid));
+                }
+                if let Some(ref turn_id) = turn_id {
+                    map.insert("_turn_id".to_string(), json!(turn_id));
                 }
                 // Mark as untrusted if this session originated from an automated
                 // trigger (e.g., email) rather than direct user interaction.
@@ -164,10 +168,8 @@ impl Agent {
                         }
                     }
                 }
-                if name == "spawn_agent" {
-                    if let Some(project_scope) = ctx.project_scope {
-                        map.insert("_project_scope".to_string(), json!(project_scope));
-                    }
+                if let Some(project_scope) = ctx.project_scope {
+                    map.insert("_project_scope".to_string(), json!(project_scope));
                 }
                 #[cfg(feature = "computer_use")]
                 if name == "computer_use" {
@@ -213,6 +215,16 @@ impl Agent {
 
         for tool in &self.tools {
             if tool.name() == name {
+                if name != "terminal"
+                    && matches!(
+                        name,
+                        "write_file" | "edit_file" | "run_command" | "cli_agent"
+                    )
+                {
+                    if let Some(manager) = crate::checkpoints::active_manager() {
+                        manager.begin_for_tool(name, &enriched_args).await?;
+                    }
+                }
                 let exec_ctx = crate::traits::ToolExecutionContext {
                     correction_preapproved: ctx.correction_preapproved,
                 };
@@ -224,6 +236,21 @@ impl Agent {
                         outcome.metadata.semantics.merge_missing_from(fallback);
                         outcome
                     });
+
+                if result.as_ref().is_ok_and(|outcome| {
+                    outcome.metadata.background_started || outcome.metadata.detached
+                }) {
+                    if let (Some(manager), Some(task_id)) =
+                        (crate::checkpoints::active_manager(), task_id)
+                    {
+                        manager
+                            .mark_task_unsafe(
+                                task_id,
+                                "mutation continued in a background or detached process",
+                            )
+                            .await;
+                    }
+                }
 
                 // Post-execution: record seen paths from successful commands
                 if result.is_ok() {

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, WriteMode};
 use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind};
 
 use super::fs_utils;
@@ -104,25 +105,28 @@ impl Tool for EditFileTool {
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: new_text"))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
-        let path = fs_utils::validate_path(path_str)?;
+        let backend = active_execution_backend();
+        let path = backend.resolve_path(path_str).await?;
 
         // Block sensitive paths (~/.ssh/*, ~/.aws/*, ~/.gnupg/*, *.env, etc.)
         // mirroring `write_file`. Even though `edit_file` only does
         // find-and-replace, it can still mutate credentials in place, so the
         // same blocklist applies.
-        if fs_utils::is_sensitive_path(&path) {
+        if fs_utils::is_sensitive_path(std::path::Path::new(path.as_str())) {
             anyhow::bail!("Cannot edit sensitive path: {}", path_str);
         }
 
-        if !path.exists() {
+        if backend.metadata(&path).await.is_err() {
             anyhow::bail!("File not found: {}", path_str);
         }
 
-        if fs_utils::is_binary_file(&path).await? {
+        let bytes = backend.read(&path).await?;
+        if bytes.iter().take(8192).any(|byte| *byte == 0) {
             anyhow::bail!("Cannot edit binary file: {}", path_str);
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("Cannot edit non-UTF-8 file: {}", path_str))?;
 
         // Count occurrences using exact match first.
         let mut effective_old_text = old_text.to_string();
@@ -164,23 +168,22 @@ impl Tool for EditFileTool {
         };
 
         // Backup + atomic write
-        let backup = path.with_extension(format!(
+        let backup_extension = format!(
             "{}.bak",
-            path.extension()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_default()
-        ));
-        let _ = tokio::fs::copy(&path, &backup).await;
-
-        let tmp_path = path.with_extension("tmp_edit");
-        tokio::fs::write(&tmp_path, &new_content).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
+            path.extension().map(str::to_string).unwrap_or_default()
+        );
+        let backup = path.with_extension(&backup_extension);
+        let _ = backend.copy(&path, &backup).await;
+        backend
+            .write(&path, new_content.as_bytes(), WriteMode::Overwrite, false)
+            .await?;
 
         // Show context around the change
         let replaced_count = if replace_all { count } else { 1 };
         let context = get_change_context(&new_content, &effective_new_text);
         let used_newline_recovery = effective_old_text != old_text;
-        let diagnostics = fs_utils::post_write_diagnostics(&path).await;
+        let diagnostics =
+            fs_utils::post_write_diagnostics(std::path::Path::new(path.as_str())).await;
 
         Ok(format!(
             "Edited {}: replaced {} occurrence{}{}\n\n{}{}",

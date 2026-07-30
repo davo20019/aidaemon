@@ -9,6 +9,7 @@ use crate::agent::Agent;
 use crate::config::AppConfig;
 use crate::tasks::TaskRegistry;
 use crate::traits::StateStore;
+use crate::types::UserRole;
 
 /// Single source of truth for command definitions.
 ///
@@ -97,6 +98,18 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
             usage: None,
             category: CommandCategory::Core,
         },
+        CommandDef {
+            name: "checkpoints",
+            description: "List filesystem checkpoints",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
+            name: "rollback",
+            description: "Preview or confirm a checkpoint rollback",
+            usage: Some("/rollback [checkpoint-id|confirm TOKEN]"),
+            category: CommandCategory::Core,
+        },
     ]
 }
 
@@ -112,7 +125,13 @@ pub(crate) struct CommandContext {
 impl CommandContext {
     /// Try to handle a shared command. Returns `Some(reply)` if the command was
     /// recognised, `None` if the channel should handle it itself.
-    pub(crate) async fn dispatch(&self, cmd: &str, args: &str, session_id: &str) -> Option<String> {
+    pub(crate) async fn dispatch(
+        &self,
+        cmd: &str,
+        args: &str,
+        session_id: &str,
+        user_role: UserRole,
+    ) -> Option<String> {
         match cmd {
             "/model" => Some(self.handle_model(args).await),
             "/models" => Some(self.handle_models().await),
@@ -123,7 +142,49 @@ impl CommandContext {
             "/clear" => Some(self.handle_clear(session_id).await),
             "/wipe" => Some(self.handle_wipe(session_id).await),
             "/cost" => Some(self.handle_cost().await),
+            "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
+            "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
+        }
+    }
+
+    async fn handle_checkpoints(&self, user_role: UserRole) -> String {
+        if user_role != UserRole::Owner {
+            return "Only the owner can inspect filesystem checkpoints.".to_string();
+        }
+        match crate::checkpoints::active_manager() {
+            Some(manager) => manager.list_text(30, None).await,
+            None => "Filesystem checkpoints are disabled.".to_string(),
+        }
+    }
+
+    async fn handle_rollback(&self, args: &str, session_id: &str, user_role: UserRole) -> String {
+        if user_role != UserRole::Owner {
+            return "Only the owner can roll back filesystem checkpoints.".to_string();
+        }
+        let Some(manager) = crate::checkpoints::active_manager() else {
+            return "Filesystem checkpoints are disabled.".to_string();
+        };
+        let mut parts = args.split_whitespace();
+        let first = parts.next();
+        if first.is_some_and(|value| value.eq_ignore_ascii_case("confirm")) {
+            let Some(token) = parts.next() else {
+                return "Usage: /rollback confirm <token>".to_string();
+            };
+            if parts.next().is_some() {
+                return "Usage: /rollback confirm <token>".to_string();
+            }
+            return match manager.apply_rollback(session_id, token).await {
+                Ok(result) => result.render(),
+                Err(error) => format!("Rollback failed: {error}"),
+            };
+        }
+        if parts.next().is_some() {
+            return "Usage: /rollback [checkpoint-id]".to_string();
+        }
+        match manager.prepare_rollback(session_id, first).await {
+            Ok(preview) => preview.render(),
+            Err(error) => format!("Could not prepare rollback: {error}"),
         }
     }
 
@@ -284,8 +345,8 @@ impl CommandContext {
                     format!(" ({} cancelled.)", cancellations.join(" and "))
                 };
                 format!(
-                    "Context cleared. Starting fresh — your history is kept (use /wipe to \
-                     permanently delete it).{suffix}"
+                    "Context cleared. Starting fresh — your active history is kept (use /wipe to \
+                     erase it from the active database).{suffix}"
                 )
             }
             Err(e) => format!("Failed to clear context: {}", e),
@@ -298,7 +359,7 @@ impl CommandContext {
             .cancel_running_for_session(session_id)
             .await;
 
-        // Destructive: permanently deletes this session's events + summary.
+        // Destructive: erases this session's active database artifacts.
         match self.agent.clear_session(session_id).await {
             Ok(_) => {
                 let suffix = if cancelled.is_empty() {
@@ -311,8 +372,10 @@ impl CommandContext {
                     )
                 };
                 format!(
-                    "Conversation permanently deleted. This cannot be undone (facts already \
-                     saved to memory are kept).{suffix}"
+                    "Conversation erased from the active database (events, exact-search index, \
+                     summaries, episodes, and raw memory spans). Facts already saved to memory \
+                     are kept without raw-message provenance. Existing encrypted backups may \
+                     retain older copies until their own lifecycle removes them.{suffix}"
                 )
             }
             Err(e) => format!("Failed to wipe conversation: {}", e),

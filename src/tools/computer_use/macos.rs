@@ -34,6 +34,7 @@ Grant it in System Settings → Privacy & Security → Accessibility for aidaemo
 const SCREEN_RECORDING_HELP: &str = "Screen Recording permission is required. \
 Grant it in System Settings → Privacy & Security → Screen Recording for aidaemon. \
 This permission only takes effect after the daemon is restarted.";
+const NO_ACCESSIBLE_WINDOW_ERROR: &str = "No accessible window found for app";
 
 const LOCKED_SCREEN_HELP: &str = "The Mac screen is locked — macOS routes all keyboard \
 and mouse input to the lock screen, so computer_use cannot type or click in any app until \
@@ -122,21 +123,23 @@ impl ComputerHarness for MacOsHarness {
 
     async fn launch_app(&self, app: &str) -> Result<AppInfo, String> {
         self.check_permissions()?;
-        // Idempotent: if it is already running, just hand back the live instance.
-        if let Ok(found) = resolve_app(app) {
-            return Ok(found);
-        }
-        launch_app_process(app)?;
-        // `open` returns as soon as the launch is initiated; the process can take
-        // a moment to register with System Events, so poll until it appears.
-        let timeout = Duration::from_secs(self.config.action_timeout_secs.max(5));
-        let resolved = wait_for_running_app(app, timeout)?;
+        // `/usr/bin/open` is deliberately called even when the process is
+        // already running. A macOS app can remain in the process list after its
+        // last window is closed; returning that process unchanged made
+        // launch_app a no-op and the following get_app_state failed with
+        // "No accessible window found for app".
+        let timeout = self.config.action_timeout().max(Duration::from_secs(5));
+        let resolved = open_and_wait_for_running_app(app, timeout)?;
         if is_prohibited_bundle(&resolved.bundle_id) {
             return Err(format!(
                 "App '{}' ({}) is blocked by computer_use policy",
                 resolved.name, resolved.bundle_id
             ));
         }
+        // `open` returns before the app has necessarily created its AX window.
+        // Wait for window readiness so launch_app's immediate get_app_state is
+        // not exposed to a launch race.
+        wait_for_accessible_window(&resolved, timeout)?;
         Ok(resolved)
     }
 
@@ -195,6 +198,17 @@ impl ComputerHarness for MacOsHarness {
             cache.validate_generation(&key, generation)?;
         }
         activate_app(&resolved)?;
+        // Setting a windowless process frontmost does not necessarily create a
+        // window. Re-open it through LaunchServices when needed, then wait for
+        // the new window before capturing state.
+        if !accessible_window_exists(&resolved).unwrap_or(false) {
+            launch_app_process(if resolved.bundle_id.is_empty() {
+                &resolved.name
+            } else {
+                &resolved.bundle_id
+            })?;
+        }
+        wait_for_accessible_window(&resolved, self.config.action_timeout())?;
         capture_app(resolved, &self.config, cache, ctx)
     }
 
@@ -401,7 +415,13 @@ fn capture_app(
 ) -> Result<AppSnapshot, String> {
     let app_element = AXUIElement::from_pid(app.pid)
         .ok_or_else(|| format!("No AX element for pid {}", app.pid))?;
-    let window = focused_or_main_window(&app_element)?;
+    let window = focused_or_main_window(&app_element).map_err(|error| {
+        if error == NO_ACCESSIBLE_WINDOW_ERROR {
+            no_accessible_window_message(&app)
+        } else {
+            error
+        }
+    })?;
     let window_title =
         optional_string_attr(&window, AX_TITLE_ATTRIBUTE).unwrap_or_else(|| app.name.clone());
     let limits = AxWalkLimits::for_app(config, &app.bundle_id);
@@ -546,6 +566,30 @@ fn launch_app_process(app: &str) -> Result<(), String> {
     ))
 }
 
+/// Ask LaunchServices to start or reopen an app, then wait for its process.
+///
+/// Opening first is important even when `resolve_app` would already succeed:
+/// a running macOS process can have zero windows after the user closes its last
+/// one. `/usr/bin/open` sends the reopen event that lets the app create a new
+/// window.
+fn open_and_wait_for_running_app(app: &str, timeout: Duration) -> Result<AppInfo, String> {
+    open_and_wait_for_running_app_with(app, timeout, launch_app_process, wait_for_running_app)
+}
+
+fn open_and_wait_for_running_app_with<Open, Wait>(
+    app: &str,
+    timeout: Duration,
+    open: Open,
+    wait: Wait,
+) -> Result<AppInfo, String>
+where
+    Open: FnOnce(&str) -> Result<(), String>,
+    Wait: FnOnce(&str, Duration) -> Result<AppInfo, String>,
+{
+    open(app)?;
+    wait(app, timeout)
+}
+
 /// Poll the running-app list until `app` appears or the timeout elapses.
 fn wait_for_running_app(app: &str, timeout: Duration) -> Result<AppInfo, String> {
     let deadline = Instant::now() + timeout;
@@ -561,6 +605,64 @@ fn wait_for_running_app(app: &str, timeout: Duration) -> Result<AppInfo, String>
             ));
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn accessible_window_exists(app: &AppInfo) -> Result<bool, String> {
+    let Some(app_element) = AXUIElement::from_pid(app.pid) else {
+        return Ok(false);
+    };
+    Ok(!windows_for_app(&app_element)?.is_empty())
+}
+
+/// Poll until LaunchServices/AX has published at least one window.
+///
+/// Process readiness and window readiness are separate on macOS. In
+/// particular, `/usr/bin/open` may return and System Events may list the process
+/// before AXWindows is populated.
+fn wait_for_accessible_window(app: &AppInfo, timeout: Duration) -> Result<(), String> {
+    wait_for_accessible_window_with(
+        app,
+        timeout,
+        || accessible_window_exists(app),
+        std::thread::sleep,
+    )
+}
+
+fn wait_for_accessible_window_with<Probe, Sleep>(
+    app: &AppInfo,
+    timeout: Duration,
+    mut probe: Probe,
+    mut sleep: Sleep,
+) -> Result<(), String>
+where
+    Probe: FnMut() -> Result<bool, String>,
+    Sleep: FnMut(Duration),
+{
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match probe() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => last_error = Some(error),
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let detail = last_error
+                .map(|error| format!(" Last AX error: {error}."))
+                .unwrap_or_default();
+            return Err(format!(
+                "Requested macOS to open or reopen '{}' (pid {}), but no accessible window \
+                 appeared within {}s. The app may not create a window automatically; activate it \
+                 and open a new window, or ask the user to open one before retrying.{}",
+                app.name,
+                app.pid,
+                timeout.as_secs(),
+                detail
+            ));
+        }
+        sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -592,7 +694,16 @@ fn focused_or_main_window(app: &AXUIElement) -> Result<AXUIElement, String> {
     windows
         .into_iter()
         .next()
-        .ok_or_else(|| "No accessible window found for app".to_string())
+        .ok_or_else(|| NO_ACCESSIBLE_WINDOW_ERROR.to_string())
+}
+
+fn no_accessible_window_message(app: &AppInfo) -> String {
+    format!(
+        "No accessible window found for app '{}' (pid {}): the app is running but has no open \
+         accessibility window. Call computer_use launch_app with app=\"{}\" to reopen it, then \
+         call get_app_state again.",
+        app.name, app.pid, app.name
+    )
 }
 
 fn windows_for_app(app: &AXUIElement) -> Result<Vec<AXUIElement>, String> {
@@ -1254,6 +1365,7 @@ fn scroll_direction(direction: &str, pages: f64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn parse_combo(raw: &str) -> Vec<Key> {
         raw.split('+')
@@ -1305,5 +1417,52 @@ mod tests {
             );
         }
         assert!(parse_key_token("definitely_not_a_key").is_err());
+    }
+
+    #[test]
+    fn launch_reopens_an_already_running_process() {
+        // Regression for the live Calculator failure (2026-07-30): process
+        // resolution succeeded even though AXWindows was empty, and launch_app
+        // returned early without sending a reopen event.
+        let opened = Cell::new(false);
+        let app = AppInfo {
+            name: "Calculator".into(),
+            bundle_id: "com.apple.calculator".into(),
+            pid: 751,
+        };
+        let resolved = open_and_wait_for_running_app_with(
+            "Calculator",
+            Duration::from_secs(10),
+            |_| {
+                opened.set(true);
+                Ok(())
+            },
+            |_, _| Ok(app.clone()),
+        )
+        .unwrap();
+        assert!(opened.get(), "launch must send the reopen event first");
+        assert_eq!(resolved.pid, app.pid);
+    }
+
+    #[test]
+    fn window_readiness_retries_until_ax_window_appears() {
+        let app = AppInfo {
+            name: "Calculator".into(),
+            bundle_id: "com.apple.calculator".into(),
+            pid: 751,
+        };
+        let probes = Cell::new(0);
+        wait_for_accessible_window_with(
+            &app,
+            Duration::from_secs(1),
+            || {
+                let next = probes.get() + 1;
+                probes.set(next);
+                Ok(next == 3)
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(probes.get(), 3);
     }
 }

@@ -220,67 +220,6 @@ impl Agent {
         } else {
             user_text.to_string()
         };
-        let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
-        harness_eval.set_completion_context(
-            format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
-            turn_context
-                .followup_mode
-                .map(|mode| mode.as_str().to_string()),
-        );
-        harness_eval.record_completion_contract(&turn_context.completion_contract);
-        if self.harness_eval_enabled() {
-            self.install_harness_eval(harness_eval).await;
-        }
-        let harness_eval_handle = if self.harness_eval_enabled() {
-            Some(self.harness_eval_handle())
-        } else {
-            None
-        };
-        let (execution_budget_tier, execution_budget_route, execution_budget) =
-            select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
-        #[cfg(test)]
-        let execution_budget = self
-            .execution_budget_override
-            .clone()
-            .unwrap_or(execution_budget);
-        let mut execution_state = ExecutionState::new(
-            execution_budget_tier,
-            execution_budget.clone(),
-            if self.depth > 0 || self.task_id.is_some() {
-                ExecutionPersistence::Durable
-            } else {
-                ExecutionPersistence::Ephemeral
-            },
-        );
-        execution_state.mark_persisted_now();
-        self.emit_decision_point(
-            &emitter,
-            &task_id,
-            0,
-            DecisionType::ExecutionBudgetSelection,
-            "Selected initial execution budget tier".to_string(),
-            json!({
-                "condition": "initial_execution_budget_selected",
-                "budget_tier": execution_budget_tier,
-                "route_kind": execution_budget_route,
-                "budget": execution_budget,
-                "persistence": execution_state.persistence,
-                "execution_id": execution_state.execution_id,
-            }),
-        )
-        .await;
-        self.emit_decision_point(
-            &emitter,
-            &task_id,
-            0,
-            DecisionType::ExecutionStateSnapshot,
-            "Initialized execution state snapshot".to_string(),
-            json!({
-                "condition": "execution_state_initialized",
-                "execution_state": execution_state.clone(),
-            }),
-        )
-        .await;
         info!(
             session_id,
             followup_mode,
@@ -343,25 +282,16 @@ impl Agent {
             evidence: super::loop_state::EvidenceLedger::default(),
             reflection: super::loop_state::ReflectionState::default(),
             directives: super::loop_state::PendingDirectives::default(),
-            counters: super::loop_state::LoopCounters::new(
-                infer_intent_gate(user_text, "")
-                    .needs_tools
-                    .unwrap_or(false),
-            ),
+            counters: super::loop_state::LoopCounters::default(),
             read_files: super::loop_state::ReadFileObservationTracker::default(),
             harness_eval: None,
             eval: None,
         };
-        if let Some(handle) = harness_eval_handle {
-            turn_state.attach_harness_eval(handle);
-        }
-
         // Task-start planning call: generate a structured plan before the main loop.
         // Skipped for conversational queries, short messages, and acknowledgments.
         // In tests, MockProvider silently intercepts planning calls (skip_planning_calls=true).
-        {
+        let task_plan = {
             use super::bootstrap_phase::task_planning::{generate_task_plan, planning_skip_reason};
-            use crate::agent::execution_state::LinearIntentStep;
             let planner_trust_tier = self.trust_tier_for_model(&model).as_str();
             let planner_skip_reason = planning_skip_reason(user_text, false);
             if let Some(reason) = planner_skip_reason {
@@ -378,6 +308,7 @@ impl Agent {
                     ),
                 )
                 .await;
+                None
             } else {
                 // Build conversation context from recent messages for the planner.
                 // This ensures the planner sees the same narrative as the main LLM,
@@ -442,7 +373,7 @@ impl Agent {
                     }),
                 )
                 .await;
-                if let Some(plan) = plan_opt {
+                if let Some(ref plan) = plan_opt {
                     let before_contract = turn_context.completion_contract.clone();
                     // The planner read the actual request (any language), so
                     // its contract classification refines the English-keyword
@@ -492,41 +423,6 @@ impl Agent {
                         ),
                     )
                     .await;
-                    let linear_steps: Vec<LinearIntentStep> = plan
-                        .steps
-                        .iter()
-                        .enumerate()
-                        .map(|(i, step)| LinearIntentStep {
-                            step_id: format!("task-plan-step-{}", i + 1),
-                            step_index: i + 1,
-                            tool: step.tool_hint.clone().unwrap_or_default(),
-                            target: String::new(),
-                            description: step.description.clone(),
-                            tool_calls_on_step: 0,
-                            completed: false,
-                            completion_evidence: None,
-                            last_evaluated_at: None,
-                        })
-                        .collect();
-
-                    let step_count = linear_steps.len();
-                    execution_state.install_linear_intent_plan(1, linear_steps);
-
-                    if !plan.success_criteria.is_empty() {
-                        turn_state
-                            .evidence
-                            .validation_state_mut()
-                            .set_plan(1, &plan.success_criteria);
-                    }
-
-                    execution_state.promote_budget_for_plan(step_count);
-
-                    info!(
-                        session_id,
-                        goal = %plan.goal,
-                        step_count,
-                        "Task plan installed and budget evaluated"
-                    );
                 } else {
                     self.emit_decision_point(
                         &emitter,
@@ -544,7 +440,131 @@ impl Agent {
                     )
                     .await;
                 }
+                plan_opt
             }
+        };
+
+        // The planner has now had its one opportunity to refine the contract.
+        // Derive all contract-dependent state exactly once from that finalized
+        // value so loop control, progress tracking, budgets, and telemetry agree.
+        let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
+        harness_eval.set_completion_context(
+            format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
+            turn_context
+                .followup_mode
+                .map(|mode| mode.as_str().to_string()),
+        );
+        harness_eval.record_completion_contract(&turn_context.completion_contract);
+        if self.harness_eval_enabled() {
+            self.install_harness_eval(harness_eval).await;
+        }
+        let harness_eval_handle = if self.harness_eval_enabled() {
+            Some(self.harness_eval_handle())
+        } else {
+            None
+        };
+        if let Some(handle) = harness_eval_handle {
+            turn_state.attach_harness_eval(handle);
+        }
+
+        let intent_gate = infer_deterministic_orchestration_intent(user_text);
+        let deterministic_tool_need = intent_gate.needs_tools;
+        let recognized_artifact_request = recognized_artifact_creation_request(user_text);
+        let route_requires_tools = self.depth == 0
+            && self.role == AgentRole::Orchestrator
+            && matches!(
+                classify_intent_complexity(user_text),
+                IntentComplexity::Complex
+            );
+        let execution_requirement = ExecutionRequirement::from_finalized_contract(
+            &turn_context.completion_contract,
+            deterministic_tool_need,
+            route_requires_tools,
+            recognized_artifact_request,
+        );
+
+        let (execution_budget_tier, execution_budget_route, execution_budget) =
+            select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
+        #[cfg(test)]
+        let execution_budget = self
+            .execution_budget_override
+            .clone()
+            .unwrap_or(execution_budget);
+        let mut execution_state = ExecutionState::new(
+            execution_budget_tier,
+            execution_budget.clone(),
+            if self.depth > 0 || self.task_id.is_some() {
+                ExecutionPersistence::Durable
+            } else {
+                ExecutionPersistence::Ephemeral
+            },
+        );
+        execution_state.mark_persisted_now();
+        self.emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::ExecutionBudgetSelection,
+            "Selected initial execution budget tier".to_string(),
+            json!({
+                "condition": "initial_execution_budget_selected",
+                "budget_tier": execution_budget_tier,
+                "route_kind": execution_budget_route,
+                "budget": execution_budget,
+                "persistence": execution_state.persistence,
+                "execution_id": execution_state.execution_id,
+            }),
+        )
+        .await;
+        self.emit_decision_point(
+            &emitter,
+            &task_id,
+            0,
+            DecisionType::ExecutionStateSnapshot,
+            "Initialized execution state snapshot".to_string(),
+            json!({
+                "condition": "execution_state_initialized",
+                "execution_state": execution_state.clone(),
+            }),
+        )
+        .await;
+
+        if let Some(plan) = task_plan {
+            use crate::agent::execution_state::LinearIntentStep;
+            let linear_steps: Vec<LinearIntentStep> = plan
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(i, step)| LinearIntentStep {
+                    step_id: format!("task-plan-step-{}", i + 1),
+                    step_index: i + 1,
+                    tool: step.tool_hint.clone().unwrap_or_default(),
+                    target: String::new(),
+                    description: step.description.clone(),
+                    tool_calls_on_step: 0,
+                    completed: false,
+                    completion_evidence: None,
+                    last_evaluated_at: None,
+                })
+                .collect();
+
+            let step_count = linear_steps.len();
+            execution_state.install_linear_intent_plan(1, linear_steps);
+
+            if !plan.success_criteria.is_empty() {
+                turn_state
+                    .evidence
+                    .validation_state_mut()
+                    .set_plan(1, &plan.success_criteria);
+            }
+
+            execution_state.promote_budget_for_plan(step_count);
+            info!(
+                session_id,
+                goal = %plan.goal,
+                step_count,
+                "Task plan installed and budget evaluated"
+            );
         }
 
         if route_failsafe_active {
@@ -914,6 +934,24 @@ impl Agent {
                 }
             }
 
+            // An unfulfilled Change/Deliver contract must retain execution
+            // capability. Recovery branches may request force-text for generic
+            // stall control, so clamp that shared state at the loop boundary.
+            if turn_state.recovery.force_text_response()
+                && !completion_contract_allows_force_text(
+                    &turn_context.completion_contract,
+                    &completion_progress,
+                )
+            {
+                turn_state.recovery.set_force_text_response(false);
+                turn_state.recovery.reset_force_text_iterations();
+                turn_state
+                    .directives
+                    .for_message_build_phase()
+                    .pending_system_messages
+                    .push(SystemDirective::DeferredToolCallRequired);
+            }
+
             // Safety net: if force-text mode has been active for too many
             // consecutive iterations, hard-return whatever the LLM last produced.
             // This prevents infinite force-text loops where the response/completion
@@ -1094,7 +1132,6 @@ impl Agent {
                 && self.role == AgentRole::Orchestrator
                 && !route_failsafe_active
             {
-                let intent_gate = infer_deterministic_orchestration_intent(user_text);
                 if let Some(outcome) = super::orchestration_phase::run_orchestration_phase(
                     &services,
                     &mut OrchestrationCtx {
@@ -1122,6 +1159,7 @@ impl Agent {
                         status_tx: status_tx.clone(),
                         intent_gate: &intent_gate,
                         turn_context: &turn_context,
+                        execution_requirement: &execution_requirement,
                     },
                 )
                 .await?
@@ -1361,7 +1399,11 @@ impl Agent {
                     empty_response_retry_note: llm_recovery.empty_response_retry_note,
                     identity_prefill_text: llm_directives.identity_prefill_text,
                     deferred_no_tool_streak: llm_counters.deferred_no_tool_streak,
-                    tools_required_for_turn: llm_counters.tools_required_for_turn,
+                    execution_requirement: &execution_requirement,
+                    force_text_allowed: completion_contract_allows_force_text(
+                        &turn_context.completion_contract,
+                        &completion_progress,
+                    ),
                     max_budget_extensions,
                     hard_token_cap,
                     truncated_text_prefix: llm_recovery.truncated_text_prefix,
@@ -1440,7 +1482,7 @@ impl Agent {
                         .require_file_recheck_before_answer,
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
-                    needs_tools_for_turn: response_counters.needs_tools_for_turn,
+                    execution_requirement: &execution_requirement,
                     force_text_response: response_recovery.force_text_response,
                     execution_state: &mut execution_state,
                     validation_state: response_evidence.validation_state,

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::execution::{active_execution_backend, BackendKind};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
 use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind};
 use crate::types::{MediaKind, MediaMessage};
@@ -119,9 +120,53 @@ impl Tool for SendFileTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let backend = active_execution_backend();
+        let mut requested_for_delivery = file_path.to_string();
+        let mut exported_from_backend = false;
+        if backend.kind() != BackendKind::Local {
+            let backend_path = match backend.resolve_path(file_path).await {
+                Ok(path) => path,
+                Err(error) => return Ok(format!("Error: Invalid execution path: {error}")),
+            };
+            let metadata = match backend.metadata(&backend_path).await {
+                Ok(metadata) => metadata,
+                Err(_) => return Ok(format!("Error: File not found: {file_path}")),
+            };
+            if !metadata.is_file() {
+                return Ok(format!("Error: Not a regular file: {file_path}"));
+            }
+            let canonical = backend
+                .canonicalize(&backend_path)
+                .await
+                .unwrap_or(backend_path);
+            if crate::tools::file_delivery::is_path_blocked(std::path::Path::new(
+                canonical.as_str(),
+            )) {
+                return Ok(format!(
+                    "Error: Sending this file is blocked for security reasons: {file_path}"
+                ));
+            }
+            let filename = canonical.file_name().unwrap_or("file");
+            let local_staging = self.inbox_dir.join(filename);
+            if let Err(error) = backend.export_local_file(&canonical, &local_staging).await {
+                return Ok(format!(
+                    "Error: Could not export {} from the {} execution backend for delivery: {}",
+                    file_path,
+                    backend.kind().as_str(),
+                    error
+                ));
+            }
+            requested_for_delivery = local_staging.to_string_lossy().into_owned();
+            exported_from_backend = true;
+        }
 
-        let ready = match prepare_delivery(file_path, &cwd, &self.inbox_dir, &self.outbox_dirs) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let ready = match prepare_delivery(
+            &requested_for_delivery,
+            &cwd,
+            &self.inbox_dir,
+            &self.outbox_dirs,
+        ) {
             Ok(r) => r,
             Err(DeliveryError::FileNotFound(_)) => {
                 return Ok(format!("Error: File not found: {}", file_path));
@@ -226,7 +271,14 @@ impl Tool for SendFileTool {
                 .map(|c| c != ready.canonical_path)
                 .unwrap_or(false);
 
-        if ready.recovered_into_inbox {
+        if exported_from_backend {
+            Ok(format!(
+                "File sent: {} ({}) [exported from the {} execution backend]",
+                ready.filename,
+                size_display,
+                backend.kind().as_str()
+            ))
+        } else if ready.recovered_into_inbox {
             Ok(format!(
                 "File sent: {} ({}) [copied into the inbox for delivery]",
                 ready.filename, size_display

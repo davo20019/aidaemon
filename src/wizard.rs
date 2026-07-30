@@ -758,6 +758,41 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+fn render_starter_persona(agent_name: &str, primary_role: &str, style: &str) -> String {
+    format!(
+        "# {agent_name}'s Persona\n\n\
+         ## Primary Role\n\n\
+         {primary_role}\n\n\
+         ## Communication Style\n\n\
+         {style}\n\n\
+         ## Working Preferences\n\n\
+         - Be proactive when the next useful step is clear.\n\
+         - Ask before irreversible or externally visible actions.\n\
+         - Be honest about uncertainty and verify completed actions.\n"
+    )
+}
+
+fn write_starter_persona_if_missing(path: &Path, content: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(content.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn toml_string_literal(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
 /// Returns true if the wizard ran and we should start the daemon immediately.
 pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!();
@@ -767,8 +802,59 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     println!("  This wizard will get you up and running in a few steps.");
     println!();
 
-    // ── Step 1: Provider ────────────────────────────────────────────────
-    println!("  STEP 1 of 2 — Choose your AI provider");
+    // ── Step 1: Agent identity ──────────────────────────────────────────
+    println!("  STEP 1 of 3 — Customize your agent");
+    println!("  ──────────────────────────────────");
+    println!();
+
+    let agent_name = loop {
+        let candidate: String = Input::new()
+            .with_prompt("What should your agent be called?")
+            .default("aidaemon".to_string())
+            .interact_text()?;
+        let candidate_config = crate::config::AgentConfig {
+            name: candidate,
+            persona_file: None,
+        };
+        match candidate_config.validated_name() {
+            Ok(name) => break name,
+            Err(e) => println!("  Invalid agent name: {e}"),
+        }
+    };
+
+    let primary_role: String = Input::new()
+        .with_prompt("What should its primary role be?")
+        .default(
+            "A capable personal assistant for projects, research, and everyday tasks.".to_string(),
+        )
+        .interact_text()?;
+
+    let style_choices = [
+        "Balanced — clear, practical, and adaptable",
+        "Concise — direct, compact, and action-oriented",
+        "Warm — conversational, encouraging, and thoughtful",
+        "Analytical — rigorous, structured, and willing to challenge assumptions",
+    ];
+    let style_instructions = [
+        "Communicate clearly and practically, adapting detail to the user's needs.",
+        "Be direct and compact. Lead with outcomes and avoid unnecessary explanation.",
+        "Be conversational, encouraging, and thoughtful while remaining candid.",
+        "Reason rigorously, structure complex answers, and challenge weak assumptions constructively.",
+    ];
+    let style_index = Select::new()
+        .with_prompt("Choose a communication style")
+        .items(&style_choices)
+        .default(0)
+        .interact()?;
+    let starter_persona = render_starter_persona(
+        &agent_name,
+        primary_role.trim(),
+        style_instructions[style_index],
+    );
+
+    // ── Step 2: Provider ────────────────────────────────────────────────
+    println!();
+    println!("  STEP 2 of 3 — Choose your AI provider");
     println!("  ──────────────────────────────────────");
     println!();
 
@@ -895,9 +981,9 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
             .interact_text()?;
     }
 
-    // ── Step 2: Channels ────────────────────────────────────────────────
+    // ── Step 3: Channels ────────────────────────────────────────────────
     println!();
-    println!("  STEP 2 of 2 — Connect channels");
+    println!("  STEP 3 of 3 — Connect channels");
     println!("  ───────────────────────────────");
     println!();
     println!("  Select one or more channels to set up now.");
@@ -1213,8 +1299,13 @@ pub fn run_wizard(config_path: &Path) -> anyhow::Result<bool> {
     let stt_section =
         crate::stt_setup::stt_config_section(&stt_probe_final, stt_enabled, &stt_language);
 
+    let agent_name_config = toml_string_literal(&agent_name);
     let config = format!(
-        r#"[provider]
+        r#"[agent]
+name = {agent_name_config}
+persona_file = "persona.md"
+
+[provider]
 kind = "{}"
 api_key = {api_key_config}
 {gateway_token_line}
@@ -1258,6 +1349,11 @@ health_port = 8080
         channel_sections = channel_sections
     );
 
+    let persona_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("persona.md");
+    let persona_created = write_starter_persona_if_missing(&persona_path, &starter_persona)?;
     std::fs::write(config_path, &config)?;
 
     println!();
@@ -1270,6 +1366,17 @@ health_port = 8080
         "  You can edit {} anytime to change settings.",
         config_path.display()
     );
+    if persona_created {
+        println!(
+            "  Your editable agent persona is in {}.",
+            persona_path.display()
+        );
+    } else {
+        println!(
+            "  Kept your existing agent persona at {}.",
+            persona_path.display()
+        );
+    }
     println!("  Run `aidaemon install-service` to start on boot (systemd/launchd).");
     if browser_enabled {
         println!("  Run `aidaemon browser login` to log into services for the agent.");
@@ -2791,9 +2898,34 @@ mod tests {
         cloudflare_models_probe_url, collect_telegram_bot_entries, hostname_matches_zone,
         is_cloudflare_ai_gateway_base, low_latency_cloudflared_ingress_routes_for_plans,
         normalize_domain_input, normalize_hostname_input, render_cloudflared_ingress_config,
-        setup_route_dns_hosts, CloudflaredIngressRoute, SetupCommandSpec, TelegramBotTarget,
-        TelegramWebhookPlan,
+        render_starter_persona, setup_route_dns_hosts, toml_string_literal,
+        write_starter_persona_if_missing, CloudflaredIngressRoute, SetupCommandSpec,
+        TelegramBotTarget, TelegramWebhookPlan,
     };
+
+    #[test]
+    fn starter_persona_is_editable_and_created_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("persona.md");
+        let first = render_starter_persona(
+            "Project Nova",
+            "Help with synthetic projects.",
+            "Be concise.",
+        );
+        assert!(write_starter_persona_if_missing(&path, &first).unwrap());
+        assert!(first.contains("# Project Nova's Persona"));
+        assert!(first.contains("Help with synthetic projects."));
+
+        let replacement = render_starter_persona("Other", "Replace it.", "Be verbose.");
+        assert!(!write_starter_persona_if_missing(&path, &replacement).unwrap());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), first);
+    }
+
+    #[test]
+    fn agent_name_is_escaped_as_a_toml_string() {
+        assert_eq!(toml_string_literal("Nova"), "\"Nova\"");
+        assert_eq!(toml_string_literal("O'Brien"), "\"O'Brien\"");
+    }
 
     #[test]
     fn cloudflare_gateway_host_detection() {

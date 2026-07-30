@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.31] - 2026-07-30
+
+### Added
+
+- **Pluggable agent execution environments.** A unified Rust backend now routes agent-visible filesystem operations, terminal commands, Git, CLI agents, attachments, and result artifacts through the same persistent local, SSH, or optional feature-gated Docker workspace. Local remains the compatible default, remote path tools are workspace-scoped by default, and durable terminal approvals are scoped to each concrete execution target.
+- **Downloadable installations can define their own agent identity and persona.** The new `[agent]` config sets a user-facing name and optional Markdown persona file, the setup wizard creates a safe editable starter persona, and the configured identity now stays consistent across private/public prompts and identity-leak recovery without weakening operational or privacy rules.
+- **Exact retained conversation search.** A repairable contentless FTS5 projection powers owner-authorized cross-session discovery, anchored exact context, task objective/resolution bookends, signed snapshot-bound paging, channel isolation, and opt-in specialist-session inclusion. Semantic episode search remains the coarse first layer.
+- **Opt-in local workspace source checkpoints.** Before the first mutating tool call in a turn, aidaemon can capture eligible source files in an external bare-Git store, audit the checkpoint ID, enforce retention/size bounds, list checkpoints remotely, and perform owner-confirmed conflict-aware rollback with a pre-rollback safety snapshot—without touching the project's Git index or metadata.
+
+### Changed
+
+- **Conversation and diagnostic retention are independent.** Exact user/assistant history and its task envelope follow `state.retention.messages_days` (90 days by default; `0` means permanent active-database history), while tool and diagnostic events default to seven days. `/wipe` erases active exact projections and raw provenance while retaining detached durable facts.
+- **Episode recall no longer has a newest-500 or aggressive age-decay gate.** Retained episodes use calibrated semantic ranking, lexical degraded mode, stable event bounds, channel provenance, and production recall counters.
+
+### Fixed
+
+- **Successful structured mutations now close out with a human-readable confirmation.** Post-tool deferral recovery parses complete JSON responses, reports useful scalar fields such as the created resource ID and text, and never exposes a raw or arbitrarily line-truncated API payload.
+
 ## [0.11.30] - 2026-07-29
 
 ### Added

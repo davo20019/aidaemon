@@ -140,8 +140,12 @@ pub(super) async fn execute_tool_call_io(
             let text = outcome.output;
             // Sanitize and wrap untrusted tool outputs
             if !crate::tools::sanitize::is_trusted_tool(&tc.name) {
-                let sanitized = crate::tools::sanitize::sanitize_external_content(&text);
-                crate::tools::sanitize::wrap_untrusted_output(&tc.name, &sanitized)
+                let body = if result_metadata.untrusted_verbatim {
+                    text
+                } else {
+                    crate::tools::sanitize::sanitize_external_content(&text)
+                };
+                crate::tools::sanitize::wrap_untrusted_output(&tc.name, &body)
             } else if tc.name == "terminal" {
                 crate::tools::sanitize::strip_internal_control_markers(&text)
             } else {
@@ -257,18 +261,19 @@ pub(super) async fn execute_tool_call_io(
             // read_file/grep it) sends the planner into a read_file/terminal loop
             // instead of clicking; lossy head+tail compression would drop mid-tree
             // controls (e.g. a feed's Like buttons). So never spill or compress it.
-            let keep_inline = tc.name == "computer_use";
+            let keep_inline = tc.name == "computer_use" || result_metadata.preserve_inline;
             let has_fs_recovery = agent
                 .tools
                 .iter()
                 .any(|t| matches!(t.name(), "read_file" | "terminal") && t.is_available());
             let spilled = if over_cap && !result_is_err && has_fs_recovery && !keep_inline {
-                crate::tools::result_spill::build_spilled_preview(
+                crate::tools::result_spill::build_spilled_preview_for_backend(
                     &tc.name,
                     ctx.session_id,
                     &result_text,
                     max_chars,
                 )
+                .await
             } else {
                 None
             };
@@ -375,8 +380,9 @@ async fn maybe_retry_edit_file_not_found_recovery(
         .await
         .is_ok();
 
-    let resolved_path = crate::tools::fs_utils::validate_path(&path).ok()?;
-    let file_content = tokio::fs::read_to_string(&resolved_path).await.ok()?;
+    let backend = crate::execution::active_execution_backend();
+    let resolved_path = backend.resolve_path(&path).await.ok()?;
+    let file_content = String::from_utf8(backend.read(&resolved_path).await.ok()?).ok()?;
     let recovered_old_text = recover_old_text_with_whitespace_tolerance(&file_content, &old_text)?;
 
     if recovered_old_text == old_text {

@@ -1331,7 +1331,7 @@ impl Agent {
                         mission: mission.to_string(),
                         task: task.chars().take(500).collect(),
                         depth: child_depth as u32,
-                        parent_task_id: None,
+                        parent_task_id: task_id.clone(),
                     },
                 )
                 .await;
@@ -1463,7 +1463,7 @@ impl Agent {
                         success,
                         result_summary: summary,
                         duration_secs: duration.as_secs(),
-                        parent_task_id: None,
+                        parent_task_id: saved_task_id.clone(),
                     },
                 )
                 .await;
@@ -1603,7 +1603,7 @@ impl Agent {
                             mission: mission.clone(),
                             task: input_text.chars().take(500).collect(),
                             depth: child_depth as u32,
-                            parent_task_id: None,
+                            parent_task_id: self.task_id.clone(),
                         },
                     )
                     .await;
@@ -1682,7 +1682,7 @@ impl Agent {
                             success,
                             result_summary: summary,
                             duration_secs: duration.as_secs(),
-                            parent_task_id: None,
+                            parent_task_id: self.task_id.clone(),
                         },
                     )
                     .await;

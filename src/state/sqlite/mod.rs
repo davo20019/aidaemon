@@ -165,6 +165,9 @@ impl SqliteStateStore {
             .filename(db_path)
             .create_if_missing(true)
             .journal_mode(journal_mode)
+            // Scrub deleted text from reusable SQLite pages. Explicit `/wipe`
+            // also truncates the WAL after deleting active history.
+            .pragma("secure_delete", "ON")
             // Startup projection/backfill and retention tasks can briefly
             // overlap. Wait for the writer instead of failing immediately
             // with SQLITE_BUSY and silently deferring an idempotent repair.
@@ -309,9 +312,35 @@ impl SqliteStateStore {
             .topics
             .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default());
+        let bounds = sqlx::query(
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+             FROM events WHERE session_id = ?
+               AND event_type IN ('user_message','assistant_response')
+               AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(&episode.session_id)
+        .bind(episode.start_time.to_rfc3339())
+        .bind(episode.end_time.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        let start_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("start_event_id").ok())
+            .flatten();
+        let end_event_id = bounds
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<i64>, _>("end_event_id").ok())
+            .flatten();
+        let channel_id = episode
+            .channel_id
+            .clone()
+            .or_else(|| crate::memory::derive_channel_id_from_session(&episode.session_id));
         let result = sqlx::query(
-            "INSERT INTO episodes (session_id, summary, topics, emotional_tone, outcome, embedding, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO episodes
+                (session_id, summary, topics, emotional_tone, outcome, embedding,
+                 importance, recall_count, last_recalled_at, message_count,
+                 start_time, end_time, created_at, channel_id, start_event_id, end_event_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&episode.session_id)
         .bind(&episode.summary)
@@ -326,6 +355,9 @@ impl SqliteStateStore {
         .bind(episode.start_time.to_rfc3339())
         .bind(episode.end_time.to_rfc3339())
         .bind(episode.created_at.to_rfc3339())
+        .bind(channel_id)
+        .bind(start_event_id)
+        .bind(end_event_id)
         .execute(&self.pool)
         .await?;
         let id = result.last_insert_rowid();
@@ -341,11 +373,12 @@ impl SqliteStateStore {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Episode>> {
-        // Load recent episodes; semantic vectors live in the replaceable side
-        // index, with the legacy column retained only as a per-row fallback.
+        // Search the complete retained episode set. Exact history search uses
+        // these results only as a soft prior, so this must not impose a
+        // newest-N semantic gate.
         let rows = sqlx::query(
-            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, embedding
-             FROM episodes ORDER BY created_at DESC LIMIT 500"
+            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id, embedding
+             FROM episodes ORDER BY created_at DESC"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -356,36 +389,52 @@ impl SqliteStateStore {
         }
 
         // Embed the query
-        let query_vec = match self.embedding_service.embed(query.to_string()).await {
-            Ok(v) => v,
-            Err(_) => return self.get_recent_episodes(limit).await,
-        };
+        let query_vec = self.embedding_service.embed(query.to_string()).await.ok();
 
         // Score by similarity with memory decay
         // Lowered from 0.5 to 0.3 to match fact retrieval threshold — 0.5 was too
         // aggressive and caused useful episodes to be filtered out.
-        const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.3;
-        let indexed_scores = self
-            .episode_embedding_scores(&query_vec, rows.len())
-            .await
-            .unwrap_or_default();
+        const EPISODE_SIMILARITY_THRESHOLD: f32 = 0.25;
+        let indexed_scores = if let Some(query_vec) = query_vec.as_ref() {
+            self.episode_embedding_scores(query_vec, rows.len())
+                .await
+                .unwrap_or_default()
+        } else {
+            tracing::warn!("Episode embedding unavailable; using explicit lexical degraded mode");
+            std::collections::HashMap::new()
+        };
 
         let mut scored: Vec<(Episode, f32)> = Vec::new();
         for row in rows {
             let episode_id: i64 = row.get("id");
-            let similarity = indexed_scores.get(&episode_id).copied().or_else(|| {
-                row.get::<Option<Vec<u8>>, _>("embedding")
-                    .and_then(|blob| decode_embedding(&blob).ok())
-                    .map(|vec| crate::memory::math::cosine_similarity(&query_vec, &vec))
-            });
+            let similarity = if let Some(query_vec) = query_vec.as_ref() {
+                indexed_scores
+                    .get(&episode_id)
+                    .copied()
+                    .or_else(|| {
+                        row.get::<Option<Vec<u8>>, _>("embedding")
+                            .and_then(|blob| decode_embedding(&blob).ok())
+                            .map(|vec| crate::memory::math::cosine_similarity(query_vec, &vec))
+                    })
+                    .or_else(|| {
+                        // A just-created or partially repaired legacy episode can
+                        // briefly lack both embedding projections. Keep it
+                        // discoverable in an explicit lexical degraded mode.
+                        Some(crate::memory::scoring::lexical_relevance(
+                            query,
+                            row.get::<String, _>("summary").as_str(),
+                        ))
+                    })
+            } else {
+                Some(crate::memory::scoring::lexical_relevance(
+                    query,
+                    row.get::<String, _>("summary").as_str(),
+                ))
+            };
             if let Some(similarity) = similarity {
                 let episode = self.row_to_episode(&row)?;
-                let score = crate::memory::scoring::memory_score(
-                    similarity,
-                    episode.created_at,
-                    episode.recall_count,
-                    episode.last_recalled_at,
-                );
+                let score =
+                    crate::memory::scoring::episode_search_score(similarity, episode.recall_count);
                 if score > EPISODE_SIMILARITY_THRESHOLD {
                     scored.push((episode, score));
                 }
@@ -408,13 +457,18 @@ impl SqliteStateStore {
         }
 
         let episodes: Vec<Episode> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
+        for episode in &episodes {
+            if let Err(error) = self.increment_episode_recall(episode.id).await {
+                tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
+            }
+        }
         Ok(episodes)
     }
 
     /// Get most recent episodes.
     pub async fn get_recent_episodes(&self, limit: usize) -> anyhow::Result<Vec<Episode>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at
+            "SELECT id, session_id, summary, topics, emotional_tone, outcome, importance, recall_count, last_recalled_at, message_count, start_time, end_time, created_at, channel_id
              FROM episodes ORDER BY created_at DESC LIMIT ?"
         )
         .bind(limit as i64)
@@ -424,6 +478,11 @@ impl SqliteStateStore {
         let mut episodes = Vec::with_capacity(rows.len());
         for row in rows {
             episodes.push(self.row_to_episode(&row)?);
+        }
+        for episode in &episodes {
+            if let Err(error) = self.increment_episode_recall(episode.id).await {
+                tracing::debug!(%error, episode_id = episode.id, "Episode recall bump deferred");
+            }
         }
         Ok(episodes)
     }
@@ -684,7 +743,7 @@ impl SqliteStateStore {
                 typical_session_length: None,
                 active_hours: None,
                 common_workflows: None,
-                asks_before_acting: true,
+                asks_before_acting: false,
                 prefers_explanations: true,
                 likes_suggestions: false,
                 updated_at: now,
@@ -1640,6 +1699,7 @@ mod episodes;
 mod facts;
 mod goals;
 mod health_checks;
+pub(crate) mod history_search;
 mod learning;
 pub(crate) mod memory;
 mod messages;

@@ -20,6 +20,7 @@ use crate::config::RetentionConfig;
 #[derive(Debug, Default)]
 pub struct RetentionStats {
     pub messages_deleted: u64,
+    pub diagnostic_events_deleted: u64,
     pub facts_deleted: u64,
     pub token_usage_aggregated: u64,
     pub token_usage_deleted: u64,
@@ -35,6 +36,7 @@ pub struct RetentionStats {
 impl RetentionStats {
     pub fn total_deleted(&self) -> u64 {
         self.messages_deleted
+            + self.diagnostic_events_deleted
             + self.facts_deleted
             + self.token_usage_deleted
             + self.episodes_deleted
@@ -64,6 +66,10 @@ impl RetentionManager {
         match self.cleanup_messages().await {
             Ok(n) => stats.messages_deleted = n,
             Err(e) => warn!("Retention: messages cleanup failed: {}", e),
+        }
+        match self.cleanup_diagnostic_events().await {
+            Ok(n) => stats.diagnostic_events_deleted = n,
+            Err(e) => warn!("Retention: diagnostic events cleanup failed: {}", e),
         }
 
         match self.cleanup_superseded_facts().await {
@@ -117,26 +123,80 @@ impl RetentionManager {
         Ok(stats)
     }
 
-    /// Delete consolidated conversation events older than cutoff.
-    /// Safety: never deletes unconsolidated events.
+    /// Delete the canonical history-bearing task envelope and exact messages.
+    /// `messages_days = 0` is the sole permanent-history switch.
     async fn cleanup_messages(&self) -> anyhow::Result<u64> {
         if self.config.messages_days == 0 {
             return Ok(0);
         }
         let cutoff = (Utc::now() - Duration::days(self.config.messages_days as i64)).to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM events WHERE id IN (
+        let mut deleted = 0_u64;
+        for _ in 0..100 {
+            let result = sqlx::query(
+                "DELETE FROM events WHERE id IN (
                 SELECT id FROM events
-                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                WHERE event_type IN ('task_start', 'user_message', 'assistant_response', 'task_end')
                   AND consolidated_at IS NOT NULL
                   AND created_at < ?
                 LIMIT 500
             )",
-        )
-        .bind(&cutoff)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+            )
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+            let count = result.rows_affected();
+            deleted += count;
+            if count < 500 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Derived rows are harmless if temporarily orphaned because all reads
+        // join back to events, but clean them promptly to reclaim FTS space.
+        for _ in 0..100 {
+            match crate::state::sqlite::history_search::remove_orphans(&self.pool, 500).await {
+                Ok(500) => tokio::task::yield_now().await,
+                Ok(_) => break,
+                Err(error) => {
+                    warn!(%error, "Retention: exact-history orphan cleanup deferred");
+                    break;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Diagnostics and tool lifecycle data have a short, independent window so
+    /// exact conversation retention is not dictated by telemetry volume.
+    async fn cleanup_diagnostic_events(&self) -> anyhow::Result<u64> {
+        if self.config.diagnostic_events_days == 0 {
+            return Ok(0);
+        }
+        let cutoff =
+            (Utc::now() - Duration::days(self.config.diagnostic_events_days as i64)).to_rfc3339();
+        let mut deleted = 0_u64;
+        for _ in 0..100 {
+            let result = sqlx::query(
+                "DELETE FROM events WHERE id IN (
+                    SELECT id FROM events
+                    WHERE event_type NOT IN
+                        ('task_start', 'user_message', 'assistant_response', 'task_end')
+                      AND consolidated_at IS NOT NULL
+                      AND created_at < ?
+                    LIMIT 500
+                )",
+            )
+            .bind(&cutoff)
+            .execute(&self.pool)
+            .await?;
+            let count = result.rows_affected();
+            deleted += count;
+            if count < 500 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(deleted)
     }
 
     /// Delete old superseded fact versions.
@@ -643,6 +703,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_days_zero_is_permanent_across_retention_paths() {
+        let pool = setup_test_db().await;
+        let old_date = "2020-01-01T00:00:00+00:00";
+        for event_type in [
+            "task_start",
+            "user_message",
+            "assistant_response",
+            "task_end",
+        ] {
+            sqlx::query(
+                "INSERT INTO events(session_id,event_type,data,created_at,consolidated_at)
+                 VALUES('permanent', ?, '{}', ?, ?)",
+            )
+            .bind(event_type)
+            .bind(old_date)
+            .bind(old_date)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO events(session_id,event_type,data,created_at,consolidated_at)
+             VALUES('permanent','tool_result','{}',?,?)",
+        )
+        .bind(old_date)
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = RetentionManager::new(
+            pool.clone(),
+            RetentionConfig {
+                messages_days: 0,
+                diagnostic_events_days: 7,
+                ..RetentionConfig::default()
+            },
+        );
+        assert_eq!(manager.cleanup_messages().await.unwrap(), 0);
+        assert_eq!(manager.cleanup_diagnostic_events().await.unwrap(), 1);
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events
+             WHERE event_type IN ('task_start','user_message','assistant_response','task_end')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(history_count, 4);
+    }
+
+    #[tokio::test]
+    async fn message_cleanup_drains_more_than_one_batch() {
+        let pool = setup_test_db().await;
+        let old_date = "2020-01-01T00:00:00+00:00";
+        for _ in 0..1_205 {
+            sqlx::query(
+                "INSERT INTO events(session_id,event_type,data,created_at,consolidated_at)
+                 VALUES('bulk','assistant_response','{}',?,?)",
+            )
+            .bind(old_date)
+            .bind(old_date)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let manager = RetentionManager::new(pool.clone(), RetentionConfig::default());
+        assert_eq!(manager.cleanup_messages().await.unwrap(), 1_205);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn test_cleanup_superseded_facts() {
         let pool = setup_test_db().await;
         let old_date = "2020-01-01T00:00:00+00:00";
@@ -723,6 +858,7 @@ mod tests {
         let pool = setup_test_db().await;
         let config = RetentionConfig {
             messages_days: 0,
+            diagnostic_events_days: 0,
             superseded_facts_days: 0,
             token_usage_aggregate_days: 0,
             episodes_days: 0,

@@ -398,7 +398,12 @@ fn apply_memory_search_saturation_controls(
     //   model literally cannot call them.
     const MEMORY_NUDGE_THRESHOLD: usize = 4;
     const MEMORY_STRIP_THRESHOLD: usize = 7;
-    let memory_tools = ["manage_memories", "remember_fact", "manage_people"];
+    let memory_tools = [
+        "manage_memories",
+        "search_history",
+        "remember_fact",
+        "manage_people",
+    ];
     let is_memory_tool = |name: &str| -> bool { memory_tools.contains(&name) };
 
     let consecutive_memory_calls = recent_tool_names

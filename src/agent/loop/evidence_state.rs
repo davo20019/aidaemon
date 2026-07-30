@@ -114,9 +114,14 @@ impl EvidenceState {
 }
 
 fn normalized_path_key(path: &str) -> String {
-    let normalized = fs_utils::validate_path(path)
-        .ok()
-        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
+    let backend = crate::execution::active_execution_backend();
+    let normalized = fs_utils::validate_path(path).ok().and_then(|path| {
+        if backend.kind() == crate::execution::BackendKind::Local {
+            std::fs::canonicalize(&path).ok().or(Some(path))
+        } else {
+            Some(path)
+        }
+    });
     normalized
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
@@ -159,9 +164,18 @@ pub fn assess_pre_execution_evidence_gate(
         }
         "write_file" => {
             let target = path_target_hint(raw_arguments)?;
-            let path_exists = fs_utils::validate_path(&target.value)
-                .map(|path| path.exists())
-                .unwrap_or(false);
+            // This gate is synchronous. For a remote backend, conservatively
+            // assume the path exists so a write must first establish direct
+            // read evidence; the backend performs the authoritative I/O check.
+            let path_exists = if crate::execution::active_execution_backend().kind()
+                == crate::execution::BackendKind::Local
+            {
+                fs_utils::validate_path(&target.value)
+                    .map(|path| path.exists())
+                    .unwrap_or(false)
+            } else {
+                true
+            };
             if !path_exists
                 || evidence_state.has_direct_targeted_evidence(EvidenceKind::FileRead, &target)
             {

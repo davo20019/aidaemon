@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::active_execution_backend;
 use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
 
 use super::command_semantics::classify_shell_command;
@@ -203,13 +204,14 @@ impl Tool for RunCommandTool {
             );
         }
 
+        let backend = active_execution_backend();
         let dir = if let Some(d) = working_dir {
-            Some(fs_utils::validate_path(d)?)
+            Some(backend.resolve_path(d).await?)
         } else {
             None
         };
 
-        let result = fs_utils::run_cmd(trimmed, dir.as_deref(), timeout).await?;
+        let result = fs_utils::run_cmd_backend(trimmed, dir.as_ref(), timeout).await?;
 
         format_output(&result, trimmed, parse_format)
     }

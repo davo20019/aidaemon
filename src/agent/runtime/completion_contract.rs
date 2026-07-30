@@ -63,6 +63,107 @@ impl CompletionContract {
     }
 }
 
+/// Authoritative, finalized per-turn assessment of whether completing the
+/// request requires execution.
+///
+/// Contract, route, and deterministic lexical signals are folded into one
+/// value. Downstream routing and recovery code must consume
+/// [`Self::requires_execution`] instead of independently recalculating whether
+/// tools are needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionRequirement {
+    requires_execution: bool,
+    deterministic_intent: bool,
+    recognized_artifact_request: bool,
+    mutation_contract: bool,
+    observation_contract: bool,
+    complex_route: bool,
+    supplied_observation: bool,
+}
+
+impl ExecutionRequirement {
+    pub(super) fn from_finalized_contract(
+        contract: &CompletionContract,
+        deterministic_tool_need: Option<bool>,
+        complex_route: bool,
+        recognized_artifact_request: bool,
+    ) -> Self {
+        let mutation_contract =
+            contract.expects_mutation && !contract.connected_content_mode.is_authoring_only();
+        let observation_contract = contract.requires_observation;
+        let supplied_observation = deterministic_tool_need == Some(false);
+        let deterministic_intent = deterministic_tool_need == Some(true);
+        let requires_execution = !supplied_observation
+            && (deterministic_intent
+                || recognized_artifact_request
+                || mutation_contract
+                || observation_contract
+                || complex_route);
+
+        Self {
+            requires_execution,
+            deterministic_intent,
+            recognized_artifact_request,
+            mutation_contract,
+            observation_contract,
+            complex_route,
+            // `Some(false)` is reserved for synthetic turns that already carry
+            // the requested observation (for example background-command output).
+            supplied_observation,
+        }
+    }
+
+    pub(super) fn requires_execution(&self) -> bool {
+        self.requires_execution
+    }
+
+    /// Recognized artifact creation is the narrow case where the first model
+    /// turn must be an execution call rather than an explanatory text response.
+    pub(super) fn requires_initial_tool_call(&self) -> bool {
+        self.requires_execution && self.recognized_artifact_request
+    }
+
+    pub(super) fn reason_codes(&self) -> Vec<&'static str> {
+        if self.supplied_observation {
+            return vec!["supplied_observation"];
+        }
+
+        let mut reasons = Vec::new();
+        if self.deterministic_intent {
+            reasons.push("deterministic_intent");
+        }
+        if self.recognized_artifact_request {
+            reasons.push("recognized_artifact_request");
+        }
+        if self.mutation_contract {
+            reasons.push("mutation_contract");
+        }
+        if self.observation_contract {
+            reasons.push("observation_contract");
+        }
+        if self.complex_route {
+            reasons.push("complex_route");
+        }
+        if reasons.is_empty() {
+            reasons.push("none");
+        }
+        reasons
+    }
+}
+
+/// Change and Deliver contracts may only enter text-only mode after their
+/// mutation obligation has actually been fulfilled.
+pub(super) fn completion_contract_allows_force_text(
+    contract: &CompletionContract,
+    progress: &CompletionProgress,
+) -> bool {
+    !matches!(
+        contract.task_kind,
+        CompletionTaskKind::Change | CompletionTaskKind::Deliver
+    ) || !contract.expects_mutation
+        || progress.mutation_count > 0
+}
+
 /// Map a planner-supplied task-kind string to the enum. Unknown values map
 /// to None so a hallucinated kind never overrides the keyword inference.
 pub(super) fn parse_planned_task_kind(value: &str) -> Option<CompletionTaskKind> {
@@ -370,8 +471,16 @@ fn extract_verification_targets(text: &str, alias_roots: &[String]) -> Vec<Verif
             {
                 continue;
             }
-            if let Ok(path) = crate::tools::fs_utils::validate_path(token) {
-                let value = path.to_string_lossy().to_string();
+            let resolved = if crate::execution::active_execution_backend().kind()
+                == crate::execution::BackendKind::Local
+            {
+                crate::tools::fs_utils::validate_path(token)
+                    .map(|path| path.to_string_lossy().to_string())
+            } else {
+                crate::execution::normalize_active_path_lexically(token)
+                    .map(|path| path.as_str().to_string())
+            };
+            if let Ok(value) = resolved {
                 if !targets.iter().any(|existing| existing.value == value) {
                     targets.push(VerificationTarget {
                         kind: VerificationTargetKind::Path,
@@ -1369,6 +1478,96 @@ mod tests {
             contract.connected_content_mode,
             super::super::intent_routing::ConnectedContentMode::DraftThenDeliver
         );
+    }
+
+    #[test]
+    fn finalized_execution_requirement_keeps_draft_only_text_optional() {
+        let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
+        let requirement =
+            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+
+        assert!(!requirement.requires_execution());
+        assert_eq!(requirement.reason_codes(), vec!["none"]);
+    }
+
+    #[test]
+    fn finalized_execution_requirement_uses_planner_refined_observation_contract() {
+        let mut contract = CompletionContract::default();
+        apply_planned_contract_signals(
+            &mut contract,
+            Some(false),
+            Some(true),
+            Some(CompletionTaskKind::Check),
+        );
+        let requirement =
+            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+
+        assert!(requirement.requires_execution());
+        assert!(requirement.reason_codes().contains(&"observation_contract"));
+    }
+
+    #[test]
+    fn evidence_grounded_observation_requires_execution() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            explicit_verification_requested: true,
+            verification_targets: vec![VerificationTarget {
+                kind: VerificationTargetKind::Url,
+                value: "https://example.com/status".to_string(),
+            }],
+            ..CompletionContract::default()
+        };
+        let requirement =
+            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+
+        assert!(requirement.requires_execution());
+    }
+
+    #[test]
+    fn supplied_observation_disarms_tool_recovery() {
+        let contract = CompletionContract {
+            requires_observation: true,
+            ..CompletionContract::default()
+        };
+        let requirement =
+            ExecutionRequirement::from_finalized_contract(&contract, Some(false), true, true);
+
+        assert!(!requirement.requires_execution());
+        assert!(!requirement.requires_initial_tool_call());
+        assert_eq!(requirement.reason_codes(), vec!["supplied_observation"]);
+    }
+
+    #[test]
+    fn recognized_artifact_requires_initial_execution_call() {
+        let contract = CompletionContract {
+            task_kind: CompletionTaskKind::Change,
+            expects_mutation: true,
+            ..CompletionContract::default()
+        };
+        let requirement =
+            ExecutionRequirement::from_finalized_contract(&contract, Some(true), false, true);
+
+        assert!(requirement.requires_execution());
+        assert!(requirement.requires_initial_tool_call());
+        assert!(requirement
+            .reason_codes()
+            .contains(&"recognized_artifact_request"));
+    }
+
+    #[test]
+    fn unfulfilled_change_and_deliver_contracts_disallow_force_text() {
+        for task_kind in [CompletionTaskKind::Change, CompletionTaskKind::Deliver] {
+            let contract = CompletionContract {
+                task_kind,
+                expects_mutation: true,
+                ..CompletionContract::default()
+            };
+            let mut progress = CompletionProgress::new(&contract);
+
+            assert!(!completion_contract_allows_force_text(&contract, &progress));
+            progress.mutation_count = 1;
+            assert!(completion_contract_allows_force_text(&contract, &progress));
+        }
     }
     #[test]
     fn recall_question_about_remembered_facts_does_not_expect_mutation() {

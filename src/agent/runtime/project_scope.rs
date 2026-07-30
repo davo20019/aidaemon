@@ -113,6 +113,10 @@ fn token_looks_like_project_scope_path(token: &str, alias_roots: &[String]) -> b
         return true;
     }
 
+    if crate::execution::active_execution_backend().kind() != crate::execution::BackendKind::Local {
+        return crate::execution::normalize_active_path_lexically(token).is_ok();
+    }
+
     let Some(first_segment) = token
         .split(['/', '\\'])
         .find(|segment| !segment.trim().is_empty())
@@ -478,6 +482,15 @@ fn extract_project_scopes_from_text_inner(
 }
 
 fn scope_looks_like_project_root(scope: &str) -> bool {
+    let backend = crate::execution::active_execution_backend();
+    if backend.kind() != crate::execution::BackendKind::Local {
+        let Ok(path) = crate::execution::normalize_active_path_lexically(scope) else {
+            return false;
+        };
+        return std::path::Path::new(path.as_str())
+            .starts_with(std::path::Path::new(backend.workspace_root().as_str()));
+    }
+
     let Ok(path) = crate::tools::fs_utils::validate_path(scope) else {
         return false;
     };

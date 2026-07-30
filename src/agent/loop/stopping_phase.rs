@@ -193,8 +193,12 @@ pub(super) async fn run_stopping_phase(
             recoverable_tool_snapshot_present,
             total_successful_tool_calls,
         );
-        let can_shift_to_final_response_closeout =
-            final_response_only && !execution_state.final_response_closeout_active;
+        let can_shift_to_final_response_closeout = final_response_only
+            && !execution_state.final_response_closeout_active
+            && completion_contract_allows_force_text(
+                &turn_context.completion_contract,
+                completion_progress,
+            );
 
         if can_shift_to_final_response_closeout {
             validation_state.record_failure(ValidationFailure::BudgetExhausted);
@@ -228,6 +232,10 @@ pub(super) async fn run_stopping_phase(
             .failed_checks
             .contains(&ValidationFailure::BudgetExhausted)
             && made_progress
+            && completion_contract_allows_force_text(
+                &turn_context.completion_contract,
+                completion_progress,
+            )
             && matches!(
                 execution_state.last_outcome,
                 Some(StepExecutionOutcome::Progress | StepExecutionOutcome::BackgroundDetached)
@@ -258,6 +266,10 @@ pub(super) async fn run_stopping_phase(
 
         let plain_text_recovery_available = text_only_turn
             && !force_text_response
+            && completion_contract_allows_force_text(
+                &turn_context.completion_contract,
+                completion_progress,
+            )
             && !validation_state
                 .failed_checks
                 .contains(&ValidationFailure::BudgetExhausted);

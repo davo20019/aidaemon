@@ -13,7 +13,6 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::process_control::{configure_command_for_process_group, send_sigkill, send_sigterm};
 use super::{
     command_risk::{PermissionMode, RiskLevel},
     daemon_guard::detect_daemonization_primitives,
@@ -24,6 +23,10 @@ use crate::agent::{
 };
 use crate::channels::ChannelHub;
 use crate::config::CliAgentsConfig;
+use crate::execution::{
+    active_execution_backend, BackendFileType, BackendPath, ExecutionRequest, ProcessHandle,
+    SharedExecutionBackend,
+};
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
@@ -109,47 +112,8 @@ impl LoopDetector {
     }
 }
 
-/// Check if a process is still alive.
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    use std::process::Command;
-    // kill -0 checks if process exists without actually sending a signal
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
-    // On non-Unix platforms, assume process is alive
-    true
-}
-
-/// Kill a process by PID (SIGTERM then SIGKILL).
-#[cfg(unix)]
-async fn kill_process(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-
-    // Send SIGTERM to process group (fallback to pid).
-    let _ = send_sigterm(pid);
-
-    // Wait a bit
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Send SIGKILL if still alive.
-    if is_process_alive(pid) {
-        let _ = send_sigkill(pid);
-    }
-}
-
-#[cfg(not(unix))]
-async fn kill_process(_pid: u32) {
-    // On non-Unix platforms, we can't easily kill by PID
-    // The process will be orphaned but should eventually terminate
+async fn kill_process(backend: &SharedExecutionBackend, handle: &ProcessHandle) {
+    let _ = backend.terminate(handle, Duration::from_secs(2)).await;
 }
 
 struct CliToolEntry {
@@ -171,8 +135,10 @@ struct RunningCliAgent {
     display_buf: Arc<Mutex<String>>,
     /// Pure stdout for JSON extraction
     stdout_buf: Arc<Mutex<String>>,
-    /// Process ID for status display and killing
-    child_id: u32,
+    /// Backend-scoped handle for status display and cancellation.
+    process_handle: ProcessHandle,
+    /// Set by the stream/wait task after the backend process exits.
+    finished: Arc<AtomicBool>,
     /// Session ID for filtering cancel_all by session
     session_id: String,
     /// Delegated task ID when this cli_agent run is acting as an executor.
@@ -305,6 +271,7 @@ fn make_dedup_prompt(prompt: &str) -> String {
 }
 
 pub struct CliAgentTool {
+    backend: SharedExecutionBackend,
     // MUST be std::sync::RwLock because schema() is sync
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
     tool_names: Arc<std::sync::RwLock<Vec<String>>>,
@@ -320,6 +287,44 @@ pub struct CliAgentTool {
     concurrency_limiter: Arc<Semaphore>,
     approval_tx: ApprovalBroker,
     hub: OnceLock<Weak<ChannelHub>>,
+}
+
+async fn list_backend_files(
+    backend: SharedExecutionBackend,
+    root: BackendPath,
+    skip: &HashSet<&str>,
+    max_depth: usize,
+    cap: usize,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(root.clone(), String::new(), 0usize)]);
+    while let Some((directory, prefix, depth)) = queue.pop_front() {
+        let Ok(entries) = backend.read_dir(&directory).await else {
+            continue;
+        };
+        for entry in entries {
+            if files.len() >= cap {
+                return files;
+            }
+            let name = entry.path.file_name().unwrap_or_default();
+            if skip.contains(name) {
+                continue;
+            }
+            let relative = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry.metadata.file_type {
+                BackendFileType::File => files.push(relative),
+                BackendFileType::Directory if depth + 1 < max_depth => {
+                    queue.push_back((entry.path, relative, depth + 1));
+                }
+                _ => {}
+            }
+        }
+    }
+    files
 }
 
 /// Default tool definitions when the user enables cli_agents but doesn't specify tools.
@@ -382,11 +387,9 @@ const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "gemini", "codex", "copilot",
 
 /// Check if a command exists on the system.
 async fn command_exists(command: &str) -> bool {
-    tokio::process::Command::new("which")
-        .arg(command)
-        .output()
+    active_execution_backend()
+        .executable_exists(command)
         .await
-        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -523,11 +526,14 @@ impl CliAgentTool {
     /// Normalize a working directory for lock/key comparisons.
     /// Uses canonical paths when possible so aliases like `/repo` and `/repo/`
     /// map to the same lock key.
-    fn normalize_working_dir(dir: &str) -> String {
-        let expanded = shellexpand::tilde(dir).to_string();
-        std::fs::canonicalize(&expanded)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(expanded)
+    async fn normalize_working_dir(dir: &str) -> anyhow::Result<String> {
+        let backend = active_execution_backend();
+        let resolved = backend.resolve_path(dir).await?;
+        Ok(backend
+            .canonicalize(&resolved)
+            .await
+            .unwrap_or(resolved)
+            .to_string())
     }
 
     /// Release a working-directory claim if it belongs to the given task.
@@ -557,6 +563,12 @@ impl CliAgentTool {
             prompt_preview
         );
         let warnings = vec![
+            format!(
+                "Execution target: {} ({}) workspace {}",
+                self.backend.kind().as_str(),
+                self.backend.id(),
+                self.backend.workspace_root()
+            ),
             format!("Daemonization primitives detected: {}", hits.join(", ")),
             "Detached/background processes may survive cancellation and continue running."
                 .to_string(),
@@ -662,6 +674,7 @@ impl CliAgentTool {
         tool_names.sort();
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -895,7 +908,7 @@ impl CliAgentTool {
             let mut running = self.running.lock().await;
             let finished_ids: Vec<String> = running
                 .iter()
-                .filter(|(_, agent)| !is_process_alive(agent.child_id))
+                .filter(|(_, agent)| agent.finished.load(Ordering::Acquire))
                 .map(|(id, _)| id.clone())
                 .collect();
 
@@ -1032,9 +1045,11 @@ impl CliAgentTool {
         // Project docs hinting
         let mut project_docs_text = String::new();
         if let Some(dir) = working_dir {
+            let root = BackendPath::new(dir);
             for doc_name in ["CLAUDE.md", "README.md"] {
-                let doc_path = std::path::Path::new(dir).join(doc_name);
-                if let Ok(content) = tokio::fs::read_to_string(&doc_path).await {
+                let doc_path = root.join(doc_name);
+                if let Ok(bytes) = self.backend.read(&doc_path).await {
+                    let content = String::from_utf8_lossy(&bytes);
                     let mut snippet: String = content.chars().take(3072).collect();
                     if content.chars().count() > 3072 {
                         snippet.push_str("\n...[truncated]");
@@ -1048,7 +1063,6 @@ impl CliAgentTool {
         // Native file listing from working directory (up to 3 levels)
         let mut files_text = String::new();
         if let Some(dir) = working_dir {
-            let cap = 200usize;
             let skip: HashSet<&str> = [
                 ".git",
                 "node_modules",
@@ -1060,71 +1074,9 @@ impl CliAgentTool {
             ]
             .into_iter()
             .collect();
-            let mut file_paths = Vec::new();
-
-            if let Ok(mut level1) = tokio::fs::read_dir(dir).await {
-                while let Ok(Some(entry1)) = level1.next_entry().await {
-                    if file_paths.len() >= cap {
-                        break;
-                    }
-                    let name1 = entry1.file_name().to_string_lossy().to_string();
-                    if skip.contains(name1.as_str()) {
-                        continue;
-                    }
-                    let Ok(ft1) = entry1.file_type().await else {
-                        continue;
-                    };
-                    if ft1.is_file() {
-                        file_paths.push(name1.clone());
-                        continue;
-                    }
-                    if !ft1.is_dir() {
-                        continue;
-                    }
-
-                    if let Ok(mut level2) = tokio::fs::read_dir(entry1.path()).await {
-                        while let Ok(Some(entry2)) = level2.next_entry().await {
-                            if file_paths.len() >= cap {
-                                break;
-                            }
-                            let name2 = entry2.file_name().to_string_lossy().to_string();
-                            if skip.contains(name2.as_str()) {
-                                continue;
-                            }
-                            let rel2 = format!("{}/{}", name1, name2);
-                            let Ok(ft2) = entry2.file_type().await else {
-                                continue;
-                            };
-                            if ft2.is_file() {
-                                file_paths.push(rel2);
-                                continue;
-                            }
-                            if !ft2.is_dir() {
-                                continue;
-                            }
-
-                            if let Ok(mut level3) = tokio::fs::read_dir(entry2.path()).await {
-                                while let Ok(Some(entry3)) = level3.next_entry().await {
-                                    if file_paths.len() >= cap {
-                                        break;
-                                    }
-                                    let Ok(ft3) = entry3.file_type().await else {
-                                        continue;
-                                    };
-                                    if !ft3.is_file() {
-                                        continue;
-                                    }
-                                    let name3 = entry3.file_name().to_string_lossy().to_string();
-                                    if skip.contains(name3.as_str()) {
-                                        continue;
-                                    }
-                                    file_paths.push(format!("{}/{}/{}", name1, name2, name3));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let mut file_paths =
+                list_backend_files(self.backend.clone(), BackendPath::new(dir), &skip, 3, 200)
+                    .await;
 
             if !file_paths.is_empty() {
                 file_paths.sort();
@@ -1135,22 +1087,20 @@ impl CliAgentTool {
         // Spatial awareness: list ~/projects/ contents so sub-agents can discover
         // files/projects outside the current working directory.
         let mut projects_listing_text = String::new();
-        if let Some(home) = dirs::home_dir() {
+        if let Ok(home) = self.backend.home_dir().await {
             let projects_dir = home.join("projects");
-            if let Ok(mut entries) = tokio::fs::read_dir(&projects_dir).await {
+            if let Ok(entries) = self.backend.read_dir(&projects_dir).await {
                 let mut dirs_list: Vec<String> = Vec::new();
                 let mut files_list: Vec<String> = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let name = entry.file_name().to_string_lossy().to_string();
+                for entry in entries {
+                    let name = entry.path.file_name().unwrap_or_default().to_string();
                     if name.starts_with('.') {
                         continue;
                     }
-                    if let Ok(ft) = entry.file_type().await {
-                        if ft.is_dir() {
-                            dirs_list.push(format!("  {}/", name));
-                        } else if ft.is_file() {
-                            files_list.push(format!("  {}", name));
-                        }
+                    if entry.metadata.file_type == BackendFileType::Directory {
+                        dirs_list.push(format!("  {}/", name));
+                    } else if entry.metadata.file_type == BackendFileType::File {
+                        files_list.push(format!("  {}", name));
                     }
                     if dirs_list.len() + files_list.len() >= 80 {
                         break;
@@ -1159,7 +1109,7 @@ impl CliAgentTool {
                 dirs_list.sort();
                 files_list.sort();
                 if !dirs_list.is_empty() || !files_list.is_empty() {
-                    let mut listing = format!("{}:\n", projects_dir.display());
+                    let mut listing = format!("{}:\n", projects_dir);
                     let mut all_entries = dirs_list;
                     all_entries.append(&mut files_list);
                     listing.push_str(&all_entries.join("\n"));
@@ -1250,56 +1200,52 @@ impl CliAgentTool {
 
     /// Capture git diff after CLI agent completes (for any exit code).
     async fn capture_git_diff(working_dir: &str) -> Option<String> {
-        // Check if it's a git repo
-        let git_check = tokio::process::Command::new("git")
-            .args(["rev-parse", "--git-dir"])
-            .current_dir(working_dir)
-            .output()
-            .await;
-        if !git_check.map(|o| o.status.success()).unwrap_or(false) {
+        let directory = BackendPath::new(working_dir);
+        let git_check =
+            crate::tools::fs_utils::run_cmd_backend("git rev-parse --git-dir", Some(&directory), 5)
+                .await
+                .ok()?;
+        if git_check.exit_code != 0 {
             return None;
         }
 
         // Check for uncommitted changes first
-        let diff_stat = tokio::process::Command::new("git")
-            .args(["diff", "--stat"])
-            .current_dir(working_dir)
-            .output()
-            .await
-            .ok()?;
-        let stat_output = String::from_utf8_lossy(&diff_stat.stdout);
+        let diff_stat =
+            crate::tools::fs_utils::run_cmd_backend("git diff --stat", Some(&directory), 10)
+                .await
+                .ok()?;
+        let stat_output = diff_stat.stdout;
 
         if !stat_output.trim().is_empty() {
             // There are uncommitted changes — capture them
-            let diff = tokio::process::Command::new("git")
-                .args(["diff"])
-                .current_dir(working_dir)
-                .output()
+            let diff = crate::tools::fs_utils::run_cmd_backend("git diff", Some(&directory), 10)
                 .await
                 .ok()?;
-            let diff_text = String::from_utf8_lossy(&diff.stdout);
+            let diff_text = diff.stdout;
             if !diff_text.trim().is_empty() {
                 return Some(truncate_with_note(&diff_text, MAX_DIFF_SIZE));
             }
         }
 
         // No uncommitted changes — check if the agent committed something
-        let log = tokio::process::Command::new("git")
-            .args(["log", "-1", "--stat", "--format=%s"])
-            .current_dir(working_dir)
-            .output()
-            .await
-            .ok()?;
-        let log_output = String::from_utf8_lossy(&log.stdout);
+        let log = crate::tools::fs_utils::run_cmd_backend(
+            "git log -1 --stat --format=%s",
+            Some(&directory),
+            10,
+        )
+        .await
+        .ok()?;
+        let log_output = log.stdout;
 
         if !log_output.trim().is_empty() {
-            let committed_diff = tokio::process::Command::new("git")
-                .args(["diff", "HEAD~1..HEAD"])
-                .current_dir(working_dir)
-                .output()
-                .await
-                .ok()?;
-            let committed_text = String::from_utf8_lossy(&committed_diff.stdout);
+            let committed_diff = crate::tools::fs_utils::run_cmd_backend(
+                "git diff HEAD~1..HEAD",
+                Some(&directory),
+                10,
+            )
+            .await
+            .ok()?;
+            let committed_text = committed_diff.stdout;
             if !committed_text.trim().is_empty() {
                 return Some(format!(
                     "Committed: {}\n{}",
@@ -1497,7 +1443,10 @@ impl CliAgentTool {
             return Ok(message);
         }
 
-        let canonical_working_dir = working_dir.map(Self::normalize_working_dir);
+        let canonical_working_dir = match working_dir {
+            Some(dir) => Some(Self::normalize_working_dir(dir).await?),
+            None => None,
+        };
         let dedup_prompt = make_dedup_prompt(prompt);
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         let short_summary: String = prompt.chars().take(50).collect();
@@ -1639,26 +1588,15 @@ impl CliAgentTool {
         let state_for_completion = self.state.clone();
         let delegated_task_id_owned = delegated_task_id.map(|task_id| task_id.to_string());
 
-        // Build command
-        let mut cmd = tokio::process::Command::new(&command);
-        for arg in &args {
-            cmd.arg(arg);
-        }
-        cmd.arg(&final_prompt);
-
-        // Ensure Claude child runs aren't treated as nested Claude sessions.
+        let mut command_args = args.clone();
+        command_args.push(final_prompt.clone());
+        let mut request = ExecutionRequest::argv(command.clone(), command_args);
         if tool_name.eq_ignore_ascii_case("claude") {
-            cmd.env_remove("CLAUDECODE");
+            request.env_remove.push("CLAUDECODE".to_string());
         }
-
         if let Some(ref dir) = canonical_working_dir {
-            cmd.current_dir(dir);
+            request.cwd = Some(BackendPath::new(dir));
         }
-
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        configure_command_for_process_group(&mut cmd);
 
         info!(
             task_id,
@@ -1677,7 +1615,7 @@ impl CliAgentTool {
         }
 
         let started_at_instant = Instant::now();
-        let mut child = match cmd.spawn() {
+        let mut spawned = match self.backend.spawn(request).await {
             Ok(child) => child,
             Err(e) => {
                 // claim_guard drops on return and releases the claim.
@@ -1699,14 +1637,12 @@ impl CliAgentTool {
                     )
                     .await;
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
-        let pid = child.id().unwrap_or(0);
-
-        // stdin is null (prompt passed via args), so just drop any handle
-        drop(child.stdin.take());
-        let stdout = match child.stdout.take() {
+        let process_handle = spawned.handle().clone();
+        let pid = process_handle.display_id();
+        let stdout = match spawned.take_stdout() {
             Some(stdout) => stdout,
             None => {
                 // claim_guard drops on return and releases the claim.
@@ -1723,7 +1659,7 @@ impl CliAgentTool {
                 return Err(anyhow::anyhow!(error));
             }
         };
-        let stderr = match child.stderr.take() {
+        let stderr = match spawned.take_stderr() {
             Some(stderr) => stderr,
             None => {
                 // claim_guard drops on return and releases the claim.
@@ -1740,6 +1676,7 @@ impl CliAgentTool {
                 return Err(anyhow::anyhow!(error));
             }
         };
+        let mut child = spawned.into_child();
 
         // Two buffers: stdout_buf for JSON extraction, display_buf for user display
         let stdout_buf = Arc::new(Mutex::new(String::new()));
@@ -1763,6 +1700,10 @@ impl CliAgentTool {
         // background, we flip it to true so completion is still delivered to the user.
         let should_notify = Arc::new(AtomicBool::new(async_mode));
         let pid_for_kill = pid;
+        let backend_for_task = self.backend.clone();
+        let process_handle_for_task = process_handle.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_task = finished.clone();
         let invocation_started_at = started_at_instant;
         let max_output_for_log = max_output;
         let notify_session_id = session_id.to_string();
@@ -1802,7 +1743,7 @@ impl CliAgentTool {
                         pattern_count = ?loop_pattern_count,
                         "Infinite loop detected in CLI agent output, killing process"
                     );
-                    kill_process(pid_for_kill).await;
+                    kill_process(&backend_for_task, &process_handle_for_task).await;
                     break;
                 }
 
@@ -1842,7 +1783,11 @@ impl CliAgentTool {
                                                 ));
                                             }
                                         }
-                                        kill_process(pid_for_kill).await;
+                                        kill_process(
+                                            &backend_for_task,
+                                            &process_handle_for_task,
+                                        )
+                                        .await;
                                         break;
                                     }
                                 }
@@ -1924,7 +1869,7 @@ impl CliAgentTool {
                             let mut buf = display_buf_writer.lock().await;
                             buf.push_str(&format!("[killed] CLI agent appears stuck waiting for input: {}\n", line));
                             drop(buf);
-                            kill_process(pid_for_kill).await;
+                            kill_process(&backend_for_task, &process_handle_for_task).await;
                             break;
                         }
                     }
@@ -2005,6 +1950,7 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
+            finished_for_task.store(true, Ordering::Release);
 
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
@@ -2130,7 +2076,8 @@ impl CliAgentTool {
                 started_at: started_at_instant,
                 display_buf,
                 stdout_buf,
-                child_id: pid,
+                process_handle: process_handle.clone(),
+                finished: finished.clone(),
                 session_id: session_id.to_string(),
                 delegated_task_id: delegated_task_id_owned.clone(),
                 working_dir: working_dir_owned,
@@ -2318,7 +2265,8 @@ impl CliAgentTool {
                     started_at: started_at_instant,
                     display_buf,
                     stdout_buf,
-                    child_id: pid,
+                    process_handle,
+                    finished,
                     session_id: session_id.to_string(),
                     delegated_task_id: delegated_task_id_owned.clone(),
                     working_dir: working_dir_owned,
@@ -2407,8 +2355,7 @@ impl CliAgentTool {
         let elapsed = agent.started_at.elapsed().as_secs();
         let display_output = agent.display_buf.lock().await.clone();
 
-        // Check if process is still alive
-        let is_running = is_process_alive(agent.child_id);
+        let is_running = !agent.finished.load(Ordering::Acquire);
 
         if !is_running {
             Ok(Self::build_finished_result(agent).await)
@@ -2419,7 +2366,7 @@ impl CliAgentTool {
                  Partial output ({} chars):\n{}",
                 agent.tool_name,
                 elapsed,
-                agent.child_id,
+                agent.process_handle.display_id(),
                 agent.prompt_summary,
                 display_output.len(),
                 truncate_with_note(&display_output, 5000)
@@ -2447,7 +2394,7 @@ impl CliAgentTool {
         }
 
         // Try to kill the process
-        kill_process(agent.child_id).await;
+        kill_process(&self.backend, &agent.process_handle).await;
 
         if let Some(ref delegated_task_id) = agent.delegated_task_id {
             Self::persist_delegated_cli_result_with_state(
@@ -2497,7 +2444,7 @@ impl CliAgentTool {
             if let Some(ref dir) = agent.working_dir {
                 self.release_working_dir_claim(dir, &task_id);
             }
-            kill_process(agent.child_id).await;
+            kill_process(&self.backend, &agent.process_handle).await;
             if let Some(ref delegated_task_id) = agent.delegated_task_id {
                 Self::persist_delegated_cli_result_with_state(
                     self.state.clone(),
@@ -2528,7 +2475,7 @@ impl CliAgentTool {
         let mut lines = vec!["Running CLI agents:".to_string()];
         for (task_id, agent) in running.iter() {
             let elapsed = agent.started_at.elapsed().as_secs();
-            let status = if is_process_alive(agent.child_id) {
+            let status = if !agent.finished.load(Ordering::Acquire) {
                 "running"
             } else {
                 "finished"
@@ -3293,6 +3240,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -3348,6 +3296,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -3647,7 +3596,7 @@ mod tests {
         let (tool, _db) = setup_bash_tool().await;
         let missing_dir = "/tmp/aidaemon-cli-agent-missing-dir-lock-test";
         let _ = std::fs::remove_dir_all(missing_dir);
-        let normalized = CliAgentTool::normalize_working_dir(missing_dir);
+        let normalized = missing_dir.to_string();
 
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"echo should-fail","working_dir":"{}"}}"#,
@@ -3776,7 +3725,7 @@ mod tests {
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir_path = tmp_dir.path().to_str().unwrap();
-        let normalized = CliAgentTool::normalize_working_dir(dir_path);
+        let normalized = CliAgentTool::normalize_working_dir(dir_path).await.unwrap();
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"echo blocked","working_dir":"{}"}}"#,
             dir_path
@@ -3805,7 +3754,7 @@ mod tests {
         let tool = Arc::new(tool);
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let dir = tmp_dir.path().to_string_lossy().to_string();
-        let normalized = CliAgentTool::normalize_working_dir(&dir);
+        let normalized = CliAgentTool::normalize_working_dir(&dir).await.unwrap();
 
         let args = format!(
             r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 15","working_dir":"{}"}}"#,
@@ -4533,6 +4482,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -4603,6 +4553,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -4758,6 +4709,7 @@ mod tests {
         );
 
         let tool = CliAgentTool {
+            backend: active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
             running: Arc::new(Mutex::new(HashMap::new())),

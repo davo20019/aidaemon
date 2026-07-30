@@ -400,6 +400,22 @@ pub struct ToolCallMetadata {
     /// Image (or other) files produced by the tool for agent vision context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::traits::MessageAttachment>,
+    /// Preserve exact, untrusted bytes while still wrapping them as untrusted
+    /// tool data. Intended for canonical-history evidence whose wording must
+    /// not be rewritten by prompt-injection sanitization.
+    #[serde(default)]
+    pub untrusted_verbatim: bool,
+    /// Keep bounded tool output inline and never write it to a temporary spill
+    /// file or run lossy generic compression.
+    #[serde(default)]
+    pub preserve_inline: bool,
+    /// Durable audit representation. The full output remains available to the
+    /// current model turn, but only this stub is written to canonical events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_output: Option<String>,
+    /// Do not copy result content into executor task-activity telemetry.
+    #[serde(default)]
+    pub suppress_activity_result: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

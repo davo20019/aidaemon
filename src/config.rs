@@ -333,6 +333,12 @@ pub fn delete_from_keychain(field_name: &str) -> anyhow::Result<()> {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub agent: AgentConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub checkpoints: CheckpointConfig,
     pub provider: ProviderConfig,
     /// Legacy single Telegram bot config (for backward compatibility).
     #[serde(default)]
@@ -408,6 +414,296 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentConfig {
+    /// User-facing assistant name used in the root identity prompt.
+    #[serde(default = "default_agent_name")]
+    pub name: String,
+    /// Optional Markdown persona file. Relative paths resolve next to config.toml.
+    #[serde(default)]
+    pub persona_file: Option<PathBuf>,
+}
+
+impl AgentConfig {
+    pub fn validated_name(&self) -> anyhow::Result<String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("agent.name cannot be empty");
+        }
+        if name.chars().count() > 40 {
+            anyhow::bail!("agent.name must be 40 characters or fewer");
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '\''))
+        {
+            anyhow::bail!(
+                "agent.name may contain only letters, numbers, spaces, hyphens, underscores, and apostrophes"
+            );
+        }
+        Ok(name.to_string())
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            name: default_agent_name(),
+            persona_file: None,
+        }
+    }
+}
+
+fn default_agent_name() -> String {
+    "aidaemon".to_string()
+}
+
+/// Agent-visible execution workspace configuration.
+///
+/// Daemon control-plane state (configuration, SQLite, channel inbox transport,
+/// keychain access, and browser/computer-use sessions) always remains local.
+/// Only tools that inspect or mutate the agent's working environment use this
+/// backend.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExecutionConfig {
+    /// Selected backend: `local`, `docker`, or `ssh`.
+    #[serde(default = "default_execution_backend")]
+    pub backend: String,
+    /// Default working directory for relative agent-visible paths. For local
+    /// execution this defaults to the daemon working directory.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    /// Allow path-based tools and explicit command working directories outside
+    /// `workspace_root`. This defaults to true only for the local backend to
+    /// preserve historical behavior. Shell commands retain the authority of
+    /// the selected OS account/container and are governed by terminal approval.
+    #[serde(default)]
+    pub allow_outside_workspace: Option<bool>,
+    #[cfg_attr(not(feature = "execution-docker"), allow(dead_code))]
+    #[serde(default)]
+    pub docker: DockerExecutionConfig,
+    #[serde(default)]
+    pub ssh: SshExecutionConfig,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_execution_backend(),
+            workspace_root: None,
+            allow_outside_workspace: None,
+            docker: DockerExecutionConfig::default(),
+            ssh: SshExecutionConfig::default(),
+        }
+    }
+}
+
+impl ExecutionConfig {
+    pub fn normalized_backend(&self) -> anyhow::Result<String> {
+        let backend = self.backend.trim().to_ascii_lowercase();
+        match backend.as_str() {
+            "local" | "docker" | "ssh" => Ok(backend),
+            _ => anyhow::bail!(
+                "execution.backend must be one of: local, docker, ssh (got {:?})",
+                self.backend
+            ),
+        }
+    }
+
+    pub fn effective_allow_outside_workspace(&self) -> bool {
+        self.allow_outside_workspace
+            .unwrap_or_else(|| self.backend.trim().eq_ignore_ascii_case("local"))
+    }
+}
+
+fn default_execution_backend() -> String {
+    "local".to_string()
+}
+
+/// Local shadow-Git workspace checkpoints created before the first filesystem
+/// mutation in an agent turn.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CheckpointConfig {
+    /// Opt in to local workspace checkpoints. Disabled by default while the
+    /// feature is in beta.
+    #[serde(default)]
+    pub enabled: bool,
+    /// External checkpoint store. Defaults to the platform data directory.
+    #[serde(default)]
+    pub storage_dir: Option<String>,
+    #[serde(default = "default_checkpoint_retention_days")]
+    pub retention_days: u64,
+    #[serde(default = "default_checkpoint_max_per_root")]
+    pub max_per_root: u32,
+    #[serde(default = "default_checkpoint_max_store_bytes")]
+    pub max_store_bytes: u64,
+    #[serde(default = "default_checkpoint_max_root_bytes")]
+    pub max_root_bytes: u64,
+    #[serde(default = "default_checkpoint_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_checkpoint_max_paths")]
+    pub max_paths: usize,
+    #[serde(default = "default_checkpoint_snapshot_timeout_secs")]
+    pub snapshot_timeout_secs: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            storage_dir: None,
+            retention_days: default_checkpoint_retention_days(),
+            max_per_root: default_checkpoint_max_per_root(),
+            max_store_bytes: default_checkpoint_max_store_bytes(),
+            max_root_bytes: default_checkpoint_max_root_bytes(),
+            max_file_bytes: default_checkpoint_max_file_bytes(),
+            max_paths: default_checkpoint_max_paths(),
+            snapshot_timeout_secs: default_checkpoint_snapshot_timeout_secs(),
+        }
+    }
+}
+
+fn default_checkpoint_retention_days() -> u64 {
+    14
+}
+
+fn default_checkpoint_max_per_root() -> u32 {
+    30
+}
+
+fn default_checkpoint_max_store_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_checkpoint_max_root_bytes() -> u64 {
+    500 * 1024 * 1024
+}
+
+fn default_checkpoint_max_file_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_checkpoint_max_paths() -> usize {
+    50_000
+}
+
+fn default_checkpoint_snapshot_timeout_secs() -> u64 {
+    10
+}
+
+#[cfg_attr(not(feature = "execution-docker"), allow(dead_code))]
+#[derive(Debug, Deserialize, Clone)]
+pub struct DockerExecutionConfig {
+    /// Persistent container name used for every tool call.
+    #[serde(default = "default_docker_container")]
+    pub container: String,
+    /// Image used when `create_if_missing` creates the persistent container.
+    #[serde(default = "default_docker_image")]
+    pub image: String,
+    /// Agent-visible workspace path inside the container.
+    #[serde(default = "default_remote_workspace_root")]
+    pub workspace_root: String,
+    /// Host directory bind-mounted at `workspace_root`. Relative paths resolve
+    /// next to config.toml. If omitted, the daemon working directory is used.
+    #[serde(default)]
+    pub host_workspace: Option<String>,
+    /// Create and start the persistent container when it does not exist.
+    #[serde(default = "default_true")]
+    pub create_if_missing: bool,
+    /// Docker network mode. Defaults to `none`; CLI agents that call cloud APIs
+    /// need an explicitly configured network such as `bridge`.
+    #[serde(default = "default_docker_network")]
+    pub network: String,
+    /// Optional Docker user (`uid:gid`, name, etc.) for `docker exec`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Additional environment variable names copied from the daemon into
+    /// container executions. Values are never exposed in tool arguments.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+}
+
+impl Default for DockerExecutionConfig {
+    fn default() -> Self {
+        Self {
+            container: default_docker_container(),
+            image: default_docker_image(),
+            workspace_root: default_remote_workspace_root(),
+            host_workspace: None,
+            create_if_missing: true,
+            network: default_docker_network(),
+            user: None,
+            env_allowlist: Vec::new(),
+        }
+    }
+}
+
+fn default_docker_container() -> String {
+    "aidaemon-execution".to_string()
+}
+
+fn default_docker_image() -> String {
+    "ubuntu:24.04".to_string()
+}
+
+fn default_remote_workspace_root() -> String {
+    "/workspace".to_string()
+}
+
+fn default_docker_network() -> String {
+    "none".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SshExecutionConfig {
+    /// OpenSSH host or alias. Existing ~/.ssh/config, ssh-agent, ProxyJump,
+    /// known_hosts, and hardware-token settings are honored.
+    #[serde(default)]
+    pub host: String,
+    /// Persistent agent-visible directory on the SSH host.
+    #[serde(default = "default_ssh_workspace_root")]
+    pub workspace_root: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Optional local identity file path. Prefer an OpenSSH alias/ssh-agent.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    /// Additional OpenSSH arguments, for example `["-J", "bastion"]`.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    #[serde(default = "default_ssh_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Create workspace_root on startup when it is missing.
+    #[serde(default = "default_true")]
+    pub create_workspace: bool,
+    /// Environment variable names explicitly forwarded to remote executions.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+}
+
+impl Default for SshExecutionConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            workspace_root: default_ssh_workspace_root(),
+            port: None,
+            identity_file: None,
+            extra_args: Vec::new(),
+            connect_timeout_secs: default_ssh_connect_timeout(),
+            create_workspace: true,
+            env_allowlist: Vec::new(),
+        }
+    }
+}
+
+fn default_ssh_workspace_root() -> String {
+    "~/aidaemon-workspace".to_string()
+}
+
+fn default_ssh_connect_timeout() -> u64 {
+    10
 }
 
 #[derive(Deserialize, Clone)]
@@ -952,6 +1248,10 @@ pub struct RetentionConfig {
     /// Delete consolidated messages older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub messages_days: u32,
+    /// Delete consolidated diagnostic/tool events older than N days (default: 7).
+    /// This is intentionally independent of exact conversation retention.
+    #[serde(default = "default_retention_7")]
+    pub diagnostic_events_days: u32,
     /// Delete superseded fact versions older than N days (default: 90)
     #[serde(default = "default_retention_90")]
     pub superseded_facts_days: u32,
@@ -982,6 +1282,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             messages_days: 90,
+            diagnostic_events_days: 7,
             superseded_facts_days: 90,
             token_usage_aggregate_days: 30,
             episodes_days: 365,
@@ -992,6 +1293,10 @@ impl Default for RetentionConfig {
             self_correction_attempts_days: 30,
         }
     }
+}
+
+fn default_retention_7() -> u32 {
+    7
 }
 
 fn default_retention_30() -> u32 {
@@ -3145,6 +3450,8 @@ impl AppConfig {
         let content = std::fs::read_to_string(path)?;
         let expanded = expand_env_vars(&content)?;
         let mut config: AppConfig = toml::from_str(&expanded)?;
+        config.agent.validated_name()?;
+        config.execution.normalized_backend()?;
         config.provider.apply_model_defaults_recursive();
         config.daemon.queue_policy = config.daemon.queue_policy.normalized();
         config.resolve_secrets()?;

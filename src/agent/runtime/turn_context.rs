@@ -505,8 +505,34 @@ impl Agent {
         error: Option<String>,
         task_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.append_tool_message_with_result_event_policy(
+            emitter,
+            msg,
+            success,
+            duration_ms,
+            error,
+            task_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn append_tool_message_with_result_event_policy(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        msg: &Message,
+        success: bool,
+        duration_ms: u64,
+        error: Option<String>,
+        task_id: Option<&str>,
+        persistent_result: Option<&str>,
+    ) -> anyhow::Result<()> {
         let normalized_msg = msg.with_inferred_annotations();
         let turn_id = self.resolve_event_turn_id(normalized_msg.as_ref()).await;
+        let durable_result = persistent_result
+            .map(str::to_owned)
+            .unwrap_or_else(|| normalized_msg.content.clone().unwrap_or_default());
         emitter
             .emit(
                 EventType::ToolResult,
@@ -520,7 +546,7 @@ impl Agent {
                         .tool_name
                         .clone()
                         .unwrap_or_else(|| "system".to_string()),
-                    result: normalized_msg.content.clone().unwrap_or_default(),
+                    result: durable_result,
                     success,
                     duration_ms,
                     error,
@@ -889,5 +915,60 @@ mod tests {
         assert_eq!(turn_context.goal_user_text, current);
         assert!(!turn_context.goal_user_text.contains("Original request:"));
         assert!(!turn_context.goal_user_text.contains("Current request:"));
+    }
+
+    #[tokio::test]
+    async fn persistence_override_keeps_raw_tool_result_ephemeral() {
+        use crate::events::{EventEmitter, EventType, ToolResultData};
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::MessageStore;
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let session_id = "ephemeral-history-result";
+        let emitter = EventEmitter::new(harness.agent.event_store.clone(), session_id);
+        let message = Message {
+            content: Some("verbatim historical evidence".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("search_history".to_string()),
+            ..Message::new_runtime("result-1", session_id, "tool")
+        };
+        harness
+            .agent
+            .append_tool_message_with_result_event_policy(
+                &emitter,
+                &message,
+                true,
+                1,
+                None,
+                Some("task-1"),
+                Some("search_history returned 1 authorized item"),
+            )
+            .await
+            .unwrap();
+
+        let events = harness
+            .agent
+            .event_store
+            .query_recent_events(session_id, 10)
+            .await
+            .unwrap();
+        let tool_result = events
+            .iter()
+            .find(|event| event.event_type == EventType::ToolResult)
+            .unwrap()
+            .parse_data::<ToolResultData>()
+            .unwrap();
+        assert_eq!(
+            tool_result.result,
+            "search_history returned 1 authorized item"
+        );
+        assert!(!tool_result.result.contains("historical evidence"));
+
+        let working = harness.state.get_history(session_id, 10).await.unwrap();
+        assert!(working
+            .iter()
+            .any(|message| message.content.as_deref() == Some("verbatim historical evidence")));
     }
 }

@@ -579,8 +579,10 @@ impl ComputerUseTool {
             ComputerActionKind::ActivateApp => {
                 let app = self.sticky_app(args).await?;
                 // Optional: activation has no element target, and it is often
-                // the first action on an app — before any get_app_state.
-                let generation = args.get("snapshot_generation").and_then(|v| v.as_u64());
+                // the first action on an app — before any get_app_state. Some
+                // model adapters materialize omitted numeric fields as 0; zero
+                // is not a real cache generation, so treat it as omitted.
+                let generation = optional_generation(args);
                 // "Activate this app" naturally means "open it" when it isn't
                 // running yet — fall back to launching so the model doesn't dead
                 // end on a not-running error.
@@ -1020,6 +1022,12 @@ fn required_generation(args: &Value) -> Result<u64, String> {
         })
 }
 
+fn optional_generation(args: &Value) -> Option<u64> {
+    args.get("snapshot_generation")
+        .and_then(|v| v.as_u64())
+        .filter(|generation| *generation > 0)
+}
+
 fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
     args.get(key)
         .and_then(|v| v.as_u64())
@@ -1103,8 +1111,13 @@ impl Tool for ComputerUseTool {
 
     fn description(&self) -> &str {
         "Inspect and control native macOS applications via accessibility trees and screenshots. \
+         Use this only for a task that requires viewing or interacting with a visible desktop GUI. \
+         Never use it to inspect files, directories, paths, processes, command output, or system \
+         information, and never use it as a fallback when a filesystem or terminal tool fails; a \
+         locked screen affects GUI automation but does not imply that shell commands are unavailable. \
          Only apps that are already running can be controlled — if the target app is not listed by \
-         list_apps, call launch_app to start it first. Call get_app_state before mutating actions; \
+         list_apps, call launch_app to start it first; if it is listed but get_app_state reports no \
+         accessible window, call launch_app to reopen its window. Call get_app_state before mutating actions; \
          copy the exact snapshot_generation from the most recent result into every mutation (do not \
          increment or guess it). To click or type into a control, prefer targeting it by \
          element_title (and element_role) rather than element_index — titles are stable while \
@@ -1139,15 +1152,15 @@ impl Tool for ComputerUseTool {
                             "scroll",
                             "set_value"
                         ],
-                        "description": "The desktop action to perform. computer_use can only control apps that are already running; if the target app is not in list_apps, use launch_app to start it first."
+                        "description": "The desktop action to perform. computer_use can only control apps that are already running; use launch_app to start an absent app or reopen an app whose process is listed but has no accessible window."
                     },
                     "app": {
                         "type": "string",
-                        "description": "Application name or bundle id. Required for every action except list_apps. If the app is installed but not running, call launch_app with this name first."
+                        "description": "Application name or bundle id. Required for every action except list_apps. Call launch_app with this name to start an absent app or reopen a listed app that has no accessible window."
                     },
                     "snapshot_generation": {
                         "type": "integer",
-                        "description": "Generation from the latest get_app_state for this app. Required for mutating actions; optional for activate_app (activation may be your first action on an app)."
+                        "description": "Generation from the latest get_app_state for this app. Required for mutating actions; optional for activate_app (activation may be your first action on an app, and 0 is treated as omitted)."
                     },
                     "element_index": {
                         "type": "integer",

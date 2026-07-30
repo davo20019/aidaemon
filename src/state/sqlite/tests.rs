@@ -152,6 +152,72 @@ async fn test_session_isolation() {
 }
 
 #[tokio::test]
+async fn episode_search_finds_older_than_500_and_bumps_recall() {
+    let (store, _db) = setup_test_store().await;
+    let query = "distinctive zircon deployment";
+    let embedding = store
+        .embedding_service
+        .embed(query.to_string())
+        .await
+        .unwrap();
+    let blob = crate::memory::binary::encode_embedding(&embedding);
+    let old = (chrono::Utc::now() - chrono::Duration::days(3_000)).to_rfc3339();
+    let matching_id = sqlx::query(
+        "INSERT INTO episodes
+            (session_id,summary,embedding,start_time,end_time,created_at,channel_id)
+         VALUES('old-session',?,?,?, ?, ?, 'slack:C1')",
+    )
+    .bind(query)
+    .bind(blob)
+    .bind(&old)
+    .bind(&old)
+    .bind(&old)
+    .execute(&store.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    let now = chrono::Utc::now().to_rfc3339();
+    for i in 0..510 {
+        sqlx::query(
+            "INSERT INTO episodes(session_id,summary,start_time,end_time,created_at,channel_id)
+             VALUES(?,?,?, ?, ?, 'slack:C2')",
+        )
+        .bind(format!("new-{i}"))
+        .bind(format!("unrelated cooking note {i}"))
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    let results = store.get_relevant_episodes(query, 5).await.unwrap();
+    assert!(
+        results.iter().any(|episode| episode.id == matching_id),
+        "semantic search must not impose a newest-500 gate"
+    );
+    let recall_count: i64 = sqlx::query_scalar("SELECT recall_count FROM episodes WHERE id=?")
+        .bind(matching_id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(recall_count, 1);
+
+    let channel_results = crate::traits::EpisodeStore::get_relevant_episodes_for_channel(
+        &store,
+        query,
+        5,
+        Some("slack:C1"),
+    )
+    .await
+    .unwrap();
+    assert!(channel_results
+        .iter()
+        .all(|episode| episode.channel_id.as_deref() == Some("slack:C1")));
+}
+
+#[tokio::test]
 async fn test_clear_session() {
     let (store, _db) = setup_test_store().await;
     let session = "sess-clear";
@@ -172,6 +238,152 @@ async fn test_clear_session() {
 
     let after = store.get_history(session, 100).await.unwrap();
     assert_eq!(after.len(), 0);
+}
+
+#[tokio::test]
+async fn clear_session_erases_exact_active_artifacts_and_detaches_claims() {
+    let (store, _db) = setup_test_store().await;
+    let session = "slack:C-WIPE";
+    let now = chrono::Utc::now().to_rfc3339();
+    let event = sqlx::query(
+        "INSERT INTO events(session_id,event_type,data,created_at,task_id,turn_id)
+         VALUES(?, 'user_message', ?, ?, 'wipe-task', 'wipe-turn')",
+    )
+    .bind(session)
+    .bind(
+        serde_json::json!({
+            "content": "verbatim secret evidence",
+            "channel_visibility": "private",
+            "channel_id": "slack:C-WIPE",
+            "user_role": "owner"
+        })
+        .to_string(),
+    )
+    .bind(&now)
+    .execute(&store.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    super::history_search::project_event(&store.pool, event)
+        .await
+        .unwrap();
+    let episode = sqlx::query(
+        "INSERT INTO episodes
+            (session_id,summary,start_time,end_time,created_at,channel_id,
+             start_event_id,end_event_id)
+         VALUES(?, 'generated secret summary', ?, ?, ?, 'slack:C-WIPE', ?, ?)",
+    )
+    .bind(session)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(event)
+    .bind(event)
+    .execute(&store.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    let span = sqlx::query(
+        "INSERT INTO memory_spans
+            (span_kind,source_event_id,source_episode_id,session_id,content,
+             content_hash,valid_from)
+         VALUES('event', ?, ?, ?, 'verbatim secret evidence', 'hash', ?)",
+    )
+    .bind(event)
+    .bind(episode)
+    .bind(session)
+    .bind(&now)
+    .execute(&store.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO goals(id,description,session_id,source_episode_id)
+         VALUES('durable-goal','keep after wipe',?,?)",
+    )
+    .bind(session)
+    .bind(episode)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let fact = sqlx::query(
+        "INSERT INTO facts
+            (category,key,value,source,created_at,updated_at,source_excerpt)
+         VALUES('preference','durable','x','user',?,?,'verbatim secret evidence')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&store.pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO memory_claims
+            (subject,predicate,object,claim_text,source_fact_id,source_span_id,
+             source_event_id,provenance,valid_from)
+         VALUES('owner','preference','x','durable fact',?,?,?,'direct',?)",
+    )
+    .bind(fact)
+    .bind(span)
+    .bind(event)
+    .bind(&now)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+
+    store.clear_session(session).await.unwrap();
+    for table in [
+        "events",
+        "history_message_index",
+        "episodes",
+        "memory_spans",
+    ] {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = sqlx::query_scalar(&query)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} retained wiped session data");
+    }
+    let exact_fts_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM history_message_fts
+         WHERE history_message_fts MATCH 'verbatim'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(exact_fts_count, 0);
+    let span_fts_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_spans_fts
+         WHERE memory_spans_fts MATCH 'verbatim'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(span_fts_count, 0);
+    let claim = sqlx::query(
+        "SELECT source_span_id, source_event_id, provenance FROM memory_claims LIMIT 1",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert!(claim.get::<Option<i64>, _>("source_span_id").is_none());
+    assert!(claim.get::<Option<i64>, _>("source_event_id").is_none());
+    assert!(claim
+        .get::<String, _>("provenance")
+        .contains("source_session_wiped"));
+    let excerpt: Option<String> = sqlx::query_scalar("SELECT source_excerpt FROM facts WHERE id=?")
+        .bind(fact)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert!(excerpt.is_none());
+    let goal_episode: Option<i64> =
+        sqlx::query_scalar("SELECT source_episode_id FROM goals WHERE id='durable-goal'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert!(goal_episode.is_none());
 }
 
 #[tokio::test]
@@ -1455,7 +1667,7 @@ async fn test_default_user_profile() {
     assert_eq!(profile.explanation_depth, "moderate");
     assert_eq!(profile.tone_preference, "neutral");
     assert_eq!(profile.emoji_preference, "none");
-    assert!(profile.asks_before_acting);
+    assert!(!profile.asks_before_acting);
     assert!(profile.prefers_explanations);
     // likes_suggestions defaults to false in the code
     assert!(!profile.likes_suggestions);

@@ -75,7 +75,7 @@ fn extract_args_summary(tool_name: &str, args_json: &str) -> String {
             .map(|q| format!("'{}'", q))
             .unwrap_or_default(),
 
-        "remember_fact" | "manage_memories" => parsed
+        "remember_fact" | "manage_memories" | "search_history" => parsed
             .get("action")
             .and_then(|v| v.as_str())
             .unwrap_or("")

@@ -15,6 +15,15 @@
 #   browser, cli_agents, diagnostics, files, skills, subagents, MCP servers
 #   policy.tool_filter_enforce = true (caps exposed tools per turn to 16–28)
 
+[agent]
+name = "aidaemon"
+# persona_file = "persona.md"
+
+[execution]
+backend = "local"
+# workspace_root = "/absolute/path/to/workspace"
+# allow_outside_workspace = true
+
 [provider]
 api_key = "keychain"
 base_url = "https://openrouter.ai/api/v1"
@@ -25,6 +34,9 @@ fallback = []
 
 [state]
 db_path = "aidaemon.db"
+# [state.retention]
+# messages_days = 90          # 0 keeps exact active-database history permanently
+# diagnostic_events_days = 7 # independent tool/telemetry retention
 
 [terminal]
 allowed_prefixes = ["ls", "cat", "head", "grep", "find", "git", "cargo", "npm", "python3"]

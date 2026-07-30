@@ -1,9 +1,9 @@
 use std::collections::HashSet;
-use std::path::Path;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::execution::{active_execution_backend, BackendPath, SharedExecutionBackend};
 use crate::traits::{
     Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind, ToolVerificationMode,
 };
@@ -175,18 +175,18 @@ fn parse_project_paths(args: &Value) -> anyhow::Result<Vec<String>> {
 }
 
 async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
-    // Use resolve_project_dir for smart fallback to ~/projects/<name>
-    let project_dir = fs_utils::resolve_project_dir(path_str)?;
+    let backend = active_execution_backend();
+    let project_dir = resolve_project_dir(backend.clone(), path_str).await?;
 
     let mut output = String::new();
-    output.push_str(&format!("# Project: {}\n\n", project_dir.display()));
+    output.push_str(&format!("# Project: {}\n\n", project_dir));
 
     // Detect project type
-    let project_type = detect_project_type(&project_dir).await;
+    let project_type = detect_project_type(backend.clone(), &project_dir).await;
     output.push_str(&format!("## Type: {}\n\n", project_type));
 
     // Read project metadata
-    let metadata = read_project_metadata(&project_dir).await;
+    let metadata = read_project_metadata(backend.clone(), &project_dir).await;
     if !metadata.is_empty() {
         output.push_str("## Metadata\n");
         output.push_str(&metadata);
@@ -194,7 +194,7 @@ async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
     }
 
     // Git info
-    let git_info = get_git_summary(&project_dir).await;
+    let git_info = get_git_summary(backend.clone(), &project_dir).await;
     if !git_info.is_empty() {
         output.push_str("## Git\n");
         output.push_str(&git_info);
@@ -202,7 +202,7 @@ async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
     }
 
     // Directory structure (top 2 levels)
-    let structure = get_directory_structure(&project_dir, 0, 2).await;
+    let structure = get_directory_structure(backend, &project_dir, 0, 2).await;
     output.push_str("## Structure\n```\n");
     output.push_str(&structure);
     output.push_str("```\n");
@@ -210,7 +210,45 @@ async fn inspect_project(path_str: &str) -> anyhow::Result<String> {
     Ok(output)
 }
 
-async fn detect_project_type(dir: &Path) -> String {
+async fn resolve_project_dir(
+    backend: SharedExecutionBackend,
+    path: &str,
+) -> anyhow::Result<BackendPath> {
+    let direct = backend.resolve_path(path).await?;
+    if backend
+        .metadata(&direct)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Ok(direct);
+    }
+
+    let trimmed = path.trim();
+    if trimmed.starts_with('/')
+        || trimmed.starts_with('~')
+        || trimmed.contains('/')
+        || trimmed.contains("..")
+    {
+        anyhow::bail!("Not a valid directory: {path}");
+    }
+    let home = backend.home_dir().await?;
+    let fallback = home.join("projects").join(trimmed);
+    if backend
+        .metadata(&fallback)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Ok(fallback);
+    }
+    anyhow::bail!(
+        "Not a valid directory: {} (also checked {}/projects/{})",
+        path,
+        home,
+        trimmed
+    )
+}
+
+async fn detect_project_type(backend: SharedExecutionBackend, dir: &BackendPath) -> String {
     let checks = [
         ("Cargo.toml", "Rust (Cargo)"),
         ("package.json", "JavaScript/TypeScript (npm)"),
@@ -235,7 +273,7 @@ async fn detect_project_type(dir: &Path) -> String {
 
     let mut types = Vec::new();
     for (file, name) in checks {
-        if dir.join(file).exists() {
+        if backend.metadata(&dir.join(file)).await.is_ok() {
             types.push(name.to_string());
         }
     }
@@ -247,11 +285,11 @@ async fn detect_project_type(dir: &Path) -> String {
     }
 }
 
-async fn read_project_metadata(dir: &Path) -> String {
+async fn read_project_metadata(backend: SharedExecutionBackend, dir: &BackendPath) -> String {
     let mut metadata = String::new();
 
     // Cargo.toml
-    if let Ok(content) = tokio::fs::read_to_string(dir.join("Cargo.toml")).await {
+    if let Ok(content) = read_backend_text(&backend, &dir.join("Cargo.toml")).await {
         if let Some(name) = extract_toml_field(&content, "name") {
             metadata.push_str(&format!("- Name: {}\n", name));
         }
@@ -264,7 +302,7 @@ async fn read_project_metadata(dir: &Path) -> String {
     }
 
     // package.json
-    if let Ok(content) = tokio::fs::read_to_string(dir.join("package.json")).await {
+    if let Ok(content) = read_backend_text(&backend, &dir.join("package.json")).await {
         if let Ok(pkg) = serde_json::from_str::<Value>(&content) {
             if let Some(name) = pkg["name"].as_str() {
                 metadata.push_str(&format!("- Name: {}\n", name));
@@ -282,7 +320,7 @@ async fn read_project_metadata(dir: &Path) -> String {
     }
 
     // pyproject.toml
-    if let Ok(content) = tokio::fs::read_to_string(dir.join("pyproject.toml")).await {
+    if let Ok(content) = read_backend_text(&backend, &dir.join("pyproject.toml")).await {
         if let Some(name) = extract_toml_field(&content, "name") {
             metadata.push_str(&format!("- Name: {}\n", name));
         }
@@ -292,7 +330,7 @@ async fn read_project_metadata(dir: &Path) -> String {
     }
 
     // go.mod
-    if let Ok(content) = tokio::fs::read_to_string(dir.join("go.mod")).await {
+    if let Ok(content) = read_backend_text(&backend, &dir.join("go.mod")).await {
         if let Some(module) = content.lines().next() {
             if let Some(stripped) = module.strip_prefix("module ") {
                 metadata.push_str(&format!("- Module: {}\n", stripped));
@@ -301,6 +339,13 @@ async fn read_project_metadata(dir: &Path) -> String {
     }
 
     metadata
+}
+
+async fn read_backend_text(
+    backend: &SharedExecutionBackend,
+    path: &BackendPath,
+) -> anyhow::Result<String> {
+    Ok(String::from_utf8(backend.read(path).await?)?)
 }
 
 fn extract_toml_field(content: &str, field: &str) -> Option<String> {
@@ -317,22 +362,24 @@ fn extract_toml_field(content: &str, field: &str) -> Option<String> {
     })
 }
 
-async fn get_git_summary(dir: &Path) -> String {
-    if !dir.join(".git").exists() {
+async fn get_git_summary(backend: SharedExecutionBackend, dir: &BackendPath) -> String {
+    if backend.metadata(&dir.join(".git")).await.is_err() {
         return String::new();
     }
 
     let mut info = String::new();
 
     // Current branch
-    if let Ok(out) = fs_utils::run_cmd("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await {
+    if let Ok(out) =
+        fs_utils::run_cmd_backend("git rev-parse --abbrev-ref HEAD", Some(dir), 5).await
+    {
         if out.exit_code == 0 {
             info.push_str(&format!("- Branch: {}\n", out.stdout.trim()));
         }
     }
 
     // Status summary
-    if let Ok(out) = fs_utils::run_cmd("git status --porcelain", Some(dir), 5).await {
+    if let Ok(out) = fs_utils::run_cmd_backend("git status --porcelain", Some(dir), 5).await {
         if out.exit_code == 0 {
             let lines: Vec<&str> = out.stdout.lines().collect();
             if lines.is_empty() {
@@ -344,14 +391,16 @@ async fn get_git_summary(dir: &Path) -> String {
     }
 
     // Last commit
-    if let Ok(out) = fs_utils::run_cmd("git log -1 --format='%h %s (%cr)'", Some(dir), 5).await {
+    if let Ok(out) =
+        fs_utils::run_cmd_backend("git log -1 --format='%h %s (%cr)'", Some(dir), 5).await
+    {
         if out.exit_code == 0 && !out.stdout.trim().is_empty() {
             info.push_str(&format!("- Last commit: {}\n", out.stdout.trim()));
         }
     }
 
     // Remote
-    if let Ok(out) = fs_utils::run_cmd("git remote -v", Some(dir), 5).await {
+    if let Ok(out) = fs_utils::run_cmd_backend("git remote -v", Some(dir), 5).await {
         if out.exit_code == 0 {
             if let Some(first_line) = out.stdout.lines().next() {
                 info.push_str(&format!("- Remote: {}\n", first_line));
@@ -363,7 +412,8 @@ async fn get_git_summary(dir: &Path) -> String {
 }
 
 fn get_directory_structure(
-    dir: &Path,
+    backend: SharedExecutionBackend,
+    dir: &BackendPath,
     depth: usize,
     max_depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
@@ -372,22 +422,22 @@ fn get_directory_structure(
             return String::new();
         }
 
-        let mut entries = match tokio::fs::read_dir(dir).await {
+        let entries = match backend.read_dir(dir).await {
             Ok(e) => e,
             Err(_) => return String::new(),
         };
 
         let mut items: Vec<(String, bool)> = Vec::new(); // (name, is_dir)
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
+        for entry in entries {
+            let name = entry.path.file_name().unwrap_or_default().to_string();
             if name.starts_with('.') && depth == 0 && name != ".github" {
                 continue;
             }
             if fs_utils::should_skip_dir(&name) {
                 continue;
             }
-            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = entry.metadata.is_dir();
             items.push((name, is_dir));
         }
 
@@ -403,7 +453,8 @@ fn get_directory_structure(
             if *is_dir {
                 output.push_str(&format!("{}{}/\n", indent, name));
                 let subdir = dir.join(name);
-                let sub = get_directory_structure(&subdir, depth + 1, max_depth).await;
+                let sub =
+                    get_directory_structure(backend.clone(), &subdir, depth + 1, max_depth).await;
                 output.push_str(&sub);
             } else {
                 output.push_str(&format!("{}{}\n", indent, name));

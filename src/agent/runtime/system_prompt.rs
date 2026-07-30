@@ -1,17 +1,18 @@
 use super::recall_guardrails::{build_critical_facts_prompt_block, extract_critical_fact_summary};
 use super::*;
 
-fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
+pub(in crate::agent) fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
     for line in prompt.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("You are ") {
             let candidate = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
+                .split_once(',')
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| rest.split_whitespace().next().unwrap_or(""))
+                .trim()
                 .trim_matches(|c: char| matches!(c, '.' | ',' | '"' | '\'' | '`'));
             if !candidate.is_empty()
-                && candidate.len() <= 40
+                && candidate.chars().count() <= 40
                 && !matches!(candidate.to_ascii_lowercase().as_str(), "a" | "an" | "the")
             {
                 return Some(candidate.to_string());
@@ -263,11 +264,19 @@ impl Agent {
 
         // Fetch memory components — channel-scoped retrieval
         let inject_personal = channel_ctx.should_inject_personal_memory();
+        let straightforward_artifact_task =
+            crate::agent::recognized_artifact_creation_request(user_text)
+                && matches!(
+                    crate::agent::classify_intent_complexity(user_text),
+                    crate::agent::IntentComplexity::Simple
+                );
 
         // Anaphoric follow-ups need the subject of the preceding exchange in
         // the retrieval query. Searching only "what's the source of that?"
         // ranks generic `source` memories and drops the actual award/entity.
-        let retrieval_query = if super::followup::looks_like_context_dependent_followup_question(
+        let retrieval_query = if straightforward_artifact_task {
+            user_text.to_string()
+        } else if super::followup::looks_like_context_dependent_followup_question(
             &user_text.trim().to_ascii_lowercase(),
         ) {
             let history = self
@@ -296,20 +305,25 @@ impl Agent {
         // Previously the owner_dm_fact_cache (all facts) was used here, but
         // that caused unrelated facts (Ecuador travel, WiFi router tips, etc.)
         // to bleed into prompts for unrelated queries like "count lines in router.rs".
-        let facts = self
-            .state
-            .get_relevant_facts_for_channel(
-                &retrieval_query,
-                self.limits.max_facts,
-                channel_ctx.channel_id.as_deref(),
-                channel_ctx.visibility,
-                user_role == UserRole::Owner,
-            )
-            .await?;
+        let facts = if straightforward_artifact_task {
+            vec![]
+        } else {
+            self.state
+                .get_relevant_facts_for_channel(
+                    &retrieval_query,
+                    self.limits.max_facts,
+                    channel_ctx.channel_id.as_deref(),
+                    channel_ctx.visibility,
+                    user_role == UserRole::Owner,
+                )
+                .await?
+        };
 
         // Critical facts (identity/profile) use the pre-fetched identity-only
         // cache from bootstrap, NOT get_facts(None) which returns ALL facts.
-        let mut critical_fact_summary = if inject_personal && user_role == UserRole::Owner {
+        let mut critical_fact_summary = if straightforward_artifact_task {
+            Default::default()
+        } else if inject_personal && user_role == UserRole::Owner {
             if let Some(identity_facts) = owner_dm_fact_cache {
                 extract_critical_fact_summary(identity_facts)
             } else {
@@ -338,41 +352,55 @@ impl Agent {
         };
 
         // Cross-channel hints (only in non-DM, non-PublicExternal channels)
-        let cross_channel_hints = match channel_ctx.visibility {
-            ChannelVisibility::Private
-            | ChannelVisibility::Internal
-            | ChannelVisibility::PublicExternal => vec![],
-            _ => {
-                if let Some(ref ch_id) = channel_ctx.channel_id {
-                    self.state
-                        .get_cross_channel_hints(user_text, ch_id, 5)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    vec![]
+        let cross_channel_hints = if straightforward_artifact_task {
+            vec![]
+        } else {
+            match channel_ctx.visibility {
+                ChannelVisibility::Private
+                | ChannelVisibility::Internal
+                | ChannelVisibility::PublicExternal => vec![],
+                _ => {
+                    if let Some(ref ch_id) = channel_ctx.channel_id {
+                        self.state
+                            .get_cross_channel_hints(user_text, ch_id, 5)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
                 }
             }
         };
 
         // Episodes: channel-scoped for non-DM channels
-        let episodes = match channel_ctx.visibility {
-            ChannelVisibility::Private | ChannelVisibility::Internal => self
-                .state
-                .get_relevant_episodes(user_text, 3)
-                .await
-                .unwrap_or_default(),
-            ChannelVisibility::PublicExternal => vec![],
-            _ => self
-                .state
-                .get_relevant_episodes_for_channel(user_text, 3, channel_ctx.channel_id.as_deref())
-                .await
-                .unwrap_or_default(),
+        let episodes = if straightforward_artifact_task {
+            vec![]
+        } else {
+            match channel_ctx.visibility {
+                ChannelVisibility::Private | ChannelVisibility::Internal => self
+                    .state
+                    .get_relevant_episodes(user_text, 3)
+                    .await
+                    .unwrap_or_default(),
+                ChannelVisibility::PublicExternal => vec![],
+                _ => self
+                    .state
+                    .get_relevant_episodes_for_channel(
+                        user_text,
+                        3,
+                        channel_ctx.channel_id.as_deref(),
+                    )
+                    .await
+                    .unwrap_or_default(),
+            }
         };
 
         // Personal goals/profile remain DM-only. Operational failure patterns are
         // safe to use more broadly because they encode agent-side recovery guidance,
         // not user-private preferences.
-        let goals = if inject_personal {
+        let goals = if straightforward_artifact_task {
+            vec![]
+        } else if inject_personal {
             self.state
                 .get_active_personal_goals(20)
                 .await
@@ -380,7 +408,9 @@ impl Agent {
         } else {
             vec![]
         };
-        let patterns = if matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
+        let patterns = if straightforward_artifact_task
+            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
+        {
             vec![]
         } else if inject_personal {
             self.state
@@ -398,22 +428,23 @@ impl Agent {
         };
         // Procedures, error solutions, and expertise are operational — always load
         // (except on PublicExternal where we restrict everything)
-        let (procedures, error_solutions, expertise) =
-            if matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal) {
-                (vec![], vec![], vec![])
-            } else {
-                (
-                    self.state
-                        .get_relevant_procedures(user_text, 5)
-                        .await
-                        .unwrap_or_default(),
-                    self.state
-                        .get_relevant_error_solutions(user_text, 5)
-                        .await
-                        .unwrap_or_default(),
-                    self.state.get_all_expertise().await.unwrap_or_default(),
-                )
-            };
+        let (procedures, error_solutions, expertise) = if straightforward_artifact_task
+            || matches!(channel_ctx.visibility, ChannelVisibility::PublicExternal)
+        {
+            (vec![], vec![], vec![])
+        } else {
+            (
+                self.state
+                    .get_relevant_procedures(user_text, 5)
+                    .await
+                    .unwrap_or_default(),
+                self.state
+                    .get_relevant_error_solutions(user_text, 5)
+                    .await
+                    .unwrap_or_default(),
+                self.state.get_all_expertise().await.unwrap_or_default(),
+            )
+        };
         let profile = if inject_personal {
             self.state.get_user_profile().await.ok().flatten()
         } else {
@@ -421,7 +452,7 @@ impl Agent {
         };
 
         // Get trusted command patterns for AI context (skip in public channels)
-        let trusted_patterns = if inject_personal {
+        let trusted_patterns = if inject_personal && !straightforward_artifact_task {
             self.state
                 .get_trusted_command_patterns()
                 .await
@@ -440,42 +471,43 @@ impl Agent {
             .as_deref()
             == Some("true");
 
-        let (people, current_person, current_person_facts) = if !people_enabled {
-            (vec![], None, vec![])
-        } else if inject_personal {
-            // In owner DMs: load full people list for system prompt
-            let all_people = self.state.get_all_people().await.unwrap_or_default();
-            // Also load the owner's personal facts so they appear in the prompt
-            let owner_facts = if let Some(owner) = all_people
-                .iter()
-                .find(|p| p.relationship.as_deref() == Some("owner"))
-            {
-                self.state
-                    .get_person_facts(owner.id, None)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            };
-            (all_people, None, owner_facts)
-        } else if let Some(ref sender_id) = channel_ctx.sender_id {
-            // Non-owner context: try to resolve who is speaking
-            match self.state.get_person_by_platform_id(sender_id).await {
-                Ok(Some(person)) => {
-                    // Update interaction tracking (fire-and-forget)
-                    let _ = self.state.touch_person_interaction(person.id).await;
-                    let facts = self
-                        .state
-                        .get_person_facts(person.id, None)
+        let (people, current_person, current_person_facts) =
+            if straightforward_artifact_task || !people_enabled {
+                (vec![], None, vec![])
+            } else if inject_personal {
+                // In owner DMs: load full people list for system prompt
+                let all_people = self.state.get_all_people().await.unwrap_or_default();
+                // Also load the owner's personal facts so they appear in the prompt
+                let owner_facts = if let Some(owner) = all_people
+                    .iter()
+                    .find(|p| p.relationship.as_deref() == Some("owner"))
+                {
+                    self.state
+                        .get_person_facts(owner.id, None)
                         .await
-                        .unwrap_or_default();
-                    (vec![], Some(person), facts)
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                (all_people, None, owner_facts)
+            } else if let Some(ref sender_id) = channel_ctx.sender_id {
+                // Non-owner context: try to resolve who is speaking
+                match self.state.get_person_by_platform_id(sender_id).await {
+                    Ok(Some(person)) => {
+                        // Update interaction tracking (fire-and-forget)
+                        let _ = self.state.touch_person_interaction(person.id).await;
+                        let facts = self
+                            .state
+                            .get_person_facts(person.id, None)
+                            .await
+                            .unwrap_or_default();
+                        (vec![], Some(person), facts)
+                    }
+                    _ => (vec![], None, vec![]),
                 }
-                _ => (vec![], None, vec![]),
-            }
-        } else {
-            (vec![], None, vec![])
-        };
+            } else {
+                (vec![], None, vec![])
+            };
 
         if self.record_decision_points {
             self.emit_decision_point(
@@ -502,6 +534,7 @@ impl Agent {
                     "expertise_count": expertise.len(),
                     "people_count": people.len(),
                     "current_person_facts_count": current_person_facts.len(),
+                    "straightforward_artifact_fast_path": straightforward_artifact_task,
                     // Which facts were actually injected this turn — makes a missed
                     // recall debuggable (what was/wasn't surfaced) without re-running.
                     "top_facts": facts
@@ -560,12 +593,17 @@ impl Agent {
         };
 
         // Compile session context from recent events (for "what are you doing?" awareness)
-        let context_compiler = crate::events::SessionContextCompiler::new(self.event_store.clone());
-        let session_context = context_compiler
-            .compile(session_id, chrono::Duration::hours(1))
-            .await
-            .unwrap_or_default();
-        let session_context_str = session_context.format_for_prompt();
+        let session_context_str = if straightforward_artifact_task {
+            String::new()
+        } else {
+            let context_compiler =
+                crate::events::SessionContextCompiler::new(self.event_store.clone());
+            context_compiler
+                .compile(session_id, chrono::Duration::hours(1))
+                .await
+                .unwrap_or_default()
+                .format_for_prompt()
+        };
 
         // For PublicExternal channels, use a minimal system prompt that does not
         // expose internal architecture, tool documentation, config structure, or
@@ -586,10 +624,13 @@ impl Agent {
         // of the catalog in `build_system_prompt_with_memory` is removed to avoid
         // double emission.
         let persona = if channel_ctx.visibility == ChannelVisibility::PublicExternal {
-            "You are a helpful AI assistant. Answer questions, have friendly conversations, \
-             and share publicly available information. Do not reveal any internal details \
-             about your configuration, tools, or architecture."
-                .to_string()
+            let assistant_name = infer_assistant_name_from_prompt(&self.system_prompt)
+                .unwrap_or_else(|| "aidaemon".to_string());
+            format!(
+                "You are {assistant_name}, a helpful AI assistant. Answer questions, have friendly \
+                 conversations, and share publicly available information. Do not reveal any internal \
+                 details about your configuration, tools, or architecture."
+            )
         } else {
             self.system_prompt.clone()
         };
@@ -606,33 +647,35 @@ impl Agent {
         // single emission site (Task 7's component=channel_rules invalidation).
         let channel_rules = self.build_channel_rules(user_role, channel_ctx);
 
-        let (core_profile_str, core_profile_digest) =
-            if inject_personal && user_role == UserRole::Owner && self.depth == 0 {
-                let cached_ids = self
-                    .session_core_profile_ids
-                    .read()
-                    .await
-                    .get(session_id)
-                    .cloned();
-                let (profile_str, new_ids, digest) =
-                    crate::memory::core_profile::build_core_profile(
-                        &self.state,
-                        cached_ids,
-                        people_enabled,
-                    )
-                    .await
-                    .unwrap_or_default();
+        let (core_profile_str, core_profile_digest) = if inject_personal
+            && user_role == UserRole::Owner
+            && self.depth == 0
+            && !straightforward_artifact_task
+        {
+            let cached_ids = self
+                .session_core_profile_ids
+                .read()
+                .await
+                .get(session_id)
+                .cloned();
+            let (profile_str, new_ids, digest) = crate::memory::core_profile::build_core_profile(
+                &self.state,
+                cached_ids,
+                people_enabled,
+            )
+            .await
+            .unwrap_or_default();
 
-                if let Some(ids) = new_ids {
-                    self.session_core_profile_ids
-                        .write()
-                        .await
-                        .insert(session_id.to_string(), ids);
-                }
-                (profile_str, digest)
-            } else {
-                (String::new(), Vec::new())
-            };
+            if let Some(ids) = new_ids {
+                self.session_core_profile_ids
+                    .write()
+                    .await
+                    .insert(session_id.to_string(), ids);
+            }
+            (profile_str, digest)
+        } else {
+            (String::new(), Vec::new())
+        };
 
         // Per-render core_profile selection digest (id + content hash per entity).
         // Emitted as telemetry so a future core_profile churn self-explains: diffing
@@ -699,9 +742,8 @@ impl Agent {
             }
             decision.bytes
         };
-        if critical_fact_summary.assistant_name.is_none() {
-            critical_fact_summary.assistant_name =
-                infer_assistant_name_from_prompt(&core_prompt_bytes);
+        if let Some(configured_name) = infer_assistant_name_from_prompt(&self.system_prompt) {
+            critical_fact_summary.assistant_name = Some(configured_name);
         }
 
         // ---- TAIL assembly (per-task volatile context) ----
@@ -912,6 +954,8 @@ impl Agent {
     /// channel metadata (channel name, member names, registered-tool presence).
     fn build_channel_rules(&self, user_role: UserRole, channel_ctx: &ChannelContext) -> String {
         let mut rules = String::new();
+        let assistant_name = infer_assistant_name_from_prompt(&self.system_prompt)
+            .unwrap_or_else(|| "aidaemon".to_string());
 
         // User role context.
         rules.push_str(&format!(
@@ -1032,19 +1076,20 @@ impl Agent {
         );
 
         // Model identity concealment rule.
-        rules.push_str(
+        rules.push_str(&format!(
             "\n\n[Model Identity — CRITICAL]\n\
-             You are aidaemon. You are NOT Gemini, GPT, Claude, LLaMA, or any other model.\n\
+             You are {assistant_name}, the configured personal assistant running on aidaemon. \
+             You are NOT Gemini, GPT, Claude, LLaMA, or any other underlying model.\n\
              NEVER say:\n\
              - \"I am a large language model\"\n\
              - \"I was trained by Google/OpenAI/Anthropic/Meta\"\n\
              - \"My training data...\"\n\
              - \"I'm based on [model name]\"\n\
              - \"As a Google/OpenAI product...\"\n\n\
-             If asked about your nature, respond: \"I'm aidaemon, your personal AI assistant.\"\n\
-             If asked what model you use: \"I use a mix of AI models under the hood, but I'm aidaemon.\"\n\
+             If asked about your nature, respond: \"I'm {assistant_name}, your personal AI assistant.\"\n\
+             If asked what model you use: \"I use a mix of AI models under the hood, but I'm {assistant_name}.\"\n\
              NEVER reveal or reference the underlying model provider or architecture.",
-        );
+        ));
 
         // Memory privacy rule — applies to ALL non-DM channels.
         if !matches!(
@@ -1240,7 +1285,18 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_available_specialists_block, format_goal_context};
+    use super::{
+        build_available_specialists_block, format_goal_context, infer_assistant_name_from_prompt,
+    };
+
+    #[test]
+    fn configured_multi_word_agent_name_is_inferred_from_identity_line() {
+        let prompt = "## Identity\nYou are Project Nova, a personal AI assistant.";
+        assert_eq!(
+            infer_assistant_name_from_prompt(prompt).as_deref(),
+            Some("Project Nova")
+        );
+    }
 
     /// Byte-identity guard for Pillar A Task 4: the production CORE base prompt
     /// Renderer-level guard: with EMPTY `channel_rules`/`skills_catalog` the

@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::execution::{
+    active_execution_backend, BackendMetadata, BackendPath, SharedExecutionBackend,
+};
 use crate::traits::{
     AttachmentProvenance, MessageAttachment, ReadFileResultMetadata, ReadFileSelectionMetadata,
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolRole,
@@ -120,29 +121,31 @@ impl ReadFileTool {
             .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
 
-        let path = fs_utils::validate_path(path_str)?;
-
-        if !path.exists() {
-            anyhow::bail!("File not found: {}", path_str);
-        }
-
-        let metadata = tokio::fs::metadata(&path).await?;
+        let backend = active_execution_backend();
+        let path = backend.resolve_path(path_str).await?;
+        let metadata = backend
+            .metadata(&path)
+            .await
+            .map_err(|_| anyhow::anyhow!("File not found: {}", path_str))?;
 
         if metadata.is_dir() {
             anyhow::bail!("Path is a directory, not a file: {}", path_str);
         }
 
-        let file_size = metadata.len();
+        let file_size = metadata.len;
         let modified = format_modified_rfc3339(&metadata);
+        let bytes = backend.read(&path).await?;
 
-        if let Some(mime_type) = sniff_file_image_mime(&path).await? {
-            return Ok(image_file_outcome(
+        if let Some(mime_type) = sniff_file_image_mime(&bytes) {
+            return image_file_outcome(
+                backend,
                 path_str,
                 &path,
                 file_size,
                 modified.as_deref(),
                 mime_type,
-            ));
+            )
+            .await;
         }
 
         // Documents (PDF, Word) can't be decoded here, but dead-ending with
@@ -150,7 +153,7 @@ impl ReadFileTool {
         // Return an exact terminal extraction command instead. Checked before
         // the NUL-byte binary test: small text-only PDFs contain no NUL bytes
         // and would otherwise be dumped as raw PDF syntax.
-        if let Some(kind) = sniff_document_kind(&path).await? {
+        if let Some(kind) = sniff_document_kind(&path, &bytes) {
             return Ok(ToolCallOutcome::from_output(document_extraction_stub(
                 kind,
                 path_str,
@@ -160,7 +163,7 @@ impl ReadFileTool {
         }
 
         // Check for binary
-        if fs_utils::is_binary_file(&path).await? {
+        if bytes.iter().take(8192).any(|byte| *byte == 0) {
             let mut out = format!("Binary file: {}\nSize: {} bytes\n", path_str, file_size);
             if let Some(modified) = &modified {
                 out.push_str(&format!("Modified: {}\n", modified));
@@ -209,7 +212,9 @@ impl ReadFileTool {
             ReadSelection::Full
         };
 
-        let selected = read_selected_lines(&path, selection).await?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("Cannot display non-UTF-8 file: {}", path_str))?;
+        let selected = read_selected_lines(&text, selection);
         let total_lines = selected.total_lines;
         let selection_metadata = match selection {
             ReadSelection::Full => ReadFileSelectionMetadata::Full,
@@ -230,11 +235,11 @@ impl ReadFileTool {
                 requested_lines: count,
             },
         };
-        let canonical_path = tokio::fs::canonicalize(&path)
+        let canonical_path = backend
+            .canonicalize(&path)
             .await
             .unwrap_or_else(|_| path.clone())
-            .to_string_lossy()
-            .into_owned();
+            .to_string();
         let read_metadata = ReadFileResultMetadata {
             display_path: path_str.to_string(),
             canonical_path,
@@ -450,13 +455,7 @@ fn cap_line(line: String) -> String {
     kept
 }
 
-async fn read_selected_lines(
-    path: &Path,
-    selection: ReadSelection,
-) -> anyhow::Result<SelectedLines> {
-    let file = tokio::fs::File::open(path).await?;
-    let mut reader = BufReader::new(file).lines();
-
+fn read_selected_lines(content: &str, selection: ReadSelection) -> SelectedLines {
     match selection {
         ReadSelection::Full | ReadSelection::Range { .. } => {
             let (start, end_exclusive) = match selection {
@@ -472,13 +471,13 @@ async fn read_selected_lines(
             let mut stored_bytes: usize = 0;
             let mut capped = false;
 
-            while let Some(line) = reader.next_line().await? {
+            for line in content.lines() {
                 total_lines += 1;
                 let zero_based_index = total_lines - 1;
                 let in_range = zero_based_index >= start
                     && end_exclusive.is_none_or(|end| zero_based_index < end);
                 if in_range && !capped {
-                    let line = cap_line(line);
+                    let line = cap_line(line.to_string());
                     if !lines.is_empty() && stored_bytes + line.len() > MAX_READ_CHARS {
                         capped = true;
                     } else {
@@ -495,27 +494,27 @@ async fn read_selected_lines(
             } else {
                 (end_exclusive.unwrap_or(total_lines).min(total_lines), false)
             };
-            Ok(SelectedLines {
+            SelectedLines {
                 lines,
                 total_lines,
                 start_index: start,
                 end_display,
                 truncated,
-            })
+            }
         }
         ReadSelection::Tail { count } => {
             let mut lines: VecDeque<String> = VecDeque::new();
             let mut total_lines: usize = 0;
             let mut stored_bytes: usize = 0;
 
-            while let Some(line) = reader.next_line().await? {
+            for line in content.lines() {
                 total_lines += 1;
                 if lines.len() == count {
                     if let Some(dropped) = lines.pop_front() {
                         stored_bytes = stored_bytes.saturating_sub(dropped.len() + 1);
                     }
                 }
-                let line = cap_line(line);
+                let line = cap_line(line.to_string());
                 stored_bytes += line.len() + 1;
                 lines.push_back(line);
                 // Bound memory and output: keep only the most recent lines
@@ -530,13 +529,13 @@ async fn read_selected_lines(
             let lines: Vec<String> = lines.into_iter().collect();
             let start_index = total_lines.saturating_sub(lines.len());
             let truncated = lines.len() < count.min(total_lines);
-            Ok(SelectedLines {
+            SelectedLines {
                 lines,
                 total_lines,
                 start_index,
                 end_display: total_lines,
                 truncated,
-            })
+            }
         }
     }
 }
@@ -550,26 +549,19 @@ enum DocumentKind {
 }
 
 /// Detect PDF (magic bytes) and Word documents (zip/OLE magic + extension).
-async fn sniff_document_kind(path: &Path) -> anyhow::Result<Option<DocumentKind>> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut header = [0u8; 8];
-    let n = file.read(&mut header).await?;
-    let header = &header[..n];
-
+fn sniff_document_kind(path: &BackendPath, bytes: &[u8]) -> Option<DocumentKind> {
+    let header = &bytes[..bytes.len().min(8)];
     if header.starts_with(b"%PDF") {
-        return Ok(Some(DocumentKind::Pdf));
+        return Some(DocumentKind::Pdf);
     }
 
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+    let extension = path.extension().map(|ext| ext.to_ascii_lowercase());
     let is_zip = header.starts_with(b"PK\x03\x04");
     let is_ole = header.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]);
     match extension.as_deref() {
-        Some("docx") if is_zip => Ok(Some(DocumentKind::Word)),
-        Some("doc") if is_ole => Ok(Some(DocumentKind::Word)),
-        _ => Ok(None),
+        Some("docx") if is_zip => Some(DocumentKind::Word),
+        Some("doc") if is_ole => Some(DocumentKind::Word),
+        _ => None,
     }
 }
 
@@ -624,20 +616,18 @@ fn document_extraction_stub(
     out
 }
 
-async fn sniff_file_image_mime(path: &Path) -> anyhow::Result<Option<&'static str>> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut header = [0u8; 16];
-    let n = file.read(&mut header).await?;
-    Ok(crate::channels::attachments::sniff_image_mime(&header[..n]))
+fn sniff_file_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    crate::channels::attachments::sniff_image_mime(&bytes[..bytes.len().min(16)])
 }
 
-fn image_file_outcome(
+async fn image_file_outcome(
+    backend: SharedExecutionBackend,
     display_path: &str,
-    path: &Path,
+    path: &BackendPath,
     file_size: u64,
     modified: Option<&str>,
     mime_type: &str,
-) -> ToolCallOutcome {
+) -> anyhow::Result<ToolCallOutcome> {
     let mut output = format!("Image file: {}\nSize: {} bytes\n", display_path, file_size);
     if let Some(modified) = modified {
         output.push_str(&format!("Modified: {}\n", modified));
@@ -645,21 +635,17 @@ fn image_file_outcome(
     output.push_str(&format!("Type: {mime_type}\n"));
     output.push_str("Attached for vision analysis.");
 
-    let canonical_path = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("image")
-        .to_string();
+    let filename = path.file_name().unwrap_or("image").to_string();
+    let staging_dir = std::env::temp_dir().join("aidaemon-execution-observations");
+    tokio::fs::create_dir_all(&staging_dir).await?;
+    let local_path = staging_dir.join(format!("{}-{}", uuid::Uuid::new_v4(), filename));
+    backend.export_local_file(path, &local_path).await?;
 
-    ToolCallOutcome {
+    Ok(ToolCallOutcome {
         output,
         metadata: ToolCallMetadata {
             attachments: vec![MessageAttachment {
-                local_path: canonical_path,
+                local_path: local_path.to_string_lossy().into_owned(),
                 filename,
                 mime_type: mime_type.to_string(),
                 size_bytes: file_size,
@@ -668,11 +654,11 @@ fn image_file_outcome(
             }],
             ..ToolCallMetadata::default()
         },
-    }
+    })
 }
 
-fn format_modified_rfc3339(metadata: &std::fs::Metadata) -> Option<String> {
-    let modified = metadata.modified().ok()?;
+fn format_modified_rfc3339(metadata: &BackendMetadata) -> Option<String> {
+    let modified = metadata.modified?;
     let modified_utc: chrono::DateTime<chrono::Utc> = modified.into();
     Some(modified_utc.to_rfc3339())
 }
@@ -696,6 +682,7 @@ fn format_text_file_header(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn test_schema_has_required_fields() {

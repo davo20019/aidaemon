@@ -410,6 +410,106 @@ impl crate::traits::Tool for PreWrappedExternalActionTool {
     }
 }
 
+struct StructuredExternalActionTool;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for StructuredExternalActionTool {
+    fn name(&self) -> &str {
+        "structured_external_action"
+    }
+
+    fn description(&self) -> &str {
+        "Creates an external record and returns a structured HTTP response."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "structured_external_action",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        Ok(
+            r#"HTTP 201 Created
+content-type: application/json; charset=utf-8
+
+JSON summary:
+Top-level keys: data
+
+{
+  "data": {
+    "edit_history_tweet_ids": [
+      ""
+    ],
+    "id": "2082623804740620701",
+    "text": "Synthetic engagement prompt"
+  }
+}"#
+            .to_string(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn test_post_tool_deferral_summarizes_structured_mutation_without_raw_json() {
+    let responses = vec![
+        MockProvider::tool_call_response("structured_external_action", "{}"),
+        MockProvider::text_response("I'll handle that now."),
+    ];
+
+    let harness = crate::testing::setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(responses),
+        vec![Arc::new(StructuredExternalActionTool)],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "structured_external_action_deferral",
+            "Create the external post.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("HTTP 201 Created"), "{response}");
+    assert!(
+        response.contains("Result ID: 2082623804740620701"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Text: Synthetic engagement prompt"),
+        "{response}"
+    );
+    assert!(!response.contains("Here are the results"), "{response}");
+    assert!(!response.contains("JSON summary"), "{response}");
+    assert!(!response.contains("edit_history_tweet_ids"), "{response}");
+    assert!(!response.contains("\"data\""), "{response}");
+    assert!(!response.contains('{'), "{response}");
+}
+
 struct UrlProbeTool;
 
 #[async_trait::async_trait]

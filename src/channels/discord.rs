@@ -943,8 +943,9 @@ impl DiscordChannel {
 
     /// Handle text commands (e.g. /model, /help)
     async fn handle_text_command(&self, ctx: &Context, msg: &SerenityMessage, text: &str) {
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, msg.author.id.get());
         let reply = self
-            .dispatch_command(text, &self.session_id_from_message(msg))
+            .dispatch_command(text, &self.session_id_from_message(msg), user_role)
             .await;
         let chunks = split_message(&reply, 2000);
         for chunk in &chunks {
@@ -995,7 +996,10 @@ impl DiscordChannel {
             .unwrap_or("");
 
         let cmd_text = format!("/{} {}", command.data.name, arg);
-        let reply = self.dispatch_command(cmd_text.trim(), &session_id).await;
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+        let reply = self
+            .dispatch_command(cmd_text.trim(), &session_id, user_role)
+            .await;
 
         let _ = command
             .edit_response(&ctx.http, EditInteractionResponse::new().content(reply))
@@ -1003,7 +1007,7 @@ impl DiscordChannel {
     }
 
     /// Dispatch a command string to the appropriate handler and return the reply text.
-    async fn dispatch_command(&self, text: &str, session_id: &str) -> String {
+    async fn dispatch_command(&self, text: &str, session_id: &str, user_role: UserRole) -> String {
         let parts: Vec<&str> = text.splitn(2, ' ').collect();
         let cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
@@ -1015,7 +1019,7 @@ impl DiscordChannel {
             task_registry: Arc::clone(&self.task_registry),
             config_path: self.config_path.clone(),
         };
-        if let Some(reply) = ctx.dispatch(cmd, arg, session_id).await {
+        if let Some(reply) = ctx.dispatch(cmd, arg, session_id, user_role).await {
             return reply;
         }
 
