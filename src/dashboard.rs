@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -73,11 +73,7 @@ pub fn get_or_create_dashboard_token() -> anyhow::Result<DashboardToken> {
     if let Err(e) = crate::config::store_in_keychain(KEYCHAIN_FIELD, &tok) {
         warn!("Could not store dashboard token in keychain: {e}");
     }
-    let prefix = tok.get(..8).unwrap_or("????????");
-    info!(
-        "Dashboard token created (prefix: {}..., expires in 24h)",
-        prefix
-    );
+    info!("Dashboard token created and stored (expires in 24h)");
     Ok(DashboardToken {
         token: tok,
         created_at: Instant::now(),
@@ -94,6 +90,7 @@ pub fn build_router(state: DashboardState) -> Router {
         .route("/api/usage", get(api_usage))
         .route("/api/sessions", get(api_sessions))
         .route("/api/tasks", get(api_tasks))
+        .route("/api/work", get(api_work))
         .route("/api/heartbeat/jobs", get(api_heartbeat_jobs))
         .route("/api/queues", get(api_queues))
         .route("/api/writes/consistency", get(api_writes_consistency))
@@ -433,6 +430,185 @@ async fn api_tasks(State(state): State<DashboardState>) -> Json<serde_json::Valu
         .collect();
 
     Json(serde_json::Value::Array(vals))
+}
+
+#[derive(Deserialize)]
+struct WorkQuery {
+    #[serde(default = "default_work_project")]
+    project: String,
+}
+
+fn default_work_project() -> String {
+    crate::traits::DEFAULT_PROJECT_ID.to_string()
+}
+
+async fn api_work(
+    State(state): State<DashboardState>,
+    Query(query): Query<WorkQuery>,
+) -> Json<serde_json::Value> {
+    let project_id = if query.project.trim().is_empty() {
+        default_work_project()
+    } else {
+        query.project.trim().to_string()
+    };
+    let projects = sqlx::query(
+        "SELECT id, name, description FROM work_projects
+         ORDER BY name COLLATE NOCASE",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("id"),
+            "name": row.get::<String, _>("name"),
+            "description": row.get::<Option<String>, _>("description"),
+        })
+    })
+    .collect::<Vec<_>>();
+    let goals = sqlx::query(
+        "WITH ranked_runs AS (
+            SELECT gr.*, rg.goal_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY gr.goal_id
+                       ORDER BY julianday(gr.started_at) DESC, gr.id DESC
+                   ) AS recency,
+                   SUM(CASE WHEN gr.status IN ('pending', 'running', 'blocked')
+                            THEN 1 ELSE 0 END) OVER (
+                       PARTITION BY gr.goal_id
+                   ) AS active_count
+            FROM goal_runs gr
+            JOIN goals rg ON rg.id = gr.goal_id
+         ),
+         visible_runs AS (
+            SELECT * FROM ranked_runs
+            WHERE status IN ('pending', 'running', 'blocked')
+               OR (active_count = 0 AND recency = 1
+                   AND NOT (trigger_type = 'legacy' AND goal_type = 'continuous'))
+         )
+         SELECT g.id AS goal_id, g.description, g.status AS goal_status,
+                vr.id AS run_id, vr.status AS run_status,
+                COALESCE(SUM(CASE WHEN t.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+                COALESCE(SUM(CASE WHEN t.status IN ('claimed', 'running') THEN 1 ELSE 0 END), 0) AS running,
+                COALESCE(SUM(CASE WHEN t.status = 'blocked' THEN 1 ELSE 0 END), 0) AS blocked,
+                COALESCE(SUM(CASE WHEN t.status IN ('completed', 'cancelled', 'skipped', 'superseded') THEN 1 ELSE 0 END), 0) AS done
+         FROM goals g
+         LEFT JOIN visible_runs vr ON vr.goal_id = g.id
+         LEFT JOIN tasks t ON t.goal_run_id = vr.id
+         WHERE g.project_id = ? AND g.domain = 'orchestration'
+           AND g.status NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+         GROUP BY g.id, vr.id
+         ORDER BY MAX(julianday(COALESCE(t.updated_at, g.updated_at))) DESC
+         LIMIT 100",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        json!({
+            "goal_id": row.get::<String, _>("goal_id"),
+            "description": row.get::<String, _>("description"),
+            "goal_status": row.get::<String, _>("goal_status"),
+            "run_id": row.get::<Option<String>, _>("run_id"),
+            "run_status": row.get::<Option<String>, _>("run_status"),
+            "pending": row.get::<i64, _>("pending"),
+            "running": row.get::<i64, _>("running"),
+            "blocked": row.get::<i64, _>("blocked"),
+            "done": row.get::<i64, _>("done"),
+        })
+    })
+    .collect::<Vec<_>>();
+    let tasks = sqlx::query(
+        "WITH ranked_runs AS (
+            SELECT gr.*, rg.goal_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY gr.goal_id
+                       ORDER BY julianday(gr.started_at) DESC, gr.id DESC
+                   ) AS recency,
+                   SUM(CASE WHEN gr.status IN ('pending', 'running', 'blocked')
+                            THEN 1 ELSE 0 END) OVER (
+                       PARTITION BY gr.goal_id
+                   ) AS active_count
+            FROM goal_runs gr
+            JOIN goals rg ON rg.id = gr.goal_id
+         ),
+         visible_runs AS (
+            SELECT * FROM ranked_runs
+            WHERE status IN ('pending', 'running', 'blocked')
+               OR (active_count = 0 AND recency = 1
+                   AND NOT (trigger_type = 'legacy' AND goal_type = 'continuous'))
+         ),
+         projected AS (
+            SELECT t.id AS task_id, t.description, t.status, t.priority,
+                   t.blocker, t.updated_at, g.id AS goal_id,
+                   wp.name AS worker_profile, a.worker_instance_id,
+                   CASE
+                     WHEN t.status = 'pending' AND EXISTS (
+                       SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) dep
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM tasks prerequisite
+                         WHERE prerequisite.id = CAST(dep.value AS TEXT)
+                           AND prerequisite.goal_run_id = t.goal_run_id
+                           AND prerequisite.status IN ('completed', 'skipped', 'superseded')
+                       )
+                     ) THEN 'waiting'
+                     WHEN t.status = 'pending' THEN 'ready'
+                     WHEN t.status IN ('claimed', 'running')
+                          AND a.status IN ('claimed', 'running')
+                          AND datetime(a.lease_expires_at) > datetime('now')
+                       THEN 'in_progress'
+                     WHEN t.status = 'blocked' THEN 'blocked'
+                     WHEN t.status IN ('completed', 'cancelled', 'skipped', 'superseded') THEN 'done'
+                     ELSE 'needs_attention'
+                   END AS lane
+            FROM tasks t
+            JOIN goals g ON g.id = t.goal_id
+            JOIN visible_runs vr ON vr.id = t.goal_run_id
+            LEFT JOIN task_attempts a ON a.id = t.current_attempt_id
+            LEFT JOIN worker_profiles wp
+              ON wp.id = COALESCE(a.worker_profile_id, t.worker_profile_id)
+            WHERE g.project_id = ?
+              AND g.status NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+         )
+         SELECT * FROM projected
+         ORDER BY CASE lane
+                    WHEN 'blocked' THEN 1 WHEN 'needs_attention' THEN 2
+                    WHEN 'in_progress' THEN 3 WHEN 'ready' THEN 4
+                    WHEN 'waiting' THEN 5 ELSE 6 END,
+                  julianday(updated_at) DESC
+         LIMIT 300",
+    )
+    .bind(&project_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        json!({
+            "task_id": row.get::<String, _>("task_id"),
+            "goal_id": row.get::<String, _>("goal_id"),
+            "description": row.get::<String, _>("description"),
+            "status": row.get::<String, _>("status"),
+            "lane": row.get::<String, _>("lane"),
+            "priority": row.get::<String, _>("priority"),
+            "worker_profile": row.get::<Option<String>, _>("worker_profile"),
+            "worker_instance_id": row.get::<Option<String>, _>("worker_instance_id"),
+            "blocker": row.get::<Option<String>, _>("blocker"),
+            "updated_at": row.get::<Option<String>, _>("updated_at"),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    Json(json!({
+        "project_id": project_id,
+        "projects": projects,
+        "goals": goals,
+        "tasks": tasks,
+        "read_only": true,
+    }))
 }
 
 #[derive(sqlx::FromRow)]

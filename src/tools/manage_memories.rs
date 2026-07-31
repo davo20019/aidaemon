@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{StateStore, Tool, ToolCapabilities};
-use crate::types::{ApprovalKind, ChannelVisibility, FactPrivacy};
+use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
 /// boundary. Structured fact keys carry their words behind `_`, `-`, `:` and
@@ -1120,7 +1120,7 @@ impl Tool for ManageMemoriesTool {
                         format!("Next: {}", next_run),
                         format!("System timezone: {}", tz_label),
                     ];
-                    let _ = tx
+                    if let Err(error) = tx
                         .send(ApprovalRequest {
                             command: desc.to_string(),
                             session_id: session_id.to_string(),
@@ -1131,44 +1131,57 @@ impl Tool for ManageMemoriesTool {
                             response_tx,
                             kind: ApprovalKind::GoalConfirmation,
                         })
-                        .await;
+                        .await
+                    {
+                        return Ok(format!(
+                            "Created scheduled goal {} (pending confirmation) with {} schedule(s), but its confirmation could not be delivered: {}. Next: {}. System timezone: {}. It was not cancelled or activated.",
+                            goal.id,
+                            parsed.len(),
+                            error,
+                            next_run,
+                            tz_label
+                        ));
+                    }
 
-                    let confirmed = matches!(
-                        response_rx.await,
-                        Ok(crate::types::ApprovalResponse::AllowOnce)
-                            | Ok(crate::types::ApprovalResponse::AllowSession)
-                            | Ok(crate::types::ApprovalResponse::AllowAlways)
-                    );
-
-                    if confirmed {
-                        let _ = self.state.activate_goal(&goal.id).await;
-                        Ok(format!(
-                            "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
+                    match response_rx.await {
+                        Ok(
+                            ApprovalResponse::AllowOnce
+                            | ApprovalResponse::AllowSession
+                            | ApprovalResponse::AllowAlways,
+                        ) => {
+                            self.state.activate_goal(&goal.id).await?;
+                            Ok(format!(
+                                "Confirmed and activated scheduled goal {}. {} schedule(s). Next: {}. System timezone: {}.",
+                                goal.id,
+                                parsed.len(),
+                                next_run,
+                                tz_label
+                            ))
+                        }
+                        Ok(ApprovalResponse::Deny) => {
+                            // Only an explicit owner response cancels the goal.
+                            let mut cancelled_goal = goal.clone();
+                            cancelled_goal.status = "cancelled".to_string();
+                            cancelled_goal.completed_at =
+                                Some(chrono::Utc::now().to_rfc3339());
+                            cancelled_goal.updated_at = chrono::Utc::now().to_rfc3339();
+                            self.state.update_goal(&cancelled_goal).await?;
+                            let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
+                            for schedule in &schedules {
+                                self.state.delete_goal_schedule(&schedule.id).await?;
+                            }
+                            Ok(format!(
+                                "Cancelled scheduled goal {}. The user declined confirmation.",
+                                goal.id
+                            ))
+                        }
+                        Err(_) => Ok(format!(
+                            "Created scheduled goal {} (pending confirmation) with {} schedule(s), but the confirmation response became unavailable. Next: {}. System timezone: {}. It was not cancelled or activated.",
                             goal.id,
                             parsed.len(),
                             next_run,
                             tz_label
-                        ))
-                    } else {
-                        // Cancel the goal and clean up schedules
-                        let mut cancelled_goal = goal.clone();
-                        cancelled_goal.status = "cancelled".to_string();
-                        cancelled_goal.completed_at =
-                            Some(chrono::Utc::now().to_rfc3339());
-                        cancelled_goal.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = self.state.update_goal(&cancelled_goal).await;
-                        if let Ok(schedules) =
-                            self.state.get_schedules_for_goal(&goal.id).await
-                        {
-                            for s in &schedules {
-                                let _ =
-                                    self.state.delete_goal_schedule(&s.id).await;
-                            }
-                        }
-                        Ok(format!(
-                            "Cancelled scheduled goal {}. The user declined confirmation.",
-                            goal.id
-                        ))
+                        )),
                     }
                 } else {
                     // Fallback: text-based confirmation when no approval channel
@@ -3222,6 +3235,48 @@ mod tests {
         assert_eq!(schedules.len(), 1);
         assert!(!schedules[0].is_one_shot);
         assert_eq!(schedules[0].cron_expr, "0 */6 * * *");
+    }
+
+    #[tokio::test]
+    async fn unavailable_schedule_confirmation_does_not_cancel_created_goal() {
+        let state = setup_state().await;
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMemoriesTool::new(state.clone())
+            .with_approval_tx(crate::tools::ApprovalBroker::new(approval_tx));
+        let responder = tokio::spawn(async move {
+            let request = approval_rx.recv().await.expect("approval request");
+            drop(request.response_tx);
+        });
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_scheduled_goal",
+                    "goal": "Check confirmation transport",
+                    "schedule": "every 6h",
+                    "_user_role": "owner",
+                    "_session_id": "test-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert!(result.contains("confirmation response became unavailable"));
+        assert!(result.contains("not cancelled or activated"));
+        let goal = state
+            .get_scheduled_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|goal| goal.description == "Check confirmation transport")
+            .unwrap();
+        assert_eq!(goal.status, "pending_confirmation");
+        assert_eq!(
+            state.get_schedules_for_goal(&goal.id).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

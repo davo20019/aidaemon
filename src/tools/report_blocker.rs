@@ -9,21 +9,35 @@ use crate::agent::{
     build_needs_approval_request, persist_executor_result_context, ExecutorStepResult,
     PartialResult, StepValidationOutcome, TaskValidationOutcome,
 };
-use crate::traits::{StateStore, Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
+use crate::traits::{
+    HandoffArtifact, StateStore, TaskAttempt, TaskAttemptPatch, TaskHandoff, Tool,
+    ToolCallSemantics, ToolCapabilities, ToolRole,
+};
 
 /// Tool for executors to report they are blocked and cannot proceed.
 ///
-/// Phase 2 simplified behavior: updates the task to "blocked" status with
-/// blocker details, then tells the executor to stop. Full blocker-resolution
-/// channel deferred to Phase 3.
 pub struct ReportBlockerTool {
     task_id: String,
     state: Arc<dyn StateStore>,
+    attempt: Option<TaskAttempt>,
 }
 
 impl ReportBlockerTool {
+    #[cfg(test)]
     pub fn new(task_id: String, state: Arc<dyn StateStore>) -> Self {
-        Self { task_id, state }
+        Self {
+            task_id,
+            state,
+            attempt: None,
+        }
+    }
+
+    pub fn for_attempt(task_id: String, state: Arc<dyn StateStore>, attempt: TaskAttempt) -> Self {
+        Self {
+            task_id,
+            state,
+            attempt: Some(attempt),
+        }
     }
 }
 
@@ -46,6 +60,28 @@ struct ReportBlockerArgs {
     artifacts: Option<Vec<String>>,
     #[serde(default)]
     options: Option<Vec<String>>,
+}
+
+fn suppresses_immediate_blocker_notification(context: Option<&str>) -> bool {
+    context
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("terminal_recovery").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn is_self_resolvable_execution_preflight(args: &ReportBlockerArgs) -> bool {
+    let combined = format!(
+        "{} {}",
+        args.reason,
+        args.exact_need.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    combined.contains("refusing an unbounded checkpoint")
+        || combined.contains("outside checkpoint scope")
+        || combined.contains("checkpoint for a command spanning multiple project roots")
+        || (combined.contains("terminal call limit")
+            && (combined.contains("workspace container")
+                || combined.contains("bounded subdirectory")))
 }
 
 #[async_trait]
@@ -133,6 +169,13 @@ impl Tool for ReportBlockerTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ReportBlockerArgs = serde_json::from_str(arguments)?;
 
+        if is_self_resolvable_execution_preflight(&args) {
+            return Ok(
+                "Error: this is a recoverable internal execution preflight, not a human blocker. No task state changed and no process was started. Select one explicit bounded project directory, retry the command from there, and use another available inspection tool if needed."
+                    .to_string(),
+            );
+        }
+
         let outcome = classify_blocker_outcome(&args);
         let partial_result = args
             .partial_work
@@ -211,21 +254,75 @@ impl Tool for ReportBlockerTool {
             blocker.push_str(&format!("\nPossible resolutions: {}", options.join(", ")));
         }
 
-        // Update the task in the database
+        // Persist the blocker through the current fenced attempt. The
+        // compatibility path is retained for direct unit tests and older
+        // callers that do not execute under a durable claim.
         if let Ok(Some(mut task)) = self.state.get_task(&self.task_id).await {
-            task.status = "blocked".to_string();
-            task.blocker = Some(blocker.clone());
-            if task
+            let suppress_immediate_notification =
+                suppresses_immediate_blocker_notification(task.context.as_deref());
+            let result_summary = if task
                 .result
                 .as_deref()
                 .is_none_or(|result| result.trim().is_empty())
             {
-                task.result = Some(executor_result.render_task_lead_summary());
-            }
-            task.context =
+                Some(executor_result.render_task_lead_summary())
+            } else {
+                task.result.clone()
+            };
+            let context =
                 persist_executor_result_context(task.context.as_deref(), &executor_result).ok();
-            task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-            let _ = self.state.update_task(&task).await;
+            if let Some(attempt) = &self.attempt {
+                let handoff = TaskHandoff {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    task_id: self.task_id.clone(),
+                    attempt_id: attempt.id.clone(),
+                    summary: executor_result.summary.clone(),
+                    artifacts: executor_result
+                        .artifacts
+                        .iter()
+                        .map(|reference| HandoffArtifact {
+                            kind: if reference.starts_with("http://")
+                                || reference.starts_with("https://")
+                            {
+                                "url".to_string()
+                            } else {
+                                "path".to_string()
+                            },
+                            reference: reference.clone(),
+                            digest: None,
+                            metadata: None,
+                        })
+                        .collect(),
+                    verification: Vec::new(),
+                    remaining_risk: Some(args.reason.clone()),
+                    next_step: Some(next_step.clone()),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                let patch = TaskAttemptPatch {
+                    status: "blocked".to_string(),
+                    result: result_summary,
+                    error: None,
+                    blocker: Some(blocker.clone()),
+                    context,
+                    handoff: Some(handoff),
+                };
+                let updated = self
+                    .state
+                    .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                    .await?;
+                if !updated {
+                    anyhow::bail!(
+                        "The execution lease is no longer current; the blocker was not applied"
+                    );
+                }
+            } else {
+                task.status = "blocked".to_string();
+                task.blocker = Some(blocker.clone());
+                task.result = result_summary;
+                task.context = context;
+                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                self.state.update_task(&task).await?;
+            }
             info!(task_id = %self.task_id, reason = %args.reason, "Executor reported blocker");
 
             // Surface the blocker to the user right away through the
@@ -233,23 +330,36 @@ impl Tool for ReportBlockerTool {
             // instead of waiting for the goal wrap-up summary. A blocker is
             // usually actionable by the user (start a service, grant access),
             // so minutes of silence here cost real wall-clock time.
-            if let Ok(Some(goal)) = self.state.get_goal(&task.goal_id).await {
-                let mut message = format!(
-                    "\u{26a0}\u{fe0f} A step is blocked: {}\nStep: {}",
-                    args.reason, task.description
-                );
-                if let Some(need) = &exact_need {
-                    message.push_str(&format!("\nNeeded to continue: {}", need));
+            if !suppress_immediate_notification {
+                if let Ok(Some(goal)) = self.state.get_goal(&task.goal_id).await {
+                    let mut message = format!(
+                        "\u{26a0}\u{fe0f} A step is blocked: {}\nStep: {}",
+                        args.reason, task.description
+                    );
+                    if let Some(need) = &exact_need {
+                        message.push_str(&format!("\nNeeded to continue: {}", need));
+                    }
+                    let short_id = self.task_id.chars().take(8).collect::<String>();
+                    message.push_str(&format!(
+                        "\nReply with /work unblock {} <resolution> after resolving it.",
+                        short_id
+                    ));
+                    let entry = crate::traits::NotificationEntry::new(
+                        &goal.id,
+                        &goal.session_id,
+                        "escalation",
+                        &message,
+                    )
+                    .with_task(&self.task_id);
+                    if let Err(e) = self.state.enqueue_notification(&entry).await {
+                        info!(task_id = %self.task_id, error = %e, "Failed to enqueue blocker notification");
+                    }
                 }
-                let entry = crate::traits::NotificationEntry::new(
-                    &goal.id,
-                    &goal.session_id,
-                    "escalation",
-                    &message,
+            } else {
+                info!(
+                    task_id = %self.task_id,
+                    "Suppressed duplicate blocker escalation for terminal recovery task"
                 );
-                if let Err(e) = self.state.enqueue_notification(&entry).await {
-                    info!(task_id = %self.task_id, error = %e, "Failed to enqueue blocker notification");
-                }
             }
         }
 
@@ -376,6 +486,60 @@ mod tests {
         assert!(entry
             .message
             .contains("Start Docker, then ask me to retry."));
+    }
+
+    #[tokio::test]
+    async fn recoverable_checkpoint_preflight_is_not_escalated_to_the_user() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let tool = ReportBlockerTool::new(task_id.clone(), state.clone());
+        let original_status = state.get_task(&task_id).await.unwrap().unwrap().status;
+
+        let result = tool
+            .call(
+                &json!({
+                    "reason": "The command surface refused an unbounded checkpoint at workspace container /Users/example/projects and the terminal call limit was reached.",
+                    "exact_need": "A bounded subdirectory under /Users/example/projects."
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.starts_with("Error: this is a recoverable internal execution preflight"));
+        assert_eq!(
+            state.get_task(&task_id).await.unwrap().unwrap().status,
+            original_status
+        );
+        assert!(state
+            .get_pending_notifications(10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_blocker_uses_parent_terminal_notification_only() {
+        let (state, _goal_id, task_id) = setup_test_state().await;
+        let mut task = state.get_task(&task_id).await.unwrap().unwrap();
+        task.context = Some(json!({ "terminal_recovery": true }).to_string());
+        state.update_task(&task).await.unwrap();
+        let tool = ReportBlockerTool::new(task_id, state.clone());
+
+        tool.call(
+            &json!({
+                "reason": "Browser verification is unavailable",
+                "exact_need": "Use another verification path."
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(state
+            .get_pending_notifications(10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

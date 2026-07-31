@@ -22,6 +22,13 @@ enum DbMode {
     EncryptedOrUnknown,
 }
 
+#[cfg(feature = "encryption")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RepairableFtsIssues {
+    memory: bool,
+    history: bool,
+}
+
 /// Enforce encrypted-at-rest database operation by default.
 ///
 /// Behavior:
@@ -233,12 +240,28 @@ async fn verify_encrypted_database(
     let pool = connect_sqlite(db_path_str).await?;
     apply_encryption_key(&pool, key).await?;
 
-    let (check,): (String,) = sqlx::query_as("PRAGMA integrity_check")
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Encrypted database integrity check failed: {}", e))?;
-    if !check.eq_ignore_ascii_case("ok") {
-        anyhow::bail!("Encrypted database integrity check returned '{}'", check);
+    let mut issues = database_integrity_issues(&pool).await?;
+    if let Some(repairable) = classify_repairable_fts_issues(&issues) {
+        warn!(
+            issues = %issues.join("; "),
+            "Database integrity check found corruption limited to replaceable search indexes; rebuilding them"
+        );
+        if repairable.memory {
+            crate::state::sqlite::migrations::rebuild_memory_fts_projections(&pool).await?;
+        }
+        if repairable.history {
+            crate::state::sqlite::history_search::reset_fts_projection(&pool).await?;
+        }
+        issues = database_integrity_issues(&pool).await?;
+        if issues.is_empty() {
+            info!("Database search indexes rebuilt and integrity reverified");
+        }
+    }
+    if !issues.is_empty() {
+        anyhow::bail!(
+            "Encrypted database integrity check returned '{}'",
+            issues.join("; ")
+        );
     }
 
     if let Some(expected) = expected_counts {
@@ -248,6 +271,37 @@ async fn verify_encrypted_database(
 
     pool.close().await;
     Ok(())
+}
+
+#[cfg(feature = "encryption")]
+async fn database_integrity_issues(pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
+    let checks = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Encrypted database integrity check failed: {}", e))?;
+    Ok(checks
+        .into_iter()
+        .filter(|check| !check.eq_ignore_ascii_case("ok"))
+        .collect())
+}
+
+#[cfg(feature = "encryption")]
+fn classify_repairable_fts_issues(issues: &[String]) -> Option<RepairableFtsIssues> {
+    if issues.is_empty() {
+        return None;
+    }
+    let mut repairable = RepairableFtsIssues::default();
+    for issue in issues {
+        let normalized = issue.to_ascii_lowercase();
+        if normalized.contains("memory_claims_fts") || normalized.contains("memory_spans_fts") {
+            repairable.memory = true;
+        } else if normalized.contains("history_message_fts") {
+            repairable.history = true;
+        } else {
+            return None;
+        }
+    }
+    Some(repairable)
 }
 
 #[cfg(feature = "encryption")]
@@ -513,6 +567,29 @@ mod tests {
         assert!(content.contains("AIDAEMON_API_KEY=test"));
         assert!(content.contains("AIDAEMON_ENCRYPTION_KEY=newkey"));
         assert!(!content.contains("AIDAEMON_ENCRYPTION_KEY=old"));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn integrity_repair_is_limited_to_known_fts_projections() {
+        assert_eq!(
+            classify_repairable_fts_issues(&[
+                "malformed inverted index for FTS5 table main.memory_claims_fts".to_string(),
+                "malformed inverted index for FTS5 table main.history_message_fts".to_string(),
+            ]),
+            Some(RepairableFtsIssues {
+                memory: true,
+                history: true,
+            })
+        );
+        assert_eq!(
+            classify_repairable_fts_issues(&[
+                "malformed inverted index for FTS5 table main.memory_claims_fts".to_string(),
+                "row 7 missing from index facts_key".to_string(),
+            ]),
+            None
+        );
+        assert_eq!(classify_repairable_fts_issues(&[]), None);
     }
 
     #[cfg(feature = "encryption")]

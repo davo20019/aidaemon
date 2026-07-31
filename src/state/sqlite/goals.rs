@@ -1,5 +1,5 @@
 use super::*;
-use crate::traits::GoalNotificationStore;
+use crate::traits::{GoalNotificationStore, GoalStore, WorkCoordinationStore};
 
 #[async_trait]
 impl crate::traits::GoalStore for SqliteStateStore {
@@ -25,9 +25,11 @@ impl crate::traits::GoalStore for SqliteStateStore {
                 id, description, domain, goal_type, status, priority, conditions, context, resources,
                 budget_per_check, budget_daily, tokens_used_today, tokens_used_day, last_useful_action,
                 created_at, updated_at, completed_at, parent_goal_id, session_id, notified_at,
-                notification_attempts, dispatch_failures, progress_notes, source_episode_id, legacy_int_id
+                notification_attempts, dispatch_failures, progress_notes, source_episode_id, legacy_int_id,
+                project_id
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     COALESCE((SELECT project_id FROM session_work_projects WHERE session_id = ?), 'default'))",
         )
         .bind(&goal.id)
         .bind(&goal.description)
@@ -54,8 +56,25 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .bind(&progress_notes_json)
         .bind(goal.source_episode_id)
         .bind(goal.legacy_int_id)
+        .bind(&goal.session_id)
         .execute(&self.pool)
         .await?;
+
+        if goal.domain == "orchestration" {
+            sqlx::query(
+                "INSERT OR IGNORE INTO work_channel_links
+                    (goal_id, channel_session_id, created_at, updated_at)
+                 VALUES (?, ?, datetime('now'), datetime('now'))",
+            )
+            .bind(&goal.id)
+            .bind(&goal.session_id)
+            .execute(&self.pool)
+            .await?;
+
+            if goal.goal_type == "finite" && matches!(goal.status.as_str(), "active" | "pending") {
+                self.start_goal_run(&goal.id, "finite", None, None).await?;
+            }
+        }
         Ok(())
     }
 
@@ -465,13 +484,38 @@ impl crate::traits::GoalStore for SqliteStateStore {
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        let activated = result.rows_affected() > 0;
+        if activated {
+            if let Some(goal) = self.get_goal(goal_id).await? {
+                if goal.goal_type == "finite" && self.get_current_goal_run(goal_id).await?.is_none()
+                {
+                    self.start_goal_run(goal_id, "finite", None, None).await?;
+                }
+            }
+        }
+        Ok(activated)
     }
 }
 
 #[async_trait]
 impl crate::traits::TaskStore for SqliteStateStore {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
+        let goal_run = match self.get_current_goal_run(&task.goal_id).await? {
+            Some(run) => run,
+            None => {
+                let trigger_type = if self
+                    .get_goal(&task.goal_id)
+                    .await?
+                    .is_some_and(|goal| goal.goal_type == "finite")
+                {
+                    "finite"
+                } else {
+                    "manual"
+                };
+                self.start_goal_run(&task.goal_id, trigger_type, None, None)
+                    .await?
+            }
+        };
         let result = task
             .result
             .as_deref()
@@ -485,13 +529,14 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .as_deref()
             .filter(|value| !value.trim().is_empty());
         sqlx::query(
-            "INSERT INTO tasks (id, goal_id, description, status, priority, task_order,
+            "INSERT INTO tasks (id, goal_id, goal_run_id, description, status, priority, task_order,
              parallel_group, depends_on, agent_id, context, result, error, blocker,
-             idempotent, retry_count, max_retries, created_at, started_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             idempotent, retry_count, max_retries, created_at, started_at, completed_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(&task.goal_id)
+        .bind(&goal_run.id)
         .bind(&task.description)
         .bind(&task.status)
         .bind(&task.priority)
@@ -509,8 +554,25 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.created_at)
         .bind(&task.started_at)
         .bind(&task.completed_at)
+        .bind(&task.created_at)
         .execute(&self.pool)
         .await?;
+
+        let normalized = task.description.trim_start().to_ascii_lowercase();
+        if normalized.starts_with("execute scheduled goal:")
+            || normalized.starts_with("scheduled check:")
+            || normalized.starts_with("manual scheduled run:")
+        {
+            sqlx::query(
+                "UPDATE goal_runs SET root_task_id = COALESCE(root_task_id, ?),
+                                      updated_at = datetime('now')
+                 WHERE id = ?",
+            )
+            .bind(&task.id)
+            .bind(&goal_run.id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -561,12 +623,14 @@ impl crate::traits::TaskStore for SqliteStateStore {
             .blocker
             .as_deref()
             .filter(|value| !value.trim().is_empty());
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE tasks SET description = ?, status = ?, priority = ?, task_order = ?,
              parallel_group = ?, depends_on = ?, agent_id = ?, context = ?,
              result = ?, error = ?, blocker = ?, idempotent = ?,
-             retry_count = ?, max_retries = ?, started_at = ?, completed_at = ?
-             WHERE id = ?",
+             retry_count = ?, max_retries = ?, started_at = ?, completed_at = ?,
+             updated_at = datetime('now'), version = version + 1
+             WHERE id = ?
+               AND (status <> 'blocked' OR ? = 'blocked')",
         )
         .bind(&task.description)
         .bind(&task.status)
@@ -585,8 +649,25 @@ impl crate::traits::TaskStore for SqliteStateStore {
         .bind(&task.started_at)
         .bind(&task.completed_at)
         .bind(&task.id)
+        .bind(&task.status)
         .execute(&self.pool)
         .await?;
+
+        if updated.rows_affected() == 0 {
+            let current_status =
+                sqlx::query_scalar::<_, String>("SELECT status FROM tasks WHERE id = ?")
+                    .bind(&task.id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if current_status.as_deref() == Some("blocked") && task.status != "blocked" {
+                anyhow::bail!(
+                    "blocked task {} must be explicitly unblocked or retried before transitioning to {}",
+                    task.id,
+                    task.status
+                );
+            }
+            anyhow::bail!("task {} no longer exists", task.id);
+        }
 
         // A completed task counts as useful progress for its goal — refresh the
         // goal's freshness so the >30-day idle auto-skip never mis-fires on a
@@ -654,17 +735,10 @@ impl crate::traits::TaskStore for SqliteStateStore {
     }
 
     async fn claim_task(&self, task_id: &str, agent_id: &str) -> anyhow::Result<bool> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            "UPDATE tasks SET status = 'claimed', agent_id = ?, started_at = ?
-             WHERE id = ? AND status = 'pending'",
-        )
-        .bind(agent_id)
-        .bind(&now)
-        .bind(task_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(self
+            .claim_task_with_lease(task_id, agent_id, None, 180)
+            .await?
+            .is_some())
     }
 
     async fn log_task_activity(&self, activity: &TaskActivity) -> anyhow::Result<()> {
@@ -1140,11 +1214,12 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
         let health_json = serde_json::to_string(&state.health)?;
         sqlx::query(
             "INSERT INTO scheduled_run_state (
-                goal_id, root_task_id, effective_budget_per_check, tokens_used,
+                goal_id, root_task_id, goal_run_id, effective_budget_per_check, tokens_used,
                 budget_extensions_count, health_json, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES (?, ?, (SELECT goal_run_id FROM tasks WHERE id = ?), ?, ?, ?, ?, ?, ?)
              ON CONFLICT(goal_id) DO UPDATE SET
                 root_task_id = excluded.root_task_id,
+                goal_run_id = excluded.goal_run_id,
                 effective_budget_per_check = excluded.effective_budget_per_check,
                 tokens_used = excluded.tokens_used,
                 budget_extensions_count = excluded.budget_extensions_count,
@@ -1152,6 +1227,7 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
                 updated_at = excluded.updated_at",
         )
         .bind(&state.goal_id)
+        .bind(&state.root_task_id)
         .bind(&state.root_task_id)
         .bind(state.effective_budget_per_check)
         .bind(state.tokens_used)
@@ -1217,7 +1293,10 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              AND NOT EXISTS (
                  SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) AS dep
                  WHERE NOT EXISTS (
-                     SELECT 1 FROM tasks d WHERE d.id = dep.value AND d.status = 'completed'
+                     SELECT 1 FROM tasks d
+                     WHERE d.id = dep.value
+                       AND d.goal_run_id = t.goal_run_id
+                       AND d.status IN ('completed', 'skipped', 'superseded')
                  )
              )
              ORDER BY
@@ -1263,10 +1342,21 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              started_at, completed_at
              FROM tasks
              WHERE status IN ('running', 'claimed')
-             AND COALESCE(
-                   (SELECT MAX(ta.created_at) FROM task_activity ta WHERE ta.task_id = tasks.id),
-                   datetime(tasks.started_at)
-                 ) < datetime('now', '-' || ? || ' seconds')
+             AND (
+                EXISTS (
+                    SELECT 1 FROM task_attempts a
+                    WHERE a.id = tasks.current_attempt_id
+                      AND a.status IN ('claimed', 'running')
+                      AND datetime(a.lease_expires_at) <= datetime('now')
+                )
+                OR (
+                    tasks.current_attempt_id IS NULL
+                    AND COALESCE(
+                        (SELECT MAX(ta.created_at) FROM task_activity ta WHERE ta.task_id = tasks.id),
+                        datetime(tasks.started_at)
+                    ) < datetime('now', '-' || ? || ' seconds')
+                )
+             )
              ORDER BY started_at ASC",
         )
         .bind(timeout_secs)

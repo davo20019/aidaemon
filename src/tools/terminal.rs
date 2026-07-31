@@ -1795,32 +1795,14 @@ impl TerminalTool {
             })
             .await
         {
-            if let Some(store) = &self.event_store {
-                let emitter =
-                    crate::events::EventEmitter::new(store.clone(), session_id.to_string());
-                let _ = emitter
-                    .emit(
-                        EventType::ApprovalDenied,
-                        ApprovalDeniedData {
-                            command: command.to_string(),
-                            task_id: task_id.map(str::to_string),
-                        },
-                    )
-                    .await;
-            }
             return Err(anyhow::anyhow!("Approval channel closed: {}", send_err));
         }
 
-        // Sub-agents get a short timeout
-        // since they can't reliably receive user approval through the channel hub.
-        // They should use safe tools (edit_file, write_file) instead of risky terminal commands.
-        // `sub-` is the legacy prefix; new child sessions use `specialist:`.
-        let timeout_secs =
-            if session_id.starts_with("sub-") || session_id.starts_with("specialist:") {
-                10
-            } else {
-                300
-            };
+        // Child sessions are routed to their originating human conversation by
+        // ChannelHub, so they receive the same response window as root turns.
+        // A timeout remains fail-closed but is infrastructure state, not a user
+        // denial, and must be reported distinctly.
+        let timeout_secs = 300;
         let response: ApprovalResponse =
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx)
                 .await
@@ -1828,15 +1810,19 @@ impl TerminalTool {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) => {
                     tracing::warn!(command, "Approval response channel closed");
-                    ApprovalResponse::Deny
+                    return Err(anyhow::anyhow!(
+                        "approval response unavailable because the channel closed"
+                    ));
                 }
                 Err(_) => {
                     tracing::warn!(
                         command,
                         timeout_secs,
-                        "Approval request timed out, auto-denying"
+                        "Approval request timed out; action remains blocked"
                     );
-                    ApprovalResponse::Deny
+                    return Err(anyhow::anyhow!(
+                        "approval request timed out after {timeout_secs} seconds"
+                    ));
                 }
             };
 

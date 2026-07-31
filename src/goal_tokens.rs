@@ -95,6 +95,16 @@ impl GoalTokenRegistry {
         })
     }
 
+    /// Return whether this process already has a task lead running for the
+    /// goal. Heartbeat recovery uses this as an admission check so it cannot
+    /// retry or claim work out from under the active lead.
+    pub fn is_run_active(&self, goal_id: &str) -> bool {
+        self.active_runs
+            .lock()
+            .map(|runs| runs.contains(goal_id))
+            .unwrap_or(true)
+    }
+
     /// Register a new cancellation token for a goal. Returns the token.
     pub async fn register(&self, goal_id: &str) -> CancellationToken {
         let token = CancellationToken::new();
@@ -366,12 +376,14 @@ mod tests {
         let g1 = registry
             .try_acquire_run("goal-1")
             .expect("first acquire should succeed");
+        assert!(registry.is_run_active("goal-1"));
         assert!(
             registry.try_acquire_run("goal-1").is_none(),
             "second acquire should fail while guard is held"
         );
 
         drop(g1);
+        assert!(!registry.is_run_active("goal-1"));
         assert!(
             registry.try_acquire_run("goal-1").is_some(),
             "acquire should succeed again after guard drop"

@@ -105,6 +105,94 @@ mod tests {
         }
     }
 
+    /// Two distinct tools, asserted in the order they were actually called.
+    #[tokio::test]
+    async fn harness_eval_enforces_tool_order_end_to_end() {
+        let fixture = crate::harness_eval::fixture::parse_fixture_yaml(
+            r#"
+name: order_ok
+session_id: eval_order_ok_01
+user_text: Check system info then remember it
+mock_responses:
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: remember_fact
+      arguments: '{"category":"project","key":"host","value":"synthetic"}'
+  - text: Done.
+expect:
+  tools_in_order: [system_info, remember_fact]
+  tool_call_counts:
+    system_info: 1
+    remember_fact: 1
+"#,
+        )
+        .unwrap();
+        run_and_assert(&fixture).await.unwrap();
+    }
+
+    /// Same run, reversed expectation — must be rejected.
+    #[tokio::test]
+    async fn harness_eval_rejects_wrong_tool_order_end_to_end() {
+        let fixture = crate::harness_eval::fixture::parse_fixture_yaml(
+            r#"
+name: order_bad
+session_id: eval_order_bad_01
+user_text: Check system info then remember it
+mock_responses:
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: remember_fact
+      arguments: '{"category":"project","key":"host","value":"synthetic"}'
+  - text: Done.
+expect:
+  tools_in_order: [remember_fact, system_info]
+"#,
+        )
+        .unwrap();
+        let err = run_and_assert(&fixture)
+            .await
+            .expect_err("reversed tool order must fail");
+        assert!(
+            err.to_string().contains("tools_in_order"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The duplicate-side-effect guard: same tool invoked twice, count says once.
+    #[tokio::test]
+    async fn harness_eval_rejects_duplicate_tool_call_end_to_end() {
+        let fixture = crate::harness_eval::fixture::parse_fixture_yaml(
+            r#"
+name: duplicate_bad
+session_id: eval_duplicate_bad_01
+user_text: Check system info
+mock_responses:
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - tool_call:
+      name: system_info
+      arguments: "{}"
+  - text: Done.
+expect:
+  tool_call_counts:
+    system_info: 1
+"#,
+        )
+        .unwrap();
+        let err = run_and_assert(&fixture)
+            .await
+            .expect_err("duplicate tool call must fail");
+        assert!(
+            err.to_string().contains("tool_call_counts"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn harness_eval_basic_conversational_fixture() {
         let fixture = crate::harness_eval::fixture::parse_fixture_yaml(

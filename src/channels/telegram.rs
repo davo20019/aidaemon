@@ -174,6 +174,48 @@ fn telegram_commands() -> Vec<CommandDef> {
     cmds
 }
 
+fn interpret_terminal_bot_sync_response(
+    status: reqwest::StatusCode,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (Result<(), String>, bool) {
+    let retryable_status =
+        status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let content_type = content_type.unwrap_or("unknown");
+            return (
+                Err(format!(
+                    "terminal bot sync returned non-JSON response (status {}, content-type {}, {} bytes): {}",
+                    status,
+                    content_type,
+                    body.len(),
+                    error
+                )),
+                retryable_status || status.is_success(),
+            );
+        }
+    };
+    if status.is_success() && parsed.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+        return (Ok(()), false);
+    }
+
+    let message = parsed
+        .get("message")
+        .and_then(|value| value.as_str())
+        .or_else(|| parsed.get("error").and_then(|value| value.as_str()))
+        .unwrap_or("unknown error");
+    (
+        Err(format!(
+            "terminal bot sync failed (status {}): {}",
+            status,
+            crate::tools::sanitize::redact_secrets(message)
+        )),
+        retryable_status,
+    )
+}
+
 impl TelegramChannel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -342,60 +384,86 @@ impl TelegramChannel {
         label: Option<&str>,
     ) -> Result<(), String> {
         let url = terminal_tenant_bot_bootstrap_url(&self.terminal_web_app_url)?;
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| format!("failed to read system clock: {}", err))?
-            .as_secs() as i64;
-        let nonce = random_terminal_bootstrap_nonce(16);
-        let sig = sign_terminal_tenant_bot_bootstrap_proof(bot_token, user_id, ts, &nonce)?;
-        let mut payload = serde_json::json!({
-            "user_id": user_id,
-            "bot_token": bot_token,
-            "ts": ts,
-            "nonce": nonce,
-            "sig": sig,
-        });
-        if let Some(label) = label
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            if let Some(map) = payload.as_object_mut() {
-                map.insert(
-                    "label".to_string(),
-                    serde_json::Value::String(label.to_string()),
-                );
-            }
-        }
-
         let client = reqwest::Client::builder()
             .user_agent("aidaemon-terminal-bot-bootstrap/1.0")
             .timeout(Duration::from_secs(8))
             .build()
             .map_err(|err| format!("failed to build HTTP client: {}", err))?;
-        let response = client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| format!("terminal bot sync request failed: {}", err))?;
-        let status = response.status();
-        let parsed: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|err| format!("terminal bot sync returned invalid JSON: {}", err))?;
-        if status.is_success() && parsed.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-            return Ok(());
-        }
+        let mut last_error = "terminal bot sync did not run".to_string();
+        for attempt in 0..3_u64 {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|err| format!("failed to read system clock: {}", err))?
+                .as_secs() as i64;
+            let nonce = random_terminal_bootstrap_nonce(16);
+            let sig = sign_terminal_tenant_bot_bootstrap_proof(bot_token, user_id, ts, &nonce)?;
+            let mut payload = serde_json::json!({
+                "user_id": user_id,
+                "bot_token": bot_token,
+                "ts": ts,
+                "nonce": nonce,
+                "sig": sig,
+            });
+            if let Some(label) = label
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(map) = payload.as_object_mut() {
+                    map.insert(
+                        "label".to_string(),
+                        serde_json::Value::String(label.to_string()),
+                    );
+                }
+            }
 
-        let message = parsed
-            .get("message")
-            .and_then(|value| value.as_str())
-            .or_else(|| parsed.get("error").and_then(|value| value.as_str()))
-            .unwrap_or("unknown error");
-        Err(format!(
-            "terminal bot sync failed (status {}): {}",
-            status, message
-        ))
+            let response = match client.post(url.clone()).json(&payload).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = format!("terminal bot sync request failed: {error}");
+                    if attempt == 2 {
+                        return Err(last_error);
+                    }
+                    let jitter = rand::random::<u64>() % 150;
+                    tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
+                    continue;
+                }
+            };
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(error) => {
+                    last_error = format!(
+                        "terminal bot sync response body failed (status {status}): {error}"
+                    );
+                    if attempt == 2 {
+                        return Err(last_error);
+                    }
+                    let jitter = rand::random::<u64>() % 150;
+                    tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
+                    continue;
+                }
+            };
+            let (result, retryable) = interpret_terminal_bot_sync_response(
+                status,
+                content_type.as_deref(),
+                body.as_ref(),
+            );
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
+            }
+            if !retryable || attempt == 2 {
+                return Err(last_error);
+            }
+            let jitter = rand::random::<u64>() % 150;
+            tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
+        }
+        Err(last_error)
     }
 
     async fn sync_terminal_tenant_bot_token_for_allowed_users(&self, label: Option<&str>) {
@@ -5148,7 +5216,9 @@ impl Channel for TelegramChannel {
                 // Remove pending approval since we couldn't ask
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                return Ok(ApprovalResponse::Deny);
+                return Err(anyhow::anyhow!(
+                    "Telegram approval request could not be delivered: {e}"
+                ));
             }
         }
 
@@ -5158,13 +5228,14 @@ impl Channel for TelegramChannel {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 warn!(approval_id = %short_id, "Approval channel closed");
-                Ok(ApprovalResponse::Deny)
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!("Telegram approval response channel closed"))
             }
             Err(_) => {
                 warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!("Telegram approval request timed out"))
             }
         }
     }
@@ -5213,7 +5284,9 @@ impl Channel for TelegramChannel {
                 warn!("Failed to send goal confirmation: {}", e);
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                return Ok(false);
+                return Err(anyhow::anyhow!(
+                    "Telegram goal confirmation could not be delivered: {e}"
+                ));
             }
         }
 
@@ -5228,13 +5301,16 @@ impl Channel for TelegramChannel {
             )),
             Ok(Err(_)) => {
                 warn!(approval_id = %short_id, "Goal confirmation channel closed");
-                Ok(false)
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!(
+                    "Telegram goal confirmation response channel closed"
+                ))
             }
             Err(_) => {
                 warn!(approval_id = %short_id, "Goal confirmation timed out after 30 minutes");
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                Ok(false)
+                Err(anyhow::anyhow!("Telegram goal confirmation timed out"))
             }
         }
     }
@@ -5804,6 +5880,41 @@ async fn poll_health_watchdog(error_count: Arc<AtomicU64>, bot_username: String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_bot_sync_response_accepts_success_json() {
+        let (result, retryable) = interpret_terminal_bot_sync_response(
+            reqwest::StatusCode::OK,
+            Some("application/json"),
+            br#"{"ok":true}"#,
+        );
+        assert!(result.is_ok());
+        assert!(!retryable);
+    }
+
+    #[test]
+    fn terminal_bot_sync_response_classifies_transient_non_json() {
+        let (result, retryable) = interpret_terminal_bot_sync_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            Some("text/html"),
+            b"upstream unavailable",
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("status 502 Bad Gateway"));
+        assert!(error.contains("content-type text/html"));
+        assert!(retryable);
+    }
+
+    #[test]
+    fn terminal_bot_sync_response_does_not_retry_auth_rejection() {
+        let (result, retryable) = interpret_terminal_bot_sync_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            Some("application/json"),
+            br#"{"ok":false,"error":"invalid proof"}"#,
+        );
+        assert!(result.unwrap_err().contains("invalid proof"));
+        assert!(!retryable);
+    }
 
     #[test]
     fn poll_health_flags_wedge_after_sustained_errors() {

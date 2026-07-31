@@ -1440,7 +1440,12 @@ impl MemoryManager {
 2. Main topics discussed (list of keywords)
 3. Emotional tone (one of: neutral, productive, frustrated, exploratory, celebratory)
 4. Outcome (one of: resolved, ongoing, abandoned, learning)
-5. Any goals mentioned or worked toward
+5. Possible enduring personal goals the user explicitly stated for themselves
+
+For goals_mentioned, return an empty list for ordinary one-off requests, implementation
+steps, delegated work, quoted examples, prohibitions, review checklists, or specialist/system
+instructions. Only include a goal when the user's own words describe an intention that should
+remain relevant beyond this conversation.
 
 Respond with ONLY valid JSON:
 {
@@ -1516,9 +1521,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         source_episode_id: i64,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        // Check for similar existing goal (including abandoned/completed to prevent resurrection)
+        // Check only personal goal observations. Background memory analysis must
+        // never mutate or satisfy executable orchestration goals.
         let existing = sqlx::query(
-            "SELECT id, description, status FROM goals WHERE status IN ('active', 'abandoned', 'completed')"
+            "SELECT id, description, status FROM goals
+             WHERE domain = 'personal'
+               AND status IN ('observed', 'active', 'abandoned', 'completed')",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1540,12 +1548,12 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             let union = goal_words.union(&desc_words).count();
 
             if union > 0 && (intersection as f32 / union as f32) > 0.5 {
-                // Similar goal found — if abandoned or completed, respect that and skip
-                if status != "active" {
+                // Similar terminal goals are never resurrected by background analysis.
+                if matches!(status.as_str(), "abandoned" | "completed") {
                     return Ok(());
                 }
 
-                // Active goal — add progress note
+                // Existing observation or explicit personal goal — attach provenance.
                 let now = Utc::now().to_rfc3339();
                 let note = format!("Referenced in episode {}", source_episode_id);
 
@@ -1571,12 +1579,15 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
             }
         }
 
-        // No similar goal - create new
+        // Model-extracted mentions are observations, not active commitments.
+        // Explicit personal goals are created through the normal goal API.
         let now = Utc::now().to_rfc3339();
         let goal_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO goals (id, description, status, priority, source_episode_id, session_id, created_at, updated_at)
-             VALUES (?, ?, 'active', 'medium', ?, ?, ?, ?)"
+            "INSERT INTO goals
+                (id, description, domain, goal_type, status, priority,
+                 source_episode_id, session_id, created_at, updated_at)
+             VALUES (?, ?, 'personal', 'finite', 'observed', 'medium', ?, ?, ?, ?)",
         )
         .bind(&goal_id)
         .bind(goal_text)
@@ -1590,7 +1601,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         info!(
             goal = goal_text,
             episode_id = source_episode_id,
-            "Created new goal"
+            "Recorded possible personal goal from episode"
         );
         Ok(())
     }
@@ -2315,16 +2326,49 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
 
 #[derive(Debug, Deserialize)]
 struct ExtractedFact {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     category: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     key: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     value: String,
     privacy: Option<String>,
     /// For "people" category: the person's name
     person_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_graph")]
     graph: crate::traits::ExtractedMemoryGraph,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_personal_memory")]
     personal_memory: Option<crate::traits::PersonalMemoryWrite>,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_lossy_graph<'de, D>(
+    deserializer: D,
+) -> Result<crate::traits::ExtractedMemoryGraph, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+fn deserialize_lossy_personal_memory<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::traits::PersonalMemoryWrite>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// Derive a channel_id from a session_id string.
@@ -2334,18 +2378,110 @@ struct ExtractedFact {
 ///   - "discord:ch:ID" or "discord:dm:ID"
 #[derive(Debug, Deserialize)]
 struct SessionAnalysis {
+    #[serde(
+        default = "default_session_summary",
+        deserialize_with = "deserialize_session_summary"
+    )]
     summary: String,
+    #[serde(default, deserialize_with = "deserialize_lossy_string_vec")]
     topics: Vec<String>,
+    #[serde(
+        default = "default_emotional_tone",
+        deserialize_with = "deserialize_emotional_tone"
+    )]
     emotional_tone: String,
+    #[serde(
+        default = "default_session_outcome",
+        deserialize_with = "deserialize_session_outcome"
+    )]
     outcome: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string_vec")]
     goals_mentioned: Vec<String>,
-    #[serde(default = "default_emotional_intensity")]
+    #[serde(
+        default = "default_emotional_intensity",
+        deserialize_with = "deserialize_emotional_intensity"
+    )]
     emotional_intensity: f32,
+}
+
+fn default_session_summary() -> String {
+    "Session with various tasks".to_string()
+}
+
+fn default_emotional_tone() -> String {
+    "neutral".to_string()
+}
+
+fn default_session_outcome() -> String {
+    "ongoing".to_string()
 }
 
 fn default_emotional_intensity() -> f32 {
     0.3
+}
+
+fn deserialize_string_value<'de, D>(deserializer: D, fallback: &str) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string())
+}
+
+fn deserialize_session_summary<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_string_value(deserializer, "Session with various tasks")
+}
+
+fn deserialize_emotional_tone<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_string_value(deserializer, "neutral")
+}
+
+fn deserialize_session_outcome<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_string_value(deserializer, "ongoing")
+}
+
+fn deserialize_lossy_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::String(value) => vec![serde_json::Value::String(value)],
+        _ => return Ok(Vec::new()),
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+fn deserialize_emotional_intensity<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let intensity = value
+        .as_f64()
+        .map(|value| value as f32)
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f32>().ok()))
+        .unwrap_or_else(default_emotional_intensity);
+    Ok(intensity.clamp(0.0, 1.0))
 }
 
 fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>> {
@@ -2361,18 +2497,39 @@ fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedFact>
         trimmed
     };
 
-    let facts: Vec<ExtractedFact> = serde_json::from_str(json_str)?;
+    let raw_facts: Vec<serde_json::Value> = serde_json::from_str(json_str)?;
+    let mut malformed = 0_usize;
+    let mut facts = Vec::with_capacity(raw_facts.len());
+    for (index, raw_fact) in raw_facts.into_iter().enumerate() {
+        match serde_json::from_value::<ExtractedFact>(raw_fact) {
+            Ok(fact) => facts.push(fact),
+            Err(error) => {
+                malformed += 1;
+                warn!(
+                    fact_index = index,
+                    %error,
+                    "Skipping one malformed memory fact from consolidation response"
+                );
+            }
+        }
+    }
+
+    if facts.is_empty() && malformed > 0 {
+        anyhow::bail!("all {malformed} memory facts were malformed");
+    }
 
     // Filter out facts with empty/meaningless values to prevent hallucination
     let facts = facts
         .into_iter()
         .filter(|f| {
-            let v = f.value.trim();
-            !v.is_empty()
-                && !v.eq_ignore_ascii_case("none")
-                && !v.eq_ignore_ascii_case("null")
-                && !v.eq_ignore_ascii_case("n/a")
-                && !v.eq_ignore_ascii_case("unknown")
+            [&f.category, &f.key, &f.value].into_iter().all(|field| {
+                let field = field.trim();
+                !field.is_empty()
+                    && !field.eq_ignore_ascii_case("none")
+                    && !field.eq_ignore_ascii_case("null")
+                    && !field.eq_ignore_ascii_case("n/a")
+                    && !field.eq_ignore_ascii_case("unknown")
+            })
         })
         .collect();
     Ok(facts)
@@ -2392,6 +2549,62 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn consolidation_parser_isolates_bad_items_and_nullable_fields() {
+        let response = r#"```json
+        [
+          {
+            "category": "preferences",
+            "key": "editor",
+            "value": "Neovim",
+            "privacy": null,
+            "graph": {
+              "entities": [{"local_id":"editor","name":null,"entity_type":"tool"}]
+            }
+          },
+          {"category": null, "key": "placeholder", "value": null},
+          42,
+          {"category": "profile", "key": "timezone", "value": "America/New_York"}
+        ]
+        ```"#;
+
+        let facts = parse_consolidation_response(response).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].key, "editor");
+        assert!(facts[0].graph.entities.is_empty());
+        assert_eq!(facts[1].key, "timezone");
+    }
+
+    #[test]
+    fn consolidation_parser_retries_when_every_item_is_structurally_bad() {
+        let error = parse_consolidation_response(r#"[{"category": 7}, false]"#)
+            .expect_err("an entirely malformed batch must be retried");
+        assert!(error
+            .to_string()
+            .contains("all 2 memory facts were malformed"));
+    }
+
+    #[test]
+    fn session_analysis_preserves_valid_fields_when_siblings_are_null_or_malformed() {
+        let analysis: SessionAnalysis = serde_json::from_str(
+            r#"{
+                "summary": {"unexpected":"object"},
+                "topics": ["deployments", null, {"bad":true}, "reliability"],
+                "emotional_tone": null,
+                "outcome": "",
+                "goals_mentioned": "Improve release reliability",
+                "emotional_intensity": "1.7"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(analysis.summary, "Session with various tasks");
+        assert_eq!(analysis.topics, ["deployments", "reliability"]);
+        assert_eq!(analysis.emotional_tone, "neutral");
+        assert_eq!(analysis.outcome, "ongoing");
+        assert_eq!(analysis.goals_mentioned, ["Improve release reliability"]);
+        assert_eq!(analysis.emotional_intensity, 1.0);
+    }
 
     #[tokio::test]
     async fn test_consolidation_skips_public_external_sessions() {

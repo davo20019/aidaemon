@@ -18,6 +18,12 @@ struct RawFrontmatter {
     tool_budget: Option<usize>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    #[serde(default)]
+    workspace_policy: Option<String>,
+    #[serde(default)]
+    memory_scope: Option<String>,
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
@@ -44,6 +50,16 @@ pub fn parse_specialist(
     if body_trimmed.is_empty() {
         anyhow::bail!("specialist body is empty");
     }
+    if raw.max_concurrency == Some(0) {
+        anyhow::bail!("max_concurrency must be positive");
+    }
+    if raw
+        .workspace_policy
+        .as_deref()
+        .is_some_and(|policy| !matches!(policy, "shared" | "isolated" | "worktree"))
+    {
+        anyhow::bail!("workspace_policy must be shared, isolated, or worktree");
+    }
 
     if !raw.extra.is_empty() {
         for key in raw.extra.keys() {
@@ -60,6 +76,9 @@ pub fn parse_specialist(
         max_iterations: raw.max_iterations,
         tool_budget: raw.tool_budget,
         timeout_secs: raw.timeout_secs,
+        max_concurrency: raw.max_concurrency,
+        workspace_policy: raw.workspace_policy,
+        memory_scope: raw.memory_scope,
         // Default to Bundled; the registry loader rewrites this to
         // `UserOverride(path)` when the file came from the user override dir.
         source: SpecialistSource::Bundled,
@@ -105,6 +124,9 @@ mod tests {
         assert_eq!(def.max_iterations, None);
         assert_eq!(def.tool_budget, None);
         assert_eq!(def.timeout_secs, None);
+        assert_eq!(def.max_concurrency, None);
+        assert_eq!(def.workspace_policy, None);
+        assert_eq!(def.memory_scope, None);
     }
 
     #[test]

@@ -19,6 +19,8 @@ use crate::goal_tokens::GoalTokenRegistry;
 use crate::traits::{GoalSchedule, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
+const TASK_ESCALATION_SETTLE_SECS: i64 = 8;
+
 fn is_scheduled_task_description(text: &str) -> bool {
     let trimmed = text.trim_start().to_ascii_lowercase();
     trimmed.starts_with("execute scheduled goal:")
@@ -138,6 +140,11 @@ fn parse_datetime_flexible(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         })
 }
 
+fn task_escalation_has_settled(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    parse_datetime_flexible(created_at)
+        .is_none_or(|created_at| (now - created_at).num_seconds() >= TASK_ESCALATION_SETTLE_SECS)
+}
+
 fn task_inactivity_secs(
     last_activity: Option<&str>,
     started_at: &str,
@@ -150,6 +157,13 @@ fn task_inactivity_secs(
         Some(ts) => (now - ts).num_seconds().max(0),
         None => 0,
     }
+}
+
+fn task_is_blocked_by_terminal_dependency(task: &crate::traits::Task) -> bool {
+    task.status == "blocked"
+        && task.blocker.as_deref().is_some_and(|blocker| {
+            blocker.starts_with("Dependency ") && blocker.contains(" ended with status ")
+        })
 }
 
 /// Runtime snapshot of a heartbeat background job.
@@ -386,6 +400,19 @@ impl HeartbeatCoordinator {
     async fn startup_recovery(&self) {
         info!("Running startup recovery");
 
+        match self.state.recover_expired_task_attempts().await {
+            Ok(tasks) if !tasks.is_empty() => {
+                info!(
+                    count = tasks.len(),
+                    "Startup recovery processed expired execution leases"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "Failed to recover expired execution leases");
+            }
+        }
+
         // Mark any tasks stuck in running/claimed as interrupted,
         // then auto-retry idempotent ones ONLY if their parent goal is still active.
         // We do NOT aggressively fail goals here — the progress-based circuit breaker
@@ -441,7 +468,12 @@ impl HeartbeatCoordinator {
                         let mut retry_task = task.clone();
                         retry_task.status = "pending".to_string();
                         retry_task.retry_count += 1;
+                        retry_task.result = None;
+                        retry_task.error = None;
+                        retry_task.blocker = None;
+                        retry_task.agent_id = None;
                         retry_task.started_at = None;
+                        retry_task.completed_at = None;
                         if let Err(e) = self.state.update_task(&retry_task).await {
                             error!(task_id = %task.id, error = %e, "Failed to auto-retry task");
                         } else {
@@ -686,6 +718,19 @@ impl HeartbeatCoordinator {
 
     /// Detect tasks that have been running/claimed longer than the timeout and mark them interrupted.
     async fn detect_stuck_tasks(&self) {
+        match self.state.recover_expired_task_attempts().await {
+            Ok(tasks) if !tasks.is_empty() => {
+                warn!(
+                    count = tasks.len(),
+                    "Recovered tasks whose execution leases expired"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "Failed to recover expired execution leases");
+                return;
+            }
+        }
         let stuck = match self
             .state
             .get_stuck_tasks(self.task_inactivity_timeout_secs)
@@ -808,6 +853,17 @@ impl HeartbeatCoordinator {
                 continue;
             }
 
+            // The active task lead owns retries for its run. Promoting one of
+            // its freshly-failed tasks back to pending here can race the lead's
+            // own completion accounting and manufacture an orphaned run.
+            if self
+                .goal_token_registry
+                .as_ref()
+                .is_some_and(|registry| registry.is_run_active(&goal.id))
+            {
+                continue;
+            }
+
             let tasks = match self.state.get_tasks_for_goal(&goal.id).await {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -846,7 +902,9 @@ impl HeartbeatCoordinator {
                     let mut retry_task = task.clone();
                     retry_task.status = "pending".to_string();
                     retry_task.retry_count += 1;
+                    retry_task.result = None;
                     retry_task.error = None;
+                    retry_task.blocker = None;
                     retry_task.agent_id = None;
                     retry_task.started_at = None;
                     retry_task.completed_at = None;
@@ -876,7 +934,13 @@ impl HeartbeatCoordinator {
                             "status_update",
                             &msg,
                         );
-                        let _ = self.state.enqueue_notification(&entry).await;
+                        if let Err(error) = self.state.enqueue_notification(&entry).await {
+                            warn!(
+                                task_id = %task.id,
+                                %error,
+                                "Failed to enqueue task retry notification"
+                            );
+                        }
                     }
                 }
             }
@@ -925,6 +989,17 @@ impl HeartbeatCoordinator {
 
             // Only care about active goals
             if goal.status != "active" {
+                continue;
+            }
+
+            // A live task lead is authoritative for this goal even during a
+            // brief interval where none of its task rows are marked running.
+            // Do not let orphan recovery claim a pending task during that gap.
+            if self
+                .goal_token_registry
+                .as_ref()
+                .is_some_and(|registry| registry.is_run_active(goal_id))
+            {
                 continue;
             }
 
@@ -1127,18 +1202,18 @@ impl HeartbeatCoordinator {
             let first_task = eligible_tasks[0];
             let agent_id = format!("heartbeat-dispatch-{}", uuid::Uuid::new_v4());
 
-            let claimed = match self.state.claim_task(&first_task.id, &agent_id).await {
-                Ok(c) => c,
+            let attempt = match self
+                .state
+                .claim_task_with_lease(&first_task.id, &agent_id, Some("profile-task-lead"), 180)
+                .await
+            {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => continue,
                 Err(e) => {
                     error!(task_id = %first_task.id, error = %e, "Failed to claim task for dispatch");
                     continue;
                 }
             };
-
-            if !claimed {
-                // Another tick or agent already claimed it — skip
-                continue;
-            }
 
             info!(
                 goal_id = %goal_id,
@@ -1197,11 +1272,22 @@ impl HeartbeatCoordinator {
                 pending_count = eligible_tasks.len(),
                 "No agent available for dispatch — reverting claim and notifying user"
             );
-            let mut reverted = first_task.clone();
-            reverted.status = "pending".to_string();
-            reverted.agent_id = None;
-            reverted.started_at = None;
-            let _ = self.state.update_task(&reverted).await;
+            let patch = crate::traits::TaskAttemptPatch {
+                status: "cancelled".to_string(),
+                error: Some("No agent was available for dispatch.".to_string()),
+                ..Default::default()
+            };
+            let released = self
+                .state
+                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                .await
+                .unwrap_or(false);
+            if released {
+                let _ = self
+                    .state
+                    .retry_work_task(&first_task.id, "heartbeat", None)
+                    .await;
+            }
 
             let msg = format!(
                 "Goal stalled: \"{}\" has {} pending task(s) but no active agent. \
@@ -1211,7 +1297,13 @@ impl HeartbeatCoordinator {
             );
             let entry =
                 crate::traits::NotificationEntry::new(goal_id, &goal.session_id, "stalled", &msg);
-            let _ = self.state.enqueue_notification(&entry).await;
+            if let Err(error) = self.state.enqueue_notification(&entry).await {
+                error!(
+                    goal_id,
+                    %error,
+                    "Failed to enqueue stalled-goal notification"
+                );
+            }
         }
     }
 
@@ -1302,62 +1394,102 @@ impl HeartbeatCoordinator {
         for goal in &goals {
             let (notification_type, msg) = match goal.status.as_str() {
                 "completed" => {
-                    // Build notification from actual task results, not goal description
-                    let completed_tasks = self
+                    // Prefer the latest run's task state. Historical failed runs
+                    // remain valuable audit data but cannot invalidate a later,
+                    // successfully tracked recovery run.
+                    let latest_run = self
                         .state
-                        .get_tasks_for_goal(&goal.id)
+                        .get_goal_runs(&goal.id)
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .next();
+                    let completed_tasks = match latest_run {
+                        Some(run) => self
+                            .state
+                            .get_tasks_for_goal_run(&run.id)
+                            .await
+                            .unwrap_or_default(),
+                        None => self
+                            .state
+                            .get_tasks_for_goal(&goal.id)
+                            .await
+                            .unwrap_or_default(),
+                    };
                     let fallback_summary: String = goal.description.chars().take(300).collect();
                     let task_results_summary =
                         build_goal_task_results_summary(&completed_tasks, &fallback_summary);
 
-                    // Check for partial success metadata in context
-                    let partial_info = goal
-                        .context
-                        .as_deref()
-                        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
-                        .filter(|v| {
-                            v.get("partial_success")
-                                .and_then(|p| p.as_bool())
-                                .unwrap_or(false)
-                        });
-
-                    if let Some(summary) = partial_info {
-                        let completed = summary
-                            .get("completed")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let failed = summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let blocked = summary.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let total = summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if !completed_tasks.is_empty()
+                        && !crate::tools::manage_goal_tasks::tasks_satisfy_goal_completion(
+                            &completed_tasks,
+                        )
+                    {
+                        let mut corrected = goal.clone();
+                        corrected.status = "failed".to_string();
+                        corrected.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        corrected.updated_at = chrono::Utc::now().to_rfc3339();
+                        if let Err(error) = self.state.update_goal(&corrected).await {
+                            error!(goal_id = %goal.id, %error, "Failed to repair inconsistent completed goal state");
+                        }
                         (
-                            "completed",
+                            "failed",
                             format!(
-                                "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
-                                completed,
-                                total,
-                                failed,
-                                blocked,
+                                "Goal incomplete: required tasks did not finish successfully.\n\n{}",
                                 task_results_summary.chars().take(4000).collect::<String>()
                             ),
                         )
-                    } else if crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished(&task_results_summary) {
-                        // The summary contains verification-blocked or incomplete-work
-                        // language (e.g., "I'm blocked from safely finishing").
-                        // Don't present this as "Goal completed:" — the user already
-                        // received the actual result via the agent's direct reply.
-                        // Suppress the misleading notification entirely.
-                        continue;
                     } else {
-                        (
-                            "completed",
-                            format!(
-                                "{}\n\n{}",
-                                goal_completion_header(&completed_tasks),
-                                task_results_summary.chars().take(4000).collect::<String>()
-                            ),
-                        )
+                        // Check for partial success metadata in context
+                        let partial_info = goal
+                            .context
+                            .as_deref()
+                            .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok())
+                            .filter(|v| {
+                                v.get("partial_success")
+                                    .and_then(|p| p.as_bool())
+                                    .unwrap_or(false)
+                            });
+
+                        if let Some(summary) = partial_info {
+                            let completed = summary
+                                .get("completed")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let failed =
+                                summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let blocked = summary
+                                .get("blocked")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let total =
+                                summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                            (
+                                "failed",
+                                format!(
+                                    "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
+                                    completed,
+                                    total,
+                                    failed,
+                                    blocked,
+                                    task_results_summary.chars().take(4000).collect::<String>()
+                                ),
+                            )
+                        } else if crate::tools::manage_goal_tasks::goal_completion_summary_indicates_not_finished(&task_results_summary) {
+                            // The summary contains verification-blocked or incomplete-work
+                            // language. Suppress a duplicate terminal notice; structural task
+                            // state above remains the authoritative completion gate.
+                            continue;
+                        } else {
+                            (
+                                "completed",
+                                format!(
+                                    "{}\n\n{}",
+                                    goal_completion_header(&completed_tasks),
+                                    task_results_summary.chars().take(4000).collect::<String>()
+                                ),
+                            )
+                        }
                     }
                 }
                 "failed" => (
@@ -1377,14 +1509,8 @@ impl HeartbeatCoordinator {
                 &msg,
             );
 
-            if let Err(e) = self.state.enqueue_notification(&entry).await {
-                error!(goal_id = %goal.id, error = %e, "Failed to enqueue notification");
-                continue;
-            }
-
-            // Mark goal as notified so we don't enqueue again
-            if let Err(e) = self.state.mark_goal_notified(&goal.id).await {
-                error!(goal_id = %goal.id, error = %e, "Failed to mark goal notified after enqueue");
+            if let Err(e) = self.state.enqueue_goal_notification(&entry).await {
+                error!(goal_id = %goal.id, error = %e, "Failed to atomically enqueue notification");
             }
         }
     }
@@ -1400,6 +1526,42 @@ impl HeartbeatCoordinator {
         };
 
         for entry in &pending {
+            if entry.notification_type == "escalation" {
+                if let Some(task_id) = entry.task_id.as_deref() {
+                    // Give the coordinator a brief chance to reconcile the
+                    // executor handoff, then verify the linked task is still
+                    // blocked. This prevents a stale critical notification
+                    // from racing a same-turn unblock or completion.
+                    if !task_escalation_has_settled(&entry.created_at, Utc::now()) {
+                        continue;
+                    }
+                    match self.state.get_task(task_id).await {
+                        Ok(Some(task)) if task.status == "blocked" => {}
+                        Ok(_) => {
+                            if let Err(error) =
+                                self.state.mark_notification_delivered(&entry.id).await
+                            {
+                                warn!(
+                                    notification_id = %entry.id,
+                                    task_id,
+                                    error = %error,
+                                    "Failed to close stale task escalation"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(
+                                notification_id = %entry.id,
+                                task_id,
+                                error = %error,
+                                "Deferred task escalation because task state could not be verified"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
                 let message = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
                 // A channel adapter is external I/O. It must never be allowed to
@@ -1524,12 +1686,21 @@ impl HeartbeatCoordinator {
                             "evergreen_alert",
                             &msg,
                         );
-                        let _ = self.state.enqueue_notification(&entry).await;
-                        let _ = self.state.mark_goal_notified(&goal.id).await;
-                        // Keep the in-memory copy consistent so the later
-                        // update_goal (after task creation) doesn't clobber
-                        // notified_at back to NULL and re-alert next tick.
-                        goal.notified_at = Some(now_ts.clone());
+                        match self.state.enqueue_goal_notification(&entry).await {
+                            Ok(_) => {
+                                // Keep the in-memory copy consistent so the later
+                                // update_goal (after task creation) doesn't clobber
+                                // notified_at back to NULL and re-alert next tick.
+                                goal.notified_at = Some(now_ts.clone());
+                            }
+                            Err(error) => {
+                                warn!(
+                                    goal_id = %goal.id,
+                                    %error,
+                                    "Failed to atomically enqueue idle-goal alert"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1542,7 +1713,10 @@ impl HeartbeatCoordinator {
             .unwrap_or_default();
         let open_count = tasks
             .iter()
-            .filter(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"))
+            .filter(|task| {
+                matches!(task.status.as_str(), "pending" | "claimed" | "running")
+                    || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
+            })
             .count();
 
         let fire_policy = schedule.fire_policy.as_str();
@@ -1596,7 +1770,13 @@ impl HeartbeatCoordinator {
                 "token_alert",
                 &msg,
             );
-            let _ = self.state.enqueue_notification(&entry).await;
+            if let Err(error) = self.state.enqueue_notification(&entry).await {
+                error!(
+                    goal_id = %goal.id,
+                    %error,
+                    "Failed to enqueue daily-budget notification"
+                );
+            }
             return Ok(());
         }
         if !daily_budget_has_run_capacity(
@@ -1638,7 +1818,13 @@ impl HeartbeatCoordinator {
                 "token_alert",
                 &msg,
             );
-            let _ = self.state.enqueue_notification(&entry).await;
+            if let Err(error) = self.state.enqueue_notification(&entry).await {
+                error!(
+                    goal_id = %goal.id,
+                    %error,
+                    "Failed to enqueue remaining-budget notification"
+                );
+            }
             info!(
                 goal_id = %goal.id,
                 remaining,
@@ -1669,6 +1855,54 @@ impl HeartbeatCoordinator {
             return Ok(());
         }
 
+        let run_root_task_id = uuid::Uuid::new_v4().to_string();
+        if coalesce {
+            if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
+                let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
+                if !run_tasks.is_empty() {
+                    let active_or_human_blocked = run_tasks.iter().any(|task| {
+                        matches!(task.status.as_str(), "pending" | "claimed" | "running")
+                            || (task.status == "blocked"
+                                && !task_is_blocked_by_terminal_dependency(task))
+                    });
+                    if active_or_human_blocked {
+                        warn!(
+                            goal_id = %goal.id,
+                            run_id = %open_run.id,
+                            "Skipped schedule fire because the previous goal run is still open"
+                        );
+                        return Ok(());
+                    }
+                    let status =
+                        if run_tasks.iter().any(|task| {
+                            matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
+                        }) || run_tasks.iter().any(task_is_blocked_by_terminal_dependency)
+                        {
+                            "failed"
+                        } else {
+                            "completed"
+                        };
+                    let _ = self
+                        .state
+                        .finish_goal_run(
+                            &open_run.id,
+                            status,
+                            Some("Closed before the next scheduled firing."),
+                        )
+                        .await?;
+                }
+            }
+        }
+        let goal_run = self
+            .state
+            .start_goal_run(
+                &goal.id,
+                "scheduled",
+                Some(&schedule.id),
+                Some(&run_root_task_id),
+            )
+            .await?;
+
         // ── Plain-reminder fast path: the only deliverable is a message back
         // to the user, so send it now instead of going through task creation
         // and the task-lead pipeline (which adds a minute-plus of dispatch and
@@ -1687,7 +1921,7 @@ impl HeartbeatCoordinator {
             if delivered {
                 // Record a completed task so history/diagnostics show the run.
                 let task = crate::traits::Task {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id: run_root_task_id.clone(),
                     goal_id: goal.id.clone(),
                     description: format!("Deliver reminder: {}", goal.description),
                     status: "completed".to_string(),
@@ -1707,7 +1941,15 @@ impl HeartbeatCoordinator {
                     started_at: Some(now_ts.clone()),
                     completed_at: Some(now_ts.clone()),
                 };
-                let _ = self.state.create_task(&task).await;
+                self.state.create_task(&task).await?;
+                let _ = self
+                    .state
+                    .finish_goal_run(
+                        &goal_run.id,
+                        "completed",
+                        Some("Reminder delivered successfully."),
+                    )
+                    .await?;
 
                 let mut updated = goal.clone();
                 if schedule.is_one_shot {
@@ -1739,7 +1981,7 @@ impl HeartbeatCoordinator {
 
         // Create a pending task for this scheduled run.
         let task = crate::traits::Task {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: run_root_task_id,
             goal_id: goal.id.clone(),
             description: if schedule.is_one_shot || goal.goal_type == "finite" {
                 format!(
@@ -1831,8 +2073,12 @@ impl HeartbeatCoordinator {
         // orphan dispatcher still picks the task up on a later tick.
         if let Some(agent_arc) = self.agent.as_ref().and_then(|w| w.upgrade()) {
             let agent_id = format!("heartbeat-schedule-fire-{}", uuid::Uuid::new_v4());
-            match self.state.claim_task(&task.id, &agent_id).await {
-                Ok(true) => {
+            match self
+                .state
+                .claim_task_with_lease(&task.id, &agent_id, Some("profile-task-lead"), 180)
+                .await
+            {
+                Ok(Some(_)) => {
                     if let Some(ref registry) = self.goal_token_registry {
                         registry.register(&goal.id).await;
                     }
@@ -1850,7 +2096,7 @@ impl HeartbeatCoordinator {
                         running_surface_id,
                     );
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => {
                     warn!(
                         task_id = %task.id,
@@ -2934,6 +3180,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_task_lead_owns_retries_and_pending_dispatch() {
+        let state = test_state_store().await;
+        let goal = Goal::new_finite("Build and deploy a site", "session-1");
+        state.create_goal(&goal).await.unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let failed = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Research visual direction".to_string(),
+            status: "failed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some("Research was incorporated directly.".to_string()),
+            error: Some("Late persistence race".to_string()),
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: old.clone(),
+            started_at: None,
+            completed_at: Some(old.clone()),
+        };
+        let pending = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Return the deployment URL".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: old,
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&failed).await.unwrap();
+        state.create_task(&pending).await.unwrap();
+
+        let registry = GoalTokenRegistry::new();
+        let _active_run = registry
+            .try_acquire_run(&goal.id)
+            .expect("test task lead should own run");
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, Some(registry), None);
+
+        coordinator.auto_retry_failed_tasks().await;
+        coordinator.dispatch_pending_tasks().await;
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.id == failed.id)
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.id == pending.id)
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert!(state
+            .get_pending_notifications(10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn closed_scheduled_run_children_are_neither_retried_nor_dispatched() {
         let state = test_state_store().await;
         let goal = Goal::new_continuous("Publish a daily post", "session-1", None, None);
@@ -3306,6 +3638,16 @@ mod tests {
             task_inactivity_secs(Some("2026-06-23 00:05:00"), "2026-06-23 00:00:00", now),
             300
         );
+    }
+
+    #[test]
+    fn task_escalations_wait_for_same_turn_state_reconciliation() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-31T16:00:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!task_escalation_has_settled("2026-07-31T16:00:05Z", now));
+        assert!(task_escalation_has_settled("2026-07-31T16:00:01Z", now));
+        assert!(task_escalation_has_settled("legacy timestamp", now));
     }
 
     #[tokio::test]

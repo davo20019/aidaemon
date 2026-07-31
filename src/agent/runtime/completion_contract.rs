@@ -13,6 +13,8 @@ use super::project_scope::{
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::traits::{ToolCallSemantics, ToolMutationEffects};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum CompletionTaskKind {
     #[default]
@@ -40,14 +42,57 @@ pub(super) struct VerificationTarget {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForbiddenMutationAction {
+    Create,
+    Delete,
+    Deploy,
+    Publish,
+    Post,
+    Send,
+}
+
+impl ForbiddenMutationAction {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::Deploy => "deploy",
+            Self::Publish => "publish",
+            Self::Post => "post",
+            Self::Send => "send",
+        }
+    }
+}
+
+/// Parse a task-assessor operation constraint. Unknown values are ignored so a
+/// malformed model response cannot invent a new policy action.
+pub(super) fn parse_planned_forbidden_action(value: &str) -> Option<ForbiddenMutationAction> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "create" => Some(ForbiddenMutationAction::Create),
+        "delete" => Some(ForbiddenMutationAction::Delete),
+        "deploy" => Some(ForbiddenMutationAction::Deploy),
+        "publish" => Some(ForbiddenMutationAction::Publish),
+        "post" => Some(ForbiddenMutationAction::Post),
+        "send" => Some(ForbiddenMutationAction::Send),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionContract {
     pub task_kind: CompletionTaskKind,
     pub expects_mutation: bool,
+    /// Typed outcomes that must be observed before a mutating request is
+    /// considered fulfilled. An empty set retains legacy count-based behavior.
+    pub required_mutation_effects: ToolMutationEffects,
     /// The user explicitly constrained this turn to observation/reporting.
     /// Unlike `expects_mutation = false`, this is a hard negative obligation:
     /// mutation attempts are contract violations and must be blocked.
     pub forbids_mutation: bool,
+    /// Operation-specific negative obligations. These do not turn an otherwise
+    /// mutating task into a report-only task; they block only the named action.
+    pub forbidden_mutation_actions: Vec<ForbiddenMutationAction>,
     pub requires_observation: bool,
     pub requires_reverification_after_mutation: bool,
     pub explicit_verification_requested: bool,
@@ -153,6 +198,20 @@ impl ExecutionRequirement {
 
 /// Change and Deliver contracts may only enter text-only mode after their
 /// mutation obligation has actually been fulfilled.
+pub(super) fn mutation_contract_fulfilled(
+    contract: &CompletionContract,
+    progress: &CompletionProgress,
+) -> bool {
+    if !contract.expects_mutation {
+        return true;
+    }
+    progress.mutation_count > 0
+        && (contract.required_mutation_effects.is_empty()
+            || progress
+                .observed_mutation_effects
+                .satisfies(contract.required_mutation_effects))
+}
+
 pub(super) fn completion_contract_allows_force_text(
     contract: &CompletionContract,
     progress: &CompletionProgress,
@@ -160,8 +219,7 @@ pub(super) fn completion_contract_allows_force_text(
     !matches!(
         contract.task_kind,
         CompletionTaskKind::Change | CompletionTaskKind::Deliver
-    ) || !contract.expects_mutation
-        || progress.mutation_count > 0
+    ) || mutation_contract_fulfilled(contract, progress)
 }
 
 /// Map a planner-supplied task-kind string to the enum. Unknown values map
@@ -181,6 +239,45 @@ pub(super) fn parse_planned_task_kind(value: &str) -> Option<CompletionTaskKind>
     }
 }
 
+/// Parse semantic outcome requirements from the task assessment. Unknown
+/// values reject the whole refinement so a malformed list cannot silently
+/// weaken or distort the completion contract.
+pub(super) fn parse_planned_mutation_effects(values: &[String]) -> Option<ToolMutationEffects> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut effects = ToolMutationEffects::NONE;
+    for value in values {
+        let effect = match value.trim().to_ascii_lowercase().as_str() {
+            "local_source_write" => ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            "repository_write" => ToolMutationEffects::REPOSITORY_WRITE,
+            "remote_mutation" => ToolMutationEffects::REMOTE_MUTATION,
+            "remote_deploy" => ToolMutationEffects::REMOTE_DEPLOY,
+            "external_delivery" => ToolMutationEffects::EXTERNAL_DELIVERY,
+            "process_state" => ToolMutationEffects::PROCESS_STATE,
+            "configuration" => ToolMutationEffects::CONFIGURATION,
+            "destructive" => ToolMutationEffects::DESTRUCTIVE,
+            _ => return None,
+        };
+        effects = effects.union(effect);
+    }
+    Some(effects)
+}
+
+/// Add semantically classified positive proof obligations. This never grants
+/// permission and never erases deterministic requirements; it only prevents a
+/// mismatched mutation from being treated as completion.
+pub(super) fn apply_planned_required_mutation_effects(
+    contract: &mut CompletionContract,
+    effects: Option<ToolMutationEffects>,
+) {
+    if contract.expects_mutation && !contract.forbids_mutation {
+        if let Some(effects) = effects.filter(|effects| !effects.is_empty()) {
+            contract.required_mutation_effects = contract.required_mutation_effects.union(effects);
+        }
+    }
+}
+
 /// Refine a keyword-inferred contract with the planning LLM's classification.
 /// The planner read the actual request (any language), so its signals win —
 /// with one exception: an explicit user verification request ("verify it",
@@ -191,17 +288,28 @@ pub(super) fn apply_planned_contract_signals(
     requires_observation: Option<bool>,
     task_kind: Option<CompletionTaskKind>,
 ) {
+    let scoped_mutation_obligation =
+        contract.expects_mutation && !contract.forbidden_mutation_actions.is_empty();
     if let Some(kind) = task_kind {
         contract.task_kind = kind;
     }
     if let Some(mutation) = expects_mutation {
         if contract.forbids_mutation {
             contract.expects_mutation = false;
+            contract.required_mutation_effects = ToolMutationEffects::NONE;
             contract.requires_reverification_after_mutation = false;
+        } else if !mutation && scoped_mutation_obligation {
+            // A planner can mistake "build locally, but do not deploy" for a
+            // report-only request. Preserve the positive work obligation while
+            // the operation-specific restriction remains independently enforced.
         } else {
             contract.expects_mutation = mutation;
+            if mutation && contract.required_mutation_effects.is_empty() {
+                contract.required_mutation_effects = ToolMutationEffects::UNSPECIFIED;
+            }
         }
         if !contract.expects_mutation {
+            contract.required_mutation_effects = ToolMutationEffects::NONE;
             // No mutation expected → nothing to re-verify after one.
             contract.requires_reverification_after_mutation = false;
         }
@@ -215,46 +323,142 @@ pub(super) fn apply_planned_contract_signals(
     }
 }
 
+/// Apply semantic negative mutation constraints from the task assessment.
+///
+/// This is additive by design: a model classification may discover a
+/// non-English constraint, but it may never erase a deterministic constraint
+/// already found in the request. `read_only` is global; `scoped` blocks only
+/// the supplied operations and leaves other required mutations available.
+pub(super) fn apply_planned_mutation_constraints(
+    contract: &mut CompletionContract,
+    mutation_scope: Option<&str>,
+    forbidden_actions: &[ForbiddenMutationAction],
+) {
+    let scope = mutation_scope
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match scope.as_str() {
+        "read_only" | "read-only" => {
+            contract.forbids_mutation = true;
+            contract.expects_mutation = false;
+            contract.required_mutation_effects = ToolMutationEffects::NONE;
+            contract.requires_reverification_after_mutation = false;
+        }
+        "scoped" => {
+            for action in forbidden_actions {
+                if !contract.forbidden_mutation_actions.contains(action) {
+                    contract.forbidden_mutation_actions.push(*action);
+                }
+            }
+        }
+        // `allowed`, absent, and unknown values cannot relax a deterministic
+        // negative obligation.
+        _ => {}
+    }
+}
+
 fn explicitly_forbids_mutation(lower: &str) -> bool {
-    text_contains_any_phrase(
-        lower,
-        &[
-            "do not modify",
-            "don't modify",
-            "do not change",
-            "don't change",
-            "do not edit",
-            "don't edit",
-            "do not write",
-            "don't write",
-            "do not create",
-            "don't create",
-            "do not delete",
-            "don't delete",
-            "do not deploy",
-            "don't deploy",
-            "do not publish",
-            "don't publish",
-            "do not post",
-            "don't post",
-            "do not send",
-            "don't send",
-            "without modifying",
-            "without changing",
-            "without writing",
-            "read-only",
-            "read only",
-            "inspect-only",
-            "inspect only",
-            "report only",
-        ],
-    )
+    let trimmed = lower.trim();
+    let explicit_mode = ["read-only", "inspect-only", "report-only"]
+        .iter()
+        .any(|mode| {
+            trimmed == *mode
+                || trimmed.starts_with(&format!("{mode}:"))
+                || trimmed.starts_with(&format!("{mode} request"))
+                || trimmed.starts_with(&format!("this is a {mode}"))
+        });
+    if explicit_mode {
+        return true;
+    }
+
+    // A global prohibition must carry a global object (anything, files, or
+    // any changes). Bare phrases such as "read only the README" and qualified
+    // constraints such as "do not make changes outside src" are not blanket
+    // write bans.
+    [
+        "do not make any changes",
+        "don't make any changes",
+        "without making any changes",
+        "do not modify anything",
+        "don't modify anything",
+        "do not change anything",
+        "don't change anything",
+        "do not edit anything",
+        "don't edit anything",
+        "do not write anything",
+        "don't write anything",
+        "do not modify files",
+        "don't modify files",
+    ]
+    .iter()
+    .any(|phrase| {
+        let Some(index) = lower.find(phrase) else {
+            return false;
+        };
+        let tail = lower[index + phrase.len()..]
+            .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ':'));
+        ![
+            "outside",
+            "except",
+            "other than",
+            "beyond",
+            "under",
+            "inside",
+        ]
+        .iter()
+        .any(|qualifier| tail.starts_with(qualifier))
+    })
+}
+
+const SCOPED_NEGATIVE_MUTATION_PHRASES: &[(ForbiddenMutationAction, &[&str])] = &[
+    (
+        ForbiddenMutationAction::Create,
+        &["do not create", "don't create", "without creating"],
+    ),
+    (
+        ForbiddenMutationAction::Delete,
+        &["do not delete", "don't delete", "without deleting"],
+    ),
+    (
+        ForbiddenMutationAction::Deploy,
+        &["do not deploy", "don't deploy", "without deploying"],
+    ),
+    (
+        ForbiddenMutationAction::Publish,
+        &["do not publish", "don't publish", "without publishing"],
+    ),
+    (
+        ForbiddenMutationAction::Post,
+        &["do not post", "don't post", "without posting"],
+    ),
+    (
+        ForbiddenMutationAction::Send,
+        &["do not send", "don't send", "without sending"],
+    ),
+];
+
+fn scoped_forbidden_mutation_actions(lower: &str) -> Vec<ForbiddenMutationAction> {
+    SCOPED_NEGATIVE_MUTATION_PHRASES
+        .iter()
+        .filter_map(|(action, phrases)| text_contains_any_phrase(lower, phrases).then_some(*action))
+        .collect()
+}
+
+fn remove_scoped_negative_mutation_phrases(lower: &str) -> String {
+    SCOPED_NEGATIVE_MUTATION_PHRASES
+        .iter()
+        .flat_map(|(_, phrases)| phrases.iter())
+        .fold(lower.to_string(), |text, phrase| text.replace(phrase, " "))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionProgress {
     pub observation_count: usize,
     pub mutation_count: usize,
+    /// Effects observed from successful calls. This is separate from the raw
+    /// count so incidental cache writes cannot fulfill source/deploy outcomes.
+    pub observed_mutation_effects: ToolMutationEffects,
     pub verification_count: usize,
     pub verification_pending: bool,
     /// Count of external mutation attempts that failed (4xx/5xx, etc.)
@@ -304,8 +508,18 @@ impl CompletionProgress {
         }
     }
 
-    pub(super) fn mark_mutation(&mut self, contract: &CompletionContract) {
+    pub(super) fn mark_mutation(
+        &mut self,
+        contract: &CompletionContract,
+        semantics: &ToolCallSemantics,
+    ) {
         self.mutation_count = self.mutation_count.saturating_add(1);
+        let effects = if semantics.mutation_effects.is_empty() {
+            ToolMutationEffects::UNSPECIFIED
+        } else {
+            semantics.mutation_effects
+        };
+        self.observed_mutation_effects = self.observed_mutation_effects.union(effects);
         if contract.requires_reverification_after_mutation {
             self.verification_pending = true;
         }
@@ -1037,6 +1251,139 @@ pub(super) fn scope_contract_for_delegated_executor(
     contract
 }
 
+fn infer_required_mutation_effects(
+    lower_text: &str,
+    expects_mutation: bool,
+) -> ToolMutationEffects {
+    if !expects_mutation {
+        return ToolMutationEffects::NONE;
+    }
+
+    let mut required = ToolMutationEffects::NONE;
+    if text_contains_any_phrase(
+        lower_text,
+        &[
+            "deploy",
+            "go live",
+            "release to production",
+            "publish the site",
+            "push to a worker",
+            "push to worker",
+        ],
+    ) {
+        required = required.union(ToolMutationEffects::REMOTE_DEPLOY);
+    }
+
+    let local_artifact = text_contains_any_phrase(
+        lower_text,
+        &[
+            "file",
+            "folder",
+            "directory",
+            "script",
+            "test",
+            "tests",
+            "readme",
+            "code",
+            "module",
+            "function",
+            "class",
+            "document",
+            "page",
+            "website",
+            "web site",
+            "site",
+            "app",
+            "application",
+            "project",
+            "worker",
+            "dashboard",
+            "api",
+        ],
+    );
+    let authors_artifact = text_contains_any_phrase(
+        lower_text,
+        &[
+            "change",
+            "update",
+            "edit",
+            "write",
+            "rewrite",
+            "overwrite",
+            "modify",
+            "replace",
+            "remove",
+            "create",
+            "implement",
+            "develop",
+            "fix",
+            "migrate",
+        ],
+    );
+    if local_artifact && authors_artifact {
+        required = required.union(ToolMutationEffects::LOCAL_SOURCE_WRITE);
+    }
+
+    let deletes_local_path = text_contains_any_phrase(lower_text, &["delete", "remove", "erase"])
+        && text_contains_any_phrase(
+            lower_text,
+            &["file", "folder", "directory", "local project", "repository"],
+        );
+    if deletes_local_path {
+        required = required
+            .union(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .union(ToolMutationEffects::DESTRUCTIVE);
+    }
+
+    if text_contains_any_phrase(
+        lower_text,
+        &[
+            "restart",
+            "reload",
+            "start the service",
+            "stop the service",
+            "kill the process",
+        ],
+    ) {
+        required = required.union(ToolMutationEffects::PROCESS_STATE);
+    }
+
+    if text_contains_any_phrase(
+        lower_text,
+        &[
+            "install the package",
+            "install dependencies",
+            "change the configuration",
+            "update the configuration",
+            "change permissions",
+        ],
+    ) {
+        required = required.union(ToolMutationEffects::CONFIGURATION);
+    }
+
+    if text_contains_any_phrase(
+        lower_text,
+        &[
+            "send the file",
+            "send me the file",
+            "deliver the file",
+            "upload the file",
+            "email the file",
+            "post this",
+            "post it",
+            "send the message",
+        ],
+    ) {
+        required = required.union(ToolMutationEffects::EXTERNAL_DELIVERY);
+    }
+
+    if required.is_empty() {
+        ToolMutationEffects::UNSPECIFIED
+    } else {
+        required
+    }
+}
+
 pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> CompletionContract {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1051,9 +1398,11 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     let current = current_request_segment(trimmed);
     let lower = current.to_ascii_lowercase();
     let forbids_mutation = explicitly_forbids_mutation(&lower);
+    let forbidden_mutation_actions = scoped_forbidden_mutation_actions(&lower);
+    let mutation_signal_text = remove_scoped_negative_mutation_phrases(&lower);
 
     let verification_targets = extract_verification_targets(text, alias_roots);
-    let signals = infer_completion_signals(&lower, &verification_targets);
+    let signals = infer_completion_signals(&mutation_signal_text, &verification_targets);
     let connected_content_mode = super::intent_routing::classify_connected_content_mode(current);
     let mut task_kind = infer_completion_task_kind(&signals);
     // "Run X and provide the output" is an observation delivered as text —
@@ -1086,6 +1435,8 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     } else {
         signals.mutation_obligation
     };
+    let required_mutation_effects =
+        infer_required_mutation_effects(&mutation_signal_text, expects_mutation);
     let requires_observation = signals.explicit_verification_requested
         || signals.observable_target_request
         || signals.visible_state_problem
@@ -1099,13 +1450,18 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         CompletionTaskKind::Diagnose | CompletionTaskKind::Monitor
     ) || (expects_mutation
         && (signals.explicit_verification_requested
-            || text_contains_any_phrase(&lower, &["deploy", "publish", "release", "go live"])
+            || text_contains_any_phrase(
+                &mutation_signal_text,
+                &["deploy", "publish", "release", "go live"],
+            )
             || signals.visible_state_problem));
 
     CompletionContract {
         task_kind,
         expects_mutation,
+        required_mutation_effects,
         forbids_mutation,
+        forbidden_mutation_actions,
         requires_observation,
         requires_reverification_after_mutation,
         explicit_verification_requested: signals.explicit_verification_requested,
@@ -1616,7 +1972,10 @@ mod tests {
         progress.mark_observation(&contract, true);
         assert!(!progress.verification_pending);
 
-        progress.mark_mutation(&contract);
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::UNSPECIFIED),
+        );
         assert!(progress.verification_pending);
 
         progress.mark_observation(&contract, true);
@@ -1751,6 +2110,81 @@ mod tests {
     }
 
     #[test]
+    fn object_scoped_modify_constraint_is_not_a_global_write_ban() {
+        let contract = infer_completion_contract(
+            "Update the application, but do not modify the deployment configuration.",
+            &[],
+        );
+        assert!(!contract.forbids_mutation);
+        assert!(contract.expects_mutation);
+
+        let global = infer_completion_contract(
+            "Inspect the application only and do not make any changes.",
+            &[],
+        );
+        assert!(global.forbids_mutation);
+        assert!(!global.expects_mutation);
+    }
+
+    #[test]
+    fn contextual_read_and_scoped_change_phrases_do_not_become_global_bans() {
+        for request in [
+            "Read only the README, then fix the failing test.",
+            "Do not make any changes outside src; update src/main.rs.",
+            "Report only the files changed after implementing the fix.",
+        ] {
+            let contract = infer_completion_contract(request, &[]);
+            assert!(
+                !contract.forbids_mutation,
+                "contextual phrase must not globally forbid work: {request}"
+            );
+            assert!(
+                contract.expects_mutation,
+                "requested edit must remain actionable: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_build_with_deployment_reserved_for_parent_remains_mutating() {
+        let request = "Inspect ~/projects for an appropriate existing app or create a new \
+            project directory there. Implement a polished website. Configure static hosting \
+            tooling and run the relevant build/check. Do not deploy externally; report the \
+            directory, changes, and verification results.";
+        let mut contract = infer_completion_contract(request, &[]);
+
+        assert!(!contract.forbids_mutation);
+        assert!(contract.expects_mutation);
+        assert_eq!(
+            contract.forbidden_mutation_actions,
+            vec![ForbiddenMutationAction::Deploy]
+        );
+
+        apply_planned_contract_signals(
+            &mut contract,
+            Some(false),
+            Some(true),
+            Some(CompletionTaskKind::Deliver),
+        );
+        assert!(
+            contract.expects_mutation,
+            "planner must not turn scoped deployment restraint into a blanket write ban"
+        );
+    }
+
+    #[test]
+    fn observation_with_deployment_restriction_does_not_invent_a_mutation() {
+        let contract =
+            infer_completion_contract("Inspect the current site, but do not deploy.", &[]);
+        assert!(!contract.forbids_mutation);
+        assert!(!contract.expects_mutation);
+        assert_eq!(
+            contract.forbidden_mutation_actions,
+            vec![ForbiddenMutationAction::Deploy]
+        );
+    }
+
+    #[test]
     fn delete_and_create_requests_expect_mutation() {
         // Turn-10 fabrication case: "delete" must keep the contract armed.
         let contract = infer_completion_contract("Delete the cachetest2 folder entirely.", &[]);
@@ -1766,6 +2200,102 @@ mod tests {
         let contract =
             infer_completion_contract("Remove west.txt and execute tally.py once more.", &[]);
         assert!(contract.expects_mutation);
+    }
+
+    #[test]
+    fn typed_outcomes_do_not_let_build_cache_satisfy_source_edit() {
+        let contract = infer_completion_contract("Fix the code in this project.", &[]);
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        let mut progress = CompletionProgress::new(&contract);
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::observation_and_mutation_with(
+                ToolMutationEffects::LOCAL_DERIVED_WRITE,
+            ),
+        );
+        assert!(!mutation_contract_fulfilled(&contract, &progress));
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+        );
+        assert!(mutation_contract_fulfilled(&contract, &progress));
+    }
+
+    #[test]
+    fn deterministic_effect_fallback_does_not_overfit_ambiguous_build_or_remove() {
+        let build = infer_completion_contract(
+            "Build the existing project and report any compiler errors.",
+            &[],
+        );
+        assert!(!build
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+
+        let edit = infer_completion_contract("Remove the unused function from the code.", &[]);
+        assert!(edit
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(!edit
+            .required_mutation_effects
+            .contains(ToolMutationEffects::DESTRUCTIVE));
+    }
+
+    #[test]
+    fn semantic_effects_add_positive_proof_without_granting_permission() {
+        let parsed = parse_planned_mutation_effects(&[
+            "local_source_write".to_string(),
+            "remote_deploy".to_string(),
+        ])
+        .expect("valid effects");
+        let mut contract = CompletionContract {
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::UNSPECIFIED,
+            ..CompletionContract::default()
+        };
+        apply_planned_required_mutation_effects(&mut contract, Some(parsed));
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::REMOTE_DEPLOY));
+        assert!(parse_planned_mutation_effects(&["made_up".to_string()]).is_none());
+
+        contract.forbids_mutation = true;
+        contract.expects_mutation = false;
+        let before = contract.required_mutation_effects;
+        apply_planned_required_mutation_effects(
+            &mut contract,
+            Some(ToolMutationEffects::REMOTE_MUTATION),
+        );
+        assert_eq!(contract.required_mutation_effects, before);
+    }
+
+    #[test]
+    fn build_and_deploy_requires_both_local_source_and_remote_deploy() {
+        let contract = infer_completion_contract(
+            "Create a website in the project, deploy it, verify it, and return the URL.",
+            &[],
+        );
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::REMOTE_DEPLOY));
+        let mut progress = CompletionProgress::new(&contract);
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+        );
+        assert!(!mutation_contract_fulfilled(&contract, &progress));
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_DEPLOY),
+        );
+        assert!(mutation_contract_fulfilled(&contract, &progress));
     }
 
     #[test]
@@ -1789,6 +2319,73 @@ mod tests {
         );
         assert_eq!(parse_planned_task_kind("destroy_everything"), None);
         assert_eq!(parse_planned_task_kind(""), None);
+    }
+
+    #[test]
+    fn planned_forbidden_actions_parse_known_values_only() {
+        for (value, expected) in [
+            ("create", ForbiddenMutationAction::Create),
+            ("DELETE", ForbiddenMutationAction::Delete),
+            (" deploy ", ForbiddenMutationAction::Deploy),
+            ("publish", ForbiddenMutationAction::Publish),
+            ("post", ForbiddenMutationAction::Post),
+            ("send", ForbiddenMutationAction::Send),
+        ] {
+            assert_eq!(parse_planned_forbidden_action(value), Some(expected));
+        }
+        assert_eq!(parse_planned_forbidden_action("rewrite-history"), None);
+    }
+
+    #[test]
+    fn semantic_read_only_constraint_blocks_all_mutation() {
+        let mut contract = CompletionContract {
+            expects_mutation: true,
+            requires_reverification_after_mutation: true,
+            ..Default::default()
+        };
+
+        apply_planned_mutation_constraints(&mut contract, Some("read_only"), &[]);
+
+        assert!(contract.forbids_mutation);
+        assert!(!contract.expects_mutation);
+        assert!(!contract.requires_reverification_after_mutation);
+    }
+
+    #[test]
+    fn semantic_scoped_constraint_preserves_other_mutation_work() {
+        let mut contract = CompletionContract {
+            expects_mutation: true,
+            ..Default::default()
+        };
+
+        apply_planned_mutation_constraints(
+            &mut contract,
+            Some("scoped"),
+            &[ForbiddenMutationAction::Deploy],
+        );
+
+        assert!(!contract.forbids_mutation);
+        assert!(contract.expects_mutation);
+        assert_eq!(
+            contract.forbidden_mutation_actions,
+            vec![ForbiddenMutationAction::Deploy]
+        );
+
+        apply_planned_contract_signals(&mut contract, Some(false), Some(true), None);
+        assert!(
+            contract.expects_mutation,
+            "a scoped restriction must not collapse the remaining work into read-only mode"
+        );
+    }
+
+    #[test]
+    fn semantic_allowed_scope_cannot_erase_deterministic_restrictions() {
+        let mut contract = infer_completion_contract("Inspect the site, but do not deploy.", &[]);
+        let before = contract.clone();
+
+        apply_planned_mutation_constraints(&mut contract, Some("allowed"), &[]);
+
+        assert_eq!(contract, before);
     }
 
     #[test]

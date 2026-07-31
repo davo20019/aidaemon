@@ -23,8 +23,9 @@ h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; }
 h2 { font-size: .9rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--fg2); margin-bottom: .5rem; }
 .cards { display: grid; gap: 1rem; grid-template-columns: 1fr; }
 @media (min-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
-.card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; box-shadow: var(--card-shadow); }
+.card { min-width: 0; background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; box-shadow: var(--card-shadow); }
 .card.wide { grid-column: 1 / -1; }
+.card > div { min-width: 0; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; font-size: .85rem; }
 th { text-align: left; font-weight: 500; color: var(--fg2); border-bottom: 1px solid var(--border); padding: .35rem .5rem; }
 td { padding: .35rem .5rem; border-bottom: 1px solid var(--border); }
@@ -45,6 +46,12 @@ tr:last-child td { border-bottom: none; }
 #auth-box .err { color: var(--err); font-size: .85rem; margin-top: .25rem; }
 .refresh-info { font-size: .75rem; color: var(--fg2); margin-top: 1rem; text-align: center; }
 .truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 599px) {
+  body { padding: .75rem; }
+  .card { padding: .75rem; }
+  table { min-width: 560px; }
+  #work-body table { min-width: 680px; }
+}
 </style>
 </head>
 <body>
@@ -69,6 +76,10 @@ tr:last-child td { border-bottom: none; }
     <div class="card" id="tasks-card">
       <h2>Scheduled Tasks</h2>
       <div id="tasks-body"></div>
+    </div>
+    <div class="card wide" id="work-card">
+      <h2>Active Work <span class="badge badge-paused">read only</span></h2>
+      <div id="work-body"></div>
     </div>
     <div class="card wide" id="maintenance-card">
       <h2>Maintenance Jobs</h2>
@@ -103,6 +114,11 @@ tr:last-child td { border-bottom: none; }
 </div>
 
 <script>
+const LOGIN_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token');
+if (LOGIN_TOKEN) {
+  sessionStorage.setItem('aidaemon_token', LOGIN_TOKEN);
+  history.replaceState(null, '', location.pathname + location.search);
+}
 let TOKEN = sessionStorage.getItem('aidaemon_token') || '';
 
 function submitToken() {
@@ -217,6 +233,58 @@ async function fetchTasks() {
     html += '</table>';
     document.getElementById('tasks-body').innerHTML = html;
   } catch {}
+}
+
+async function fetchWork() {
+  try {
+    const d = await api('/api/work');
+    const tasks = d.tasks || [];
+    const goals = d.goals || [];
+    if (!tasks.length && !goals.length) {
+      document.getElementById('work-body').innerHTML = '<p class="empty">No durable work in project ' + esc(d.project_id || 'default') + '</p>';
+      return;
+    }
+    const laneLabels = {
+      blocked: 'Blocked',
+      needs_attention: 'Needs attention',
+      in_progress: 'In progress',
+      ready: 'Ready',
+      waiting: 'Waiting',
+      done: 'Done'
+    };
+    const laneLimits = { blocked: 40, needs_attention: 40, in_progress: 40, ready: 40, waiting: 40, done: 20 };
+    const shownByLane = {};
+    const visibleTasks = tasks.filter(task => {
+      const lane = task.lane || 'needs_attention';
+      const shown = shownByLane[lane] || 0;
+      if (shown >= (laneLimits[lane] || 40)) return false;
+      shownByLane[lane] = shown + 1;
+      return true;
+    });
+    const hiddenTaskCount = tasks.length - visibleTasks.length;
+    let html = '<div style="font-size:.8rem;color:var(--fg2);margin-bottom:.5rem">Project: <span class="mono">' + esc(d.project_id || 'default') + '</span> · ' + goals.length + ' goal(s) · ' + tasks.length + ' task(s)</div>';
+    html += '<table><tr><th>Lane</th><th>Task</th><th>Worker</th><th>Updated</th></tr>';
+    for (const task of visibleTasks) {
+      let badgeClass = 'badge-paused';
+      if (task.lane === 'done') badgeClass = 'badge-ok';
+      if (task.lane === 'blocked' || task.lane === 'needs_attention') badgeClass = 'badge-err';
+      if (task.lane === 'in_progress') badgeClass = 'badge-warn';
+      const description = task.blocker ? task.description + ' — ' + task.blocker : task.description;
+      html += '<tr>'
+        + '<td><span class="badge ' + badgeClass + '">' + esc(laneLabels[task.lane] || task.lane) + '</span></td>'
+        + '<td class="truncate" title="' + esc(description || '') + '"><span class="mono">' + esc((task.task_id || '').slice(0,8)) + '</span> ' + esc(description || '-') + '</td>'
+        + '<td class="truncate">' + esc(task.worker_profile || task.worker_instance_id || '-') + '</td>'
+        + '<td class="mono">' + esc(fmtTs(task.updated_at)) + '</td>'
+        + '</tr>';
+    }
+    html += '</table>';
+    if (hiddenTaskCount > 0) {
+      html += '<p class="empty" style="margin-top:.6rem">Showing ' + visibleTasks.length + ' of ' + tasks.length + ' tasks. Use the chat work commands for complete lane-specific lists.</p>';
+    }
+    document.getElementById('work-body').innerHTML = html;
+  } catch {
+    document.getElementById('work-body').innerHTML = '<p class="empty">Work view unavailable</p>';
+  }
 }
 
 async function fetchMaintenanceJobs() {
@@ -389,7 +457,7 @@ async function fetchWriteConsistency() {
   }
 }
 
-function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchMaintenanceJobs(); fetchQueues(); fetchLlmLatency(); fetchPolicyMetrics(); fetchWriteConsistency(); }
+function fetchAll() { fetchStatus(); fetchUsage(); fetchSessions(); fetchTasks(); fetchWork(); fetchMaintenanceJobs(); fetchQueues(); fetchLlmLatency(); fetchPolicyMetrics(); fetchWriteConsistency(); }
 
 // Startup
 if (TOKEN) { tryConnect(); } else { showAuth(); }

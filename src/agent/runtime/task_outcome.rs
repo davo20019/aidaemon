@@ -1,6 +1,8 @@
 //! Task outcome derivation from completion evidence at the `emit_task_end` boundary.
 
-use super::completion_contract::{CompletionContract, CompletionProgress};
+use super::completion_contract::{
+    mutation_contract_fulfilled, CompletionContract, CompletionProgress,
+};
 use super::execution_state::ExecutionState;
 use super::goal_dispatch::is_low_signal_task_lead_reply;
 use super::validation_state::ValidationState;
@@ -168,7 +170,7 @@ fn completion_contract_is_fulfilled(
     // Expected mutation is an outcome obligation, not merely a routing hint.
     // A task cannot be persisted as Succeeded when its mutation ledger is
     // empty, even if the model produced a useful explanatory response.
-    if contract.expects_mutation && progress.mutation_count == 0 {
+    if !mutation_contract_fulfilled(contract, progress) {
         return false;
     }
 

@@ -147,7 +147,8 @@ pub mod llm_classifier;
 pub mod relational_prefilter;
 use intent_routing::{
     classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
-    is_internal_maintenance_intent, recognized_artifact_creation_request, IntentComplexity,
+    is_internal_maintenance_intent, recognized_artifact_creation_request,
+    refine_intent_complexity_with_task_shape, IntentComplexity, IntentTaskShape,
 };
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
@@ -271,16 +272,23 @@ pub(crate) use parent_delivery::ParentDeliveryKind;
 mod response_phase;
 #[path = "loop/services.rs"]
 mod services;
-pub(in crate::agent) use history::completion_contract_allows_force_text;
 pub(in crate::agent) use history::CompletionContract;
 pub(in crate::agent) use history::CompletionProgress;
 pub(in crate::agent) use history::CompletionTaskKind;
 pub(in crate::agent) use history::ExecutionRequirement;
 pub(in crate::agent) use history::FollowupMode;
+pub(in crate::agent) use history::ForbiddenMutationAction;
 pub(in crate::agent) use history::TurnContext;
 pub(in crate::agent) use history::VerificationTarget;
 pub(in crate::agent) use history::VerificationTargetKind;
-pub(in crate::agent) use history::{apply_planned_contract_signals, parse_planned_task_kind};
+pub(in crate::agent) use history::{
+    apply_planned_contract_signals, apply_planned_mutation_constraints,
+    apply_planned_required_mutation_effects, parse_planned_forbidden_action,
+    parse_planned_mutation_effects, parse_planned_task_kind,
+};
+pub(in crate::agent) use history::{
+    completion_contract_allows_force_text, mutation_contract_fulfilled,
+};
 #[path = "loop/compaction.rs"]
 mod compaction;
 #[path = "runtime/llm.rs"]
@@ -481,6 +489,10 @@ pub struct Agent {
     path_aliases: PathAliasConfig,
     /// Parent scope carried into spawned child agents.
     inherited_project_scope: Option<String>,
+    /// Human-facing session that owns approvals for this internal child.
+    /// Root agents leave this unset; every spawned descendant inherits the
+    /// originating conversation while retaining its own isolated runtime ID.
+    approval_session_id: Option<String>,
     /// Full tool list from the root agent — used by TaskLead when spawning
     /// Executor children so they can access Action tools that were filtered
     /// out of the TaskLead's own `tools` vec.
@@ -622,8 +634,8 @@ pub(in crate::agent) use goal_dispatch::{
     is_low_signal_task_lead_reply, is_scheduled_task_description,
     looks_like_evidence_grounding_challenge, looks_like_false_capability_denial_after_tool_success,
     looks_like_incomplete_live_work_summary, parse_goal_leading_wait, parse_wait_task_seconds,
-    persist_scheduled_run_state, salvageable_task_lead_result, strip_leading_wait,
-    task_has_scheduled_provenance, truncate_goal_result_text, user_facing_task_description,
+    persist_scheduled_run_state, strip_leading_wait, task_has_scheduled_provenance,
+    truncate_goal_result_text, user_facing_task_description,
 };
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,

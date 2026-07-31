@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -63,6 +64,14 @@ pub struct ExpectBlock {
     pub tools_used: Vec<String>,
     #[serde(default)]
     pub tools_not_used: Vec<String>,
+    /// Tools that must appear in this relative order (subsequence match —
+    /// unrelated calls may interleave).
+    #[serde(default)]
+    pub tools_in_order: Vec<String>,
+    /// Exact call count per tool. Guards duplicate-side-effect regressions,
+    /// e.g. `{twitter_post: 1}`. Tools omitted here are unconstrained.
+    #[serde(default)]
+    pub tool_call_counts: BTreeMap<String, u32>,
     #[serde(default)]
     pub outcome: Option<String>,
     #[serde(default)]
@@ -267,6 +276,13 @@ pub fn assert_expectations(
         );
     }
 
+    if !expect.tools_in_order.is_empty() {
+        assert_tool_order(&fixture.name, &expect.tools_in_order, &result.tool_names)?;
+    }
+    if !expect.tool_call_counts.is_empty() {
+        assert_tool_counts(&fixture.name, &expect.tool_call_counts, &result.tool_names)?;
+    }
+
     if let Some(expected) = &expect.outcome {
         let actual = result.task_end.effective_outcome().as_str();
         anyhow::ensure!(
@@ -431,6 +447,49 @@ pub fn assert_expectations(
     Ok(())
 }
 
+/// Assert `expected` appears as a subsequence of `actual` tool calls.
+///
+/// Unrelated calls may interleave; only relative order is checked. A tool
+/// listed twice must appear twice, in that order.
+fn assert_tool_order(
+    fixture_name: &str,
+    expected: &[String],
+    actual: &[String],
+) -> anyhow::Result<()> {
+    let mut cursor = 0usize;
+    for tool in expected {
+        match actual[cursor..].iter().position(|name| name == tool) {
+            Some(offset) => cursor += offset + 1,
+            None => anyhow::bail!(
+                "[{fixture_name}] tools_in_order: expected {expected:?} as a subsequence, \
+                 but {tool} does not appear after position {cursor}; got {actual:?}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Assert each named tool was called exactly the expected number of times.
+/// Tools absent from `expected` are unconstrained.
+fn assert_tool_counts(
+    fixture_name: &str,
+    expected: &BTreeMap<String, u32>,
+    actual: &[String],
+) -> anyhow::Result<()> {
+    for (tool, want) in expected {
+        let got = actual
+            .iter()
+            .filter(|name| name.as_str() == tool.as_str())
+            .count() as u32;
+        anyhow::ensure!(
+            got == *want,
+            "[{fixture_name}] tool_call_counts: expected {tool} called {want} time(s), \
+             got {got}; all calls: {actual:?}"
+        );
+    }
+    Ok(())
+}
+
 fn assert_score_min(
     fixture_name: &str,
     label: &str,
@@ -470,6 +529,8 @@ pub fn build_recorded_fixture(
             tools_required_predicted: Some(eval.routing.tools_required_predicted),
             tools_used: tool_names.to_vec(),
             tools_not_used: Vec::new(),
+            tools_in_order: Vec::new(),
+            tool_call_counts: BTreeMap::new(),
             outcome: Some(task_end.effective_outcome().as_str().to_string()),
             stop_reason: Some(eval.quality.stop_reason.clone()),
             llm_calls_min: None,
@@ -502,6 +563,136 @@ fn round_score(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn counts(raw: &[(&str, u32)]) -> BTreeMap<String, u32> {
+        raw.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn tools_in_order_rejects_reversed_sequence() {
+        let err = assert_tool_order(
+            "fx",
+            &names(&["read_file", "write_file"]),
+            &names(&["write_file", "read_file"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("tools_in_order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tools_in_order_allows_unrelated_calls_between() {
+        assert_tool_order(
+            "fx",
+            &names(&["read_file", "write_file"]),
+            &names(&["read_file", "system_info", "write_file"]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn tools_in_order_requires_each_repeat_of_a_tool() {
+        let err = assert_tool_order(
+            "fx",
+            &names(&["read_file", "write_file", "read_file"]),
+            &names(&["read_file", "write_file"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("tools_in_order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tools_in_order_rejects_missing_tool() {
+        let err = assert_tool_order(
+            "fx",
+            &names(&["read_file", "write_file"]),
+            &names(&["read_file"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("write_file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_call_counts_rejects_duplicate_side_effect() {
+        let err = assert_tool_counts(
+            "fx",
+            &counts(&[("twitter_post", 1)]),
+            &names(&["twitter_post", "twitter_post"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("twitter_post") && err.to_string().contains("got 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_call_counts_accepts_exact_match() {
+        assert_tool_counts(
+            "fx",
+            &counts(&[("twitter_post", 1), ("read_file", 2)]),
+            &names(&["read_file", "twitter_post", "read_file"]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn tool_call_counts_zero_requires_absence() {
+        let err = assert_tool_counts(
+            "fx",
+            &counts(&[("twitter_post", 0)]),
+            &names(&["twitter_post"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("twitter_post"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_call_counts_ignores_unlisted_tools() {
+        assert_tool_counts(
+            "fx",
+            &counts(&[("read_file", 1)]),
+            &names(&["read_file", "system_info"]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_fixture_yaml_reads_order_and_count_assertions() {
+        let yaml = r#"
+name: ordering
+session_id: s1
+user_text: Post it
+expect:
+  tools_in_order: [read_file, twitter_post]
+  tool_call_counts:
+    twitter_post: 1
+"#;
+        let fixture = parse_fixture_yaml(yaml).unwrap();
+        assert_eq!(
+            fixture.expect.tools_in_order,
+            names(&["read_file", "twitter_post"])
+        );
+        assert_eq!(
+            fixture.expect.tool_call_counts.get("twitter_post"),
+            Some(&1)
+        );
+    }
 
     #[test]
     fn parse_minimal_fixture_yaml() {

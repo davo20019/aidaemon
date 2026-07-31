@@ -15,8 +15,8 @@ use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
+    ToolVerificationMode, TruncationInfo,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -884,14 +884,19 @@ impl HttpRequestTool {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 warn!("Approval response channel closed for http_request");
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!(
+                    "Approval response channel closed for http_request"
+                ))
             }
             Err(_) => {
                 warn!(
                     "Approval request timed out for http_request ({}s)",
                     APPROVAL_TIMEOUT_SECS
                 );
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!(
+                    "Approval request timed out for http_request after {}s",
+                    APPROVAL_TIMEOUT_SECS
+                ))
             }
         }
     }
@@ -1706,9 +1711,11 @@ impl Tool for HttpRequestTool {
                 .with_verification_mode(ToolVerificationMode::ResultContent)
                 .with_target_hint(ToolTargetHintKind::Url, url),
             "POST" | "PUT" | "PATCH" | "DELETE" => {
-                ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url)
+                ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
+                    .with_target_hint(ToolTargetHintKind::Url, url)
             }
-            _ => ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url),
+            _ => ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
+                .with_target_hint(ToolTargetHintKind::Url, url),
         }
     }
 }

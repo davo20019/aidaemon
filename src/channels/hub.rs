@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
@@ -18,6 +18,41 @@ use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 /// read by the hub to route outbound messages (approvals, media, notifications).
 pub type SessionMap = Arc<RwLock<HashMap<String, String>>>;
 
+/// Cancellation-safe lifetime for an internal child-session route.
+///
+/// Child agent futures can be aborted while awaiting an LLM or a tool. Keeping
+/// cleanup in `Drop` prevents those cancellations from leaving stale routes in
+/// the hub indefinitely. The parent value is checked before removal so an old
+/// guard can never erase a newer route for the same child identifier.
+pub(crate) struct SessionRouteGuard {
+    hub: Weak<ChannelHub>,
+    child_session: String,
+    parent_session: String,
+}
+
+impl Drop for SessionRouteGuard {
+    fn drop(&mut self) {
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        if let Ok(mut routes) = hub.session_routes.try_write() {
+            if routes.get(&self.child_session) == Some(&self.parent_session) {
+                routes.remove(&self.child_session);
+            }
+            return;
+        }
+
+        let child_session = self.child_session.clone();
+        let parent_session = self.parent_session.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                hub.unregister_session_route(&child_session, &parent_session)
+                    .await;
+            });
+        }
+    }
+}
+
 /// Central router for outbound messages across all channels.
 ///
 /// The hub routes approval requests, media, and notifications to the
@@ -28,6 +63,10 @@ pub struct ChannelHub {
     /// Registered channels. Uses RwLock to support dynamic registration.
     channels: RwLock<Vec<Arc<dyn Channel>>>,
     session_map: SessionMap,
+    /// Ephemeral runtime-owned routes from a specialist session to the human
+    /// conversation that spawned it. This lets approvals use the real parent
+    /// chat without making internal worker IDs externally addressable.
+    session_routes: RwLock<HashMap<String, String>>,
     queue_telemetry: Option<Arc<QueueTelemetry>>,
     queue_policy: Option<QueuePolicyConfig>,
     delivery_note_agent: Option<Arc<Agent>>,
@@ -54,6 +93,7 @@ impl ChannelHub {
         Self {
             channels: RwLock::new(channels),
             session_map,
+            session_routes: RwLock::new(HashMap::new()),
             queue_telemetry: None,
             queue_policy: None,
             delivery_note_agent: None,
@@ -136,7 +176,7 @@ impl ChannelHub {
         self
     }
 
-    async fn record_media_delivery_note(&self, media: &MediaMessage) {
+    async fn record_media_delivery_note(&self, session_id: &str, media: &MediaMessage) {
         let Some(agent) = self.delivery_note_agent.as_ref() else {
             return;
         };
@@ -152,11 +192,11 @@ impl ChannelHub {
             filename, file_path
         );
         if let Err(err) = agent
-            .record_auxiliary_assistant_note(&media.session_id, &summary)
+            .record_auxiliary_assistant_note(session_id, &summary)
             .await
         {
             warn!(
-                session_id = %media.session_id,
+                session_id,
                 error = %err,
                 "Failed to persist outbound media delivery summary"
             );
@@ -191,9 +231,58 @@ impl ChannelHub {
         &self.session_map
     }
 
-    /// Find the channel that owns a session.
-    /// Returns None for unknown sessions to prevent cross-channel privacy leaks.
-    async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
+    /// Route an internal child session through its originating human session.
+    /// Only the agent runtime calls this; tool/model arguments cannot register
+    /// routes. The parent may itself be a child, so resolution follows a short
+    /// bounded chain.
+    pub(crate) async fn register_session_route(
+        self: &Arc<Self>,
+        child_session: &str,
+        parent_session: &str,
+    ) -> Option<SessionRouteGuard> {
+        if child_session.is_empty() || parent_session.is_empty() || child_session == parent_session
+        {
+            return None;
+        }
+        self.session_routes
+            .write()
+            .await
+            .insert(child_session.to_string(), parent_session.to_string());
+        Some(SessionRouteGuard {
+            hub: Arc::downgrade(self),
+            child_session: child_session.to_string(),
+            parent_session: parent_session.to_string(),
+        })
+    }
+
+    async fn unregister_session_route(&self, child_session: &str, parent_session: &str) {
+        let mut routes = self.session_routes.write().await;
+        if routes.get(child_session).map(String::as_str) == Some(parent_session) {
+            routes.remove(child_session);
+        }
+    }
+
+    async fn routed_session_id(&self, session_id: &str) -> String {
+        let routes = self.session_routes.read().await;
+        let mut current = session_id.to_string();
+        for _ in 0..8 {
+            let Some(parent) = routes.get(&current) else {
+                return current;
+            };
+            if parent == &current {
+                break;
+            }
+            current = parent.clone();
+        }
+        warn!(session_id, "Session route chain was cyclic or too deep");
+        session_id.to_string()
+    }
+
+    /// Resolve both the channel and the externally addressable session. Every
+    /// outbound operation must use the returned session, not the internal child
+    /// identifier that was supplied by the caller.
+    async fn routed_channel(&self, session_id: &str) -> Option<(Arc<dyn Channel>, String)> {
+        let routed_session = self.routed_session_id(session_id).await;
         let map =
             match tokio::time::timeout(std::time::Duration::from_secs(2), self.session_map.read())
                 .await
@@ -220,12 +309,21 @@ impl ChannelHub {
                     return None;
                 }
             };
-        if let Some(channel_name) = map.get(session_id) {
+        if let Some(channel_name) = map.get(&routed_session) {
             if let Some(ch) = channels.iter().find(|c| &c.name() == channel_name) {
-                return Some(ch.clone());
+                return Some((ch.clone(), routed_session));
             }
         }
         None
+    }
+
+    /// Find the channel that owns a session.
+    /// Returns None for unknown sessions to prevent cross-channel privacy leaks.
+    #[cfg(test)]
+    async fn channel_for_session(&self, session_id: &str) -> Option<Arc<dyn Channel>> {
+        self.routed_channel(session_id)
+            .await
+            .map(|(channel, _)| channel)
     }
 
     /// Request approval through a channel that supports inline buttons.
@@ -240,8 +338,8 @@ impl ChannelHub {
         warnings: &[String],
         permission_mode: PermissionMode,
     ) -> anyhow::Result<ApprovalResponse> {
-        let channel = self
-            .channel_for_session(session_id)
+        let (channel, routed_session) = self
+            .routed_channel(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
         if !channel.capabilities().inline_buttons {
@@ -251,7 +349,13 @@ impl ChannelHub {
             );
         }
         channel
-            .request_approval(session_id, command, risk_level, warnings, permission_mode)
+            .request_approval(
+                &routed_session,
+                command,
+                risk_level,
+                warnings,
+                permission_mode,
+            )
             .await
     }
 
@@ -265,8 +369,8 @@ impl ChannelHub {
         goal_description: &str,
         details: &[String],
     ) -> anyhow::Result<bool> {
-        let channel = self
-            .channel_for_session(session_id)
+        let (channel, routed_session) = self
+            .routed_channel(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
         if !channel.capabilities().inline_buttons {
@@ -276,7 +380,7 @@ impl ChannelHub {
             );
         }
         channel
-            .request_goal_confirmation(session_id, goal_description, details)
+            .request_goal_confirmation(&routed_session, goal_description, details)
             .await
     }
 
@@ -325,57 +429,50 @@ impl ChannelHub {
             };
 
             if should_shed {
-                let mut had_error = false;
-                if request.response_tx.send(ApprovalResponse::Deny).is_err() {
-                    had_error = true;
-                    warn!(
-                        session_id = %request.session_id,
-                        "Approval response receiver dropped before overload-shed deny could be sent"
-                    );
-                }
                 if let Some(queue_telemetry) = &self.queue_telemetry {
                     queue_telemetry.mark_approval_dropped(1);
-                    if had_error {
-                        queue_telemetry.mark_approval_failed();
-                    }
+                    queue_telemetry.mark_approval_failed();
                     queue_telemetry.mark_approval_completed();
                 }
                 warn!(
                     session_id = %request.session_id,
                     "Dropping approval request due to configured overload shedding policy"
                 );
+                // Drop response_tx without manufacturing a user denial. Tools
+                // still fail closed, but can distinguish infrastructure
+                // unavailability from an explicit Deny response.
                 continue;
             }
 
             let hub = self.clone();
             tokio::spawn(async move {
                 let queue_telemetry = hub.queue_telemetry.clone();
-                let channel = hub.channel_for_session(&request.session_id).await;
+                let route = hub.routed_channel(&request.session_id).await;
                 let mut had_error = false;
-                let response = match channel {
-                    Some(ch) => match request.kind {
+                let response = match route {
+                    Some((ch, routed_session)) => match request.kind {
                         ApprovalKind::GoalConfirmation => {
                             match ch
                                 .request_goal_confirmation(
-                                    &request.session_id,
+                                    &routed_session,
                                     &request.command,
                                     &request.warnings,
                                 )
                                 .await
                             {
-                                Ok(true) => ApprovalResponse::AllowOnce,
-                                Ok(false) => ApprovalResponse::Deny,
+                                Ok(true) => Some(ApprovalResponse::AllowOnce),
+                                Ok(false) => Some(ApprovalResponse::Deny),
                                 Err(e) => {
                                     warn!("Goal confirmation failed on {}: {}", ch.name(), e);
                                     had_error = true;
-                                    ApprovalResponse::Deny
+                                    None
                                 }
                             }
                         }
                         ApprovalKind::Command => {
                             match ch
                                 .request_approval(
-                                    &request.session_id,
+                                    &routed_session,
                                     &request.command,
                                     request.risk_level,
                                     &request.warnings,
@@ -383,30 +480,32 @@ impl ChannelHub {
                                 )
                                 .await
                             {
-                                Ok(resp) => resp,
+                                Ok(resp) => Some(resp),
                                 Err(e) => {
                                     warn!("Approval request failed on {}: {}", ch.name(), e);
                                     had_error = true;
-                                    ApprovalResponse::Deny
+                                    None
                                 }
                             }
                         }
                     },
                     None => {
                         warn!(
-                            "No channel found for session {}, denying",
+                            "No channel found for session {}; approval unavailable",
                             request.session_id
                         );
                         had_error = true;
-                        ApprovalResponse::Deny
+                        None
                     }
                 };
-                if request.response_tx.send(response).is_err() {
-                    had_error = true;
-                    warn!(
-                        session_id = %request.session_id,
-                        "Approval response receiver dropped before response could be sent"
-                    );
+                if let Some(response) = response {
+                    if request.response_tx.send(response).is_err() {
+                        had_error = true;
+                        warn!(
+                            session_id = %request.session_id,
+                            "Approval response receiver dropped before response could be sent"
+                        );
+                    }
                 }
                 if let Some(queue_telemetry) = queue_telemetry {
                     if had_error {
@@ -461,10 +560,11 @@ impl ChannelHub {
 
             if should_shed {
                 let mut had_error = false;
-                if let Some(channel) = self.channel_for_session(&msg.session_id).await {
+                if let Some((channel, routed_session)) = self.routed_channel(&msg.session_id).await
+                {
                     if let Err(e) = channel
                         .send_text(
-                            &msg.session_id,
+                            &routed_session,
                             "[Media skipped due high system load. Please retry shortly.]",
                         )
                         .await
@@ -504,29 +604,29 @@ impl ChannelHub {
             // fallback) was actually handed to the channel successfully. Reasons
             // are concise and free of secrets/URLs.
             let mut delivery_result: Result<(), String> = Ok(());
-            if let Some(channel) = self.channel_for_session(&msg.session_id).await {
+            if let Some((channel, routed_session)) = self.routed_channel(&msg.session_id).await {
                 if channel.capabilities().media {
                     // Skip a document already delivered to this session recently
                     // (e.g. the notifier's deterministic delivery beat this
                     // `send_file` to the same file). The file is already in the
                     // chat, so report success to the enqueuing tool.
-                    if !self.claim_media_delivery(&msg.session_id, &msg).await {
+                    if !self.claim_media_delivery(&routed_session, &msg).await {
                         info!(
-                            session_id = %msg.session_id,
+                            session_id = %routed_session,
                             "Suppressed duplicate document delivery from media queue (already delivered recently)"
                         );
-                    } else if let Err(e) = channel.send_media(&msg.session_id, &msg).await {
-                        self.release_media_delivery(&msg.session_id, &msg).await;
+                    } else if let Err(e) = channel.send_media(&routed_session, &msg).await {
+                        self.release_media_delivery(&routed_session, &msg).await;
                         had_error = true;
                         delivery_result = Err(e.to_string());
                         warn!("Failed to send media via {}: {}", channel.name(), e);
                     } else {
-                        self.record_media_delivery_note(&msg).await;
+                        self.record_media_delivery_note(&routed_session, &msg).await;
                     }
                 } else {
                     // Channel doesn't support media — send caption as text
                     if let Err(e) = channel
-                        .send_text(&msg.session_id, &format!("[Media] {}", msg.caption))
+                        .send_text(&routed_session, &format!("[Media] {}", msg.caption))
                         .await
                     {
                         had_error = true;
@@ -554,9 +654,15 @@ impl ChannelHub {
     /// Send text to the channel that owns a specific session.
     #[allow(dead_code)]
     pub async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        let (channel, routed_session) = self
+            .routed_channel(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
+
         // Deduplicate identical spam (e.g. multiple heartbeats) within a short window.
         // This intentionally remains best-effort: it favors reducing noise over
         // perfect delivery guarantees.
+        let mut delivery_claim = None;
         {
             let now = tokio::time::Instant::now();
             let text_norm = text.trim();
@@ -567,29 +673,44 @@ impl ChannelHub {
             .await
             {
                 Ok(mut last) => {
-                    if let Some((prev, prev_at)) = last.get(session_id) {
+                    if let Some((prev, prev_at)) = last.get(&routed_session) {
                         if prev.trim() == text_norm
                             && now.duration_since(*prev_at) < std::time::Duration::from_secs(10)
                         {
                             return Ok(());
                         }
                     }
-                    last.insert(session_id.to_string(), (text_norm.to_string(), now));
+                    last.insert(routed_session.clone(), (text_norm.to_string(), now));
+                    delivery_claim = Some((text_norm.to_string(), now));
                 }
                 Err(_) => {
                     warn!(
-                        session_id,
+                        session_id = %routed_session,
                         "Timed out acquiring dedupe lock in send_text; continuing without dedupe"
                     );
                 }
             }
         }
 
-        if let Some(channel) = self.channel_for_session(session_id).await {
-            channel.send_text(session_id, text).await
-        } else {
-            anyhow::bail!("No channel found for session {}", session_id)
+        let result = channel.send_text(&routed_session, text).await;
+        if result.is_err() {
+            if let Some((claimed_text, claimed_at)) = delivery_claim {
+                if let Ok(mut last) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.last_sent_text.write(),
+                )
+                .await
+                {
+                    let owns_claim = last
+                        .get(&routed_session)
+                        .is_some_and(|(text, at)| text == &claimed_text && *at == claimed_at);
+                    if owns_claim {
+                        last.remove(&routed_session);
+                    }
+                }
+            }
         }
+        result
     }
 
     /// Send text and return an editable message id when the owning channel
@@ -600,8 +721,8 @@ impl ChannelHub {
         session_id: &str,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
-        if let Some(channel) = self.channel_for_session(session_id).await {
-            channel.send_text_tracked(session_id, text).await
+        if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
+            channel.send_text_tracked(&routed_session, text).await
         } else {
             anyhow::bail!("No channel found for session {}", session_id)
         }
@@ -615,8 +736,8 @@ impl ChannelHub {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<bool> {
-        if let Some(channel) = self.channel_for_session(session_id).await {
-            channel.edit_text(session_id, message_id, text).await
+        if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
+            channel.edit_text(&routed_session, message_id, text).await
         } else {
             Ok(false)
         }
@@ -625,24 +746,25 @@ impl ChannelHub {
     /// Send media to the channel that owns a specific session.
     /// Falls back to text caption for channels without media support.
     pub async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-        if let Some(channel) = self.channel_for_session(session_id).await {
+        if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
             if channel.capabilities().media {
-                if !self.claim_media_delivery(session_id, media).await {
+                if !self.claim_media_delivery(&routed_session, media).await {
                     info!(
-                        session_id,
+                        session_id = %routed_session,
                         "Suppressed duplicate document delivery (already delivered recently)"
                     );
                     return Ok(());
                 }
-                if let Err(e) = channel.send_media(session_id, media).await {
-                    self.release_media_delivery(session_id, media).await;
+                if let Err(e) = channel.send_media(&routed_session, media).await {
+                    self.release_media_delivery(&routed_session, media).await;
                     return Err(e);
                 }
-                self.record_media_delivery_note(media).await;
+                self.record_media_delivery_note(&routed_session, media)
+                    .await;
                 Ok(())
             } else {
                 channel
-                    .send_text(session_id, &format!("[File] {}", media.caption))
+                    .send_text(&routed_session, &format!("[File] {}", media.caption))
                     .await
             }
         } else {
@@ -660,32 +782,33 @@ impl ChannelHub {
         session_id: &str,
         media: &MediaMessage,
     ) -> anyhow::Result<()> {
-        let Some(channel) = self.channel_for_session(session_id).await else {
+        let Some((channel, routed_session)) = self.routed_channel(session_id).await else {
             anyhow::bail!("No channel found for session {}", session_id);
         };
         if !channel.capabilities().media {
             anyhow::bail!(
                 "Channel '{}' for session {} cannot deliver media documents",
                 channel.name(),
-                session_id
+                routed_session
             );
         }
         // Suppress a duplicate of a document already delivered to this session
         // within the dedupe window (e.g. the model's `send_file` racing the
         // notifier's deterministic delivery of the same file). Treat as success —
         // the file IS in the chat.
-        if !self.claim_media_delivery(session_id, media).await {
+        if !self.claim_media_delivery(&routed_session, media).await {
             info!(
-                session_id,
+                session_id = %routed_session,
                 "Suppressed duplicate document delivery (already delivered recently)"
             );
             return Ok(());
         }
-        if let Err(e) = channel.send_media(session_id, media).await {
-            self.release_media_delivery(session_id, media).await;
+        if let Err(e) = channel.send_media(&routed_session, media).await {
+            self.release_media_delivery(&routed_session, media).await;
             return Err(e);
         }
-        self.record_media_delivery_note(media).await;
+        self.record_media_delivery_note(&routed_session, media)
+            .await;
         Ok(())
     }
 
@@ -693,8 +816,8 @@ impl ChannelHub {
     /// Errors are logged but don't stop the broadcast.
     pub async fn broadcast_text(&self, session_ids: &[String], text: &str) {
         for session_id in session_ids {
-            if let Some(channel) = self.channel_for_session(session_id).await {
-                if let Err(e) = channel.send_text(session_id, text).await {
+            if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
+                if let Err(e) = channel.send_text(&routed_session, text).await {
                     warn!(
                         channel = channel.name(),
                         session_id, "Broadcast send failed: {}", e
@@ -709,6 +832,7 @@ impl ChannelHub {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -723,6 +847,7 @@ mod tests {
     struct NamedTestChannel {
         channel_name: String,
         messages: Mutex<Vec<(String, String)>>, // (session_id, text)
+        approvals: Mutex<Vec<String>>,
     }
 
     impl NamedTestChannel {
@@ -730,11 +855,16 @@ mod tests {
             Self {
                 channel_name: name.to_string(),
                 messages: Mutex::new(Vec::new()),
+                approvals: Mutex::new(Vec::new()),
             }
         }
 
         async fn captured_messages(&self) -> Vec<(String, String)> {
             self.messages.lock().await.clone()
+        }
+
+        async fn captured_approvals(&self) -> Vec<String> {
+            self.approvals.lock().await.clone()
         }
     }
 
@@ -767,12 +897,13 @@ mod tests {
 
         async fn request_approval(
             &self,
-            _session_id: &str,
+            session_id: &str,
             _command: &str,
             _risk_level: RiskLevel,
             _warnings: &[String],
             _permission_mode: PermissionMode,
         ) -> anyhow::Result<ApprovalResponse> {
+            self.approvals.lock().await.push(session_id.to_string());
             Ok(ApprovalResponse::AllowOnce)
         }
     }
@@ -785,6 +916,48 @@ mod tests {
     /// so tests can prove de-duplication suppressed a redundant delivery.
     struct CountingMediaChannel {
         sent_docs: Mutex<Vec<String>>, // file paths
+    }
+
+    struct FlakyTextChannel {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Channel for FlakyTextChannel {
+        fn name(&self) -> String {
+            "flaky".to_string()
+        }
+
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities {
+                markdown: true,
+                inline_buttons: false,
+                media: false,
+                max_message_len: 4096,
+            }
+        }
+
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("synthetic first-send failure");
+            }
+            Ok(())
+        }
+
+        async fn send_media(&self, _session_id: &str, _media: &MediaMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _session_id: &str,
+            _command: &str,
+            _risk_level: RiskLevel,
+            _warnings: &[String],
+            _permission_mode: PermissionMode,
+        ) -> anyhow::Result<ApprovalResponse> {
+            Ok(ApprovalResponse::AllowOnce)
+        }
     }
 
     impl CountingMediaChannel {
@@ -910,6 +1083,145 @@ mod tests {
         // Unknown session should return None to prevent cross-channel leaks
         let found = hub.channel_for_session("unknown_session").await;
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn child_approval_is_delivered_through_parent_session() {
+        let channel = Arc::new(NamedTestChannel::new("telegram"));
+        let session_map = session_map_with(vec![("parent-session", "telegram")]);
+        let hub = Arc::new(ChannelHub::new(
+            vec![channel.clone() as Arc<dyn Channel>],
+            session_map,
+        ));
+        let route_guard = hub
+            .register_session_route("specialist:browser:child", "parent-session")
+            .await
+            .expect("route guard");
+
+        hub.send_text("specialist:browser:child", "child result")
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.captured_messages().await,
+            vec![("parent-session".to_string(), "child result".to_string())],
+            "all child output must use the externally addressable parent session"
+        );
+
+        let (approval_tx, approval_rx) = mpsc::channel(1);
+        let listener = tokio::spawn(hub.clone().approval_listener(approval_rx));
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        approval_tx
+            .send(ApprovalRequest {
+                command: "Navigate to public site".to_string(),
+                session_id: "specialist:browser:child".to_string(),
+                risk_level: RiskLevel::Medium,
+                warnings: Vec::new(),
+                permission_mode: PermissionMode::Default,
+                response_tx,
+                kind: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response_rx.await.unwrap(),
+            ApprovalResponse::AllowOnce
+        ));
+        drop(route_guard);
+        tokio::task::yield_now().await;
+        let (unrouted_tx, unrouted_rx) = tokio::sync::oneshot::channel();
+        approval_tx
+            .send(ApprovalRequest {
+                command: "Navigate to public site".to_string(),
+                session_id: "specialist:browser:child".to_string(),
+                risk_level: RiskLevel::Medium,
+                warnings: Vec::new(),
+                permission_mode: PermissionMode::Default,
+                response_tx: unrouted_tx,
+                kind: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            unrouted_rx.await.is_err(),
+            "missing runtime route must close the request as unavailable, not fabricate Deny"
+        );
+        drop(approval_tx);
+        listener.await.unwrap();
+        assert_eq!(channel.captured_approvals().await, vec!["parent-session"]);
+    }
+
+    #[tokio::test]
+    async fn failed_text_send_releases_dedupe_claim_for_retry() {
+        let channel = Arc::new(FlakyTextChannel {
+            calls: AtomicUsize::new(0),
+        });
+        let session_map = session_map_with(vec![("session", "flaky")]);
+        let hub = ChannelHub::new(vec![channel.clone() as Arc<dyn Channel>], session_map);
+
+        assert!(hub.send_text("session", "important result").await.is_err());
+        hub.send_text("session", "important result")
+            .await
+            .expect("retry must reach the channel");
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_route_guard_cannot_remove_newer_route() {
+        let channel = Arc::new(NamedTestChannel::new("telegram"));
+        let session_map =
+            session_map_with(vec![("parent-one", "telegram"), ("parent-two", "telegram")]);
+        let hub = Arc::new(ChannelHub::new(
+            vec![channel.clone() as Arc<dyn Channel>],
+            session_map,
+        ));
+        let old_guard = hub
+            .register_session_route("child", "parent-one")
+            .await
+            .unwrap();
+        let new_guard = hub
+            .register_session_route("child", "parent-two")
+            .await
+            .unwrap();
+
+        drop(old_guard);
+        hub.send_text("child", "still routed")
+            .await
+            .expect("new route must survive old cleanup");
+        assert_eq!(
+            channel.captured_messages().await,
+            vec![("parent-two".to_string(), "still routed".to_string())]
+        );
+        drop(new_guard);
+    }
+
+    #[tokio::test]
+    async fn aborting_child_future_removes_session_route() {
+        let channel = Arc::new(NamedTestChannel::new("telegram"));
+        let session_map = session_map_with(vec![("parent", "telegram")]);
+        let hub = Arc::new(ChannelHub::new(
+            vec![channel as Arc<dyn Channel>],
+            session_map,
+        ));
+        let child_hub = hub.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let child = tokio::spawn(async move {
+            let _route = child_hub
+                .register_session_route("child", "parent")
+                .await
+                .unwrap();
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        child.abort();
+        let _ = child.await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            hub.send_text("child", "must not leak").await.is_err(),
+            "aborted child route must not remain externally addressable"
+        );
     }
 
     #[tokio::test]

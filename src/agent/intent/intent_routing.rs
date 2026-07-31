@@ -1185,11 +1185,11 @@ pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<Connected
 
 /// Classify user intent complexity for orchestration routing.
 ///
-/// Fully deterministic: schedule extraction, recurring-without-timing
-/// detection, and a complex-request fallback for obviously cross-project
-/// multi-step requests. Everything else routes as `Simple` (full agent
-/// loop). The LLM-provided `complexity` field this once consumed died with
-/// the `[INTENT_GATE]` protocol in v0.9.21.
+/// This is the deterministic first pass: schedule extraction plus a
+/// conservative durable-work fallback. When a semantic task assessment is
+/// available, [`refine_intent_complexity_with_task_shape`] finalizes the
+/// inline-vs-durable decision. Keeping this pass means routing still works
+/// when the assessment provider is unavailable.
 pub(super) fn classify_intent_complexity(user_text: &str) -> IntentComplexity {
     // Heuristic schedule extraction: if the user message contains a concrete
     // schedule phrase, treat it as scheduled rather than falling into the
@@ -1217,6 +1217,61 @@ pub(super) fn classify_intent_complexity(user_text: &str) -> IntentComplexity {
     }
 
     IntentComplexity::Simple
+}
+
+/// Refine the deterministic complexity fallback with a semantic task-shape
+/// classification. Scheduling remains deterministic because its parsed timing
+/// payload must be preserved. Low-confidence or internally inconsistent model
+/// output is ignored.
+///
+/// The boolean reports whether the structured assessment was accepted, even
+/// when it agreed with the fallback.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct IntentTaskShape<'a> {
+    pub execution_mode: Option<&'a str>,
+    pub confidence: Option<&'a str>,
+    pub independent_workstreams: Option<u8>,
+    pub requires_background_continuation: Option<bool>,
+}
+
+pub(super) fn refine_intent_complexity_with_task_shape(
+    fallback: IntentComplexity,
+    shape: IntentTaskShape<'_>,
+) -> (IntentComplexity, bool) {
+    if matches!(
+        fallback,
+        IntentComplexity::Scheduled { .. } | IntentComplexity::ScheduledMissingTiming
+    ) {
+        return (fallback, false);
+    }
+
+    let confident = matches!(
+        shape
+            .confidence
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "medium" | "high")
+    );
+    if !confident {
+        return (fallback, false);
+    }
+
+    let mode = shape
+        .execution_mode
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let shape_demands_durable = shape.requires_background_continuation == Some(true)
+        || shape
+            .independent_workstreams
+            .is_some_and(|count| count >= 2);
+
+    match mode.as_str() {
+        "durable" if shape_demands_durable => (IntentComplexity::Complex, true),
+        "inline" if !shape_demands_durable => (IntentComplexity::Simple, true),
+        // A routing label without supporting shape facts, or an inline label
+        // paired with durable facts, is inconsistent. Retain the deterministic
+        // fallback rather than trusting the label alone.
+        _ => (fallback, false),
+    }
 }
 
 fn looks_like_complex_request_fallback(user_text: &str) -> bool {

@@ -64,6 +64,138 @@ fn test_classify_intent_cross_project_analysis_promoted_to_complex() {
 }
 
 #[test]
+fn test_build_deploy_and_url_handoff_stays_with_primary_agent() {
+    assert_eq!(
+        classify_intent_complexity(
+            "Can you create a website about Ecuador in the ~/projects folder and push to a \
+             worker on cloudflare and send me the URL when it's done. Make it look nice."
+        ),
+        IntentComplexity::Simple
+    );
+}
+
+#[test]
+fn test_small_single_artifact_creation_stays_simple() {
+    assert_eq!(
+        classify_intent_complexity("Create a file named notes.txt."),
+        IntentComplexity::Simple
+    );
+}
+
+#[test]
+fn structured_task_shape_can_promote_semantic_durable_work() {
+    let fallback = IntentComplexity::Simple;
+    let (complexity, accepted) = refine_intent_complexity_with_task_shape(
+        fallback,
+        IntentTaskShape {
+            execution_mode: Some("durable"),
+            confidence: Some("high"),
+            independent_workstreams: Some(1),
+            requires_background_continuation: Some(true),
+        },
+    );
+
+    assert!(accepted);
+    assert_eq!(complexity, IntentComplexity::Complex);
+}
+
+#[test]
+fn structured_task_shape_can_demote_long_but_cohesive_work() {
+    let fallback = IntentComplexity::Complex;
+    let (complexity, accepted) = refine_intent_complexity_with_task_shape(
+        fallback,
+        IntentTaskShape {
+            execution_mode: Some("inline"),
+            confidence: Some("medium"),
+            independent_workstreams: Some(1),
+            requires_background_continuation: Some(false),
+        },
+    );
+
+    assert!(accepted);
+    assert_eq!(complexity, IntentComplexity::Simple);
+}
+
+#[test]
+fn structured_multistage_delivery_without_background_need_stays_inline() {
+    let (complexity, accepted) = refine_intent_complexity_with_task_shape(
+        IntentComplexity::Simple,
+        IntentTaskShape {
+            execution_mode: Some("inline"),
+            confidence: Some("high"),
+            independent_workstreams: Some(1),
+            requires_background_continuation: Some(false),
+        },
+    );
+    assert!(accepted);
+    assert_eq!(complexity, IntentComplexity::Simple);
+}
+
+#[test]
+fn structured_task_shape_rejects_unsupported_durable_label() {
+    let fallback = IntentComplexity::Simple;
+    let (complexity, accepted) = refine_intent_complexity_with_task_shape(
+        fallback,
+        IntentTaskShape {
+            execution_mode: Some("durable"),
+            confidence: Some("high"),
+            independent_workstreams: Some(1),
+            requires_background_continuation: Some(false),
+        },
+    );
+
+    assert!(!accepted);
+    assert_eq!(complexity, IntentComplexity::Simple);
+}
+
+#[test]
+fn structured_task_shape_rejects_low_confidence_or_inconsistent_output() {
+    let (low_confidence, accepted) = refine_intent_complexity_with_task_shape(
+        IntentComplexity::Simple,
+        IntentTaskShape {
+            execution_mode: Some("durable"),
+            confidence: Some("low"),
+            independent_workstreams: Some(3),
+            requires_background_continuation: Some(true),
+        },
+    );
+    assert!(!accepted);
+    assert_eq!(low_confidence, IntentComplexity::Simple);
+
+    let (inconsistent, accepted) = refine_intent_complexity_with_task_shape(
+        IntentComplexity::Complex,
+        IntentTaskShape {
+            execution_mode: Some("inline"),
+            confidence: Some("high"),
+            independent_workstreams: Some(2),
+            requires_background_continuation: Some(false),
+        },
+    );
+    assert!(!accepted);
+    assert_eq!(inconsistent, IntentComplexity::Complex);
+}
+
+#[test]
+fn structured_task_shape_never_overrides_parsed_schedule() {
+    let scheduled = IntentComplexity::Scheduled {
+        schedule_raw: "every 6h".to_string(),
+        is_one_shot: false,
+    };
+    let (complexity, accepted) = refine_intent_complexity_with_task_shape(
+        scheduled.clone(),
+        IntentTaskShape {
+            execution_mode: Some("inline"),
+            confidence: Some("high"),
+            independent_workstreams: Some(1),
+            requires_background_continuation: Some(false),
+        },
+    );
+
+    assert!(!accepted);
+    assert_eq!(complexity, scheduled);
+}
+
+#[test]
 fn test_detect_schedule_heuristic_in_time() {
     let detected = detect_schedule_heuristic("remind me in 2h");
     assert_eq!(detected, Some(("in 2h".to_string(), true)));

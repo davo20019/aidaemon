@@ -926,29 +926,32 @@ async fn handle_simple_intent(
         );
     }
 
-    // Inject plan suggestion when heuristics detect a multi-step task.
-    let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
-    if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
-        info!(
-            ctx.session_id,
-            reason = ?plan_trigger.reason(),
-            "Plan detection triggered for simple intent"
-        );
-        ctx.pending_system_messages
-            .push(SystemDirective::PlanSuggestion { hint });
-        // Telemetry: this turn is plan-worthy, so the model is expected to call
-        // track_requirements. The denominator for checklist capture rate (join
-        // to a later checklist_nudge/checklist_complete event by task_id).
-        agent
-            .emit_decision_point(
-                ctx.emitter,
-                ctx.task_id,
-                ctx.iteration,
-                crate::events::DecisionType::GateTelemetry,
-                "checklist expected (plan-worthy turn)",
-                serde_json::json!({ "event": "checklist_expected" }),
-            )
-            .await;
+    // Guided models may benefit from a checklist suggestion. Autonomous models
+    // own their approach and receive no plan/checklist narration.
+    if agent.trust_tier_for_model(ctx.model) == crate::agent::trust_tier::ModelTrustTier::Guided {
+        let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
+        if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
+            info!(
+                ctx.session_id,
+                reason = ?plan_trigger.reason(),
+                "Plan detection triggered for simple intent"
+            );
+            ctx.pending_system_messages
+                .push(SystemDirective::PlanSuggestion { hint });
+            // Telemetry: this turn is plan-worthy, so the model is expected to call
+            // track_requirements. The denominator for checklist capture rate (join
+            // to a later checklist_nudge/checklist_complete event by task_id).
+            agent
+                .emit_decision_point(
+                    ctx.emitter,
+                    ctx.task_id,
+                    ctx.iteration,
+                    crate::events::DecisionType::GateTelemetry,
+                    "checklist expected (plan-worthy turn)",
+                    serde_json::json!({ "event": "checklist_expected" }),
+                )
+                .await;
+        }
     }
 
     info!(
@@ -988,21 +991,25 @@ async fn handle_complex_intent(
                 "Complex non-owner request: filtered competing execution tools for delegation mode"
             );
         }
-        // Inject plan suggestion for non-owner complex intents going through direct loop.
-        let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
-        if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
-            ctx.pending_system_messages
-                .push(SystemDirective::PlanSuggestion { hint });
-            agent
-                .emit_decision_point(
-                    ctx.emitter,
-                    ctx.task_id,
-                    ctx.iteration,
-                    crate::events::DecisionType::GateTelemetry,
-                    "checklist expected (plan-worthy turn)",
-                    serde_json::json!({ "event": "checklist_expected" }),
-                )
-                .await;
+        // Guided non-owner sessions still get a checklist hint. Autonomous
+        // models keep the same thin direct loop as owner sessions.
+        if agent.trust_tier_for_model(ctx.model) == crate::agent::trust_tier::ModelTrustTier::Guided
+        {
+            let plan_trigger = crate::plans::detection::should_create_plan(ctx.user_text);
+            if let Some(hint) = crate::plans::detection::get_plan_suggestion_prompt(&plan_trigger) {
+                ctx.pending_system_messages
+                    .push(SystemDirective::PlanSuggestion { hint });
+                agent
+                    .emit_decision_point(
+                        ctx.emitter,
+                        ctx.task_id,
+                        ctx.iteration,
+                        crate::events::DecisionType::GateTelemetry,
+                        "checklist expected (plan-worthy turn)",
+                        serde_json::json!({ "event": "checklist_expected" }),
+                    )
+                    .await;
+            }
         }
         ctx.pending_system_messages
             .push(SystemDirective::GoalCreationOwnerOnly);
@@ -1120,6 +1127,7 @@ async fn handle_complex_intent(
                 &goal.id,
                 &goal.description,
                 &goal_user_text,
+                ctx.session_id,
                 ctx.status_tx.clone(),
                 ctx.channel_ctx.clone(),
                 ctx.user_role,

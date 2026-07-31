@@ -3804,7 +3804,7 @@ impl TerminalBridge {
             connection = ?req.headers().get("connection"),
             "Prepared daemon websocket request headers"
         );
-        info!(url = %ws_url, "Connecting terminal bridge to broker");
+        info!("Connecting terminal bridge to broker");
         let (ws_stream, _) = connect_async(req).await?;
         info!("Terminal bridge connected");
 

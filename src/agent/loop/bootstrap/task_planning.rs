@@ -21,26 +21,148 @@ pub(crate) struct TaskPlanStep {
 /// absent fields leave the keyword-inferred contract untouched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PlannedContractSignals {
+    /// `low`, `medium`, or `high`. Permission-affecting refinements require
+    /// medium or high confidence.
+    #[serde(default)]
+    pub confidence: Option<String>,
     #[serde(default)]
     pub expects_mutation: Option<bool>,
     #[serde(default)]
     pub requires_observation: Option<bool>,
+    /// Positive outcome effects required for completion. These refine proof
+    /// obligations; they do not grant permission to perform an action.
+    #[serde(default)]
+    pub required_effects: Option<Vec<String>>,
     #[serde(default)]
     pub task_kind: Option<String>,
+    /// `allowed`, `read_only`, or `scoped`. This separates a global
+    /// observation-only constraint from a request that merely forbids one
+    /// operation while still requiring other changes.
+    #[serde(default)]
+    pub mutation_scope: Option<String>,
+    /// Operation-specific constraints such as `deploy` or `send`.
+    #[serde(default)]
+    pub forbidden_actions: Vec<String>,
+    /// Exact, verbatim spans from the current user request that support a
+    /// negative mutation constraint.
+    #[serde(default)]
+    pub constraint_evidence: Vec<String>,
 }
 
-/// Raw response from the planning LLM call.
+/// Semantic task shape used by the orchestration router. The route decision is
+/// deliberately separate from the step plan: autonomous models need routing,
+/// not a second model dictating how to perform the work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PlannedTaskShape {
+    /// `inline` for work the current agent loop should finish, `durable` for
+    /// work that should become a persistent background goal.
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+    /// `low`, `medium`, or `high`.
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub independent_workstreams: Option<u8>,
+    #[serde(default)]
+    pub requires_background_continuation: Option<bool>,
+}
+
+fn confidence_is_sufficient(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "medium" | "high")
+    )
+}
+
+pub(crate) fn planned_contract_is_confident(
+    signals: &PlannedContractSignals,
+    task_shape: Option<&PlannedTaskShape>,
+) -> bool {
+    confidence_is_sufficient(
+        signals
+            .confidence
+            .as_deref()
+            .or_else(|| task_shape.and_then(|shape| shape.confidence.as_deref())),
+    )
+}
+
+pub(crate) fn planned_mutation_constraints_are_grounded(
+    signals: &PlannedContractSignals,
+    current_user_text: &str,
+) -> bool {
+    let scope = signals
+        .mutation_scope
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(scope.as_str(), "read_only" | "read-only" | "scoped") {
+        return false;
+    }
+    if scope == "scoped" && signals.forbidden_actions.is_empty() {
+        return false;
+    }
+    if matches!(scope.as_str(), "read_only" | "read-only") {
+        if !signals.forbidden_actions.is_empty() || signals.expects_mutation != Some(false) {
+            return false;
+        }
+        if signals.task_kind.as_deref().is_some_and(|kind| {
+            matches!(
+                kind.trim().to_ascii_lowercase().as_str(),
+                "change" | "deliver" | "schedule" | "monitor"
+            )
+        }) {
+            return false;
+        }
+    }
+
+    let current_lower = current_user_text.to_lowercase();
+    !signals.constraint_evidence.is_empty()
+        && signals.constraint_evidence.iter().all(|evidence| {
+            let evidence = evidence.trim();
+            !evidence.is_empty()
+                && evidence.chars().count() <= 500
+                && current_lower.contains(&evidence.to_lowercase())
+        })
+}
+
+/// How much task scaffolding the active model needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskAssessmentMode {
+    /// Produce a concrete step plan for models that benefit from supervision.
+    GuidedPlan,
+    /// Classify only the contract and orchestration shape. The primary model
+    /// remains responsible for its own approach.
+    AutonomousRouting,
+}
+
+impl TaskAssessmentMode {
+    pub(crate) fn includes_step_plan(self) -> bool {
+        matches!(self, Self::GuidedPlan)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::GuidedPlan => "guided_plan",
+            Self::AutonomousRouting => "autonomous_routing",
+        }
+    }
+}
+
+/// Raw response from the task assessment call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskPlanResponse {
     goal: String,
+    #[serde(default)]
     steps: Vec<TaskPlanStep>,
     #[serde(default)]
     success_criteria: Vec<String>,
     #[serde(default)]
     contract: Option<PlannedContractSignals>,
+    #[serde(default)]
+    task_shape: Option<PlannedTaskShape>,
 }
 
-/// Result of the task-start planning call.
+/// Result of the task-start assessment call.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct TaskPlan {
@@ -48,6 +170,8 @@ pub(crate) struct TaskPlan {
     pub steps: Vec<TaskPlanStep>,
     pub success_criteria: Vec<String>,
     pub contract: Option<PlannedContractSignals>,
+    pub task_shape: Option<PlannedTaskShape>,
+    pub mode: TaskAssessmentMode,
 }
 
 const MAX_PLAN_STEPS: usize = 7;
@@ -138,21 +262,27 @@ async fn record_auxiliary_model_call(
     .await;
 }
 
-/// Generate a task plan from the user's request.
+/// Assess the user's request before orchestration routing.
 ///
-/// Returns None if the planning call fails, times out, or returns
-/// unparseable JSON. Failure is silent — the system operates as
-/// it does today without a plan.
+/// Guided models receive a concrete step plan. Autonomous models receive only
+/// semantic contract and task-shape classification, avoiding step-by-step
+/// supervision while still giving the control plane a language-independent
+/// routing signal.
+///
+/// Returns None if the assessment call fails, times out, or returns
+/// unparseable JSON. Failure is silent and callers use the conservative
+/// deterministic fallback.
 #[allow(dead_code)]
 pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
     model: &str,
     user_text: &str,
     conversation_context: Option<&str>,
+    mode: TaskAssessmentMode,
     telemetry: Option<PlannerTelemetryCtx<'_>>,
 ) -> Option<TaskPlan> {
-    let system = "You are a task planner. Analyze the user request and return a JSON plan. \
-                  Return ONLY valid JSON, no markdown fences.";
+    let system = "You are a task assessment router. Read the request semantically in its \
+                  original language and return ONLY valid JSON, with no markdown fences.";
 
     // Include conversation context from the sliding window so the planner
     // has the same narrative as the main LLM. Without this, short follow-ups
@@ -162,51 +292,79 @@ pub(crate) async fn generate_task_plan(
         .map(|ctx| format!("Recent conversation context:\n{}\n\n", ctx))
         .unwrap_or_default();
 
+    let plan_instructions = if mode.includes_step_plan() {
+        "- Return 2-7 concrete steps and concrete success criteria.\n\
+         - tool_hint is advisory.\n\
+         - Keep each distinct action in its own step; do not collapse build, run, fix, \
+           deploy, and verify into one step.\n\
+         - When creating a file that processes other files, begin by inspecting the \
+           target format."
+    } else {
+        "- Return steps=[] and success_criteria=[]. Do not plan the model's approach; \
+           this call only classifies routing and obligations."
+    };
+
     let user_prompt = format!(
-        "{}Analyze this user request and create a step-by-step plan.\n\n\
-         User request: \"{}\"\n\n\
-         Return JSON only:\n\
-         {{\n  \
-           \"goal\": \"one-line summary of what the user wants\",\n  \
-           \"steps\": [\n    \
-             {{ \"description\": \"specific action step\", \"tool_hint\": \"likely tool name or null\" }}\n  \
-           ],\n  \
-           \"success_criteria\": [\n    \
-             \"concrete criterion for task completion\"\n  \
-           ],\n  \
-           \"contract\": {{\n    \
-             \"task_kind\": \"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\n    \
-             \"expects_mutation\": true,\n    \
-             \"requires_observation\": true\n  \
+        "{context_block}Assess this user request.\n\n\
+         User request: \"{user_text}\"\n\n\
+         Return exactly this JSON shape:\n\
+         {{\n\
+           \"goal\": \"one-line semantic summary\",\n\
+           \"steps\": [],\n\
+           \"success_criteria\": [],\n\
+           \"contract\": {{\n\
+             \"confidence\": \"low|medium|high\",\n\
+             \"task_kind\": \"conversational|answer|check|find|change|deliver|schedule|monitor|diagnose\",\n\
+             \"expects_mutation\": true,\n\
+             \"requires_observation\": true,\n\
+             \"required_effects\": [\"local_source_write\", \"remote_deploy\"],\n\
+             \"mutation_scope\": \"allowed|read_only|scoped\",\n\
+             \"forbidden_actions\": [\"deploy\"],\n\
+             \"constraint_evidence\": [\"exact verbatim span from the current user request\"]\n\
+           }},\n\
+           \"task_shape\": {{\n\
+             \"execution_mode\": \"inline|durable\",\n\
+             \"confidence\": \"low|medium|high\",\n\
+             \"independent_workstreams\": 1,\n\
+             \"requires_background_continuation\": false\n\
            }}\n\
          }}\n\n\
-         Rules:\n\
-         - 2-7 steps. Simple questions that need one lookup: 2 steps.\n\
-         - Each step should be a concrete action, not vague \
-           (\"search memory for twitter schedule\" not \"investigate\")\n\
-         - tool_hint is advisory — helps understand step type\n\
-         - success_criteria: what does \"done\" look like?\n\
-         - contract.task_kind: what KIND of request this is (judge the user's \
-           intent in whatever language they wrote it).\n\
-         - contract.expects_mutation: true only if completing the request \
-           requires creating/modifying files or external state. Generating \
-           text INTO THE REPLY (a tweet, a poem, an explanation) is NOT a \
-           mutation.\n\
-         - contract.requires_observation: true if answering requires reading \
-           live data first (files, command output, web, APIs) rather than \
-           general knowledge.\n\
-         - IMPORTANT: When the request contains MULTIPLE distinct actions \
-           (create + run, write + execute + fix, build + deploy + verify), \
-           each action MUST be its own step. Never collapse \"create X then run it\" \
-           into a single step.\n\
-         - When the task involves creating a file that processes other files, \
-           ALWAYS start with an inspection step to understand the target files' format.\n\n\
-         Examples of compound task decomposition:\n\
-         \"Create a script and run it\" → 3 steps: inspect target files, create script, run script\n\
-         \"Write tests then fix any failures\" → 3 steps: write tests, run tests, fix failures\n\
-         \"Build a checker, run it, fix issues\" → 4 steps: inspect files, create checker, run checker, fix reported issues",
-        context_block,
-        truncate_str(user_text, 500)
+         Classification rules:\n\
+         - Judge meaning, scope, and outcomes in whatever language the user wrote. \
+           Do not classify by isolated keywords.\n\
+         - execution_mode=inline for answers, lookups, small artifacts, and one \
+           cohesive change that the current loop should finish, even when it should \
+           run a test afterward.\n\
+         - execution_mode=durable only when continuation outside the current run is \
+           operationally necessary: explicit background/asynchronous work, waiting on an \
+           external condition, monitoring, cross-project work, or multiple genuinely \
+           independent workstreams.\n\
+         - A long or multi-stage request is not automatically durable. One cohesive target \
+           remains inline even when the same agent must build, deploy, verify, and return \
+           an external URL. Persistence and task decomposition are separate decisions.\n\
+         - expects_mutation=true only when completion changes files or external state. \
+           Text generated in the reply is not a mutation.\n\
+         - requires_observation=true when live files, commands, web pages, APIs, or \
+           current state must be read.\n\
+         - required_effects names the successful effects completion must prove. Valid \
+           values are local_source_write, repository_write, remote_mutation, \
+           remote_deploy, external_delivery, process_state, configuration, and \
+           destructive. Use [] when expects_mutation=false. A build cache or installed \
+           dependency is not a local_source_write.\n\
+         - mutation_scope=read_only only when the whole task forbids changes. Use \
+           mutation_scope=scoped when the task still requires changes but forbids only \
+           named operations. Example: build locally but do not deploy => scoped, \
+           expects_mutation=true, forbidden_actions=[\"deploy\"].\n\
+         - Valid forbidden_actions values are create, delete, deploy, publish, post, and send. \
+           Include only operations actually forbidden by the current request.\n\
+         - mutation_scope=allowed when there is no negative mutation constraint; then \
+           forbidden_actions and constraint_evidence must be empty.\n\
+         - For read_only or scoped, constraint_evidence must contain the exact verbatim \
+           words in the CURRENT user request that impose the restriction. Never derive \
+           a restriction from recent conversation context, this prompt's examples, or an \
+           inferred phrase that the user did not write.\n\
+         {plan_instructions}",
+        user_text = truncate_str(user_text, 4000),
     );
 
     let messages = vec![
@@ -223,17 +381,17 @@ pub(crate) async fn generate_task_plan(
     {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
-            warn!(error = %e, "Task planning call failed");
+            warn!(error = %e, "Task assessment call failed");
             return None;
         }
         Err(_) => {
-            warn!("Task planning call timed out (15s)");
+            warn!("Task assessment call timed out (15s)");
             return None;
         }
     };
     record_auxiliary_model_call(
         telemetry,
-        "task_planner",
+        "task_assessment",
         model,
         &result,
         call_start.elapsed().as_millis() as u64,
@@ -245,7 +403,7 @@ pub(crate) async fn generate_task_plan(
     let json_str = match crate::utils::extract_json_object(content) {
         Some(s) => s,
         None => {
-            warn!("Task planning response: no valid JSON found");
+            warn!("Task assessment response: no valid JSON found");
             return None;
         }
     };
@@ -253,21 +411,26 @@ pub(crate) async fn generate_task_plan(
     let parsed: TaskPlanResponse = match serde_json::from_str(&json_str) {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "Task planning response unparseable");
+            warn!(error = %e, "Task assessment response unparseable");
             return None;
         }
     };
 
-    if parsed.steps.is_empty() {
+    if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return None;
     }
 
     let mut steps = parsed.steps;
+    let mut success_criteria = parsed.success_criteria;
+    if !mode.includes_step_plan() {
+        steps.clear();
+        success_criteria.clear();
+    }
 
     // For compound tasks (user asked to create+run, write+execute+fix, etc.),
     // ensure the plan has enough steps. If the LLM collapsed everything into
     // 1-2 steps, append execution/verification steps.
-    if steps.len() < 3 && looks_like_compound_task(user_text) {
+    if mode.includes_step_plan() && steps.len() < 3 && looks_like_compound_task(user_text) {
         let has_execution_step = steps.iter().any(|s| {
             let d = s.description.to_lowercase();
             ["run", "execute", "test"]
@@ -304,14 +467,17 @@ pub(crate) async fn generate_task_plan(
     info!(
         goal = %parsed.goal,
         step_count = steps.len(),
-        "Task plan generated"
+        assessment_mode = mode.as_str(),
+        "Task assessment generated"
     );
 
     Some(TaskPlan {
         goal: parsed.goal,
         steps,
-        success_criteria: parsed.success_criteria,
+        success_criteria,
         contract: parsed.contract,
+        task_shape: parsed.task_shape,
+        mode,
     })
 }
 
@@ -354,10 +520,11 @@ fn looks_like_compound_task(user_text: &str) -> bool {
     categories >= 2
 }
 
-/// Determine whether the task-start planning call should be skipped.
+/// Determine whether the task-start assessment call should be skipped.
 ///
 /// Simple turns can still use tools in the normal loop; they do not need a
-/// separate model call that restates the question as a two-step plan first.
+/// separate model call. Longer requests are assessed even when English action
+/// markers are absent so routing does not become English-only word matching.
 #[cfg(test)]
 fn should_skip_planning(
     _task_kind: &crate::agent::CompletionTaskKind,
@@ -382,6 +549,7 @@ pub(crate) fn planning_skip_reason(
     if matches!(
         crate::agent::classify_intent_complexity(user_text),
         crate::agent::IntentComplexity::Scheduled { .. }
+            | crate::agent::IntentComplexity::ScheduledMissingTiming
     ) {
         return Some("orchestration_direct_return");
     }
@@ -438,7 +606,9 @@ pub(crate) fn planning_skip_reason(
         .iter()
         .any(|marker| crate::agent::contains_keyword_as_words(&lower, marker));
 
-    if !planning_worthy
+    let compact_turn = user_text.chars().count() <= 80;
+    if compact_turn
+        && !planning_worthy
         && !looks_like_compound_task(user_text)
         && matches!(
             crate::agent::classify_intent_complexity(user_text),
@@ -687,6 +857,14 @@ mod tests {
     }
 
     #[test]
+    fn long_non_english_request_gets_semantic_assessment() {
+        let request = "Construye una aplicación completa, configura la entrega externa, \
+            comprueba el resultado final y comparte el enlace cuando todo esté listo.";
+
+        assert_eq!(planning_skip_reason(request, false), None);
+    }
+
+    #[test]
     fn test_parse_plan_response() {
         let json = r#"{
             "goal": "Find how Twitter task was removed",
@@ -715,6 +893,7 @@ mod tests {
             ],
             "success_criteria": ["deploy.sh contains the retry flag"],
             "contract": {
+                "confidence": "high",
                 "expects_mutation": true,
                 "requires_observation": true,
                 "task_kind": "change"
@@ -726,6 +905,8 @@ mod tests {
         assert_eq!(contract.expects_mutation, Some(true));
         assert_eq!(contract.requires_observation, Some(true));
         assert_eq!(contract.task_kind.as_deref(), Some("change"));
+        assert!(contract.mutation_scope.is_none());
+        assert!(contract.forbidden_actions.is_empty());
     }
 
     #[test]
@@ -739,6 +920,161 @@ mod tests {
         let contract = parsed.contract.unwrap();
         assert_eq!(contract.expects_mutation, None);
         assert_eq!(contract.task_kind.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn test_parse_semantic_task_shape_and_scoped_mutation() {
+        let json = r#"{
+            "goal": "Build and verify locally without publishing",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "expects_mutation": true,
+                "requires_observation": true,
+                "task_kind": "change",
+                "mutation_scope": "scoped",
+                "forbidden_actions": ["deploy", "publish"],
+                "constraint_evidence": ["without publishing"]
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false
+            }
+        }"#;
+
+        let parsed: TaskPlanResponse = serde_json::from_str(json).unwrap();
+        let contract = parsed.contract.unwrap();
+        assert_eq!(contract.mutation_scope.as_deref(), Some("scoped"));
+        assert_eq!(contract.forbidden_actions, ["deploy", "publish"]);
+        assert!(planned_mutation_constraints_are_grounded(
+            &contract,
+            "Build and verify locally without publishing"
+        ));
+        assert!(!planned_mutation_constraints_are_grounded(
+            &contract,
+            "Build and verify the project"
+        ));
+        let shape = parsed.task_shape.unwrap();
+        assert_eq!(shape.execution_mode.as_deref(), Some("inline"));
+        assert_eq!(shape.confidence.as_deref(), Some("high"));
+        assert_eq!(shape.independent_workstreams, Some(1));
+    }
+
+    #[test]
+    fn scoped_evidence_cannot_ground_a_global_read_only_contract() {
+        let signals = PlannedContractSignals {
+            confidence: Some("high".to_string()),
+            expects_mutation: Some(true),
+            requires_observation: Some(true),
+            required_effects: Some(vec!["local_source_write".to_string()]),
+            task_kind: Some("change".to_string()),
+            mutation_scope: Some("read_only".to_string()),
+            forbidden_actions: vec!["deploy".to_string()],
+            constraint_evidence: vec!["do not deploy".to_string()],
+        };
+        assert!(!planned_mutation_constraints_are_grounded(
+            &signals,
+            "Build the project locally, but do not deploy"
+        ));
+    }
+
+    #[test]
+    fn autonomous_assessment_mode_never_installs_steps() {
+        assert!(!TaskAssessmentMode::AutonomousRouting.includes_step_plan());
+        assert!(TaskAssessmentMode::GuidedPlan.includes_step_plan());
+    }
+
+    #[tokio::test]
+    async fn autonomous_assessment_discards_model_generated_plan_scaffolding() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+                "goal": "Update one file",
+                "steps": [{"description": "Micromanaged step", "tool_hint": "edit_file"}],
+                "success_criteria": ["Micromanaged criterion"],
+                "contract": {
+                    "task_kind": "change",
+                    "expects_mutation": true,
+                    "requires_observation": true,
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": []
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false
+                }
+            }"#,
+        );
+        let mut provider = crate::testing::MockProvider::with_responses(vec![response]);
+        provider.skip_planning_calls = false;
+
+        let assessment = generate_task_plan(
+            Arc::new(provider),
+            "gpt-5",
+            "Update the file and verify it.",
+            None,
+            TaskAssessmentMode::AutonomousRouting,
+            None,
+        )
+        .await
+        .expect("assessment");
+
+        assert!(assessment.steps.is_empty());
+        assert!(assessment.success_criteria.is_empty());
+        assert!(assessment.contract.is_some());
+        assert_eq!(
+            assessment
+                .task_shape
+                .as_ref()
+                .and_then(|shape| shape.execution_mode.as_deref()),
+            Some("inline")
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_assessment_retains_concrete_plan() {
+        let response = crate::testing::MockProvider::text_response(
+            r#"{
+                "goal": "Update one file",
+                "steps": [
+                    {"description": "Inspect the file", "tool_hint": "read_file"},
+                    {"description": "Update the file", "tool_hint": "edit_file"}
+                ],
+                "success_criteria": ["The requested value is present"],
+                "contract": {
+                    "task_kind": "change",
+                    "expects_mutation": true,
+                    "requires_observation": true,
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": []
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false
+                }
+            }"#,
+        );
+        let mut provider = crate::testing::MockProvider::with_responses(vec![response]);
+        provider.skip_planning_calls = false;
+
+        let assessment = generate_task_plan(
+            Arc::new(provider),
+            "local-model",
+            "Update the file.",
+            None,
+            TaskAssessmentMode::GuidedPlan,
+            None,
+        )
+        .await
+        .expect("assessment");
+
+        assert_eq!(assessment.steps.len(), 2);
+        assert_eq!(assessment.success_criteria.len(), 1);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::agent::{Agent, StatusUpdate};
 use crate::channels::ChannelHub;
+use crate::events::TaskOutcome;
 use crate::traits::{AgentRole, StateStore, Tool, ToolCapabilities};
 use crate::types::{ChannelContext, ChannelVisibility, UserRole};
 
@@ -184,6 +185,38 @@ fn truncate_utf8(s: &str, max_chars: usize) -> &str {
         .last()
         .unwrap_or(0);
     &s[..boundary]
+}
+
+fn format_background_completion(
+    mission: &str,
+    response: &str,
+    outcome: TaskOutcome,
+    max_response_chars: usize,
+) -> (&'static str, String) {
+    let text = truncate_utf8(response, max_response_chars);
+    match outcome {
+        TaskOutcome::Succeeded => (
+            "completed",
+            format!(
+                "\u{2705} Background task complete\nMission: {}\n\n{}",
+                mission, text
+            ),
+        ),
+        TaskOutcome::Partial => (
+            "partial",
+            format!(
+                "\u{26a0}\u{fe0f} Background task incomplete\nMission: {}\n\n{}",
+                mission, text
+            ),
+        ),
+        TaskOutcome::Failed => (
+            "failed",
+            format!(
+                "\u{274c} Background task failed\nMission: {}\n\n{}",
+                mission, text
+            ),
+        ),
+    }
 }
 
 /// Parse a leading wait/delay prefix from a task string.
@@ -623,6 +656,8 @@ impl Tool for SpawnAgentTool {
             }
         }
 
+        let approval_session_id = args._session_id.clone();
+
         if !args.background {
             let result = self
                 .run_sync(
@@ -637,6 +672,7 @@ impl Tool for SpawnAgentTool {
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
                     args.specialist.as_deref(),
+                    approval_session_id.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -666,6 +702,7 @@ impl Tool for SpawnAgentTool {
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
                     args.specialist.as_deref(),
+                    approval_session_id.as_deref(),
                 )
                 .await;
             if let Some(ref task_id) = executor_task_id {
@@ -673,8 +710,8 @@ impl Tool for SpawnAgentTool {
             }
             return result;
         }
-        let session_id = match args._session_id {
-            Some(ref id) if !id.is_empty() => id.clone(),
+        let session_id = match approval_session_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
             _ => {
                 info!("Background mode requested but no session_id, falling back to sync");
                 let result = self
@@ -690,6 +727,7 @@ impl Tool for SpawnAgentTool {
                         task_id_ref.as_deref(),
                         args._project_scope.as_deref(),
                         args.specialist.as_deref(),
+                        approval_session_id.as_deref(),
                     )
                     .await;
                 if let Some(ref task_id) = executor_task_id {
@@ -718,7 +756,7 @@ impl Tool for SpawnAgentTool {
             let arg_specialist = arg_specialist_owned.as_deref();
             let mut result_fut = std::pin::pin!(tokio::time::timeout(
                 timeout_duration,
-                agent.spawn_child(
+                agent.spawn_child_with_outcome(
                     &mission,
                     &task,
                     status_tx.clone(),
@@ -729,6 +767,7 @@ impl Tool for SpawnAgentTool {
                     task_id_ref.as_deref(),
                     args._project_scope.as_deref(),
                     arg_specialist,
+                    Some(&session_id),
                 ),
             ));
             let result = loop {
@@ -764,20 +803,12 @@ impl Tool for SpawnAgentTool {
             };
 
             let (notification_type, message) = match result {
-                Ok(Ok(response)) => {
-                    let text = if response.len() > max_response_chars {
-                        truncate_utf8(&response, max_response_chars).to_string()
-                    } else {
-                        response
-                    };
-                    (
-                        "completed",
-                        format!(
-                            "\u{2705} Background task complete\nMission: {}\n\n{}",
-                            mission, text
-                        ),
-                    )
-                }
+                Ok(Ok(run)) => format_background_completion(
+                    &mission,
+                    &run.response,
+                    run.outcome,
+                    max_response_chars,
+                ),
                 Ok(Err(e)) => (
                     "failed",
                     format!(
@@ -798,11 +829,25 @@ impl Tool for SpawnAgentTool {
                         None => None,
                     };
                     match salvaged {
-                        Some(outcome) => (
+                        Some(outcome) if outcome.status == "completed" => (
                             "completed",
                             format!(
-                                "\u{2705} Background task finished\nMission: {}\n\n{}",
-                                mission, outcome
+                                "\u{2705} Background task complete\nMission: {}\n\n{}",
+                                mission, outcome.details
+                            ),
+                        ),
+                        Some(outcome) if outcome.status == "blocked" => (
+                            "blocked",
+                            format!(
+                                "\u{26a0}\u{fe0f} Background task blocked\nMission: {}\n\n{}",
+                                mission, outcome.details
+                            ),
+                        ),
+                        Some(outcome) => (
+                            "failed",
+                            format!(
+                                "\u{274c} Background task failed\nMission: {}\n\n{}",
+                                mission, outcome.details
                             ),
                         ),
                         None => (
@@ -879,11 +924,12 @@ impl SpawnAgentTool {
         task_id: Option<&str>,
         project_scope: Option<&str>,
         arg_specialist: Option<&str>,
+        approval_session_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let result = tokio::time::timeout(
             timeout_duration,
-            agent.spawn_child(
+            agent.spawn_child_with_outcome(
                 mission,
                 task,
                 status_tx,
@@ -894,12 +940,22 @@ impl SpawnAgentTool {
                 task_id,
                 project_scope,
                 arg_specialist,
+                approval_session_id,
             ),
         )
         .await;
 
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok(run)) => {
+                let response = match run.outcome {
+                    TaskOutcome::Succeeded => run.response,
+                    TaskOutcome::Partial => {
+                        format!("\u{26a0}\u{fe0f} Sub-agent incomplete\n\n{}", run.response)
+                    }
+                    TaskOutcome::Failed => {
+                        format!("\u{274c} Sub-agent failed\n\n{}", run.response)
+                    }
+                };
                 let max_len = self.max_response_chars;
                 if response.len() > max_len {
                     let truncated = truncate_utf8(&response, max_len);
@@ -921,7 +977,12 @@ impl SpawnAgentTool {
                         .salvage_executor_task_outcome(task_id, self.timeout_secs)
                         .await
                     {
-                        return Ok(salvaged);
+                        let prefix = match salvaged.status.as_str() {
+                            "completed" => "\u{2705} Sub-agent complete",
+                            "blocked" => "\u{26a0}\u{fe0f} Sub-agent blocked",
+                            _ => "\u{274c} Sub-agent failed",
+                        };
+                        return Ok(format!("{prefix}\n\n{}", salvaged.details));
                     }
                     if child_role == Some(AgentRole::Executor) {
                         agent
@@ -1018,6 +1079,31 @@ mod tests {
     fn truncate_utf8_empty() {
         assert_eq!(truncate_utf8("", 10), "");
         assert_eq!(truncate_utf8("", 0), "");
+    }
+
+    #[test]
+    fn partial_background_result_is_not_labeled_complete() {
+        let (notification_type, message) = format_background_completion(
+            "Build and verify the site",
+            "Blocked on workspace access.",
+            TaskOutcome::Partial,
+            8_000,
+        );
+        assert_eq!(notification_type, "partial");
+        assert!(message.starts_with("\u{26a0}\u{fe0f} Background task incomplete"));
+        assert!(!message.contains("\u{2705} Background task complete"));
+    }
+
+    #[test]
+    fn successful_background_result_keeps_completion_label() {
+        let (notification_type, message) = format_background_completion(
+            "Build and verify the site",
+            "Build passed.",
+            TaskOutcome::Succeeded,
+            8_000,
+        );
+        assert_eq!(notification_type, "completed");
+        assert!(message.starts_with("\u{2705} Background task complete"));
     }
 
     #[test]

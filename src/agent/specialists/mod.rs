@@ -41,10 +41,8 @@ pub struct SpecialistRenderContext {
     pub execution_mode: String,
 }
 
-// `kind`, `description`, and `tool_budget` are parsed from frontmatter and
-// surfaced for completeness / future consumers (logging, schema generation),
-// but the spawn flow currently does not read them. Keep them on the struct
-// so the parsed representation stays faithful to the on-disk schema.
+// Keep the parsed representation faithful to the on-disk schema. Some fields
+// also feed discovery and durable worker-profile snapshots.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SpecialistDef {
@@ -56,6 +54,9 @@ pub struct SpecialistDef {
     pub max_iterations: Option<usize>,
     pub tool_budget: Option<usize>,
     pub timeout_secs: Option<u64>,
+    pub max_concurrency: Option<usize>,
+    pub workspace_policy: Option<String>,
+    pub memory_scope: Option<String>,
     pub source: SpecialistSource,
 }
 

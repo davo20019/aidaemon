@@ -12,6 +12,18 @@ struct TaskLeadSpec {
     input_text: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct SpawnChildResult {
+    pub response: String,
+    pub outcome: TaskOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct SalvagedTaskOutcome {
+    pub status: String,
+    pub details: String,
+}
+
 async fn latest_child_task_end(
     event_store: &crate::events::EventStore,
     child_session: &str,
@@ -42,6 +54,10 @@ fn enforce_child_terminal_outcome(
         return Err(anyhow::anyhow!("Child task failed: {summary}"));
     }
     result
+}
+
+fn worker_profile_id(kind: SpecialistKind) -> String {
+    format!("profile-{}", kind.as_str().replace('_', "-"))
 }
 
 fn task_references_parent_context(task: &str) -> bool {
@@ -190,7 +206,7 @@ impl Agent {
     }
 
     /// Resolve the effective `SpecialistKind` for a spawn given:
-    /// - explicit role (role-typed spawns ignore the arg),
+    /// - explicit role (role-typed spawns normally ignore the arg),
     /// - optional caller-supplied `arg_specialist` (from `spawn_agent`'s schema),
     /// - mission + task text (heuristic fallback).
     ///
@@ -204,6 +220,15 @@ impl Agent {
         task: &str,
     ) -> SpecialistKind {
         if let Some(role) = role {
+            // Internal whole-mission recovery is deliberately broad. It may
+            // contain URLs, code, research, and deployment evidence in the
+            // same prompt, so a narrow heuristic specialist would discard
+            // valid recovery paths. Only the generic executor override is
+            // accepted across this role boundary; every other role remains
+            // authoritative.
+            if role == AgentRole::Executor && arg_specialist == Some("executor") {
+                return SpecialistKind::Executor;
+            }
             return Self::select_specialist_kind(role, mission, task);
         }
         if let Some(s) = arg_specialist {
@@ -222,6 +247,79 @@ impl Agent {
             }
         }
         Self::select_specialist_kind(AgentRole::Executor, mission, task)
+    }
+
+    async fn sync_worker_profile(
+        &self,
+        specialist_kind: SpecialistKind,
+    ) -> anyhow::Result<crate::traits::WorkerProfile> {
+        let def = self.specialists.get(specialist_kind);
+        let profile_id = worker_profile_id(specialist_kind);
+        let existing = self.state.get_worker_profile(&profile_id).await?;
+        let tools_json = def.tools.as_ref().map(serde_json::to_string).transpose()?;
+        let max_concurrency = def
+            .max_concurrency
+            .map(|value| value as i64)
+            .or_else(|| existing.as_ref().map(|profile| profile.max_concurrency))
+            .unwrap_or(1);
+        let workspace_policy = def
+            .workspace_policy
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|profile| profile.workspace_policy.clone())
+            })
+            .unwrap_or_else(|| "shared".to_string());
+        let memory_scope = def
+            .memory_scope
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|profile| profile.memory_scope.clone())
+            })
+            .unwrap_or_else(|| "project".to_string());
+        let changed = existing.as_ref().is_some_and(|profile| {
+            profile.name != specialist_kind.as_str()
+                || profile.specialist != specialist_kind.as_str()
+                || profile.model != def.model
+                || profile.tools_json != tools_json
+                || profile.max_iterations != def.max_iterations.map(|value| value as i64)
+                || profile.tool_budget != def.tool_budget.map(|value| value as i64)
+                || profile.timeout_secs != def.timeout_secs.map(|value| value as i64)
+                || profile.max_concurrency != max_concurrency
+                || profile.workspace_policy != workspace_policy
+                || profile.memory_scope != memory_scope
+                || !profile.enabled
+        });
+        let now = chrono::Utc::now().to_rfc3339();
+        let profile = crate::traits::WorkerProfile {
+            id: profile_id,
+            project_id: None,
+            name: specialist_kind.as_str().to_string(),
+            specialist: specialist_kind.as_str().to_string(),
+            model: def.model.clone(),
+            tools_json,
+            max_iterations: def.max_iterations.map(|value| value as i64),
+            tool_budget: def.tool_budget.map(|value| value as i64),
+            timeout_secs: def.timeout_secs.map(|value| value as i64),
+            max_concurrency,
+            workspace_policy,
+            memory_scope,
+            version: existing
+                .as_ref()
+                .map(|profile| profile.version + i64::from(changed))
+                .unwrap_or(1),
+            enabled: true,
+            created_at: existing
+                .as_ref()
+                .map(|profile| profile.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now,
+        };
+        self.state.upsert_worker_profile(&profile).await?;
+        Ok(profile)
     }
 
     /// Apply a specialist's declared tool allowlist to the in-flight tool set.
@@ -363,7 +461,13 @@ impl Agent {
             parent_session_id: String::new(),
             execution_mode: String::new(),
         };
-        let base = registry.render(specialist_kind, &ctx);
+        // Markdown source files conventionally end with a newline, while the
+        // dynamic suffix below owns its leading separator. Normalize that
+        // boundary so prompt output does not depend on editor EOF settings.
+        let base = registry
+            .render(specialist_kind, &ctx)
+            .trim_end_matches('\n')
+            .to_string();
 
         // Build the dynamic mid-section (working directory + task contract)
         // that the legacy builder inserts between the sub-agent header and
@@ -427,6 +531,7 @@ impl Agent {
                 "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
                  Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
                  Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
+                 For public URL reachability or returned text, use an available HTTP read tool or ask `cli_agent` to run curl; do not require browser access unless the task is visual or interactive.\n\
                  When you use `cli_agent`, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.",
             );
         }
@@ -493,23 +598,16 @@ impl Agent {
             false
         };
 
-        let run_started_at = if is_scheduled {
-            if let Some(root_task_id) = active_scheduled_root_task_id(&self.state, goal_id).await {
-                self.state
-                    .get_task(&root_task_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|task| task.created_at)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let goal_run_id = self
+            .state
+            .get_current_goal_run(goal_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|run| run.id);
         tools.push(Arc::new(
             crate::tools::ManageGoalTasksTool::new(goal_id.to_string(), self.state.clone())
-                .with_run_started_at(run_started_at),
+                .with_goal_run_id(goal_run_id),
         ));
 
         let goal_context = self
@@ -638,19 +736,39 @@ impl Agent {
     async fn prepare_executor_task_handoff(
         &self,
         task_id: &str,
+        attempt: &crate::traits::TaskAttempt,
         handoff: &ExecutorHandoff,
         child_session: &str,
     ) {
-        if let Ok(Some(mut task)) = self.state.get_task(task_id).await {
-            task.status = "running".to_string();
-            if task.started_at.is_none() {
-                task.started_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            if let Ok(context) = persist_executor_handoff_context(task.context.as_deref(), handoff)
+        if let Ok(Some(task)) = self.state.get_task(task_id).await {
+            let context = persist_executor_handoff_context(task.context.as_deref(), handoff).ok();
+            let patch = crate::traits::TaskAttemptPatch {
+                status: "running".to_string(),
+                context,
+                ..Default::default()
+            };
+            match self
+                .state
+                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                .await
             {
-                task.context = Some(context);
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        task_id,
+                        attempt_id = %attempt.id,
+                        "Executor handoff rejected because its lease is no longer current"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        task_id,
+                        attempt_id = %attempt.id,
+                        error = %error,
+                        "Could not persist executor handoff"
+                    );
+                }
             }
-            let _ = self.state.update_task(&task).await;
         }
 
         let activity = crate::traits::TaskActivity {
@@ -695,24 +813,35 @@ impl Agent {
     async fn finalize_executor_task_outcome(
         &self,
         task_id: &str,
+        attempt: Option<&crate::traits::TaskAttempt>,
         response: Option<&str>,
         error: Option<&str>,
         child_session: &str,
-    ) {
+    ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let latest_task = self.state.get_task(task_id).await.ok().flatten();
+        let latest_task = self.state.get_task(task_id).await?;
+        anyhow::ensure!(
+            latest_task.is_some(),
+            "cannot finalize executor outcome because task '{task_id}' no longer exists"
+        );
         let structured =
             derive_executor_step_result(task_id, latest_task.as_ref(), response, error);
         let task_lead_summary = structured.render_task_lead_summary();
 
         if let Some(mut task) = latest_task {
             // An already-terminal task means the executor persisted its own
-            // outcome (e.g. report_blocker → "blocked") before this failure
-            // path ran. Keep that richer outcome instead of clobbering it
-            // with a generic failure (the parent timeout cancelling a child
-            // that already finished is the common case).
-            let already_terminal = matches!(task.status.as_str(), "blocked" | "completed");
-            if error.is_some() && already_terminal {
+            // fenced outcome before returning. That record is authoritative:
+            // its attempt has been closed and its structured handoff is
+            // already durable, so parent finalization must not renew or patch
+            // the retired lease.
+            let already_terminal = matches!(
+                task.status.as_str(),
+                "blocked" | "completed" | "failed" | "cancelled"
+            );
+            if already_terminal {
+                let late_error = error
+                    .map(|value| format!(" Parent error: {value}"))
+                    .unwrap_or_default();
                 let _ = self
                     .state
                     .log_task_activity(&crate::traits::TaskActivity {
@@ -722,17 +851,43 @@ impl Agent {
                         tool_name: None,
                         tool_args: None,
                         result: Some(format!(
-                            "Late executor failure ignored; task already terminal with status '{}': {}",
-                            task.status,
-                            error.unwrap_or_default()
+                            "Kept executor-persisted terminal outcome with status '{}'.{}",
+                            task.status, late_error
                         )),
-                        success: Some(false),
+                        success: Some(error.is_none()),
                         tokens_used: None,
                         created_at: now.clone(),
                     })
                     .await;
-                return;
+                return Ok(());
             }
+
+            if let Some(attempt) = attempt {
+                let renewed = self
+                    .state
+                    .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                    .await?;
+                anyhow::ensure!(
+                    renewed,
+                    "executor lease was lost before preserving the final handoff"
+                );
+            }
+            let workspace_evidence = match crate::workspaces::preserve_task_workspace(
+                self.state.as_ref(),
+                task_id,
+            )
+            .await
+            {
+                Ok(evidence) => evidence,
+                Err(workspace_error) => {
+                    warn!(
+                        task_id,
+                        error = %workspace_error,
+                        "Could not preserve task workspace state"
+                    );
+                    crate::workspaces::WorkspaceEvidence::default()
+                }
+            };
 
             if let Ok(context) =
                 persist_executor_result_context(task.context.as_deref(), &structured)
@@ -790,7 +945,62 @@ impl Agent {
                 }
             }
 
-            let _ = self.state.update_task(&task).await;
+            if let Some(attempt) = attempt {
+                let mut artifacts = structured
+                    .artifacts
+                    .iter()
+                    .map(|reference| crate::traits::HandoffArtifact {
+                        kind: if reference.starts_with("http://")
+                            || reference.starts_with("https://")
+                        {
+                            "url".to_string()
+                        } else {
+                            "path".to_string()
+                        },
+                        reference: reference.clone(),
+                        digest: None,
+                        metadata: None,
+                    })
+                    .collect::<Vec<_>>();
+                artifacts.extend(workspace_evidence.artifacts);
+                let handoff = crate::traits::TaskHandoff {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    task_id: task_id.to_string(),
+                    attempt_id: attempt.id.clone(),
+                    summary: structured.summary.clone(),
+                    artifacts,
+                    verification: workspace_evidence.verification,
+                    remaining_risk: structured.blocker.clone(),
+                    next_step: structured.next_step.clone(),
+                    created_at: now.clone(),
+                };
+                let patch = crate::traits::TaskAttemptPatch {
+                    status: task.status.clone(),
+                    result: task.result.clone(),
+                    error: task.error.clone(),
+                    blocker: task.blocker.clone(),
+                    context: task.context.clone(),
+                    handoff: Some(handoff),
+                };
+                let renewed = self
+                    .state
+                    .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                    .await?;
+                anyhow::ensure!(
+                    renewed,
+                    "executor lease was lost before persisting the final handoff"
+                );
+                let persisted = self
+                    .state
+                    .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                    .await?;
+                anyhow::ensure!(
+                    persisted,
+                    "executor result was rejected because its lease is no longer current"
+                );
+            } else {
+                self.state.update_task(&task).await?;
+            }
         }
 
         let activity = crate::traits::TaskActivity {
@@ -839,13 +1049,34 @@ impl Agent {
                 )
                 .await;
         }
+        Ok(())
     }
 
     pub(crate) async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64) {
         let session_id = format!("executor-timeout-{task_id}");
         let error = format!("Executor timed out after {timeout_secs} seconds");
-        self.finalize_executor_task_outcome(task_id, None, Some(&error), &session_id)
-            .await;
+        let attempt = self
+            .state
+            .get_current_task_attempt(task_id)
+            .await
+            .ok()
+            .flatten();
+        if let Err(finalize_error) = self
+            .finalize_executor_task_outcome(
+                task_id,
+                attempt.as_ref(),
+                None,
+                Some(&error),
+                &session_id,
+            )
+            .await
+        {
+            warn!(
+                task_id,
+                error = %finalize_error,
+                "Could not persist executor timeout outcome"
+            );
+        }
     }
 
     /// If the executor already persisted a terminal outcome on its task
@@ -856,7 +1087,7 @@ impl Agent {
         &self,
         task_id: &str,
         timeout_secs: u64,
-    ) -> Option<String> {
+    ) -> Option<SalvagedTaskOutcome> {
         let task = self.state.get_task(task_id).await.ok().flatten()?;
         if !matches!(task.status.as_str(), "blocked" | "completed" | "failed") {
             return None;
@@ -867,11 +1098,14 @@ impl Agent {
             .or(task.blocker.as_deref())
             .or(task.error.as_deref())
             .unwrap_or("(no summary recorded)");
-        Some(format!(
-            "Executor for task {} finished with status '{}' before the {}s spawn timeout \
-             was handled; its persisted outcome:\n\n{}",
-            task_id, task.status, timeout_secs, summary
-        ))
+        Some(SalvagedTaskOutcome {
+            status: task.status.clone(),
+            details: format!(
+                "Executor for task {} finished with status '{}' before the {}s spawn timeout \
+                 was handled; its persisted outcome:\n\n{}",
+                task_id, task.status, timeout_secs, summary
+            ),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -888,6 +1122,7 @@ impl Agent {
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         add_spawn_tool: bool,
         inherited_project_scope: Option<String>,
+        approval_session_id: Option<String>,
         max_iterations_override: Option<usize>,
         timeout_secs_override: Option<u64>,
     ) -> Arc<Agent> {
@@ -955,6 +1190,7 @@ impl Agent {
             self.policy_config.clone(),
             self.path_aliases.clone(),
             inherited_project_scope,
+            approval_session_id,
             root_tools,
             self.specialists.clone(),
             self.vision_config.clone(),
@@ -986,7 +1222,7 @@ impl Agent {
     /// - TaskLead: Management + Universal + cli_agent (if available) +
     ///   ManageGoalTasksTool + SpawnAgentTool
     /// - Executor: Action + Universal + ReportBlockerTool, NO SpawnAgentTool
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub async fn spawn_child(
         self: &Arc<Self>,
         mission: &str,
@@ -1000,6 +1236,38 @@ impl Agent {
         inherited_project_scope: Option<&str>,
         arg_specialist: Option<&str>,
     ) -> anyhow::Result<String> {
+        self.spawn_child_with_outcome(
+            mission,
+            task,
+            status_tx,
+            channel_ctx,
+            user_role,
+            child_role,
+            goal_id,
+            task_id,
+            inherited_project_scope,
+            arg_specialist,
+            None,
+        )
+        .await
+        .map(|result| result.response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_child_with_outcome(
+        self: &Arc<Self>,
+        mission: &str,
+        task: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        channel_ctx: ChannelContext,
+        user_role: UserRole,
+        child_role: Option<AgentRole>,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        inherited_project_scope: Option<&str>,
+        arg_specialist: Option<&str>,
+        approval_session_id: Option<&str>,
+    ) -> anyhow::Result<SpawnChildResult> {
         if self.depth >= self.limits.max_depth {
             anyhow::bail!(
                 "Cannot spawn sub-agent: max recursion depth ({}) reached",
@@ -1053,14 +1321,56 @@ impl Agent {
                             arg_specialist,
                             true,
                             None,
+                            None,
                             Some(goal_id.to_string()),
                             Some(root_tools),
                             cancel_token,
                             inherited_project_scope,
+                            approval_session_id,
                         )
                         .await;
                 }
                 AgentRole::Executor => {
+                    let mut specialist_kind = Self::resolve_specialist_kind(
+                        Some(AgentRole::Executor),
+                        arg_specialist,
+                        mission,
+                        task,
+                    );
+                    self.sync_worker_profile(specialist_kind).await?;
+                    let task_attempt = if let Some(tid) = task_id {
+                        match self.state.get_current_task_attempt(tid).await? {
+                            Some(attempt) => Some(attempt),
+                            None => {
+                                let worker_id = format!("executor-claim-{}", Uuid::new_v4());
+                                let profile_id = worker_profile_id(specialist_kind);
+                                self.state
+                                    .claim_task_with_lease(tid, &worker_id, Some(&profile_id), 180)
+                                    .await?
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if task_id.is_some() && task_attempt.is_none() {
+                        anyhow::bail!("Task is not ready or is already owned by another worker");
+                    }
+                    if let Some(profile_id) = task_attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.worker_profile_id.as_deref())
+                    {
+                        if profile_id != "profile-executor" {
+                            if let Some(profile) = self.state.get_worker_profile(profile_id).await?
+                            {
+                                if let Some(assigned_kind) =
+                                    SpecialistKind::from_str(&profile.specialist)
+                                {
+                                    specialist_kind = assigned_kind;
+                                    self.sync_worker_profile(specialist_kind).await?;
+                                }
+                            }
+                        }
+                    }
                     let has_cli_agent = full_tools
                         .iter()
                         .any(|t| t.name() == "cli_agent" && t.is_available());
@@ -1085,10 +1395,13 @@ impl Agent {
                     }
                     // Add ReportBlockerTool
                     if let Some(tid) = task_id {
-                        tools.push(Arc::new(crate::tools::ReportBlockerTool::new(
-                            tid.to_string(),
-                            self.state.clone(),
-                        )));
+                        if let Some(attempt) = task_attempt.clone() {
+                            tools.push(Arc::new(crate::tools::ReportBlockerTool::for_attempt(
+                                tid.to_string(),
+                                self.state.clone(),
+                                attempt,
+                            )));
+                        }
                     }
                     // Resolve the specialist kind here so the prompt reflects
                     // the role-specific tagline (Code/Research/Review/etc.)
@@ -1096,12 +1409,6 @@ impl Agent {
                     // `spawn_child_inner` resolves the same kind again from the
                     // same inputs for tool/budget application — both calls are
                     // idempotent.
-                    let specialist_kind = Self::resolve_specialist_kind(
-                        Some(AgentRole::Executor),
-                        arg_specialist,
-                        mission,
-                        task,
-                    );
                     let mut prompt = Self::compose_executor_prompt_from_registry(
                         &self.specialists,
                         specialist_kind,
@@ -1111,8 +1418,61 @@ impl Agent {
                         self.limits.max_depth,
                         effective_delegation_mode,
                         task_id,
-                        inherited_project_scope,
+                        // A claimed durable task receives its attempt workspace
+                        // in `spawn_child_inner`. Do not pin the earlier broad
+                        // project container into the executor prompt as a
+                        // competing working-directory instruction.
+                        if task_attempt.is_some() {
+                            None
+                        } else {
+                            inherited_project_scope
+                        },
                     );
+                    if let Some(tid) = task_id {
+                        let journal = self
+                            .state
+                            .get_task_journal(tid, 12)
+                            .await
+                            .unwrap_or_default();
+                        let human_entries = journal
+                            .iter()
+                            .rev()
+                            .filter(|entry| entry.actor_type == "human")
+                            .collect::<Vec<_>>();
+                        let latest_handoff =
+                            self.state.get_latest_task_handoff(tid).await.ok().flatten();
+                        if !human_entries.is_empty() || latest_handoff.is_some() {
+                            prompt.push_str(
+                                "\n\n## Durable Task Context\n\
+                                 Treat these board records as authoritative context for this attempt.",
+                            );
+                            for entry in human_entries {
+                                prompt.push_str(&format!(
+                                    "\n- Human {} from {}: {}",
+                                    entry.entry_type, entry.actor_id, entry.body
+                                ));
+                            }
+                            if let Some(handoff) = latest_handoff {
+                                prompt.push_str(&format!(
+                                    "\n- Previous handoff: {}",
+                                    handoff.summary
+                                ));
+                                if !handoff.verification.is_empty() {
+                                    prompt.push_str(&format!(
+                                        "\n- Previous verification: {}",
+                                        handoff.verification.join("; ")
+                                    ));
+                                }
+                                if let Some(risk) = handoff.remaining_risk {
+                                    prompt.push_str(&format!("\n- Remaining risk: {risk}"));
+                                }
+                                if let Some(next_step) = handoff.next_step {
+                                    prompt
+                                        .push_str(&format!("\n- Suggested next step: {next_step}"));
+                                }
+                            }
+                        }
+                    }
                     // Normally the Task Lead must inline prerequisite evidence in
                     // the delegated task. Keep a bounded compatibility path for
                     // explicit references to parent-only context so an executor
@@ -1157,10 +1517,12 @@ impl Agent {
                             arg_specialist,
                             false, // no spawn tool
                             task_id.map(|s| s.to_string()),
+                            task_attempt,
                             goal_id.map(|s| s.to_string()),
                             None, // root_tools (executors don't spawn children)
                             None, // cancel token override
                             inherited_project_scope,
+                            approval_session_id,
                         )
                         .await;
                 }
@@ -1230,10 +1592,12 @@ impl Agent {
             arg_specialist,
             can_spawn,
             None,             // task_id (executor activity tracking)
+            None,             // task_attempt
             goal_for_child,   // goal_id (task lead context injection)
             child_root_tools, // root_tools for TaskLead → Executor inheritance
             None,             // cancel token override
             inherited_project_scope,
+            approval_session_id,
         )
         .await
     }
@@ -1243,8 +1607,8 @@ impl Agent {
     async fn spawn_child_inner(
         self: &Arc<Self>,
         tools: &[Arc<dyn Tool>],
-        model: String,
-        system_prompt: String,
+        mut model: String,
+        mut system_prompt: String,
         child_depth: usize,
         mission: &str,
         task: &str,
@@ -1256,14 +1620,100 @@ impl Agent {
         arg_specialist: Option<&str>,
         add_spawn_tool: bool,
         task_id: Option<String>,
+        task_attempt: Option<crate::traits::TaskAttempt>,
         goal_id: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         cancel_token_override: Option<tokio_util::sync::CancellationToken>,
         inherited_project_scope: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let specialist_kind =
+        approval_session_id: Option<&str>,
+    ) -> anyhow::Result<SpawnChildResult> {
+        let mut specialist_kind =
             Self::resolve_specialist_kind(original_child_role, arg_specialist, mission, task);
+        if let Some(profile_id) = task_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.worker_profile_id.as_deref())
+        {
+            if profile_id != "profile-executor" {
+                if let Some(profile) = self.state.get_worker_profile(profile_id).await? {
+                    if let Some(assigned_kind) = SpecialistKind::from_str(&profile.specialist) {
+                        specialist_kind = assigned_kind;
+                    }
+                }
+            }
+        }
+        self.sync_worker_profile(specialist_kind).await?;
+        let def = self.specialists.get(specialist_kind);
         let child_session = Self::build_specialist_session_id(specialist_kind, Uuid::new_v4());
+        let mut effective_project_scope = inherited_project_scope.map(ToOwned::to_owned);
+        if let Some(attempt) = task_attempt.as_ref() {
+            let effective_profile_id = match attempt.worker_profile_id.as_deref() {
+                Some("profile-executor") if specialist_kind != SpecialistKind::Executor => {
+                    worker_profile_id(specialist_kind)
+                }
+                Some(profile_id) => profile_id.to_string(),
+                None => worker_profile_id(specialist_kind),
+            };
+            let bound = self
+                .state
+                .bind_task_attempt_worker(
+                    &attempt.id,
+                    &attempt.lease_token,
+                    &child_session,
+                    Some(&effective_profile_id),
+                )
+                .await?;
+            if !bound {
+                anyhow::bail!("Task execution lease was lost before the worker started");
+            }
+            if let Some(task_id) = task_id.as_deref() {
+                match crate::workspaces::provision_task_workspace(
+                    self.state.as_ref(),
+                    task_id,
+                    attempt,
+                    inherited_project_scope,
+                )
+                .await
+                {
+                    Ok(workspace) => {
+                        effective_project_scope = Some(workspace.root_path.clone());
+                        system_prompt.push_str(&format!(
+                            "\n\n## Attempt Workspace\n\
+                             Work only inside `{}` for this attempt. The workspace is preserved \
+                             after execution for explicit review or integration; do not merge it \
+                             automatically.",
+                            workspace.root_path
+                        ));
+                    }
+                    Err(error) => {
+                        let handoff = crate::traits::TaskHandoff {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            task_id: task_id.to_string(),
+                            attempt_id: attempt.id.clone(),
+                            summary: "Task workspace could not be prepared.".to_string(),
+                            artifacts: Vec::new(),
+                            verification: Vec::new(),
+                            remaining_risk: Some(error.to_string()),
+                            next_step: Some(
+                                "Fix the workspace policy or project scope, then unblock the task."
+                                    .to_string(),
+                            ),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let patch = crate::traits::TaskAttemptPatch {
+                            status: "blocked".to_string(),
+                            blocker: Some(format!("Workspace preparation failed: {error}")),
+                            handoff: Some(handoff),
+                            ..Default::default()
+                        };
+                        let _ = self
+                            .state
+                            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                            .await;
+                        return Err(error);
+                    }
+                }
+            }
+        }
 
         // Apply specialist overrides (tool allowlist + budgets) from the
         // registry. The role boundary has already been enforced by the
@@ -1272,7 +1722,6 @@ impl Agent {
         // with a warn (see `intersect_tools`). Budget overrides are clamped
         // via `clamp_max_iterations` / `clamp_timeout`.
         //
-        let def = self.specialists.get(specialist_kind);
         let scoped_tools: Vec<Arc<dyn Tool>> = if let Some(declared) = def.tools.as_deref() {
             let mut scoped = tools.to_vec();
             Self::apply_specialist_tool_allowlist(specialist_kind, declared, &mut scoped);
@@ -1280,7 +1729,16 @@ impl Agent {
         } else {
             tools.to_vec()
         };
-        let max_iterations_override = def.max_iterations.map(|raw| {
+        // Iterations are also capped by the declared tool budget. One
+        // iteration can issue more than one read-only call, but it cannot
+        // create another unbounded loop beyond the profile's call budget.
+        let declared_iteration_cap = match (def.max_iterations, def.tool_budget) {
+            (Some(iterations), Some(tool_budget)) => Some(iterations.min(tool_budget)),
+            (Some(iterations), None) => Some(iterations),
+            (None, Some(tool_budget)) => Some(tool_budget),
+            (None, None) => None,
+        };
+        let max_iterations_override = declared_iteration_cap.map(|raw| {
             specialist_validation::clamp_max_iterations(
                 specialist_kind,
                 raw,
@@ -1292,14 +1750,24 @@ impl Agent {
             .timeout_secs
             .map(|raw| specialist_validation::clamp_timeout(specialist_kind, raw, timeout_cap));
         if let Some(declared_model) = def.model.as_deref() {
-            // Provider-side model availability checks are deferred (Task 13+).
-            // For now we warn that the override was observed; the spawn keeps
-            // the parent-selected model.
-            warn!(
-                kind = specialist_kind.as_str(),
-                model = declared_model,
-                "specialist model override declared; provider availability check deferred — using parent model"
-            );
+            let snapshot = self.llm_runtime.snapshot();
+            let configured_models = snapshot
+                .router()
+                .map(|router| router.all_models_ordered())
+                .filter(|models| !models.is_empty())
+                .unwrap_or_else(|| vec![snapshot.primary_model()]);
+            if configured_models
+                .iter()
+                .any(|candidate| candidate == declared_model)
+            {
+                model = declared_model.to_string();
+            } else {
+                warn!(
+                    kind = specialist_kind.as_str(),
+                    model = declared_model,
+                    "specialist model is not configured — using parent model"
+                );
+            }
         }
 
         let specialist_source = match self.specialists.get(specialist_kind).source {
@@ -1347,14 +1815,37 @@ impl Agent {
                     mission,
                     task,
                     &scoped_tools,
-                    inherited_project_scope,
+                    effective_project_scope.as_deref(),
                 );
-                self.prepare_executor_task_handoff(task_id, &handoff, &child_session)
-                    .await;
+                if let Some(attempt) = task_attempt.as_ref() {
+                    self.prepare_executor_task_handoff(task_id, attempt, &handoff, &child_session)
+                        .await;
+                }
             }
         }
         let cancel_token =
             cancel_token_override.or_else(|| self.cancel_token.as_ref().map(|t| t.child_token()));
+        let effective_approval_session_id = self
+            .approval_session_id
+            .clone()
+            .or_else(|| approval_session_id.map(str::to_string));
+        let approval_route_guard = if let Some(parent_session) =
+            effective_approval_session_id.as_deref()
+        {
+            let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await {
+                Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
+                Err(_) => None,
+            };
+            match hub {
+                Some(hub) => {
+                    hub.register_session_route(&child_session, parent_session)
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let child = self
             .create_child_agent(
                 scoped_tools,
@@ -1367,7 +1858,8 @@ impl Agent {
                 cancel_token,
                 root_tools,
                 add_spawn_tool,
-                inherited_project_scope.map(ToOwned::to_owned),
+                effective_project_scope,
+                effective_approval_session_id,
                 max_iterations_override,
                 timeout_secs_override,
             )
@@ -1391,7 +1883,7 @@ impl Agent {
         }
         let session_for_task = child_session.clone();
         let task_for_task = task.to_string();
-        let join = tokio::spawn(async move {
+        let mut join = tokio::spawn(async move {
             child
                 .handle_message(
                     &session_for_task,
@@ -1404,16 +1896,61 @@ impl Agent {
                 .await
         });
         let _abort = AbortOnDrop(join.abort_handle());
-        let result = match join.await {
-            Ok(r) => r,
-            Err(join_err) => Err(anyhow::anyhow!(
-                "child agent task did not complete: {join_err}"
-            )),
+        let result = if let Some(attempt) = task_attempt.as_ref() {
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(45));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    joined = &mut join => {
+                        break match joined {
+                            Ok(result) => result,
+                            Err(join_err) => Err(anyhow::anyhow!(
+                                "child agent task did not complete: {join_err}"
+                            )),
+                        };
+                    }
+                    _ = heartbeat.tick() => {
+                        let renewed = self
+                            .state
+                            .heartbeat_task_attempt(
+                                &attempt.id,
+                                &attempt.lease_token,
+                                180,
+                            )
+                            .await?;
+                        if !renewed {
+                            join.abort();
+                            break Err(anyhow::anyhow!(
+                                "Task execution lease was lost; stale worker stopped"
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            match join.await {
+                Ok(result) => result,
+                Err(join_err) => Err(anyhow::anyhow!(
+                    "child agent task did not complete: {join_err}"
+                )),
+            }
         };
+
+        drop(approval_route_guard);
 
         let child_task_end =
             latest_child_task_end(&self.event_store, &child_session_for_events).await;
-        let result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
+        let child_outcome = child_task_end
+            .as_ref()
+            .map(TaskEndData::effective_outcome)
+            .unwrap_or_else(|| {
+                if result.is_ok() {
+                    TaskOutcome::Succeeded
+                } else {
+                    TaskOutcome::Failed
+                }
+            });
+        let mut result = enforce_child_terminal_outcome(result, child_task_end.as_ref());
 
         if self.harness_eval_enabled() {
             if let Some(child_snapshot) = child_task_end
@@ -1428,13 +1965,21 @@ impl Agent {
         if role == AgentRole::Executor {
             if let Some(task_id) = saved_task_id.as_deref() {
                 let error_text = result.as_ref().err().map(|error| error.to_string());
-                self.finalize_executor_task_outcome(
-                    task_id,
-                    result.as_ref().ok().map(String::as_str),
-                    error_text.as_deref(),
-                    &child_session,
-                )
-                .await;
+                if let Err(finalize_error) = self
+                    .finalize_executor_task_outcome(
+                        task_id,
+                        task_attempt.as_ref(),
+                        result.as_ref().ok().map(String::as_str),
+                        error_text.as_deref(),
+                        &child_session,
+                    )
+                    .await
+                {
+                    result = Err(anyhow::anyhow!(
+                        "Executor returned, but its durable task outcome could not be persisted: \
+                         {finalize_error}"
+                    ));
+                }
             }
         }
 
@@ -1458,7 +2003,7 @@ impl Agent {
                 .emit(
                     EventType::SubAgentComplete,
                     SubAgentCompleteData {
-                        child_session_id: child_session,
+                        child_session_id: child_session.clone(),
                         specialist_kind: Some(specialist_kind.as_str().to_string()),
                         success,
                         result_summary: summary,
@@ -1515,7 +2060,10 @@ impl Agent {
             }
         }
 
-        result
+        result.map(|response| SpawnChildResult {
+            response,
+            outcome: child_outcome,
+        })
     }
 
     /// Spawn a task lead for a goal. Called from handle_message (&self context).
@@ -1523,11 +2071,13 @@ impl Agent {
     /// This is a simplified version of spawn_child that doesn't require &Arc<Self>,
     /// since handle_message takes &self. The task lead gets management + universal tools
     /// plus ManageGoalTasksTool and SpawnAgentTool (for spawning executors).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_task_lead(
         &self,
         goal_id: &str,
         goal_description: &str,
         user_text: &str,
+        approval_session_id: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         channel_ctx: ChannelContext,
         user_role: UserRole,
@@ -1537,10 +2087,15 @@ impl Agent {
         let goal_id = goal_id.to_string();
         let goal_description = goal_description.to_string();
         let user_text = user_text.to_string();
+        let approval_session_id = approval_session_id.to_string();
         Box::pin(async move {
             let goal_id = &goal_id;
             let goal_description = &goal_description;
             let user_text = &user_text;
+            let effective_approval_session_id = self
+                .approval_session_id
+                .clone()
+                .or_else(|| Some(approval_session_id.clone()));
             if self.depth >= self.limits.max_depth {
                 anyhow::bail!(
                     "Cannot spawn task lead: max recursion depth ({}) reached",
@@ -1611,6 +2166,20 @@ impl Agent {
 
             let start = std::time::Instant::now();
             let child_cancel_token = self.resolve_task_lead_cancel_token(goal_id).await;
+            let approval_route_guard = {
+                let hub = match tokio::time::timeout(Duration::from_secs(2), self.hub.read()).await
+                {
+                    Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
+                    Err(_) => None,
+                };
+                match (hub, effective_approval_session_id.as_deref()) {
+                    (Some(hub), Some(parent_session)) => {
+                        hub.register_session_route(&child_session, parent_session)
+                            .await
+                    }
+                    _ => None,
+                }
+            };
             let child = self
                 .create_child_agent(
                     tools,
@@ -1624,6 +2193,7 @@ impl Agent {
                     Some(root_tools), // root_tools for Executor inheritance
                     true,
                     None,
+                    effective_approval_session_id,
                     None, // max_iterations override (task leads use parent default)
                     None, // timeout_secs override
                 )
@@ -1640,6 +2210,8 @@ impl Agent {
                     None,
                 )
                 .await;
+
+            drop(approval_route_guard);
 
             let child_task_end =
                 latest_child_task_end(&self.event_store, &child_session_for_events).await;
@@ -1717,12 +2289,15 @@ impl Agent {
              {execution_mode}\n\n\
              ## Workflow\n\
              1. Analyze the goal and break it into concrete tasks using manage_goal_tasks(create_task)\n\
-                - Start with 2-5 tasks for the NEXT PHASE (not the entire project)\n\
+                - Start with 1-5 tasks for the NEXT PHASE (not the entire project)\n\
+                - Keep one cohesive target in one task even when it has sequential build, deploy, and verification stages; split only independent workstreams or ownership boundaries\n\
                 - After those tasks complete, reassess and create more tasks if the goal isn't done\n\
                 - Set `depends_on` (array of task IDs) for tasks that require prior tasks to complete\n\
                 - Set `parallel_group` for tasks that belong to the same logical phase\n\
                 - Set `idempotent: true` for tasks safe to retry on failure\n\
                 - Set `task_order` for display ordering\n\
+                - Set `worker_profile` to the best named profile: profile-code, profile-research, profile-review, profile-browser-verifier, profile-artifact-writer, profile-comms-draft, or profile-executor\n\
+                - Use `workspace_policy: isolated` for a new project, `worktree` for parallel or collision-prone edits in an existing Git project, and `shared` only for one explicit existing project\n\
              2. Before spawning an executor, claim the task: manage_goal_tasks(claim_task, task_id=...)\n\
                 - This verifies dependencies are met and atomically reserves the task\n\
                 - If claiming fails due to unmet dependencies, work on other available tasks first\n\
@@ -1738,8 +2313,8 @@ impl Agent {
              6. When every required task is completed/skipped and every obsolete task is explicitly \
                 superseded: manage_goal_tasks(complete_goal, summary)\n\n\
              ## Rules\n\
-             - Keep each planning step small: 2-5 tasks at a time, then iterate\n\
-             - Spawn executors one at a time (sequential execution)\n\
+             - Keep each planning step small: 1-5 tasks at a time, then iterate\n\
+             - Execute sequentially unless independent tasks share an explicit `parallel_group`; bounded parallel groups may run up to four executors\n\
              - Each executor gets a single, focused task\n\
              - Executors do not automatically see this Task Lead's prompt. If a task depends on \
                Prior Knowledge, Completed Task Results, or another context section, copy the \
@@ -1750,12 +2325,16 @@ impl Agent {
              - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
              - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\"\n\n\
              ## Pre-flight and Verification\n\
-             - Before any task that modifies external state (deploy, publish, push, send, upload, migrate), \
-             create a prerequisite-check task that verifies readiness (e.g., all changes committed, \
-             dependencies installed, credentials valid, build passing)\n\
-             - After any task that modifies external state, ALWAYS create a verification task that \
-             confirms the change was applied correctly (e.g., fetch the live URL, query the database, \
-             check the published package version)\n\
+             - Keep readiness checks, the mutation, and immediate verification in the same task when \
+             they concern one target and one worker can perform them safely. Put the concrete checks in \
+             that task's acceptance criteria and structured handoff\n\
+             - Create a separate prerequisite or verification task only for a real ownership boundary, \
+             an independent parallel review, an external wait/monitoring period, or a prerequisite that \
+             must be handed to another worker\n\
+             - For public endpoint reachability and rendered text, prefer an HTTP read first. Require a \
+             browser only for visual layout or interactive behavior. If one verification surface is \
+             unavailable, use another surface for every claim it can prove instead of asking the user \
+             to repair the tool session\n\
              - Never mark the goal as complete until you have a completion signal — but the completion \
              signal is the mutating call's OWN success response (e.g. HTTP 2xx with a created/updated \
              resource ID), not necessarily a separate read-back\n\
@@ -1911,7 +2490,8 @@ impl Agent {
              - For running commands, use the execution surface actually available in your tool set.\n\
              - If `terminal` is available, keep commands simple and single-line.\n\
              - If `terminal` is available, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
-             - If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.\n\
+             - Before reporting a tool or verification blocker, exhaust safe in-scope alternatives. For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.\n\
+             - If you encounter ambiguity or a blocker you cannot resolve after those alternatives, use report_blocker immediately.\n\
              - When using report_blocker, include outcome, reason, partial_work when applicable, exact_need, next_step, and target.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
@@ -1926,6 +2506,7 @@ impl Agent {
                 "\n- Delegation mode is active: `terminal`, `browser`, and `run_command` are not available here.\n\
                  Use direct file tools (`read_file`, `edit_file`, `write_file`, `search_files`) for narrow file work.\n\
                  Use `cli_agent` for shell/test flows or multi-step coding and research work.\n\
+                 For public URL reachability or returned text, use an available HTTP read tool or ask `cli_agent` to run curl; do not require browser access unless the task is visual or interactive.\n\
                  When you use `cli_agent`, always provide `action=\"run\"`, a concrete `prompt`, and `working_dir` when you know the repo path.",
             );
         }
@@ -1986,6 +2567,17 @@ mod tests {
             "any task",
         );
         assert_eq!(kind, SpecialistKind::TaskLead);
+    }
+
+    #[test]
+    fn executor_role_accepts_generic_recovery_override() {
+        let kind = Agent::resolve_specialist_kind(
+            Some(AgentRole::Executor),
+            Some("executor"),
+            "Recover a website deployment",
+            "Verify https://example.com in a browser and finish every unmet requirement",
+        );
+        assert_eq!(kind, SpecialistKind::Executor);
     }
 
     #[test]
@@ -2165,6 +2757,17 @@ mod tests {
     }
 
     #[test]
+    fn task_lead_keeps_cohesive_delivery_and_verification_with_one_worker() {
+        let prompt =
+            Agent::build_task_lead_prompt("goal_1", "deploy the site", None, 1, 3, false, false);
+        assert!(prompt.contains(
+            "Keep readiness checks, the mutation, and immediate verification in the same task"
+        ));
+        assert!(prompt.contains("real ownership boundary"));
+        assert!(!prompt.contains("ALWAYS create a verification task"));
+    }
+
+    #[test]
     fn executor_prompt_mentions_cli_delegate_mode_when_cli_present() {
         let prompt =
             Agent::build_executor_prompt("refactor auth", "user request", 2, 4, true, None, None);
@@ -2173,6 +2776,8 @@ mod tests {
         assert!(!prompt.contains("prefer `terminal` directly"));
         assert!(prompt.contains("action=\"run\""));
         assert!(prompt.contains("working_dir"));
+        assert!(prompt.contains("public URL reachability"));
+        assert!(prompt.contains("do not require browser access"));
     }
 
     #[test]

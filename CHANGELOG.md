@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.32] - 2026-07-31
+
+### Added
+
+- **Durable work coordination for goals and tasks.** Goal execution now runs against a persistent coordination model: explicit work projects, one goal run per finite goal or scheduled firing, fenced task attempts with leases and heartbeats, named worker profiles, an append-only task journal, structured handoffs, and attempt-scoped workspaces. Expired leases are recovered automatically—idempotent tasks with retry budget are re-queued, while ambiguous writes are held for verification instead of being blindly retried. Existing installations migrate into a `default` project and one closed legacy run, so prior behavior is unchanged.
+- **`/work` board from chat.** `/work [ready|running|blocked|show|comment|unblock|retry|cancel|assign|workspace|project]` inspects and steers durable work without leaving the conversation, including per-task journals, blocker resolution, worker-profile assignment, and workspace policy. The local dashboard gains a matching read-only Active Work panel backed by a new `/api/work` endpoint.
+- **Per-task workspace policies.** Tasks declare `shared`, `isolated`, or `worktree` execution scope, so a new project gets its own directory and parallel or collision-prone edits in an existing Git project get a worktree. Workspaces are preserved after execution until explicitly released, and their artifacts and verification notes flow into the task handoff.
+- **`aidaemon dashboard`.** `dashboard open` launches the authenticated local dashboard in a browser and `dashboard login-url` prints the token URL for headless and remote hosts.
+- **Owner-only rotating daemon logs.** Background service output is written to a size-rotated file with `0700` directories and `0600` files rather than an unbounded launch-service redirect, so a long-lived daemon cannot consume the host disk. `AIDAEMON_LOG_DIR`, `AIDAEMON_LOG_MAX_BYTES`, and `AIDAEMON_LOG_BACKUPS` tune placement and retention; interactive runs still log to stderr.
+
+### Changed
+
+- **Task planning keeps a cohesive target in one task.** Sequential build, deploy, and verification stages for a single target now share one task with concrete acceptance criteria, and separate prerequisite or verification tasks are reserved for real ownership boundaries, independent review, or external waits. Independent tasks sharing an explicit `parallel_group` may run up to four executors concurrently; everything else stays sequential.
+- **Verification picks the cheapest sufficient surface.** HTTP status and returned text prove public reachability without a browser; layout, client-side state, and interaction still require one. When a browser session is unavailable, executors and the browser verifier switch to an HTTP read for every claim it can prove instead of asking the owner to repair the tool session.
+- **Inline-vs-durable routing is refined by task shape.** A semantic task-shape assessment finalizes the routing decision, while the deterministic pass remains the fallback when the assessment provider is unavailable and low-confidence or self-inconsistent classifications are discarded.
+- **Command classification is typed rather than keyword-shaped.** Shell commands resolve to observation, mutation, or both, with separate source, build, and deployment effects, per-CLI handling for `git`, `curl`, `npm`, and `wrangler`, and recognition of inert introspection flags only when they form the complete invocation. Incidental cache writes can no longer satisfy a source or deployment outcome.
+- **Checkpoint scope is discovered from command operands.** Mutating shell commands narrow to a bounded project root, a workspace that is a container for several projects resolves to the specific child being modified, and system read paths such as `/dev/null` no longer widen a snapshot.
+- **Background memory analysis cannot create executable work.** Model-extracted goal mentions are recorded as inert personal observations with provenance; they never mutate, satisfy, or resurrect orchestration goals.
+
+### Fixed
+
+- **Duplicate task leads no longer strand a goal.** A per-goal run guard admits one lead, and a losing heartbeat trigger returns its claim to the pending queue instead of leaving a phantom running task. Orphan recovery also defers to a live lead during the brief interval when none of its tasks are marked running.
+- **A stale coordinator can no longer overwrite a durably blocked attempt as completed.** The latest fenced attempt is authoritative, a transition fence protects new blocked tasks, and a migration repairs rows already corrupted by the historical race.
+- **Finite goals complete only from successful terminal task state.** Failed, blocked, and interrupted work is terminal for scheduling but is not completion evidence, and partial work is preserved as context rather than promoted to success. Legacy recurring calls keep their historical-task tolerance so one old task cannot wedge every future firing.
+- **Escalation notifications stop firing after the blocker is gone.** Task-linked critical alerts are re-verified against current task state and closed when an unblock, retry, cancellation, or completion has already landed.
+- **Startup no longer refuses to run because a search index is corrupt.** When integrity failures are limited to the replaceable memory and history FTS projections, those indexes are rebuilt and integrity is reverified; any other corruption still aborts startup.
+- **A checkpoint scope preflight failure no longer burns the tool's error budget.** The command never started and a different explicit project target can satisfy the condition, so the attempt does not count toward the semantic-error lockout.
+- **The macOS launch agent reloads reliably.** Packaging now boots the agent out and retries `launchctl bootstrap`, failing loudly with launchd's own output instead of leaving a half-loaded service.
+
 ## [0.11.31] - 2026-07-30
 
 ### Added

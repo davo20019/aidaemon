@@ -1349,7 +1349,9 @@ impl Channel for DiscordChannel {
                 warn!("Failed to send Discord approval request: {}", e);
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                return Ok(ApprovalResponse::Deny);
+                return Err(anyhow::anyhow!(
+                    "Discord approval request could not be delivered: {e}"
+                ));
             }
         }
 
@@ -1359,13 +1361,14 @@ impl Channel for DiscordChannel {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 warn!(approval_id = %short_id, "Approval channel closed");
-                Ok(ApprovalResponse::Deny)
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!("Discord approval response channel closed"))
             }
             Err(_) => {
                 warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!("Discord approval request timed out"))
             }
         }
     }

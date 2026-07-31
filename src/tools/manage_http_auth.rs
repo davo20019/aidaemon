@@ -446,8 +446,8 @@ impl ManageHttpAuthTool {
 
         match tokio::time::timeout(Duration::from_secs(300), response_rx).await {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Ok(ApprovalResponse::Deny),
-            Err(_) => Ok(ApprovalResponse::Deny),
+            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
+            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
         }
     }
 

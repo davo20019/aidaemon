@@ -153,6 +153,7 @@ impl Agent {
             policy_config,
             path_aliases,
             inherited_project_scope,
+            approval_session_id: None,
             root_tools: None, // Root agent — its own tools ARE the root tools
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -308,6 +309,7 @@ impl Agent {
         policy_config: PolicyConfig,
         path_aliases: PathAliasConfig,
         inherited_project_scope: Option<String>,
+        approval_session_id: Option<String>,
         root_tools: Option<Vec<Arc<dyn Tool>>>,
         specialists: Arc<crate::agent::specialists::SpecialistRegistry>,
         vision_config: VisionConfig,
@@ -365,6 +367,7 @@ impl Agent {
             policy_config,
             path_aliases,
             inherited_project_scope,
+            approval_session_id,
             root_tools,
             record_decision_points,
             current_turn_ids: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

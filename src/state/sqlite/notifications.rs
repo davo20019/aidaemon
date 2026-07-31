@@ -7,8 +7,10 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         entry: &crate::traits::NotificationEntry,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO notification_queue (id, goal_id, session_id, notification_type, priority, message, created_at, delivered_at, attempts, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notification_queue
+                (id, goal_id, session_id, notification_type, priority, message,
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.goal_id)
@@ -20,9 +22,58 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         .bind(&entry.delivered_at)
         .bind(entry.attempts)
         .bind(&entry.expires_at)
+        .bind(&entry.task_id)
+        .bind(&entry.action_token)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn enqueue_goal_notification(
+        &self,
+        entry: &crate::traits::NotificationEntry,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let notified_at = chrono::Utc::now().to_rfc3339();
+        let claimed = sqlx::query(
+            "UPDATE goals
+             SET notified_at = ?, notification_attempts = notification_attempts + 1
+             WHERE id = ? AND notified_at IS NULL",
+        )
+        .bind(&notified_at)
+        .bind(&entry.goal_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if claimed == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO notification_queue
+                (id, goal_id, session_id, notification_type, priority, message,
+                 created_at, delivered_at, attempts, expires_at, task_id, action_token)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&entry.id)
+        .bind(&entry.goal_id)
+        .bind(&entry.session_id)
+        .bind(&entry.notification_type)
+        .bind(&entry.priority)
+        .bind(&entry.message)
+        .bind(&entry.created_at)
+        .bind(&entry.delivered_at)
+        .bind(entry.attempts)
+        .bind(&entry.expires_at)
+        .bind(&entry.task_id)
+        .bind(&entry.action_token)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn get_pending_notifications(
@@ -30,15 +81,22 @@ impl crate::traits::NotificationStore for SqliteStateStore {
         limit: i64,
     ) -> anyhow::Result<Vec<crate::traits::NotificationEntry>> {
         let rows = sqlx::query(
-            "SELECT id, goal_id, session_id, notification_type, priority, message, created_at, delivered_at, attempts, expires_at
+            "SELECT id, goal_id, session_id, notification_type, priority, message,
+                    created_at, delivered_at, attempts, expires_at, task_id, action_token
              FROM notification_queue
              WHERE delivered_at IS NULL
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
-               AND attempts < 10
-               AND datetime(created_at) > datetime('now', '-24 hours')
+               AND (
+                    priority = 'critical'
+                    OR (
+                        attempts < 10
+                        AND datetime(created_at) > datetime('now', '-24 hours')
+                    )
+               )
              ORDER BY
                CASE priority WHEN 'critical' THEN 0 ELSE 1 END ASC,
-               created_at DESC
+               julianday(created_at) DESC,
+               id DESC
              LIMIT ?",
         )
         .bind(limit)
@@ -58,6 +116,8 @@ impl crate::traits::NotificationStore for SqliteStateStore {
                 delivered_at: row.get("delivered_at"),
                 attempts: row.get("attempts"),
                 expires_at: row.get("expires_at"),
+                task_id: row.get("task_id"),
+                action_token: row.get("action_token"),
             });
         }
         Ok(entries)

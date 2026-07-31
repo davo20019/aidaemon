@@ -166,9 +166,10 @@ fn normalize_error_line_for_signature(line: &str) -> String {
 fn should_skip_transient_cooldown(tool_name: &str, error_text: &str) -> bool {
     let lower = error_text.to_ascii_lowercase();
     loop_utils::is_file_lookup_miss_for_tool(tool_name, &lower)
+        || loop_utils::is_recoverable_checkpoint_scope_failure(&lower)
 }
 
-fn is_browser_launch_failure(tool_name: &str, error_text: &str) -> bool {
+fn is_browser_action_unavailable(tool_name: &str, error_text: &str) -> bool {
     if tool_name != "browser" {
         return false;
     }
@@ -180,6 +181,7 @@ fn is_browser_launch_failure(tool_name: &str, error_text: &str) -> bool {
         || lower.contains("user data directory is already in use")
         || lower.contains("devtoolsactiveport")
         || lower.contains("failed to connect to browser websocket")
+        || lower.contains("no approval channel is available")
 }
 
 fn derive_failure_signature(error_text: &str) -> String {
@@ -264,6 +266,9 @@ pub(super) async fn apply_result_learning(
         if tc.name == "spawn_agent" {
             append_tool_result_notice(result_text, &ToolResultNotice::SpecialistFailurePivot);
         }
+        if is_browser_action_unavailable(&tc.name, &base_error) {
+            append_tool_result_notice(result_text, &ToolResultNotice::BrowserUnavailableFallback);
+        }
         if matches!(failure_class, ToolFailureClass::Transient) {
             state.pending_error_solution_ids.clear();
             let transient_count = state
@@ -273,12 +278,16 @@ pub(super) async fn apply_result_learning(
             *transient_count += 1;
             if should_skip_transient_cooldown(&tc.name, &base_error) {
                 state.tool_cooldown_until_iteration.remove(&tc.name);
-                append_tool_result_notice(
-                    result_text,
-                    &ToolResultNotice::RecoverableFilePathMiss {
+                let notice = if loop_utils::is_recoverable_checkpoint_scope_failure(&base_error) {
+                    ToolResultNotice::RecoverableCheckpointScopeMiss {
                         tool_name: tc.name.clone(),
-                    },
-                );
+                    }
+                } else {
+                    ToolResultNotice::RecoverableFilePathMiss {
+                        tool_name: tc.name.clone(),
+                    }
+                };
+                append_tool_result_notice(result_text, &notice);
             } else {
                 let cooldown_iters = 2usize;
                 let cooldown_until = env.iteration.saturating_add(cooldown_iters);
@@ -293,9 +302,6 @@ pub(super) async fn apply_result_learning(
                         cooldown_iters,
                     },
                 );
-            }
-            if is_browser_launch_failure(&tc.name, &base_error) {
-                append_tool_result_notice(result_text, &ToolResultNotice::BrowserLaunchFallback);
             }
         } else {
             let failure = record_semantic_failure_signature(
@@ -334,9 +340,10 @@ pub(super) async fn apply_result_learning(
                 append_tool_result_notice(result_text, &coach);
             }
 
-            // Fetch failure pivot: a failed page read (403, timeout,
-            // navigation error) must redirect the model to the NEXT search
-            // result, not a retry of the same URL.
+            // A failed page-read method is not proof that the target URL is
+            // inaccessible. Prevent an identical-call loop while preserving
+            // alternate verification of the same target (HTTP/CLI/another
+            // browser path).
             if tc.name == "web_fetch" || tc.name == "browser" {
                 let url = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                     .ok()
@@ -344,7 +351,7 @@ pub(super) async fn apply_result_learning(
                     .unwrap_or_else(|| "<the same URL>".to_string());
                 append_tool_result_notice(
                     result_text,
-                    &ToolResultNotice::FetchFailedTryDifferentSource {
+                    &ToolResultNotice::FetchFailurePivot {
                         tool_name: tc.name.clone(),
                         url,
                     },
@@ -978,27 +985,35 @@ mod tests {
     }
 
     #[test]
-    fn browser_launch_failure_detection_matches_singleton_lock() {
+    fn browser_unavailable_detection_matches_singleton_lock() {
         let error = "Failed to launch browser: Browser process exited before websocket URL could be resolved, stderr: BrowserStderr(\"SingletonLock: File exists\")";
-        assert!(is_browser_launch_failure("browser", error));
-        assert!(!is_browser_launch_failure("web_fetch", error));
-        assert!(!is_browser_launch_failure("browser", "HTTP 404 Not Found"));
+        assert!(is_browser_action_unavailable("browser", error));
+        assert!(!is_browser_action_unavailable("web_fetch", error));
+        assert!(!is_browser_action_unavailable(
+            "browser",
+            "HTTP 404 Not Found"
+        ));
     }
 
     #[test]
-    fn browser_launch_failure_detection_handles_profile_and_devtools_failures() {
-        assert!(is_browser_launch_failure(
+    fn browser_unavailable_detection_handles_profile_devtools_and_approval_failures() {
+        assert!(is_browser_action_unavailable(
             "browser",
             "Chrome failed to start: user data directory is already in use"
         ));
-        assert!(is_browser_launch_failure(
+        assert!(is_browser_action_unavailable(
             "browser",
             "DevToolsActivePort file doesn't exist; browser process crashed"
         ));
-        assert!(is_browser_launch_failure(
+        assert!(is_browser_action_unavailable(
             "browser",
             "failed to connect to browser websocket endpoint"
         ));
+        assert!(is_browser_action_unavailable(
+            "browser",
+            "Approval required, but no approval channel is available. Action denied."
+        ));
+        assert!(!is_browser_action_unavailable("browser", "Denied by user."));
     }
 
     #[test]
@@ -1167,6 +1182,21 @@ mod tests {
             "terminal",
             "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
         ));
+    }
+
+    #[test]
+    fn checkpoint_scope_preflight_skips_terminal_cooldown() {
+        assert!(should_skip_transient_cooldown(
+            "terminal",
+            "Error: refusing an unbounded checkpoint at workspace container /Users/example/projects",
+        ));
+        let rendered = ToolResultNotice::RecoverableCheckpointScopeMiss {
+            tool_name: "terminal".to_string(),
+        }
+        .render();
+        assert!(rendered.contains("No process was started"));
+        assert!(rendered.contains("did NOT consume semantic lockout budget"));
+        assert!(rendered.contains("bounded project directory"));
     }
 
     #[test]

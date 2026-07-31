@@ -1609,6 +1609,462 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
 
+    // Durable collaborative-work model. The default project keeps existing
+    // installations behaviorally unchanged while making project scope explicit.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS work_projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            description TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO work_projects (id, name, description)
+         VALUES ('default', 'Default', 'Default Aidaemon work project')",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_work_projects (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE goals ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "UPDATE goals SET project_id = 'default' WHERE project_id IS NULL OR project_id = ''",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS goal_runs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            trigger_type TEXT NOT NULL,
+            schedule_id TEXT REFERENCES goal_schedules(id) ON DELETE SET NULL,
+            root_task_id TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            outcome_summary TEXT,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN goal_run_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN current_attempt_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN worker_profile_id TEXT")
+        .execute(pool)
+        .await;
+    let _ =
+        sqlx::query("ALTER TABLE tasks ADD COLUMN workspace_policy TEXT NOT NULL DEFAULT 'shared'")
+            .execute(pool)
+            .await;
+    let _ = sqlx::query(
+        "ALTER TABLE tasks ADD COLUMN workspace_policy_explicit INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'work'")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal'")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN updated_at TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "UPDATE tasks
+         SET updated_at = COALESCE(updated_at, completed_at, started_at, created_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS worker_profiles (
+            id TEXT PRIMARY KEY,
+            project_id TEXT REFERENCES work_projects(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            specialist TEXT NOT NULL,
+            model TEXT,
+            tools_json TEXT,
+            max_iterations INTEGER,
+            tool_budget INTEGER,
+            timeout_secs INTEGER,
+            max_concurrency INTEGER NOT NULL DEFAULT 1 CHECK (max_concurrency > 0),
+            workspace_policy TEXT NOT NULL DEFAULT 'shared',
+            memory_scope TEXT NOT NULL DEFAULT 'project',
+            version INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, name)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for (id, name, max_concurrency, workspace_policy) in [
+        ("profile-task-lead", "task_lead", 2_i64, "shared"),
+        ("profile-executor", "executor", 4_i64, "shared"),
+        ("profile-research", "research", 4_i64, "shared"),
+        (
+            "profile-artifact-writer",
+            "artifact_writer",
+            2_i64,
+            "shared",
+        ),
+        ("profile-code", "code", 2_i64, "shared"),
+        (
+            "profile-browser-verifier",
+            "browser_verifier",
+            2_i64,
+            "shared",
+        ),
+        ("profile-review", "review", 2_i64, "shared"),
+        ("profile-comms-draft", "comms_draft", 2_i64, "shared"),
+        ("profile-generic", "generic", 2_i64, "shared"),
+    ] {
+        sqlx::query(
+            "INSERT OR IGNORE INTO worker_profiles
+                (id, project_id, name, specialist, max_concurrency, workspace_policy)
+             VALUES (?, NULL, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(name)
+        .bind(max_concurrency)
+        .bind(workspace_policy)
+        .execute(pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_attempts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            worker_profile_id TEXT REFERENCES worker_profiles(id) ON DELETE SET NULL,
+            worker_instance_id TEXT NOT NULL,
+            lease_token TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            last_heartbeat_at TEXT NOT NULL,
+            workspace_id TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_journal (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT REFERENCES task_attempts(id) ON DELETE SET NULL,
+            entry_type TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            source_channel TEXT,
+            body TEXT NOT NULL,
+            payload TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_handoffs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+            summary TEXT NOT NULL,
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            verification_json TEXT NOT NULL DEFAULT '[]',
+            remaining_risk TEXT,
+            next_step TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS task_workspaces (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+            backend_id TEXT NOT NULL,
+            policy TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            branch_name TEXT,
+            base_ref TEXT,
+            head_ref TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            released_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS work_channel_links (
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            channel_session_id TEXT NOT NULL,
+            thread_ref TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (goal_id, channel_session_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Episode analysis historically inserted inferred goal mentions without a
+    // domain, so the orchestration default made them executable work. Reclassify
+    // only rows that still have no task or schedule evidence; preserve them as
+    // inert personal observations for audit and possible later confirmation.
+    sqlx::query(
+        "UPDATE goals
+         SET domain = 'personal',
+             status = CASE
+                 WHEN status IN ('active', 'pending', 'pending_confirmation')
+                 THEN 'observed'
+                 ELSE status
+             END,
+             updated_at = datetime('now')
+         WHERE domain = 'orchestration'
+           AND source_episode_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.goal_id = goals.id)
+           AND NOT EXISTS (SELECT 1 FROM goal_schedules s WHERE s.goal_id = goals.id)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM work_channel_links
+         WHERE goal_id IN (
+             SELECT id FROM goals
+             WHERE domain = 'personal' AND source_episode_id IS NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "UPDATE goal_runs
+         SET status = 'cancelled',
+             outcome_summary = COALESCE(
+                 outcome_summary,
+                 'Reclassified as a non-executable personal observation'
+             ),
+             completed_at = COALESCE(completed_at, datetime('now')),
+             updated_at = datetime('now')
+         WHERE status IN ('pending', 'running', 'blocked')
+           AND goal_id IN (
+               SELECT g.id FROM goals g
+               WHERE g.domain = 'personal'
+                 AND g.source_episode_id IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.goal_id = g.id)
+           )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Existing goal/task data gets one explicit legacy run. New scheduled
+    // firings create a fresh run before any task is inserted.
+    sqlx::query(
+        "INSERT OR IGNORE INTO goal_runs
+            (id, project_id, goal_id, trigger_type, status, outcome_summary,
+             started_at, completed_at, created_at, updated_at)
+         SELECT
+            'run-legacy-' || g.id,
+            COALESCE(NULLIF(g.project_id, ''), 'default'),
+            g.id,
+            'legacy',
+            CASE
+                WHEN g.status IN ('completed', 'failed', 'cancelled') THEN g.status
+                WHEN EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.goal_id = g.id AND t.status = 'blocked'
+                ) THEN 'blocked'
+                ELSE 'running'
+            END,
+            NULL,
+            g.created_at,
+            CASE WHEN g.status IN ('completed', 'failed', 'cancelled')
+                 THEN COALESCE(g.completed_at, g.updated_at) ELSE NULL END,
+            g.created_at,
+            g.updated_at
+         FROM goals g
+         WHERE g.domain = 'orchestration'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE tasks
+         SET goal_run_id = COALESCE(
+             goal_run_id,
+             (SELECT gr.id FROM goal_runs gr
+              WHERE gr.goal_id = tasks.goal_id
+              ORDER BY julianday(gr.started_at) DESC, gr.id DESC LIMIT 1)
+         )
+         WHERE goal_run_id IS NULL OR goal_run_id = ''",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE scheduled_run_state ADD COLUMN goal_run_id TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "UPDATE scheduled_run_state
+         SET goal_run_id = COALESCE(
+             goal_run_id,
+             (SELECT t.goal_run_id FROM tasks t
+              WHERE t.id = scheduled_run_state.root_task_id)
+         )",
+    )
+    .execute(pool)
+    .await?;
+
+    // The first run-isolation migration grouped all pre-existing recurring
+    // history into one legacy run. Once no live task or scheduled-run state
+    // references that run, close it so current board views do not present old
+    // outcomes as an active recurring cycle. Tasks and journals remain intact.
+    sqlx::query(
+        "UPDATE goal_runs
+         SET status = CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM tasks t
+                     WHERE t.goal_run_id = goal_runs.id
+                       AND t.status IN ('failed', 'blocked', 'interrupted')
+                 ) THEN 'failed'
+                 ELSE 'completed'
+             END,
+             outcome_summary = COALESCE(
+                 outcome_summary,
+                 'Archived legacy history after recurring-run isolation'
+             ),
+             completed_at = COALESCE(completed_at, datetime('now')),
+             updated_at = datetime('now')
+         WHERE trigger_type = 'legacy'
+           AND status IN ('pending', 'running', 'blocked')
+           AND EXISTS (
+               SELECT 1 FROM goals g
+               WHERE g.id = goal_runs.goal_id
+                 AND g.goal_type = 'continuous'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+               WHERE t.goal_run_id = goal_runs.id
+                 AND t.status IN ('pending', 'claimed', 'running')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM scheduled_run_state s
+               WHERE s.goal_run_id = goal_runs.id
+           )",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN task_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_goals_project_status
+         ON goals(project_id, status)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_goal_runs_goal_started
+         ON goal_runs(goal_id, started_at DESC)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("DROP INDEX IF EXISTS idx_goal_runs_one_open")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_goal_runs_open
+         ON goal_runs(goal_id, status)
+         WHERE status IN ('pending', 'running', 'blocked')",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_goal_run_status
+         ON tasks(goal_run_id, status)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_one_active
+         ON task_attempts(task_id)
+         WHERE status IN ('claimed', 'running')",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_attempts_lease
+         ON task_attempts(status, lease_expires_at)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_journal_task_created
+         ON task_journal(task_id, created_at)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_handoffs_task_created
+         ON task_handoffs(task_id, created_at)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_task_workspaces_task
+         ON task_workspaces(task_id, created_at)",
+    )
+    .execute(pool)
+    .await;
+
     // Indexes (idempotent).
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status)")
         .execute(pool)
@@ -1687,6 +2143,13 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN task_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_notification_queue_pending
          ON notification_queue(delivered_at, priority, created_at)
@@ -1760,6 +2223,47 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
          WHERE (result IS NOT NULL AND TRIM(result) = '')
             OR (error IS NOT NULL AND TRIM(error) = '')
             OR (blocker IS NOT NULL AND TRIM(blocker) = '')",
+    )
+    .execute(pool)
+    .await?;
+
+    // Repair the historical race where an executor durably blocked an attempt,
+    // then a stale coordinator overwrote the task row as completed without an
+    // unblock or a newer attempt. The latest fenced attempt is authoritative.
+    sqlx::query(
+        "UPDATE tasks
+         SET status = 'blocked',
+             blocker = COALESCE(blocker, 'Latest execution attempt is blocked.'),
+             completed_at = COALESCE(
+                 (SELECT a.completed_at FROM task_attempts a
+                  WHERE a.task_id = tasks.id
+                  ORDER BY julianday(a.started_at) DESC, a.id DESC LIMIT 1),
+                 completed_at
+             ),
+             updated_at = datetime('now'), version = version + 1
+         WHERE status = 'completed'
+           AND (
+               SELECT a.status FROM task_attempts a
+               WHERE a.task_id = tasks.id
+               ORDER BY julianday(a.started_at) DESC, a.id DESC LIMIT 1
+           ) = 'blocked'",
+    )
+    .execute(pool)
+    .await?;
+
+    // Task-linked escalation notifications are actionable only while the task
+    // remains blocked. Close obsolete critical rows so they cannot surface
+    // hours later after an unblock, retry, cancellation, or completion.
+    sqlx::query(
+        "UPDATE notification_queue
+         SET delivered_at = datetime('now')
+         WHERE delivered_at IS NULL
+           AND notification_type = 'escalation'
+           AND task_id IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+               WHERE t.id = notification_queue.task_id AND t.status = 'blocked'
+           )",
     )
     .execute(pool)
     .await?;
@@ -2233,4 +2737,19 @@ async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
             .await?;
     }
     Ok(())
+}
+
+/// Recreate the memory search indexes from their authoritative source tables.
+///
+/// These FTS tables are replaceable projections. Rebuilding both together keeps
+/// their trigger and secure-delete configuration consistent after either index
+/// is reported corrupt during startup integrity verification.
+pub(crate) async fn rebuild_memory_fts_projections(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS memory_claims_fts")
+        .execute(pool)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS memory_spans_fts")
+        .execute(pool)
+        .await?;
+    create_memory_fts(pool).await
 }

@@ -364,6 +364,32 @@ impl ScheduledGoalRunsTool {
             schedule_consumed = true;
         }
 
+        if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
+            let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
+            if !run_tasks.is_empty() {
+                let status = if run_tasks.iter().any(|existing| {
+                    matches!(
+                        existing.status.as_str(),
+                        "failed" | "interrupted" | "cancelled"
+                    )
+                }) {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                self.state
+                    .finish_goal_run(
+                        &open_run.id,
+                        status,
+                        Some("Closed before an explicit manual run."),
+                    )
+                    .await?;
+            }
+        }
+        self.state
+            .start_goal_run(&goal.id, "manual", schedule_id, Some(&task.id))
+            .await?;
+
         goal.last_useful_action = Some(now.clone());
         goal.updated_at = now;
         self.state.update_goal(&goal).await?;
@@ -388,25 +414,24 @@ impl ScheduledGoalRunsTool {
             return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
         };
 
-        let mut tasks = self.state.get_tasks_for_goal(&goal.id).await?;
-        if tasks.is_empty() {
+        let mut runs = self.state.get_goal_runs(&goal.id).await?;
+        if runs.is_empty() {
             return Ok(format!("No runs found yet for scheduled goal {}.", goal.id));
         }
-        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         let cap = limit.clamp(1, 50);
-        tasks.truncate(cap);
+        runs.truncate(cap);
 
         let mut failed = 0usize;
         let mut completed = 0usize;
         let mut pending = 0usize;
         let mut running = 0usize;
         let mut blocked = 0usize;
-        for t in &tasks {
-            match t.status.as_str() {
+        for run in &runs {
+            match run.status.as_str() {
                 "failed" => failed += 1,
                 "completed" => completed += 1,
                 "pending" => pending += 1,
-                "running" | "claimed" => running += 1,
+                "running" => running += 1,
                 "blocked" => blocked += 1,
                 _ => {}
             }
@@ -416,7 +441,7 @@ impl ScheduledGoalRunsTool {
             "**Scheduled Run History**\n\n- Goal: {}\n- ID: {}\n- Showing: {} run(s)\n- Status mix: completed {}, failed {}, running {}, pending {}, blocked {}\n",
             goal.description,
             goal.id,
-            tasks.len(),
+            runs.len(),
             completed,
             failed,
             running,
@@ -426,56 +451,66 @@ impl ScheduledGoalRunsTool {
 
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         let coalesces = schedules.iter().any(|s| s.fire_policy != "always_fire");
-        let open_tasks: Vec<&Task> = tasks
+        let mut tasks_by_run = Vec::with_capacity(runs.len());
+        for run in &runs {
+            tasks_by_run.push(
+                self.state
+                    .get_tasks_for_goal_run(&run.id)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        let open_tasks = tasks_by_run
             .iter()
-            .filter(|t| matches!(t.status.as_str(), "pending" | "claimed" | "running"))
-            .collect();
+            .flatten()
+            .filter(|task| {
+                matches!(
+                    task.status.as_str(),
+                    "pending" | "claimed" | "running" | "blocked"
+                )
+            })
+            .collect::<Vec<_>>();
         if coalesces && !open_tasks.is_empty() {
             out.push_str("\n**Open task(s) blocking coalesced schedule fires**");
-            for t in open_tasks.iter().take(5) {
+            for task in open_tasks.iter().take(5) {
                 out.push_str(&format!(
                     "\n- **{}** status={} created={} desc={}",
-                    t.id,
-                    t.status,
-                    t.created_at,
-                    Self::truncate(&t.description, 160)
+                    task.id,
+                    task.status,
+                    task.created_at,
+                    Self::truncate(&task.description, 160)
                 ));
             }
             out.push('\n');
         }
 
-        for t in &tasks {
-            let activities = self
-                .state
-                .get_task_activities(&t.id)
-                .await
-                .unwrap_or_default();
-            let last_activity = activities.last();
-            let last_tool = last_activity
-                .and_then(|a| a.tool_name.as_deref())
-                .unwrap_or("-");
-            let last_ok = last_activity
-                .and_then(|a| a.success)
-                .map(|s| if s { "ok" } else { "err" })
-                .unwrap_or("n/a");
-
+        for (run, tasks) in runs.iter().zip(tasks_by_run.iter()) {
             out.push_str(&format!(
-                "\n- **{}** status={} retry={}/{} created={} duration={} last_tool={}({})",
-                t.id,
-                t.status,
-                t.retry_count,
-                t.max_retries,
-                t.created_at,
-                Self::format_duration(t.started_at.as_deref(), t.completed_at.as_deref()),
-                last_tool,
-                last_ok
+                "\n- **{}** trigger={} status={} started={} duration={} tasks={}",
+                run.id,
+                run.trigger_type,
+                run.status,
+                run.started_at,
+                Self::format_duration(Some(&run.started_at), run.completed_at.as_deref()),
+                tasks.len()
             ));
-            if t.status == "failed" {
-                if let Some(err) = &t.error {
+            if let Some(summary) = &run.outcome_summary {
+                out.push_str(&format!("\n  summary: {}", Self::truncate(summary, 220)));
+            }
+            for task in tasks
+                .iter()
+                .filter(|task| matches!(task.status.as_str(), "failed" | "blocked" | "interrupted"))
+            {
+                out.push_str(&format!(
+                    "\n  task {} status={} desc={}",
+                    Self::short_id(&task.id),
+                    task.status,
+                    Self::truncate(&task.description, 120)
+                ));
+                if let Some(err) = &task.error {
                     out.push_str(&format!("\n  error: {}", Self::truncate(err, 160)));
                 }
-            } else if t.status == "blocked" {
-                if let Some(blocker) = &t.blocker {
+                if let Some(blocker) = &task.blocker {
                     out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 160)));
                 }
             }

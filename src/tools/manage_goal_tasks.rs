@@ -5,13 +5,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::traits::{StateStore, Task, Tool, ToolCapabilities, ToolRole};
+use crate::traits::{
+    HandoffArtifact, StateStore, Task, TaskAttemptPatch, TaskHandoff, Tool, ToolCapabilities,
+    ToolRole,
+};
 
 /// Tool for task leads to manage tasks within their assigned goal.
 pub struct ManageGoalTasksTool {
     goal_id: String,
     state: Arc<dyn StateStore>,
-    run_started_at: Option<String>,
+    goal_run_id: Option<String>,
 }
 
 impl ManageGoalTasksTool {
@@ -19,22 +22,17 @@ impl ManageGoalTasksTool {
         Self {
             goal_id,
             state,
-            run_started_at: None,
+            goal_run_id: None,
         }
     }
 
-    pub fn with_run_started_at(mut self, run_started_at: Option<String>) -> Self {
-        self.run_started_at = run_started_at;
+    pub fn with_goal_run_id(mut self, goal_run_id: Option<String>) -> Self {
+        self.goal_run_id = goal_run_id;
         self
     }
 
     fn task_in_scope(&self, task: &Task) -> bool {
-        task.goal_id == self.goal_id
-            && !Self::is_scheduled_root_task(task)
-            && self
-                .run_started_at
-                .as_deref()
-                .is_none_or(|started_at| task.created_at.as_str() >= started_at)
+        task.goal_id == self.goal_id && !Self::is_scheduled_root_task(task)
     }
 
     fn is_scheduled_root_task(task: &Task) -> bool {
@@ -45,13 +43,23 @@ impl ManageGoalTasksTool {
     }
 
     async fn scoped_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        Ok(self
-            .state
-            .get_tasks_for_goal(&self.goal_id)
-            .await?
+        let tasks = if let Some(run_id) = self.goal_run_id.as_deref() {
+            self.state.get_tasks_for_goal_run(run_id).await?
+        } else {
+            self.state.get_tasks_for_goal(&self.goal_id).await?
+        };
+        Ok(tasks
             .into_iter()
             .filter(|task| self.task_in_scope(task))
             .collect())
+    }
+
+    async fn task_id_in_scope(&self, task_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .scoped_tasks()
+            .await?
+            .iter()
+            .any(|task| task.id == task_id))
     }
 
     fn out_of_scope_message(&self, task_id: &str) -> String {
@@ -83,7 +91,7 @@ impl ManageGoalTasksTool {
         }
         // Try exact lookup first
         if let Ok(Some(task)) = self.state.get_task(task_id).await {
-            if self.task_in_scope(&task) {
+            if self.task_in_scope(&task) && self.task_id_in_scope(task_id).await.unwrap_or(false) {
                 return task_id.to_string();
             }
         }
@@ -192,9 +200,9 @@ impl ManageGoalTasksTool {
 /// own — either it already succeeded (`completed`/`skipped`), was explicitly
 /// replaced (`superseded`), or it is dead
 /// (`failed`/`blocked`/`interrupted`/`cancelled`/`abandoned`). Terminal tasks
-/// must not block goal completion. The dead set mirrors `heartbeat`'s
-/// `terminal_failed` classification so the two subsystems agree on what "done"
-/// means for a task.
+/// are useful when deciding whether a scheduler can make further progress.
+/// Terminal does not imply successful: strict finite/current-run completion
+/// separately requires [`Task::satisfies_run_completion`].
 pub(crate) fn is_terminal_task_status(status: &str) -> bool {
     matches!(
         status,
@@ -207,6 +215,10 @@ pub(crate) fn is_terminal_task_status(status: &str) -> bool {
             | "cancelled"
             | "abandoned"
     )
+}
+
+pub(crate) fn tasks_satisfy_goal_completion(tasks: &[Task]) -> bool {
+    !tasks.is_empty() && tasks.iter().all(Task::satisfies_run_completion)
 }
 
 pub(crate) fn goal_completion_summary_indicates_not_finished(summary: &str) -> bool {
@@ -267,6 +279,18 @@ struct ManageGoalTasksArgs {
     summary: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
+    #[serde(default)]
+    worker_profile: Option<String>,
+    #[serde(default)]
+    workspace_policy: Option<String>,
+    #[serde(default)]
+    artifacts: Option<Vec<String>>,
+    #[serde(default)]
+    verification: Option<Vec<String>>,
+    #[serde(default)]
+    remaining_risk: Option<String>,
+    #[serde(default)]
+    next_step: Option<String>,
 }
 
 #[async_trait]
@@ -342,6 +366,33 @@ impl Tool for ManageGoalTasksTool {
                     "agent_id": {
                         "type": "string",
                         "description": "Agent ID"
+                    },
+                    "worker_profile": {
+                        "type": "string",
+                        "description": "Named worker profile ID, such as profile-code or profile-review"
+                    },
+                    "workspace_policy": {
+                        "type": "string",
+                        "enum": ["shared", "isolated", "worktree"],
+                        "description": "Workspace policy: shared for an explicit existing project, isolated for a new project/directory, or worktree for parallel Git edits"
+                    },
+                    "artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paths, URLs, commits, or messages produced by this task"
+                    },
+                    "verification": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Checks performed and their outcomes"
+                    },
+                    "remaining_risk": {
+                        "type": "string",
+                        "description": "Known residual risk after this attempt"
+                    },
+                    "next_step": {
+                        "type": "string",
+                        "description": "Explicit next action for a downstream worker or human"
                     }
                 },
                 "required": ["action"],
@@ -385,16 +436,23 @@ impl Tool for ManageGoalTasksTool {
 /// or an error message string describing which dependencies are unmet.
 async fn check_dependencies_met(state: &dyn StateStore, task: &Task) -> Result<(), String> {
     if let Some(ref deps_json) = task.depends_on {
-        if let Ok(dep_ids) = serde_json::from_str::<Vec<String>>(deps_json) {
-            for dep_id in &dep_ids {
-                if let Ok(Some(dep_task)) = state.get_task(dep_id).await {
-                    if dep_task.status != "completed" {
-                        return Err(format!(
-                            "dependency {} not completed (status: {})",
-                            dep_id, dep_task.status
-                        ));
-                    }
+        let dep_ids = serde_json::from_str::<Vec<String>>(deps_json)
+            .map_err(|_| "dependency metadata is invalid".to_string())?;
+        for dep_id in &dep_ids {
+            match state.get_task(dep_id).await {
+                Ok(Some(dep_task))
+                    if matches!(
+                        dep_task.status.as_str(),
+                        "completed" | "skipped" | "superseded"
+                    ) => {}
+                Ok(Some(dep_task)) => {
+                    return Err(format!(
+                        "dependency {} is not completed or otherwise accepted (status: {})",
+                        dep_id, dep_task.status
+                    ));
                 }
+                Ok(None) => return Err(format!("dependency {} does not exist", dep_id)),
+                Err(error) => return Err(format!("could not read dependency {dep_id}: {error}")),
             }
         }
     }
@@ -503,6 +561,19 @@ impl ManageGoalTasksTool {
             .description
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("create_task requires 'description'"))?;
+        if let Some(profile_id) = args.worker_profile.as_deref() {
+            if self.state.get_worker_profile(profile_id).await?.is_none() {
+                return Ok(format!(
+                    "Cannot create task: worker profile {profile_id} not found"
+                ));
+            }
+        }
+        if let Some(policy) = args.workspace_policy.as_deref() {
+            anyhow::ensure!(
+                matches!(policy, "shared" | "isolated" | "worktree"),
+                "workspace_policy must be shared, isolated, or worktree"
+            );
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -546,6 +617,24 @@ impl ManageGoalTasksTool {
         };
 
         self.state.create_task(&task).await?;
+        if let Some(profile_id) = args.worker_profile.as_deref() {
+            if !self
+                .state
+                .assign_task_worker_profile(&task.id, profile_id, "task-lead", None)
+                .await?
+            {
+                anyhow::bail!("worker profile '{}' is unavailable", profile_id);
+            }
+        }
+        if let Some(policy) = args.workspace_policy.as_deref() {
+            if !self
+                .state
+                .set_task_workspace_policy(&task.id, policy)
+                .await?
+            {
+                anyhow::bail!("workspace policy could not be applied to the new task");
+            }
+        }
         info!(goal_id = %self.goal_id, task_id = %task.id, "Created task");
 
         Ok(format!(
@@ -593,6 +682,16 @@ impl ManageGoalTasksTool {
                     task.retry_count, task.max_retries
                 ));
             }
+            if let Ok(journal) = self.state.get_task_journal(&task.id, 12).await {
+                if let Some(entry) = journal.iter().find(|entry| entry.actor_type == "human") {
+                    let end = crate::utils::floor_char_boundary(&entry.body, 120);
+                    details.push(format!(
+                        "latest human {}: {}",
+                        entry.entry_type,
+                        &entry.body[..end]
+                    ));
+                }
+            }
 
             let result_suffix = task
                 .result
@@ -626,12 +725,25 @@ impl ManageGoalTasksTool {
         let Some(mut task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
         };
+        let original_status = task.status.clone();
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
         }
-        if !self.task_in_scope(&task) {
+        if !self.task_id_in_scope(task_id).await? {
             return Ok(self.out_of_scope_message(task_id));
+        }
+
+        if original_status == "blocked"
+            && args
+                .status
+                .as_deref()
+                .is_some_and(|status| status != "blocked")
+        {
+            return Ok(format!(
+                "Blocked: task {} is waiting on a recorded blocker and cannot transition directly to another status. Use resolve_blocker with the concrete resolution, or retry_task, before completing it.",
+                task_id
+            ));
         }
 
         // Dependency enforcement: prevent moving to "running" or "claimed" if deps unmet
@@ -665,7 +777,97 @@ impl ManageGoalTasksTool {
             task.error = (!error.trim().is_empty()).then(|| error.clone());
         }
 
-        self.state.update_task(&task).await?;
+        let fenced_status = matches!(
+            task.status.as_str(),
+            "running" | "completed" | "failed" | "blocked" | "cancelled"
+        );
+        let mut attempt = self.state.get_current_task_attempt(task_id).await?;
+        if attempt.is_none() && original_status == "pending" && fenced_status {
+            attempt = self
+                .state
+                .claim_task_with_lease(
+                    task_id,
+                    args.agent_id.as_deref().unwrap_or("task-lead"),
+                    args.worker_profile.as_deref().or(Some("profile-task-lead")),
+                    180,
+                )
+                .await?;
+        }
+        if let Some(attempt) = attempt {
+            if !fenced_status {
+                return Ok(
+                    "A claimed task cannot be skipped or superseded by an unfenced update; finish or cancel its current attempt first."
+                        .to_string(),
+                );
+            }
+            let terminal = matches!(
+                task.status.as_str(),
+                "completed" | "failed" | "blocked" | "cancelled"
+            );
+            let handoff = terminal.then(|| TaskHandoff {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task_id.to_string(),
+                attempt_id: attempt.id.clone(),
+                summary: args
+                    .summary
+                    .clone()
+                    .or_else(|| args.result.clone())
+                    .or_else(|| args.error.clone())
+                    .unwrap_or_else(|| format!("Task {}", task.status)),
+                artifacts: args
+                    .artifacts
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|reference| HandoffArtifact {
+                        kind: if reference.starts_with("http://")
+                            || reference.starts_with("https://")
+                        {
+                            "url".to_string()
+                        } else {
+                            "path".to_string()
+                        },
+                        reference,
+                        digest: None,
+                        metadata: None,
+                    })
+                    .collect(),
+                verification: args.verification.clone().unwrap_or_default(),
+                remaining_risk: args.remaining_risk.clone(),
+                next_step: args.next_step.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            });
+            let patch = TaskAttemptPatch {
+                status: task.status.clone(),
+                result: task.result.clone(),
+                error: task.error.clone(),
+                blocker: (task.status == "blocked").then(|| {
+                    args.error
+                        .clone()
+                        .or_else(|| args.remaining_risk.clone())
+                        .or_else(|| args.result.clone())
+                        .unwrap_or_else(|| "Task is blocked.".to_string())
+                }),
+                context: task.context.clone(),
+                handoff,
+            };
+            if !self
+                .state
+                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                .await?
+            {
+                return Ok(
+                    "Update rejected because the task lease is no longer current.".to_string(),
+                );
+            }
+            task = self
+                .state
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Task disappeared after update"))?;
+        } else {
+            self.state.update_task(&task).await?;
+        }
         info!(goal_id = %self.goal_id, task_id, status = %task.status, "Updated task");
 
         // Accumulate context when a task completes with a result
@@ -696,25 +898,47 @@ impl ManageGoalTasksTool {
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
         }
-        if !self.task_in_scope(&task) {
+        if !self.task_id_in_scope(task_id).await? {
             return Ok(self.out_of_scope_message(task_id));
         }
 
-        // Check dependency satisfaction
+        // Give the task lead a precise explanation while retaining the same
+        // dependency check inside the atomic lease claim for race safety.
         if let Err(reason) = check_dependencies_met(self.state.as_ref(), &task).await {
             return Ok(format!("Cannot claim task {}: {}", task_id, reason));
         }
 
         let agent_id = args.agent_id.as_deref().unwrap_or("executor");
-        let claimed = self.state.claim_task(task_id, agent_id).await?;
-        if claimed {
-            info!(goal_id = %self.goal_id, task_id, agent_id, "Claimed task");
-            Ok(format!("Claimed task {} for agent {}", task_id, agent_id))
-        } else {
-            Ok(format!(
-                "Failed to claim task {} — may already be claimed or not pending",
+        match self
+            .state
+            .claim_task_with_lease(
+                task_id,
+                agent_id,
+                args.worker_profile.as_deref(),
+                180,
+            )
+            .await?
+        {
+            Some(attempt) => {
+                info!(
+                    goal_id = %self.goal_id,
+                    task_id,
+                    agent_id,
+                    attempt_id = %attempt.id,
+                    "Claimed task"
+                );
+                Ok(format!(
+                    "Claimed task {} for agent {} with attempt {} and profile {}",
+                    task_id,
+                    agent_id,
+                    attempt.id,
+                    attempt.worker_profile_id.as_deref().unwrap_or("default")
+                ))
+            }
+            None => Ok(format!(
+                "Failed to claim task {} — dependencies may be unmet, the profile may be at capacity, or another worker owns it",
                 task_id
-            ))
+            )),
         }
     }
 
@@ -726,14 +950,14 @@ impl ManageGoalTasksTool {
         let task_id = self.resolve_task_id(raw_task_id).await;
         let task_id = task_id.as_str();
 
-        let Some(mut task) = self.state.get_task(task_id).await? else {
+        let Some(task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
         };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
         }
-        if !self.task_in_scope(&task) {
+        if !self.task_id_in_scope(task_id).await? {
             return Ok(self.out_of_scope_message(task_id));
         }
         if task.status != "failed" && task.status != "blocked" {
@@ -755,26 +979,29 @@ impl ManageGoalTasksTool {
             ));
         }
 
-        task.retry_count += 1;
-        task.status = "pending".to_string();
-        task.error = None;
-        task.blocker = None;
-        task.agent_id = None;
-        task.started_at = None;
-        task.completed_at = None;
-        self.state.update_task(&task).await?;
+        if !self
+            .state
+            .retry_work_task(task_id, "task-lead", None)
+            .await?
+        {
+            return Ok(format!(
+                "Cannot retry task {} — it may still have a live attempt",
+                task_id
+            ));
+        }
+        let retry_count = task.retry_count + 1;
 
         info!(
             goal_id = %self.goal_id,
             task_id,
-            retry_count = task.retry_count,
+            retry_count,
             max_retries = task.max_retries,
             "Retried task"
         );
 
         Ok(format!(
             "Task {} reset to pending for retry ({}/{})",
-            task_id, task.retry_count, task.max_retries
+            task_id, retry_count, task.max_retries
         ))
     }
 
@@ -797,11 +1024,16 @@ impl ManageGoalTasksTool {
                     .to_string(),
             );
         }
-        // Block only on tasks that are still GENUINELY ACTIVE (pending/running/
-        // claimed). A task in a terminal state — successful (completed/skipped) OR
-        // dead (failed/blocked/interrupted/cancelled/abandoned) — must not block
-        // completion: a dead task never transitions to "completed" on its own, so
-        // counting it as "still incomplete" permanently wedges a recurring goal.
+        let mut goal = self
+            .state
+            .get_goal(&self.goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
+
+        // Identify genuinely active work first. A dead task never transitions to
+        // completed on its own; strict success handling for finite/current runs
+        // follows below, while legacy recurring calls may ignore historical dead
+        // rows so one old run cannot wedge every future schedule fire.
         // (Observed live on the daily-tweet goal 9a744834: watchdog-interrupted
         // tasks from prior fires blocked complete_goal, so every new fire looped
         // trying to "resolve" them, got interrupted in turn, and piled up 178 dead
@@ -816,11 +1048,22 @@ impl ManageGoalTasksTool {
             ));
         }
 
-        let mut goal = self
-            .state
-            .get_goal(&self.goal_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Goal not found: {}", self.goal_id))?;
+        // A finite goal, and every explicitly scoped run, may complete only
+        // from successful terminal task state. Failed/blocked/interrupted work
+        // is terminal for scheduling purposes but is not completion evidence.
+        // Legacy recurring calls without a run id retain their historical-task
+        // tolerance so an old dead task cannot wedge every future schedule fire.
+        let strict_run_completion = goal.goal_type == "finite" || self.goal_run_id.is_some();
+        if strict_run_completion && !tasks_satisfy_goal_completion(&tasks) {
+            let task = tasks
+                .iter()
+                .find(|task| !task.satisfies_run_completion())
+                .expect("an unsatisfied task must exist");
+            return Ok(format!(
+                "Blocked: goal completion requires successful task state. '{}' ended as {}. Retry or replace that task successfully, or use fail_goal.",
+                task.description, task.status
+            ));
+        }
 
         // A continuous (recurring) goal is open-ended: a successful run does not
         // complete the goal. Keep it active for the next cycle and clear the
@@ -847,6 +1090,20 @@ impl ManageGoalTasksTool {
         goal.updated_at = chrono::Utc::now().to_rfc3339();
 
         self.state.update_goal(&goal).await?;
+        let run_id = match self.goal_run_id.clone() {
+            Some(run_id) => Some(run_id),
+            None => self
+                .state
+                .get_current_goal_run(&self.goal_id)
+                .await?
+                .map(|run| run.id),
+        };
+        if let Some(run_id) = run_id {
+            let _ = self
+                .state
+                .finish_goal_run(&run_id, "completed", Some(summary))
+                .await?;
+        }
         info!(goal_id = %self.goal_id, is_continuous, "Goal run completed");
 
         let mut response = if is_continuous {
@@ -922,14 +1179,14 @@ impl ManageGoalTasksTool {
         let task_id = self.resolve_task_id(raw_task_id).await;
         let task_id = task_id.as_str();
 
-        let Some(mut task) = self.state.get_task(task_id).await? else {
+        let Some(task) = self.state.get_task(task_id).await? else {
             return Ok(self.task_not_found_message(task_id).await);
         };
 
         if task.goal_id != self.goal_id {
             anyhow::bail!("Task {} does not belong to goal {}", task_id, self.goal_id);
         }
-        if !self.task_in_scope(&task) {
+        if !self.task_id_in_scope(task_id).await? {
             return Ok(self.out_of_scope_message(task_id));
         }
         if task.status != "blocked" {
@@ -939,19 +1196,25 @@ impl ManageGoalTasksTool {
             ));
         }
 
-        task.status = "pending".to_string();
-        task.blocker = None;
-
-        // Append resolution context if provided
-        if let Some(resolution) = &args.result {
-            task.context = Some(format!(
-                "{}\nBlocker resolution: {}",
-                task.context.as_deref().unwrap_or(""),
-                resolution
-            ));
+        let Some(resolution) = args
+            .result
+            .as_deref()
+            .or(args.summary.as_deref())
+            .or(args.error.as_deref())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(
+                "resolve_blocker requires the concrete unblock message in result or summary."
+                    .to_string(),
+            );
+        };
+        if !self
+            .state
+            .unblock_task(task_id, resolution, "task-lead", None)
+            .await?
+        {
+            return Ok(format!("Task {} could not be unblocked.", task_id));
         }
-
-        self.state.update_task(&task).await?;
         info!(goal_id = %self.goal_id, task_id, "Blocker resolved; task reset to pending");
 
         Ok(format!(
@@ -1038,17 +1301,32 @@ impl ManageGoalTasksTool {
         let tasks = self.scoped_tasks().await.unwrap_or_default();
         let mut cancelled = 0;
         for task in &tasks {
-            if task.status == "pending" || task.status == "claimed" {
-                let mut t = task.clone();
-                t.status = "completed".to_string();
-                t.error = Some("Cancelled: parent goal explicitly failed".to_string());
-                t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                let _ = self.state.update_task(&t).await;
+            if (task.status == "pending" || task.status == "claimed")
+                && self
+                    .state
+                    .cancel_work_task(&task.id, "task-lead", None)
+                    .await
+                    .unwrap_or(false)
+            {
                 cancelled += 1;
             }
         }
         if cancelled > 0 {
             info!(goal_id = %self.goal_id, cancelled, "Cancelled pending tasks for failed goal");
+        }
+        let run_id = match self.goal_run_id.clone() {
+            Some(run_id) => Some(run_id),
+            None => self
+                .state
+                .get_current_goal_run(&self.goal_id)
+                .await?
+                .map(|run| run.id),
+        };
+        if let Some(run_id) = run_id {
+            let _ = self
+                .state
+                .finish_goal_run(&run_id, "failed", Some(summary))
+                .await?;
         }
 
         if is_continuous {
@@ -1138,11 +1416,20 @@ mod tests {
             "2026-07-28T12:00:01Z",
         );
         state.create_task(&prior).await.unwrap();
+        let prior_run = state.get_current_goal_run(&goal_id).await.unwrap().unwrap();
+        state
+            .finish_goal_run(&prior_run.id, "completed", Some("prior run"))
+            .await
+            .unwrap();
+        let current_run = state
+            .start_goal_run(&goal_id, "manual", None, Some(&root.id))
+            .await
+            .unwrap();
         state.create_task(&root).await.unwrap();
         state.create_task(&current).await.unwrap();
 
-        let tool = ManageGoalTasksTool::new(goal_id, state.clone())
-            .with_run_started_at(Some(root.created_at.clone()));
+        let tool =
+            ManageGoalTasksTool::new(goal_id, state.clone()).with_goal_run_id(Some(current_run.id));
         let listed = tool
             .call(&json!({ "action": "list_tasks" }).to_string())
             .await
@@ -1330,6 +1617,122 @@ mod tests {
         assert!(
             result.contains("Blocked") && result.contains("still running"),
             "an active running task must still block completion: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finite_goal_cannot_complete_with_failed_terminal_task() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Build and publish the site"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let mut failed = state.get_tasks_for_goal(&goal_id).await.unwrap()[0].clone();
+        failed.status = "failed".to_string();
+        failed.error = Some("build never ran".to_string());
+        failed.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        state.update_task(&failed).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "The source files exist"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("requires successful task state"),
+            "{result}"
+        );
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert!(goal.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn finite_goal_cannot_complete_with_stale_blocker_on_completed_task() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Verify the deployment"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Reproduce a legacy inconsistent row without first moving through the
+        // blocked state. The transition fence protects new blocked tasks; this
+        // success predicate also protects already-corrupt persisted data.
+        let mut inconsistent = state.get_tasks_for_goal(&goal_id).await.unwrap()[0].clone();
+        inconsistent.status = "completed".to_string();
+        inconsistent.blocker = Some("verification never ran".to_string());
+        inconsistent.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        state.update_task(&inconsistent).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "complete_goal",
+                    "summary": "The deployment is ready"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("requires successful task state"),
+            "{result}"
+        );
+        let goal = state.get_goal(&goal_id).await.unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert!(goal.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn current_recurring_run_cannot_complete_with_failed_task() {
+        let (state, _finite) = setup_test_state().await;
+        let goal = Goal::new_continuous("Recurring publication", "test-session", None, None);
+        state.create_goal(&goal).await.unwrap();
+        let legacy_tool = ManageGoalTasksTool::new(goal.id.clone(), state.clone());
+        legacy_tool
+            .call(
+                &json!({
+                    "action": "create_task",
+                    "description": "Publish this run"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        let mut failed = state.get_tasks_for_goal_run(&run.id).await.unwrap()[0].clone();
+        failed.status = "failed".to_string();
+        failed.error = Some("publication failed".to_string());
+        state.update_task(&failed).await.unwrap();
+        let scoped_tool =
+            ManageGoalTasksTool::new(goal.id.clone(), state.clone()).with_goal_run_id(Some(run.id));
+
+        let result = scoped_tool
+            .call(&json!({"action": "complete_goal", "summary": "run done"}).to_string())
+            .await
+            .unwrap();
+        assert!(
+            result.contains("requires successful task state"),
+            "{result}"
         );
     }
 
@@ -2258,7 +2661,58 @@ mod tests {
         let task = state.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "pending");
         assert!(task.blocker.is_none());
-        assert!(task.context.unwrap().contains("Found alternative approach"));
+        let journal = state.get_task_journal(&task_id, 10).await.unwrap();
+        assert!(journal.iter().any(|entry| {
+            entry.entry_type == "unblocked" && entry.body.contains("Found alternative approach")
+        }));
+    }
+
+    #[tokio::test]
+    async fn blocked_task_cannot_be_overwritten_as_completed() {
+        let (state, goal_id) = setup_test_state().await;
+        let tool = ManageGoalTasksTool::new(goal_id.clone(), state.clone());
+        tool.call(
+            &json!({
+                "action": "create_task",
+                "description": "Inspect deployment tooling"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let task_id = state.get_tasks_for_goal(&goal_id).await.unwrap()[0]
+            .id
+            .clone();
+        tool.call(
+            &json!({
+                "action": "update_task",
+                "task_id": &task_id,
+                "status": "blocked",
+                "result": "A preflight check did not run"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "update_task",
+                    "task_id": &task_id,
+                    "status": "completed",
+                    "result": "Done"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Use resolve_blocker"));
+        assert_eq!(
+            state.get_task(&task_id).await.unwrap().unwrap().status,
+            "blocked"
+        );
     }
 
     #[tokio::test]

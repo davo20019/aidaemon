@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 
 use crate::execution::{active_execution_backend, BackendKind};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolTargetHintKind};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolTargetHintKind,
+};
 use crate::types::{MediaKind, MediaMessage};
 
 pub struct SendFileTool {
@@ -102,7 +104,8 @@ impl Tool for SendFileTool {
             })
             .unwrap_or_default();
 
-        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Path, path)
+        ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

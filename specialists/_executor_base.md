@@ -18,7 +18,8 @@ Rules:
 - For running commands, use the execution surface actually available in your tool set.
 - If `terminal` is available, keep commands simple and single-line.
 - If `terminal` is available, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.
-- If you encounter ambiguity or a blocker you cannot resolve, use report_blocker immediately.
+- Before reporting a tool or verification blocker, exhaust safe in-scope alternatives. For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.
+- If you encounter ambiguity or a blocker you cannot resolve after those alternatives, use report_blocker immediately.
 - When using report_blocker, include outcome, reason, partial_work when applicable, exact_need, next_step, and target.
 - Return the FULL content you produced — not a meta-description of what you did.
 - NEVER return just "I researched X" or "Generated a report about Y". Return the actual content.

@@ -590,8 +590,8 @@ impl CliAgentTool {
 
         match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Ok(ApprovalResponse::Deny),
-            Err(_) => Ok(ApprovalResponse::Deny),
+            Ok(Err(_)) => Err(anyhow::anyhow!("Approval response channel closed")),
+            Err(_) => Err(anyhow::anyhow!("Approval request timed out after 300s")),
         }
     }
 
@@ -1950,8 +1950,6 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
-            finished_for_task.store(true, Ordering::Release);
-
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
                 let duration = invocation_started_at.elapsed().as_secs_f64();
@@ -2001,6 +1999,11 @@ impl CliAgentTool {
                     )
                     .await;
                 }
+
+                // Durable state is authoritative for completion. Publish the
+                // finished flag before optional chat delivery, which may be
+                // slow, but never before the delegated task update above.
+                finished_for_task.store(true, Ordering::Release);
 
                 // Send proactive notification when the caller won't necessarily be waiting
                 // for completion (async_mode or sync->timeout moved to background).
@@ -2064,6 +2067,10 @@ impl CliAgentTool {
                     }
                 }
             }
+            // Publish completion only after durable invocation/task state has
+            // been flushed. Reapers and `check` callers must never observe a
+            // finished process while its delegated board task is still running.
+            finished_for_task.store(true, Ordering::Release);
             let _ = completion_tx.send((exit_code, loop_detected, loop_pattern_count));
         });
 
@@ -4656,9 +4663,18 @@ mod tests {
             resp
         );
 
-        tokio::time::sleep(Duration::from_millis(700)).await;
-
-        let updated_task = tool.state.get_task(&task.id).await.unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let updated_task = loop {
+            let current = tool.state.get_task(&task.id).await.unwrap().unwrap();
+            if current.status != "running" && current.status != "claimed" {
+                break current;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delegated task did not persist a terminal outcome before the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         assert_eq!(updated_task.status, "completed");
         let context: serde_json::Value =
             serde_json::from_str(updated_task.context.as_deref().unwrap()).unwrap();

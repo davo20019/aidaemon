@@ -130,6 +130,29 @@ fn compile_step_plan_preserves_url_targets_when_project_scope_exists() {
 }
 
 #[test]
+fn pure_terminal_observation_does_not_inherit_static_high_impact_approval() {
+    let plan = compile_step_execution_plan(
+        "exec-1",
+        1,
+        1,
+        "call-1",
+        "terminal",
+        r#"{"command":"node --version"}"#,
+        &ToolCallSemantics::observation(),
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        },
+        Some("/repo"),
+    );
+    assert_eq!(plan.approval_requirement, ApprovalRequirement::NotNeeded);
+    assert!(plan.idempotency_key.is_none());
+}
+
+#[test]
 fn execution_state_reports_budget_exhaustion() {
     let mut state = ExecutionState::new(
         BudgetTier::Small,

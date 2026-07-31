@@ -1079,6 +1079,237 @@ pub trait TaskDispatchStore: Send + Sync {
     }
 }
 
+/// Durable coordination for goal runs, fenced task attempts, collaboration
+/// records, named worker policies, project scope, and attempt workspaces.
+#[async_trait]
+pub trait WorkCoordinationStore: Send + Sync {
+    async fn create_work_project(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> anyhow::Result<super::WorkProject> {
+        anyhow::bail!("work projects are not supported by this store")
+    }
+
+    async fn list_work_projects(&self) -> anyhow::Result<Vec<super::WorkProject>> {
+        Ok(vec![])
+    }
+
+    async fn get_session_work_project(&self, _session_id: &str) -> anyhow::Result<String> {
+        Ok(super::DEFAULT_PROJECT_ID.to_string())
+    }
+
+    async fn set_session_work_project(
+        &self,
+        _session_id: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn start_goal_run(
+        &self,
+        _goal_id: &str,
+        _trigger_type: &str,
+        _schedule_id: Option<&str>,
+        _root_task_id: Option<&str>,
+    ) -> anyhow::Result<super::GoalRun> {
+        anyhow::bail!("goal runs are not supported by this store")
+    }
+
+    async fn get_current_goal_run(&self, _goal_id: &str) -> anyhow::Result<Option<super::GoalRun>> {
+        Ok(None)
+    }
+
+    async fn get_goal_runs(&self, _goal_id: &str) -> anyhow::Result<Vec<super::GoalRun>> {
+        Ok(vec![])
+    }
+
+    async fn get_tasks_for_goal_run(&self, _run_id: &str) -> anyhow::Result<Vec<super::Task>> {
+        Ok(vec![])
+    }
+
+    async fn finish_goal_run(
+        &self,
+        _run_id: &str,
+        _status: &str,
+        _summary: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn claim_task_with_lease(
+        &self,
+        _task_id: &str,
+        _worker_instance_id: &str,
+        _worker_profile_id: Option<&str>,
+        _lease_secs: i64,
+    ) -> anyhow::Result<Option<super::TaskAttempt>> {
+        Ok(None)
+    }
+
+    async fn get_current_task_attempt(
+        &self,
+        _task_id: &str,
+    ) -> anyhow::Result<Option<super::TaskAttempt>> {
+        Ok(None)
+    }
+
+    async fn bind_task_attempt_worker(
+        &self,
+        _attempt_id: &str,
+        _lease_token: &str,
+        _worker_instance_id: &str,
+        _worker_profile_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn heartbeat_task_attempt(
+        &self,
+        _attempt_id: &str,
+        _lease_token: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn patch_task_from_attempt(
+        &self,
+        _attempt_id: &str,
+        _lease_token: &str,
+        _patch: &super::TaskAttemptPatch,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Expire elapsed leases and return the affected task IDs. Idempotent tasks
+    /// with retry budget are re-queued; ambiguous writes require verification.
+    async fn recover_expired_task_attempts(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    async fn append_task_journal(&self, _entry: &super::TaskJournalEntry) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_task_journal(
+        &self,
+        _task_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::TaskJournalEntry>> {
+        Ok(vec![])
+    }
+
+    async fn unblock_task(
+        &self,
+        _task_id: &str,
+        _resolution: &str,
+        _actor_id: &str,
+        _source_channel: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn retry_work_task(
+        &self,
+        _task_id: &str,
+        _actor_id: &str,
+        _source_channel: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn cancel_work_task(
+        &self,
+        _task_id: &str,
+        _actor_id: &str,
+        _source_channel: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn upsert_worker_profile(&self, _profile: &super::WorkerProfile) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_worker_profile(
+        &self,
+        _profile_id: &str,
+    ) -> anyhow::Result<Option<super::WorkerProfile>> {
+        Ok(None)
+    }
+
+    async fn list_worker_profiles(
+        &self,
+        _project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<super::WorkerProfile>> {
+        Ok(vec![])
+    }
+
+    async fn assign_task_worker_profile(
+        &self,
+        _task_id: &str,
+        _profile_id: &str,
+        _actor_id: &str,
+        _source_channel: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn set_task_workspace_policy(
+        &self,
+        _task_id: &str,
+        _policy: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn get_task_workspace_policy(&self, _task_id: &str) -> anyhow::Result<String> {
+        Ok("shared".to_string())
+    }
+
+    async fn create_task_workspace(&self, _workspace: &super::TaskWorkspace) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn update_task_workspace(&self, _workspace: &super::TaskWorkspace) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_task_workspace(
+        &self,
+        _task_id: &str,
+    ) -> anyhow::Result<Option<super::TaskWorkspace>> {
+        Ok(None)
+    }
+
+    async fn get_latest_task_handoff(
+        &self,
+        _task_id: &str,
+    ) -> anyhow::Result<Option<super::TaskHandoff>> {
+        Ok(None)
+    }
+
+    async fn list_work_goals(
+        &self,
+        _project_id: &str,
+        _include_terminal: bool,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::WorkGoalSummary>> {
+        Ok(vec![])
+    }
+
+    async fn list_work_tasks(
+        &self,
+        _project_id: &str,
+        _lane: Option<&str>,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::WorkTaskSummary>> {
+        Ok(vec![])
+    }
+}
+
 /// Goal lifecycle cleanup and user notification bookkeeping.
 #[async_trait]
 pub trait GoalNotificationStore: Send + Sync {
@@ -1143,6 +1374,18 @@ pub trait NotificationStore: Send + Sync {
     /// Enqueue a notification for delivery.
     async fn enqueue_notification(&self, _entry: &super::NotificationEntry) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Atomically claim a goal's notification slot and enqueue its notification.
+    ///
+    /// Returns `false` when another writer has already claimed the goal. Stores
+    /// that do not support transactions may fall back to enqueueing only.
+    async fn enqueue_goal_notification(
+        &self,
+        entry: &super::NotificationEntry,
+    ) -> anyhow::Result<bool> {
+        self.enqueue_notification(entry).await?;
+        Ok(true)
     }
 
     /// Get pending notifications ordered by priority (critical first), then creation time.
@@ -1218,6 +1461,7 @@ pub trait StateStore:
     + GoalBudgetStore
     + ScheduledRunStore
     + TaskDispatchStore
+    + WorkCoordinationStore
     + GoalNotificationStore
     + ConversationSummaryStore
     + HealthCheckStore
@@ -1249,6 +1493,7 @@ impl<T> StateStore for T where
         + GoalBudgetStore
         + ScheduledRunStore
         + TaskDispatchStore
+        + WorkCoordinationStore
         + GoalNotificationStore
         + ConversationSummaryStore
         + HealthCheckStore

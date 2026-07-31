@@ -414,16 +414,19 @@ pub(super) async fn run_completion_phase(
         let has_tool_attempts = !learning_ctx.tool_calls.is_empty();
         let assistant_claimed_mutation = claims_completed_side_effect(&reply);
         let assistant_claimed_delegation = claims_delegation_started(&reply);
-        let unbacked_mutation_claim = super::completion_checks::mutation_claim_lacks_evidence(
-            assistant_claimed_mutation,
-            completion_progress.mutation_count,
-        );
+        let typed_mutation_fulfilled =
+            mutation_contract_fulfilled(&turn_context.completion_contract, &completion_progress);
+        let unbacked_mutation_claim = assistant_claimed_mutation
+            && if turn_context.completion_contract.expects_mutation {
+                !typed_mutation_fulfilled
+            } else {
+                completion_progress.mutation_count == 0
+            };
         let concrete_mutation_required =
             super::completion_checks::contract_has_concrete_mutation_target(
                 &turn_context.completion_contract,
             );
-        let unfulfilled_concrete_mutation =
-            concrete_mutation_required && completion_progress.mutation_count == 0;
+        let unfulfilled_concrete_mutation = concrete_mutation_required && !typed_mutation_fulfilled;
         // The completion contract is an intent hint, not proof of a required
         // side effect. Hard enforcement starts when the assistant itself
         // claims that a mutation happened; that claim can be checked exactly
@@ -445,7 +448,7 @@ pub(super) async fn run_completion_phase(
                 ("blocked_claimed_mutation_without_tool", None)
             } else if agent.depth != 0 {
                 ("skipped_non_root_agent", Some("non_root_agent"))
-            } else if completion_progress.mutation_count > 0 {
+            } else if typed_mutation_fulfilled {
                 ("passed", None)
             } else if mutation_gate_block_condition {
                 ("blocked_unsatisfied_after_tools", None)
@@ -458,6 +461,8 @@ pub(super) async fn run_completion_phase(
                 "assistant_claimed_mutation": assistant_claimed_mutation,
                 "tool_calls_count": resp.tool_calls.len(),
                 "mutation_tool_calls_count": completion_progress.mutation_count,
+                "required_mutation_effects": turn_context.completion_contract.required_mutation_effects,
+                "observed_mutation_effects": completion_progress.observed_mutation_effects,
                 "total_successful_tool_calls": total_successful_tool_calls,
                 "has_tool_attempts": has_tool_attempts,
                 "outcome": outcome,
@@ -727,7 +732,10 @@ pub(super) async fn run_completion_phase(
                     );
                 } else if !tool_output_paste_recovery_allowed(
                     turn_context.completion_contract.expects_mutation,
-                    completion_progress.mutation_count,
+                    usize::from(mutation_contract_fulfilled(
+                        &turn_context.completion_contract,
+                        &completion_progress,
+                    )),
                 ) {
                     // An unfulfilled mutation contract: never substitute a
                     // tool-output paste for the missing action ("Send me X" →
@@ -1703,7 +1711,10 @@ pub(super) async fn run_completion_phase(
                     // stayed undone). Let the stall path nudge the model instead.
                     let paste_recovery_allowed = tool_output_paste_recovery_allowed(
                         turn_context.completion_contract.expects_mutation,
-                        completion_progress.mutation_count,
+                        usize::from(mutation_contract_fulfilled(
+                            &turn_context.completion_contract,
+                            &completion_progress,
+                        )),
                     );
                     let candidate = if paste_recovery_allowed {
                         latest_task_tool_result_for_completion(agent, session_id, task_id, 2500)

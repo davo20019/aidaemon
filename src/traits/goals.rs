@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_PROJECT_ID: &str = "default";
+
 /// Snapshot of a goal's token budget state.
 #[derive(Debug, Clone)]
 pub struct GoalTokenBudgetStatus {
@@ -300,8 +302,17 @@ impl Task {
             .is_some_and(|error| !error.trim().is_empty())
     }
 
+    /// A blocker is unresolved work even if a stale coordinator has written a
+    /// terminal-looking status. Treat legacy empty strings as absent, matching
+    /// the normalization used for errors.
+    pub fn has_blocker(&self) -> bool {
+        self.blocker
+            .as_deref()
+            .is_some_and(|blocker| !blocker.trim().is_empty())
+    }
+
     pub fn completed_successfully(&self) -> bool {
-        self.status == "completed" && !self.has_error()
+        self.status == "completed" && !self.has_error() && !self.has_blocker()
     }
 
     /// True when this task no longer represents required work for the current
@@ -310,6 +321,252 @@ impl Task {
     pub fn satisfies_run_completion(&self) -> bool {
         self.completed_successfully() || matches!(self.status.as_str(), "skipped" | "superseded")
     }
+}
+
+/// A stable isolation boundary for goals, runs, worker policies, and channel views.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkProject {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One execution of a goal. Finite goals normally have one run; each scheduled
+/// firing gets a distinct run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalRun {
+    pub id: String,
+    pub project_id: String,
+    pub goal_id: String,
+    /// "finite", "scheduled", "manual", or "legacy"
+    pub trigger_type: String,
+    pub schedule_id: Option<String>,
+    pub root_task_id: Option<String>,
+    /// "pending", "running", "completed", "failed", "blocked", or "cancelled"
+    pub status: String,
+    pub outcome_summary: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl GoalRun {
+    pub fn new(goal_id: &str, project_id: &str, trigger_type: &str) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            goal_id: goal_id.to_string(),
+            trigger_type: trigger_type.to_string(),
+            schedule_id: None,
+            root_task_id: None,
+            status: "running".to_string(),
+            outcome_summary: None,
+            started_at: now.clone(),
+            completed_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+}
+
+/// Durable execution policy. The profile is stable configuration; a task
+/// attempt and its worker instance remain distinct identities.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerProfile {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub name: String,
+    pub specialist: String,
+    pub model: Option<String>,
+    pub tools_json: Option<String>,
+    pub max_iterations: Option<i64>,
+    pub tool_budget: Option<i64>,
+    pub timeout_secs: Option<i64>,
+    pub max_concurrency: i64,
+    /// "shared", "isolated", or "worktree"
+    pub workspace_policy: String,
+    pub memory_scope: String,
+    pub version: i64,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One fenced claim of a task by one worker instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskAttempt {
+    pub id: String,
+    pub task_id: String,
+    pub goal_run_id: String,
+    pub worker_profile_id: Option<String>,
+    pub worker_instance_id: String,
+    /// Local fencing token. It is never included in user-facing output.
+    #[serde(skip_serializing)]
+    pub lease_token: String,
+    /// "claimed", "running", "completed", "failed", "blocked", "expired",
+    /// "needs_verification", or "cancelled"
+    pub status: String,
+    pub lease_expires_at: String,
+    pub last_heartbeat_at: String,
+    pub workspace_id: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandoffArtifact {
+    /// "path", "commit", "url", "message", or another explicit artifact kind.
+    pub kind: String,
+    pub reference: String,
+    pub digest: Option<String>,
+    pub metadata: Option<String>,
+}
+
+/// Low-volume, structured output from one attempt for the next worker or human.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskHandoff {
+    pub id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub summary: String,
+    pub artifacts: Vec<HandoffArtifact>,
+    pub verification: Vec<String>,
+    pub remaining_risk: Option<String>,
+    pub next_step: Option<String>,
+    pub created_at: String,
+}
+
+/// Append-only collaboration and audit record. Tool/LLM telemetry remains in
+/// `TaskActivity`; this journal is for durable decisions and human interaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskJournalEntry {
+    pub id: String,
+    pub project_id: String,
+    pub goal_id: String,
+    pub goal_run_id: String,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+    /// "comment", "blocked", "unblocked", "assigned", "handoff",
+    /// "lease_lost", "workspace", or "transition"
+    pub entry_type: String,
+    /// "human", "agent", or "system"
+    pub actor_type: String,
+    pub actor_id: String,
+    pub source_channel: Option<String>,
+    pub body: String,
+    pub payload: Option<String>,
+    pub created_at: String,
+}
+
+impl TaskJournalEntry {
+    pub fn new(
+        project_id: &str,
+        goal_id: &str,
+        goal_run_id: &str,
+        entry_type: &str,
+        actor_type: &str,
+        actor_id: &str,
+        body: &str,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            goal_id: goal_id.to_string(),
+            goal_run_id: goal_run_id.to_string(),
+            task_id: None,
+            attempt_id: None,
+            entry_type: entry_type.to_string(),
+            actor_type: actor_type.to_string(),
+            actor_id: actor_id.to_string(),
+            source_channel: None,
+            body: body.to_string(),
+            payload: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn with_task(mut self, task_id: Option<&str>, attempt_id: Option<&str>) -> Self {
+        self.task_id = task_id.map(ToOwned::to_owned);
+        self.attempt_id = attempt_id.map(ToOwned::to_owned);
+        self
+    }
+
+    pub fn with_source_channel(mut self, source_channel: Option<&str>) -> Self {
+        self.source_channel = source_channel.map(ToOwned::to_owned);
+        self
+    }
+}
+
+/// Realized workspace for one attempt. Workspaces are preserved after execution
+/// until explicitly released so downstream integration can consume them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskWorkspace {
+    pub id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub backend_id: String,
+    pub policy: String,
+    pub root_path: String,
+    pub branch_name: Option<String>,
+    pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
+    /// "active", "preserved", "released", or "failed"
+    pub status: String,
+    pub created_at: String,
+    pub released_at: Option<String>,
+}
+
+/// Attempt-scoped mutation applied only while the supplied lease is current.
+#[derive(Debug, Clone, Default)]
+pub struct TaskAttemptPatch {
+    pub status: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub blocker: Option<String>,
+    pub context: Option<String>,
+    pub handoff: Option<TaskHandoff>,
+}
+
+/// Goal-level work projection used by chat and dashboard views.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkGoalSummary {
+    pub project_id: String,
+    pub goal_id: String,
+    pub description: String,
+    pub goal_status: String,
+    pub run_id: Option<String>,
+    pub run_status: Option<String>,
+    pub waiting: i64,
+    pub ready: i64,
+    pub in_progress: i64,
+    pub blocked: i64,
+    pub needs_attention: i64,
+    pub done: i64,
+    pub updated_at: String,
+}
+
+/// Task-level work projection. `lane` is derived from scheduler state and is
+/// never persisted as a second status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkTaskSummary {
+    pub project_id: String,
+    pub goal_id: String,
+    pub goal_description: String,
+    pub goal_run_id: String,
+    pub task_id: String,
+    pub description: String,
+    pub status: String,
+    pub lane: String,
+    pub priority: String,
+    pub worker_profile: Option<String>,
+    pub worker_instance_id: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub blocker: Option<String>,
+    pub updated_at: String,
 }
 
 /// A task activity log entry — records tool calls and results within a task.
@@ -348,6 +605,12 @@ pub struct NotificationEntry {
     pub attempts: i32,
     /// When this notification expires (None = never, for critical notifications)
     pub expires_at: Option<String>,
+    /// Optional durable work item associated with this notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Opaque token reserved for channel-native actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_token: Option<String>,
 }
 
 impl NotificationEntry {
@@ -374,6 +637,14 @@ impl NotificationEntry {
             delivered_at: None,
             attempts: 0,
             expires_at,
+            task_id: None,
+            action_token: None,
         }
+    }
+
+    pub fn with_task(mut self, task_id: &str) -> Self {
+        self.task_id = Some(task_id.to_string());
+        self.action_token = Some(uuid::Uuid::new_v4().to_string());
+        self
     }
 }

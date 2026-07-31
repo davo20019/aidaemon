@@ -581,7 +581,7 @@ impl DiagnoseTool {
             candidates.push(RootCauseCandidate {
                 category: FailureCategory::SandboxPermissionBlock,
                 confidence: 0.9,
-                description: "Execution required approval and the command was denied or timed out."
+                description: "Execution required approval and the command was explicitly denied."
                     .to_string(),
                 evidence: approval_denied.iter().take(3).cloned().collect(),
                 why_previous_step_looked_valid: Some(

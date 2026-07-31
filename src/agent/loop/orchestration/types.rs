@@ -22,6 +22,8 @@ pub(in crate::agent) struct OrchestrationCtx<'a> {
     pub channel_ctx: ChannelContext,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub intent_gate: &'a IntentGateDecision,
+    pub intent_complexity: &'a IntentComplexity,
+    pub structured_complexity_used: bool,
     pub turn_context: &'a TurnContext,
     pub execution_requirement: &'a ExecutionRequirement,
 }

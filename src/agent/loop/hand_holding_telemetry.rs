@@ -27,7 +27,7 @@ pub(crate) fn planner_result_metadata(
     error: Option<&str>,
 ) -> Value {
     let mut metadata = json!({
-        "component": "task_planner",
+        "component": "task_assessment",
         "action": action,
         "model": model,
         "trust_tier": trust_tier,
@@ -44,7 +44,7 @@ pub(crate) fn planner_result_metadata(
 
 pub(crate) fn planner_skip_metadata(reason: &str, model: &str, trust_tier: &str) -> Value {
     json!({
-        "component": "task_planner",
+        "component": "task_assessment",
         "action": "skipped",
         "reason": reason,
         "model": model,
@@ -92,7 +92,7 @@ mod tests {
             },
             None,
         );
-        assert_eq!(metadata["component"], "task_planner");
+        assert_eq!(metadata["component"], "task_assessment");
         assert_eq!(metadata["action"], "succeeded");
         assert_eq!(metadata["model"], "gemma-4-26b");
         assert_eq!(metadata["trust_tier"], "guided");
@@ -112,7 +112,7 @@ mod tests {
             PlannerResultStats::empty(),
             Some("timeout"),
         );
-        assert_eq!(metadata["component"], "task_planner");
+        assert_eq!(metadata["component"], "task_assessment");
         assert_eq!(metadata["action"], "failed");
         assert_eq!(metadata["error"], "timeout");
     }
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(
             metadata,
             json!({
-                "component": "task_planner",
+                "component": "task_assessment",
                 "action": "skipped",
                 "reason": "control_or_ack",
                 "model": "gemma-4-26b",

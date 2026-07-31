@@ -79,6 +79,13 @@ fn extract_status_from_value(value: &Value) -> Option<u16> {
 }
 
 fn classify_text_error(lower: &str) -> ToolFailureClass {
+    if is_recoverable_checkpoint_scope_failure(lower) {
+        // The process never started. A different explicit project target can
+        // satisfy this preflight condition, so it must not consume the
+        // semantic-error lockout budget for the execution tool.
+        return ToolFailureClass::Transient;
+    }
+
     if contains_any(
         lower,
         &[
@@ -117,6 +124,18 @@ fn classify_text_error(lower: &str) -> ToolFailureClass {
         return ToolFailureClass::Transient;
     }
     ToolFailureClass::Semantic
+}
+
+pub(super) fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "refusing an unbounded checkpoint",
+            "outside checkpoint scope",
+            "checkpoint for a command spanning multiple project roots",
+        ],
+    )
 }
 
 fn looks_like_tool_contract_error(lower: &str) -> bool {
@@ -1120,6 +1139,26 @@ mod tool_error_detection_tests {
             "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
         );
         assert_eq!(classified, Some(ToolFailureClass::Transient));
+    }
+
+    #[test]
+    fn checkpoint_scope_preflight_does_not_consume_semantic_lockout_budget() {
+        for result in [
+            "Error: refusing an unbounded checkpoint at workspace container /Users/example/projects",
+            "Error: command path /workspace/b is outside checkpoint scope /workspace/a",
+            "Error: refusing a checkpoint for a command spanning multiple project roots: /workspace/a, /workspace/b",
+        ] {
+            assert_eq!(
+                classify_tool_result_failure("terminal", result),
+                Some(ToolFailureClass::Transient),
+                "{result}"
+            );
+            assert_eq!(
+                classify_execution_failure_kind("terminal", result, None, None, false),
+                Some(ExecutionFailureKind::ToolInvocationFailure),
+                "{result}"
+            );
+        }
     }
 
     #[test]

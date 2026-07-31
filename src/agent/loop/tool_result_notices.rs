@@ -21,20 +21,22 @@ pub(in crate::agent) enum ToolResultNotice {
     RecoverableFilePathMiss {
         tool_name: String,
     },
+    RecoverableCheckpointScopeMiss {
+        tool_name: String,
+    },
     TransientFailureCooldown {
         tool_name: String,
         cooldown_until: usize,
         cooldown_iters: usize,
     },
     SpecialistFailurePivot,
-    BrowserLaunchFallback,
+    BrowserUnavailableFallback,
     OffTargetFactStorageRequest,
     MissingGoalIdManageMemories,
     MissingGoalIdGeneric,
-    /// A page read failed (HTTP error, timeout, navigation failure). The
-    /// model must pivot to a different source URL instead of retrying the
-    /// same one (observed: same unreadable URL re-fetched 4x, then give-up).
-    FetchFailedTryDifferentSource {
+    /// A page-read method failed. The model should not loop the identical
+    /// call, but the failure does not prove the target URL itself is invalid.
+    FetchFailurePivot {
         tool_name: String,
         url: String,
     },
@@ -186,6 +188,13 @@ This did NOT consume semantic lockout budget. Recheck the target path first \
 (project_inspect/search_files/read_file) and retry with the exact path.",
                 tool_name
             ),
+            Self::RecoverableCheckpointScopeMiss { tool_name } => format!(
+                "[SYSTEM] Recoverable checkpoint-scope preflight for `{}`. No process was started, \
+and this did NOT consume semantic lockout budget. Select one explicit bounded project directory \
+under the workspace, run the next command from that directory, and continue without asking the user \
+to change command permissions.",
+                tool_name
+            ),
             Self::TransientFailureCooldown {
                 tool_name,
                 cooldown_until,
@@ -203,8 +212,8 @@ the concrete blocker and verified partial results. Do NOT claim you are monitori
 or will retry later unless a real background task or retry was scheduled."
                     .to_string()
             }
-            Self::BrowserLaunchFallback => {
-                "[SYSTEM] browser launch failed. Do NOT retry browser for this verification step. \
+            Self::BrowserUnavailableFallback => {
+                "[SYSTEM] The browser action is unavailable in this execution context. Do NOT retry browser for this verification step. \
 Use another available approach now: `terminal` with curl/wrangler/HTTP status checks, \
 or an HTTP-capable fetch tool if available. Verify the URL or deployment with concrete HTTP evidence."
                     .to_string()
@@ -227,12 +236,11 @@ Do NOT retry the same call. If this is scheduled-goal run forensics, first call 
 If the user is asking to store facts, use `remember_fact` instead."
                     .to_string()
             }
-            Self::FetchFailedTryDifferentSource { tool_name, url } => format!(
-                "[SYSTEM] `{}` could not read {} (blocked, timed out, or unreadable). \
-Do NOT retry the same URL — the result will not change. Pick a DIFFERENT URL from your \
-most recent web_search results (the next-best result covering the same topic) and fetch \
-that instead. If several sources fail, answer with what you verified and name the \
-sources you could not reach.",
+            Self::FetchFailurePivot { tool_name, url } => format!(
+                "[SYSTEM] `{}` could not read {}. Do not loop the identical tool call. \
+This failure does not prove the URL is inaccessible and does not imply a user denial. \
+Try another available verification method on the same URL (HTTP/CLI) or use a different \
+source when the source itself rejected or lacked the content. Report only what was verified.",
                 tool_name, url
             ),
             Self::WriteFileJsonRecovery { path } => format!(
@@ -533,9 +541,9 @@ mod tests {
     }
 
     #[test]
-    fn browser_launch_fallback_render_points_to_http_verification() {
-        let rendered = ToolResultNotice::BrowserLaunchFallback.render();
-        assert!(rendered.contains("browser launch failed"));
+    fn browser_unavailable_fallback_render_points_to_http_verification() {
+        let rendered = ToolResultNotice::BrowserUnavailableFallback.render();
+        assert!(rendered.contains("browser action is unavailable"));
         assert!(rendered.contains("terminal"));
         assert!(rendered.contains("curl"));
         assert!(rendered.contains("HTTP"));
@@ -592,15 +600,15 @@ mod fetch_pivot_tests {
 
     #[test]
     fn fetch_failure_notice_pivots_to_a_different_source() {
-        let rendered = ToolResultNotice::FetchFailedTryDifferentSource {
+        let rendered = ToolResultNotice::FetchFailurePivot {
             tool_name: "web_fetch".to_string(),
             url: "https://www.olympics.com/squad".to_string(),
         }
         .render();
         assert!(rendered.contains("web_fetch"));
         assert!(rendered.contains("https://www.olympics.com/squad"));
-        assert!(rendered.contains("Do NOT retry"));
-        assert!(rendered.contains("DIFFERENT URL"));
-        assert!(rendered.contains("web_search results"));
+        assert!(rendered.contains("does not prove the URL is inaccessible"));
+        assert!(rendered.contains("same URL"));
+        assert!(rendered.contains("different source"));
     }
 }

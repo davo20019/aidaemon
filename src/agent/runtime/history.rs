@@ -12,9 +12,12 @@
 //! same names through `history::`.
 
 pub(super) use super::completion_contract::{
-    apply_planned_contract_signals, completion_contract_allows_force_text,
-    infer_completion_contract, parse_planned_task_kind, CompletionContract, CompletionProgress,
-    CompletionTaskKind, ExecutionRequirement, VerificationTarget, VerificationTargetKind,
+    apply_planned_contract_signals, apply_planned_mutation_constraints,
+    apply_planned_required_mutation_effects, completion_contract_allows_force_text,
+    infer_completion_contract, mutation_contract_fulfilled, parse_planned_forbidden_action,
+    parse_planned_mutation_effects, parse_planned_task_kind, CompletionContract,
+    CompletionProgress, CompletionTaskKind, ExecutionRequirement, ForbiddenMutationAction,
+    VerificationTarget, VerificationTargetKind,
 };
 pub(super) use super::followup::{
     assistant_message_looks_like_clarifying_question,

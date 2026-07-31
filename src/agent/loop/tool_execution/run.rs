@@ -745,7 +745,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             step_plan.approval_requirement,
             ApprovalRequirement::Required { .. }
         ) || call_semantics.mutates_state()
-            || tool_caps.external_side_effect
+            || (tool_caps.external_side_effect && !call_semantics.observes_state())
         {
             execution_state.promote_persistence(ExecutionPersistence::Durable);
         }
@@ -1841,7 +1841,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             );
             validation_state.clear_loop_repetition_reason();
             if semantics.mutates_state() {
-                completion_progress.mark_mutation(&turn_context.completion_contract);
+                completion_progress.mark_mutation(&turn_context.completion_contract, semantics);
                 // Track external mutation success for the completion gate
                 if caps.external_side_effect {
                     completion_progress.mark_successful_external_mutation();

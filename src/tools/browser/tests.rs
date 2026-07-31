@@ -1731,6 +1731,10 @@ async fn approval_timeout_denies_without_backend() {
         "timed-out approval must deny: {out}"
     );
     assert!(
+        !out.contains("Denied by user"),
+        "an unavailable approval path must not be attributed to the user: {out}"
+    );
+    assert!(
         elapsed < Duration::from_secs(2),
         "timeout path must resolve quickly, took {elapsed:?}"
     );

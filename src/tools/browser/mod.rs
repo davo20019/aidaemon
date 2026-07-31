@@ -13,7 +13,7 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     MessageAttachment, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolTargetHintKind, ToolVerificationMode,
+    ToolCapabilities, ToolMutationEffects, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
@@ -35,7 +35,7 @@ use session::{BrowserSessionRegistry, TabView};
 use tokio::sync::OwnedMutexGuard;
 
 /// Default time the user has to respond to a browser approval prompt before the
-/// action is auto-denied (fail safe). Matches the terminal/config approval
+/// action fails closed as unavailable. Matches the terminal/config approval
 /// window. Overridable in tests so the timeout path runs in milliseconds.
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -391,7 +391,7 @@ pub struct BrowserTool {
     /// `with_backend`); in that case every action that would require approval
     /// fails safe to Deny without touching the backend.
     approval_tx: Option<ApprovalBroker>,
-    /// How long to wait for an approval response before auto-denying.
+    /// How long to wait for an approval response before failing closed.
     approval_timeout: Duration,
     /// Bounded navigation/DOM-ready timeout (resolved + clamped from config).
     /// Used by `action_navigate` after `goto` and by the `action_click`
@@ -576,8 +576,9 @@ impl BrowserTool {
     }
 
     /// Send an approval request and await the user's decision, failing safe to
-    /// `Deny` on a closed channel or timeout. Returns `None` only when no
-    /// approval channel is wired (the caller treats that as a fail-safe Deny).
+    /// closed on any routing failure or timeout. `None` means approval was
+    /// unavailable; the caller still fails closed without claiming the user
+    /// explicitly denied the action.
     async fn request_approval(
         &self,
         command: String,
@@ -600,18 +601,18 @@ impl BrowserTool {
             .await
             .is_err()
         {
-            warn!("browser approval channel closed; denying action");
-            return Some(ApprovalResponse::Deny);
+            warn!("browser approval channel closed; action remains blocked");
+            return None;
         }
         match tokio::time::timeout(self.approval_timeout, response_rx).await {
             Ok(Ok(resp)) => Some(resp),
             Ok(Err(_)) => {
-                warn!("browser approval response channel closed; denying action");
-                Some(ApprovalResponse::Deny)
+                warn!("browser approval response channel closed; action remains blocked");
+                None
             }
             Err(_) => {
-                warn!("browser approval request timed out; denying action");
-                Some(ApprovalResponse::Deny)
+                warn!("browser approval request timed out; action remains blocked");
+                None
             }
         }
     }
@@ -1929,22 +1930,22 @@ fn browser_call_semantics(
         Some("click") => {
             let risk = policy::classify("click", Some(selector), None);
             if risk.consequential {
-                ToolCallSemantics::mutation()
+                ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
             } else {
                 ToolCallSemantics::observation()
             }
         }
-        Some("fill") => ToolCallSemantics::mutation(),
+        Some("fill") => ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION),
         Some("execute_js") => {
             if browser_script_has_mutation_signal(script) {
-                ToolCallSemantics::mutation()
+                ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
             } else {
                 ToolCallSemantics::observation()
                     .with_verification_mode(ToolVerificationMode::ResultContent)
             }
         }
         Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
-        _ => ToolCallSemantics::mutation(),
+        _ => ToolCallSemantics::mutation_with(ToolMutationEffects::UNSPECIFIED),
     }
 }
 

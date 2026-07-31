@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::execution::{active_execution_backend, WriteMode};
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole, ToolTargetHintKind};
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole, ToolTargetHintKind,
+};
 
 use super::fs_utils;
 
@@ -82,7 +84,8 @@ impl Tool for WriteFileTool {
             })
             .unwrap_or_default();
 
-        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Path, path)
+        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

@@ -629,27 +629,18 @@ pub(super) fn should_enforce_no_tool_text_when_tools_required(
     !reply.trim().is_empty()
 }
 
-/// A completed side-effect claim is trustworthy only when the execution
-/// ledger contains a mutation. Request classification is deliberately absent:
-/// lexical and planner signals may guide the run, but cannot prove an effect.
-pub(super) fn mutation_claim_lacks_evidence(
-    assistant_claimed_mutation: bool,
-    mutation_count: usize,
-) -> bool {
-    assistant_claimed_mutation && mutation_count == 0
-}
-
 /// Whether the request carries a concrete mutation destination that the
 /// ledger can validate. A filesystem/project target is stronger evidence than
 /// a verb classification such as "write" or "change".
 pub(super) fn contract_has_concrete_mutation_target(contract: &CompletionContract) -> bool {
     contract.expects_mutation
-        && contract.verification_targets.iter().any(|target| {
-            matches!(
-                target.kind,
-                VerificationTargetKind::Path | VerificationTargetKind::ProjectScope
-            )
-        })
+        && (contract.required_mutation_effects.has_specific_effects()
+            || contract.verification_targets.iter().any(|target| {
+                matches!(
+                    target.kind,
+                    VerificationTargetKind::Path | VerificationTargetKind::ProjectScope
+                )
+            }))
 }
 
 pub(super) fn completion_verification_still_required(
@@ -971,8 +962,8 @@ mod tests {
         build_structured_tool_output_completion_reply, build_tool_output_completion_reply,
         choose_completion_recovery_candidate, contract_has_concrete_mutation_target,
         looks_like_idle_reengagement_reply, looks_like_recovery_message_with_trivial_content,
-        mutation_claim_lacks_evidence, reply_acknowledges_outcome_reconciliation,
-        reply_admits_unfulfilled_request, should_enforce_no_tool_text_when_tools_required,
+        reply_acknowledges_outcome_reconciliation, reply_admits_unfulfilled_request,
+        should_enforce_no_tool_text_when_tools_required,
         should_recover_completion_from_tool_output, summarize_structured_tool_output,
         tool_output_completion_prefix, tool_output_paste_recovery_allowed,
         tool_output_requires_final_synthesis, CompletionRecoveryCandidate,
@@ -984,13 +975,6 @@ mod tests {
         TurnContext, VerificationTarget, VerificationTargetKind,
     };
     use chrono::Utc;
-
-    #[test]
-    fn mutation_claim_guard_is_ledger_first() {
-        assert!(mutation_claim_lacks_evidence(true, 0));
-        assert!(!mutation_claim_lacks_evidence(true, 1));
-        assert!(!mutation_claim_lacks_evidence(false, 0));
-    }
 
     #[test]
     fn only_concrete_targets_harden_inferred_mutation_requirement() {

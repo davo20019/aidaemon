@@ -129,6 +129,17 @@ async fn create_fts(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drop and recreate the replaceable history search projection.
+///
+/// Canonical events and projection metadata remain untouched. Startup
+/// backfilling repopulates the contentless index after database verification.
+pub(crate) async fn reset_fts_projection(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS history_message_fts")
+        .execute(pool)
+        .await?;
+    create_fts(pool).await
+}
+
 fn source_kind(session_id: &str) -> &'static str {
     if session_id.starts_with("specialist:") || session_id.starts_with("sub-") {
         "specialist"
@@ -345,10 +356,7 @@ pub(crate) async fn remove_orphans(pool: &SqlitePool, limit: i64) -> anyhow::Res
 }
 
 async fn rebuild_fts(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query("DROP TABLE IF EXISTS history_message_fts")
-        .execute(pool)
-        .await?;
-    create_fts(pool).await?;
+    reset_fts_projection(pool).await?;
     let ids: Vec<i64> =
         sqlx::query_scalar("SELECT event_id FROM history_message_index ORDER BY event_id")
             .fetch_all(pool)
@@ -395,8 +403,28 @@ async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Res
     let rows = sqlx::query(
         "SELECT id, session_id, start_time, end_time, channel_id,
                 start_event_id, end_event_id
-         FROM episodes
-         WHERE channel_id IS NULL OR start_event_id IS NULL OR end_event_id IS NULL
+         FROM episodes ep
+         WHERE
+           (ep.channel_id IS NULL AND (
+              instr(ep.session_id, 'slack:') > 0
+              OR instr(ep.session_id, 'discord:') > 0
+              OR instr(ep.session_id, 'telegram:') > 0
+              OR EXISTS (
+                 SELECT 1 FROM events e
+                 WHERE e.session_id = ep.session_id
+                   AND e.event_type IN ('user_message', 'assistant_response')
+                   AND julianday(e.created_at) >= julianday(ep.start_time)
+                   AND julianday(e.created_at) <= julianday(ep.end_time)
+                   AND json_type(e.data, '$.channel_id') = 'text'
+              )
+           ))
+           OR ((ep.start_event_id IS NULL OR ep.end_event_id IS NULL) AND EXISTS (
+              SELECT 1 FROM events e
+              WHERE e.session_id = ep.session_id
+                AND e.event_type IN ('user_message', 'assistant_response')
+                AND julianday(e.created_at) >= julianday(ep.start_time)
+                AND julianday(e.created_at) <= julianday(ep.end_time)
+           ))
          ORDER BY id LIMIT ?",
     )
     .bind(limit)
@@ -407,10 +435,15 @@ async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Res
         let episode_id: i64 = row.get("id");
         let session_id: String = row.get("session_id");
         let bounds = sqlx::query(
-            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id
+            "SELECT MIN(id) AS start_event_id, MAX(id) AS end_event_id,
+                    MAX(CASE
+                        WHEN json_type(data, '$.channel_id') = 'text'
+                        THEN json_extract(data, '$.channel_id')
+                    END) AS event_channel_id
              FROM events WHERE session_id=?
                AND event_type IN ('user_message','assistant_response')
-               AND created_at>=? AND created_at<=?",
+               AND julianday(created_at)>=julianday(?)
+               AND julianday(created_at)<=julianday(?)",
         )
         .bind(&session_id)
         .bind(row.get::<String, _>("start_time"))
@@ -420,7 +453,8 @@ async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Res
         let channel_id = row
             .try_get::<Option<String>, _>("channel_id")
             .unwrap_or(None)
-            .or_else(|| crate::session::derive_channel_id_from_session(&session_id));
+            .or_else(|| crate::session::derive_channel_id_from_session(&session_id))
+            .or_else(|| bounds.try_get("event_channel_id").ok().flatten());
         let start_event_id = row
             .try_get::<Option<i64>, _>("start_event_id")
             .unwrap_or(None)
@@ -429,8 +463,31 @@ async fn repair_episode_provenance(pool: &SqlitePool, limit: i64) -> anyhow::Res
             .try_get::<Option<i64>, _>("end_event_id")
             .unwrap_or(None)
             .or_else(|| bounds.try_get("end_event_id").ok().flatten());
+        let changed = row
+            .try_get::<Option<String>, _>("channel_id")
+            .unwrap_or(None)
+            .is_none()
+            && channel_id.is_some()
+            || row
+                .try_get::<Option<i64>, _>("start_event_id")
+                .unwrap_or(None)
+                .is_none()
+                && start_event_id.is_some()
+            || row
+                .try_get::<Option<i64>, _>("end_event_id")
+                .unwrap_or(None)
+                .is_none()
+                && end_event_id.is_some();
+        if !changed {
+            continue;
+        }
         repaired += sqlx::query(
-            "UPDATE episodes SET channel_id=?, start_event_id=?, end_event_id=? WHERE id=?",
+            "UPDATE episodes
+             SET channel_id=COALESCE(channel_id, ?),
+                 start_event_id=COALESCE(start_event_id, ?),
+                 end_event_id=COALESCE(end_event_id, ?)
+             WHERE id=?
+               AND (channel_id IS NULL OR start_event_id IS NULL OR end_event_id IS NULL)",
         )
         .bind(channel_id)
         .bind(start_event_id)
@@ -1052,5 +1109,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(indexed, 0);
+    }
+
+    #[tokio::test]
+    async fn episode_provenance_repair_skips_irreparable_rows_and_counts_real_changes_once() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                channel_id TEXT,
+                start_event_id INTEGER,
+                end_event_id INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO episodes(session_id,start_time,end_time)
+             VALUES ('specialist:research:no-events',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z'),
+                    ('slack:C1',
+                     '2026-01-01T11:59:00Z', '2026-01-01T12:01:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let event_id = sqlx::query(
+            "INSERT INTO events(session_id,event_type,data,created_at)
+             VALUES ('slack:C1','user_message',?, '2026-01-01 12:00:00')",
+        )
+        .bind(
+            serde_json::json!({
+                "content": "repair me",
+                "channel_id": "slack:C1"
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        assert_eq!(repair_episode_provenance(&pool, 1).await.unwrap(), 1);
+        assert_eq!(repair_episode_provenance(&pool, 1).await.unwrap(), 0);
+
+        let repaired = sqlx::query(
+            "SELECT channel_id,start_event_id,end_event_id
+             FROM episodes WHERE session_id='slack:C1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired.get::<String, _>("channel_id"), "slack:C1");
+        assert_eq!(repaired.get::<i64, _>("start_event_id"), event_id);
+        assert_eq!(repaired.get::<i64, _>("end_event_id"), event_id);
+
+        let untouched: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT channel_id,start_event_id,end_event_id
+             FROM episodes WHERE session_id='specialist:research:no-events'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, (None, None, None));
     }
 }

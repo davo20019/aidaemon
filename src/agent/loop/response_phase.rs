@@ -114,6 +114,7 @@ pub(super) async fn run_response_phase(
                 ctx.session_id,
                 ctx.task_id,
                 ctx.iteration,
+                ctx.model,
             )
             .await
             {
@@ -138,6 +139,7 @@ async fn checklist_completion_gate(
     session_id: &str,
     task_id: &str,
     iteration: usize,
+    model: &str,
 ) -> Option<super::system_directives::SystemDirective> {
     use crate::plans::StepStatus;
     if task_id.is_empty() {
@@ -157,7 +159,10 @@ async fn checklist_completion_gate(
         .iter()
         .map(|s| s.description.clone())
         .collect();
-    if !unchecked.is_empty()
+    let guided =
+        agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided;
+    if guided
+        && !unchecked.is_empty()
         && agent
             .checklist_turn_flags
             .write()

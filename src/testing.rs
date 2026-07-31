@@ -49,7 +49,7 @@ pub struct MockProvider {
     response_delays: Mutex<Vec<Duration>>,
     pub call_log: Mutex<Vec<MockChatCall>>,
     reject_non_default_options: bool,
-    /// When true (default), planning/re-planner LLM calls are silently
+    /// When true (default), assessment/re-planner LLM calls are silently
     /// intercepted with an empty response (causing generate_task_plan()
     /// to return None). Preserves existing test behavior — no plan
     /// generated, no call_log entry, no plan context in prompts.
@@ -166,13 +166,15 @@ impl ModelProvider for MockProvider {
         tools: &[Value],
         options: &ChatOptions,
     ) -> anyhow::Result<ProviderResponse> {
-        // Silently intercept planning/re-planner calls: return empty response
+        // Silently intercept assessment/re-planner calls: return empty response
         // (causes generate_task_plan() to return None) without recording in call_log.
         if self.skip_planning_calls {
             let is_planning_call = messages.iter().any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("task planner") || s.contains("progress evaluator"))
+                m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+                    s.contains("task planner")
+                        || s.contains("task assessment router")
+                        || s.contains("progress evaluator")
+                })
             });
             if is_planning_call {
                 return Ok(ProviderResponse {

@@ -1609,6 +1609,19 @@ async fn test_create_and_get_active_personal_goals() {
     assert_eq!(active[0].status, "active");
     assert_eq!(active[0].priority, "high");
     assert_eq!(active[0].domain, "personal");
+    let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM goal_runs WHERE goal_id = ?")
+        .bind(&goal.id)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap();
+    let work_link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_channel_links WHERE goal_id = ?")
+            .bind(&goal.id)
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert_eq!(run_count, 0);
+    assert_eq!(work_link_count, 0);
 }
 
 #[tokio::test]
@@ -2698,6 +2711,109 @@ async fn test_tasks_crud() {
 }
 
 #[tokio::test]
+async fn generic_task_update_cannot_bypass_human_unblock_transition() {
+    let (store, _file) = setup_test_store().await;
+    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    store.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "Blocked work".to_string(),
+        status: "blocked".to_string(),
+        priority: "medium".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: Some("Needs a concrete resolution".to_string()),
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: Some(now),
+    };
+    store.create_task(&task).await.unwrap();
+
+    let mut invalid = task.clone();
+    invalid.status = "completed".to_string();
+    invalid.result = Some("Overwritten by a stale coordinator".to_string());
+    let error = store.update_task(&invalid).await.unwrap_err().to_string();
+
+    assert!(error.contains("must be explicitly unblocked or retried"));
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().status,
+        "blocked"
+    );
+}
+
+#[tokio::test]
+async fn migration_repairs_completed_task_overwritten_after_blocked_attempt() {
+    let (store, _file) = setup_test_store().await;
+    let goal = crate::traits::Goal::new_finite("Parent goal", "session_1");
+    store.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let task = crate::traits::Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "Inspect deployment tooling".to_string(),
+        status: "pending".to_string(),
+        priority: "medium".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    store.create_task(&task).await.unwrap();
+    let attempt = store
+        .claim_task_with_lease(&task.id, "worker-a", None, 180)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .patch_task_from_attempt(
+            &attempt.id,
+            &attempt.lease_token,
+            &crate::traits::TaskAttemptPatch {
+                status: "blocked".to_string(),
+                blocker: Some("Preflight did not run".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap());
+
+    sqlx::query(
+        "UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&task.id)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    super::migrations::migrate_state(&store.pool())
+        .await
+        .unwrap();
+
+    let repaired = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(repaired.status, "blocked");
+    assert_eq!(repaired.blocker.as_deref(), Some("Preflight did not run"));
+}
+
+#[tokio::test]
 async fn test_claim_task() {
     let (store, _file) = setup_test_store().await;
 
@@ -3031,12 +3147,18 @@ async fn test_notification_queue_does_not_starve_recent_entries() {
 
     let mut exhausted =
         crate::traits::NotificationEntry::new(goal_id, "stale-session", "token_alert", "old");
-    exhausted.created_at = now.to_rfc3339();
+    exhausted.created_at = (now - chrono::Duration::minutes(30)).to_rfc3339();
     exhausted.attempts = 10;
     store.enqueue_notification(&exhausted).await.unwrap();
 
+    let mut exhausted_status =
+        crate::traits::NotificationEntry::new(goal_id, "status-session", "progress", "old status");
+    exhausted_status.created_at = now.to_rfc3339();
+    exhausted_status.attempts = 10;
+    store.enqueue_notification(&exhausted_status).await.unwrap();
+
     let mut stale =
-        crate::traits::NotificationEntry::new(goal_id, "stale-session", "token_alert", "stale");
+        crate::traits::NotificationEntry::new(goal_id, "stale-session", "progress", "stale");
     stale.created_at = (now - chrono::Duration::days(2)).to_rfc3339();
     store.enqueue_notification(&stale).await.unwrap();
 
@@ -3051,11 +3173,97 @@ async fn test_notification_queue_does_not_starve_recent_entries() {
     store.enqueue_notification(&recent).await.unwrap();
 
     let pending = store.get_pending_notifications(10).await.unwrap();
-    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.len(), 3);
     assert_eq!(pending[0].id, recent.id);
-    assert_eq!(pending[1].id, earlier.id);
-    assert!(!pending.iter().any(|entry| entry.id == exhausted.id));
+    assert_eq!(pending[1].id, exhausted.id);
+    assert_eq!(pending[2].id, earlier.id);
+    assert!(pending.iter().any(|entry| entry.id == exhausted.id));
+    assert!(!pending.iter().any(|entry| entry.id == exhausted_status.id));
     assert!(!pending.iter().any(|entry| entry.id == stale.id));
+}
+
+#[tokio::test]
+async fn test_notification_queue_normalizes_mixed_timestamp_formats() {
+    let (store, _file) = setup_test_store().await;
+
+    let mut older =
+        crate::traits::NotificationEntry::new("goal-mixed-time", "session-1", "failed", "older");
+    older.id = "older-rfc3339".to_string();
+    older.created_at = "2026-07-30T12:00:00Z".to_string();
+    store.enqueue_notification(&older).await.unwrap();
+
+    let mut newer =
+        crate::traits::NotificationEntry::new("goal-mixed-time", "session-1", "failed", "newer");
+    newer.id = "newer-sqlite".to_string();
+    newer.created_at = "2026-07-30 13:00:00".to_string();
+    store.enqueue_notification(&newer).await.unwrap();
+
+    let pending = store.get_pending_notifications(10).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].id, newer.id);
+    assert_eq!(pending[1].id, older.id);
+}
+
+#[tokio::test]
+async fn test_goal_notification_claim_is_atomic_and_single_writer() {
+    let (store, _file) = setup_test_store().await;
+    let mut goal = Goal::new_finite("atomic notification", "session-1");
+    goal.id = "goal-atomic-notification".to_string();
+    store.create_goal(&goal).await.unwrap();
+
+    let first =
+        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "first");
+    let second =
+        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "second");
+
+    let (first_result, second_result) = tokio::join!(
+        store.enqueue_goal_notification(&first),
+        store.enqueue_goal_notification(&second)
+    );
+    let claimed = [first_result.unwrap(), second_result.unwrap()]
+        .into_iter()
+        .filter(|claimed| *claimed)
+        .count();
+    assert_eq!(claimed, 1);
+
+    let pending = store.get_pending_notifications(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let stored_goal = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert!(stored_goal.notified_at.is_some());
+    assert_eq!(stored_goal.notification_attempts, 1);
+}
+
+#[tokio::test]
+async fn test_goal_notification_enqueue_failure_rolls_back_claim() {
+    let (store, _file) = setup_test_store().await;
+    let mut goal = Goal::new_finite("rollback notification", "session-1");
+    goal.id = "goal-rollback-notification".to_string();
+    store.create_goal(&goal).await.unwrap();
+
+    let blocker = crate::traits::NotificationEntry::new(
+        "different-goal",
+        "session-1",
+        "completed",
+        "existing",
+    );
+    store.enqueue_notification(&blocker).await.unwrap();
+
+    let mut conflicting = crate::traits::NotificationEntry::new(
+        &goal.id,
+        &goal.session_id,
+        "completed",
+        "conflicting",
+    );
+    conflicting.id = blocker.id.clone();
+    assert!(store.enqueue_goal_notification(&conflicting).await.is_err());
+
+    let stored_goal = store.get_goal(&goal.id).await.unwrap().unwrap();
+    assert!(stored_goal.notified_at.is_none());
+    assert_eq!(stored_goal.notification_attempts, 0);
+
+    let valid =
+        crate::traits::NotificationEntry::new(&goal.id, &goal.session_id, "completed", "valid");
+    assert!(store.enqueue_goal_notification(&valid).await.unwrap());
 }
 
 #[tokio::test]
@@ -4002,6 +4210,141 @@ async fn reopening_store_allows_existing_multiple_episodes_per_session() {
             .await
             .unwrap();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn reopening_store_reclassifies_inferred_goal_mentions_as_non_executable() {
+    let (store, db_file) = setup_test_store().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let episode_id = sqlx::query(
+        "INSERT INTO episodes
+            (session_id, summary, start_time, end_time, created_at)
+         VALUES ('session-inferred', 'summary', ?, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&store.pool())
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO goals
+            (id, description, domain, status, session_id, source_episode_id)
+         VALUES ('inferred-goal', 'Do not deploy', 'orchestration', 'active',
+                 'session-inferred', ?)",
+    )
+    .bind(episode_id)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO goal_runs(id,project_id,goal_id,trigger_type,status)
+         VALUES('run-inferred','default','inferred-goal','legacy','running')",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO work_channel_links(goal_id,channel_session_id)
+         VALUES('inferred-goal','session-inferred')",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    drop(store);
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let reopened = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .unwrap();
+    let (domain, status): (String, String) =
+        sqlx::query_as("SELECT domain,status FROM goals WHERE id='inferred-goal'")
+            .fetch_one(&reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!((domain.as_str(), status.as_str()), ("personal", "observed"));
+    let run_status: String =
+        sqlx::query_scalar("SELECT status FROM goal_runs WHERE id='run-inferred'")
+            .fetch_one(&reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(run_status, "cancelled");
+    let links: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_channel_links WHERE goal_id='inferred-goal'")
+            .fetch_one(&reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(links, 0);
+}
+
+#[tokio::test]
+async fn reopening_store_closes_inactive_legacy_continuous_runs() {
+    let (store, db_file) = setup_test_store().await;
+    let goal = Goal::new_continuous("recurring work", "session-recurring", None, None);
+    store.create_goal(&goal).await.unwrap();
+    let run = store
+        .start_goal_run(&goal.id, "legacy", None, None)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let task = Task {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        description: "historical blocker".to_string(),
+        status: "pending".to_string(),
+        priority: "medium".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: true,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    store.create_task(&task).await.unwrap();
+    sqlx::query("UPDATE tasks SET status='blocked', blocker='old blocker' WHERE id=?")
+        .bind(&task.id)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    drop(store);
+
+    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let reopened = SqliteStateStore::new(
+        db_file.path().to_str().unwrap(),
+        100,
+        None,
+        embedding_service,
+    )
+    .await
+    .unwrap();
+    let (status, completed_at): (String, Option<String>) =
+        sqlx::query_as("SELECT status,completed_at FROM goal_runs WHERE id=?")
+            .bind(&run.id)
+            .fetch_one(&reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "failed");
+    assert!(completed_at.is_some());
+    let task_status: String = sqlx::query_scalar("SELECT status FROM tasks WHERE id=?")
+        .bind(&task.id)
+        .fetch_one(&reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(task_status, "blocked", "audit history must remain intact");
 }
 
 #[tokio::test]

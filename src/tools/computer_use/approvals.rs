@@ -190,22 +190,21 @@ async fn request_approval(
     // watchdog (300s): if the approval wait reached the watchdog, the tool call
     // is killed mid-await, the turn ends abnormally, and the running-task entry
     // can leak (the queue then stalls behind a phantom task). 120s gives the
-    // user time to respond while still resolving to a clean "denied" well before
-    // the watchdog fires. Child sessions get a short non-interactive wait.
-    let timeout_secs = if session_id.starts_with("sub-") || session_id.starts_with("specialist:") {
-        10
-    } else {
-        120
-    };
+    // user time to respond while still resolving cleanly before the watchdog
+    // fires. Child sessions are routed to the parent channel and get the same
+    // response window.
+    let timeout_secs = 120;
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), response_rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => {
             warn!(command, "computer_use approval response channel closed");
-            Ok(ApprovalResponse::Deny)
+            Err("computer_use approval response channel closed".to_string())
         }
         Err(_) => {
             warn!(command, "computer_use approval timed out");
-            Ok(ApprovalResponse::Deny)
+            Err(format!(
+                "computer_use approval timed out after {timeout_secs}s"
+            ))
         }
     }
 }

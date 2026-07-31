@@ -162,7 +162,7 @@ pub fn install_service() -> anyhow::Result<()> {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{log}/stdout.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>{log}/stderr.log</string>
 </dict>

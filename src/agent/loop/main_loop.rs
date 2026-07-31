@@ -287,20 +287,48 @@ impl Agent {
             harness_eval: None,
             eval: None,
         };
-        // Task-start planning call: generate a structured plan before the main loop.
-        // Skipped for conversational queries, short messages, and acknowledgments.
-        // In tests, MockProvider silently intercepts planning calls (skip_planning_calls=true).
+        // Task-start semantic assessment. Every model gets contract/task-shape
+        // classification when the turn warrants it; only Guided models get a
+        // step plan. Autonomous models retain control of their own approach.
+        // In tests, MockProvider silently intercepts assessment calls.
         let task_plan = {
-            use super::bootstrap_phase::task_planning::{generate_task_plan, planning_skip_reason};
-            let planner_trust_tier = self.trust_tier_for_model(&model).as_str();
-            let planner_skip_reason = planning_skip_reason(user_text, false);
+            use super::bootstrap_phase::task_planning::{
+                generate_task_plan, planned_contract_is_confident,
+                planned_mutation_constraints_are_grounded, planning_skip_reason,
+                TaskAssessmentMode,
+            };
+            let model_trust_tier = self.trust_tier_for_model(&model);
+            let planner_trust_tier = model_trust_tier.as_str();
+            let assessment_mode = match model_trust_tier {
+                crate::agent::trust_tier::ModelTrustTier::Guided => {
+                    TaskAssessmentMode::GuidedPlan
+                }
+                crate::agent::trust_tier::ModelTrustTier::Autonomous => {
+                    TaskAssessmentMode::AutonomousRouting
+                }
+            };
+            let assessment_decision_type = match assessment_mode {
+                TaskAssessmentMode::GuidedPlan => {
+                    crate::events::DecisionType::HandHoldingTelemetry
+                }
+                TaskAssessmentMode::AutonomousRouting => crate::events::DecisionType::IntentGate,
+            };
+            let planner_skip_reason = if matches!(
+                assessment_mode,
+                TaskAssessmentMode::AutonomousRouting
+            ) && (self.depth > 0 || self.role != AgentRole::Orchestrator)
+            {
+                Some("autonomous_worker_self_directed")
+            } else {
+                planning_skip_reason(user_text, false)
+            };
             if let Some(reason) = planner_skip_reason {
                 self.emit_decision_point(
                     &emitter,
                     &task_id,
                     0,
-                    crate::events::DecisionType::HandHoldingTelemetry,
-                    "Task planner skipped".to_string(),
+                    assessment_decision_type,
+                    "Task assessment skipped".to_string(),
                     super::hand_holding_telemetry::planner_skip_metadata(
                         reason,
                         &model,
@@ -310,8 +338,8 @@ impl Agent {
                 .await;
                 None
             } else {
-                // Build conversation context from recent messages for the planner.
-                // This ensures the planner sees the same narrative as the main LLM,
+                // Build conversation context from recent messages for the assessment.
+                // This ensures it sees the same narrative as the main LLM,
                 // preventing intent loss across multi-hop follow-ups.
                 let planner_context = {
                     let mut ctx_parts = Vec::new();
@@ -345,8 +373,8 @@ impl Agent {
                     &emitter,
                     &task_id,
                     0,
-                    crate::events::DecisionType::HandHoldingTelemetry,
-                    "Task planner attempted".to_string(),
+                    assessment_decision_type,
+                    "Task assessment attempted".to_string(),
                     super::hand_holding_telemetry::planner_result_metadata(
                         "attempted",
                         planner_model,
@@ -356,15 +384,14 @@ impl Agent {
                     ),
                 )
                 .await;
-                // Single-model deployments still run the planner. The router
-                // chooses a model when present; otherwise the active model
-                // reads the request instead of leaving lexical inference as
-                // the only contract classifier.
+                // The active model reads the request semantically so lexical
+                // inference remains a fallback rather than the final decision.
                 let plan_opt = generate_task_plan(
                     llm_provider.clone(),
                     planner_model,
                     user_text,
                     planner_context.as_deref(),
+                    assessment_mode,
                     Some(super::bootstrap_phase::task_planning::PlannerTelemetryCtx {
                         emitter: &emitter,
                         state: self.state.as_ref(),
@@ -375,21 +402,81 @@ impl Agent {
                 .await;
                 if let Some(ref plan) = plan_opt {
                     let before_contract = turn_context.completion_contract.clone();
-                    // The planner read the actual request (any language), so
+                    // The assessment read the actual request (any language), so
                     // its contract classification refines the English-keyword
                     // inference. Explicit user verification requests are
                     // never relaxed (enforced inside apply).
                     if let Some(ref signals) = plan.contract {
-                        let planned_kind = signals
-                            .task_kind
+                        let scope = signals
+                            .mutation_scope
                             .as_deref()
-                            .and_then(crate::agent::parse_planned_task_kind);
-                        crate::agent::apply_planned_contract_signals(
-                            &mut turn_context.completion_contract,
-                            signals.expects_mutation,
-                            signals.requires_observation,
-                            planned_kind,
+                            .map(|value| value.trim().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        let declares_negative_scope =
+                            matches!(scope.as_str(), "read_only" | "read-only" | "scoped");
+                        let confident = planned_contract_is_confident(
+                            signals,
+                            plan.task_shape.as_ref(),
                         );
+                        let grounded = planned_mutation_constraints_are_grounded(
+                            signals,
+                            user_text,
+                        );
+                        let broadens_scoped_constraint = matches!(
+                            scope.as_str(),
+                            "read_only" | "read-only"
+                        ) && !turn_context.completion_contract.forbids_mutation
+                            && !turn_context
+                                .completion_contract
+                                .forbidden_mutation_actions
+                                .is_empty();
+
+                        if confident
+                            && (!declares_negative_scope || grounded)
+                            && !broadens_scoped_constraint
+                        {
+                            let planned_kind = signals
+                                .task_kind
+                                .as_deref()
+                                .and_then(crate::agent::parse_planned_task_kind);
+                            let forbidden_actions = signals
+                                .forbidden_actions
+                                .iter()
+                                .filter_map(|action| {
+                                    crate::agent::parse_planned_forbidden_action(action)
+                                })
+                                .collect::<Vec<_>>();
+                            if declares_negative_scope {
+                                crate::agent::apply_planned_mutation_constraints(
+                                    &mut turn_context.completion_contract,
+                                    signals.mutation_scope.as_deref(),
+                                    &forbidden_actions,
+                                );
+                            }
+                            crate::agent::apply_planned_contract_signals(
+                                &mut turn_context.completion_contract,
+                                signals.expects_mutation,
+                                signals.requires_observation,
+                                planned_kind,
+                            );
+                            let required_effects = signals
+                                .required_effects
+                                .as_deref()
+                                .and_then(crate::agent::parse_planned_mutation_effects);
+                            crate::agent::apply_planned_required_mutation_effects(
+                                &mut turn_context.completion_contract,
+                                required_effects,
+                            );
+                        } else {
+                            warn!(
+                                session_id,
+                                confident,
+                                grounded,
+                                broadens_scoped_constraint,
+                                mutation_scope = %scope,
+                                "Ignored untrusted semantic contract refinement"
+                            );
+                        }
                         if turn_context.completion_contract != before_contract {
                             info!(
                                 session_id,
@@ -398,7 +485,7 @@ impl Agent {
                                     turn_context.completion_contract.expects_mutation,
                                 requires_observation =
                                     turn_context.completion_contract.requires_observation,
-                                "Completion contract refined by planner classification"
+                                "Completion contract refined by semantic task assessment"
                             );
                         }
                     }
@@ -407,20 +494,26 @@ impl Agent {
                         &emitter,
                         &task_id,
                         0,
-                        crate::events::DecisionType::HandHoldingTelemetry,
-                        "Task planner succeeded".to_string(),
-                        super::hand_holding_telemetry::planner_result_metadata(
-                            "succeeded",
-                            &model,
-                            planner_trust_tier,
-                            super::hand_holding_telemetry::PlannerResultStats {
-                                step_count: plan.steps.len(),
-                                success_criteria_count: plan.success_criteria.len(),
-                                contract_present: plan.contract.is_some(),
-                                contract_changed,
-                            },
-                            None,
-                        ),
+                        assessment_decision_type,
+                        "Task assessment succeeded".to_string(),
+                        {
+                            let mut metadata =
+                                super::hand_holding_telemetry::planner_result_metadata(
+                                    "succeeded",
+                                    &model,
+                                    planner_trust_tier,
+                                    super::hand_holding_telemetry::PlannerResultStats {
+                                        step_count: plan.steps.len(),
+                                        success_criteria_count: plan.success_criteria.len(),
+                                        contract_present: plan.contract.is_some(),
+                                        contract_changed,
+                                    },
+                                    None,
+                                );
+                            metadata["assessment_mode"] = json!(plan.mode.as_str());
+                            metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                            metadata
+                        },
                     )
                     .await;
                 } else {
@@ -428,14 +521,14 @@ impl Agent {
                         &emitter,
                         &task_id,
                         0,
-                        crate::events::DecisionType::HandHoldingTelemetry,
-                        "Task planner returned no plan".to_string(),
+                        assessment_decision_type,
+                        "Task assessment returned no result".to_string(),
                         super::hand_holding_telemetry::planner_result_metadata(
                             "no_plan",
                             &model,
                             planner_trust_tier,
                             super::hand_holding_telemetry::PlannerResultStats::empty(),
-                            Some("planner_returned_none"),
+                            Some("assessment_returned_none"),
                         ),
                     )
                     .await;
@@ -444,7 +537,26 @@ impl Agent {
             }
         };
 
-        // The planner has now had its one opportunity to refine the contract.
+        let fallback_intent_complexity = classify_intent_complexity(user_text);
+        let (intent_complexity, structured_complexity_used) = task_plan
+            .as_ref()
+            .and_then(|plan| plan.task_shape.as_ref())
+            .map(|shape| {
+                refine_intent_complexity_with_task_shape(
+                    fallback_intent_complexity.clone(),
+                    IntentTaskShape {
+                        execution_mode: shape.execution_mode.as_deref(),
+                        confidence: shape.confidence.as_deref(),
+                        independent_workstreams: shape.independent_workstreams,
+                        requires_background_continuation: shape
+                            .requires_background_continuation,
+                    },
+                )
+            })
+            .unwrap_or((fallback_intent_complexity, false));
+
+        // The assessment has now had its one opportunity to refine the contract
+        // and route. Derive contract-dependent state exactly once.
         // Derive all contract-dependent state exactly once from that finalized
         // value so loop control, progress tracking, budgets, and telemetry agree.
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
@@ -472,10 +584,7 @@ impl Agent {
         let recognized_artifact_request = recognized_artifact_creation_request(user_text);
         let route_requires_tools = self.depth == 0
             && self.role == AgentRole::Orchestrator
-            && matches!(
-                classify_intent_complexity(user_text),
-                IntentComplexity::Complex
-            );
+            && matches!(&intent_complexity, IntentComplexity::Complex);
         let execution_requirement = ExecutionRequirement::from_finalized_contract(
             &turn_context.completion_contract,
             deterministic_tool_need,
@@ -529,7 +638,9 @@ impl Agent {
         )
         .await;
 
-        if let Some(plan) = task_plan {
+        if let Some(plan) = task_plan.filter(|plan| {
+            plan.mode.includes_step_plan() && !plan.steps.is_empty()
+        }) {
             use crate::agent::execution_state::LinearIntentStep;
             let linear_steps: Vec<LinearIntentStep> = plan
                 .steps
@@ -1158,6 +1269,8 @@ impl Agent {
                         channel_ctx: channel_ctx.clone(),
                         status_tx: status_tx.clone(),
                         intent_gate: &intent_gate,
+                        intent_complexity: &intent_complexity,
+                        structured_complexity_used,
                         turn_context: &turn_context,
                         execution_requirement: &execution_requirement,
                     },
@@ -1651,9 +1764,10 @@ impl Agent {
                 ToolExecutionOutcome::NextIteration => {}
             }
 
-            // Re-planner: track tool calls on current plan step and evaluate
-            // whether the step is complete. Uses delta of learning_ctx.tool_calls
-            // to count ALL calls this round (including failures).
+            // Guided-only re-planner. Autonomous models self-direct and never
+            // spend an auxiliary model call evaluating their own step progress.
+            if self.trust_tier_for_model(&model)
+                == crate::agent::trust_tier::ModelTrustTier::Guided
             {
                 let tool_calls_this_round = learning_ctx
                     .tool_calls

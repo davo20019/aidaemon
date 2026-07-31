@@ -87,8 +87,9 @@ pub(in crate::agent) async fn run_orchestration_phase(
         return Ok(Some(outcome));
     }
 
-    // Orchestration routing (always-on).
-    let complexity = classify_intent_complexity(ctx.user_text);
+    // Orchestration routing (always-on). The task-start semantic assessment
+    // finalized this value; deterministic classification is only its fallback.
+    let complexity = ctx.intent_complexity.clone();
     let (route, _) = orchestration_route_label(&complexity);
     let tools_required = ctx.execution_requirement.requires_execution();
     let tool_control_enforced = agent.trust_tier_for_model(ctx.model)
@@ -106,6 +107,7 @@ pub(in crate::agent) async fn run_orchestration_phase(
         ctx.user_text.chars().count(),
         tool_control_enforced,
         &requirement_reasons,
+        ctx.structured_complexity_used,
     );
     agent
         .emit_decision_point(
@@ -138,6 +140,7 @@ fn intent_decision_telemetry(
     user_text_len: usize,
     tool_control_enforced: bool,
     requirement_reasons: &[&str],
+    structured_complexity_used: bool,
 ) -> (String, Value) {
     let complexity_label = match complexity {
         IntentComplexity::Simple => "simple",
@@ -156,6 +159,11 @@ fn intent_decision_telemetry(
         "user_text_len": user_text_len,
         "tool_control_enforced": tool_control_enforced,
         "requirement_reasons": requirement_reasons,
+        "classification_source": if structured_complexity_used {
+            "semantic_task_shape"
+        } else {
+            "deterministic_fallback"
+        },
     });
     (summary, metadata)
 }
@@ -193,6 +201,7 @@ mod intent_telemetry_tests {
             42,
             true,
             &["mutation_contract"],
+            true,
         );
         assert!(summary.contains("needs_tools=true"), "summary: {summary}");
         assert!(summary.contains("complexity=complex"), "summary: {summary}");
@@ -207,6 +216,7 @@ mod intent_telemetry_tests {
         assert_eq!(meta["user_text_len"], 42);
         assert_eq!(meta["tool_control_enforced"], true);
         assert_eq!(meta["requirement_reasons"][0], "mutation_contract");
+        assert_eq!(meta["classification_source"], "semantic_task_shape");
     }
 
     #[test]
@@ -234,6 +244,7 @@ mod intent_telemetry_tests {
                 0,
                 false,
                 &["none"],
+                false,
             );
             assert_eq!(meta["complexity"], label, "variant should map to {label}");
         }

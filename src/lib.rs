@@ -23,6 +23,7 @@ mod health;
 mod heartbeat;
 mod llm_markers;
 mod llm_runtime;
+mod logging;
 mod mcp;
 mod memory;
 mod oauth;
@@ -55,6 +56,7 @@ mod types;
 mod updater;
 pub mod utils;
 mod wizard;
+mod workspaces;
 
 #[cfg(test)]
 mod integration_tests;
@@ -66,8 +68,6 @@ mod testing;
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "terminal-bridge"))]
 use std::process::Stdio;
-
-use tracing_subscriber::EnvFilter;
 
 const SUPPORTED_TERMINAL_AGENTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
 const MAX_AGENT_LAUNCH_ARGS: usize = 24;
@@ -145,16 +145,14 @@ pub fn run() -> anyhow::Result<()> {
     export_runtime_context(&config_path, &env_file_path, &working_dir);
     load_startup_env_file(&env_file_path);
 
-    // Tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            if cfg!(feature = "browser") {
-                EnvFilter::new("info,chromiumoxide=off")
-            } else {
-                EnvFilter::new("info")
-            }
-        }))
-        .init();
+    // Interactive runs log to stderr. Background service logs are written to
+    // an owner-only, size-rotated file so a long-lived daemon cannot consume
+    // the host disk through launch-service output redirection.
+    logging::init(if cfg!(feature = "browser") {
+        "info,chromiumoxide=off"
+    } else {
+        "info"
+    })?;
 
     // Handle CLI arguments
     let args: Vec<String> = std::env::args().collect();
@@ -191,6 +189,8 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  auth login openai     Connect a ChatGPT subscription (Codex OAuth)");
                 println!("  auth status           Show connected model subscriptions");
                 println!("  auth logout openai    Disconnect the ChatGPT subscription");
+                println!("  dashboard             Open the authenticated local dashboard");
+                println!("  dashboard login-url   Print a local dashboard login URL");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -245,6 +245,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "keychain" => {
                 return handle_keychain_command(&args[2..]);
+            }
+            "dashboard" => {
+                return handle_dashboard_command(&args[2..], config_path.as_path());
             }
             "auth" => {
                 return handle_auth_command(&args[2..]);
@@ -326,6 +329,61 @@ pub fn run() -> anyhow::Result<()> {
         .thread_stack_size(8 * 1024 * 1024)
         .build()?
         .block_on(crate::core::run(config, config_path))
+}
+
+fn dashboard_login_url(config_path: &Path) -> anyhow::Result<String> {
+    let config = config::AppConfig::load(config_path)?;
+    if !config.daemon.dashboard_enabled {
+        anyhow::bail!("The dashboard is disabled in config.toml");
+    }
+    let token = config::resolve_from_keychain("dashboard_token").map_err(|error| {
+        anyhow::anyhow!(
+            "Dashboard token is unavailable: {error}. Start or restart the daemon first."
+        )
+    })?;
+    let host = match config.daemon.health_bind.trim() {
+        "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        value if value.contains(':') && !value.starts_with('[') => format!("[{value}]"),
+        value => value.to_string(),
+    };
+    Ok(format!(
+        "http://{}:{}/#token={}",
+        host, config.daemon.health_port, token
+    ))
+}
+
+fn handle_dashboard_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
+    let action = args.first().map(String::as_str).unwrap_or("open");
+    let login_url = dashboard_login_url(config_path)?;
+    match action {
+        "open" => {
+            #[cfg(target_os = "macos")]
+            let status = std::process::Command::new("open")
+                .arg(&login_url)
+                .status()?;
+            #[cfg(target_os = "linux")]
+            let status = std::process::Command::new("xdg-open")
+                .arg(&login_url)
+                .status()?;
+            #[cfg(target_os = "windows")]
+            let status = std::process::Command::new("rundll32")
+                .arg("url.dll,FileProtocolHandler")
+                .arg(&login_url)
+                .status()?;
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            anyhow::bail!("Opening the dashboard is not supported on this platform");
+
+            if !status.success() {
+                anyhow::bail!("Could not open the local dashboard in a browser");
+            }
+            println!("Opened the authenticated local dashboard.");
+        }
+        "login-url" => {
+            println!("{login_url}");
+        }
+        _ => anyhow::bail!("Usage: aidaemon dashboard [open|login-url]"),
+    }
+    Ok(())
 }
 
 #[allow(unreachable_code)]

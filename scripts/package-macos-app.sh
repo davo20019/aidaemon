@@ -61,6 +61,9 @@ BIN="$PROJECT_DIR/target/$PROFILE/aidaemon"
 
 echo "Packaging $PROFILE binary -> $APP"
 mkdir -p "$APP/Contents/MacOS" "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+touch "$LOG_DIR/stderr.log"
+chmod 600 "$LOG_DIR/stderr.log"
 cp "$BIN" "$APP/Contents/MacOS/aidaemon"
 
 cat > "$APP/Contents/Info.plist" <<PLISTEOF
@@ -113,18 +116,37 @@ cat > "$PLIST" <<PLISTEOF
     <dict><key>PATH</key><string>$DAEMON_PATH</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$LOG_DIR/stdout.log</string>
+    <key>StandardOutPath</key><string>/dev/null</string>
     <key>StandardErrorPath</key><string>$LOG_DIR/stderr.log</string>
 </dict>
 </plist>
 PLISTEOF
 
+bootstrap_agent() {
+  local attempt bootstrap_output
+  for attempt in 1 2 3 4 5; do
+    if bootstrap_output=$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1); then
+      if [ "$attempt" != "1" ]; then
+        echo "launchd bootstrap accepted on retry $attempt."
+      fi
+      return 0
+    fi
+    if [ "$attempt" != "5" ]; then
+      sleep 0.2
+    fi
+  done
+  printf '%s\n' "$bootstrap_output" >&2
+  echo "error: launchd did not accept $PLIST after 5 attempts" >&2
+  return 1
+}
+
 # (Re)load the launchd agent.
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-  launchctl kickstart -k "gui/$(id -u)/$LABEL"
-  echo "Restarted existing launchd agent."
+  launchctl bootout "gui/$(id -u)/$LABEL"
+  bootstrap_agent
+  echo "Reloaded existing launchd agent."
 else
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  bootstrap_agent
   echo "Bootstrapped launchd agent."
 fi
 

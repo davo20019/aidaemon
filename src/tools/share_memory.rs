@@ -49,14 +49,19 @@ impl ShareMemoryTool {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 warn!("Approval response channel closed for share_memory");
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!(
+                    "Approval response channel closed for share_memory"
+                ))
             }
             Err(_) => {
                 warn!(
                     "Approval request timed out for share_memory ({}s)",
                     APPROVAL_TIMEOUT_SECS
                 );
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!(
+                    "Approval request timed out for share_memory after {}s",
+                    APPROVAL_TIMEOUT_SECS
+                ))
             }
         }
     }

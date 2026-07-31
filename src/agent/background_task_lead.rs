@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use crate::events::TaskOutcome;
 use crate::traits::AgentRole;
 use crate::types::{ChannelContext, UserRole};
 
@@ -17,10 +18,9 @@ use super::parent_delivery;
 use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
-    extract_file_paths_from_text, goal_completion_response_indicates_incomplete_work,
-    goal_has_scheduled_provenance, is_group_session, is_low_signal_task_lead_reply,
-    is_scheduled_task_description, parse_goal_leading_wait, parse_wait_task_seconds,
-    persist_scheduled_run_state, salvageable_task_lead_result, strip_leading_wait,
+    extract_file_paths_from_text, goal_has_scheduled_provenance, is_group_session,
+    is_low_signal_task_lead_reply, is_scheduled_task_description, parse_goal_leading_wait,
+    parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
     truncate_goal_result_text, user_facing_task_description, Agent,
 };
 
@@ -46,24 +46,285 @@ fn count_successful_completed_work(
         .count()
 }
 
-fn tasks_for_current_run(
-    tasks: Vec<crate::traits::Task>,
-    run_started_at: Option<&str>,
-) -> Vec<crate::traits::Task> {
+fn render_recovery_task_ledger(tasks: &[crate::traits::Task]) -> String {
     tasks
-        .into_iter()
-        .filter(|task| {
-            run_started_at.is_none_or(|started_at| task.created_at.as_str() >= started_at)
+        .iter()
+        .take(16)
+        .map(|task| {
+            let mut entry = format!(
+                "- [{}] {}",
+                task.status,
+                task.description.chars().take(240).collect::<String>()
+            );
+            if let Some(result) = task
+                .result
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                entry.push_str(&format!(
+                    "\n  Result: {}",
+                    result.chars().take(1200).collect::<String>()
+                ));
+            }
+            if let Some(error) = task
+                .error
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                entry.push_str(&format!(
+                    "\n  Error: {}",
+                    error.chars().take(500).collect::<String>()
+                ));
+            }
+            if let Some(blocker) = task
+                .blocker
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                entry.push_str(&format!(
+                    "\n  Blocker: {}",
+                    blocker.chars().take(500).collect::<String>()
+                ));
+            }
+            entry
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn work_tasks_for_current_run(
-    tasks: Vec<crate::traits::Task>,
-    run_started_at: Option<&str>,
+/// Return a heartbeat-owned trigger to the pending queue when another task
+/// lead won the goal run guard. The claim was only an admission mechanism; it
+/// must not strand the task as running after the duplicate spawn yields.
+async fn release_duplicate_dispatch_trigger(
+    state: &Arc<dyn crate::traits::StateStore>,
+    task_id: &str,
+    attempt: Option<&crate::traits::TaskAttempt>,
+) {
+    if let Some(attempt) = attempt {
+        let patch = crate::traits::TaskAttemptPatch {
+            status: "cancelled".to_string(),
+            error: Some(
+                "Duplicate heartbeat dispatch yielded to the active task lead.".to_string(),
+            ),
+            ..Default::default()
+        };
+        if !state
+            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
+    if let Ok(Some(mut task)) = state.get_task(task_id).await {
+        let heartbeat_owned = task
+            .agent_id
+            .as_deref()
+            .is_some_and(|agent_id| agent_id.starts_with("heartbeat-dispatch-"));
+        if task.status == "cancelled" || heartbeat_owned {
+            task.status = "pending".to_string();
+            task.agent_id = None;
+            task.error = None;
+            task.blocker = None;
+            task.started_at = None;
+            task.completed_at = None;
+            let _ = state.update_task(&task).await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AutoDispatchContext {
+    agent: Arc<Agent>,
+    state: Arc<dyn crate::traits::StateStore>,
+    mission: String,
+    goal_id: String,
+    approval_session_id: String,
+    channel_ctx: ChannelContext,
+    user_role: UserRole,
+    project_scope: Option<String>,
+}
+
+async fn execute_auto_dispatch_task(
+    context: AutoDispatchContext,
+    task: crate::traits::Task,
+) -> Option<(crate::traits::Task, anyhow::Result<String>)> {
+    let AutoDispatchContext {
+        agent,
+        state,
+        mission,
+        goal_id,
+        approval_session_id,
+        channel_ctx,
+        user_role,
+        project_scope,
+    } = context;
+    let specialist =
+        Agent::select_specialist_kind(AgentRole::Executor, &mission, &task.description);
+    let profile_id = format!("profile-{}", specialist.as_str().replace('_', "-"));
+    let attempt = match state
+        .claim_task_with_lease(
+            &task.id,
+            &format!("auto-dispatch-{goal_id}"),
+            Some(&profile_id),
+            180,
+        )
+        .await
+    {
+        Ok(Some(attempt)) => attempt,
+        Ok(None) => return None,
+        Err(error) => return Some((task, Err(error))),
+    };
+
+    if let Some(wait_secs) = parse_wait_task_seconds(&task.description) {
+        info!(
+            goal_id = %goal_id,
+            task_id = %task.id,
+            wait_secs,
+            "Executing wait task locally"
+        );
+        let mut remaining = wait_secs;
+        while remaining > 0 {
+            let step = remaining.min(45);
+            tokio::time::sleep(Duration::from_secs(step)).await;
+            remaining = remaining.saturating_sub(step);
+            match state
+                .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Some((
+                        task,
+                        Err(anyhow::anyhow!("Wait task lost its execution lease")),
+                    ));
+                }
+                Err(error) => return Some((task, Err(error))),
+            }
+        }
+        let summary = format!("Waited for {} second(s).", wait_secs);
+        let handoff = crate::traits::TaskHandoff {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            attempt_id: attempt.id.clone(),
+            summary: summary.clone(),
+            artifacts: Vec::new(),
+            verification: vec!["Timer elapsed without cancellation.".to_string()],
+            remaining_risk: None,
+            next_step: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let patch = crate::traits::TaskAttemptPatch {
+            status: "completed".to_string(),
+            result: Some(summary.clone()),
+            handoff: Some(handoff),
+            ..Default::default()
+        };
+        return match state
+            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+            .await
+        {
+            Ok(true) => Some((task, Ok(summary))),
+            Ok(false) => Some((
+                task,
+                Err(anyhow::anyhow!("Wait task result was rejected as stale")),
+            )),
+            Err(error) => Some((task, Err(error))),
+        };
+    }
+
+    let task_text = task.description.clone();
+    let task_id = task.id.clone();
+    let result = agent
+        .spawn_child_with_outcome(
+            &mission,
+            &task_text,
+            None,
+            channel_ctx,
+            user_role,
+            Some(AgentRole::Executor),
+            Some(&goal_id),
+            Some(&task_id),
+            project_scope.as_deref(),
+            None,
+            Some(&approval_session_id),
+        )
+        .await
+        .map(|run| run.response);
+    Some((task, result))
+}
+
+async fn deliver_auto_dispatch_result(
+    agent: &Arc<Agent>,
+    state: &Arc<dyn crate::traits::StateStore>,
+    hub: Option<&Weak<crate::channels::ChannelHub>>,
+    session_id: &str,
+    task: &crate::traits::Task,
+    result: &anyhow::Result<String>,
+) -> bool {
+    let Ok(response) = result else {
+        return false;
+    };
+    let persisted = state.get_task(&task.id).await.ok().flatten();
+    let delivery_text = if !response.trim().is_empty() {
+        response.clone()
+    } else {
+        persisted
+            .and_then(|task| {
+                task.result
+                    .filter(|result| !result.trim().is_empty())
+                    .or_else(|| task.blocker.filter(|blocker| !blocker.trim().is_empty()))
+            })
+            .unwrap_or_default()
+    };
+    if delivery_text.trim().is_empty() {
+        return false;
+    }
+    match agent
+        .deliver_parent_text_result(
+            hub,
+            session_id,
+            &delivery_text,
+            parent_delivery::ParentDeliveryKind::ExecutorResult,
+        )
+        .await
+    {
+        Ok(outcome) => outcome.sent,
+        Err(error) => {
+            warn!(
+                session_id,
+                task_id = %task.id,
+                %error,
+                "Failed to record parent-mediated executor result"
+            );
+            false
+        }
+    }
+}
+
+async fn tasks_for_current_run(
+    state: &Arc<dyn crate::traits::StateStore>,
+    goal_id: &str,
+    goal_run_id: Option<&str>,
+) -> Vec<crate::traits::Task> {
+    match goal_run_id {
+        Some(run_id) => state
+            .get_tasks_for_goal_run(run_id)
+            .await
+            .unwrap_or_default(),
+        None => state.get_tasks_for_goal(goal_id).await.unwrap_or_default(),
+    }
+}
+
+async fn work_tasks_for_current_run(
+    state: &Arc<dyn crate::traits::StateStore>,
+    goal_id: &str,
+    goal_run_id: Option<&str>,
     dispatch_trigger_task_id: Option<&str>,
 ) -> Vec<crate::traits::Task> {
-    tasks_for_current_run(tasks, run_started_at)
+    tasks_for_current_run(state, goal_id, goal_run_id)
+        .await
         .into_iter()
         .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id)
         .collect()
@@ -95,6 +356,27 @@ fn dispatch_trigger_succeeded(
     work_tasks
         .iter()
         .all(|task| task.satisfies_run_completion())
+}
+
+fn clear_partial_success_context(goal: &mut crate::traits::Goal) {
+    let Some(raw) = goal.context.as_deref() else {
+        return;
+    };
+    let Ok(mut context) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(object) = context.as_object_mut() else {
+        return;
+    };
+    for key in ["partial_success", "completed", "failed", "blocked", "total"] {
+        object.remove(key);
+    }
+    goal.context = (!object.is_empty()).then(|| context.to_string());
+}
+
+fn recovery_task_succeeded(outcome: TaskOutcome, persisted: Option<&crate::traits::Task>) -> bool {
+    outcome == TaskOutcome::Succeeded
+        && persisted.is_some_and(crate::traits::Task::completed_successfully)
 }
 
 fn failed_run_summary(tasks: &[crate::traits::Task], fallback: Option<&str>) -> String {
@@ -217,14 +499,46 @@ pub fn spawn_background_task_lead(
         let body = async move {
             let goal_id = goal.id.clone();
             let mission = goal.description.clone();
-            let run_started_at = if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref()
-            {
-                state
-                    .get_task(trigger_task_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|task| task.created_at)
+            let goal_run_id = state
+                .get_current_goal_run(&goal_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| run.id);
+            let dispatch_attempt =
+                if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
+                    state
+                        .get_current_task_attempt(trigger_task_id)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+
+            // Take the per-goal run guard before binding the heartbeat trigger.
+            // If another lead is already active, release the admission claim
+            // immediately instead of leaving a phantom running task behind.
+            let _run_guard = if let Some(ref registry) = goal_token_registry {
+                match registry.try_acquire_run(&goal_id) {
+                    Some(guard) => Some(guard),
+                    None => {
+                        info!(
+                            goal_id = %goal_id,
+                            session_id = %session_id,
+                            "Goal already has an active task lead; skipping duplicate background spawn"
+                        );
+                        if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
+                            release_duplicate_dispatch_trigger(
+                                &state,
+                                trigger_task_id,
+                                dispatch_attempt.as_ref(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                }
             } else {
                 None
             };
@@ -252,35 +566,65 @@ pub fn spawn_background_task_lead(
             // the next heartbeat tick would see the task as orphaned-pending and re-dispatch
             // it, causing duplicate execution (e.g., double tweet posts).
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
-                match state.get_task(trigger_task_id).await {
-                    Ok(Some(task))
-                        if (task.status == "claimed" || task.status == "running")
-                            && task
-                                .agent_id
-                                .as_deref()
-                                .is_some_and(|aid| aid.starts_with("heartbeat-dispatch-")) =>
-                    {
-                        let mut updated = task.clone();
-                        updated.status = "running".to_string();
-                        updated.agent_id = Some(format!("task-lead-{}", goal_id));
-                        // Keep started_at from the claim so dispatch sees it as active
-                        if let Err(e) = state.update_task(&updated).await {
+                if let Some(attempt) = dispatch_attempt.as_ref() {
+                    let worker_id = format!("task-lead-{}", goal_id);
+                    let bound = state
+                        .bind_task_attempt_worker(
+                            &attempt.id,
+                            &attempt.lease_token,
+                            &worker_id,
+                            Some("profile-task-lead"),
+                        )
+                        .await
+                        .unwrap_or(false);
+                    let patch = crate::traits::TaskAttemptPatch {
+                        status: "running".to_string(),
+                        ..Default::default()
+                    };
+                    let running = bound
+                        && state
+                            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                            .await
+                            .unwrap_or(false);
+                    if !running {
+                        warn!(
+                            task_id = %trigger_task_id,
+                            attempt_id = %attempt.id,
+                            "Task-lead trigger lease was lost before execution"
+                        );
+                        return;
+                    }
+                } else {
+                    match state.get_task(trigger_task_id).await {
+                        Ok(Some(task))
+                            if (task.status == "claimed" || task.status == "running")
+                                && task
+                                    .agent_id
+                                    .as_deref()
+                                    .is_some_and(|aid| aid.starts_with("heartbeat-dispatch-")) =>
+                        {
+                            let mut updated = task.clone();
+                            updated.status = "running".to_string();
+                            updated.agent_id = Some(format!("task-lead-{}", goal_id));
+                            // Keep started_at from the claim so dispatch sees it as active
+                            if let Err(e) = state.update_task(&updated).await {
+                                warn!(
+                                    task_id = %trigger_task_id,
+                                    goal_id = %goal_id,
+                                    error = %e,
+                                    "Failed to update dispatch trigger task to running"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
                             warn!(
                                 task_id = %trigger_task_id,
                                 goal_id = %goal_id,
                                 error = %e,
-                                "Failed to update dispatch trigger task to running"
+                                "Failed to load dispatch trigger task"
                             );
                         }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            task_id = %trigger_task_id,
-                            goal_id = %goal_id,
-                            error = %e,
-                            "Failed to load dispatch trigger task"
-                        );
                     }
                 }
             }
@@ -288,34 +632,13 @@ pub fn spawn_background_task_lead(
             // Snapshot genuine completed work before this dispatch. The scheduled
             // trigger task is bookkeeping and is finalized below, so it must not
             // count as progress by itself.
-            let completed_work_before = state
-                .get_tasks_for_goal(&goal_id)
-                .await
-                .map(|tasks| {
-                    let tasks = tasks_for_current_run(tasks, run_started_at.as_deref());
-                    count_successful_completed_work(&tasks, dispatch_trigger_task_id.as_deref())
-                })
-                .unwrap_or(0);
+            let initial_run_tasks =
+                tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await;
+            let completed_work_before = count_successful_completed_work(
+                &initial_run_tasks,
+                dispatch_trigger_task_id.as_deref(),
+            );
 
-            // Prevent duplicate concurrent task leads (and duplicate heartbeats) for the same goal.
-            // Multiple codepaths can attempt to dispatch work for a goal (initial spawn, heartbeat
-            // orphan recovery, auto-dispatch). This in-memory guard keeps progress messages sane
-            // and avoids overlapping TaskLead runs.
-            let _run_guard = if let Some(ref registry) = goal_token_registry {
-                match registry.try_acquire_run(&goal_id) {
-                    Some(g) => Some(g),
-                    None => {
-                        info!(
-                            goal_id = %goal_id,
-                            session_id = %session_id,
-                            "Goal already has an active task lead; skipping duplicate background spawn"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
             // This background lead owns the complete scheduled cycle: planning,
             // child execution, trigger finalization, and terminal notification.
             // Nested Agent turns must not clear the shared budget when they
@@ -339,6 +662,7 @@ pub fn spawn_background_task_lead(
                 tokio::sync::oneshot::channel::<()>();
             let keepalive_state = state.clone();
             let keepalive_task_id = dispatch_trigger_task_id.clone();
+            let keepalive_attempt = dispatch_attempt.clone();
             let keepalive_handle = tokio::spawn(async move {
                 let Some(task_id) = keepalive_task_id else {
                     let _ = keepalive_cancel_rx.await;
@@ -347,6 +671,24 @@ pub fn spawn_background_task_lead(
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            if let Some(attempt) = keepalive_attempt.as_ref() {
+                                let renewed = keepalive_state
+                                    .heartbeat_task_attempt(
+                                        &attempt.id,
+                                        &attempt.lease_token,
+                                        180,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                if !renewed {
+                                    warn!(
+                                        task_id = %task_id,
+                                        attempt_id = %attempt.id,
+                                        "Task-lead keepalive lost its execution lease"
+                                    );
+                                    break;
+                                }
+                            }
                             let activity = crate::traits::TaskActivity {
                                 id: 0,
                                 task_id: task_id.clone(),
@@ -378,7 +720,7 @@ pub fn spawn_background_task_lead(
             let heartbeat_session = session_id.clone();
             let heartbeat_state = state.clone();
             let heartbeat_goal_id = goal_id.clone();
-            let heartbeat_run_started_at = run_started_at.clone();
+            let heartbeat_goal_run_id = goal_run_id.clone();
             let heartbeat_trigger_task_id = dispatch_trigger_task_id.clone();
             let heartbeat_initial_surface = initial_surface_id;
             let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) =
@@ -409,13 +751,12 @@ pub fn spawn_background_task_lead(
 
                     // Build progress message from task statuses
                     let tasks = work_tasks_for_current_run(
-                        heartbeat_state
-                            .get_tasks_for_goal(&heartbeat_goal_id)
-                            .await
-                            .unwrap_or_default(),
-                        heartbeat_run_started_at.as_deref(),
+                        &heartbeat_state,
+                        &heartbeat_goal_id,
+                        heartbeat_goal_run_id.as_deref(),
                         heartbeat_trigger_task_id.as_deref(),
-                    );
+                    )
+                    .await;
                     if tasks.is_empty() {
                         // Tasks not yet created — send one planning message on the
                         // first empty-tasks heartbeat. If planning is still running
@@ -535,20 +876,54 @@ pub fn spawn_background_task_lead(
 
                     // Finalize any non-terminal tasks so we don't leave pending rows behind
                     // after a local pure-wait short-circuit.
-                    if let Ok(tasks) = state.get_tasks_for_goal(&goal_id).await {
-                        for task in tasks_for_current_run(tasks, run_started_at.as_deref()) {
-                            if task.status != "completed"
-                                && task.status != "failed"
-                                && task.status != "cancelled"
-                            {
-                                let mut updated = task.clone();
-                                updated.status = "completed".to_string();
-                                updated.error = None;
-                                updated.result = Some(msg.clone());
-                                updated.completed_at = Some(now.clone());
-                                let _ = state.update_task(&updated).await;
+                    for task in
+                        tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await
+                    {
+                        if task.status != "completed"
+                            && task.status != "failed"
+                            && task.status != "cancelled"
+                        {
+                            if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref() {
+                                if let Some(attempt) = dispatch_attempt.as_ref() {
+                                    let handoff = crate::traits::TaskHandoff {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        task_id: task.id.clone(),
+                                        attempt_id: attempt.id.clone(),
+                                        summary: msg.clone(),
+                                        artifacts: Vec::new(),
+                                        verification: vec![
+                                            "Timer elapsed without cancellation.".to_string()
+                                        ],
+                                        remaining_risk: None,
+                                        next_step: None,
+                                        created_at: now.clone(),
+                                    };
+                                    let patch = crate::traits::TaskAttemptPatch {
+                                        status: "completed".to_string(),
+                                        result: Some(msg.clone()),
+                                        handoff: Some(handoff),
+                                        ..Default::default()
+                                    };
+                                    let _ = state
+                                        .patch_task_from_attempt(
+                                            &attempt.id,
+                                            &attempt.lease_token,
+                                            &patch,
+                                        )
+                                        .await;
+                                    continue;
+                                }
                             }
+                            let mut updated = task.clone();
+                            updated.status = "completed".to_string();
+                            updated.error = None;
+                            updated.result = Some(msg.clone());
+                            updated.completed_at = Some(now.clone());
+                            let _ = state.update_task(&updated).await;
                         }
+                    }
+                    if let Some(run_id) = goal_run_id.as_deref() {
+                        let _ = state.finish_goal_run(run_id, "completed", Some(&msg)).await;
                     }
 
                     if let Err(err) = agent
@@ -575,8 +950,8 @@ pub fn spawn_background_task_lead(
                 effective_user_text = user_text.clone();
             }
 
-            let result = agent
-                .spawn_child(
+            let task_lead_run = agent
+                .spawn_child_with_outcome(
                     &effective_mission,
                     &effective_user_text,
                     None,
@@ -587,8 +962,11 @@ pub fn spawn_background_task_lead(
                     None,
                     None,
                     None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
+                    Some(&session_id),
                 )
                 .await;
+            let task_lead_outcome = task_lead_run.as_ref().ok().map(|run| run.outcome);
+            let result = task_lead_run.map(|run| run.response);
 
             // Keep the task-lead textual response, but defer relay until we know
             // whether the goal is terminal. For terminal goals, we prefer the
@@ -602,6 +980,16 @@ pub fn spawn_background_task_lead(
             // Track whether any executor results were already sent inline to the user.
             // Used to avoid duplicate content in the completion notification.
             let mut any_executor_results_sent = false;
+            let auto_dispatch_context = AutoDispatchContext {
+                agent: agent.clone(),
+                state: state.clone(),
+                mission: mission.clone(),
+                goal_id: goal_id.clone(),
+                approval_session_id: session_id.clone(),
+                channel_ctx: dispatch_channel_ctx.clone(),
+                user_role: fallback_user_role,
+                project_scope: dispatch_project_scope.clone(),
+            };
 
             // Auto-dispatch: dispatch remaining pending tasks after task lead returns.
             // This handles both cases: LLMs that create tasks but don't spawn executors,
@@ -615,15 +1003,19 @@ pub fn spawn_background_task_lead(
                 let mut budget_exhausted = false;
                 for _round in 0..max_dispatch_rounds {
                     let all_tasks = work_tasks_for_current_run(
-                        state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                        run_started_at.as_deref(),
+                        &state,
+                        &goal_id,
+                        goal_run_id.as_deref(),
                         dispatch_trigger_task_id.as_deref(),
-                    );
+                    )
+                    .await;
 
                     // Build set of completed task IDs for dependency checking
                     let completed_ids: std::collections::HashSet<String> = all_tasks
                         .iter()
-                        .filter(|t| t.status == "completed" || t.status == "skipped")
+                        .filter(|t| {
+                            matches!(t.status.as_str(), "completed" | "skipped" | "superseded")
+                        })
                         .map(|t| t.id.clone())
                         .collect();
 
@@ -663,7 +1055,15 @@ pub fn spawn_background_task_lead(
                         "Auto-dispatching pending tasks after task lead"
                     );
 
+                    let mut dispatched_parallel_groups = std::collections::HashSet::new();
                     for task in &dispatch_batch {
+                        if task
+                            .parallel_group
+                            .as_ref()
+                            .is_some_and(|group| dispatched_parallel_groups.contains(group))
+                        {
+                            continue;
+                        }
                         // Stop dispatching when the active run has exhausted its
                         // shared per-run budget, or when a non-scheduled goal hits
                         // its daily budget.
@@ -746,160 +1146,59 @@ pub fn spawn_background_task_lead(
                             }
                         }
 
-                        // Claim the task
-                        let claimed = match state
-                            .claim_task(&task.id, &format!("auto-dispatch-{}", goal_id))
-                            .await
-                        {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        if !claimed {
-                            continue;
-                        }
-
-                        // Execute pure wait tasks locally to avoid unnecessary LLM
-                        // calls and provider rate-limit churn.
-                        if let Some(wait_secs) = parse_wait_task_seconds(&task.description) {
-                            info!(
-                                goal_id = %goal_id,
-                                task_id = %task.id,
-                                wait_secs,
-                                "Executing wait task locally"
-                            );
-
-                            // Keep the claimed task fresh so heartbeat stuck-task
-                            // detection does not interrupt legitimate waits.
-                            let mut remaining = wait_secs;
-                            while remaining > 0 {
-                                let step = remaining.min(60);
-                                tokio::time::sleep(Duration::from_secs(step)).await;
-                                remaining = remaining.saturating_sub(step);
-                                if remaining > 0 {
-                                    if let Ok(Some(mut claimed_task)) =
-                                        state.get_task(&task.id).await
+                        if let Some(group) = task.parallel_group.as_ref() {
+                            let grouped = dispatch_batch
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.parallel_group.as_deref() == Some(group.as_str())
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if grouped.len() > 1 {
+                                dispatched_parallel_groups.insert(group.clone());
+                                // Profile caps apply at claim time; this local
+                                // cap also bounds aggregate load across profiles.
+                                for chunk in grouped.chunks(4) {
+                                    let executions = futures::future::join_all(
+                                        chunk.iter().cloned().map(|parallel_task| {
+                                            execute_auto_dispatch_task(
+                                                auto_dispatch_context.clone(),
+                                                parallel_task,
+                                            )
+                                        }),
+                                    )
+                                    .await;
+                                    for (executed_task, execution_result) in
+                                        executions.into_iter().flatten()
                                     {
-                                        claimed_task.started_at =
-                                            Some(chrono::Utc::now().to_rfc3339());
-                                        claimed_task.status = "claimed".to_string();
-                                        let _ = state.update_task(&claimed_task).await;
-                                    }
-                                }
-                            }
-
-                            if let Ok(Some(mut completed_task)) = state.get_task(&task.id).await {
-                                completed_task.status = "completed".to_string();
-                                completed_task.result =
-                                    Some(format!("Waited for {} second(s).", wait_secs));
-                                completed_task.error = None;
-                                completed_task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                                let _ = state.update_task(&completed_task).await;
-                            }
-                            continue;
-                        }
-
-                        // Spawn executor
-                        let exec_result = agent
-                            .spawn_child(
-                                &mission,
-                                &task.description,
-                                None,
-                                dispatch_channel_ctx.clone(),
-                                fallback_user_role,
-                                Some(AgentRole::Executor),
-                                Some(goal_id.as_str()),
-                                Some(task.id.as_str()),
-                                dispatch_project_scope.as_deref(),
-                                None, // arg_specialist (task-lead dispatch — not from LLM tool call)
-                            )
-                            .await;
-
-                        let mut latest_task = state.get_task(&task.id).await.ok().flatten();
-                        match exec_result {
-                            Ok(response) => {
-                                let delivery_text = if !response.trim().is_empty() {
-                                    response.clone()
-                                } else {
-                                    latest_task
-                                        .as_ref()
-                                        .and_then(|task| {
-                                            task.result
-                                                .clone()
-                                                .filter(|result| !result.trim().is_empty())
-                                                .or_else(|| {
-                                                    task.blocker.clone().filter(|blocker| {
-                                                        !blocker.trim().is_empty()
-                                                    })
-                                                })
-                                        })
-                                        .unwrap_or_default()
-                                };
-
-                                if !delivery_text.trim().is_empty() {
-                                    match agent
-                                        .deliver_parent_text_result(
+                                        any_executor_results_sent |= deliver_auto_dispatch_result(
+                                            &agent,
+                                            &state,
                                             hub.as_ref(),
                                             &session_id,
-                                            &delivery_text,
-                                            parent_delivery::ParentDeliveryKind::ExecutorResult,
+                                            &executed_task,
+                                            &execution_result,
                                         )
-                                        .await
-                                    {
-                                        Ok(outcome) => {
-                                            if outcome.sent {
-                                                any_executor_results_sent = true;
-                                            }
-                                        }
-                                        Err(err) => {
-                                            warn!(
-                                                session_id = %session_id,
-                                                error = %err,
-                                                "Failed to record parent-mediated executor result"
-                                            );
-                                        }
+                                        .await;
                                     }
                                 }
+                                continue;
+                            }
+                        }
 
-                                if let Some(ref mut current_task) = latest_task {
-                                    if current_task
-                                        .result
-                                        .as_deref()
-                                        .is_none_or(|result| result.trim().is_empty())
-                                        && !response.trim().is_empty()
-                                    {
-                                        current_task.result = Some(response);
-                                        current_task.completed_at =
-                                            Some(chrono::Utc::now().to_rfc3339());
-                                        if !matches!(
-                                            current_task.status.as_str(),
-                                            "completed" | "blocked" | "failed"
-                                        ) {
-                                            current_task.status = "completed".to_string();
-                                            current_task.blocker = None;
-                                        }
-                                        let _ = state.update_task(current_task).await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(ref mut current_task) = latest_task {
-                                    if !matches!(
-                                        current_task.status.as_str(),
-                                        "completed" | "blocked" | "failed"
-                                    ) {
-                                        current_task.status = "failed".to_string();
-                                        current_task.error = Some(e.to_string());
-                                        current_task.completed_at =
-                                            Some(chrono::Utc::now().to_rfc3339());
-                                        let _ = state.update_task(current_task).await;
-                                    }
-                                } else {
-                                    let mut updated = task.clone();
-                                    updated.status = "failed".to_string();
-                                    updated.error = Some(e.to_string());
-                                    let _ = state.update_task(&updated).await;
-                                }
-                            }
+                        if let Some((executed_task, execution_result)) =
+                            execute_auto_dispatch_task(auto_dispatch_context.clone(), task.clone())
+                                .await
+                        {
+                            any_executor_results_sent |= deliver_auto_dispatch_result(
+                                &agent,
+                                &state,
+                                hub.as_ref(),
+                                &session_id,
+                                &executed_task,
+                                &execution_result,
+                            )
+                            .await;
                         }
                     }
 
@@ -912,10 +1211,8 @@ pub fn spawn_background_task_lead(
             // Mark the trigger task as completed now that the task lead and auto-dispatch
             // have finished. The trigger task was kept in "running" to prevent duplicate
             // dispatch; now finalize it so it doesn't appear stuck.
-            let tasks_before_trigger_finalization = tasks_for_current_run(
-                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                run_started_at.as_deref(),
-            );
+            let tasks_before_trigger_finalization =
+                tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await;
             let completed_work_after = count_successful_completed_work(
                 &tasks_before_trigger_finalization,
                 dispatch_trigger_task_id.as_deref(),
@@ -929,16 +1226,16 @@ pub fn spawn_background_task_lead(
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
                 if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
                     if trigger_task.status == "running" || trigger_task.status == "claimed" {
-                        let mut updated = trigger_task;
-                        let success =
-                            dispatch_trigger_succeeded(result.is_ok(), &trigger_work_tasks);
-                        updated.status = if success {
+                        let success = dispatch_trigger_succeeded(
+                            task_lead_outcome == Some(TaskOutcome::Succeeded),
+                            &trigger_work_tasks,
+                        );
+                        let status = if success {
                             "completed".to_string()
                         } else {
                             "failed".to_string()
                         };
-                        updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        updated.error = if success {
+                        let error = if success {
                             None
                         } else {
                             Some(failed_run_summary(
@@ -950,13 +1247,55 @@ pub fn spawn_background_task_lead(
                                     .as_deref(),
                             ))
                         };
-                        if let Err(e) = state.update_task(&updated).await {
-                            warn!(
-                                task_id = %trigger_task_id,
-                                goal_id = %goal_id,
-                                error = %e,
-                                "Failed to finalize dispatch trigger task"
-                            );
+                        if let Some(attempt) = dispatch_attempt.as_ref() {
+                            let handoff = crate::traits::TaskHandoff {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                task_id: trigger_task_id.clone(),
+                                attempt_id: attempt.id.clone(),
+                                summary: if success {
+                                    "Task-lead run completed.".to_string()
+                                } else {
+                                    error
+                                        .clone()
+                                        .unwrap_or_else(|| "Task-lead run failed.".to_string())
+                                },
+                                artifacts: Vec::new(),
+                                verification: Vec::new(),
+                                remaining_risk: error.clone(),
+                                next_step: (!success)
+                                    .then(|| "Inspect failed or blocked child tasks.".to_string()),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                            };
+                            let patch = crate::traits::TaskAttemptPatch {
+                                status,
+                                error,
+                                handoff: Some(handoff),
+                                ..Default::default()
+                            };
+                            if !state
+                                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                warn!(
+                                    task_id = %trigger_task_id,
+                                    goal_id = %goal_id,
+                                    "Ignored stale task-lead finalization"
+                                );
+                            }
+                        } else {
+                            let mut updated = trigger_task;
+                            updated.status = status;
+                            updated.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            updated.error = error;
+                            if let Err(e) = state.update_task(&updated).await {
+                                warn!(
+                                    task_id = %trigger_task_id,
+                                    goal_id = %goal_id,
+                                    error = %e,
+                                    "Failed to finalize dispatch trigger task"
+                                );
+                            }
                         }
                     }
                 }
@@ -981,10 +1320,12 @@ pub fn spawn_background_task_lead(
                 // Use progress-based circuit breaker: compare completed task count
                 // before vs after to detect whether the dispatch made progress.
                 let tasks = work_tasks_for_current_run(
-                    state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                    run_started_at.as_deref(),
+                    &state,
+                    &goal_id,
+                    goal_run_id.as_deref(),
                     dispatch_trigger_task_id.as_deref(),
-                );
+                )
+                .await;
                 let completed_after = tasks
                     .iter()
                     .filter(|task| task.completed_successfully())
@@ -1033,6 +1374,7 @@ pub fn spawn_background_task_lead(
                         updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
                     }
                     updated_goal.dispatch_failures = 0;
+                    clear_partial_success_context(&mut updated_goal);
                 } else if scheduled_run_budget_exhausted {
                     updated_goal.dispatch_failures = 0;
                     info!(
@@ -1070,9 +1412,9 @@ pub fn spawn_background_task_lead(
                         "Finite goal failed: no tasks completed after dispatch"
                     );
                 } else if is_finite {
-                    // Finite goal with some tasks completed but others remain.
-                    // Since finite goals have no re-dispatch, mark as completed
-                    // (partial success) rather than leaving it stuck.
+                    // Finite goals are all-or-nothing at the goal boundary.
+                    // Preserve useful partial work in context, but never turn it
+                    // into a successful terminal state while required tasks remain.
                     let completed_count =
                         tasks.iter().filter(|t| t.completed_successfully()).count();
                     let failed_count = tasks.iter().filter(|t| t.status == "failed").count();
@@ -1081,27 +1423,24 @@ pub fn spawn_background_task_lead(
                         .iter()
                         .filter(|t| !t.satisfies_run_completion())
                         .count();
-                    updated_goal.status = "completed".to_string();
+                    updated_goal.status = "failed".to_string();
                     updated_goal.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
-                    // Store completion summary in context for notification enrichment
-                    if failed_count > 0 || blocked_count > 0 {
-                        let summary = serde_json::json!({
-                            "partial_success": true,
-                            "completed": completed_count,
-                            "failed": failed_count,
-                            "blocked": blocked_count,
-                            "total": tasks.len(),
-                        });
-                        updated_goal.context = Some(summary.to_string());
-                    }
+                    let summary = serde_json::json!({
+                        "partial_success": completed_count > 0,
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "blocked": blocked_count,
+                        "total": tasks.len(),
+                    });
+                    updated_goal.context = Some(summary.to_string());
                     info!(
                         goal_id = %goal_id,
                         completed_count,
                         failed_count,
                         blocked_count,
                         remaining,
-                        "Finite goal partially completed after dispatch"
+                        "Finite goal failed with partial work preserved"
                     );
                 } else {
                     // Continuous goal: evaluate progress made by this dispatch,
@@ -1181,15 +1520,12 @@ pub fn spawn_background_task_lead(
                 if updated_goal.status == "stalled" || updated_goal.status == "failed" {
                     let mut cancelled = 0;
                     for task in &tasks {
-                        if task.status == "pending" || task.status == "claimed" {
-                            let mut t = task.clone();
-                            t.status = "completed".to_string();
-                            t.error = Some(
-                                "Cancelled: goal stalled (no progress after 3 dispatch cycles)"
-                                    .to_string(),
-                            );
-                            t.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                            let _ = state.update_task(&t).await;
+                        if (task.status == "pending" || task.status == "claimed")
+                            && state
+                                .cancel_work_task(&task.id, "task-lead", None)
+                                .await
+                                .unwrap_or(false)
+                        {
                             cancelled += 1;
                         }
                     }
@@ -1209,10 +1545,12 @@ pub fn spawn_background_task_lead(
                 .map(|g| g.status.as_str())
                 .unwrap_or("unknown");
             let final_run_tasks = work_tasks_for_current_run(
-                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                run_started_at.as_deref(),
+                &state,
+                &goal_id,
+                goal_run_id.as_deref(),
                 dispatch_trigger_task_id.as_deref(),
-            );
+            )
+            .await;
             let trigger_status = if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref()
             {
                 state
@@ -1224,6 +1562,43 @@ pub fn spawn_background_task_lead(
             } else {
                 None
             };
+            if let Some(run_id) = goal_run_id.as_deref() {
+                let run_status = if final_run_tasks.iter().any(|task| task.status == "blocked") {
+                    Some("blocked")
+                } else if matches!(status, "failed" | "stalled" | "cancelled")
+                    || trigger_status.as_deref() == Some("failed")
+                    || final_run_tasks.iter().any(|task| {
+                        matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
+                    })
+                {
+                    Some("failed")
+                } else if status == "completed" || trigger_status.as_deref() == Some("completed") {
+                    Some("completed")
+                } else {
+                    None
+                };
+                if let Some(run_status) = run_status {
+                    let summary = build_goal_task_results_summary(
+                        &final_run_tasks,
+                        if run_status == "completed" {
+                            "Run completed."
+                        } else {
+                            "Run needs attention."
+                        },
+                    );
+                    if let Err(error) = state
+                        .finish_goal_run(run_id, run_status, Some(&summary))
+                        .await
+                    {
+                        warn!(
+                            goal_id = %goal_id,
+                            run_id,
+                            %error,
+                            "Failed to finalize durable goal run"
+                        );
+                    }
+                }
+            }
 
             // A recurring goal stays active after each cycle, but an individual
             // cycle can still complete or fail. Surface that terminal run outcome instead
@@ -1270,7 +1645,18 @@ pub fn spawn_background_task_lead(
                         &msg,
                     );
                     let notification_id = entry.id.clone();
-                    let _ = state.enqueue_notification(&entry).await;
+                    let queued = match state.enqueue_notification(&entry).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(
+                                goal_id = %goal_id,
+                                notification_id = %notification_id,
+                                %error,
+                                "Failed to queue recurring-run terminal notification"
+                            );
+                            false
+                        }
+                    };
                     match agent
                         .deliver_parent_text_result(
                             hub.as_ref(),
@@ -1281,7 +1667,9 @@ pub fn spawn_background_task_lead(
                         .await
                     {
                         Ok(outcome) if outcome.sent => {
-                            let _ = state.mark_notification_delivered(&notification_id).await;
+                            if queued {
+                                let _ = state.mark_notification_delivered(&notification_id).await;
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -1349,147 +1737,219 @@ pub fn spawn_background_task_lead(
                     .map(|g| g.goal_type == "finite")
                     .unwrap_or(false)
             {
-                // Salvage path: if the task lead already produced a substantive,
-                // finished answer, surface it instead of discarding the work and
-                // re-running a fresh, context-free direct fallback (which wastes
-                // tokens and — as observed — can lose a perfectly good result).
-                if let Some(salvaged) = salvageable_task_lead_result(task_lead_response.as_deref())
-                {
-                    let _ = state.mark_goal_notified(&goal_id).await;
-                    if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                        g.status = "completed".to_string();
-                        g.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                        g.updated_at = chrono::Utc::now().to_rfc3339();
-                        let _ = state.update_goal(&g).await;
+                info!(goal_id = %goal_id, "Finite goal failed — attempting durable direct recovery");
+
+                // Prevent the heartbeat from racing a duplicate terminal notice
+                // while a separately tracked recovery run is active.
+                let _ = state.mark_goal_notified(&goal_id).await;
+                if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                    g.status = "active".to_string();
+                    g.completed_at = None;
+                    g.notified_at = None;
+                    g.updated_at = chrono::Utc::now().to_rfc3339();
+                    let _ = state.update_goal(&g).await;
+                }
+
+                if let Some(hub_weak) = &hub {
+                    if let Some(hub_arc) = hub_weak.upgrade() {
+                        let _ = hub_arc
+                            .send_text(
+                                &session_id,
+                                "The planned run did not complete. I am retrying it as a directly tracked recovery task...",
+                            )
+                            .await;
                     }
-                    info!(
-                        goal_id = %goal_id,
-                        "Salvaged substantive task-lead result for failed/stalled finite goal"
-                    );
-                    if let Some(ref registry) = goal_token_registry {
-                        registry.remove(&goal_id).await;
-                    }
-                    (
-                        "completed",
-                        format!(
-                            "Goal completed: {}",
-                            truncate_goal_result_text(&salvaged, 4000)
-                        ),
-                    )
+                }
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let recovery_task_id = uuid::Uuid::new_v4().to_string();
+                let recovery_task = crate::traits::Task {
+                    id: recovery_task_id.clone(),
+                    goal_id: goal_id.clone(),
+                    description: format!("Directly recover and finish: {user_text}"),
+                    status: "pending".to_string(),
+                    priority: "high".to_string(),
+                    task_order: final_run_tasks
+                        .iter()
+                        .map(|task| task.task_order)
+                        .max()
+                        .unwrap_or(0)
+                        + 1,
+                    parallel_group: None,
+                    depends_on: None,
+                    agent_id: None,
+                    context: Some(
+                        serde_json::json!({
+                            "recovery_for_run": goal_run_id.as_deref(),
+                            "terminal_recovery": true,
+                            "prior_report": task_lead_response.as_deref().map(|report| {
+                                report.chars().take(2000).collect::<String>()
+                            }),
+                        })
+                        .to_string(),
+                    ),
+                    result: None,
+                    error: None,
+                    blocker: None,
+                    idempotent: false,
+                    retry_count: 0,
+                    max_retries: 1,
+                    created_at: now,
+                    started_at: None,
+                    completed_at: None,
+                };
+                let recovery_created = state.create_task(&recovery_task).await;
+                let recovery_run_id = if recovery_created.is_ok() {
+                    state
+                        .get_current_goal_run(&goal_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|run| run.id)
                 } else {
-                    info!(goal_id = %goal_id, "Finite goal failed — attempting direct fallback");
-
-                    // Mark as notified immediately to prevent the heartbeat from
-                    // sending a duplicate "Goal failed" notification while the
-                    // fallback is in progress.
-                    let _ = state.mark_goal_notified(&goal_id).await;
-
-                    // Notify user we're retrying with a different approach
-                    if let Some(hub_weak) = &hub {
-                        if let Some(hub_arc) = hub_weak.upgrade() {
-                            let _ = hub_arc
-                        .send_text(
-                            &session_id,
-                            "The task planner couldn't complete this. Let me try handling it directly...",
-                        )
-                        .await;
-                        }
+                    None
+                };
+                let recovery_ledger = render_recovery_task_ledger(&final_run_tasks);
+                let prior_report = task_lead_response
+                    .as_deref()
+                    .map(|report| report.chars().take(3000).collect::<String>())
+                    .unwrap_or_else(|| "No usable prior summary was returned.".to_string());
+                let recovery_prompt = format!(
+                    "{user_text}\n\nRecover the whole mission, using the durable task ledger below as authoritative evidence. Preserve successful work and never repeat a completed external side effect. If the requested artifact, deployment, and verification are already proven by the ledger, report the mission complete without demanding a second verification surface. Only execute work that is genuinely unmet.\n\nExisting task ledger:\n{recovery_ledger}\n\nPrevious task-lead report:\n{prior_report}"
+                );
+                let fallback_result = match recovery_created {
+                    Ok(()) => {
+                        agent
+                            .spawn_child_with_outcome(
+                                &user_text,
+                                &recovery_prompt,
+                                None,
+                                fallback_channel_ctx,
+                                fallback_user_role,
+                                Some(AgentRole::Executor),
+                                Some(&goal_id),
+                                Some(&recovery_task_id),
+                                dispatch_project_scope.as_deref(),
+                                Some("executor"),
+                                Some(&session_id),
+                            )
+                            .await
                     }
+                    Err(error) => Err(error),
+                };
 
-                    // Spawn a direct executor to handle the original request
-                    // without goal/task decomposition
-                    let fallback_result = agent
-                        .spawn_child(
-                            &user_text,
-                            &user_text,
-                            None,
-                            fallback_channel_ctx,
-                            fallback_user_role,
-                            None, // no specific role — gets full tool access
-                            None, // no goal_id — prevents goal re-entry
-                            None,
-                            None,
-                            None, // arg_specialist (direct executor fallback — no LLM tool selection)
-                        )
-                        .await;
-
-                    match fallback_result {
-                        Ok(response)
-                            if !response.trim().is_empty()
-                                && !goal_completion_response_indicates_incomplete_work(
-                                    &response,
-                                ) =>
-                        {
-                            // Direct handling succeeded — update goal to completed
+                match fallback_result {
+                    Ok(run) => {
+                        let persisted = state.get_task(&recovery_task_id).await.ok().flatten();
+                        let structurally_succeeded =
+                            recovery_task_succeeded(run.outcome, persisted.as_ref());
+                        if structurally_succeeded {
+                            for prior in &final_run_tasks {
+                                if prior.satisfies_run_completion() {
+                                    continue;
+                                }
+                                let mut superseded = prior.clone();
+                                superseded.status = "superseded".to_string();
+                                superseded.error = None;
+                                superseded.blocker = None;
+                                superseded.result = Some(format!(
+                                    "Replaced by successful recovery task {recovery_task_id}."
+                                ));
+                                superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                let _ = state.update_task(&superseded).await;
+                            }
                             if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
                                 g.status = "completed".to_string();
                                 g.completed_at = Some(chrono::Utc::now().to_rfc3339());
                                 g.updated_at = chrono::Utc::now().to_rfc3339();
+                                clear_partial_success_context(&mut g);
                                 let _ = state.update_goal(&g).await;
                             }
-                            info!(goal_id = %goal_id, "Direct fallback succeeded");
+                            if let Some(run_id) = recovery_run_id.as_deref() {
+                                let _ = state
+                                    .finish_goal_run(run_id, "completed", Some(&run.response))
+                                    .await;
+                            }
+                            info!(goal_id = %goal_id, task_id = %recovery_task_id, "Direct recovery succeeded");
                             (
                                 "completed",
                                 format!(
                                     "Goal completed: {}",
-                                    truncate_goal_result_text(&response, 4000)
+                                    truncate_goal_result_text(&run.response, 4000)
                                 ),
                             )
-                        }
-                        Ok(response) if !response.trim().is_empty() => {
-                            info!(
-                                goal_id = %goal_id,
-                                "Direct fallback returned an incomplete/unverified response"
-                            );
+                        } else {
+                            if let Some(run_id) = recovery_run_id.as_deref() {
+                                let _ = state
+                                    .finish_goal_run(
+                                        run_id,
+                                        "failed",
+                                        Some("Recovery task did not produce a successful structured outcome."),
+                                    )
+                                    .await;
+                            }
+                            if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                                g.status = "failed".to_string();
+                                g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                g.updated_at = chrono::Utc::now().to_rfc3339();
+                                let _ = state.update_goal(&g).await;
+                            }
+                            info!(goal_id = %goal_id, task_id = %recovery_task_id, outcome = ?run.outcome, "Direct recovery remained incomplete");
                             (
                                 "failed",
                                 format!(
-                            "I made some progress, but I couldn't verify the final outcome:\n\n{}",
-                            truncate_goal_result_text(&response, 3500)
-                        ),
+                                    "The recovery task did not complete every required outcome:\n\n{}",
+                                    truncate_goal_result_text(&run.response, 3500)
+                                ),
                             )
                         }
-                        _ => {
-                            // Direct handling also failed — give detailed info
-                            let tasks = work_tasks_for_current_run(
-                                state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                                run_started_at.as_deref(),
-                                dispatch_trigger_task_id.as_deref(),
-                            );
-                            let task_summary: String = tasks
-                                .iter()
-                                .take(5)
-                                .map(|t| {
-                                    let err = t.error.as_deref().unwrap_or("no details");
-                                    format!("• {} ({})", t.description, err)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            info!(goal_id = %goal_id, "Direct fallback also failed");
-                            (
-                        "failed",
-                        format!(
-                            "I wasn't able to complete your request. Here's what I tried:\n{}\n\nYou could try rephrasing or breaking it into smaller steps.",
-                            if task_summary.is_empty() {
-                                "(no task details available)".to_string()
-                            } else {
-                                task_summary
-                            }
-                        ),
-                    )
+                    }
+                    Err(error) => {
+                        if let Some(run_id) = recovery_run_id.as_deref() {
+                            let _ = state
+                                .finish_goal_run(run_id, "failed", Some(&error.to_string()))
+                                .await;
                         }
+                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                            g.status = "failed".to_string();
+                            g.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                            g.updated_at = chrono::Utc::now().to_rfc3339();
+                            let _ = state.update_goal(&g).await;
+                        }
+                        let task_summary =
+                            failed_run_summary(&final_run_tasks, Some(&error.to_string()));
+                        info!(goal_id = %goal_id, task_id = %recovery_task_id, %error, "Direct recovery failed");
+                        (
+                            "failed",
+                            format!("I was not able to complete the request:\n\n{task_summary}"),
+                        )
                     }
                 }
             } else {
                 let completed_tasks = work_tasks_for_current_run(
-                    state.get_tasks_for_goal(&goal_id).await.unwrap_or_default(),
-                    run_started_at.as_deref(),
+                    &state,
+                    &goal_id,
+                    goal_run_id.as_deref(),
                     dispatch_trigger_task_id.as_deref(),
-                );
+                )
+                .await;
                 let task_lead_error = result.as_ref().err().map(|e| e.to_string());
                 match status {
                     "completed" => {
-                        if any_executor_results_sent {
+                        if !crate::tools::manage_goal_tasks::tasks_satisfy_goal_completion(
+                            &completed_tasks,
+                        ) {
+                            (
+                                "failed",
+                                format!(
+                                    "Goal state was inconsistent with its required tasks:\n\n{}",
+                                    failed_run_summary(
+                                        &completed_tasks,
+                                        task_lead_error.as_deref()
+                                    )
+                                ),
+                            )
+                        } else if any_executor_results_sent {
                             // Executor results were already sent inline — don't repeat them.
                             // Send a brief completion signal instead.
                             let desc_preview: String = final_goal
@@ -1533,7 +1993,7 @@ pub fn spawn_background_task_lead(
                                 let total =
                                     summary.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                                 (
-                                "completed",
+                                "failed",
                                 format!(
                                     "Goal partially completed ({}/{} tasks succeeded, {} failed, {} blocked):\n\n{}",
                                     completed,
@@ -1596,58 +2056,92 @@ pub fn spawn_background_task_lead(
                 &msg,
             );
             let notification_id = entry.id.clone();
-            let _ = state.enqueue_notification(&entry).await;
+            match state.enqueue_goal_notification(&entry).await {
+                Ok(true) => {
+                    // Attempt immediate delivery — if it fails, heartbeat will retry from queue.
+                    match agent
+                        .deliver_parent_text_result(
+                            hub.as_ref(),
+                            &session_id,
+                            &msg,
+                            parent_delivery::ParentDeliveryKind::GoalNotification,
+                        )
+                        .await
+                    {
+                        Ok(outcome) if outcome.sent => {
+                            let _ = state.mark_notification_delivered(&notification_id).await;
 
-            // Mark goal as notified so heartbeat doesn't double-enqueue
-            let _ = state.mark_goal_notified(&goal_id).await;
-
-            // Attempt immediate delivery — if it fails, heartbeat will retry from queue.
-            match agent
-                .deliver_parent_text_result(
-                    hub.as_ref(),
-                    &session_id,
-                    &msg,
-                    parent_delivery::ParentDeliveryKind::GoalNotification,
-                )
-                .await
-            {
-                Ok(outcome) if outcome.sent => {
-                    let _ = state.mark_notification_delivered(&notification_id).await;
-
-                    // Auto-send any files referenced in the completion message
-                    let file_paths = extract_file_paths_from_text(&msg);
-                    if let Some(hub_weak) = &hub {
-                        if let Some(hub_arc) = hub_weak.upgrade() {
-                            for path in file_paths {
-                                let filename = std::path::Path::new(&path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "file".to_string());
-                                let media = crate::types::MediaMessage {
-                                    session_id: session_id.clone(),
-                                    caption: filename.clone(),
-                                    kind: crate::types::MediaKind::Document {
-                                        file_path: path.clone(),
-                                        filename,
-                                    },
-                                    // Fire-and-forget: no delivery receipt awaited.
-                                    result_tx: None,
-                                };
-                                if let Err(e) = hub_arc.send_media(&session_id, &media).await {
-                                    warn!("Failed to auto-send goal file {}: {}", path, e);
+                            // Auto-send any files referenced in the completion message
+                            let file_paths = extract_file_paths_from_text(&msg);
+                            if let Some(hub_weak) = &hub {
+                                if let Some(hub_arc) = hub_weak.upgrade() {
+                                    for path in file_paths {
+                                        let filename = std::path::Path::new(&path)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "file".to_string());
+                                        let media = crate::types::MediaMessage {
+                                            session_id: session_id.clone(),
+                                            caption: filename.clone(),
+                                            kind: crate::types::MediaKind::Document {
+                                                file_path: path.clone(),
+                                                filename,
+                                            },
+                                            // Fire-and-forget: no delivery receipt awaited.
+                                            result_tx: None,
+                                        };
+                                        if let Err(e) =
+                                            hub_arc.send_media(&session_id, &media).await
+                                        {
+                                            warn!("Failed to auto-send goal file {}: {}", path, e);
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(
+                                session_id = %session_id,
+                                notification_id = %notification_id,
+                                error = %err,
+                                "Failed to record parent-mediated goal notification"
+                            );
+                        }
                     }
                 }
-                Ok(_) => {}
+                Ok(false) => {
+                    info!(
+                        goal_id = %goal_id,
+                        "Terminal notification was already claimed by another worker"
+                    );
+                }
                 Err(err) => {
                     warn!(
-                        session_id = %session_id,
-                        notification_id = %notification_id,
+                        goal_id = %goal_id,
                         error = %err,
-                        "Failed to record parent-mediated goal notification"
+                        "Failed to atomically enqueue terminal notification; attempting direct delivery"
                     );
+                    match agent
+                        .deliver_parent_text_result(
+                            hub.as_ref(),
+                            &session_id,
+                            &msg,
+                            parent_delivery::ParentDeliveryKind::GoalNotification,
+                        )
+                        .await
+                    {
+                        Ok(outcome) if outcome.sent => {}
+                        Ok(_) => warn!(
+                            goal_id = %goal_id,
+                            "Direct terminal-notification fallback had no delivery route"
+                        ),
+                        Err(delivery_error) => warn!(
+                            goal_id = %goal_id,
+                            %delivery_error,
+                            "Direct terminal-notification fallback also failed"
+                        ),
+                    }
                 }
             }
 
@@ -1801,6 +2295,88 @@ mod tests {
         assert!(dispatch_trigger_succeeded(true, &[]));
         assert!(!dispatch_trigger_succeeded(false, &[]));
         assert!(failed_run_summary(&[failed], None).contains("109976 / 100000"));
+    }
+
+    #[test]
+    fn direct_recovery_requires_structured_and_persisted_success() {
+        let mut task = crate::traits::Task {
+            id: "recovery-1".to_string(),
+            goal_id: "goal-1".to_string(),
+            description: "Finish every unmet requirement".to_string(),
+            status: "completed".to_string(),
+            priority: "high".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some("Verified final result".to_string()),
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+
+        assert!(recovery_task_succeeded(TaskOutcome::Succeeded, Some(&task)));
+        assert!(!recovery_task_succeeded(TaskOutcome::Partial, Some(&task)));
+        assert!(!recovery_task_succeeded(TaskOutcome::Succeeded, None));
+
+        task.status = "failed".to_string();
+        task.error = Some("Build failed".to_string());
+        assert!(!recovery_task_succeeded(
+            TaskOutcome::Succeeded,
+            Some(&task)
+        ));
+    }
+
+    #[test]
+    fn recovery_ledger_preserves_success_and_failure_evidence() {
+        let task = |id: &str, status: &str, result: Option<&str>, error: Option<&str>| {
+            crate::traits::Task {
+                id: id.to_string(),
+                goal_id: "goal-1".to_string(),
+                description: format!("Step {id}"),
+                status: status.to_string(),
+                priority: "medium".to_string(),
+                task_order: 0,
+                parallel_group: None,
+                depends_on: None,
+                agent_id: None,
+                context: None,
+                result: result.map(str::to_string),
+                error: error.map(str::to_string),
+                blocker: None,
+                idempotent: true,
+                retry_count: 0,
+                max_retries: 1,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                started_at: None,
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            }
+        };
+        let ledger = render_recovery_task_ledger(&[
+            task(
+                "deploy",
+                "completed",
+                Some("Published https://example.workers.dev"),
+                None,
+            ),
+            task(
+                "research",
+                "failed",
+                Some("Direction was incorporated by implementation."),
+                Some("Late database lock"),
+            ),
+        ]);
+
+        assert!(ledger.contains("[completed] Step deploy"));
+        assert!(ledger.contains("https://example.workers.dev"));
+        assert!(ledger.contains("[failed] Step research"));
+        assert!(ledger.contains("Late database lock"));
     }
 
     #[test]

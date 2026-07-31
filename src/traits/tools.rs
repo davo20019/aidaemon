@@ -111,6 +111,85 @@ pub enum ToolCallEffect {
     ObservationAndMutation,
 }
 
+/// Typed mutation effects for one tool call.
+///
+/// `ToolCallEffect` deliberately remains the compact observation/mutation
+/// summary used by older persisted events. This set carries the detail needed
+/// by policy and completion accounting so an incidental build-cache write does
+/// not satisfy a requested source edit, and a local write does not satisfy a
+/// requested remote deployment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(transparent)]
+pub struct ToolMutationEffects(u32);
+
+impl ToolMutationEffects {
+    pub const NONE: Self = Self(0);
+    /// A write to user-authored files through a path-aware editing tool.
+    pub const LOCAL_SOURCE_WRITE: Self = Self(1 << 0);
+    /// A local write whose target is not typed precisely (shell redirect,
+    /// copy, generated file, and similar workspace activity).
+    pub const LOCAL_WORKSPACE_WRITE: Self = Self(1 << 1);
+    /// Compiler caches, dependency directories, and other reproducible output.
+    pub const LOCAL_DERIVED_WRITE: Self = Self(1 << 2);
+    /// Git refs, index state, commits, and related repository metadata.
+    pub const REPOSITORY_WRITE: Self = Self(1 << 3);
+    /// A remote state change that is not specifically a deployment.
+    pub const REMOTE_MUTATION: Self = Self(1 << 4);
+    /// Publishing a new application/site deployment or version.
+    pub const REMOTE_DEPLOY: Self = Self(1 << 5);
+    /// Sending, posting, uploading, or otherwise delivering content.
+    pub const EXTERNAL_DELIVERY: Self = Self(1 << 6);
+    /// Starting, stopping, restarting, or killing a process/service.
+    pub const PROCESS_STATE: Self = Self(1 << 7);
+    /// Mutating configuration, permissions, packages, or runtime setup.
+    pub const CONFIGURATION: Self = Self(1 << 8);
+    /// Deletion or another intentionally destructive local/remote operation.
+    pub const DESTRUCTIVE: Self = Self(1 << 9);
+    /// A command can mutate, but static inspection cannot state how. This is
+    /// intentionally not allowed to satisfy a more specific required outcome.
+    pub const UNSPECIFIED: Self = Self(1 << 10);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    pub const fn has_specific_effects(self) -> bool {
+        (self.0 & !Self::UNSPECIFIED.0) != 0
+    }
+
+    /// Whether observed effects fulfill every typed requirement.
+    ///
+    /// Known effects are checked strictly: cache output, repository metadata,
+    /// and directory scaffolding cannot masquerade as authored source. Opaque
+    /// execution surfaces remain compatible by reporting `UNSPECIFIED`; a
+    /// successful opaque mutation can have performed any required effect, so
+    /// downstream verification must decide whether its result is credible.
+    pub const fn satisfies(self, required: Self) -> bool {
+        if required.is_empty() {
+            return true;
+        }
+        if self.intersects(Self::UNSPECIFIED) {
+            return true;
+        }
+        let generic_required = required.intersects(Self::UNSPECIFIED);
+        let generic_satisfied = !generic_required || !self.is_empty();
+        let specific_required = Self(required.0 & !Self::UNSPECIFIED.0);
+        generic_satisfied && self.contains(specific_required)
+    }
+}
+
 impl ToolCallEffect {
     pub fn observes_state(self) -> bool {
         matches!(self, Self::Observation | Self::ObservationAndMutation)
@@ -204,6 +283,10 @@ pub struct ToolCallSemantics {
     pub effect: ToolCallEffect,
     #[serde(default)]
     pub verification_mode: ToolVerificationMode,
+    /// Fine-grained mutation effects. Older persisted rows omit this field and
+    /// continue to deserialize through the default empty set.
+    #[serde(default, skip_serializing_if = "ToolMutationEffects::is_empty")]
+    pub mutation_effects: ToolMutationEffects,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_hints: Vec<ToolTargetHint>,
 }
@@ -226,6 +309,7 @@ impl ToolCallSemantics {
     pub fn mutation() -> Self {
         Self {
             effect: ToolCallEffect::Mutation,
+            mutation_effects: ToolMutationEffects::UNSPECIFIED,
             ..Self::default()
         }
     }
@@ -233,6 +317,31 @@ impl ToolCallSemantics {
     pub fn observation_and_mutation() -> Self {
         Self {
             effect: ToolCallEffect::ObservationAndMutation,
+            mutation_effects: ToolMutationEffects::UNSPECIFIED,
+            ..Self::default()
+        }
+    }
+
+    pub fn mutation_with(mutation_effects: ToolMutationEffects) -> Self {
+        Self {
+            effect: ToolCallEffect::Mutation,
+            mutation_effects: if mutation_effects.is_empty() {
+                ToolMutationEffects::UNSPECIFIED
+            } else {
+                mutation_effects
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn observation_and_mutation_with(mutation_effects: ToolMutationEffects) -> Self {
+        Self {
+            effect: ToolCallEffect::ObservationAndMutation,
+            mutation_effects: if mutation_effects.is_empty() {
+                ToolMutationEffects::UNSPECIFIED
+            } else {
+                mutation_effects
+            },
             ..Self::default()
         }
     }
@@ -254,7 +363,7 @@ impl ToolCallSemantics {
     }
 
     pub fn mutates_state(&self) -> bool {
-        self.effect.mutates_state()
+        self.effect.mutates_state() || !self.mutation_effects.is_empty()
     }
 
     pub fn can_verify_with_result_content(&self) -> bool {
@@ -264,6 +373,7 @@ impl ToolCallSemantics {
     pub fn is_empty(&self) -> bool {
         self.effect == ToolCallEffect::Unknown
             && self.verification_mode == ToolVerificationMode::None
+            && self.mutation_effects.is_empty()
             && self.target_hints.is_empty()
     }
 
@@ -273,6 +383,9 @@ impl ToolCallSemantics {
         }
         if self.verification_mode == ToolVerificationMode::None {
             self.verification_mode = fallback.verification_mode;
+        }
+        if self.mutation_effects.is_empty() {
+            self.mutation_effects = fallback.mutation_effects;
         }
         if self.target_hints.is_empty() {
             self.target_hints = fallback.target_hints;

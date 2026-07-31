@@ -1255,7 +1255,10 @@ pub fn compile_step_execution_plan(
         .or_else(|| allowed_targets.first().map(|target| target.value.as_str()))
         .unwrap_or("the requested target");
 
-    let approval_requirement = if capabilities.needs_approval || capabilities.high_impact_write {
+    let call_is_pure_observation = semantics.observes_state() && !semantics.mutates_state();
+    let approval_requirement = if !call_is_pure_observation
+        && (capabilities.needs_approval || capabilities.high_impact_write)
+    {
         ApprovalRequirement::Required {
             reason: format!("{} is approval-gated or high impact", tool_name),
         }
@@ -1263,8 +1266,10 @@ pub fn compile_step_execution_plan(
         ApprovalRequirement::NotNeeded
     };
 
-    let needs_idempotency =
-        semantics.mutates_state() || capabilities.external_side_effect || !capabilities.idempotent;
+    let needs_idempotency = !call_is_pure_observation
+        && (semantics.mutates_state()
+            || capabilities.external_side_effect
+            || !capabilities.idempotent);
 
     StepExecutionPlan {
         step_id: format!("step-{iteration}-{tool_call_id}"),

@@ -321,14 +321,11 @@ impl ConfigManagerTool {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 tracing::warn!(description, "Approval response channel closed");
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!("Approval response channel closed"))
             }
             Err(_) => {
-                tracing::warn!(
-                    description,
-                    "Approval request timed out (300s), auto-denying"
-                );
-                Ok(ApprovalResponse::Deny)
+                tracing::warn!(description, "Approval request timed out (300s)");
+                Err(anyhow::anyhow!("Approval request timed out after 300s"))
             }
         }
     }

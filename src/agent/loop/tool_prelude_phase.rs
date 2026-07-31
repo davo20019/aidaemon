@@ -225,13 +225,150 @@ fn user_visible_side_effect_guard_blocks_tool(tool_name: &str, is_side_effecting
     is_side_effecting && tool_name != "spawn_agent"
 }
 
-fn negative_contract_blocks_tool(
+fn scoped_action_matches_tool_call(action: ForbiddenMutationAction, tc: &ToolCall) -> bool {
+    let normalized_name = tc.name.replace(['_', '-'], " ").to_ascii_lowercase();
+    let command = if matches!(tc.name.as_str(), "terminal" | "run_command") {
+        serde_json::from_str::<Value>(&tc.arguments)
+            .ok()
+            .and_then(|args| {
+                ["command", "cmd", "script"]
+                    .iter()
+                    .find_map(|key| args.get(*key).and_then(Value::as_str).map(str::to_string))
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let delegated_instructions = if matches!(tc.name.as_str(), "spawn_agent" | "cli_agent") {
+        serde_json::from_str::<Value>(&tc.arguments)
+            .ok()
+            .and_then(|args| args.as_object().cloned())
+            .map(|args| {
+                [
+                    "mission",
+                    "task",
+                    "prompt",
+                    "command",
+                    "description",
+                    "system_instruction",
+                ]
+                .iter()
+                .filter_map(|key| args.get(*key).and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+            })
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+
+    let name_has = |keyword: &str| contains_keyword_as_words(&normalized_name, keyword);
+    let command_effects = if command.is_empty() {
+        crate::traits::ToolMutationEffects::NONE
+    } else {
+        crate::tools::command_semantics::classify_shell_command(&command).mutation_effects
+    };
+    let delegated_requests = |keyword: &str| {
+        let text = delegated_instructions.trim();
+        if text.is_empty()
+            || [
+                format!("do not {keyword}"),
+                format!("don't {keyword}"),
+                format!("without {keyword}"),
+                format!("how to {keyword}"),
+                format!("whether to {keyword}"),
+            ]
+            .iter()
+            .any(|phrase| contains_keyword_as_words(text, phrase))
+        {
+            return false;
+        }
+        text.lines()
+            .any(|line| line.trim_start().starts_with(&format!("{keyword} ")))
+            || [
+                format!(" and {keyword}"),
+                format!(" then {keyword}"),
+                format!(" to {keyword}"),
+                format!(" please {keyword}"),
+                format!(" must {keyword}"),
+            ]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+    };
+
+    match action {
+        ForbiddenMutationAction::Create => {
+            matches!(tc.name.as_str(), "write_file")
+                || name_has("create")
+                || command_effects.intersects(
+                    crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE
+                        .union(crate::traits::ToolMutationEffects::LOCAL_WORKSPACE_WRITE),
+                )
+                || ["create", "write", "build", "make", "generate"]
+                    .iter()
+                    .any(|keyword| delegated_requests(keyword))
+        }
+        ForbiddenMutationAction::Delete => {
+            name_has("delete")
+                || name_has("remove")
+                || command_effects.intersects(crate::traits::ToolMutationEffects::DESTRUCTIVE)
+                || ["delete", "remove"]
+                    .iter()
+                    .any(|keyword| delegated_requests(keyword))
+        }
+        ForbiddenMutationAction::Deploy => {
+            name_has("deploy")
+                || command_effects.intersects(crate::traits::ToolMutationEffects::REMOTE_DEPLOY)
+                || delegated_requests("deploy")
+        }
+        ForbiddenMutationAction::Publish => {
+            name_has("publish")
+                || command_effects.intersects(
+                    crate::traits::ToolMutationEffects::REMOTE_DEPLOY
+                        .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
+                        .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
+                )
+                || delegated_requests("publish")
+        }
+        ForbiddenMutationAction::Post => {
+            name_has("post")
+                || command_effects.intersects(
+                    crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY
+                        .union(crate::traits::ToolMutationEffects::REMOTE_MUTATION),
+                )
+                || delegated_requests("post")
+        }
+        ForbiddenMutationAction::Send => {
+            name_has("send")
+                || command_effects.intersects(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
+                || delegated_requests("send")
+        }
+    }
+}
+
+fn negative_contract_block_reason(
     contract: &CompletionContract,
-    tool_name: &str,
+    tool_call: &ToolCall,
     is_side_effecting: bool,
-) -> bool {
-    contract.forbids_mutation
-        && user_visible_side_effect_guard_blocks_tool(tool_name, is_side_effecting)
+) -> Option<String> {
+    if contract.forbids_mutation {
+        if is_side_effecting || matches!(tool_call.name.as_str(), "spawn_agent" | "cli_agent") {
+            return Some("all mutation".to_string());
+        }
+        return None;
+    }
+    if !user_visible_side_effect_guard_blocks_tool(&tool_call.name, is_side_effecting)
+        && !matches!(tool_call.name.as_str(), "spawn_agent" | "cli_agent")
+    {
+        return None;
+    }
+    contract
+        .forbidden_mutation_actions
+        .iter()
+        .copied()
+        .find(|action| scoped_action_matches_tool_call(*action, tool_call))
+        .map(|action| action.as_str().to_string())
 }
 
 fn first_plain_text_blocked_tool_call<'a>(
@@ -461,7 +598,7 @@ fn plain_text_redirect_exempts_lookup(
     if PURE_READ_TOOLS.contains(&tool_name) {
         return true;
     }
-    if tool_name != "terminal" {
+    if !matches!(tool_name, "terminal" | "run_command") {
         return false;
     }
     turn_is_interrogative_lookup(turn_context) || terminal_command_is_read_only(arguments)
@@ -488,30 +625,17 @@ fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
     if turn_is_approval_of_prior_proposal(turn_context) {
         return false;
     }
+    if turn_context.completion_contract.forbids_mutation {
+        return true;
+    }
     // Absence of an inferred mutation/observation is not evidence that a tool
-    // call is drift. Only an explicit user prohibition may arm this redirect;
-    // ordinary text-only classification remains advisory.
+    // call is drift. Only an explicit response-only request may arm this
+    // redirect. Scoped prohibitions are enforced per action below and must not
+    // disable unrelated work.
     let lower = turn_context.goal_user_text.trim().to_ascii_lowercase();
-    [
-        "draft only",
-        "answer only",
-        "explain only",
-        "do not post",
-        "don't post",
-        "do not publish",
-        "don't publish",
-        "do not send",
-        "don't send",
-        "do not modify",
-        "don't modify",
-        "do not change",
-        "don't change",
-        "without posting",
-        "without publishing",
-        "without sending",
-    ]
-    .iter()
-    .any(|phrase| contains_keyword_as_words(&lower, phrase))
+    ["draft only", "answer only", "explain only"]
+        .iter()
+        .any(|phrase| contains_keyword_as_words(&lower, phrase))
 }
 
 /// The text-only drift redirect protects a plain-text turn from drifting
@@ -888,12 +1012,13 @@ pub(super) async fn run_tool_prelude_phase(
     // Hard negative contract: an executor instructed to inspect/report only
     // must never drift into a write. This is enforced before execution rather
     // than merely scored after the damage is done.
-    if let Some(blocked) = resp.tool_calls.iter().find(|tc| {
-        negative_contract_blocks_tool(
+    if let Some((blocked, restriction)) = resp.tool_calls.iter().find_map(|tc| {
+        negative_contract_block_reason(
             &turn_context.completion_contract,
-            &tc.name,
+            tc,
             tool_call_is_side_effecting(agent, tc, available_capabilities),
         )
+        .map(|restriction| (tc, restriction))
     }) {
         agent
             .with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
@@ -912,22 +1037,33 @@ pub(super) async fn run_tool_prelude_phase(
                 json!({
                     "condition": "negative_completion_contract",
                     "tool": blocked.name,
-                    "forbids_mutation": true,
+                    "forbids_mutation": turn_context.completion_contract.forbids_mutation,
+                    "forbidden_action": restriction.clone(),
                 }),
             )
             .await;
+        let notice = if turn_context.completion_contract.forbids_mutation {
+            format!(
+                "[SYSTEM] Blocked `{}`: this task has an explicit read-only/report-only contract. \
+                 Do not modify files, create artifacts, deploy, publish, post, send, or otherwise \
+                 mutate state. Continue only with observation tools, then report findings.",
+                blocked.name
+            )
+        } else {
+            format!(
+                "[SYSTEM] Blocked `{}` because this task explicitly forbids the `{}` action. \
+                 Other authorized work remains allowed. Continue without performing `{}`, then \
+                 report what was completed and what remains for the parent or user.",
+                blocked.name, restriction, restriction
+            )
+        };
         inject_prelude_retry_messages(
             agent,
             emitter,
             session_id,
             task_id,
             &resp.tool_calls,
-            format!(
-                "[SYSTEM] Blocked `{}`: this task has an explicit read-only/report-only contract. \
-                 Do not modify files, create artifacts, deploy, publish, post, send, or otherwise \
-                 mutate state. Continue only with observation tools, then report findings.",
-                blocked.name
-            ),
+            notice,
         )
         .await?;
         return Ok(ToolPreludeOutcome::ContinueLoop);
@@ -1685,6 +1821,107 @@ pub(super) async fn run_tool_prelude_phase(
 mod tests {
     use super::*;
 
+    fn tool_call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            extra_content: None,
+        }
+    }
+
+    #[test]
+    fn scoped_deploy_restriction_allows_local_build_but_blocks_deployment() {
+        let contract = CompletionContract {
+            expects_mutation: true,
+            forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
+            ..CompletionContract::default()
+        };
+        let write = tool_call(
+            "write_file",
+            r#"{"path":"/tmp/site/package.json","content":"{\"scripts\":{\"deploy\":\"wrangler deploy\"}}"}"#,
+        );
+        let build = tool_call("terminal", r#"{"action":"run","command":"npm run build"}"#);
+        let inspect = tool_call("terminal", r#"{"action":"run","command":"rg deploy ."}"#);
+        let deploy = tool_call(
+            "terminal",
+            r#"{"action":"run","command":"npx wrangler deploy"}"#,
+        );
+
+        assert_eq!(
+            negative_contract_block_reason(&contract, &write, true),
+            None
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &build, true),
+            None
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &inspect, true),
+            None,
+            "mentioning deployment in an observation is not a deployment action"
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &deploy, true).as_deref(),
+            Some("deploy")
+        );
+    }
+
+    #[test]
+    fn global_read_only_contract_still_blocks_every_side_effect() {
+        let contract = CompletionContract {
+            forbids_mutation: true,
+            ..CompletionContract::default()
+        };
+        let build = tool_call("terminal", r#"{"action":"run","command":"npm run build"}"#);
+        assert_eq!(
+            negative_contract_block_reason(&contract, &build, true).as_deref(),
+            Some("all mutation")
+        );
+
+        let delegated = tool_call(
+            "spawn_agent",
+            r#"{"mission":"Implement the change","task":"Edit files and deploy it"}"#,
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &delegated, false).as_deref(),
+            Some("all mutation")
+        );
+    }
+
+    #[test]
+    fn scoped_restriction_follows_delegated_work_without_disabling_other_work() {
+        let contract = CompletionContract {
+            expects_mutation: true,
+            forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
+            ..CompletionContract::default()
+        };
+        let build = tool_call(
+            "spawn_agent",
+            r#"{"mission":"Build the site","task":"Create and test the site locally"}"#,
+        );
+        let deploy = tool_call(
+            "spawn_agent",
+            r#"{"mission":"Ship the site","task":"Deploy the site and return its URL"}"#,
+        );
+
+        assert_eq!(
+            negative_contract_block_reason(&contract, &build, true),
+            None
+        );
+        assert_eq!(
+            negative_contract_block_reason(&contract, &deploy, true).as_deref(),
+            Some("deploy")
+        );
+
+        let turn = TurnContext {
+            goal_user_text: "Build the site locally but do not deploy it.".to_string(),
+            completion_contract: contract,
+            ..TurnContext::default()
+        };
+        assert!(!turn_prefers_plain_text_completion(&turn));
+    }
+
     fn turn_with(
         goal_user_text: &str,
         recent_messages: Vec<Value>,
@@ -1761,6 +1998,11 @@ mod tests {
             r#"{"action": "run", "command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#;
         assert!(super::plain_text_redirect_exempts_lookup(
             "terminal", arguments, &turn
+        ));
+        assert!(super::plain_text_redirect_exempts_lookup(
+            "run_command",
+            r#"{"command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#,
+            &turn
         ));
     }
 

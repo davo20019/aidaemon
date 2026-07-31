@@ -1,4 +1,4 @@
-use super::{CompletionProgress, TurnContext};
+use super::{mutation_contract_fulfilled, CompletionProgress, TurnContext};
 
 pub(super) fn turn_contract_is_text_only(turn_context: &TurnContext) -> bool {
     !turn_context.completion_contract.expects_mutation
@@ -9,7 +9,8 @@ pub(super) fn has_task_relevant_progress(
     turn_context: &TurnContext,
     completion_progress: &CompletionProgress,
 ) -> bool {
-    (turn_context.completion_contract.expects_mutation && completion_progress.mutation_count > 0)
+    (turn_context.completion_contract.expects_mutation
+        && mutation_contract_fulfilled(&turn_context.completion_contract, completion_progress))
         || completion_progress.observation_count > 0
         || completion_progress.verification_count > 0
 }

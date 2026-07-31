@@ -552,26 +552,6 @@ pub(crate) fn goal_completion_response_indicates_incomplete_work(text: &str) -> 
             && !is_substantive_text_response(trimmed, 200))
 }
 
-/// If the task lead already produced a substantive, finished answer, return it
-/// so callers can surface it as the goal result instead of discarding the work
-/// and re-running a fresh, context-free direct fallback.
-///
-/// Returns `None` when there is no usable response to salvage — i.e. it is
-/// empty, low-signal, or admits incomplete/unverified work — in which case the
-/// caller should fall back to direct handling.
-pub(in crate::agent) fn salvageable_task_lead_result(
-    task_lead_response: Option<&str>,
-) -> Option<String> {
-    let resp = task_lead_response?.trim();
-    if resp.is_empty() {
-        return None;
-    }
-    if goal_completion_response_indicates_incomplete_work(resp) {
-        return None;
-    }
-    Some(resp.to_string())
-}
-
 pub(in crate::agent) fn truncate_goal_result_text(text: &str, max_chars: usize) -> String {
     let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(text);
     let trimmed = sanitized.trim();

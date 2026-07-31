@@ -237,7 +237,9 @@ impl SlackChannel {
 
         // Request a WebSocket URL from Slack
         let wss_url = self.open_connection().await?;
-        info!(url = %wss_url, "Slack Socket Mode connection URL obtained");
+        // The returned URL carries a short-lived ticket in its query string.
+        // Never persist it in logs.
+        info!("Slack Socket Mode connection URL obtained");
 
         // Connect via WebSocket
         let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url)
@@ -2336,7 +2338,9 @@ impl Channel for SlackChannel {
                 warn!("Failed to send Slack approval request: {}", e);
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                return Ok(ApprovalResponse::Deny);
+                return Err(anyhow::anyhow!(
+                    "Slack approval request could not be delivered: {e}"
+                ));
             }
         }
 
@@ -2346,13 +2350,14 @@ impl Channel for SlackChannel {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 warn!(approval_id = %short_id, "Approval channel closed");
-                Ok(ApprovalResponse::Deny)
+                self.pending_approvals.lock().await.remove(&approval_id);
+                Err(anyhow::anyhow!("Slack approval response channel closed"))
             }
             Err(_) => {
                 warn!(approval_id = %short_id, "Approval timed out after 5 minutes");
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
-                Ok(ApprovalResponse::Deny)
+                Err(anyhow::anyhow!("Slack approval request timed out"))
             }
         }
     }

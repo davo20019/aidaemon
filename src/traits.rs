@@ -32,8 +32,10 @@ pub use dynamic::{
     OAuthConnection, PendingOAuthFlow, SkillDraft,
 };
 pub use goals::{
-    Goal, GoalSchedule, GoalTokenBudgetStatus, NotificationEntry, ScheduledRunHealth,
-    ScheduledRunState, Task, TaskActivity,
+    Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact, NotificationEntry,
+    ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
+    TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
+    WorkerProfile, DEFAULT_PROJECT_ID,
 };
 #[allow(unused_imports)]
 pub use memory::{
@@ -53,8 +55,9 @@ pub use self_correction::*;
 pub use tools::{
     AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
     ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolOutcomeStatus, ToolRole, ToolSemanticAffordances, ToolSemanticFacet,
-    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
+    ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
+    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 
@@ -73,7 +76,7 @@ pub mod store_prelude {
         GoalScheduleStore, GoalStore, HealthCheckStore, LearningStore, MessageStore,
         NotificationStore, OAuthStore, PeopleStore, PromptSnapshotStore, ScheduledRunStore,
         SessionChannelStore, SettingsStore, SkillStore, StateStore, TaskDispatchStore, TaskStore,
-        TokenUsageStore,
+        TokenUsageStore, WorkCoordinationStore,
     };
 }
 

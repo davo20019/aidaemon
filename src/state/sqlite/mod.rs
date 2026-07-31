@@ -156,15 +156,14 @@ impl SqliteStateStore {
         // connection closes and can consume tens of gigabytes in one suite.
         // Delete journaling keeps test databases self-contained; production
         // retains WAL concurrency and crash behavior.
-        let journal_mode = if cfg!(test) {
-            sqlx::sqlite::SqliteJournalMode::Delete
+        let (journal_mode_name, journal_mode_pragma) = if cfg!(test) {
+            ("delete", "PRAGMA journal_mode = DELETE")
         } else {
-            sqlx::sqlite::SqliteJournalMode::Wal
+            ("wal", "PRAGMA journal_mode = WAL")
         };
         let mut opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            .journal_mode(journal_mode)
             // Scrub deleted text from reusable SQLite pages. Explicit `/wipe`
             // also truncates the WAL after deleting active history.
             .pragma("secure_delete", "ON")
@@ -209,6 +208,19 @@ impl SqliteStateStore {
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(opts)
             .await?;
+
+        // Journal mode belongs to the database, not to an individual pooled
+        // operation. Set it once before migrations or concurrent work begins.
+        // Putting it in SqliteConnectOptions makes every lazily opened pool
+        // connection reissue the PRAGMA; SQLite can then return SQLITE_BUSY
+        // if an established connection is already writing.
+        let active_journal_mode: String = sqlx::query_scalar(journal_mode_pragma)
+            .fetch_one(&pool)
+            .await?;
+        anyhow::ensure!(
+            active_journal_mode.eq_ignore_ascii_case(journal_mode_name),
+            "SQLite refused journal mode '{journal_mode_name}' (active mode: '{active_journal_mode}')"
+        );
 
         // Set restrictive file permissions (owner-only read/write)
         set_db_file_permissions(db_path);
@@ -1713,6 +1725,7 @@ mod settings;
 mod skills;
 mod structured_memory;
 mod token_usage;
+mod work;
 
 #[cfg(test)]
 mod tests;

@@ -444,6 +444,45 @@ impl Tool for MockRemoteMutationTool {
     }
 }
 
+struct CountingRemoteMutationTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingRemoteMutationTool {
+    fn name(&self) -> &str {
+        "update_remote"
+    }
+
+    fn description(&self) -> &str {
+        "Mock tool that updates remote state"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "update_remote",
+            "description": "Mock remote update",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("Updated {arguments}"))
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        let url = args["url"].as_str().unwrap_or("https://example.com/status");
+        ToolCallSemantics::mutation().with_target_hint(ToolTargetHintKind::Url, url)
+    }
+}
+
 struct MockRemoteObservationTool;
 
 #[async_trait]
@@ -1250,9 +1289,13 @@ async fn planner_refined_observation_contract_requires_execution_until_observed(
                 ],
                 "success_criteria": ["The comparison cites inspected evidence"],
                 "contract": {
+                    "confidence": "high",
                     "task_kind": "check",
                     "expects_mutation": false,
-                    "requires_observation": true
+                    "requires_observation": true,
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": [],
+                    "constraint_evidence": []
                 }
             }"#,
         ),
@@ -1291,6 +1334,126 @@ async fn planner_refined_observation_contract_requires_execution_until_observed(
             .iter()
             .any(|tool| tool["function"]["name"] == "system_info")),
         "the finalized observation contract must remain execution-required until evidence exists"
+    );
+}
+
+#[tokio::test]
+async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation() {
+    let url = "https://example.com/status";
+    let mut provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            r#"{
+                "goal": "Update remote status",
+                "steps": [],
+                "success_criteria": [],
+                "contract": {
+                    "confidence": "high",
+                    "task_kind": "check",
+                    "expects_mutation": false,
+                    "requires_observation": true,
+                    "mutation_scope": "read_only",
+                    "forbidden_actions": [],
+                    "constraint_evidence": ["change locally but don't deploy"]
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false
+                }
+            }"#,
+        ),
+        MockProvider::tool_call_response("update_remote", &json!({"url": url}).to_string()),
+        MockProvider::text_response("Remote status updated."),
+    ]);
+    provider.skip_planning_calls = false;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(CountingRemoteMutationTool {
+            calls: calls.clone(),
+        }) as Arc<dyn Tool>],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "ungrounded_negative_contract",
+            &format!("Update the status at {url}."),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "Remote status updated.");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "an invented restriction without a verbatim span must not suppress mutation"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_semantic_assessment_routes_without_installing_a_step_plan() {
+    let mut provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            r#"{
+                "goal": "Explain a cohesive comparison",
+                "steps": [
+                    {"description": "This must be discarded", "tool_hint": "system_info"}
+                ],
+                "success_criteria": ["This must also be discarded"],
+                "contract": {
+                    "task_kind": "answer",
+                    "expects_mutation": false,
+                    "requires_observation": false,
+                    "mutation_scope": "allowed",
+                    "forbidden_actions": []
+                },
+                "task_shape": {
+                    "execution_mode": "inline",
+                    "confidence": "high",
+                    "independent_workstreams": 1,
+                    "requires_background_continuation": false
+                }
+            }"#,
+        ),
+        MockProvider::text_response(
+            "This is one cohesive comparison, so it was completed inline without a background goal.",
+        ),
+    ]);
+    provider.skip_planning_calls = false;
+
+    let harness = setup_test_agent_with_models(provider, "gpt-5.6-terra", "gpt-5.6-terra")
+        .await
+        .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "autonomous_semantic_inline_route",
+            "Compare the package files across all my projects, identify shared dependencies, \
+             calculate the totals, and summarize the version conflicts.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(reply.contains("completed inline"), "reply: {reply}");
+    let calls = harness.provider.call_log.lock().await.clone();
+    assert_eq!(calls.len(), 2, "assessment + primary model call");
+    let primary_context = serde_json::to_string(&calls[1].messages).unwrap();
+    assert!(
+        !primary_context.contains("This must be discarded"),
+        "autonomous assessment steps must never enter the primary model context"
     );
 }
 

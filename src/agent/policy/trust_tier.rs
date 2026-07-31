@@ -119,6 +119,7 @@ mod tests {
             "claude-sonnet-4-6",
             "anthropic/claude-haiku-4-5-20251001",
             "gpt-5",
+            "gpt-5.6-terra",
             "openai/gpt-4.1",
             "gpt-4o",
             "o3",
