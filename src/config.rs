@@ -3045,13 +3045,13 @@ pub struct ContextWindowConfig {
     /// Enable context window management (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Default token budget for conversation history (default: 24000).
+    /// Default total model context budget used by history fitting (default: 48000).
     #[serde(default = "default_context_budget")]
     pub default_budget: usize,
     /// Per-model token budgets (model name → budget). Overrides default_budget.
     #[serde(default)]
     pub model_budgets: HashMap<String, usize>,
-    /// Maximum characters for tool results before truncation (default: 2000).
+    /// Maximum characters for tool results before truncation (default: 4000).
     #[serde(default = "default_tool_result_chars")]
     pub max_tool_result_chars: usize,
     /// Per-model tool result character caps (model name → max chars).
@@ -3060,15 +3060,25 @@ pub struct ContextWindowConfig {
     /// their budget.
     #[serde(default)]
     pub model_tool_result_chars: HashMap<String, usize>,
-    /// Number of recent messages to always keep in the window (default: 6).
+    /// Legacy message-window setting retained for configuration compatibility.
+    /// Runtime compaction now protects recent raw context by token budget.
+    #[allow(dead_code)]
     #[serde(default = "default_summary_window")]
     pub summary_window: usize,
     /// Enable progressive fact extraction after each interaction (default: true).
     #[serde(default = "default_true")]
     pub progressive_facts: bool,
-    /// Message count threshold before summarization kicks in (default: 12).
+    /// Legacy message-count threshold retained for configuration compatibility.
+    /// Runtime compaction uses `summarize_token_threshold` instead.
+    #[allow(dead_code)]
     #[serde(default = "default_summarize_threshold")]
     pub summarize_threshold: usize,
+    /// Estimated unsummarized conversation tokens that trigger compaction.
+    #[serde(default = "default_summarize_token_threshold")]
+    pub summarize_token_threshold: usize,
+    /// Estimated tokens of recent whole turns to keep verbatim after compaction.
+    #[serde(default = "default_summary_recent_tokens")]
+    pub summary_recent_tokens: usize,
 }
 
 impl Default for ContextWindowConfig {
@@ -3082,6 +3092,8 @@ impl Default for ContextWindowConfig {
             summary_window: default_summary_window(),
             progressive_facts: true,
             summarize_threshold: default_summarize_threshold(),
+            summarize_token_threshold: default_summarize_token_threshold(),
+            summary_recent_tokens: default_summary_recent_tokens(),
         }
     }
 }
@@ -3108,6 +3120,25 @@ impl ContextWindowConfig {
         }
         self.max_tool_result_chars
     }
+
+    /// Token-pressure high-water mark, clamped for small model windows.
+    pub fn summarize_token_threshold_for(&self, model: &str) -> usize {
+        let model_budget = self
+            .model_budgets
+            .get(model)
+            .copied()
+            .unwrap_or(self.default_budget);
+        self.summarize_token_threshold
+            .min(model_budget.saturating_mul(3) / 5)
+            .max(512)
+    }
+
+    /// Raw recent-context overlap, also clamped so a summary can make progress.
+    pub fn summary_recent_tokens_for(&self, model: &str) -> usize {
+        self.summary_recent_tokens
+            .min(self.summarize_token_threshold_for(model) / 2)
+            .max(256)
+    }
 }
 
 fn default_context_budget() -> usize {
@@ -3121,6 +3152,12 @@ fn default_summary_window() -> usize {
 }
 fn default_summarize_threshold() -> usize {
     12
+}
+fn default_summarize_token_threshold() -> usize {
+    12_000
+}
+fn default_summary_recent_tokens() -> usize {
+    4_000
 }
 
 fn default_heartbeat_tick() -> u64 {

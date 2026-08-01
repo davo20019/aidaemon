@@ -6,10 +6,11 @@
 // PublicExternal is fully locked down.
 // ==========================================================================
 
-/// Facts are NOT bulk-injected into the system prompt — accessed on demand via tools.
-/// The system prompt should contain the memory capabilities summary instead.
+/// A same-channel fact selected by semantic retrieval is rendered in the
+/// bounded volatile memory tail. This is targeted recall, not a dump of the
+/// fact store.
 #[tokio::test]
-async fn test_same_channel_fact_recall() {
+async fn test_same_channel_relevant_fact_is_rendered() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
     harness
@@ -18,6 +19,18 @@ async fn test_same_channel_fact_recall() {
             "project",
             "framework",
             "NextJS with TypeScript",
+            "user",
+            Some("slack:C_ABC"),
+            crate::types::FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    harness
+        .state
+        .upsert_fact(
+            "preference",
+            "beverage",
+            "Synthetic jasmine tea",
             "user",
             Some("slack:C_ABC"),
             crate::types::FactPrivacy::Channel,
@@ -59,10 +72,13 @@ async fn test_same_channel_fact_recall() {
         .collect::<Vec<_>>()
         .join("\n");
     let content = content_owned.as_str();
-    // Facts are on-demand now, NOT injected into prompt
     assert!(
-        !content.contains("NextJS"),
-        "Facts should NOT be bulk-injected into system prompt"
+        content.contains("NextJS"),
+        "A query-selected same-channel fact should be present in the volatile memory tail"
+    );
+    assert!(
+        !content.contains("Synthetic jasmine tea"),
+        "Passive recall must not pad the prompt with unrelated same-channel facts"
     );
     assert!(
         content.contains("Your Memory"),
@@ -299,7 +315,7 @@ async fn test_cross_channel_hints() {
     }
 }
 
-/// Legacy facts (NULL channel_id) should be accessible everywhere — backward compat.
+/// A relevant legacy fact (NULL channel_id) remains eligible for bounded recall.
 #[tokio::test]
 async fn test_legacy_facts_backward_compat() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -353,10 +369,9 @@ async fn test_legacy_facts_backward_compat() {
         .collect::<Vec<_>>()
         .join("\n");
     let content = content_owned.as_str();
-    // Facts are on-demand now — not bulk-injected into system prompt
     assert!(
-        !content.contains("Neovim"),
-        "Facts should NOT be bulk-injected into system prompt"
+        content.contains("Neovim"),
+        "A query-selected legacy fact should be present in the volatile memory tail"
     );
     assert!(
         content.contains("Your Memory"),

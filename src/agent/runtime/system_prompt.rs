@@ -279,9 +279,10 @@ impl Agent {
                     crate::agent::IntentComplexity::Simple
                 );
 
-        // Anaphoric follow-ups need the subject of the preceding exchange in
-        // the retrieval query. Searching only "what's the source of that?"
-        // ranks generic `source` memories and drops the actual award/entity.
+        // Anaphoric explanation follow-ups can benefit from the subject of the
+        // preceding exchange in the private memory-retrieval query. Provider
+        // transcript continuity itself is structural and does not depend on
+        // this heuristic or rewrite the persisted/current user message.
         let retrieval_query = if straightforward_artifact_task {
             user_text.to_string()
         } else if super::followup::looks_like_context_dependent_followup_question(
@@ -517,44 +518,6 @@ impl Agent {
                 (vec![], None, vec![])
             };
 
-        if self.record_decision_points {
-            self.emit_decision_point(
-                emitter,
-                task_id,
-                0,
-                DecisionType::MemoryRetrieval,
-                format!(
-                    "Memory retrieved: facts={} episodes={} hints={} procedures={} errors={}",
-                    facts.len(),
-                    episodes.len(),
-                    cross_channel_hints.len(),
-                    procedures.len(),
-                    error_solutions.len()
-                ),
-                json!({
-                    "facts_count": facts.len(),
-                    "episodes_count": episodes.len(),
-                    "hints_count": cross_channel_hints.len(),
-                    "goals_count": goals.len(),
-                    "patterns_count": patterns.len(),
-                    "procedures_count": procedures.len(),
-                    "error_solutions_count": error_solutions.len(),
-                    "expertise_count": expertise.len(),
-                    "people_count": people.len(),
-                    "current_person_facts_count": current_person_facts.len(),
-                    "straightforward_artifact_fast_path": straightforward_artifact_task,
-                    // Which facts were actually injected this turn — makes a missed
-                    // recall debuggable (what was/wasn't surfaced) without re-running.
-                    "top_facts": facts
-                        .iter()
-                        .take(8)
-                        .map(|f| format!("{}/{}", f.category, f.key))
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .await;
-        }
-
         // Build extended system prompt with all memory components
         let memory_context = MemoryContext {
             facts: &facts,
@@ -761,7 +724,7 @@ impl Agent {
         // Query-ranked memory recall + people/current-speaker context + matched
         // skill CONTENT. These flow through `build_system_prompt_with_memory`
         // (which no longer emits the availability catalog — that is CORE now).
-        let memory_section = skills::build_system_prompt_with_memory(
+        let memory_render = skills::build_system_prompt_with_memory_report(
             "",
             &skills_snapshot,
             &active_skills,
@@ -774,6 +737,49 @@ impl Agent {
             },
             &channel_ctx.user_id_map,
         );
+        let memory_section = memory_render.prompt.as_str();
+
+        if self.record_decision_points {
+            self.emit_decision_point(
+                emitter,
+                task_id,
+                0,
+                DecisionType::MemoryRetrieval,
+                format!(
+                    "Memory fetched/rendered: facts={}/{} episodes={}/{} procedures={}/{}",
+                    facts.len(),
+                    memory_render.rendered_fact_ids.len(),
+                    episodes.len(),
+                    memory_render.rendered_episode_ids.len(),
+                    procedures.len(),
+                    memory_render.rendered_procedure_ids.len()
+                ),
+                json!({
+                    "fetched": {
+                        "facts": facts.len(),
+                        "episodes": episodes.len(),
+                        "hints": cross_channel_hints.len(),
+                        "goals": goals.len(),
+                        "patterns": patterns.len(),
+                        "procedures": procedures.len(),
+                        "error_solutions": error_solutions.len(),
+                        "expertise": expertise.len(),
+                        "people": people.len(),
+                        "current_person_facts": current_person_facts.len()
+                    },
+                    "rendered": {
+                        "fact_ids": memory_render.rendered_fact_ids,
+                        "episode_ids": memory_render.rendered_episode_ids,
+                        "goal_ids": memory_render.rendered_goal_ids,
+                        "procedure_ids": memory_render.rendered_procedure_ids,
+                        "error_solution_ids": memory_render.rendered_error_solution_ids,
+                        "pattern_ids": memory_render.rendered_pattern_ids
+                    },
+                    "straightforward_artifact_fast_path": straightforward_artifact_task
+                }),
+            )
+            .await;
+        }
 
         // Current date and time — volatile by definition; lives in the tail so
         // message zero (the core) stays byte-stable across turns.
@@ -790,7 +796,7 @@ impl Agent {
 
         let tail = Self::build_context_tail(
             critical_facts_block.as_deref(),
-            &memory_section,
+            memory_section,
             channel_ctx.sender_name.as_deref(),
             session_summary,
             &session_context_str,
@@ -1295,7 +1301,16 @@ impl Agent {
         // insertion (Pillar A). The summary now participates ONLY in the tail.
         if let Some(summary) = session_summary {
             if !summary.summary.is_empty() {
-                tail.push_str("\n\n[Session Summary]\n");
+                tail.push_str(&format!(
+                    "\n\n[Context Coverage]\nCompacted through canonical turn {} / message {}. \
+                     Recent raw turns and the immediately preceding exchange are supplied separately. \
+                     If exact wording or evidence is absent below, retrieve the canonical conversation with `search_history`; do not guess.\n\n[Compacted Conversation State]\n",
+                    summary
+                        .last_turn_seq
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "legacy".to_string()),
+                    summary.last_message_id
+                ));
                 tail.push_str(&summary.summary);
             }
         }
@@ -1568,6 +1583,7 @@ mod tests {
             summary: "User likes black coffee.".into(),
             message_count: 3,
             last_message_id: "x".into(),
+            last_turn_seq: Some(3),
             updated_at: chrono::Utc::now(),
         };
         let tail = Agent::build_context_tail(
@@ -1580,7 +1596,9 @@ mod tests {
             None,
         );
         assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
-        assert!(tail.contains("[Session Summary]"));
+        assert!(tail.contains("[Context Coverage]"));
+        assert!(tail.contains("[Compacted Conversation State]"));
+        assert!(tail.contains("turn 3 / message x"));
         assert!(tail.contains("black coffee"));
     }
 }

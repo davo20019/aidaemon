@@ -114,6 +114,11 @@ fn extract_outcome(tool_name: &str, result: &str) -> String {
         "http_request" => extract_http_outcome(result),
         "read_file" => extract_read_file_outcome(result),
         "write_file" | "edit_file" => extract_write_outcome(result),
+        // These read-only retrieval tools return the evidence behind the final
+        // answer. Keeping a bounded excerpt is essential for a subsequent
+        // source question; replacing it with merely "completed" discards the
+        // very provenance the user is asking to inspect.
+        "manage_memories" | "search_history" | "web_search" => truncate_str(result, 1_200),
         _ => "completed".to_string(),
     }
 }
@@ -318,6 +323,18 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_summary_preserves_bounded_provenance() {
+        let evidence = "fact_id: 41; source: progressive; evidence: recurring AI briefing";
+        let result = summarize_tool_result(
+            "manage_memories",
+            r#"{"action":"search","query":"working together"}"#,
+            evidence,
+        );
+        assert!(result.contains(evidence), "{result}");
+        assert!(result.chars().count() <= 1_250, "{result}");
+    }
+
+    #[test]
     fn test_http_request_with_status() {
         let result = summarize_tool_result(
             "http_request",
@@ -435,7 +452,10 @@ mod tests {
             r#"{"query": "skin cancer trials DC"}"#,
             "Found 10 results...",
         );
-        assert_eq!(result, "web_search: 'skin cancer trials DC' -> completed");
+        assert_eq!(
+            result,
+            "web_search: 'skin cancer trials DC' -> Found 10 results..."
+        );
     }
 
     #[test]
@@ -455,7 +475,7 @@ mod tests {
             r#"{"action": "search", "query": "coffee"}"#,
             "Found 3 matching facts",
         );
-        assert_eq!(result, "manage_memories: search -> completed");
+        assert_eq!(result, "manage_memories: search -> Found 3 matching facts");
     }
 
     #[test]

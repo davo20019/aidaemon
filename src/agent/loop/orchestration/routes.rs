@@ -1301,14 +1301,14 @@ async fn handle_complex_intent(
         "On it. I'll plan this out and get started. Goal: {}{}",
         desc_preview, ellipsis
     );
+    let fast_model = ctx
+        .llm_router
+        .as_ref()
+        .map(|r| r.select(crate::router::Tier::Fast).to_string())
+        .unwrap_or_else(|| ctx.model.clone());
     if agent.context_window_config.progressive_facts
         && crate::memory::context_window::should_extract_facts(ctx.user_text)
     {
-        let fast_model = ctx
-            .llm_router
-            .as_ref()
-            .map(|r| r.select(crate::router::Tier::Fast).to_string())
-            .unwrap_or_else(|| ctx.model.clone());
         crate::memory::context_window::spawn_progressive_extraction(
             ctx.llm_provider.clone(),
             fast_model.clone(),
@@ -1320,19 +1320,25 @@ async fn handle_complex_intent(
             ctx.channel_ctx.visibility,
             ctx.user_role,
         );
+    }
 
-        if agent.context_window_config.enabled {
-            crate::memory::context_window::spawn_incremental_summarization(
-                ctx.llm_provider.clone(),
-                fast_model,
-                agent.state.clone(),
-                agent.event_store.clone(),
-                ctx.session_id.to_string(),
-                agent.context_window_config.summarize_threshold,
-                agent.context_window_config.summary_window,
-                ctx.user_role,
-            );
-        }
+    if agent.context_window_config.enabled {
+        let summary_token_threshold = agent
+            .context_window_config
+            .summarize_token_threshold_for(&fast_model);
+        let summary_recent_tokens = agent
+            .context_window_config
+            .summary_recent_tokens_for(&fast_model);
+        crate::memory::context_window::spawn_incremental_summarization(
+            ctx.llm_provider.clone(),
+            fast_model,
+            agent.state.clone(),
+            agent.event_store.clone(),
+            ctx.session_id.to_string(),
+            summary_token_threshold,
+            summary_recent_tokens,
+            ctx.user_role,
+        );
     }
 
     // Persist the goal acknowledgment reply.

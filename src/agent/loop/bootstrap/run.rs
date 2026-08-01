@@ -834,6 +834,50 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 | ChannelVisibility::Public
                 | ChannelVisibility::PublicExternal
         );
+
+    // Emergency pre-call compaction is token-driven and happens before the
+    // tail/cursor snapshot is built, so this turn can safely use the refreshed
+    // state. Normal maintenance remains the coalesced post-turn worker.
+    if agent.context_window_config.enabled
+        && user_role.can_persist_owner_memory()
+        && !straightforward_artifact_task
+        && !non_owner_shared_context
+    {
+        let compaction_model = llm_router
+            .as_ref()
+            .map(|router| router.select(crate::router::Tier::Fast).to_string())
+            .unwrap_or_else(|| model.clone());
+        let token_threshold = agent
+            .context_window_config
+            .summarize_token_threshold_for(&compaction_model);
+        let recent_tokens = agent
+            .context_window_config
+            .summary_recent_tokens_for(&compaction_model);
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::memory::context_window::refresh_incremental_summarization(
+                llm_provider.clone(),
+                &compaction_model,
+                agent.state.clone(),
+                agent.event_store.clone(),
+                session_id,
+                token_threshold,
+                recent_tokens,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(Some(summary))) => info!(
+                session_id,
+                last_turn_seq = summary.last_turn_seq,
+                "Emergency token-pressure compaction refreshed current context"
+            ),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => warn!(session_id, %error, "Emergency compaction failed"),
+            Err(_) => warn!(session_id, "Emergency compaction timed out after 30s"),
+        }
+    }
+
     let session_summary = if agent.context_window_config.enabled
         && !straightforward_artifact_task
         && !non_owner_shared_context
@@ -844,6 +888,10 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             .await
             .ok()
             .flatten()
+            // A legacy cursorless summary may end in the middle of an exchange.
+            // Keep it out of the prompt until the canonical turn summarizer
+            // rebuilds it with a safe boundary.
+            .filter(|summary| summary.last_turn_seq.is_some())
     } else {
         None
     };
@@ -851,7 +899,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
     // Returns the session-static CORE bytes (message zero) and the per-task
     // volatile TAIL separately so the assembler can place them at message 0 and
-    // boundary − 1 respectively.
+    // before the structurally preserved preceding exchange respectively.
     //
     // Pillar A Task 7 (per-task core-cache hook): the per-session core cache lives
     // INSIDE `build_system_prompt_for_message` (it is `&self` on Agent and reads
@@ -900,6 +948,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     );
 
     let data = BootstrapData {
+        user_text: user_text.to_string(),
         task_id,
         resume_execution_snapshot: resume_checkpoint
             .as_ref()

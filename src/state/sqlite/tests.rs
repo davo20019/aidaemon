@@ -1287,14 +1287,10 @@ async fn test_get_relevant_facts_does_not_pad_with_unrelated_recent_facts() {
         facts.iter().any(|f| f.key == "deploy_notes"),
         "Above-threshold fact should be returned"
     );
-    // With padding enabled, unrelated facts may be included when results are sparse.
-    // The key invariant is that relevant facts come first.
-    if facts.len() >= 2 {
-        assert_eq!(
-            facts[0].key, "deploy_notes",
-            "Relevant fact should come before padded results"
-        );
-    }
+    assert!(
+        facts.iter().all(|fact| fact.key != "vacation_city"),
+        "Passive prompt recall must not pad sparse results with unrelated recent facts"
+    );
 }
 
 #[tokio::test]

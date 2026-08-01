@@ -26,9 +26,9 @@ use crate::events::TerminalState;
 use crate::traits::AttachmentProvenance;
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-/// v4: archived clarifying menus keep their actionable tail instead of being
-/// head-truncated to the old-assistant cap.
-pub(crate) const RENDERER_VERSION: u32 = 4;
+/// v5: a structurally referenced parent turn gets its own high-fidelity mode;
+/// ordinary archived turns remain aggressively compact.
+pub(crate) const RENDERER_VERSION: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
@@ -63,6 +63,7 @@ impl Default for RenderOptions {
 pub(crate) enum RenderMode {
     Current,
     Archived { terminal_state: TerminalState },
+    Adjacent { terminal_state: TerminalState },
 }
 
 /// Pure entry point. Dispatches to the per-mode renderer.
@@ -75,7 +76,10 @@ pub(crate) fn render_turn(
     match mode {
         RenderMode::Current => render_current(turn_messages, options),
         RenderMode::Archived { terminal_state } => {
-            render_archived(turn_messages, terminal_state, options)
+            render_archived(turn_messages, terminal_state, options, false)
+        }
+        RenderMode::Adjacent { terminal_state } => {
+            render_archived(turn_messages, terminal_state, options, true)
         }
     }
 }
@@ -135,6 +139,24 @@ fn truncate_winning_assistant(content: &str) -> String {
     let head: String = content.chars().take(HEAD_CHARS).collect();
     let tail: String = content.chars().skip(count - tail_chars).collect();
     format!("{head}\n…\n{tail}")
+}
+
+/// Preserve the parent answer the current user can refer to. The cap protects
+/// small-context providers from pathological outputs while retaining both the
+/// answer's premise and source-bearing conclusion.
+fn truncate_adjacent_assistant(content: &str) -> String {
+    let count = content.chars().count();
+    if count <= MAX_ADJACENT_ASSISTANT_CONTENT_CHARS {
+        return content.to_string();
+    }
+    let head_chars = (MAX_ADJACENT_ASSISTANT_CONTENT_CHARS * 2) / 3;
+    let tail_chars = MAX_ADJACENT_ASSISTANT_CONTENT_CHARS - head_chars;
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content.chars().skip(count - tail_chars).collect();
+    format!(
+        "{head}\n\n[Middle of immediately preceding answer omitted: retained {}/{} characters]\n\n{tail}",
+        MAX_ADJACENT_ASSISTANT_CONTENT_CHARS, count
+    )
 }
 
 /// Set of `tool_call_id`s that have a matching `tool` result in this turn.
@@ -399,6 +421,7 @@ fn render_archived(
     turn_messages: &[Message],
     terminal_state: TerminalState,
     options: &RenderOptions,
+    preserve_winning_assistant: bool,
 ) -> Vec<Value> {
     let result_ids = tool_result_ids(turn_messages);
 
@@ -484,7 +507,13 @@ fn render_archived(
                     let truncated = m
                         .content
                         .as_deref()
-                        .map(truncate_winning_assistant)
+                        .map(|content| {
+                            if preserve_winning_assistant {
+                                truncate_adjacent_assistant(content)
+                            } else {
+                                truncate_winning_assistant(content)
+                            }
+                        })
                         .unwrap_or_default();
                     let mut obj = json!({
                         "role": "assistant",

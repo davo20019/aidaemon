@@ -105,6 +105,12 @@ pub(crate) fn shared_commands() -> Vec<CommandDef> {
             category: CommandCategory::Core,
         },
         CommandDef {
+            name: "context",
+            description: "Show conversation context coverage",
+            usage: None,
+            category: CommandCategory::Core,
+        },
+        CommandDef {
             name: "checkpoints",
             description: "List filesystem checkpoints",
             usage: None,
@@ -149,9 +155,67 @@ impl CommandContext {
             "/clear" => Some(self.handle_clear(session_id).await),
             "/wipe" => Some(self.handle_wipe(session_id).await),
             "/cost" => Some(self.handle_cost().await),
+            "/context" => Some(self.handle_context(session_id, user_role).await),
             "/checkpoints" => Some(self.handle_checkpoints(user_role).await),
             "/rollback" => Some(self.handle_rollback(args, session_id, user_role).await),
             _ => None,
+        }
+    }
+
+    async fn handle_context(&self, session_id: &str, user_role: UserRole) -> String {
+        if user_role != UserRole::Owner {
+            return "Only the owner can inspect conversation context coverage.".to_string();
+        }
+        let model = self.agent.current_model().await;
+        let (enabled, model_budget, trigger_tokens, recent_tokens, anchor) =
+            self.agent.context_debug_settings(session_id, &model).await;
+        let history = self.state.get_history(session_id, 10_000).await;
+        let summary = self.state.get_conversation_summary(session_id).await;
+        match (history, summary) {
+            (Ok(history), Ok(summary)) => {
+                let raw_values = history
+                    .iter()
+                    .map(|message| {
+                        serde_json::json!({
+                            "role": message.role,
+                            "content": message.content,
+                            "name": message.tool_name,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let exact_tokens =
+                    crate::memory::context_window::estimate_multimodal_message_tokens(&raw_values);
+                let compacted_messages = summary
+                    .as_ref()
+                    .map(|value| value.message_count)
+                    .unwrap_or(0);
+                let raw_recent_messages = history.len().saturating_sub(compacted_messages);
+                let summary_line = summary.as_ref().map_or_else(
+                    || "Summary: none yet".to_string(),
+                    |value| {
+                        format!(
+                            "Summary: {} messages through turn {} / message {} (~{} tokens)",
+                            value.message_count,
+                            value
+                                .last_turn_seq
+                                .map(|seq| seq.to_string())
+                                .unwrap_or_else(|| "legacy".to_string()),
+                            value.last_message_id,
+                            crate::memory::context_window::estimate_tokens(&value.summary)
+                        )
+                    },
+                );
+                format!(
+                    "Conversation context\nEnabled: {enabled}\nModel: {model}\nModel window: ~{model_budget} tokens\nCompaction high-water: ~{trigger_tokens} tokens\nRecent raw overlap target: ~{recent_tokens} tokens\n{summary_line}\nPersisted exact messages inspected: {} (~{exact_tokens} tokens)\nEstimated uncompacted messages: {raw_recent_messages}\nCurrent raw-turn anchor: {}\n\nExact retained history remains searchable even when it is not in the active prompt.",
+                    history.len(),
+                    anchor
+                        .map(|seq| seq.to_string())
+                        .unwrap_or_else(|| "not initialized".to_string())
+                )
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                format!("Could not inspect conversation context: {error}")
+            }
         }
     }
 

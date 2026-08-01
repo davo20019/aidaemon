@@ -561,7 +561,7 @@ pub(crate) async fn checkpoint_after_wipe(pool: &SqlitePool) -> anyhow::Result<(
     anyhow::bail!("could not truncate SQLite WAL after wiping session data")
 }
 
-fn match_expression(query: &str) -> anyhow::Result<String> {
+fn match_tokens(query: &str) -> anyhow::Result<Vec<String>> {
     let tokens: Vec<String> = query
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '+' | '#')))
         .filter(|token| !token.is_empty())
@@ -571,7 +571,11 @@ fn match_expression(query: &str) -> anyhow::Result<String> {
     if tokens.is_empty() {
         anyhow::bail!("query must contain at least one searchable character");
     }
-    Ok(tokens.join(" AND "))
+    Ok(tokens)
+}
+
+fn match_expression(tokens: &[String], operator: &str) -> String {
+    tokens.join(operator)
 }
 
 fn push_scope(qb: &mut QueryBuilder<'_, Sqlite>, scope: &HistoryScope, alias: &str) {
@@ -673,26 +677,24 @@ pub(crate) async fn search(
     semantic_sessions: &HashSet<String>,
 ) -> anyhow::Result<Vec<HistoryMessage>> {
     ensure_scope(scope)?;
-    let expression = match_expression(query)?;
+    let tokens = match_tokens(query)?;
+    let strict_expression = match_expression(&tokens, " AND ");
     let candidate_limit = limit.clamp(1, 50).saturating_mul(8).min(240) as i64;
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT h.event_id, h.session_id, h.task_id, h.turn_id, h.message_id,
-                h.role, h.created_at, h.source_kind,
-                json_extract(e.data, '$.content') AS content,
-                bm25(history_message_fts) AS lexical_rank
-         FROM history_message_fts
-         JOIN history_message_index h ON h.event_id=history_message_fts.rowid
-         JOIN events e ON e.id=h.event_id
-         WHERE history_message_fts MATCH ",
-    );
-    qb.push_bind(expression);
-    qb.push(" AND h.event_id <= ");
-    qb.push_bind(scope.snapshot_max_event_id);
-    push_scope(&mut qb, scope, "h");
-    qb.push(" ORDER BY lexical_rank LIMIT ");
-    qb.push_bind(candidate_limit);
-    let rows = qb.build().fetch_all(pool).await?;
-    let mut messages: Vec<_> = rows.iter().map(row_to_message).collect();
+    let mut messages = search_expression(pool, &strict_expression, scope, candidate_limit).await?;
+
+    // Exact all-term matching is precise but brittle under paraphrase. Broaden
+    // only when it cannot fill the requested set, then merge/deduplicate below.
+    if tokens.len() > 1 && messages.len() < limit.clamp(1, 50) {
+        let broad_expression = match_expression(&tokens, " OR ");
+        let mut broad = search_expression(pool, &broad_expression, scope, candidate_limit).await?;
+        for message in &mut broad {
+            // FTS5 bm25 ranks lower values first. Pull broad-only candidates
+            // toward zero so exact all-term hits remain preferred.
+            message.lexical_rank = message.lexical_rank.map(|rank| rank * 0.85);
+        }
+        messages.extend(broad);
+    }
+
     // Semantic episodes are a soft prior only. Global lexical discovery is
     // never restricted to the episode set.
     messages.sort_by(|a, b| {
@@ -711,6 +713,32 @@ pub(crate) async fn search(
     dedup_stable_message_ids(&mut messages);
     messages.truncate(limit.clamp(1, 50));
     Ok(messages)
+}
+
+async fn search_expression(
+    pool: &SqlitePool,
+    expression: &str,
+    scope: &HistoryScope,
+    candidate_limit: i64,
+) -> anyhow::Result<Vec<HistoryMessage>> {
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT h.event_id, h.session_id, h.task_id, h.turn_id, h.message_id,
+                h.role, h.created_at, h.source_kind,
+                json_extract(e.data, '$.content') AS content,
+                bm25(history_message_fts) AS lexical_rank
+         FROM history_message_fts
+         JOIN history_message_index h ON h.event_id=history_message_fts.rowid
+         JOIN events e ON e.id=h.event_id
+         WHERE history_message_fts MATCH ",
+    );
+    qb.push_bind(expression.to_string());
+    qb.push(" AND h.event_id <= ");
+    qb.push_bind(scope.snapshot_max_event_id);
+    push_scope(&mut qb, scope, "h");
+    qb.push(" ORDER BY lexical_rank LIMIT ");
+    qb.push_bind(candidate_limit);
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_message).collect())
 }
 
 pub(crate) async fn open(
@@ -1044,6 +1072,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_broadens_without_phrase_specific_rules() {
+        let pool = pool().await;
+        let event_id = insert(
+            &pool,
+            "root",
+            "assistant",
+            "The service was deployed to the Frankfurt region.",
+        )
+        .await;
+        project_event(&pool, event_id).await.unwrap();
+
+        // `source` is absent, so strict AND has no hit. The generic OR fallback
+        // still recovers the semantically adjacent canonical message.
+        let hits = search(
+            &pool,
+            "service deployment source",
+            &private_scope(event_id),
+            10,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(hits.iter().any(|hit| hit.event_id == event_id));
     }
 
     #[tokio::test]

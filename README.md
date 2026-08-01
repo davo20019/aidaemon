@@ -49,6 +49,7 @@ Then run `aidaemon` — the setup wizard walks you through picking a provider, e
 ### Channels
 Talk to it on **Telegram**, **Slack** (Socket Mode), or **Discord**. Run multiple bots, add new ones at runtime with `/connect`, no restart needed.
 Send images with a caption and the agent analyzes them via vision-capable LLMs (toggle with `[files] vision_enabled` in config).
+Ask it to create an image and the provider-neutral `generate_image` tool saves and attaches the result, ready for `send_file`. The bundled image backend uses a connected ChatGPT subscription and works even when the conversational model is Anthropic, Gemini, or another configured provider.
 Send voice notes or audio files on Telegram, Slack, or Discord. Audio-capable models receive native `input_audio` blocks; otherwise enable local Whisper STT fallback under `[files.stt]` (requires `whisper-cli`, a GGUF model, and `ffmpeg` for OGG/Opus). See `config.toml.example` for settings. Restart after config changes.
 Telegram owners can also run `/terminal [agent] [working_dir]` to launch the hosted terminal Mini App (`https://terminal.aidaemon.ai`) for direct CLI-agent sessions with automatic secure daemon pairing.
 
@@ -222,6 +223,20 @@ on `http://localhost:1455/auth/callback` (the port is fixed by OpenAI's client
 registration — use `--paste` when no local browser can reach it). Tokens are
 stored in the OS keychain and refreshed automatically. Requests identify
 themselves with an `originator: aidaemon` header.
+
+The same login also enables `generate_image` (when `[files] enabled = true`).
+It uses ChatGPT's subscription-backed image service and does not require an
+`OPENAI_API_KEY`. The image backend is selected independently from the chat
+provider, so a conversation running on Anthropic, Gemini, xAI, or a local model
+can still generate through the connected ChatGPT account.
+
+Internally, `generate_image` targets a provider-neutral
+`ImageGenerationBackend` interface. The ChatGPT subscription adapter is the
+first bundled implementation; adding another provider's native image API only
+requires a new adapter, without changing the tool schema, agent loop, attachment
+handling, or delivery flow. Until such an adapter is configured, image requests
+still require the ChatGPT login above. Disable the tool explicitly with
+`[tools] disabled = ["generate_image"]` if that fallback is not wanted.
 
 Subscription plans meter usage: when a cap is hit, the provider reports a rate
 limit and the configured fallbacks take over. Background goals and heartbeats

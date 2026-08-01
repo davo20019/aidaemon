@@ -11,26 +11,24 @@
 //! header — and the stream is consumed to completion before returning, matching
 //! the non-streaming contract every other provider here honors.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::error::{ProviderError, ProviderErrorKind};
 use super::streaming::SseFramer;
-use crate::oauth::chatgpt_codex::{self, ChatGptCredentials};
+use crate::oauth::chatgpt_codex::{self, ChatGptCredentialManager, ChatGptCredentials};
 use crate::traits::{
     ChatOptions, ModelProvider, ProviderResponse, ResponseMode, TokenUsage, ToolCall,
     ToolChoiceMode,
 };
 
 /// Codex backend root. Overridable for tests and self-hosted proxies.
-pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const DEFAULT_BASE_URL: &str = chatgpt_codex::CODEX_BACKEND_BASE_URL;
 
 /// Identifies the calling tool to OpenAI. Third-party clients declare
 /// themselves here rather than impersonating the Codex CLI.
@@ -67,9 +65,9 @@ pub struct OpenAiChatGptProvider {
     client: Client,
     base_url: String,
     reasoning_effort: Option<String>,
-    /// Cached credentials. The mutex also serializes refresh so concurrent
-    /// agent turns cannot each burn a rotation of the refresh token.
-    credentials: Arc<Mutex<Option<ChatGptCredentials>>>,
+    /// Shared with other subscription-backed adapters (for example image
+    /// generation) so refresh-token rotation is serialized process-wide.
+    credentials: std::sync::Arc<ChatGptCredentialManager>,
 }
 
 impl OpenAiChatGptProvider {
@@ -88,7 +86,7 @@ impl OpenAiChatGptProvider {
             client,
             base_url,
             reasoning_effort: None,
-            credentials: Arc::new(Mutex::new(None)),
+            credentials: chatgpt_codex::shared_credential_manager(),
         })
     }
 
@@ -119,42 +117,10 @@ impl OpenAiChatGptProvider {
 
     /// Return usable credentials, refreshing under lock when near expiry.
     async fn credentials(&self) -> Result<ChatGptCredentials, ProviderError> {
-        let mut guard = self.credentials.lock().await;
-
-        if guard.is_none() {
-            *guard = chatgpt_codex::load_credentials();
-        }
-
-        let current = guard.clone().ok_or_else(|| {
-            ProviderError::from_status(
-                401,
-                "No ChatGPT subscription login found. Run `aidaemon auth login openai` to connect \
-                 your ChatGPT account.",
-            )
-        })?;
-
-        if !current.needs_refresh(chrono::Utc::now()) {
-            return Ok(current);
-        }
-
-        debug!("Refreshing ChatGPT subscription access token");
-        match chatgpt_codex::refresh_credentials(&self.client, &current).await {
-            Ok(refreshed) => {
-                // Persist immediately: OpenAI rotates refresh tokens and the old
-                // one may already be dead.
-                if let Err(e) = chatgpt_codex::store_credentials(&refreshed) {
-                    warn!(error = %e, "Refreshed ChatGPT tokens could not be persisted");
-                }
-                *guard = Some(refreshed.clone());
-                Ok(refreshed)
-            }
-            Err(e) => {
-                // Drop the cached copy so the next call reloads from storage
-                // rather than retrying a token we know is dead.
-                *guard = None;
-                Err(ProviderError::from_status(401, &e.to_string()))
-            }
-        }
+        self.credentials
+            .usable_credentials(&self.client)
+            .await
+            .map_err(|error| ProviderError::from_status(401, &error.to_string()))
     }
 
     async fn send(

@@ -18,7 +18,34 @@ const FACT_LEXICAL_MIN_SCORE: f32 = 0.3;
 const FACT_LEXICAL_MAX_SCORE: f32 = 0.55;
 const FACT_FRESHNESS_MAX_BOOST: f32 = 0.15;
 const FACT_FRESHNESS_DECAY_HOURS: f32 = 168.0; // 7 days
-const FACT_PAD_LOW_CONFIDENCE_RESULTS: bool = true;
+
+/// Conservative fallback for passive prompt recall when embeddings are
+/// unavailable. Returning recent facts regardless of relevance leaks unrelated
+/// context into the model; an empty result is safer because explicit memory
+/// search remains available to the agent.
+fn lexical_relevant_facts(facts: &[Fact], query: &str, max: usize) -> Vec<Fact> {
+    let query_lower = query.to_lowercase();
+    let tokens = query_tokens(&query_lower);
+    let mut scored = facts
+        .iter()
+        .filter_map(|fact| {
+            let score = lexical_fallback_score(&query_lower, &tokens, fact);
+            (score > FACT_LEXICAL_MIN_SCORE).then_some((fact, score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.0.updated_at.cmp(&left.0.updated_at))
+    });
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(fact, _)| fact.clone())
+        .collect()
+}
 
 /// Keywords that signal the user wants ALL facts, not a filtered subset.
 const EXHAUSTIVE_QUERY_MARKERS: &[&str] = &[
@@ -1004,11 +1031,10 @@ impl crate::traits::FactStore for SqliteStateStore {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    "Failed to embed query for fact filtering, returning all facts: {}",
+                    "Failed to embed query for passive fact filtering; using lexical matches: {}",
                     e
                 );
-                let mut facts = all_facts;
-                facts.truncate(max);
+                let facts = lexical_relevant_facts(&all_facts, query, max);
                 bump_fact_recall(&self.pool, &facts).await;
                 let canonical = self.canonical_personal_facts().await.unwrap_or_default();
                 return Ok(prefer_canonical_facts(canonical, facts, query, max));
@@ -1123,22 +1149,6 @@ impl crate::traits::FactStore for SqliteStateStore {
                 let fact = all_facts[i].clone();
                 if seen_ids.insert(fact.id) {
                     relevant.push(fact);
-                }
-            }
-        }
-
-        // If filtering left us with very few facts, pad with most recent ones
-        if FACT_PAD_LOW_CONFIDENCE_RESULTS
-            && relevant.len() < max / 3
-            && all_facts.len() > relevant.len()
-        {
-            for fact in &all_facts {
-                if relevant.len() >= max {
-                    break;
-                }
-                if !seen_ids.contains(&fact.id) {
-                    seen_ids.insert(fact.id);
-                    relevant.push(fact.clone());
                 }
             }
         }
@@ -1344,8 +1354,7 @@ impl crate::traits::FactStore for SqliteStateStore {
         let query_vec = match self.embedding_service.embed(query.to_string()).await {
             Ok(v) => v,
             Err(_) => {
-                let mut facts = filtered;
-                facts.truncate(max);
+                let facts = lexical_relevant_facts(&filtered, query, max);
                 bump_fact_recall(&self.pool, &facts).await;
                 return Ok(facts);
             }
@@ -1456,21 +1465,6 @@ impl crate::traits::FactStore for SqliteStateStore {
                 let fact = filtered[fi].clone();
                 if seen_ids.insert(fact.id) {
                     relevant.push(fact);
-                }
-            }
-        }
-
-        if FACT_PAD_LOW_CONFIDENCE_RESULTS
-            && relevant.len() < max / 3
-            && filtered.len() > relevant.len()
-        {
-            for fact in &filtered {
-                if relevant.len() >= max {
-                    break;
-                }
-                if !seen_ids.contains(&fact.id) {
-                    seen_ids.insert(fact.id);
-                    relevant.push(fact.clone());
                 }
             }
         }

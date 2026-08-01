@@ -17,14 +17,18 @@
 //! which falls back to the `.env` file when `AIDAEMON_NO_KEYCHAIN=1`, so headless
 //! installs (launchd, systemd, containers) still work.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 /// Authorization endpoint (user-facing sign-in).
 pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -32,6 +36,10 @@ pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Token revocation endpoint, used on logout.
 pub const REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
+
+/// ChatGPT's subscription-backed Codex API root. Chat and image adapters share
+/// this root, but remain independent consumers of the OAuth credentials.
+pub const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 /// Public OAuth client identifier for ChatGPT/Codex sign-in. Not a secret.
 pub const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -88,6 +96,82 @@ impl ChatGptCredentials {
     pub fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
         self.expires_at <= now + REFRESH_SKEW
     }
+}
+
+/// Process-wide owner of ChatGPT subscription credentials.
+///
+/// OpenAI rotates refresh tokens. Keeping the refresh lock here, rather than in
+/// an individual model or image provider, prevents concurrent adapters from
+/// refreshing the same token and invalidating one another.
+pub struct ChatGptCredentialManager {
+    credentials: Mutex<Option<ChatGptCredentials>>,
+}
+
+impl ChatGptCredentialManager {
+    fn new() -> Self {
+        Self {
+            credentials: Mutex::new(None),
+        }
+    }
+
+    /// Return a usable access token, refreshing and persisting it under one
+    /// process-wide lock when it is close to expiry.
+    pub async fn usable_credentials(&self, client: &reqwest::Client) -> Result<ChatGptCredentials> {
+        let mut guard = self.credentials.lock().await;
+
+        if guard.is_none() {
+            *guard = load_credentials();
+        }
+
+        let current = guard.clone().ok_or_else(|| {
+            anyhow!(
+                "No ChatGPT subscription login found. Run `aidaemon auth login openai` to connect \
+                 your ChatGPT account."
+            )
+        })?;
+
+        if !current.needs_refresh(Utc::now()) {
+            return Ok(current);
+        }
+
+        debug!("Refreshing ChatGPT subscription access token");
+        match refresh_credentials(client, &current).await {
+            Ok(refreshed) => {
+                // Persist immediately: OpenAI rotates refresh tokens and the
+                // old token may already be dead.
+                if let Err(error) = store_credentials(&refreshed) {
+                    warn!(%error, "Refreshed ChatGPT tokens could not be persisted");
+                }
+                *guard = Some(refreshed.clone());
+                Ok(refreshed)
+            }
+            Err(error) => {
+                // Reload storage on the next call instead of retrying a token
+                // that is already known to be unusable.
+                *guard = None;
+                Err(error)
+            }
+        }
+    }
+
+    async fn replace_cached(&self, credentials: Option<ChatGptCredentials>) {
+        *self.credentials.lock().await = credentials;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_credentials(credentials: ChatGptCredentials) -> Self {
+        Self {
+            credentials: Mutex::new(Some(credentials)),
+        }
+    }
+}
+
+static SHARED_CREDENTIAL_MANAGER: Lazy<Arc<ChatGptCredentialManager>> =
+    Lazy::new(|| Arc::new(ChatGptCredentialManager::new()));
+
+/// Shared credential owner used by every ChatGPT subscription-backed adapter.
+pub fn shared_credential_manager() -> Arc<ChatGptCredentialManager> {
+    SHARED_CREDENTIAL_MANAGER.clone()
 }
 
 /// Raw token endpoint response.
@@ -381,6 +465,7 @@ pub async fn logout(client: &reqwest::Client) -> Result<()> {
     for suffix in ["access_token", "refresh_token", "account_id", "expires_at"] {
         let _ = crate::config::delete_from_keychain(&key(suffix));
     }
+    shared_credential_manager().replace_cached(None).await;
     Ok(())
 }
 
@@ -515,6 +600,9 @@ pub async fn login(
 
     let creds = exchange_code(client, &code, &pkce.verifier).await?;
     store_credentials(&creds)?;
+    shared_credential_manager()
+        .replace_cached(Some(creds.clone()))
+        .await;
     Ok(creds)
 }
 

@@ -26,6 +26,11 @@ fn lexical_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn compact_provenance_excerpt(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::utils::truncate_str(&single_line, 180)
+}
+
 /// Score one fact against a search query, or `None` if it doesn't clear the
 /// relevance bar.
 ///
@@ -703,9 +708,31 @@ impl Tool for ManageMemoriesTool {
                     // search results instead of reaching for the wrong tool.
                     let learned_ts = f.first_seen_at.unwrap_or(f.created_at).to_rfc3339();
                     let learned = Self::format_age(&learned_ts);
+                    let evidence = f
+                        .source_excerpt
+                        .as_deref()
+                        .map(compact_provenance_excerpt)
+                        .filter(|excerpt| !excerpt.is_empty())
+                        .map(|excerpt| {
+                            format!(
+                                "; evidence: {}",
+                                serde_json::to_string(&excerpt)
+                                    .unwrap_or_else(|_| "\"[unavailable]\"".to_string())
+                            )
+                        })
+                        .unwrap_or_default();
                     output.push_str(&format!(
-                        "• [{}] {} → \"{}\" (privacy: {}, from: {}, learned: {}){}\n",
-                        f.category, f.key, f.value, privacy_label, channel_label, learned, marker
+                        "• [{}] {} → \"{}\" (fact_id: {}, source: {}, privacy: {}, from: {}, learned: {}{}){}\n",
+                        f.category,
+                        f.key,
+                        f.value,
+                        f.id,
+                        f.source,
+                        privacy_label,
+                        channel_label,
+                        learned,
+                        evidence,
+                        marker
                     ));
                 }
 
@@ -2444,6 +2471,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provenance_excerpt_is_single_line_utf8_safe_and_bounded() {
+        let input = format!("User said:\n\t{}", "🦀".repeat(250));
+        let compact = compact_provenance_excerpt(&input);
+        assert!(!compact.contains('\n'));
+        assert!(!compact.contains('\t'));
+        assert!(compact.chars().count() <= 180);
+        assert!(compact.ends_with("..."));
+    }
+
     fn mk_fact(id: i64, category: &str, key: &str, value: &str) -> crate::traits::Fact {
         let now = chrono::Utc::now();
         crate::traits::Fact {
@@ -2504,13 +2541,15 @@ mod tests {
         let tool = ManageMemoriesTool::new(state.clone());
 
         state
-            .upsert_fact(
+            .upsert_fact_with_provenance(
                 "preference",
                 "local_dev_db_port",
                 "54329",
-                "test",
+                "progressive",
                 None,
                 FactPrivacy::Global,
+                Some(chrono::Utc::now()),
+                Some("You told me:\nThe local database port is 54329."),
             )
             .await
             .unwrap();
@@ -2555,6 +2594,15 @@ mod tests {
         assert!(
             result.contains("learned:"),
             "search results should include a 'learned:' recency; got:\n{result}"
+        );
+        assert!(result.contains("fact_id:"), "missing fact id:\n{result}");
+        assert!(
+            result.contains("source: progressive"),
+            "missing extraction source:\n{result}"
+        );
+        assert!(
+            result.contains("evidence: \"You told me: The local database port is 54329.\""),
+            "missing normalized source evidence:\n{result}"
         );
     }
 

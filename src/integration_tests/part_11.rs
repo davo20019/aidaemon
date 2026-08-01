@@ -144,6 +144,7 @@ async fn test_summary_crud() {
         summary: "We discussed topic A and decided on approach B.".to_string(),
         message_count: 10,
         last_message_id: "msg-123".to_string(),
+        last_turn_seq: Some(123),
         updated_at: Utc::now(),
     };
     harness
@@ -166,11 +167,13 @@ async fn test_summary_crud() {
         "We discussed topic A and decided on approach B."
     );
     assert_eq!(loaded.message_count, 10);
+    assert_eq!(loaded.last_turn_seq, Some(123));
 
     // Update it
     let updated = ConversationSummary {
         summary: "Updated: topic A, approach B, and new topic C.".to_string(),
         message_count: 15,
+        last_turn_seq: Some(124),
         ..loaded
     };
     harness
@@ -190,6 +193,51 @@ async fn test_summary_crud() {
         "Updated: topic A, approach B, and new topic C."
     );
     assert_eq!(reloaded.message_count, 15);
+    assert_eq!(reloaded.last_turn_seq, Some(124));
+
+    // A slower background job cannot overwrite a newer canonical cursor, even
+    // if its bounded message count is much larger.
+    let stale = ConversationSummary {
+        summary: "STALE".to_string(),
+        message_count: 10_000,
+        last_turn_seq: Some(120),
+        ..reloaded.clone()
+    };
+    harness
+        .state
+        .upsert_conversation_summary(&stale)
+        .await
+        .unwrap();
+    let after_stale = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(after_stale.summary, "STALE");
+    assert_eq!(after_stale.last_turn_seq, Some(124));
+
+    // Cursor progress is accepted even when the cumulative count happens to be
+    // equal, which prevents the old working-window-cap freeze.
+    let advanced = ConversationSummary {
+        summary: "Advanced cursor".to_string(),
+        last_message_id: "msg-125".to_string(),
+        last_turn_seq: Some(125),
+        ..after_stale
+    };
+    harness
+        .state
+        .upsert_conversation_summary(&advanced)
+        .await
+        .unwrap();
+    let advanced_loaded = harness
+        .state
+        .get_conversation_summary("test_session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(advanced_loaded.summary, "Advanced cursor");
+    assert_eq!(advanced_loaded.last_turn_seq, Some(125));
 
     // Clear session should also clear summary
     harness.state.clear_session("test_session").await.unwrap();

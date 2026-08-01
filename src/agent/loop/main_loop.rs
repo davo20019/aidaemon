@@ -161,6 +161,7 @@ impl Agent {
         )
         .await?;
         let BootstrapData {
+            user_text: canonical_user_text,
             task_id,
             resume_execution_snapshot,
             emitter,
@@ -184,12 +185,16 @@ impl Agent {
             route_failsafe_active,
             core_prompt_bytes,
             task_context_tail,
-            mut session_summary,
+            session_summary,
             mut harness_eval,
         } = match bootstrap_outcome {
             BootstrapOutcome::Return(result) => return result,
             BootstrapOutcome::Continue(data) => *data,
         };
+        // Bootstrap may enrich the durable user message with an STT fallback.
+        // From this point onward, use exactly what was persisted so matching,
+        // rendering, routing, and dialogue projection share one source of truth.
+        let user_text = canonical_user_text.as_str();
         let mut turn_context = self
             .build_turn_context_from_recent_history(session_id, user_text)
             .await;
@@ -202,25 +207,25 @@ impl Agent {
             .iter()
             .map(|reason| reason.as_code())
             .collect();
-        let llm_user_text = if matches!(
-            turn_context.followup_mode,
-            Some(FollowupMode::Followup | FollowupMode::ClarificationAnswer)
-        ) {
-            let dialogue_state = self
-                .state
-                .get_dialogue_state(session_id)
-                .await
-                .ok()
-                .flatten();
-            super::dialogue_state::compose_llm_user_text(
-                turn_context.followup_mode,
-                dialogue_state.as_ref(),
-                user_text,
-                chrono::Utc::now(),
-            )
-        } else {
-            user_text.to_string()
-        };
+        let dialogue_state = self
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .ok()
+            .flatten();
+        // Keep the persisted user message byte-for-byte intact. Historically a
+        // follow-up was rewritten into a second synthetic user message, leaving
+        // both the stored raw message and the rewritten copy in the provider
+        // transcript. Continuity now comes from normal transcript adjacency.
+        let llm_user_text = canonical_user_text.clone();
+        // Conversation continuity is topological, not phrase-classified: every
+        // user turn keeps the immediately preceding assistant exchange intact.
+        // Whether the wording continues that topic or starts a new task remains
+        // for the model to interpret from the raw transcript.
+        let prior_assistant_message_id = dialogue_state
+            .as_ref()
+            .and_then(|state| state.last_assistant_turn.as_ref())
+            .map(|turn| turn.message_id.clone());
         info!(
             session_id,
             followup_mode,
@@ -1200,7 +1205,6 @@ impl Agent {
                     soft_limit_warned: stopping_budget.soft_limit_warned,
                     last_progress_summary: &mut last_progress_summary,
                     tool_failure_count: stopping_failures.tool_failure_count,
-                    session_summary: &mut session_summary,
                     policy_bundle: &mut policy_bundle,
                     user_text,
                     available_capabilities: &available_capabilities,
@@ -1307,138 +1311,6 @@ impl Agent {
                 }
             }
 
-            // Compaction: on the first iteration, detect whether the conversation
-            // history needs compacting. IdleGap and FileUpload triggers run
-            // synchronously (user just arrived or uploaded a file — latency is
-            // acceptable). WindowOverflow runs asynchronously in the background
-            // so it doesn't add 15s latency to every message once the conversation
-            // exceeds the window size. The aging pair stays in the sliding window
-            // until the background compaction completes.
-            if iteration == 1 && self.context_window_config.enabled {
-                // Count user-message pairs and compute idle gap.
-                let history = self
-                    .state
-                    .get_history(session_id, 100)
-                    .await
-                    .unwrap_or_default();
-                let total_pairs = history.iter().filter(|m| m.role == "user").count();
-                let idle_gap_seconds = history
-                    .last()
-                    .map(|m| {
-                        let now = Utc::now();
-                        now.signed_duration_since(m.created_at).num_seconds().max(0) as u64
-                    })
-                    .unwrap_or(0);
-
-                let window_size = self.context_window_config.summary_window;
-                let compaction_trigger = super::compaction::detect_compaction_trigger(
-                    total_pairs,
-                    window_size,
-                    idle_gap_seconds,
-                    user_text,
-                );
-
-                if let Some(ref trigger) = compaction_trigger {
-                    info!(
-                        session_id,
-                        ?trigger,
-                        total_pairs,
-                        idle_gap_seconds,
-                        window_size,
-                        "Compaction trigger detected"
-                    );
-
-                    // Convert history messages to JSON Value array for the compaction prompt.
-                    let messages_to_compact: Vec<Value> = history
-                        .iter()
-                        .map(|m| {
-                            let mut msg = json!({ "role": m.role });
-                            if let Some(ref content) = m.content {
-                                msg["content"] = json!(content);
-                            }
-                            if let Some(ref name) = m.tool_name {
-                                msg["name"] = json!(name);
-                            }
-                            msg
-                        })
-                        .collect();
-
-                    let last_message_id = history.last().map(|m| m.id.as_str()).unwrap_or("");
-
-                    match trigger {
-                        super::compaction::CompactionTrigger::WindowOverflow { .. } => {
-                            // Async — don't block the user's response. The aging
-                            // pair is already in the sliding window (we haven't
-                            // removed it). On the next turn the summary's
-                            // last_message_id will cover it.
-                            let provider = llm_provider.clone();
-                            let compaction_model = model.clone();
-                            let state = self.state.clone();
-                            let sid = session_id.to_string();
-                            let summary_clone = session_summary.clone();
-                            let msgs = messages_to_compact.clone();
-                            let msg_count = total_pairs;
-                            let last_id = last_message_id.to_string();
-                            tokio::spawn(async move {
-                                if let Err(e) = super::compaction::run_and_store_compaction(
-                                    provider,
-                                    &compaction_model,
-                                    state.as_ref(),
-                                    &sid,
-                                    summary_clone,
-                                    &msgs,
-                                    msg_count,
-                                    &last_id,
-                                )
-                                .await
-                                {
-                                    warn!(session_id = %sid, error = %e, "Background compaction failed");
-                                }
-                            });
-                            info!(
-                                session_id,
-                                "Background compaction spawned for window overflow"
-                            );
-                        }
-                        _ => {
-                            // IdleGap / FileUpload — run synchronously (15s timeout).
-                            match tokio::time::timeout(
-                                Duration::from_secs(15),
-                                super::compaction::run_and_store_compaction(
-                                    llm_provider.clone(),
-                                    &model,
-                                    self.state.as_ref(),
-                                    session_id,
-                                    session_summary.clone(),
-                                    &messages_to_compact,
-                                    total_pairs,
-                                    last_message_id,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    // Reload the summary so message build uses the fresh version.
-                                    session_summary = self
-                                        .state
-                                        .get_conversation_summary(session_id)
-                                        .await
-                                        .ok()
-                                        .flatten();
-                                    info!(session_id, "Synchronous compaction completed");
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(session_id, error = %e, "Synchronous compaction failed");
-                                }
-                                Err(_) => {
-                                    warn!(session_id, "Synchronous compaction timed out (15s)");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             let message_build_directives = turn_state.directives.for_message_build_phase();
             let message_build_recovery = turn_state.recovery.for_message_build_phase();
             let message_build_start = Instant::now();
@@ -1457,6 +1329,11 @@ impl Agent {
                     model: &model,
                     core_prompt: &core_prompt_bytes,
                     task_context_tail: &task_context_tail,
+                    prior_assistant_message_id: prior_assistant_message_id.as_deref(),
+                    summary_last_message_id: session_summary
+                        .as_ref()
+                        .filter(|summary| summary.last_turn_seq.is_some())
+                        .map(|summary| summary.last_message_id.as_str()),
                     tool_defs: &tool_defs,
                     policy_bundle: &policy_bundle,
                     pending_system_messages: message_build_directives.pending_system_messages,

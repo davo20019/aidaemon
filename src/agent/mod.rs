@@ -110,6 +110,10 @@ const HARD_ITERATION_CAP: usize = 200;
 /// Longer content is truncated with a "[prior turn, truncated]" marker to
 /// prevent stale context from polluting subsequent interactions.
 const MAX_OLD_ASSISTANT_CONTENT_CHARS: usize = 200;
+/// The adjacent prior assistant answer is recent transcript, not generic
+/// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only
+/// genuinely oversized answers use deterministic head/tail compaction.
+const MAX_ADJACENT_ASSISTANT_CONTENT_CHARS: usize = 12_000;
 /// Higher cap for archived assistant messages that end in a clarifying
 /// question/menu: the options ARE the actionable state the next user turn
 /// refers to ("Yes do 1, 2"), so they must survive archival. Content over the
@@ -291,8 +295,6 @@ pub(in crate::agent) use history::{
     authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
     mutation_contract_fulfilled,
 };
-#[path = "loop/compaction.rs"]
-mod compaction;
 #[path = "runtime/llm.rs"]
 mod llm;
 pub(in crate::agent) use llm::LlmCallTelemetry;
@@ -682,6 +684,35 @@ impl Agent {
     /// Current recursion depth of this agent.
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Read-only context-window diagnostics for the owner-facing `/context`
+    /// command. No prompt content or private memory values are exposed.
+    pub(crate) async fn context_debug_settings(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> (bool, usize, usize, usize, Option<i64>) {
+        (
+            self.context_window_config.enabled,
+            crate::memory::context_window::model_context_budget(model, &self.context_window_config),
+            self.context_window_config
+                .summarize_token_threshold_for(model),
+            self.context_window_config.summary_recent_tokens_for(model),
+            self.turn_anchors.read().await.get(session_id).copied(),
+        )
+    }
+
+    /// Lower the token-pressure watermark in focused tests without weakening
+    /// production defaults or making tests manufacture multi-megabyte prompts.
+    #[cfg(test)]
+    pub(crate) fn set_context_compaction_tokens_for_test(
+        &mut self,
+        token_threshold: usize,
+        recent_tokens: usize,
+    ) {
+        self.context_window_config.summarize_token_threshold = token_threshold;
+        self.context_window_config.summary_recent_tokens = recent_tokens;
     }
 
     /// Register a correction-execution context for a remediation goal id.

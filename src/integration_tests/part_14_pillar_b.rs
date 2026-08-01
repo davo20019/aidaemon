@@ -18,26 +18,24 @@
 // sequence. These invariants apply ONLY to the OpenAI adapter; anthropic/google
 // hoist system content and are covered by Pillar A determinism tests.
 //
-// The stable region is `core` (message index 0, role=system) + the archived
-// turns that follow it. The transient suffix is the `[Task Context]` tail
-// (boundary − 1) + the current-turn messages; these rotate per turn by design
-// and are excluded from the stable-region comparisons below.
+// The stable region is `core` (message index 0, role=system) + archived turns
+// older than the immediate parent. The transient continuity suffix is the
+// `[Current Task]` marker, `[Task Context]` tail, the complete immediate-parent
+// exchange, and the current turn. A turn graduates from that suffix into the
+// stable archived prefix after it is no longer the immediate parent.
 
 /// Identify the contiguous stable prefix of a built payload: message 0 (core)
-/// plus every following ARCHIVED conversation message, stopping at the first
-/// transient element. Transient elements are the per-task `[Task Context]`
-/// system tail and the current user turn. We detect the tail by its marker
-/// substring and stop there; everything before it (after core) is archived.
+/// plus every following stable ARCHIVED conversation message, stopping at the
+/// first transient element. We detect the task marker/tail and stop there;
+/// everything before it (after core) is older than the immediate parent.
 fn stable_prefix_serialized(messages: &[serde_json::Value]) -> Vec<String> {
     let mut out = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        // The transient suffix begins at the per-task directives injected just
-        // before the current user (boundary − 1): the `[Task Context]` tail and
-        // the `[Current Task]` marker. Both are system messages that rotate per
-        // turn; the first of them marks the end of the stable (core+archived)
-        // region. Everything before it is core (i==0) + archived turns.
+        // The transient suffix begins at the per-task directives injected
+        // before the immediate-parent exchange. Both system messages rotate
+        // per turn; the first marks the end of core + older archived turns.
         if i > 0
             && role == "system"
             && (content.contains("[Task Context]") || content.contains("[Current Task]"))
@@ -55,21 +53,27 @@ fn core_serialized(messages: &[serde_json::Value]) -> String {
 }
 
 /// INVARIANT 2 — cross-turn archived stability.
-/// Across three turns in one session, `core + archived[..N-1]` elements are
-/// byte-identical between turn 2 and turn 3, and the archived turn introduced in
-/// turn 2 (`archived[N]`) is byte-stable when re-rendered in turn 3. Asserted on
-/// the built payload (call_log) element-wise.
+/// Across four turns in one session, `core + archived[..N-1]` elements are
+/// byte-identical between turn 3 and turn 4. Turn 1 is already older than the
+/// immediate parent in both builds, so this verifies the stable cache region
+/// without conflating it with the deliberately transient continuity suffix.
 #[tokio::test]
 async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("First answer."),
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
+        MockProvider::text_response("Fourth answer."),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_cross_turn_archived";
 
-    for msg in ["alpha question one", "beta question two", "gamma question three"] {
+    for msg in [
+        "alpha question one",
+        "beta question two",
+        "gamma question three",
+        "delta question four",
+    ] {
         let _ = harness
             .agent
             .handle_message(
@@ -85,10 +89,10 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
     }
 
     let calls = harness.provider.call_log.lock().await;
-    assert!(calls.len() >= 3, "expected one LLM call per turn, got {}", calls.len());
-    // The build that ran for turn 2 (sees turn 1 archived) and turn 3 (sees
-    // turns 1 and 2 archived). Use the LAST call of each turn — here one call
-    // per turn (text response, no tools).
+    assert!(calls.len() >= 4, "expected one LLM call per turn, got {}", calls.len());
+    // Turn 3 carries turn 1 in the stable archived prefix and turn 2 in the
+    // transient continuity suffix. Turn 4 extends the stable prefix with turn
+    // 2 while keeping turn 1 byte-identical.
     let turn2 = &calls[calls.len() - 2].messages;
     let turn3 = &calls[calls.len() - 1].messages;
 
@@ -99,26 +103,25 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
         "core (message 0) must be byte-identical across turns"
     );
 
-    // The stable archived prefix of turn 2 must be an element-wise PREFIX of
-    // turn 3's stable archived prefix: turn 3 archives one more whole turn, so
-    // it extends turn 2's archived region without rewriting any earlier element.
+    // The stable archived prefix of turn 3 must be an element-wise PREFIX of
+    // turn 4's stable archived prefix: the older region grows without rewriting
+    // any existing element.
     let pre2 = stable_prefix_serialized(turn2);
     let pre3 = stable_prefix_serialized(turn3);
-    // The archived region must actually GROW turn-over-turn (otherwise the
-    // prefix-equality below would be vacuously true): turn 3 archives turn 2 on
-    // top of turn 1, so its stable prefix is strictly longer.
+    // The archived region must actually grow turn-over-turn (otherwise the
+    // prefix-equality below would be vacuously true).
     assert!(
         pre3.len() > pre2.len(),
-        "turn 3 stable prefix ({}) must STRICTLY exceed turn 2 ({}) — the \
+        "turn 4 stable prefix ({}) must STRICTLY exceed turn 3 ({}) — the \
          archived region must grow as turns accumulate",
         pre3.len(),
         pre2.len()
     );
-    // And turn 2 must already carry a non-trivial archived region (core + at
+    // And turn 3 must already carry a non-trivial archived region (core + at
     // least turn 1's archived messages), so the prefix check is meaningful.
     assert!(
         pre2.len() > 1,
-        "turn 2 stable prefix must include core + archived turn 1, got {}",
+        "turn 3 stable prefix must include core + archived turn 1, got {}",
         pre2.len()
     );
     for (i, el) in pre2.iter().enumerate() {
@@ -128,22 +131,22 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
              byte-identical when turn 3 archives an additional turn"
         );
     }
-    // The prior user message from turn 1 must survive verbatim in turn 2's
+    // The prior user message from turn 1 must survive verbatim in turn 3's
     // archived region (turn-anchored whole-turn history retains it).
     assert!(
         turn2.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content").and_then(|c| c.as_str()) == Some("alpha question one")
         }),
-        "turn 1 user message must survive verbatim as archived context in turn 2"
+        "turn 1 user message must survive verbatim as archived context in turn 3"
     );
-    // And it is still byte-identical in turn 3 (archived[N] byte-stability).
+    // And it is still present in turn 4 (archived byte-stability).
     assert!(
         turn3.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content").and_then(|c| c.as_str()) == Some("alpha question one")
         }),
-        "turn 1 user message must remain byte-stable in turn 3"
+        "turn 1 user message must remain byte-stable in turn 4"
     );
 }
 
@@ -157,6 +160,7 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         MockProvider::text_response("First answer."),
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
+        MockProvider::text_response("Fourth answer."),
     ]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_fact_between_turns";
@@ -174,12 +178,28 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         )
         .await
         .unwrap();
-    // Turn 2 (baseline) — captures core + archived prefix BEFORE the fact.
+    // Turn 2 establishes enough history for turn 1 to enter the stable prefix
+    // on the next build.
     let _ = harness
         .agent
         .handle_message(
             session,
             "second request here",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Turn 3 is the baseline before the fact. Its stable prefix contains turn
+    // 1, while turn 2 remains in the transient continuity suffix.
+    let _ = harness
+        .agent
+        .handle_message(
+            session,
+            "third request here",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -204,12 +224,12 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         .await
         .unwrap();
 
-    // Turn 3 — built AFTER the fact store.
+    // Turn 4 — built AFTER the fact store.
     let _ = harness
         .agent
         .handle_message(
             session,
-            "third request here",
+            "fourth request here",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -219,8 +239,8 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         .unwrap();
 
     let calls = harness.provider.call_log.lock().await;
-    let turn2 = &calls[calls.len() - 2].messages; // before fact
-    let turn3 = &calls[calls.len() - 1].messages; // after fact
+    let turn2 = &calls[calls.len() - 2].messages; // turn 3, before fact
+    let turn3 = &calls[calls.len() - 1].messages; // turn 4, after fact
 
     // Core unchanged (facts do not invalidate the stable core).
     assert_eq!(

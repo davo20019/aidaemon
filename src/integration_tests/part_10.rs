@@ -582,13 +582,8 @@ async fn test_synthesized_done_persisted() {
     );
 }
 
-/// Regression: old interaction assistant responses should be truncated so
-/// stale context from long prior turns doesn't pollute subsequent replies.
-///
-/// Pillar B (Task 7): the archived renderer (`render_archived`) truncates the
-/// winning assistant of EVERY archived turn — the legacy "immediately-prior
-/// assistant preserved untruncated" exemption was retired (handoff context now
-/// lives in the per-task context tail, not in raw archived assistant bytes).
+/// Regression: stale archived answers stay compact while the exact immediately
+/// preceding answer remains available for natural-language follow-ups.
 #[tokio::test]
 async fn test_old_interaction_assistant_content_truncated() {
     let long_response_1 = "B".repeat(500);
@@ -649,8 +644,8 @@ async fn test_old_interaction_assistant_content_truncated() {
         .unwrap();
     assert_eq!(r3, "Short answer.");
 
-    // Verify: BOTH prior turns' 500-char responses are truncated in Turn 3 —
-    // every archived turn's winning assistant is truncated by `render_archived`.
+    // Verify: the older turn is compact, while the structurally referenced
+    // immediately preceding turn is present in full.
     let call_log = harness.provider.call_log.lock().await;
     let turn3_call = call_log.last().unwrap();
     let assistant_msgs: Vec<&serde_json::Value> = turn3_call
@@ -670,22 +665,20 @@ async fn test_old_interaction_assistant_content_truncated() {
         "Turn 1's long assistant response should be truncated in Turn 3's context"
     );
 
-    // Turn 2's response (AAA...) is ALSO truncated now (no immediately-prior
-    // exemption under the turn-anchored archived renderer).
-    let has_truncated_a = assistant_msgs.iter().any(|m| {
+    let has_full_a = assistant_msgs.iter().any(|m| {
         m.get("content")
             .and_then(|c| c.as_str())
-            .is_some_and(|s| s.starts_with('A') && s.ends_with('…') && s.len() < 500)
+            .is_some_and(|s| s == long_response_2)
     });
     assert!(
-        has_truncated_a,
-        "Turn 2's assistant response should also be truncated (archived)"
+        has_full_a,
+        "Turn 2's assistant response should be preserved in full as the referenced parent"
     );
 
     // Truncated content should be <= MAX_OLD_ASSISTANT_CONTENT_CHARS + ellipsis
     for m in &assistant_msgs {
         if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-            if (content.starts_with('B') || content.starts_with('A')) && content.ends_with('…') {
+            if content.starts_with('B') && content.ends_with('…') {
                 // 200 chars + "…" (3 bytes) = ~203 bytes max
                 assert!(
                     content.len() <= 210,
@@ -775,42 +768,34 @@ async fn test_old_short_assistant_response_preserved_unmodified() {
 
 // ==================== Compaction Integration Tests ====================
 
-/// When a session exceeds the sliding window size, compaction should fire
-/// and produce a summary in the DB. Subsequent turns should see the
-/// [Session Summary] in their LLM context.
+/// When canonical conversation history crosses the token high-water mark,
+/// compaction should fire and produce structured state in the DB. Subsequent
+/// turns should see that state and its coverage cursor in their LLM context.
 #[tokio::test]
 async fn test_compaction_fires_on_window_overflow() {
-    // The default ContextWindowConfig has enabled=true, summary_window=6.
-    // We need 7+ turns to exceed the window. Each turn consumes 1 mock response.
-    // Window overflow compaction runs asynchronously, so we provide extra
-    // responses (compaction calls also consume from the mock queue).
-    // Turns 7+ each trigger async compaction: 1 extra response per turn.
-    let mut responses = Vec::new();
-    // Turns 1-6: 1 response each (no compaction triggered)
-    for i in 1..=6 {
-        responses.push(MockProvider::text_response(&format!("Response {}", i)));
-    }
-    // Turn 7: compaction fires (async) + main response = 2 responses
-    responses.push(MockProvider::text_response("Mock response"));
-    responses.push(MockProvider::text_response("Response 7"));
-    // Turn 8: compaction fires again (async, incremental) + main response = 2 responses
-    responses.push(MockProvider::text_response("Mock response"));
-    responses.push(MockProvider::text_response("Response 8"));
-    // Extra safety margin for any additional LLM calls
-    for _ in 0..4 {
-        responses.push(MockProvider::text_response("Mock response"));
-    }
+    // All responses are interchangeable because the background summary and
+    // foreground completion calls can race. Supplying a generous homogeneous
+    // queue makes the test assert context behavior, not scheduler ordering.
+    let responses = (0..32)
+        .map(|_| MockProvider::text_response("Synthetic response"))
+        .collect();
 
     let provider = MockProvider::with_responses(responses);
-    let harness = setup_test_agent(provider).await.unwrap();
+    let mut harness = setup_test_agent(provider).await.unwrap();
+    harness
+        .agent
+        .set_context_compaction_tokens_for_test(512, 256);
 
-    // Run 7 turns to trigger window overflow compaction.
+    // Cross the focused test watermark with ordinary-sized synthetic messages.
+    // Production retains its 12k-token default; compaction is intentionally no
+    // longer driven by a fixed number of messages.
+    let pressure = "synthetic historical context detail ".repeat(30);
     for i in 1..=7 {
         let _ = harness
             .agent
             .handle_message(
                 "compaction_test",
-                &format!("Question {} about topic {}", i, i),
+                &format!("Question {i} about synthetic topic {i}. {pressure}"),
                 None,
                 UserRole::Owner,
                 ChannelContext::private("test"),
@@ -859,7 +844,7 @@ async fn test_compaction_fires_on_window_overflow() {
     // resilient to slower runners.
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Verify: Turn 8's LLM call should include [Session Summary]. Turn 8
+    // Verify: Turn 8's LLM call should include compacted state. Turn 8
     // can generate multiple LLM calls (an async incremental compaction plus
     // the main response) and their order on the call_log is timing-
     // dependent. Scan the calls produced during Turn 8 rather than relying
@@ -881,12 +866,15 @@ async fn test_compaction_fires_on_window_overflow() {
             m.get("role").and_then(|r| r.as_str()) == Some("system")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|s| s.contains("[Session Summary]"))
+                    .is_some_and(|s| {
+                        s.contains("[Context Coverage]")
+                            && s.contains("[Compacted Conversation State]")
+                    })
         })
     });
     assert!(
         has_summary,
-        "Turn 8's LLM context should include [Session Summary] from compaction"
+        "Turn 8's LLM context should include compacted state and its coverage cursor"
     );
 
     // Verify: Turn 8 should have a [Current Task] boundary marker. Like the

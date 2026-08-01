@@ -157,9 +157,6 @@ const OPEN_REQUEST_ANCHOR_TTL_HOURS: i64 = 12;
 /// long pause is normal, but an arbitrary short message hours later is a new
 /// request, not an answer.
 const OPEN_QUESTION_IMPLICIT_BIND_TTL_MINUTES: i64 = 30;
-/// A question the user just answered stays readable for the answering turn's
-/// prompt; the binding is per-exchange, not durable state.
-const CLOSED_QUESTION_INJECTION_TTL_MINUTES: i64 = 30;
 
 fn open_request_anchor_expired(request: &OpenRequest, now: chrono::DateTime<Utc>) -> bool {
     match request.status {
@@ -232,7 +229,19 @@ fn user_turn_weakly_references_existing_request(
     trimmed: &str,
     lower: &str,
 ) -> bool {
-    if state.open_request.is_none() {
+    // Weak linguistic carry-over (a generic short utterance) may bind only to
+    // genuinely pending work. An answered request must not capture an unrelated
+    // short question during the linger TTL; ordinary transcript adjacency still
+    // gives the model the preceding exchange without changing routing state.
+    if !state.open_request.as_ref().is_some_and(|request| {
+        matches!(
+            request.status,
+            OpenRequestStatus::Open
+                | OpenRequestStatus::InProgress
+                | OpenRequestStatus::PartiallyAnswered
+                | OpenRequestStatus::Blocked
+        )
+    }) {
         return false;
     }
 
@@ -242,6 +251,30 @@ fn user_turn_weakly_references_existing_request(
         && !looks_like_self_contained_mutation_request(trimmed, lower)
         && !looks_like_short_command_request(trimmed)
         && !is_courtesy_only(lower)
+}
+
+/// Return the single persisted classification for the current user turn.
+///
+/// `record_dialogue_user_message` runs during bootstrap before turn-context
+/// assembly. Consumers should use this result instead of independently
+/// classifying the same text a second time. Text equality protects callers
+/// from accidentally reusing a stale dialogue-state row.
+pub(in crate::agent) fn resolved_followup_mode(
+    state: &DialogueState,
+    current_user_text: &str,
+) -> Option<super::followup::FollowupMode> {
+    let current = current_user_text.trim();
+    let turn = state
+        .last_user_turn
+        .as_ref()
+        .filter(|turn| turn.text.trim().eq_ignore_ascii_case(current))?;
+    Some(match turn.kind {
+        UserTurnKind::Followup => super::followup::FollowupMode::Followup,
+        UserTurnKind::ClarificationAnswer => super::followup::FollowupMode::ClarificationAnswer,
+        UserTurnKind::NewRequest | UserTurnKind::Courtesy | UserTurnKind::Unknown => {
+            super::followup::FollowupMode::NewTask
+        }
+    })
 }
 
 fn classify_user_turn(
@@ -288,14 +321,18 @@ fn classify_user_turn(
         return UserTurnKind::Followup;
     }
 
-    if state.open_request.is_none() {
-        return UserTurnKind::NewRequest;
-    }
-
-    if state.open_request.is_some() {
+    if state.open_request.as_ref().is_some_and(|request| {
+        matches!(
+            request.status,
+            OpenRequestStatus::Open
+                | OpenRequestStatus::InProgress
+                | OpenRequestStatus::PartiallyAnswered
+                | OpenRequestStatus::Blocked
+        )
+    }) {
         UserTurnKind::Followup
     } else {
-        UserTurnKind::Unknown
+        UserTurnKind::NewRequest
     }
 }
 
@@ -746,66 +783,6 @@ pub(in crate::agent) async fn record_dialogue_assistant_message(
     agent.state.upsert_dialogue_state(&state).await
 }
 
-/// Tail-preserving clip for injected clarifying questions: the options at the
-/// end are the actionable part the user's reply refers to.
-fn clip_question_keeping_tail(text: &str) -> String {
-    const CAP: usize = 2000;
-    let count = text.chars().count();
-    if count <= CAP {
-        text.to_string()
-    } else {
-        let tail: String = text.chars().skip(count - CAP).collect();
-        format!("…{tail}")
-    }
-}
-
-/// Compose the LLM-visible user text for the current turn from the dialogue
-/// state. Extracted from the main loop so the injection policy is unit-testable.
-///
-/// Followup turns carry the pending open request — but ONLY while it is
-/// genuinely pending (not answered/superseded) and within its TTL; re-injecting
-/// a resolved request resurrects questions the user already got answers for.
-/// Clarification-answer turns carry the question being answered instead.
-pub(in crate::agent) fn compose_llm_user_text(
-    followup_mode: Option<super::followup::FollowupMode>,
-    state: Option<&DialogueState>,
-    user_text: &str,
-    now: chrono::DateTime<Utc>,
-) -> String {
-    let trimmed = user_text.trim();
-    match followup_mode {
-        Some(super::followup::FollowupMode::Followup) => state
-            .and_then(|s| s.open_request.as_ref())
-            .filter(|request| !open_request_anchor_expired(request, now))
-            .map(|request| request.text.trim())
-            .filter(|original| !original.is_empty() && !original.eq_ignore_ascii_case(trimmed))
-            .map(|original| format!("Original request:\n{original}\n\nFollow-up:\n{trimmed}"))
-            .unwrap_or_else(|| user_text.to_string()),
-        Some(super::followup::FollowupMode::ClarificationAnswer) => state
-            .and_then(|s| {
-                s.open_question
-                    .as_ref()
-                    .filter(|question| question.awaiting_user_reply)
-                    .or(s.last_closed_question.as_ref())
-            })
-            .filter(|question| {
-                now.signed_duration_since(question.asked_at)
-                    <= chrono::Duration::minutes(CLOSED_QUESTION_INJECTION_TTL_MINUTES)
-            })
-            .map(|question| question.text.trim())
-            .filter(|question| !question.is_empty())
-            .map(|question| {
-                format!(
-                    "Assistant asked:\n{}\n\nFollow-up:\n{}",
-                    clip_question_keeping_tail(question),
-                    trimmed
-                )
-            })
-            .unwrap_or_else(|| user_text.to_string()),
-        _ => user_text.to_string(),
-    }
-}
-
 pub(in crate::agent) async fn record_dialogue_task_end(
     agent: &Agent,
     session_id: &str,
@@ -1008,128 +985,6 @@ mod tests {
     }
 
     #[test]
-    fn compose_followup_skips_answered_open_request() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        state.open_request = Some(request_with(
-            OpenRequestStatus::Answered,
-            now - chrono::Duration::hours(2),
-            Some(now - chrono::Duration::hours(2)),
-        ));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::Followup),
-            Some(&state),
-            "Yes do 1, 2",
-            now,
-        );
-        assert_eq!(
-            out, "Yes do 1, 2",
-            "answered requests must never be re-injected"
-        );
-    }
-
-    #[test]
-    fn compose_followup_injects_fresh_open_request() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        state.open_request = Some(request_with(
-            OpenRequestStatus::Open,
-            now - chrono::Duration::minutes(1),
-            None,
-        ));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::Followup),
-            Some(&state),
-            "make it shorter",
-            now,
-        );
-        assert!(out.starts_with("Original request:\nWhat's a contract vehicle?"));
-        assert!(out.ends_with("Follow-up:\nmake it shorter"));
-    }
-
-    #[test]
-    fn compose_followup_skips_expired_open_request() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        state.open_request = Some(request_with(
-            OpenRequestStatus::Open,
-            now - chrono::Duration::hours(13),
-            None,
-        ));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::Followup),
-            Some(&state),
-            "make it shorter",
-            now,
-        );
-        assert_eq!(
-            out, "make it shorter",
-            "requests past the TTL must not be injected"
-        );
-    }
-
-    #[test]
-    fn compose_clarification_answer_injects_closed_question() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        state.last_closed_question = Some(question_with(now - chrono::Duration::minutes(1), false));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::ClarificationAnswer),
-            Some(&state),
-            "Yes do 1, 2",
-            now,
-        );
-        assert!(out.starts_with("Assistant asked:"));
-        assert!(out.contains("1. Search your entire machine"));
-        assert!(out.ends_with("Follow-up:\nYes do 1, 2"));
-    }
-
-    #[test]
-    fn compose_clarification_answer_prefers_awaiting_open_question() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        let mut awaiting = question_with(now - chrono::Duration::minutes(1), true);
-        awaiting.text = "Should I proceed with the deploy?".to_string();
-        state.open_question = Some(awaiting);
-        state.last_closed_question = Some(question_with(now - chrono::Duration::minutes(5), false));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::ClarificationAnswer),
-            Some(&state),
-            "yes",
-            now,
-        );
-        assert!(out.contains("Should I proceed with the deploy?"));
-        assert!(!out.contains("1. Search your entire machine"));
-    }
-
-    #[test]
-    fn compose_clarification_answer_skips_stale_question() {
-        let now = Utc::now();
-        let mut state = DialogueState::new("s1");
-        state.last_closed_question = Some(question_with(now - chrono::Duration::hours(2), false));
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::ClarificationAnswer),
-            Some(&state),
-            "Yes do 1, 2",
-            now,
-        );
-        assert_eq!(out, "Yes do 1, 2");
-    }
-
-    #[test]
-    fn compose_clarification_answer_without_question_passes_through() {
-        let now = Utc::now();
-        let state = DialogueState::new("s1");
-        let out = compose_llm_user_text(
-            Some(super::super::followup::FollowupMode::ClarificationAnswer),
-            Some(&state),
-            "Yes do 1, 2",
-            now,
-        );
-        assert_eq!(out, "Yes do 1, 2");
-    }
-
-    #[test]
     fn clarification_answer_stashes_closed_question() {
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
@@ -1142,7 +997,31 @@ mod tests {
                 .as_ref()
                 .map(|question| question.text.as_str()),
             Some(MENU),
-            "the answered question must remain readable for this turn's prompt"
+            "the answered question remains auditable in dialogue state"
+        );
+    }
+
+    #[test]
+    fn fresh_answered_request_does_not_capture_unrelated_short_question() {
+        let now = Utc::now();
+        let answered = request_with(
+            OpenRequestStatus::Answered,
+            now - chrono::Duration::minutes(1),
+            Some(now - chrono::Duration::minutes(1)),
+        );
+
+        let mut standalone = DialogueState::new("standalone");
+        standalone.open_request = Some(answered);
+        apply_user_message(
+            &mut standalone,
+            "u2",
+            "What is dependency injection?",
+            &[],
+            now,
+        );
+        assert_eq!(
+            resolved_followup_mode(&standalone, "What is dependency injection?"),
+            Some(super::super::followup::FollowupMode::NewTask)
         );
     }
 
@@ -1236,8 +1115,8 @@ mod tests {
     fn incident_2026_07_11_ack_binds_to_menu_not_stale_request() {
         // Full replay of the incident chain: a request answered two hours ago
         // sits in state, the assistant presents a clarifying menu, the user
-        // acks with option numbers. The composed prompt must carry the menu —
-        // not resurrect the stale request, and not pass bare text.
+        // acks with option numbers. The persisted classifier must bind the
+        // answer to that menu rather than resurrecting the stale request.
         let now = Utc::now();
         let mut state = DialogueState::new("s1");
         state.open_request = Some(request_with(
@@ -1248,13 +1127,16 @@ mod tests {
         apply_assistant_message(&mut state, "a2", MENU, now - chrono::Duration::seconds(90));
         apply_user_message(&mut state, "u2", "Yes do 1, 2", &[], now);
 
-        let (mode, _) = super::super::followup::classify_followup_mode("Yes do 1, 2", Some(MENU));
-        let out = compose_llm_user_text(Some(mode), Some(&state), "Yes do 1, 2", now);
-        assert!(out.starts_with("Assistant asked:"), "got: {out}");
-        assert!(out.contains("1. Search your entire machine"));
-        assert!(
-            !out.contains("contract vehicle"),
-            "the stale answered request must not be resurrected"
+        assert_eq!(
+            resolved_followup_mode(&state, "Yes do 1, 2"),
+            Some(super::super::followup::FollowupMode::ClarificationAnswer)
+        );
+        assert_eq!(
+            state
+                .last_closed_question
+                .as_ref()
+                .map(|question| question.assistant_message_id.as_str()),
+            Some("a2")
         );
     }
 

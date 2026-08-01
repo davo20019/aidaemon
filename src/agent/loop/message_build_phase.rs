@@ -17,9 +17,18 @@ pub(super) struct MessageBuildCtx<'a> {
     /// across the within-task loop so the prefix cache reuses it.
     pub core_prompt: &'a str,
     /// Pillar A: the per-task volatile context tail. Inserted at boundary − 1
-    /// (immediately before the current user message). The SAME string is reused
-    /// every iteration of the within-task loop.
+    /// immediately before the structurally preserved preceding exchange (or
+    /// before the current user when there is no prior exchange). The SAME string
+    /// is reused every iteration of the within-task loop.
     pub task_context_tail: &'a str,
+    /// Exact canonical assistant message selected before the model runs. This
+    /// is metadata for locating the parent turn; it is never inferred from
+    /// assistant text or repeated into the current user message.
+    pub prior_assistant_message_id: Option<&'a str>,
+    /// Cursor of the last message already represented by the cumulative
+    /// conversation summary. Whole turns through this message are omitted from
+    /// the verbatim transcript so summary and history never duplicate them.
+    pub summary_last_message_id: Option<&'a str>,
     pub tool_defs: &'a [Value],
     pub policy_bundle: &'a PolicyBundle,
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
@@ -54,8 +63,11 @@ const CURRENT_TURN_RESERVE_TOKENS: usize = 4_000;
 /// Pillar B (Task 7): safety margin applied to the archived-region budget.
 const ARCHIVED_BUDGET_SAFETY_MARGIN: f64 = 0.10;
 const COMPACT_PARENT_USER_CHARS: usize = 1_200;
-const COMPACT_PARENT_ASSISTANT_CHARS: usize = 1_000;
+const COMPACT_PARENT_ASSISTANT_CHARS: usize = 4_000;
 const COMPACT_PARENT_DELIVERY_CHARS: usize = 320;
+const COMPACT_PARENT_RETRIEVAL_CHARS: usize = 600;
+const COMPACT_PARENT_RETRIEVAL_ITEMS: usize = 2;
+const ADJACENT_EXCHANGE_LOCATOR_KEY: &str = "_aidaemon_adjacent_exchange";
 
 fn redact_archived_shared_turns(turns: &mut Vec<crate::events::FetchedTurn>) {
     for turn in turns.iter_mut() {
@@ -98,6 +110,22 @@ fn compact_parent_text(content: &str, max_chars: usize, strip_file_stubs: bool) 
     truncate_for_resume(redacted.trim(), max_chars)
 }
 
+fn compact_parent_answer(content: &str, max_chars: usize) -> String {
+    let redacted = crate::tools::sanitize::redact_secrets(content);
+    let redacted = redacted.trim();
+    let count = redacted.chars().count();
+    if count <= max_chars {
+        return redacted.to_string();
+    }
+    let head_chars = (max_chars * 2) / 3;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head: String = redacted.chars().take(head_chars).collect();
+    let tail: String = redacted.chars().skip(count - tail_chars).collect();
+    format!(
+        "{head}\n[Middle of prior answer omitted: retained {max_chars}/{count} characters]\n{tail}"
+    )
+}
+
 /// Provider-valid shell for the immediately preceding turn when its complete
 /// archived rendering cannot fit even the low-water window. Retain the human
 /// request, final answer, and delivery evidence; discard tool protocol and
@@ -122,7 +150,7 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
         if raw.trim().is_empty() || super::turn_render::is_failure_boilerplate(raw) {
             return None;
         }
-        let content = compact_parent_text(raw, COMPACT_PARENT_ASSISTANT_CHARS, false);
+        let content = compact_parent_answer(raw, COMPACT_PARENT_ASSISTANT_CHARS);
         (!content.is_empty()).then_some(content)
     });
     let delivery_evidence = turn_messages.iter().rev().find_map(|message| {
@@ -138,6 +166,26 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
         let content = compact_parent_text(&primary, COMPACT_PARENT_DELIVERY_CHARS, false);
         (!content.is_empty()).then_some(content)
     });
+    let mut retrieval_evidence: Vec<(String, String)> = turn_messages
+        .iter()
+        .rev()
+        .filter_map(|message| {
+            let tool_name = message.tool_name.as_deref()?;
+            if message.role != "tool"
+                || !matches!(
+                    tool_name,
+                    "manage_memories" | "search_history" | "web_search"
+                )
+            {
+                return None;
+            }
+            let primary = message.primary_content().unwrap_or_default();
+            let content = compact_parent_text(&primary, COMPACT_PARENT_RETRIEVAL_CHARS, false);
+            (!content.is_empty()).then(|| (tool_name.to_string(), content))
+        })
+        .take(COMPACT_PARENT_RETRIEVAL_ITEMS)
+        .collect();
+    retrieval_evidence.reverse();
 
     let mut compact = Vec::with_capacity(2);
     if let Some(prior_user) = prior_user {
@@ -156,6 +204,14 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
     }
     if let Some(delivery_evidence) = delivery_evidence {
         assistant_lines.push(format!("Delivery evidence: {delivery_evidence}"));
+    }
+    if !retrieval_evidence.is_empty() {
+        assistant_lines.push("Prior retrieval evidence:".to_string());
+        assistant_lines.extend(
+            retrieval_evidence
+                .into_iter()
+                .map(|(tool, evidence)| format!("- {tool}: {evidence}")),
+        );
     }
     if assistant_lines.len() > 1 {
         compact.push(json!({
@@ -337,6 +393,8 @@ pub(super) async fn run_message_build_phase(
     let model = ctx.model;
     let core_prompt = ctx.core_prompt;
     let task_context_tail = ctx.task_context_tail;
+    let prior_assistant_message_id = ctx.prior_assistant_message_id;
+    let summary_last_message_id = ctx.summary_last_message_id;
     let original_tool_defs = ctx.tool_defs;
     let policy_bundle = ctx.policy_bundle;
     let pending_system_messages = &mut *ctx.pending_system_messages;
@@ -433,9 +491,18 @@ pub(super) async fn run_message_build_phase(
                         break;
                     };
                     let terminal_state = TerminalState::from_task_status(turn.terminal_status);
+                    let contains_prior_assistant = prior_assistant_message_id.is_some_and(|id| {
+                        turn.messages
+                            .iter()
+                            .any(|message| message.role == "assistant" && message.id == id)
+                    });
                     let rendered = super::turn_render::render_turn(
                         &turn.messages,
-                        super::turn_render::RenderMode::Archived { terminal_state },
+                        if contains_prior_assistant {
+                            super::turn_render::RenderMode::Adjacent { terminal_state }
+                        } else {
+                            super::turn_render::RenderMode::Archived { terminal_state }
+                        },
                         super::turn_render::RENDERER_VERSION,
                         &render_options,
                     );
@@ -507,6 +574,32 @@ pub(super) async fn run_message_build_phase(
         .event_store
         .get_turns_from_anchor(session_id, anchor)
         .await?;
+
+    // A cumulative summary replaces the completed whole turns it covers, except
+    // for the exact preceding assistant exchange. Continuity is a hard pin: an
+    // aggressive summary window must not erase the parent the current user can
+    // refer to. If the cursor predates the in-memory anchor it will not be
+    // present, and there is nothing here to remove.
+    if let Some(summary_cursor) = summary_last_message_id {
+        let parent_turn_seq = prior_assistant_message_id.and_then(|assistant_id| {
+            turns.iter().find_map(|turn| {
+                turn.messages
+                    .iter()
+                    .any(|message| message.role == "assistant" && message.id == assistant_id)
+                    .then_some(turn.turn_seq)
+            })
+        });
+        if let Some(summary_turn_seq) = turns.iter().find_map(|turn| {
+            turn.messages
+                .iter()
+                .any(|message| message.id == summary_cursor)
+                .then_some(turn.turn_seq)
+        }) {
+            turns.retain(|turn| {
+                turn.turn_seq > summary_turn_seq || Some(turn.turn_seq) == parent_turn_seq
+            });
+        }
+    }
 
     // Identify the current turn = last FetchedTurn whose turn_id == current_turn_id.
     let last_is_current = turns
@@ -580,6 +673,7 @@ pub(super) async fn run_message_build_phase(
         cache_bytes: Vec<Value>,
         cache_hit: bool,
         cache_reason: &'static str,
+        contains_prior_assistant: bool,
     }
 
     let mut archived_renders: Vec<ArchivedRender> = Vec::with_capacity(turns.len());
@@ -590,6 +684,11 @@ pub(super) async fn run_message_build_phase(
         let session_cache = prev_cache.get(session_id);
         for (turn_idx, turn) in turns.iter().enumerate() {
             let terminal_state = TerminalState::from_task_status(turn.terminal_status);
+            let contains_prior_assistant = prior_assistant_message_id.is_some_and(|id| {
+                turn.messages
+                    .iter()
+                    .any(|message| message.role == "assistant" && message.id == id)
+            });
             let fp = super::turn_render_cache::content_fp(&turn.messages, terminal_state);
             let prev = turn
                 .turn_id
@@ -628,15 +727,25 @@ pub(super) async fn run_message_build_phase(
                     turn.turn_id
                 );
             }
+            let request_bytes = if contains_prior_assistant {
+                super::turn_render::render_turn(
+                    &turn.messages,
+                    super::turn_render::RenderMode::Adjacent { terminal_state },
+                    super::turn_render::RENDERER_VERSION,
+                    &render_options,
+                )
+            } else {
+                cache_bytes.clone()
+            };
             let full_est =
-                crate::memory::context_window::estimate_multimodal_message_tokens(&cache_bytes);
+                crate::memory::context_window::estimate_multimodal_message_tokens(&request_bytes);
             let is_immediate_parent = turn_idx + 1 == turns.len();
             let bytes = if is_immediate_parent
                 && full_est > super::turn_eviction::low_water(archived_budget)
             {
                 let compact = compact_immediate_parent_turn(&turn.messages);
                 if compact.is_empty() {
-                    cache_bytes.clone()
+                    request_bytes.clone()
                 } else {
                     let compact_est =
                         crate::memory::context_window::estimate_multimodal_message_tokens(&compact);
@@ -650,7 +759,7 @@ pub(super) async fn run_message_build_phase(
                     compact
                 }
             } else {
-                cache_bytes.clone()
+                request_bytes
             };
             archived_renders.push(ArchivedRender {
                 turn_id: turn.turn_id.clone(),
@@ -660,6 +769,7 @@ pub(super) async fn run_message_build_phase(
                 cache_bytes,
                 cache_hit: hit,
                 cache_reason: reason,
+                contains_prior_assistant,
             });
         }
     }
@@ -764,7 +874,25 @@ pub(super) async fn run_message_build_phase(
     // Step 6 (assembly, part 1): archived turns first, then the current turn.
     // Pillar A tail + core insertion happen further below, unchanged.
     let mut messages: Vec<Value> = Vec::new();
-    for r in &archived_renders {
+    let exact_parent_found = archived_renders
+        .iter()
+        .any(|render| render.contains_prior_assistant);
+    if prior_assistant_message_id.is_some() && !exact_parent_found {
+        tracing::warn!(
+            session_id,
+            prior_assistant_message_id,
+            "Exact preceding assistant fell outside retained context; using nearest retained exchange"
+        );
+    }
+    for (index, r) in archived_renders.iter().enumerate() {
+        let fallback_immediate_parent = !exact_parent_found && index + 1 == archived_renders.len();
+        if r.contains_prior_assistant || fallback_immediate_parent {
+            messages.push(json!({
+                "role": "system",
+                "content": "",
+                "_aidaemon_adjacent_exchange": true,
+            }));
+        }
         messages.extend(r.bytes.iter().cloned());
     }
     // The current region begins here. Current-region fitting (step 7) re-locates
@@ -835,10 +963,10 @@ pub(super) async fn run_message_build_phase(
     // (i.e., multiple independent tasks in the same chat session), inject a
     // system separator before the current user message so the LLM knows which
     // task is current. Without this, models confuse old tasks with the new one.
-    // Injected on ALL iterations (not just early ones) because on iteration 3+
-    // old user messages can mislead the model into responding to them instead of
-    // the current task — especially after tool calls push the current user message
-    // further up the context.
+    // Injected on all iterations because on iteration 3+ old user messages can
+    // mislead the model. The marker sits before the preserved prior exchange,
+    // so it never breaks assistant → user continuity and does not need a
+    // follow-up classifier.
     {
         let user_positions: Vec<usize> = messages
             .iter()
@@ -883,25 +1011,33 @@ pub(super) async fn run_message_build_phase(
                     // which broke follow-up references like "the ones within 20 miles".
                     let marker = json!({
                         "role": "system",
-                        "content": "[Current Task] The message below is the user's current request. \
-                                    Prior messages are conversation history for context."
+                        "content": "[Current Task] The final user message in this transcript is the \
+                                    current request. Earlier messages remain conversation context."
                     });
-                    messages.insert(current_pos, marker);
+                    let continuity_boundary = messages
+                        .iter()
+                        .position(|message| {
+                            message
+                                .get(ADJACENT_EXCHANGE_LOCATOR_KEY)
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                        })
+                        .unwrap_or(current_pos);
+                    messages.insert(continuity_boundary, marker);
                     info!(
                         session_id,
                         iteration,
                         user_messages = user_positions.len(),
-                        "Current task marker injected before current user message"
+                        "Current task marker injected before preserved preceding exchange"
                     );
                 }
             }
         }
     }
 
-    // Phase 0 stage hash: the `[Current Task]` marker is a system message
-    // inserted just before the current user (boundary) message, so it falls in
-    // the pre-boundary region. Marker movement between turns is a known cache
-    // boundary; this stage makes it attributable.
+    // Phase 0 stage hash: the `[Current Task]` marker is a system message in the
+    // pre-boundary region. When a preceding exchange exists it sits before that
+    // exchange, never between its assistant answer and the current user.
     tracing::debug!(
         session_id,
         iteration,
@@ -1098,19 +1234,43 @@ pub(super) async fn run_message_build_phase(
         );
     }
 
-    // Pillar A: insert the per-task context TAIL immediately BEFORE the current
-    // user message (boundary − 1). The tail is a single `role:"system"` message
-    // whose content starts with `TASK_CONTEXT_TAIL_MARKER`; the provider-call
-    // fingerprint locates it by that marker. The session summary, current
-    // date/time, session context, query-ranked memory, matched skill bodies, and
-    // resume checkpoint all live INSIDE this string (compiled once per task in
-    // bootstrap and reused byte-identically across the within-task loop).
+    // Pillar A: replace the internal adjacency locator with the per-task context
+    // TAIL. The locator never reaches the provider: the assistant message ID is
+    // used only by deterministic assembly code. This leaves the adjacent prior
+    // exchange directly before the raw user message, with summaries and volatile
+    // system data earlier in the transcript. This continuity invariant applies
+    // regardless of the heuristic follow-up label.
     //
     // This insertion happens BEFORE message zero is inserted, so the boundary is
     // located against the current `messages` (no leading system prompt yet).
-    if !task_context_tail.is_empty() {
-        let tail_insert_pos =
-            find_current_user_position(&messages, user_text).unwrap_or(messages.len());
+    let adjacency_locator_pos = messages.iter().position(|message| {
+        message
+            .get(ADJACENT_EXCHANGE_LOCATOR_KEY)
+            .and_then(Value::as_bool)
+            == Some(true)
+    });
+    if let Some(position) = adjacency_locator_pos {
+        messages.remove(position);
+        if !task_context_tail.is_empty() {
+            messages.insert(
+                position,
+                json!({
+                    "role": "system",
+                    "content": task_context_tail,
+                }),
+            );
+        }
+    } else if !task_context_tail.is_empty() {
+        let current_user_pos = find_current_user_position(&messages, user_text);
+        let parent_start_pos = current_user_pos.map(|current_pos| {
+            messages[..current_pos]
+                .iter()
+                .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap_or(current_pos)
+        });
+        let tail_insert_pos = parent_start_pos
+            .or(current_user_pos)
+            .unwrap_or(messages.len());
         messages.insert(
             tail_insert_pos,
             json!({
@@ -1573,6 +1733,37 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn oversized_immediate_parent_shell_keeps_bounded_retrieval_provenance() {
+        let messages = vec![
+            msg("user", "What have we been working on together?"),
+            tool_msg(
+                "manage_memories",
+                "fact_id: 41; source: progressive; evidence: recurring AI interview briefing",
+            ),
+            msg(
+                "assistant",
+                "We have mainly been working on your AI job preparation.",
+            ),
+        ];
+
+        let compact = compact_immediate_parent_turn(&messages);
+        let serialized = serde_json::to_string(&compact).expect("serialize compact parent");
+
+        assert!(serialized.contains("fact_id: 41"), "{serialized}");
+        assert!(serialized.contains("source: progressive"), "{serialized}");
+        assert!(
+            serialized.contains("recurring AI interview briefing"),
+            "{serialized}"
+        );
+        assert!(compact.iter().all(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            )
+        }));
+    }
+
     // ====================================================================
     // Pillar B (Task 7): turn-anchored build-phase test scaffolding.
     //
@@ -1763,6 +1954,8 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -1832,6 +2025,8 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut first_pending_system_messages,
@@ -1856,6 +2051,8 @@ mod tests {
             model: "mock-model",
             core_prompt: system_prompt,
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut second_pending_system_messages,
@@ -1953,6 +2150,8 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2029,6 +2228,8 @@ mod tests {
             model: "mock-model",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: &tail,
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2077,6 +2278,189 @@ mod tests {
             summary_only_messages, 1,
             "summary must appear exactly once (inside the tail), not as a separate message"
         );
+    }
+
+    #[tokio::test]
+    async fn adjacent_answer_continuity_does_not_depend_on_followup_phrase_classifier() {
+        use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
+        use crate::execution_policy::PolicyBundle;
+        use crate::testing::{setup_test_agent, MockProvider};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let store = seed_store(&harness).await;
+        let session = "source-followup-session";
+
+        // Reproduce the incident's competing salience: an older location answer
+        // is represented by the summary, while the exact parent is a tool-backed
+        // job-preparation answer.
+        seed_turn(
+            &store,
+            session,
+            "turn-location",
+            "Where do I live?",
+            Some(("manage_memories", "location candidate: Fairfax")),
+            "You live in Fairfax, VA.",
+            "completed",
+        )
+        .await;
+        let parent_turn = "turn-job-prep";
+        for event in [
+            Event::new(
+                session,
+                EventType::UserMessage,
+                json!({
+                    "message_id": "job-user",
+                    "content": "Remind me what we have been working on together.",
+                    "turn_id": parent_turn,
+                }),
+            ),
+            Event::new(
+                session,
+                EventType::AssistantResponse,
+                json!({
+                    "message_id": "job-tool-call",
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": "call-job-memory",
+                        "name": "manage_memories",
+                        "arguments": "{\"action\":\"search\",\"query\":\"working together\"}"
+                    }],
+                    "turn_id": parent_turn,
+                }),
+            ),
+            Event::new(
+                session,
+                EventType::ToolResult,
+                json!({
+                    "message_id": "job-tool-result",
+                    "tool_call_id": "call-job-memory",
+                    "name": "manage_memories",
+                    "result": "fact_id: 41; source: progressive; evidence: recurring AI interview briefing",
+                    "success": true,
+                    "duration_ms": 1,
+                    "turn_id": parent_turn,
+                }),
+            ),
+            Event::new(
+                session,
+                EventType::AssistantResponse,
+                json!({
+                    "message_id": "job-answer",
+                    "content": "We have mainly been working on your AI job preparation.",
+                    "turn_id": parent_turn,
+                }),
+            ),
+            Event::new(
+                session,
+                EventType::TaskEnd,
+                json!({ "status": "completed", "turn_id": parent_turn }),
+            ),
+        ] {
+            store.append(event).await.unwrap();
+        }
+
+        let current_turn = "turn-source-question";
+        let current_user = "Where did you get that info from?";
+        store
+            .append(Event::new(
+                session,
+                EventType::UserMessage,
+                json!({
+                    "message_id": "source-user",
+                    "content": current_user,
+                    "turn_id": current_turn,
+                }),
+            ))
+            .await
+            .unwrap();
+        set_current_turn(&harness, session, current_turn).await;
+
+        let tail = format!(
+            "{TASK_CONTEXT_TAIL_MARKER}\n\n[Compacted Conversation State]\nAn older turn mentioned Synthetic City."
+        );
+        let policy_bundle = PolicyBundle::from_scores(0.1, 0.1, 0.9);
+        let tool_defs = Vec::new();
+        let mut pending = Vec::new();
+        let status_tx: Option<mpsc::Sender<StatusUpdate>> = None;
+        let mut ctx = MessageBuildCtx {
+            session_id: session,
+            iteration: 1,
+            user_text: current_user,
+            current_attachments: &[],
+            completed_tool_calls: &[],
+            model: "mock-model",
+            core_prompt: "CORE",
+            task_context_tail: &tail,
+            // No follow-up label is supplied to message assembly: continuity
+            // comes solely from the canonical preceding assistant ID.
+            prior_assistant_message_id: Some("job-answer"),
+            // Simulate an aggressively advanced summary cursor. The exact
+            // parent exchange must remain verbatim even when the summary says
+            // it already covers that turn.
+            summary_last_message_id: Some("job-answer"),
+            tool_defs: &tool_defs,
+            policy_bundle: &policy_bundle,
+            pending_system_messages: &mut pending,
+            empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
+            status_tx: &status_tx,
+        };
+
+        let built = run_message_build_phase(
+            &crate::agent::services::AgentServices::new(&harness.agent),
+            &mut ctx,
+        )
+        .await
+        .expect("message build");
+        let messages = built.messages;
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert_eq!(serialized.matches(current_user).count(), 1, "{serialized}");
+        assert!(!serialized.contains("Original request:"), "{serialized}");
+        assert!(
+            !serialized.contains(ADJACENT_EXCHANGE_LOCATOR_KEY),
+            "{serialized}"
+        );
+        assert!(serialized.contains("fact_id: 41"), "{serialized}");
+
+        let tail_pos = messages
+            .iter()
+            .position(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.starts_with(TASK_CONTEXT_TAIL_MARKER))
+            })
+            .unwrap();
+        let task_marker_pos = messages
+            .iter()
+            .position(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.starts_with("[Current Task]"))
+            })
+            .unwrap();
+        let parent_user_pos = messages
+            .iter()
+            .position(|message| {
+                message.get("content").and_then(Value::as_str)
+                    == Some("Remind me what we have been working on together.")
+            })
+            .unwrap();
+        let parent_answer = "We have mainly been working on your AI job preparation.";
+        let parent_answer_pos = messages
+            .iter()
+            .position(|message| {
+                message.get("content").and_then(Value::as_str) == Some(parent_answer)
+            })
+            .unwrap();
+        let current_user_pos = find_current_user_position(&messages, current_user).unwrap();
+        assert!(task_marker_pos < tail_pos);
+        assert!(tail_pos < parent_user_pos);
+        assert_eq!(parent_answer_pos + 1, current_user_pos, "{serialized}");
+        assert_eq!(messages[current_user_pos]["role"], "user");
     }
 
     #[tokio::test]
@@ -2144,6 +2528,8 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: "You are a helpful test assistant.",
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2272,6 +2658,8 @@ mod tests {
             model: "gemma-4-26b",
             core_prompt: &system_prompt,
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2349,6 +2737,8 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2471,6 +2861,8 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p1,
@@ -2495,6 +2887,8 @@ mod tests {
             model: "mock-model",
             core_prompt: core,
             task_context_tail: &tail,
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p2,
@@ -2562,6 +2956,8 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE",
             task_context_tail: "",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending,
@@ -2616,6 +3012,8 @@ mod tests {
             model: "mock-model",
             core_prompt: "CORE-PROMPT-BYTES",
             task_context_tail: "[Task Context] tail",
+            prior_assistant_message_id: None,
+            summary_last_message_id: None,
             tool_defs: &tool_defs,
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
@@ -2823,8 +3221,11 @@ mod tests {
         );
     }
 
-    /// 2. Cross-turn archived stability: archived turn 1's bytes are identical
-    ///    when built in turn 2 vs turn 3 (render-cache hit; no fp_mismatch).
+    /// 2. Cross-turn archived stability: once turn 1 is older than the
+    ///    immediate parent, its bytes are identical when built in turn 3 vs
+    ///    turn 4 (render-cache hit; no fp_mismatch). The immediate parent is a
+    ///    deliberate continuity suffix and graduates into this stable prefix
+    ///    on the following turn.
     #[tokio::test]
     async fn cross_turn_archived_render_is_byte_stable() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -2840,29 +3241,19 @@ mod tests {
         )
         .await;
 
-        // Build turn 2 (current = t2).
         seed_turn(
             &store,
             "s2",
             "t2",
             "marker-TWO question",
             None,
-            "",
-            "in_progress",
+            "answer two",
+            "completed",
         )
         .await;
-        set_current_turn(&harness, "s2", "t2").await;
-        let build_a = build_payload(&harness, "s2", "marker-TWO question", 1).await;
 
-        // Close t2, open t3 as current.
-        store
-            .append(Event::new(
-                "s2",
-                EventType::TaskEnd,
-                json!({"status":"completed","turn_id":"t2"}),
-            ))
-            .await
-            .unwrap();
+        // Build turn 3. Turn 1 is now in the stable archived prefix, while
+        // turn 2 is the continuity suffix immediately before the current user.
         seed_turn(
             &store,
             "s2",
@@ -2874,7 +3265,29 @@ mod tests {
         )
         .await;
         set_current_turn(&harness, "s2", "t3").await;
-        let build_b = build_payload(&harness, "s2", "marker-THREE question", 1).await;
+        let build_a = build_payload(&harness, "s2", "marker-THREE question", 1).await;
+
+        // Close t3, open t4 as current. Turn 1 must remain byte-identical.
+        store
+            .append(Event::new(
+                "s2",
+                EventType::TaskEnd,
+                json!({"status":"completed","turn_id":"t3"}),
+            ))
+            .await
+            .unwrap();
+        seed_turn(
+            &store,
+            "s2",
+            "t4",
+            "marker-FOUR question",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, "s2", "t4").await;
+        let build_b = build_payload(&harness, "s2", "marker-FOUR question", 1).await;
 
         // The rendered archived-turn-1 region (everything up to its 'answer one')
         // must be byte-identical across both builds.
@@ -2919,8 +3332,9 @@ mod tests {
         );
     }
 
-    /// 4. Tail + core position preserved: exactly one tail marker at boundary−1,
-    ///    message zero equals the core bytes.
+    /// 4. Tail + core position preserved: exactly one tail before the immediate
+    ///    parent exchange, message zero equals the core bytes, and the parent's
+    ///    final answer remains adjacent to the current user.
     #[tokio::test]
     async fn tail_and_core_positions_preserved() {
         use crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER;
@@ -2961,16 +3375,24 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(tail_positions.len(), 1, "exactly one tail marker");
-        // Tail sits immediately before the current user message (boundary − 1).
         let tail_idx = tail_positions[0];
         assert_eq!(
             messages[tail_idx + 1]["role"].as_str(),
             Some("user"),
-            "tail must sit at boundary − 1 (immediately before current user)"
+            "tail must sit immediately before the parent exchange"
         );
         assert_eq!(
             messages[tail_idx + 1]["content"].as_str(),
-            Some("current question")
+            Some("old question")
+        );
+        let parent_answer_idx = messages
+            .iter()
+            .position(|message| message["content"].as_str() == Some("old answer"))
+            .expect("parent answer");
+        assert_eq!(
+            messages[parent_answer_idx + 1]["content"].as_str(),
+            Some("current question"),
+            "parent assistant answer must be immediately before current user"
         );
     }
 
@@ -3346,6 +3768,8 @@ mod tests {
                 model: _,
                 core_prompt: _,
                 task_context_tail: _,
+                prior_assistant_message_id: _,
+                summary_last_message_id: _,
                 tool_defs: _,
                 policy_bundle: _,
                 pending_system_messages: _,

@@ -21,7 +21,7 @@ use crate::tools::ComputerUseTool;
 use crate::tools::ReadChannelHistoryTool;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
+    GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
     ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMcpTool,
     ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ProjectInspectTool,
     ReadFileTool, RememberFactTool, RunCommandTool, ScheduledGoalRunsTool, SearchFilesTool,
@@ -187,6 +187,7 @@ enum OptionalToolId {
     Browser,
     #[cfg(feature = "computer_use")]
     ComputerUse,
+    GenerateImage,
     SendFile,
     CliAgents,
     HealthProbe,
@@ -243,6 +244,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::ComputerUse,
         name: "computer_use",
         enabled_if: optional_enabled_computer_use,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::GenerateImage,
+        name: "generate_image",
+        enabled_if: optional_enabled_files,
     },
     OptionalToolSpec {
         id: OptionalToolId::SendFile,
@@ -545,6 +551,16 @@ pub async fn register_optional_tools(
                 tools.push(Arc::new(
                     SendFileTool::new(media_tx.clone(), &config.files.outbox_dirs, &inbox_dir)
                         .with_event_store(event_store.clone()),
+                ));
+            }
+            OptionalToolId::GenerateImage => {
+                if !config.tools.is_enabled("generate_image") {
+                    continue;
+                }
+                std::fs::create_dir_all(&inbox_dir)?;
+                tools.push(Arc::new(
+                    GenerateImageTool::chatgpt_subscription(PathBuf::from(&inbox_dir))
+                        .map_err(anyhow::Error::msg)?,
                 ));
             }
             OptionalToolId::CliAgents => {

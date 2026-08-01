@@ -266,8 +266,28 @@ impl Agent {
             .await
             .unwrap_or_default();
         let (prev_assistant, prev_user) = find_previous_turns(&history, stored_current);
-        let (mut followup_mode, mut reasons) =
+        let (lexical_mode, mut reasons) =
             classify_followup_mode(stored_current, prev_assistant.as_deref());
+        // Dialogue ingestion already classified this exact persisted user turn.
+        // Reuse that decision so dialogue state and prompt assembly cannot drift
+        // into contradictory modes for the same message.
+        let mut followup_mode = self
+            .state
+            .get_dialogue_state(session_id)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|state| super::dialogue_state::resolved_followup_mode(state, stored_current))
+            .unwrap_or(lexical_mode);
+        if followup_mode != lexical_mode {
+            reasons.clear();
+            reasons.push(match followup_mode {
+                FollowupMode::NewTask => TurnContextReason::DefaultNewTask,
+                FollowupMode::Followup => TurnContextReason::ContextDependentQuestion,
+                FollowupMode::ClarificationAnswer => TurnContextReason::ClarificationAnswer,
+            });
+        }
 
         let mut goal_user_text = if authored_current.is_empty() {
             String::new()

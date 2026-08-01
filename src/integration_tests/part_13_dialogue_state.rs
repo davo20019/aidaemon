@@ -103,29 +103,131 @@ async fn test_unanswered_request_followup_uses_dialogue_state_projection() {
 
     let call_log = harness.provider.call_log.lock().await;
     let second_call = call_log.last().expect("expected second LLM call");
-    let user_message = second_call
+    let user_messages = second_call
         .messages
         .iter()
-        .rev()
-        .find(|msg| msg.get("role").and_then(|role| role.as_str()) == Some("user"))
-        .and_then(|msg| msg.get("content").and_then(|content| content.as_str()))
-        .unwrap_or_default();
+        .filter(|msg| msg.get("role").and_then(|role| role.as_str()) == Some("user"))
+        .filter_map(|msg| msg.get("content").and_then(|content| content.as_str()))
+        .collect::<Vec<_>>();
 
-    assert!(
-        user_message.contains("Original request:"),
-        "expected combined followup prompt, got: {user_message}"
+    assert_eq!(
+        user_messages
+            .iter()
+            .filter(|message| **message == "You didn't answer my question")
+            .count(),
+        1,
+        "the raw follow-up must appear exactly once: {:?}",
+        second_call.messages
     );
     assert!(
-        user_message.contains("What were the deployment regressions in yesterday's rollout?"),
-        "original request missing from followup prompt: {user_message}"
+        !serde_json::to_string(&second_call.messages)
+            .unwrap()
+            .contains("Original request:"),
+        "the provider payload must not contain a synthetic combined prompt"
+    );
+    let parent_answer_idx = second_call
+        .messages
+        .iter()
+        .position(|message| {
+            message.get("content").and_then(|content| content.as_str())
+                == Some("I searched for AI news and found several results.")
+        })
+        .expect("preceding assistant answer must remain in the transcript");
+    assert_eq!(
+        second_call.messages[parent_answer_idx + 1]
+            .get("content")
+            .and_then(|content| content.as_str()),
+        Some("You didn't answer my question"),
+        "the preceding assistant answer must be structurally adjacent to the raw follow-up"
+    );
+}
+
+#[tokio::test]
+async fn test_exact_source_question_keeps_adjacent_answer_without_phrase_rule() {
+    let location_answer = "You live in Fairfax, VA.";
+    let job_prep_answer = format!(
+        "We've mainly been working on your 2026 AI job preparation and interview briefing. {}\n\nSource artifact: /tmp/synthetic-ai-job-prep/briefing.md",
+        "Detailed preparation context covering agent systems, production reliability, evaluated projects, RAG, MLOps, system design, technical interviews, behavioral interviews, market updates, and application tracking. ".repeat(8)
+    );
+    let source_question = "Where did you get that info from?";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(location_answer),
+        MockProvider::text_response(&job_prep_answer),
+        MockProvider::text_response(
+            "I based that recap on the saved job-preparation notes returned in the prior turn.",
+        ),
+    ]);
+    let harness = setup_test_agent(provider).await.unwrap();
+    let session_id = "exact_source_question_adjacency";
+
+    for message in [
+        "Where do I live?",
+        "Remind me what we've mainly been working on together.",
+        source_question,
+    ] {
+        harness
+            .agent
+            .handle_message(
+                session_id,
+                message,
+                None,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // This exact wording intentionally has no source-question phrase rule. Its
+    // persisted lexical label may remain NewRequest; transcript continuity must
+    // still bind it to the immediately preceding answer by canonical topology.
+    let dialogue_state = harness
+        .state
+        .get_dialogue_state(session_id)
+        .await
+        .unwrap()
+        .expect("dialogue state");
+    assert_eq!(
+        dialogue_state.last_user_turn.as_ref().map(|turn| turn.kind),
+        Some(crate::traits::UserTurnKind::NewRequest)
+    );
+
+    let calls = harness.provider.call_log.lock().await;
+    let source_call = calls.last().expect("source-question model call");
+    let serialized = serde_json::to_string(&source_call.messages).unwrap();
+    assert_eq!(serialized.matches(source_question).count(), 1, "{serialized}");
+    assert!(!serialized.contains("Original request:"), "{serialized}");
+
+    let job_answer_idx = source_call
+        .messages
+        .iter()
+        .position(|message| {
+            message.get("content").and_then(|content| content.as_str())
+                == Some(job_prep_answer.as_str())
+        })
+        .expect("immediately preceding job-preparation answer");
+    assert_eq!(
+        source_call.messages[job_answer_idx + 1]
+            .get("content")
+            .and_then(|content| content.as_str()),
+        Some(source_question),
+        "source question must be directly adjacent to the immediately preceding answer"
     );
     assert!(
-        user_message.contains("Follow-up:"),
-        "follow-up marker missing from prompt: {user_message}"
+        serialized.contains("/tmp/synthetic-ai-job-prep/briefing.md"),
+        "source-bearing tail of the preceding answer must survive"
     );
+    let location_idx = source_call
+        .messages
+        .iter()
+        .position(|message| {
+            message.get("content").and_then(|content| content.as_str()) == Some(location_answer)
+        })
+        .expect("older location answer remains available as history");
     assert!(
-        user_message.contains("You didn't answer my question"),
-        "follow-up text missing from prompt: {user_message}"
+        location_idx < job_answer_idx,
+        "older Fairfax answer must not replace the structural parent"
     );
 }
 

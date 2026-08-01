@@ -34,6 +34,24 @@ fn should_run_live_tests() -> bool {
     std::env::var("AIDAEMON_LIVE_TEST").is_ok_and(|v| v == "1")
 }
 
+fn load_live_test_config(config_path: &std::path::Path) -> anyhow::Result<AppConfig> {
+    let env_path = std::env::var_os("AIDAEMON_ENV_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".env")
+        });
+    if env_path.exists() {
+        dotenvy::from_path(&env_path)?;
+    }
+
+    let mut config = AppConfig::load(config_path)?;
+    config.provider.models.apply_defaults(&config.provider.kind);
+    Ok(config)
+}
+
 /// Set up a live agent with a real LLM provider from config.toml.
 async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
     let config_path = PathBuf::from("config.toml");
@@ -43,8 +61,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
         ));
     }
 
-    let mut config = AppConfig::load(&config_path)?;
-    config.provider.models.apply_defaults(&config.provider.kind);
+    let config = load_live_test_config(&config_path)?;
 
     // Create real provider
     let provider: Arc<dyn ModelProvider> = match config.provider.kind {
@@ -246,8 +263,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
         ));
     }
 
-    let mut config = AppConfig::load(&config_path)?;
-    config.provider.models.apply_defaults(&config.provider.kind);
+    let config = load_live_test_config(&config_path)?;
 
     let provider: Arc<dyn ModelProvider> = match config.provider.kind {
         ProviderKind::OpenaiCompatible => Arc::new(
@@ -412,6 +428,80 @@ async fn test_live_simple_response() {
         response.contains('4'),
         "Live agent should answer 2+2=4. Got: {}",
         response
+    );
+}
+
+/// Live regression: an ordinary provenance question must be interpreted from
+/// the adjacent assistant answer without phrase classification or a rewritten
+/// user prompt.
+#[tokio::test]
+async fn test_live_adjacent_source_followup_uses_previous_answer() {
+    if !should_run_live_tests() {
+        eprintln!("Skipping live test (set AIDAEMON_LIVE_TEST=1 to run)");
+        return;
+    }
+
+    let harness = setup_live_agent()
+        .await
+        .expect("Failed to set up live agent");
+    let session = "live_adjacent_source_followup";
+
+    let first_response = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        harness.agent.handle_message(
+            session,
+            "Invent a fictional one-sentence status update about a synthetic lunar greenhouse. \
+             Choose the details yourself, and do not use tools or external sources.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        ),
+    )
+    .await
+    .expect("First turn timed out")
+    .expect("First turn error");
+    assert!(
+        !first_response.trim().is_empty(),
+        "First turn should produce a fictional status update"
+    );
+
+    let followup = "Where did you get that info from?";
+    let second_response = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        harness.agent.handle_message(
+            session,
+            followup,
+            None,
+            UserRole::Owner,
+            ChannelContext::private("telegram"),
+            None,
+        ),
+    )
+    .await
+    .expect("Follow-up turn timed out")
+    .expect("Follow-up turn error");
+
+    let response = second_response.to_lowercase();
+    let explains_fictional_origin = [
+        "fictional",
+        "invented",
+        "made up",
+        "generated",
+        "your prompt",
+        "your request",
+        "you asked",
+    ]
+    .iter()
+    .any(|signal| response.contains(signal));
+    assert!(
+        explains_fictional_origin,
+        "Follow-up should explain that the adjacent answer was invented for the request. \
+         First response: {first_response}\nFollow-up response: {second_response}"
+    );
+    assert!(
+        !response.contains("saved profile"),
+        "Follow-up must not invent profile provenance: {second_response}"
     );
 }
 

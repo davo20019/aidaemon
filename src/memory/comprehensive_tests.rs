@@ -2409,7 +2409,7 @@ async fn test_context_window_token_estimation() {
     use crate::memory::context_window::estimate_tokens;
 
     assert_eq!(estimate_tokens(""), 0);
-    assert_eq!(estimate_tokens("hi"), 0); // 2/4 = 0
+    assert_eq!(estimate_tokens("hi"), 1); // ceil(2/4) = 1
     assert_eq!(estimate_tokens("hello world and more"), 5); // 20/4 = 5
     let long = "a".repeat(4000);
     assert_eq!(estimate_tokens(&long), 1000); // 4000/4 = 1000

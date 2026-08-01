@@ -1,10 +1,9 @@
 // ==========================================================================
 // Minimal context system prompt tests
 //
-// Memory data (facts, goals, expertise, procedures, episodes, patterns) is
-// retrieved on demand via tools, NOT bulk-injected into the system prompt.
-// These tests verify the system prompt contains capability descriptions
-// instead of raw data.
+// The prompt carries a small volatile tail of query-selected memory and active
+// working state. Full memory stores remain available on demand through tools.
+// These tests verify bounded section names and the on-demand capability guide.
 // ==========================================================================
 
 /// System prompt contains memory capabilities summary instead of bulk data.
@@ -34,7 +33,8 @@ async fn test_memory_episodes_injected_into_prompt() {
         .collect::<Vec<_>>()
         .join("\n");
     let content = content_owned.as_str();
-    // Episodes are no longer injected — memory is on-demand
+    // The old bulk section is gone; individual relevant episodes use compact
+    // entries in the bounded memory tail when any exist.
     assert!(
         !content.contains("Past Sessions"),
         "System prompt should NOT contain bulk episode data"
@@ -45,9 +45,10 @@ async fn test_memory_episodes_injected_into_prompt() {
     );
 }
 
-/// Goals are NOT bulk-injected — accessed on demand via scheduled_goals tool.
+/// A bounded set of active goals is rendered in the volatile memory tail for an
+/// owner DM, while the full goal store remains available through tools.
 #[tokio::test]
-async fn test_memory_goals_injected_into_prompt() {
+async fn test_relevant_active_goal_is_rendered_in_owner_prompt() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
 
     let mut goal = Goal::new_finite(
@@ -81,8 +82,8 @@ async fn test_memory_goals_injected_into_prompt() {
         .join("\n");
     let content = content_owned.as_str();
     assert!(
-        !content.contains("PostgreSQL"),
-        "Goal descriptions should NOT be bulk-injected into prompt"
+        content.contains("PostgreSQL"),
+        "The bounded relevant-memory tail should include the active goal"
     );
     assert!(
         content.contains("scheduled_goals"),

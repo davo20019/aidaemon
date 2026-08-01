@@ -382,6 +382,11 @@ pub struct ConversationSummary {
     pub summary: String,
     pub message_count: usize,
     pub last_message_id: String,
+    /// Canonical event sequence of the last *whole turn* represented by this
+    /// cumulative summary. `None` identifies a legacy, message-sliced summary
+    /// that must be rebuilt before it can advance incrementally.
+    #[serde(default)]
+    pub last_turn_seq: Option<i64>,
     pub updated_at: DateTime<Utc>,
 }
 

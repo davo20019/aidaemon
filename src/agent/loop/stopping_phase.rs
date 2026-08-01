@@ -8,7 +8,6 @@ use super::stopping_progress::{
 use super::*;
 use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
-use crate::traits::ConversationSummary;
 
 pub(super) enum StoppingPhaseOutcome {
     ContinueLoop,
@@ -56,7 +55,6 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub soft_limit_warned: &'a mut bool,
     pub last_progress_summary: &'a mut Instant,
     pub tool_failure_count: &'a HashMap<String, usize>,
-    pub session_summary: &'a mut Option<ConversationSummary>,
     pub policy_bundle: &'a mut PolicyBundle,
     pub user_text: &'a str,
     pub available_capabilities: &'a HashMap<String, ToolCapabilities>,
@@ -133,7 +131,6 @@ pub(super) async fn run_stopping_phase(
     let mut soft_limit_warned = *ctx.soft_limit_warned;
     let mut last_progress_summary = *ctx.last_progress_summary;
     let tool_failure_count = ctx.tool_failure_count;
-    let mut session_summary = ctx.session_summary.clone();
     let mut policy_bundle = ctx.policy_bundle.clone();
     let user_text = ctx.user_text;
     let available_capabilities = ctx.available_capabilities;
@@ -159,7 +156,6 @@ pub(super) async fn run_stopping_phase(
             *ctx.model = model.clone();
             *ctx.soft_limit_warned = soft_limit_warned;
             *ctx.last_progress_summary = last_progress_summary;
-            *ctx.session_summary = session_summary.clone();
             *ctx.policy_bundle = policy_bundle.clone();
             *ctx.last_escalation_iteration = last_escalation_iteration;
             *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
@@ -2058,33 +2054,10 @@ pub(super) async fn run_stopping_phase(
             POLICY_METRICS
                 .context_refresh_total
                 .fetch_add(1, Ordering::Relaxed);
-            // Refresh summary context and re-score policy with fresh failure signal.
-            if agent.context_window_config.enabled {
-                session_summary = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    agent.state.get_conversation_summary(session_id),
-                )
-                .await
-                {
-                    Ok(Ok(summary)) => summary,
-                    Ok(Err(e)) => {
-                        warn!(
-                            session_id,
-                            iteration,
-                            error = %e,
-                            "Failed to refresh conversation summary"
-                        );
-                        None
-                    }
-                    Err(_) => {
-                        warn!(
-                            session_id,
-                            iteration, "Timed out refreshing conversation summary"
-                        );
-                        None
-                    }
-                };
-            }
+            // Re-score policy with the fresh failure signal. Conversation
+            // summary text and its cursor are a bootstrap-time pair; changing
+            // only the cursor mid-task would remove history that is not present
+            // in the already-compiled task-context tail.
             policy_bundle = build_policy_bundle(user_text, available_capabilities, true);
 
             let can_escalate =

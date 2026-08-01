@@ -1201,6 +1201,7 @@ impl DiscordChannel {
                 .description("Start fresh conversation (history kept for memory/audit)"),
             CreateCommand::new("wipe").description("Permanently delete this conversation"),
             CreateCommand::new("cost").description("Show token usage statistics"),
+            CreateCommand::new("context").description("Show conversation context coverage"),
             CreateCommand::new("help").description("Show available commands"),
         ];
 

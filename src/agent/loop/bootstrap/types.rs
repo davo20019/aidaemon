@@ -17,6 +17,11 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
 }
 
 pub(in crate::agent) struct BootstrapData {
+    /// Canonical user message persisted for this turn. This is normally the
+    /// user's exact text; when STT fallback runs it also contains the appended
+    /// transcription. Downstream phases must use this value rather than the
+    /// pre-bootstrap input so prompt assembly matches durable history.
+    pub user_text: String,
     pub task_id: String,
     /// Durable execution identity recovered from an interrupted run. The new
     /// turn reuses it so operation-derived idempotency keys remain stable.
@@ -45,8 +50,9 @@ pub(in crate::agent) struct BootstrapData {
     pub core_prompt_bytes: String,
     /// Pillar A: the per-task volatile context tail (timestamp, session context,
     /// memories, matched skill bodies, resume checkpoint, …). Compiled once per
-    /// task and reused byte-identically across the within-task loop. Inserted at
-    /// the boundary − 1 position (immediately before the current user message).
+    /// task and reused byte-identically across the within-task loop. Inserted
+    /// immediately before the structurally preserved preceding exchange (or
+    /// before the current user when no preceding exchange exists).
     pub task_context_tail: String,
     pub session_summary: Option<ConversationSummary>,
     pub harness_eval: HarnessEvalAccumulator,

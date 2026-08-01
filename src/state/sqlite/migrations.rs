@@ -2179,11 +2179,18 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             summary TEXT NOT NULL,
             message_count INTEGER NOT NULL DEFAULT 0,
             last_message_id TEXT NOT NULL,
+            last_turn_seq INTEGER,
             updated_at TEXT NOT NULL
         )",
     )
     .execute(pool)
     .await?;
+    // Legacy summaries were cursorless and could end in the middle of a tool
+    // exchange. A NULL cursor makes that state explicit so the summarizer can
+    // rebuild it once from canonical whole turns.
+    let _ = sqlx::query("ALTER TABLE conversation_summaries ADD COLUMN last_turn_seq INTEGER")
+        .execute(pool)
+        .await;
 
     // Rendered system-prompt snapshots, deduplicated by content hash.
     // Written insert-or-ignore from the instructions-snapshot path so any past

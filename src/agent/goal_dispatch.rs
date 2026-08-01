@@ -506,7 +506,6 @@ pub(in crate::agent) fn looks_like_evidence_grounding_challenge(text: &str) -> b
         "failures", "file", "files", "test", "tests", "api",
     ];
     let challenge_phrases = [
-        "where did you get that",
         "show the exact output",
         "show the exact result",
         "what did it actually say",

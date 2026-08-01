@@ -2002,14 +2002,15 @@ pub(super) async fn run_completion_phase(
             )
             .await?;
 
-        // Progressive fact extraction: extract durable facts immediately
+        let fast_model = llm_router
+            .as_ref()
+            .map(|r| r.select(crate::router::Tier::Fast).to_string())
+            .unwrap_or_else(|| model.clone());
+
+        // Progressive fact extraction: extract durable facts immediately.
         if agent.context_window_config.progressive_facts
             && crate::memory::context_window::should_extract_facts(user_text)
         {
-            let fast_model = llm_router
-                .as_ref()
-                .map(|r| r.select(crate::router::Tier::Fast).to_string())
-                .unwrap_or_else(|| model.clone());
             crate::memory::context_window::spawn_progressive_extraction(
                 llm_provider.clone(),
                 fast_model.clone(),
@@ -2021,20 +2022,28 @@ pub(super) async fn run_completion_phase(
                 channel_ctx.visibility,
                 user_role,
             );
+        }
 
-            // Incremental summarization: update summary if threshold reached
-            if agent.context_window_config.enabled {
-                crate::memory::context_window::spawn_incremental_summarization(
-                    llm_provider.clone(),
-                    fast_model,
-                    agent.state.clone(),
-                    agent.event_store.clone(),
-                    session_id.to_string(),
-                    agent.context_window_config.summarize_threshold,
-                    agent.context_window_config.summary_window,
-                    user_role,
-                );
-            }
+        // Summary maintenance is independent of fact-extraction eligibility:
+        // short acknowledgements and follow-ups still advance conversation
+        // history and must not leave the summary cursor frozen.
+        if agent.context_window_config.enabled {
+            let summary_token_threshold = agent
+                .context_window_config
+                .summarize_token_threshold_for(&fast_model);
+            let summary_recent_tokens = agent
+                .context_window_config
+                .summary_recent_tokens_for(&fast_model);
+            crate::memory::context_window::spawn_incremental_summarization(
+                llm_provider.clone(),
+                fast_model,
+                agent.state.clone(),
+                agent.event_store.clone(),
+                session_id.to_string(),
+                summary_token_threshold,
+                summary_recent_tokens,
+                user_role,
+            );
         }
 
         let reply_is_model_authored = reply == model_authored_reply;

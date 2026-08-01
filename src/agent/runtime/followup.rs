@@ -216,21 +216,10 @@ pub(super) fn looks_like_context_dependent_followup_question(lower_text: &str) -
         return false;
     }
 
-    let source_followup_prefixes = [
-        "what's the source",
-        "what is the source",
-        "where did that come from",
-        "where did this come from",
-        "source for that",
-        "source for this",
-    ];
-    if source_followup_prefixes
-        .iter()
-        .any(|prefix| lower_text.starts_with(prefix))
-    {
-        return true;
-    }
-
+    // This classifier only handles generic status/explanation carry-over.
+    // Provider transcript assembly preserves the adjacent prior exchange for
+    // every turn, so conversational correctness does not depend on enumerating
+    // every possible follow-up intent here.
     let status_followup_prefixes = [
         "did you ",
         "were you able",
@@ -1071,16 +1060,6 @@ mod tests {
         assert!(reasons.contains(&TurnContextReason::ContextDependentQuestion));
     }
 
-    #[test]
-    fn followup_accepts_deictic_source_question() {
-        for prompt in [
-            "what's the source of that?",
-            "what is the source for this?",
-            "where did that come from?",
-        ] {
-            assert!(looks_like_context_dependent_followup_question(prompt));
-        }
-    }
     #[test]
     fn generic_explanation_question_without_context_markers_stays_new_task() {
         let current = "Can you explain Rust ownership?";

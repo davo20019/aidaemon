@@ -135,11 +135,8 @@ impl SessionContext {
         // Current task
         if let Some(task) = &self.current_task {
             lines.push(format!(
-                "- **Active task:** \"{}\" (running {}s, iteration {}, {} tool calls)",
-                truncate_str(&task.description, 60),
-                task.elapsed_secs,
-                task.iterations,
-                task.tool_calls
+                "- **Active task:** current request (running {}s, iteration {}, {} tool calls)",
+                task.elapsed_secs, task.iterations, task.tool_calls
             ));
         }
 
@@ -484,7 +481,11 @@ mod tests {
 
         let formatted = ctx.format_for_prompt();
         assert!(formatted.contains("Active task"));
-        assert!(formatted.contains("Add blog posts"));
+        assert!(formatted.contains("current request"));
+        assert!(
+            !formatted.contains("Add blog posts"),
+            "the session tail must not echo the current user message"
+        );
         assert!(formatted.contains("Recent error"));
         assert!(formatted.contains("terminal"));
         assert!(formatted.contains("Recent diagnostics"));

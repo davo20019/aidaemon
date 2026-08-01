@@ -803,6 +803,11 @@ pub(super) async fn run_llm_phase(
         } else {
             llm_telemetry.final_model.clone()
         };
+        crate::memory::context_window::record_token_estimate_calibration(
+            &final_model,
+            est_input_tokens as usize,
+            in_tok as usize,
+        );
         info!(
             session_id,
             iteration,

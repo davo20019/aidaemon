@@ -180,6 +180,9 @@ working_memory_cap = 50
 
 # Optional per-model total context windows (input plus output tokens).
 # Use the exact model identifier configured under [provider.models].
+# [state.context_window]
+# summarize_token_threshold = 12000 # compact when unsummarized whole turns reach this estimate
+# summary_recent_tokens = 4000      # keep at least this much recent raw context
 # [state.context_window.model_budgets]
 # local-model-name = 16384
 
@@ -329,7 +332,10 @@ health_port = 8080
 # timeout_secs = 300       # 5 minute timeout per sub-agent
 
 # [files]
-# Channel file inbox/outbox and LLM vision for uploaded images.
+# Channel file inbox/outbox, LLM vision, and generated-image artifact storage.
+# When enabled, generate_image is available independently of the active chat provider;
+# the bundled backend uses `aidaemon auth login openai` (ChatGPT subscription OAuth).
+# Other providers can supply their own ImageGenerationBackend adapter.
 # enabled = true
 # inbox_dir = "~/.aidaemon/files/inbox"
 # max_file_size_mb = 10
