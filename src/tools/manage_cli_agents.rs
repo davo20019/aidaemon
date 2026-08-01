@@ -9,7 +9,10 @@ use crate::tools::cli_agent::CliAgentTool;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{DynamicCliAgentStore, Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, DynamicCliAgentStore, Tool, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects,
+};
 use crate::types::ApprovalResponse;
 
 pub struct ManageCliAgentsTool {
@@ -237,6 +240,14 @@ impl Tool for ManageCliAgentsTool {
 
     fn schema(&self) -> Value {
         manage_cli_agents_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "history"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

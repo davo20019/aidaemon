@@ -6,46 +6,6 @@ use crate::execution_policy::{
 };
 use crate::traits::ToolCapabilities;
 
-pub(super) fn user_text_looks_ambiguous(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-
-    // If the message contains a filesystem path, the user is giving us
-    // concrete location info - never treat that as ambiguous.
-    if lower.contains('/') || lower.contains('\\') {
-        return false;
-    }
-
-    // Only flag truly bare/short references - when the entire message
-    // is basically just a pronoun or vague phrase with no actionable context.
-    // Longer messages (>40 chars) have enough context for the LLM to decide.
-    if lower.len() > 40 {
-        return false;
-    }
-
-    let phrase_ambiguous = [
-        "the site",
-        "that site",
-        "this site",
-        "that project",
-        "the project",
-        "that file",
-        "this file",
-        "that one",
-        "this one",
-        "the thing",
-        "that thing",
-    ]
-    .iter()
-    .any(|p| {
-        lower == *p || lower.starts_with(&format!("{} ", p)) || lower.contains(&format!(" {}", p))
-    });
-    if phrase_ambiguous {
-        return true;
-    }
-
-    matches!(lower.as_str(), "it" | "this" | "that")
-}
-
 #[allow(dead_code)] // Kept for potential future response/fallback handling.
 pub(super) fn first_question_line(text: &str) -> Option<String> {
     text.lines()
@@ -54,17 +14,14 @@ pub(super) fn first_question_line(text: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub(super) fn default_clarifying_question(user_text: &str, missing_info: &[String]) -> String {
+pub(super) fn default_clarifying_question(_user_text: &str, missing_info: &[String]) -> String {
     if !missing_info.is_empty() {
         return format!(
             "Could you clarify {} so I can proceed correctly?",
             missing_info.join(", ")
         );
     }
-    if user_text_looks_ambiguous(user_text) {
-        return "Could you clarify exactly which site/project/file you mean?".to_string();
-    }
-    "Could you share the missing details I need before I proceed?".to_string()
+    "Which exact target should I use for this action?".to_string()
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -259,8 +216,11 @@ fn infer_uncertainty_signals(user_text: &str, prior_immediate_failure: bool) -> 
     let mutation_request = looks_like_mutation_request(&lower);
     let deployment_or_external_write = looks_like_deployment_or_external_write(&lower);
     let scheduled_action = looks_like_scheduled_action(&lower);
-    let missing_required_slot = user_text_looks_ambiguous(user_text)
-        || matches!(lower.as_str(), "do it" | "handle it" | "fix it" | "run it");
+    // Missing required slots are enforced from the model's structured tool
+    // arguments at the execution boundary. Guessing them from pronouns here
+    // makes coreference language-dependent and can veto a valid resolved
+    // target. Keep this pre-assessment signal neutral.
+    let missing_required_slot = false;
 
     let missing_target_project =
         (mutation_request || deployment_or_external_write || scheduled_action)

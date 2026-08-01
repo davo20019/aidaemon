@@ -2813,6 +2813,7 @@ mod tests {
                 annotations: Vec::new(),
                 turn_id: None,
                 attachments: Vec::new(),
+                receipt: None,
             },
             Some("t1"),
         )

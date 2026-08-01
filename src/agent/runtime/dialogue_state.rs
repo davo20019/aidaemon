@@ -606,6 +606,9 @@ fn apply_task_end(
                     open_request.status = OpenRequestStatus::Blocked;
                     open_request.resolved_at = Some(observed_at);
                 }
+                TaskStatus::Interrupted => {
+                    open_request.status = OpenRequestStatus::PartiallyAnswered;
+                }
             }
         }
     }

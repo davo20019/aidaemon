@@ -127,6 +127,18 @@ pub enum EventType {
     /// Tool execution completed
     ToolResult,
 
+    // === Resource Lifecycle ===
+    /// A stable resource handle was registered from an attachment or tool.
+    ResourceRegistered,
+    /// A previously registered resource is no longer safe/current to use.
+    ResourceInvalidated,
+
+    // === Human Interaction Lifecycle ===
+    /// A run paused while waiting for a human decision.
+    InteractionRequested,
+    /// A pending human decision was resolved or became unavailable.
+    InteractionResolved,
+
     // === Filesystem Checkpoints ===
     /// A pre-mutation workspace checkpoint was created.
     CheckpointCreated,
@@ -225,6 +237,9 @@ pub enum TaskStatus {
     Completed,
     Cancelled,
     Failed,
+    /// Execution stopped without reaching a semantic terminal result and may
+    /// continue from durable state. This is not equivalent to failure.
+    Interrupted,
 }
 
 /// Semantic outcome delivered by a task execution.

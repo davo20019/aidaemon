@@ -150,6 +150,7 @@ impl SessionContext {
                     TaskStatus::Completed => "completed",
                     TaskStatus::Cancelled => "CANCELLED",
                     TaskStatus::Failed => "FAILED",
+                    TaskStatus::Interrupted => "INTERRUPTED",
                 };
                 let error_suffix = task
                     .error

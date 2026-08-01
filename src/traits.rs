@@ -53,9 +53,9 @@ pub use provider::{
 pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
-    AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
-    ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
+    semantics_for_exact_read_actions, AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
     ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
     ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };

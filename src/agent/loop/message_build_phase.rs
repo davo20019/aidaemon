@@ -1541,6 +1541,7 @@ mod tests {
             size_bytes: 2_000_000,
             provenance: crate::traits::AttachmentProvenance::ToolObservation,
             source_tool: Some("browser".to_string()),
+            ..MessageAttachment::default()
         });
         let messages = vec![
             msg(

@@ -151,6 +151,8 @@ impl TaskAssessmentMode {
 /// Raw response from the task assessment call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskPlanResponse {
+    #[serde(default = "task_contract_schema_version")]
+    schema_version: u16,
     goal: String,
     #[serde(default)]
     steps: Vec<TaskPlanStep>,
@@ -160,6 +162,12 @@ struct TaskPlanResponse {
     contract: Option<PlannedContractSignals>,
     #[serde(default)]
     task_shape: Option<PlannedTaskShape>,
+}
+
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 1;
+
+const fn task_contract_schema_version() -> u16 {
+    TASK_CONTRACT_SCHEMA_VERSION
 }
 
 /// Result of the task-start assessment call.
@@ -309,6 +317,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
+           \"schema_version\": 1,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -415,6 +424,15 @@ pub(crate) async fn generate_task_plan(
             return None;
         }
     };
+
+    if parsed.schema_version != TASK_CONTRACT_SCHEMA_VERSION {
+        warn!(
+            received = parsed.schema_version,
+            supported = TASK_CONTRACT_SCHEMA_VERSION,
+            "Task assessment response used an unsupported schema version"
+        );
+        return None;
+    }
 
     if parsed.contract.is_none() && parsed.task_shape.is_none() && parsed.steps.is_empty() {
         return None;

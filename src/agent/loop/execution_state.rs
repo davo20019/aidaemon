@@ -1288,11 +1288,15 @@ pub fn compile_step_execution_plan(
             allow_tool_invocation_retry: capabilities.idempotent,
         },
         approval_requirement,
+        // Retries and crash recovery may receive a new model call id or loop
+        // iteration. Bind idempotency to the durable execution plus the exact
+        // canonical operation instead, so replaying the same side effect gets
+        // the same key while changed arguments get a new key.
         idempotency_key: needs_idempotency.then(|| {
-            format!(
-                "exec:{}:{}:{}:{}",
-                execution_id, iteration, tool_name, tool_call_id
-            )
+            let arguments = serde_json::from_str::<serde_json::Value>(effective_arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(effective_arguments.to_string()));
+            let argument_hash = crate::agent::prefix_fingerprint::hash_canonical(&arguments);
+            format!("exec:{execution_id}:{tool_name}:{argument_hash}")
         }),
     }
 }
@@ -1329,6 +1333,7 @@ pub(crate) fn extract_target_hints_from_arguments(arguments: &str) -> Vec<ToolTa
         "working_dir",
         "directory",
         "dir",
+        "resource_id",
         "url",
         "target",
         "target_url",
@@ -1337,6 +1342,7 @@ pub(crate) fn extract_target_hints_from_arguments(arguments: &str) -> Vec<ToolTa
             continue;
         };
         let candidate = match key {
+            "resource_id" => ToolTargetHint::new(ToolTargetHintKind::ResourceId, value),
             "url" | "target_url" => ToolTargetHint::new(ToolTargetHintKind::Url, value),
             "project_path" | "project_dir" | "repo_path" | "repo_dir" => {
                 ToolTargetHint::new(ToolTargetHintKind::ProjectScope, value)

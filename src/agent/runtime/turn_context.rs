@@ -40,6 +40,62 @@ const GOAL_CONTEXT_HINT_HISTORY_LIMIT: usize = 30;
 const GOAL_CONTEXT_MAX_PROJECT_HINTS: usize = 8;
 const GOAL_CONTEXT_MAX_PROJECT_SCOPES: usize = 6;
 
+fn normalize_message_resources(msg: &Message) -> Message {
+    let mut normalized = msg.with_inferred_annotations().into_owned();
+    for attachment in &mut normalized.attachments {
+        crate::channels::attachments::ensure_attachment_resource_identity(attachment);
+    }
+
+    // Resource handles are trusted runtime metadata, not an interpretation of
+    // the user's wording. Expose them to the model so follow-ups can bind an
+    // exact artifact without pronoun or basename heuristics.
+    let existing = normalized.content.clone().unwrap_or_default();
+    let resource_lines = normalized
+        .attachments
+        .iter()
+        .filter_map(|attachment| {
+            let resource_id = attachment.resource_id.as_deref()?;
+            (!existing.contains(resource_id)).then(|| {
+                format!(
+                    "[Resource: {} ({}; {})]",
+                    resource_id, attachment.filename, attachment.mime_type
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if !resource_lines.is_empty() {
+        let resource_block = resource_lines.join("\n");
+        normalized.content = Some(if existing.trim().is_empty() {
+            resource_block
+        } else {
+            format!("{existing}\n{resource_block}")
+        });
+    }
+    normalized
+}
+
+async fn emit_registered_resources(
+    emitter: &crate::events::EventEmitter,
+    msg: &Message,
+    produced_by_tool_call_id: Option<String>,
+    task_id: Option<String>,
+    turn_id: Option<String>,
+) -> anyhow::Result<()> {
+    for attachment in &msg.attachments {
+        if let Some(resource) = crate::events::ResourceRegisteredData::from_attachment(
+            attachment,
+            produced_by_tool_call_id.clone(),
+            task_id.clone(),
+            turn_id.clone(),
+        ) {
+            emitter
+                .emit(crate::events::EventType::ResourceRegistered, resource)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 fn trim_assistant_context_content(content: &str) -> String {
     let trimmed = content.trim();
     if let Some((before, _)) = trimmed.split_once(INTENT_GATE_MARKER) {
@@ -410,7 +466,7 @@ impl Agent {
         channel_ctx: &ChannelContext,
         has_attachments: bool,
     ) -> anyhow::Result<()> {
-        let normalized_msg = msg.with_inferred_annotations();
+        let normalized_msg = normalize_message_resources(msg);
         emitter
             .emit(
                 EventType::UserMessage,
@@ -429,16 +485,23 @@ impl Agent {
                     // Pillar B: stamp the turn_id onto the emitted event so the
                     // turn-anchored fetch (which filters turn_id IS NOT NULL)
                     // returns this message. Without this the row is NULL.
-                    "turn_id": normalized_msg.turn_id,
+                    "turn_id": normalized_msg.turn_id.clone(),
                 }),
             )
             .await?;
-        self.append_message_canonical(normalized_msg.as_ref())
-            .await?;
+        emit_registered_resources(
+            emitter,
+            &normalized_msg,
+            None,
+            None,
+            normalized_msg.turn_id.clone(),
+        )
+        .await?;
+        self.append_message_canonical(&normalized_msg).await?;
         super::dialogue_state::record_dialogue_user_message(
             self,
             &normalized_msg.session_id,
-            normalized_msg.as_ref(),
+            &normalized_msg,
         )
         .await?;
         Ok(())
@@ -452,8 +515,8 @@ impl Agent {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     ) -> anyhow::Result<()> {
-        let normalized_msg = msg.with_inferred_annotations();
-        let turn_id = self.resolve_event_turn_id(normalized_msg.as_ref()).await;
+        let normalized_msg = normalize_message_resources(msg);
+        let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
         let tool_calls = normalized_msg.tool_calls_json.as_ref().and_then(|raw| {
             serde_json::from_str::<Vec<ToolCall>>(raw)
                 .ok()
@@ -481,16 +544,15 @@ impl Agent {
                     input_tokens,
                     output_tokens,
                     annotations: normalized_msg.annotations.clone(),
-                    turn_id,
+                    turn_id: turn_id.clone(),
                 },
             )
             .await?;
-        self.append_message_canonical(normalized_msg.as_ref())
-            .await?;
+        self.append_message_canonical(&normalized_msg).await?;
         super::dialogue_state::record_dialogue_assistant_message(
             self,
             &normalized_msg.session_id,
-            normalized_msg.as_ref(),
+            &normalized_msg,
         )
         .await?;
         Ok(())
@@ -528,8 +590,33 @@ impl Agent {
         task_id: Option<&str>,
         persistent_result: Option<&str>,
     ) -> anyhow::Result<()> {
-        let normalized_msg = msg.with_inferred_annotations();
-        let turn_id = self.resolve_event_turn_id(normalized_msg.as_ref()).await;
+        self.append_tool_message_with_receipt_event_policy(
+            emitter,
+            msg,
+            success,
+            duration_ms,
+            error,
+            task_id,
+            persistent_result,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn append_tool_message_with_receipt_event_policy(
+        &self,
+        emitter: &crate::events::EventEmitter,
+        msg: &Message,
+        success: bool,
+        duration_ms: u64,
+        error: Option<String>,
+        task_id: Option<&str>,
+        persistent_result: Option<&str>,
+        receipt: Option<crate::events::ToolReceiptV1>,
+    ) -> anyhow::Result<()> {
+        let normalized_msg = normalize_message_resources(msg);
+        let turn_id = self.resolve_event_turn_id(&normalized_msg).await;
         let durable_result = persistent_result
             .map(str::to_owned)
             .unwrap_or_else(|| normalized_msg.content.clone().unwrap_or_default());
@@ -552,13 +639,21 @@ impl Agent {
                     error,
                     task_id: task_id.map(str::to_string),
                     annotations: normalized_msg.annotations.clone(),
-                    turn_id,
+                    turn_id: turn_id.clone(),
                     attachments: normalized_msg.attachments.clone(),
+                    receipt,
                 },
             )
             .await?;
-        self.append_message_canonical(normalized_msg.as_ref())
-            .await?;
+        emit_registered_resources(
+            emitter,
+            &normalized_msg,
+            normalized_msg.tool_call_id.clone(),
+            task_id.map(str::to_string),
+            turn_id,
+        )
+        .await?;
+        self.append_message_canonical(&normalized_msg).await?;
         Ok(())
     }
 
@@ -970,5 +1065,79 @@ mod tests {
         assert!(working
             .iter()
             .any(|message| message.content.as_deref() == Some("verbatim historical evidence")));
+    }
+
+    #[tokio::test]
+    async fn tool_artifact_gets_durable_resource_identity() {
+        use crate::events::{EventEmitter, EventType, ResourceRegisteredData};
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{AttachmentProvenance, MessageAttachment, MessageStore};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = temp.path().join("report.pdf");
+        std::fs::write(&artifact, b"%PDF-1.7 resource test").expect("write artifact");
+        let session_id = "resource-registration";
+        let emitter = EventEmitter::new(harness.agent.event_store.clone(), session_id);
+        let message = Message {
+            content: Some("Rendered a PDF.".to_string()),
+            tool_call_id: Some("browser-call".to_string()),
+            tool_name: Some("browser".to_string()),
+            attachments: vec![MessageAttachment {
+                local_path: artifact.to_string_lossy().into_owned(),
+                filename: "report.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                size_bytes: std::fs::metadata(&artifact).unwrap().len(),
+                provenance: AttachmentProvenance::ToolArtifact,
+                source_tool: Some("browser".to_string()),
+                ..MessageAttachment::default()
+            }],
+            ..Message::new_runtime("result-resource", session_id, "tool")
+        };
+
+        harness
+            .agent
+            .append_tool_message_with_result_event(
+                &emitter,
+                &message,
+                true,
+                5,
+                None,
+                Some("task-resource"),
+            )
+            .await
+            .unwrap();
+
+        let events = harness
+            .agent
+            .event_store
+            .query_events_by_types(session_id, &[EventType::ResourceRegistered], 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let registered = events[0].parse_data::<ResourceRegisteredData>().unwrap();
+        assert!(registered.resource_id.starts_with("res_"));
+        assert_eq!(registered.locator, artifact.to_string_lossy());
+        assert!(registered.sha256.is_some());
+        assert_eq!(
+            registered.produced_by_tool_call_id.as_deref(),
+            Some("browser-call")
+        );
+        assert!(harness
+            .agent
+            .event_store
+            .get_resource(session_id, &registered.resource_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let history = harness.state.get_history(session_id, 10).await.unwrap();
+        assert!(history[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&registered.resource_id));
     }
 }

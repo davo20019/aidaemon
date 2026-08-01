@@ -18,6 +18,9 @@ pub(in crate::agent) struct BootstrapCtx<'a> {
 
 pub(in crate::agent) struct BootstrapData {
     pub task_id: String,
+    /// Durable execution identity recovered from an interrupted run. The new
+    /// turn reuses it so operation-derived idempotency keys remain stable.
+    pub resume_execution_snapshot: Option<ResumeExecutionSnapshot>,
     pub emitter: crate::events::EventEmitter,
     pub learning_ctx: LearningContext,
     pub is_personal_memory_recall_turn: bool,

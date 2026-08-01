@@ -1,9 +1,10 @@
 //! Shared inbound file attachment helpers for Telegram, Slack, and Discord.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::traits::{AttachmentProvenance, MessageAttachment};
+use sha2::{Digest, Sha256};
 
 use super::formatting::sanitize_filename;
 
@@ -31,6 +32,9 @@ pub fn format_file_stub(
 /// Prefix for channel-injected file metadata blocks (`format_file_stub`).
 pub const INBOUND_FILE_STUB_PREFIX: &str = "[File received:";
 
+/// Prefix for the opaque resource handle line paired with an inbound file stub.
+pub const INBOUND_RESOURCE_STUB_PREFIX: &str = "[Resource: res_";
+
 /// Remove channel-injected `[File received: ...]` blocks from inbound message text.
 ///
 /// Channels prepend these stubs so the LLM knows a file was saved, but paths
@@ -56,6 +60,21 @@ pub fn strip_inbound_file_stubs(text: &str) -> String {
         } else if text[cursor..].starts_with('\n') {
             cursor += 1;
         }
+        // Resource handles are injected by the channel immediately after the
+        // legacy file block. They are runtime metadata too, not user-authored
+        // language, so keep them out of intent and completion heuristics.
+        if text[cursor..].starts_with(INBOUND_RESOURCE_STUB_PREFIX) {
+            let Some(resource_close_rel) = text[cursor..].find(']') else {
+                out.push_str(&text[cursor..]);
+                break;
+            };
+            cursor += resource_close_rel + 1;
+            if text[cursor..].starts_with("\r\n") {
+                cursor += 2;
+            } else if text[cursor..].starts_with('\n') {
+                cursor += 1;
+            }
+        }
     }
     out.trim().to_string()
 }
@@ -70,12 +89,16 @@ pub fn build_inbound_text(user_text: &str, attachments: &[MessageAttachment]) ->
     let stubs: Vec<String> = attachments
         .iter()
         .map(|a| {
-            format_file_stub(
+            let stub = format_file_stub(
                 &a.filename,
                 a.size_bytes,
                 &a.mime_type,
                 Path::new(&a.local_path),
-            )
+            );
+            match a.resource_id.as_deref() {
+                Some(resource_id) => format!("{stub}\n[Resource: {resource_id}]"),
+                None => stub,
+            }
         })
         .collect();
     let file_block = stubs.join("\n");
@@ -107,7 +130,11 @@ pub fn build_inbound_text_without_local_paths(
             format!(
                 "[File received: {} ({}, {})]",
                 attachment.filename, size_display, attachment.mime_type
-            )
+            ) + &attachment
+                .resource_id
+                .as_deref()
+                .map(|id| format!("\n[Resource: {id}]"))
+                .unwrap_or_default()
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -128,12 +155,60 @@ pub fn message_attachment(
     size_bytes: u64,
 ) -> MessageAttachment {
     MessageAttachment {
+        resource_id: Some(new_resource_id()),
         local_path: dest_path.to_string_lossy().into_owned(),
         filename,
         mime_type,
         size_bytes,
         provenance: AttachmentProvenance::Inbound,
         source_tool: None,
+        sha256: sha256_file(&dest_path),
+    }
+}
+
+pub fn new_resource_id() -> String {
+    format!("res_{}", uuid::Uuid::new_v4().simple())
+}
+
+pub fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+pub fn ensure_attachment_resource_identity(attachment: &mut MessageAttachment) {
+    if attachment.resource_id.is_none() {
+        attachment.resource_id = Some(new_resource_id());
+    }
+    if attachment.sha256.is_none() {
+        attachment.sha256 = sha256_file(Path::new(&attachment.local_path));
+    }
+}
+
+pub fn tool_artifact_attachment(
+    path: &Path,
+    filename: String,
+    mime_type: String,
+    size_bytes: u64,
+    source_tool: &str,
+) -> MessageAttachment {
+    MessageAttachment {
+        resource_id: Some(new_resource_id()),
+        local_path: path.to_string_lossy().into_owned(),
+        filename,
+        mime_type,
+        size_bytes,
+        provenance: AttachmentProvenance::ToolArtifact,
+        source_tool: Some(source_tool.to_string()),
+        sha256: sha256_file(path),
     }
 }
 
@@ -152,12 +227,14 @@ pub fn save_tool_observation_image(
     let dest_path = inbox_dir.join(&dest_name);
     std::fs::write(&dest_path, bytes)?;
     Ok(MessageAttachment {
+        resource_id: Some(new_resource_id()),
         local_path: dest_path.to_string_lossy().into_owned(),
         filename: sanitized,
         mime_type: mime_type.to_string(),
         size_bytes: bytes.len() as u64,
         provenance: AttachmentProvenance::ToolObservation,
         source_tool: Some(source_tool.to_string()),
+        sha256: Some(format!("{:x}", Sha256::digest(bytes))),
     })
 }
 

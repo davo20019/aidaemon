@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::traits::{
-    HandoffArtifact, StateStore, Task, TaskAttemptPatch, TaskHandoff, Tool, ToolCapabilities,
-    ToolRole,
+    semantics_for_exact_read_actions, HandoffArtifact, StateStore, Task, TaskAttemptPatch,
+    TaskHandoff, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
 
 /// Tool for task leads to manage tasks within their assigned goal.
@@ -403,6 +403,10 @@ impl Tool for ManageGoalTasksTool {
 
     fn tool_role(&self) -> ToolRole {
         ToolRole::Management
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(arguments, &["list_tasks"], ToolMutationEffects::NONE)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

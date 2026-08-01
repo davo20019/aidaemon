@@ -10,7 +10,10 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, OAuthProviderConfig};
 use crate::oauth::{OAuthGateway, OAuthType};
-use crate::traits::{OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, OAuthStore, Tool, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+};
 use crate::types::{ApprovalResponse, StatusUpdate};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
@@ -893,6 +896,14 @@ impl Tool for ManageOAuthTool {
 
     fn schema(&self) -> Value {
         manage_oauth_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "providers", "describe_provider"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

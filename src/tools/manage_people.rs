@@ -6,7 +6,10 @@ use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Person, PersonFact, StateStore, Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, Person, PersonFact, StateStore, Tool, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects,
+};
 
 pub struct ManagePeopleTool {
     state: Arc<dyn StateStore>,
@@ -98,6 +101,14 @@ impl Tool for ManagePeopleTool {
 
     fn schema(&self) -> Value {
         manage_people_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["status", "list", "view", "brief", "upcoming", "audit"],
+            ToolMutationEffects::NONE,
+        )
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

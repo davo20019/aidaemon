@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::{TaskOutcome, TaskStatus};
-use crate::traits::{MessageAnnotation, MessageAttachment};
+use crate::traits::{
+    MessageAnnotation, MessageAttachment, ToolCallMetadata, ToolCallSemantics, ToolOutcomeStatus,
+    TruncationInfo,
+};
 
 // =============================================================================
 // Session Events
@@ -180,6 +183,184 @@ pub struct ToolResultData {
     /// Files saved for agent vision (e.g. browser screenshots).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
+    /// Versioned structured execution receipt. Legacy events omit this field;
+    /// readers must treat an absent receipt as unknown rather than infer that
+    /// every requested effect occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ToolReceiptV1>,
+}
+
+/// How the daemon obtained the durable outcome recorded in a tool receipt.
+///
+/// `LegacyText` is deliberately explicit: compatibility parsing can guide a
+/// retry, but it is weaker evidence than an outcome reported by the tool or
+/// derived from exit/HTTP/transport metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcomeEvidenceSource {
+    ToolReported,
+    StructuredMetadata,
+    DurableReplay,
+    LegacyText,
+}
+
+/// Durable, content-safe subset of [`ToolCallMetadata`].
+///
+/// Large read bodies and direct-response prose intentionally stay out of this
+/// record. The receipt owns execution facts needed for recovery, policy audit,
+/// and completion evaluation; `ToolResultData::result` owns the bounded durable
+/// display/audit text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolReceiptV1 {
+    pub schema_version: u16,
+    pub outcome_status: ToolOutcomeStatus,
+    pub outcome_evidence: ToolOutcomeEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub background_started: bool,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default)]
+    pub completion_notifications_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationInfo>,
+    #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
+    pub semantics: ToolCallSemantics,
+}
+
+impl ToolReceiptV1 {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn from_metadata(
+        metadata: &ToolCallMetadata,
+        outcome_status: ToolOutcomeStatus,
+        outcome_evidence: ToolOutcomeEvidenceSource,
+        idempotency_key: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            outcome_status,
+            outcome_evidence,
+            idempotency_key,
+            exit_code: metadata.exit_code,
+            timed_out: metadata.timed_out,
+            background_started: metadata.background_started,
+            detached: metadata.detached,
+            completion_notifications_enabled: metadata.completion_notifications_enabled,
+            transport_error: metadata.transport_error.clone(),
+            http_status: metadata.http_status,
+            truncation: metadata.truncation.clone(),
+            semantics: metadata.semantics.clone(),
+        }
+    }
+
+    pub fn to_metadata(&self) -> ToolCallMetadata {
+        ToolCallMetadata {
+            outcome_status: Some(self.outcome_status),
+            receipt_replayed: true,
+            exit_code: self.exit_code,
+            timed_out: self.timed_out,
+            background_started: self.background_started,
+            detached: self.detached,
+            completion_notifications_enabled: self.completion_notifications_enabled,
+            transport_error: self.transport_error.clone(),
+            http_status: self.http_status,
+            truncation: self.truncation.clone(),
+            semantics: self.semantics.clone(),
+            ..ToolCallMetadata::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceProvenance {
+    CurrentAttachment,
+    ToolObservation,
+    ToolArtifact,
+    ToolTarget,
+}
+
+/// Durable resource identity projected from the canonical event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceRegisteredData {
+    pub schema_version: u16,
+    pub resource_id: String,
+    pub kind: String,
+    pub locator: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub provenance: ResourceProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_by_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+impl ResourceRegisteredData {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn from_attachment(
+        attachment: &MessageAttachment,
+        produced_by_tool_call_id: Option<String>,
+        task_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> Option<Self> {
+        let resource_id = attachment.resource_id.clone()?;
+        let provenance = match attachment.provenance {
+            crate::traits::AttachmentProvenance::Inbound => ResourceProvenance::CurrentAttachment,
+            crate::traits::AttachmentProvenance::ToolObservation => {
+                ResourceProvenance::ToolObservation
+            }
+            crate::traits::AttachmentProvenance::ToolArtifact => ResourceProvenance::ToolArtifact,
+        };
+        Some(Self {
+            schema_version: Self::SCHEMA_VERSION,
+            resource_id,
+            kind: "file".to_string(),
+            locator: attachment.local_path.clone(),
+            display_name: attachment.filename.clone(),
+            mime_type: Some(attachment.mime_type.clone()),
+            size_bytes: Some(attachment.size_bytes),
+            sha256: attachment.sha256.clone(),
+            provenance,
+            produced_by_tool_call_id,
+            source_tool: attachment.source_tool.clone(),
+            task_id,
+            turn_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceInvalidatedData {
+    pub schema_version: u16,
+    pub resource_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+impl ResourceInvalidatedData {
+    pub const SCHEMA_VERSION: u16 = 1;
 }
 
 // =============================================================================
@@ -467,6 +648,8 @@ pub enum DecisionType {
     ExecutionCritiquePass,
     ExecutionBudgetSelection,
     ExecutionStateSnapshot,
+    IdempotencyReceiptReplayed,
+    IdempotencyIndeterminateBlock,
     EvidenceGate,
     ExecutionFailureClassification,
     PostExecutionValidation,
@@ -589,6 +772,7 @@ impl TaskEndData {
         match self.status {
             TaskStatus::Completed => TaskOutcome::Succeeded,
             TaskStatus::Cancelled | TaskStatus::Failed => TaskOutcome::Failed,
+            TaskStatus::Interrupted => TaskOutcome::Partial,
         }
     }
 }
@@ -837,6 +1021,48 @@ pub struct SubAgentCompleteData {
 // =============================================================================
 // Approval Events
 // =============================================================================
+
+/// Durable, provider-independent human-interaction request.
+///
+/// Unlike the legacy approval events below, this record is emitted by the
+/// central approval broker for every approval-producing tool. The matching
+/// [`InteractionResolvedData`] makes pending approvals reconstructable after
+/// a process restart instead of leaving the wait state only in a oneshot
+/// channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractionRequestedData {
+    pub schema_version: u32,
+    pub interaction_id: String,
+    pub interaction_kind: String,
+    /// Exact action shown to the user. Approval is action-bound; a paraphrase
+    /// is not sufficient to safely resume it.
+    pub action: String,
+    /// Stable digest used for reconciliation and audit comparisons.
+    pub action_sha256: String,
+    pub risk_level: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub permission_mode: String,
+}
+
+impl InteractionRequestedData {
+    pub const SCHEMA_VERSION: u32 = 1;
+}
+
+/// Resolution for a durable human-interaction request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractionResolvedData {
+    pub schema_version: u32,
+    pub interaction_id: String,
+    /// `approved_once`, `approved_session`, `approved_always`, `denied`, or
+    /// `unavailable`. Kept as an open string so adding a channel response does
+    /// not make old event readers fail to deserialize.
+    pub resolution: String,
+}
+
+impl InteractionResolvedData {
+    pub const SCHEMA_VERSION: u32 = 1;
+}
 
 /// Data for ApprovalRequested event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1178,7 +1404,7 @@ mod tests {
 
     #[test]
     fn task_end_all_status_outcome_combinations_serialize() {
-        for status in ["completed", "failed", "cancelled"] {
+        for status in ["completed", "failed", "cancelled", "interrupted"] {
             for outcome in ["succeeded", "partial", "failed"] {
                 let value = json!({
                     "task_id": "t1",
@@ -1305,6 +1531,7 @@ mod tests {
             annotations: vec![],
             turn_id: Some("t1".to_string()),
             attachments: vec![],
+            receipt: None,
         };
         let back: ToolResultData =
             serde_json::from_value(serde_json::to_value(&tr).unwrap()).unwrap();
@@ -1374,6 +1601,46 @@ mod tests {
         }))
         .unwrap();
         assert!(te.turn_id.is_none());
+    }
+
+    #[test]
+    fn tool_receipt_roundtrips_and_legacy_result_has_no_receipt() {
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Succeeded),
+            exit_code: Some(0),
+            http_status: Some(201),
+            semantics: ToolCallSemantics::mutation_with(
+                crate::traits::ToolMutationEffects::REMOTE_DEPLOY,
+            ),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        let receipt = ToolReceiptV1::from_metadata(
+            &metadata,
+            ToolOutcomeStatus::Succeeded,
+            ToolOutcomeEvidenceSource::StructuredMetadata,
+            Some("exec:e1:deploy:abc".to_string()),
+        );
+        let roundtrip: ToolReceiptV1 =
+            serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+        assert_eq!(roundtrip, receipt);
+        assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
+        let replay = roundtrip.to_metadata();
+        assert!(replay.receipt_replayed);
+        assert_eq!(replay.outcome_status, Some(ToolOutcomeStatus::Succeeded));
+        assert!(replay
+            .semantics
+            .mutation_effects
+            .contains(crate::traits::ToolMutationEffects::REMOTE_DEPLOY));
+
+        let legacy: ToolResultData = serde_json::from_value(json!({
+            "tool_call_id": "call-legacy",
+            "name": "terminal",
+            "result": "ok",
+            "success": true,
+            "duration_ms": 1
+        }))
+        .unwrap();
+        assert!(legacy.receipt.is_none());
     }
 
     #[test]

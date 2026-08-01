@@ -173,14 +173,11 @@ impl ToolMutationEffects {
     ///
     /// Known effects are checked strictly: cache output, repository metadata,
     /// and directory scaffolding cannot masquerade as authored source. Opaque
-    /// execution surfaces remain compatible by reporting `UNSPECIFIED`; a
-    /// successful opaque mutation can have performed any required effect, so
-    /// downstream verification must decide whether its result is credible.
+    /// execution surfaces report `UNSPECIFIED`, but unknown evidence is never
+    /// allowed to prove a more specific effect. A caller that requires a source
+    /// edit, deployment, or delivery must observe that exact typed effect.
     pub const fn satisfies(self, required: Self) -> bool {
         if required.is_empty() {
-            return true;
-        }
-        if self.intersects(Self::UNSPECIFIED) {
             return true;
         }
         let generic_required = required.intersects(Self::UNSPECIFIED);
@@ -214,6 +211,10 @@ pub enum ToolTargetHintKind {
     Url,
     Path,
     ProjectScope,
+    /// Stable opaque identity from the session resource registry. Unlike a
+    /// filename or prose reference this is exact, session-scoped, and safe to
+    /// compare without natural-language interpretation.
+    ResourceId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +474,10 @@ pub struct ToolCallMetadata {
     /// exit/HTTP/transport metadata before falling back to legacy text parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_status: Option<ToolOutcomeStatus>,
+    /// True when the dispatcher reconstructed this outcome from a prior
+    /// durable receipt instead of invoking the side effect again.
+    #[serde(default)]
+    pub receipt_replayed: bool,
     /// Process exit code when applicable (e.g. terminal/run_command style tools).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -559,121 +564,6 @@ impl Default for ToolCapabilities {
     }
 }
 
-fn tokenized_segments(text: &str) -> Vec<String> {
-    text.to_ascii_lowercase()
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn contains_token(text: &str, token: &str) -> bool {
-    let token = token.to_ascii_lowercase();
-    tokenized_segments(text)
-        .into_iter()
-        .any(|segment| segment == token)
-}
-
-fn contains_any_token(text: &str, tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| contains_token(text, token))
-}
-
-fn json_string_arg(arguments: &str, key: &str) -> Option<String> {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-}
-
-fn identifier_action_semantics(arguments: &str) -> Option<ToolCallSemantics> {
-    let action = json_string_arg(arguments, "action")?;
-    let lower = action.trim().to_ascii_lowercase();
-
-    if lower.is_empty() {
-        return None;
-    }
-
-    if lower == "providers" {
-        return Some(
-            ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-        );
-    }
-
-    if contains_any_token(&lower, &["trust", "close"]) {
-        return Some(ToolCallSemantics::administrative());
-    }
-
-    if contains_token(&lower, "review") {
-        let approve = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| value.get("approve").and_then(|value| value.as_bool()))
-            .unwrap_or(false);
-        return Some(if approve {
-            ToolCallSemantics::mutation()
-        } else {
-            ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent)
-        });
-    }
-
-    if contains_any_token(
-        &lower,
-        &[
-            "trace", "history", "status", "summary", "describe", "compare", "diagnose", "brief",
-            "upcoming", "usage", "audit", "verify", "timeline", "hints", "check",
-        ],
-    ) {
-        return Some(
-            ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-        );
-    }
-
-    if contains_any_token(
-        &lower,
-        &[
-            "add", "create", "set", "switch", "connect", "refresh", "register", "remove", "delete",
-            "update", "edit", "write", "upsert", "install", "enable", "disable", "pause", "resume",
-            "retry", "cancel", "claim", "complete", "fail", "resolve", "share", "send", "link",
-            "export", "purge", "confirm", "abandon", "run", "onboard", "restore", "promote",
-        ],
-    ) {
-        return Some(ToolCallSemantics::mutation());
-    }
-
-    if contains_any_token(
-        &lower,
-        &[
-            "list", "read", "get", "show", "view", "search", "find", "browse", "inspect",
-        ],
-    ) {
-        return Some(
-            ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent),
-        );
-    }
-
-    None
-}
-
-fn http_method_semantics(arguments: &str) -> Option<ToolCallSemantics> {
-    let method = json_string_arg(arguments, "method")?;
-    let lower = method.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    Some(match lower.as_str() {
-        "get" | "head" | "options" => ToolCallSemantics::observation()
-            .with_verification_mode(ToolVerificationMode::ResultContent),
-        _ => ToolCallSemantics::mutation(),
-    })
-}
-
 fn string_to_target_hint(key: &str, value: &str) -> Option<ToolTargetHint> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -681,6 +571,10 @@ fn string_to_target_hint(key: &str, value: &str) -> Option<ToolTargetHint> {
     }
 
     let lower_key = key.to_ascii_lowercase();
+    if lower_key == "resource_id" {
+        return ToolTargetHint::new(ToolTargetHintKind::ResourceId, trimmed);
+    }
+
     if matches!(
         lower_key.as_str(),
         "url" | "verify_url" | "callback_url" | "target_url" | "auth_url"
@@ -748,60 +642,55 @@ fn collect_common_target_hints(arguments: &str) -> Vec<ToolTargetHint> {
     hints
 }
 
+/// Classify a mixed-operation tool from the exact `action` enum in its schema.
+///
+/// This helper intentionally performs no tokenization, substring matching, or
+/// interpretation of unknown action names. Tools pass their exhaustive set of
+/// read-only enum variants; every missing, malformed, or new variant fails
+/// conservatively as a mutation until the tool implementation classifies it.
+pub fn semantics_for_exact_read_actions(
+    arguments: &str,
+    read_actions: &[&str],
+    mutation_effects: ToolMutationEffects,
+) -> ToolCallSemantics {
+    let action = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let mut semantics = if action
+        .as_deref()
+        .is_some_and(|action| read_actions.contains(&action))
+    {
+        ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
+    } else if mutation_effects.is_empty() {
+        ToolCallSemantics::mutation()
+    } else {
+        ToolCallSemantics::mutation_with(mutation_effects)
+    };
+    for target_hint in collect_common_target_hints(arguments) {
+        semantics = semantics.with_target_hint(target_hint.kind, target_hint.value);
+    }
+    semantics
+}
+
 fn default_semantics_from_identity(
-    name: &str,
-    description: &str,
+    _name: &str,
+    _description: &str,
     arguments: &str,
     caps: ToolCapabilities,
 ) -> ToolCallSemantics {
-    if let Some(mut semantics) = identifier_action_semantics(arguments) {
-        for target_hint in collect_common_target_hints(arguments) {
-            semantics = semantics.with_target_hint(target_hint.kind, target_hint.value);
-        }
-        return semantics;
-    }
-
-    if let Some(mut semantics) = http_method_semantics(arguments) {
-        for target_hint in collect_common_target_hints(arguments) {
-            semantics = semantics.with_target_hint(target_hint.kind, target_hint.value);
-        }
-        return semantics;
-    }
-
     let mut semantics = if caps.read_only {
         ToolCallSemantics::observation().with_verification_mode(ToolVerificationMode::ResultContent)
     } else {
-        let identity = format!("{} {}", name, description);
-        if contains_any_token(
-            &identity,
-            &[
-                "read", "list", "show", "fetch", "search", "inspect", "trace", "status", "info",
-                "metrics", "history", "usage", "brief", "browse", "check", "verify", "query",
-                "view",
-            ],
-        ) && !contains_any_token(
-            &identity,
-            &[
-                "create", "update", "remove", "delete", "add", "set", "write", "edit", "send",
-                "share", "register", "install", "connect", "commit", "spawn", "run",
-            ],
-        ) {
-            ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent)
-        } else if contains_any_token(
-            &identity,
-            &[
-                "create", "update", "remove", "delete", "add", "set", "write", "edit", "send",
-                "share", "register", "install", "connect", "commit", "spawn", "run", "manage",
-                "store", "remember", "save", "report", "blocker",
-            ],
-        ) || caps.external_side_effect
-            || caps.high_impact_write
-        {
-            ToolCallSemantics::mutation()
-        } else {
-            ToolCallSemantics::administrative()
-        }
+        // Unknown non-read-only tools fail conservatively as mutations. Mixed
+        // tools must override `call_semantics` with an exact match on their
+        // schema enum; names, descriptions, and arbitrary action vocabulary are
+        // never an authority source.
+        ToolCallSemantics::mutation()
     };
 
     for target_hint in collect_common_target_hints(arguments) {
@@ -1037,12 +926,11 @@ mod tests {
     }
 
     #[test]
-    fn default_call_semantics_classifies_structural_actions() {
+    fn default_call_semantics_uses_capabilities_not_action_vocabulary() {
         let tool = ManageTool;
         let list = tool.call_semantics(r#"{"action":"list","path":"/tmp/demo"}"#);
-        assert!(list.observes_state());
-        assert!(!list.mutates_state());
-        assert!(list.can_verify_with_result_content());
+        assert!(!list.observes_state());
+        assert!(list.mutates_state());
         assert_eq!(
             list.target_hints,
             vec![ToolTargetHint {
@@ -1057,22 +945,64 @@ mod tests {
     }
 
     #[test]
-    fn review_action_becomes_mutation_when_approved() {
+    fn default_semantics_does_not_interpret_action_names() {
         let tool = ManageTool;
-        let review = tool.call_semantics(r#"{"action":"review","approve":true}"#);
-        assert!(review.mutates_state());
-        assert!(!review.observes_state());
+        for action in ["review", "remove_provider", "run_history", "made_up"] {
+            let semantics = tool.call_semantics(&format!(r#"{{"action":"{action}"}}"#));
+            assert!(semantics.mutates_state(), "action={action}");
+            assert!(!semantics.observes_state(), "action={action}");
+        }
     }
 
     #[test]
-    fn mutation_verbs_beat_entity_nouns_in_action_names() {
-        let tool = ManageTool;
-        let remove = tool.call_semantics(r#"{"action":"remove_provider"}"#);
-        assert!(remove.mutates_state());
+    fn exact_read_action_helper_never_guesses_unknown_actions() {
+        let read = semantics_for_exact_read_actions(
+            r#"{"action":"list","resource_id":"res_123"}"#,
+            &["list", "get"],
+            ToolMutationEffects::CONFIGURATION,
+        );
+        assert!(read.observes_state());
+        assert!(!read.mutates_state());
+        assert_eq!(
+            read.target_hints,
+            vec![ToolTargetHint {
+                kind: ToolTargetHintKind::ResourceId,
+                value: "res_123".to_string(),
+            }]
+        );
 
-        let history = tool.call_semantics(r#"{"action":"run_history"}"#);
-        assert!(history.observes_state());
-        assert!(!history.mutates_state());
+        for arguments in [
+            r#"{"action":"listed"}"#,
+            r#"{"action":"made_up"}"#,
+            r#"{"action":7}"#,
+            r#"{}"#,
+            "not json",
+        ] {
+            let semantics = semantics_for_exact_read_actions(
+                arguments,
+                &["list", "get"],
+                ToolMutationEffects::CONFIGURATION,
+            );
+            assert!(semantics.mutates_state(), "arguments={arguments}");
+            assert!(
+                semantics
+                    .mutation_effects
+                    .contains(ToolMutationEffects::CONFIGURATION),
+                "arguments={arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn unspecified_evidence_cannot_prove_a_specific_mutation() {
+        assert!(
+            !ToolMutationEffects::UNSPECIFIED.satisfies(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        );
+        assert!(
+            !ToolMutationEffects::LOCAL_DERIVED_WRITE.satisfies(ToolMutationEffects::REMOTE_DEPLOY)
+        );
+        assert!(ToolMutationEffects::LOCAL_SOURCE_WRITE.satisfies(ToolMutationEffects::UNSPECIFIED));
+        assert!(ToolMutationEffects::REMOTE_DEPLOY.satisfies(ToolMutationEffects::REMOTE_DEPLOY));
     }
 
     struct RememberTool;
@@ -1105,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_mutation_keywords_cover_non_action_tools() {
+    fn conservative_capability_default_covers_non_action_tools() {
         let tool = RememberTool;
         let semantics = tool.call_semantics("{}");
         assert!(semantics.mutates_state());

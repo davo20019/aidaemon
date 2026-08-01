@@ -18,7 +18,10 @@ use crate::tools::skill_registry::{self, RegistryEntry};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::{build_browser_client, validate_url_for_ssrf};
 use crate::tools::ApprovalBroker;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects,
+};
 use crate::types::ApprovalResponse;
 
 pub struct ManageSkillsTool {
@@ -3120,6 +3123,26 @@ impl Tool for ManageSkillsTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let review_without_decision = parsed.as_ref().is_some_and(|args| {
+            args.get("action").and_then(Value::as_str) == Some("review")
+                && args.get("approve").and_then(Value::as_bool).is_none()
+        });
+        if review_without_decision {
+            return semantics_for_exact_read_actions(
+                r#"{"action":"review"}"#,
+                &["review"],
+                ToolMutationEffects::CONFIGURATION,
+            );
+        }
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "browse"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

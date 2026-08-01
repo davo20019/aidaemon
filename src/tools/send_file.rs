@@ -1,13 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::events::{
+    Event, EventStore, EventType, ResourceInvalidatedData, ResourceRegisteredData,
+};
 use crate::execution::{active_execution_backend, BackendKind};
 use crate::tools::file_delivery::{prepare_delivery, DeliveryError};
 use crate::traits::{
-    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolTargetHintKind,
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
 };
 use crate::types::{MediaKind, MediaMessage};
 
@@ -15,6 +20,7 @@ pub struct SendFileTool {
     media_tx: mpsc::Sender<MediaMessage>,
     outbox_dirs: Vec<PathBuf>,
     inbox_dir: PathBuf,
+    event_store: Option<Arc<EventStore>>,
     /// How long to wait for the media listener's delivery receipt before
     /// reporting the file as queued-but-pending. Long enough to cover one
     /// full channel rate-limit retry sleep (capped at 60s) plus the upload.
@@ -41,7 +47,64 @@ impl SendFileTool {
             media_tx,
             outbox_dirs,
             inbox_dir,
+            event_store: None,
             receipt_timeout: DELIVERY_RECEIPT_TIMEOUT,
+        }
+    }
+
+    pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
+        self.event_store = Some(event_store);
+        self
+    }
+
+    async fn resolve_resource(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> Result<ResourceRegisteredData, String> {
+        if session_id.is_empty() {
+            return Err("resource_id requires the current session context".to_string());
+        }
+        let store = self
+            .event_store
+            .as_ref()
+            .ok_or_else(|| "the resource registry is unavailable".to_string())?;
+        let resource = store
+            .get_resource(session_id, resource_id)
+            .await
+            .map_err(|error| format!("could not read the resource registry: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "resource {resource_id} is unknown, expired, or invalidated in this session"
+                )
+            })?;
+        if resource.kind != "file" {
+            return Err(format!(
+                "resource {resource_id} is {}, not a deliverable file",
+                resource.kind
+            ));
+        }
+        Ok(resource)
+    }
+
+    async fn invalidate_resource(&self, session_id: &str, resource_id: &str, reason: &str) {
+        let Some(store) = &self.event_store else {
+            return;
+        };
+        let data = ResourceInvalidatedData {
+            schema_version: ResourceInvalidatedData::SCHEMA_VERSION,
+            resource_id: resource_id.to_string(),
+            reason: reason.to_string(),
+            turn_id: None,
+        };
+        if let Ok(value) = serde_json::to_value(data) {
+            let _ = store
+                .append(Event::new(
+                    session_id,
+                    EventType::ResourceInvalidated,
+                    value,
+                ))
+                .await;
         }
     }
 
@@ -59,7 +122,7 @@ impl Tool for SendFileTool {
     }
 
     fn description(&self) -> &str {
-        "Send a file to the user in the current chat. ALWAYS use this tool when the user asks you to send, share, or deliver a file. Validates the path is within allowed directories and not a sensitive file."
+        "Send an exact file resource to the user in the current chat. Prefer resource_id from an attachment or artifact result; otherwise provide an exact file_path. Never guess a path or substitute another file with the same name."
     }
 
     fn schema(&self) -> Value {
@@ -71,14 +134,17 @@ impl Tool for SendFileTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to send"
+                        "description": "Exact absolute path to send. Use only when no resource_id is available."
+                    },
+                    "resource_id": {
+                        "type": "string",
+                        "description": "Exact opaque resource handle (res_...) from this conversation. Preferred for attachments and tool-created artifacts."
                     },
                     "caption": {
                         "type": "string",
                         "description": "Optional caption for the file"
                     }
                 },
-                "required": ["file_path"],
                 "additionalProperties": false
             }
         })
@@ -95,26 +161,28 @@ impl Tool for SendFileTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                args.get("file_path")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            })
+        let args = serde_json::from_str::<Value>(arguments).ok();
+        let resource_id = args
+            .as_ref()
+            .and_then(|args| args.get("resource_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = args
+            .as_ref()
+            .and_then(|args| args.get("file_path"))
+            .and_then(Value::as_str)
             .unwrap_or_default();
 
-        ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
-            .with_target_hint(ToolTargetHintKind::Path, path)
+        let semantics = ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY);
+        if resource_id.is_empty() {
+            semantics.with_target_hint(ToolTargetHintKind::Path, path)
+        } else {
+            semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id)
+        }
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
-
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: file_path"))?;
 
         let caption = args.get("caption").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -123,10 +191,42 @@ impl Tool for SendFileTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
+        let resource_id = args
+            .get("resource_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let explicit_path = args
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if resource_id.is_some() && explicit_path.is_some() {
+            return Ok(
+                "Error: Provide exactly one of resource_id or file_path, not both.".to_string(),
+            );
+        }
+
+        let registered_resource = if let Some(resource_id) = resource_id {
+            match self.resolve_resource(session_id, resource_id).await {
+                Ok(resource) => Some(resource),
+                Err(reason) => return Ok(format!("Error: {reason}")),
+            }
+        } else {
+            None
+        };
+        let file_path = registered_resource
+            .as_ref()
+            .map(|resource| resource.locator.as_str())
+            .or(explicit_path);
+        let Some(file_path) = file_path else {
+            return Ok("Error: Missing resource_id or file_path.".to_string());
+        };
+
         let backend = active_execution_backend();
         let mut requested_for_delivery = file_path.to_string();
         let mut exported_from_backend = false;
-        if backend.kind() != BackendKind::Local {
+        if registered_resource.is_none() && backend.kind() != BackendKind::Local {
             let backend_path = match backend.resolve_path(file_path).await {
                 Ok(path) => path,
                 Err(error) => return Ok(format!("Error: Invalid execution path: {error}")),
@@ -163,6 +263,29 @@ impl Tool for SendFileTool {
             exported_from_backend = true;
         }
 
+        if let Some(resource) = &registered_resource {
+            let Some(expected_sha256) = resource.sha256.as_deref() else {
+                return Ok(format!(
+                    "Error: Resource {} has no integrity receipt and cannot be delivered safely.",
+                    resource.resource_id
+                ));
+            };
+            let actual_sha256 =
+                crate::channels::attachments::sha256_file(Path::new(&requested_for_delivery));
+            if actual_sha256.as_deref() != Some(expected_sha256) {
+                self.invalidate_resource(
+                    session_id,
+                    &resource.resource_id,
+                    "file content changed after registration",
+                )
+                .await;
+                return Ok(format!(
+                    "Error: Resource {} changed after it was registered and was invalidated. Recreate or reattach the file before sending it.",
+                    resource.resource_id
+                ));
+            }
+        }
+
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let ready = match prepare_delivery(
             &requested_for_delivery,
@@ -173,18 +296,6 @@ impl Tool for SendFileTool {
             Ok(r) => r,
             Err(DeliveryError::FileNotFound(_)) => {
                 return Ok(format!("Error: File not found: {}", file_path));
-            }
-            Err(DeliveryError::Ambiguous(candidates)) => {
-                let names = candidates
-                    .iter()
-                    .take(3)
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Ok(format!(
-                    "Error: File not found: {}. Found multiple files with this name in allowed locations: {}",
-                    file_path, names
-                ));
             }
             Err(DeliveryError::NotRegularFile(_)) => {
                 return Ok(format!("Error: Not a regular file: {}", file_path));
@@ -265,15 +376,6 @@ impl Tool for SendFileTool {
             }
         }
 
-        // Determine success message: resolved_missing_path is detected by comparing
-        // the canonical path with a fresh expansion of the requested path.
-        let expanded_requested = shellexpand::tilde(file_path).to_string();
-        let resolved_missing_path = !PathBuf::from(&expanded_requested).exists()
-            || PathBuf::from(&expanded_requested)
-                .canonicalize()
-                .map(|c| c != ready.canonical_path)
-                .unwrap_or(false);
-
         if exported_from_backend {
             Ok(format!(
                 "File sent: {} ({}) [exported from the {} execution backend]",
@@ -286,26 +388,90 @@ impl Tool for SendFileTool {
                 "File sent: {} ({}) [copied into the inbox for delivery]",
                 ready.filename, size_display
             ))
-        } else if resolved_missing_path {
-            Ok(format!(
-                "File sent: {} ({}) [resolved missing path to {}]",
-                ready.filename,
-                size_display,
-                ready.canonical_path.display()
-            ))
         } else {
             Ok(format!("File sent: {} ({})", ready.filename, size_display))
         }
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.call(arguments).await?;
+        let outcome_status = if output.starts_with("File sent:") {
+            ToolOutcomeStatus::Succeeded
+        } else if output.starts_with("File queued for delivery:") {
+            ToolOutcomeStatus::Backgrounded
+        } else {
+            ToolOutcomeStatus::FailedPermanent
+        };
+        Ok(ToolCallOutcome {
+            metadata: ToolCallMetadata {
+                outcome_status: Some(outcome_status),
+                background_started: outcome_status == ToolOutcomeStatus::Backgrounded,
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+            output,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::file_delivery::{
-        is_recoverable_source, resolve_missing_path_by_filename, ResolveResult,
-    };
+    use crate::events::{ResourceProvenance, ResourceRegisteredData};
+    use crate::tools::file_delivery::is_recoverable_source;
     use std::path::Path;
+
+    async fn test_event_store() -> Arc<EventStore> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect test event store");
+        Arc::new(
+            EventStore::new(pool)
+                .await
+                .expect("migrate test event store"),
+        )
+    }
+
+    async fn register_file_resource(
+        store: &EventStore,
+        session_id: &str,
+        resource_id: &str,
+        path: &Path,
+    ) {
+        let data = ResourceRegisteredData {
+            schema_version: 1,
+            resource_id: resource_id.to_string(),
+            kind: "file".to_string(),
+            locator: path.to_string_lossy().into_owned(),
+            display_name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            mime_type: Some("application/pdf".to_string()),
+            size_bytes: std::fs::metadata(path).ok().map(|metadata| metadata.len()),
+            sha256: crate::channels::attachments::sha256_file(path),
+            provenance: ResourceProvenance::ToolArtifact,
+            produced_by_tool_call_id: Some("browser-call-1".to_string()),
+            source_tool: Some("browser".to_string()),
+            task_id: Some("task-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+        };
+        store
+            .append(Event::new(
+                session_id,
+                EventType::ResourceRegistered,
+                serde_json::to_value(data).unwrap(),
+            ))
+            .await
+            .expect("register resource");
+    }
 
     #[tokio::test]
     async fn send_file_awaits_delivery_receipt_before_claiming_sent() {
@@ -328,7 +494,8 @@ mod tests {
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
 
         let call_tool = tool.clone();
-        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        let call =
+            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
         // Deliver the receipt like the hub's media_listener does.
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg
@@ -336,7 +503,12 @@ mod tests {
             .take()
             .expect("send_file must request a receipt");
         receipt.send(Ok(())).expect("receipt delivered");
-        let out = call.await.expect("join").expect("call ok");
+        let outcome = call.await.expect("join").expect("call ok");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        let out = outcome.output;
         assert!(out.contains("File sent"), "got: {out}");
     }
 
@@ -355,13 +527,19 @@ mod tests {
         );
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
         let call_tool = tool.clone();
-        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        let call =
+            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
         let mut msg = rx.recv().await.expect("media message enqueued");
         let receipt = msg.result_tx.take().expect("receipt requested");
         receipt
             .send(Err("system overload".to_string()))
             .expect("receipt delivered");
-        let out = call.await.expect("join").expect("call ok");
+        let outcome = call.await.expect("join").expect("call ok");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+        let out = outcome.output;
         assert!(
             out.contains("could not be delivered") && out.contains("system overload"),
             "must surface the delivery failure to the model, got: {out}"
@@ -382,8 +560,16 @@ mod tests {
             .with_receipt_timeout(std::time::Duration::from_millis(100));
         let args = json!({"_session_id": "sess-1", "file_path": f.to_string_lossy()}).to_string();
         // Nobody answers the receipt (congested channel) → honest pending text.
-        let out = tool.call(&args).await.expect("call ok");
+        let outcome = tool
+            .call_with_status_outcome(&args, None)
+            .await
+            .expect("call ok");
         let _keep_queue_alive = rx.recv().await; // message was still enqueued
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded)
+        );
+        let out = outcome.output;
         assert!(
             out.contains("queued for delivery"),
             "must report pending, not sent: {out}"
@@ -415,14 +601,20 @@ mod tests {
         })
         .to_string();
         let call_tool = tool.clone();
-        let call = tokio::spawn(async move { call_tool.call(&args).await });
+        let call =
+            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
         let mut msg = rx.recv().await.expect("media message sent");
         msg.result_tx
             .take()
             .expect("receipt requested")
             .send(Ok(()))
             .expect("receipt delivered");
-        let out = call.await.expect("join").expect("call ok");
+        let outcome = call.await.expect("join").expect("call ok");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        let out = outcome.output;
         assert!(out.contains("File sent"), "got: {out}");
         assert!(
             out.contains("copied into the inbox"),
@@ -441,6 +633,103 @@ mod tests {
             inbox.join("latency_results.txt").exists(),
             "copy must land in inbox"
         );
+    }
+
+    #[tokio::test]
+    async fn send_file_resolves_exact_session_resource_and_checks_digest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let artifact = inbox.join("brief.pdf");
+        std::fs::write(&artifact, b"%PDF-1.7 exact artifact").expect("write artifact");
+
+        let store = test_event_store().await;
+        register_file_resource(&store, "sess-resource", "res_exact", &artifact).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool = Arc::new(
+            SendFileTool::new(tx, &[], &inbox.to_string_lossy())
+                .with_event_store(store)
+                .with_receipt_timeout(std::time::Duration::from_secs(5)),
+        );
+        let args = json!({
+            "_session_id": "sess-resource",
+            "resource_id": "res_exact"
+        })
+        .to_string();
+
+        let call_tool = tool.clone();
+        let call =
+            tokio::spawn(async move { call_tool.call_with_status_outcome(&args, None).await });
+        let mut message = rx.recv().await.expect("media enqueued");
+        match &message.kind {
+            MediaKind::Document { file_path, .. } => {
+                assert_eq!(Path::new(file_path), artifact.canonicalize().unwrap());
+            }
+            _ => panic!("expected document"),
+        }
+        message
+            .result_tx
+            .take()
+            .expect("delivery receipt")
+            .send(Ok(()))
+            .expect("deliver receipt");
+        let outcome = call.await.expect("join").expect("call");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert_eq!(
+            outcome.metadata.semantics.target_hints[0].kind,
+            ToolTargetHintKind::ResourceId
+        );
+    }
+
+    #[tokio::test]
+    async fn send_file_invalidates_resource_when_content_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("create inbox");
+        let artifact = inbox.join("brief.pdf");
+        std::fs::write(&artifact, b"%PDF-1.7 original").expect("write artifact");
+        let store = test_event_store().await;
+        register_file_resource(&store, "sess-resource", "res_changed", &artifact).await;
+        std::fs::write(&artifact, b"%PDF-1.7 replaced").expect("replace artifact");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tool =
+            SendFileTool::new(tx, &[], &inbox.to_string_lossy()).with_event_store(store.clone());
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "_session_id": "sess-resource",
+                    "resource_id": "res_changed"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .expect("call");
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+        assert!(outcome.output.contains("changed after it was registered"));
+        assert!(rx.try_recv().is_err(), "changed content must not be queued");
+        assert!(store
+            .get_resource("sess-resource", "res_changed")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn send_file_schema_prefers_resource_id_without_requiring_a_path() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let tool = SendFileTool::new(tx, &[], "/tmp/aidaemon-inbox");
+        let schema = tool.schema();
+        assert!(schema["parameters"]["properties"]["resource_id"].is_object());
+        assert!(schema["parameters"].get("required").is_none());
     }
 
     #[test]
@@ -512,65 +801,5 @@ mod tests {
             !inbox.join(".env").exists(),
             "blocked file must not be copied into the inbox"
         );
-    }
-
-    #[test]
-    fn resolve_missing_path_by_filename_finds_unique_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let outbox = tmp.path().join("outbox");
-        std::fs::create_dir_all(&outbox).expect("create outbox");
-        let file = outbox.join("report.pdf");
-        std::fs::write(&file, b"pdf").expect("write file");
-
-        let outboxes = vec![outbox.clone()];
-        let inbox = tmp.path().join("inbox");
-
-        let requested = Path::new("/tmp/testuser/report.pdf");
-        let result = resolve_missing_path_by_filename(requested, tmp.path(), &inbox, &outboxes);
-        let resolved = match result.expect("expected one match") {
-            ResolveResult::Found(p) => p,
-            ResolveResult::Ambiguous(_) => panic!("expected unique match"),
-        };
-        assert_eq!(
-            resolved,
-            file.canonicalize().expect("canonicalize expected file")
-        );
-    }
-
-    #[test]
-    fn resolve_missing_path_by_filename_errors_on_ambiguous_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let outbox1 = tmp.path().join("outbox1");
-        let outbox2 = tmp.path().join("outbox2");
-        std::fs::create_dir_all(&outbox1).expect("create outbox1");
-        std::fs::create_dir_all(&outbox2).expect("create outbox2");
-        std::fs::write(outbox1.join("report.pdf"), b"one").expect("write outbox1 file");
-        std::fs::write(outbox2.join("report.pdf"), b"two").expect("write outbox2 file");
-
-        let outboxes = vec![outbox1, outbox2];
-        let inbox = tmp.path().join("inbox");
-
-        let requested = Path::new("/tmp/testuser/report.pdf");
-        let result = resolve_missing_path_by_filename(requested, tmp.path(), &inbox, &outboxes);
-        match result.expect("expected a result") {
-            ResolveResult::Ambiguous(candidates) => {
-                assert!(candidates.len() >= 2, "expected multiple candidates");
-            }
-            ResolveResult::Found(_) => panic!("expected ambiguity"),
-        }
-    }
-
-    #[test]
-    fn resolve_missing_path_by_filename_returns_none_without_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let outbox = tmp.path().join("outbox");
-        std::fs::create_dir_all(&outbox).expect("create outbox");
-
-        let outboxes = vec![outbox];
-        let inbox = tmp.path().join("inbox");
-
-        let requested = Path::new("/tmp/testuser/report.pdf");
-        let result = resolve_missing_path_by_filename(requested, tmp.path(), &inbox, &outboxes);
-        assert!(result.is_none(), "expected no match");
     }
 }

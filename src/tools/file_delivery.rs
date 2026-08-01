@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub struct ReadyMedia {
@@ -23,33 +22,23 @@ pub enum DeliveryError {
         path: PathBuf,
         error: String,
     },
-    Ambiguous(Vec<PathBuf>),
 }
 
 /// Validate + recover a path for delivery. No transport — callers send `ReadyMedia` through their own sink.
 pub fn prepare_delivery(
     requested_path: &str,
-    cwd: &Path,
+    _cwd: &Path,
     inbox_dir: &Path,
     outbox_dirs: &[PathBuf],
 ) -> Result<ReadyMedia, DeliveryError> {
     // 1. Expand ~ in the path
     let expanded = shellexpand::tilde(requested_path).to_string();
-    let mut path = PathBuf::from(&expanded);
+    let path = PathBuf::from(&expanded);
 
-    // 2. If path doesn't exist, try to find by filename in known roots
+    // 2. Resource selection is exact. Never substitute a different file just
+    // because it has the same basename in an allowed directory.
     if !path.exists() {
-        match resolve_missing_path_by_filename(&path, cwd, inbox_dir, outbox_dirs) {
-            Some(ResolveResult::Found(found)) => {
-                path = found;
-            }
-            Some(ResolveResult::Ambiguous(candidates)) => {
-                return Err(DeliveryError::Ambiguous(candidates));
-            }
-            None => {
-                return Err(DeliveryError::FileNotFound(requested_path.to_string()));
-            }
-        }
+        return Err(DeliveryError::FileNotFound(requested_path.to_string()));
     }
 
     // 3. Must be a regular file
@@ -209,59 +198,6 @@ pub(crate) fn recover_into_inbox(src: &Path, inbox_dir: &Path) -> std::io::Resul
     dest.canonicalize()
 }
 
-// ── Missing-path resolver ──────────────────────────────────────────────────
-
-pub(crate) enum ResolveResult {
-    Found(PathBuf),
-    Ambiguous(Vec<PathBuf>),
-}
-
-/// If the requested absolute path doesn't exist, try a safe, bounded
-/// recovery by looking for the same filename in known roots.
-pub(crate) fn resolve_missing_path_by_filename(
-    requested: &Path,
-    cwd: &Path,
-    inbox_dir: &Path,
-    outbox_dirs: &[PathBuf],
-) -> Option<ResolveResult> {
-    let file_name = match requested.file_name() {
-        Some(name) if !name.is_empty() => name.to_os_string(),
-        _ => return None,
-    };
-
-    let mut matches: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut check_candidate = |candidate: PathBuf| {
-        if !candidate.exists() {
-            return;
-        }
-        if let Ok(md) = std::fs::metadata(&candidate) {
-            if !md.is_file() {
-                return;
-            }
-        } else {
-            return;
-        }
-        if let Ok(canonical) = candidate.canonicalize() {
-            if seen.insert(canonical.clone()) {
-                matches.push(canonical);
-            }
-        }
-    };
-
-    check_candidate(cwd.join(&file_name));
-    check_candidate(inbox_dir.join(&file_name));
-    for outbox in outbox_dirs {
-        check_candidate(outbox.join(&file_name));
-    }
-
-    match matches.len() {
-        0 => None,
-        1 => Some(ResolveResult::Found(matches.into_iter().next().unwrap())),
-        _ => Some(ResolveResult::Ambiguous(matches)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +241,18 @@ mod tests {
             &tmp.path().join("inbox"),
             &[],
         );
+        assert!(matches!(err, Err(DeliveryError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn prepare_delivery_never_substitutes_a_matching_basename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("report.pdf"), b"old artifact").unwrap();
+
+        let missing = tmp.path().join("missing").join("report.pdf");
+        let err = prepare_delivery(&missing.to_string_lossy(), tmp.path(), &inbox, &[]);
         assert!(matches!(err, Err(DeliveryError::FileNotFound(_))));
     }
 }

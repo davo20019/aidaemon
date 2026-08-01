@@ -651,6 +651,7 @@ async fn image_file_outcome(
                 size_bytes: file_size,
                 provenance: AttachmentProvenance::ToolObservation,
                 source_tool: Some("read_file".to_string()),
+                ..MessageAttachment::default()
             }],
             ..ToolCallMetadata::default()
         },

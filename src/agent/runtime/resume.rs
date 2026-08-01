@@ -1,4 +1,6 @@
 use super::*;
+use crate::events::ToolReceiptV1;
+use crate::traits::ToolOutcomeStatus;
 
 pub(in crate::agent) async fn build_resume_checkpoint(
     agent: &Agent,
@@ -31,6 +33,7 @@ pub(in crate::agent) async fn build_resume_checkpoint(
     let mut last_tool_summary: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut execution_snapshot: Option<ResumeExecutionSnapshot> = None;
+    let mut last_typed_receipt: Option<(String, String, ToolReceiptV1)> = None;
 
     for event in &events {
         match event.event_type {
@@ -66,6 +69,9 @@ pub(in crate::agent) async fn build_resume_checkpoint(
                     let detail = detail.trim();
                     if !detail.is_empty() {
                         last_tool_summary = Some(truncate_for_resume(detail, 180));
+                    }
+                    if let Some(receipt) = data.receipt {
+                        last_typed_receipt = Some((data.tool_call_id, data.name, receipt));
                     }
                 }
             }
@@ -149,6 +155,39 @@ pub(in crate::agent) async fn build_resume_checkpoint(
         }
     }
 
+    // The versioned receipt is the producer-owned execution fact. Snapshot
+    // JSON remains a compatibility/reconciliation view, but it must not
+    // override a later typed result when recovering after a crash.
+    if let (Some(snapshot), Some((tool_call_id, tool_name, receipt))) =
+        (&mut execution_snapshot, last_typed_receipt)
+    {
+        let call_matches_step = snapshot
+            .current_step_id
+            .as_deref()
+            .is_some_and(|step_id| step_id.ends_with(&format!("-{tool_call_id}")));
+        let key_matches_step = receipt.idempotency_key.is_some()
+            && receipt.idempotency_key == snapshot.idempotency_key;
+        let receipt_matches_step = snapshot.current_tool.as_deref() == Some(tool_name.as_str())
+            && (call_matches_step || key_matches_step);
+        if receipt_matches_step {
+            snapshot.current_tool.get_or_insert(tool_name);
+            if receipt.idempotency_key.is_some() {
+                snapshot.idempotency_key = receipt.idempotency_key.clone();
+            }
+            snapshot.background_handoff_active =
+                receipt.outcome_status == ToolOutcomeStatus::Backgrounded;
+            snapshot.last_outcome = Some(match receipt.outcome_status {
+                ToolOutcomeStatus::Succeeded => StepExecutionOutcome::Progress,
+                ToolOutcomeStatus::CompletedWithNegativeResult => StepExecutionOutcome::NoProgress,
+                ToolOutcomeStatus::FailedRetryable => StepExecutionOutcome::RecoverableFailure,
+                ToolOutcomeStatus::FailedPermanent | ToolOutcomeStatus::Blocked => {
+                    StepExecutionOutcome::NonrecoverableFailure
+                }
+                ToolOutcomeStatus::Backgrounded => StepExecutionOutcome::BackgroundDetached,
+            });
+        }
+    }
+
     let elapsed_secs = (Utc::now() - active_task_event.created_at)
         .num_seconds()
         .max(0) as u64;
@@ -193,7 +232,7 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
     let resume_emitter =
         crate::events::EventEmitter::new(agent.event_store.clone(), session_id.to_string())
             .with_task_id(checkpoint.task_id.clone());
-    let error = format!(
+    let summary = format!(
         "Agent process interrupted before completion. Resumed in task {}.",
         resumed_task_id
     );
@@ -202,13 +241,13 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
             EventType::TaskEnd,
             TaskEndData {
                 task_id: checkpoint.task_id.clone(),
-                status: TaskStatus::Failed,
-                outcome: Some(crate::events::TaskOutcome::Failed),
+                status: TaskStatus::Interrupted,
+                outcome: Some(crate::events::TaskOutcome::Partial),
                 duration_secs: checkpoint.elapsed_secs,
                 iterations: checkpoint.last_iteration,
                 tool_calls_count: checkpoint.tool_results_count,
-                error: Some(error),
-                summary: Some("Recovered from checkpoint after interruption".to_string()),
+                error: None,
+                summary: Some(summary),
                 efficiency: None,
                 // Recovery MUST use the checkpoint's original turn_id, never
                 // current_turn_ids (which points at the new resume turn).
@@ -222,7 +261,7 @@ pub(in crate::agent) async fn mark_task_interrupted_for_resume(
         agent,
         session_id,
         &checkpoint.task_id,
-        TaskStatus::Failed,
+        TaskStatus::Interrupted,
     )
     .await
     {

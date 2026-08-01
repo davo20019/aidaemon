@@ -9,7 +9,10 @@ use tracing::info;
 
 use crate::cron_utils::{compute_next_run, parse_schedule};
 use crate::health::{HealthProbe, HealthProbeStore, ProbeConfig, ProbeExecutor, ProbeType};
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects,
+};
 
 pub struct HealthProbeTool {
     store: Arc<HealthProbeStore>,
@@ -144,6 +147,14 @@ impl Tool for HealthProbeTool {
                 "additionalProperties": false
             }
         })
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "status"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

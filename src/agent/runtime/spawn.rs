@@ -56,6 +56,16 @@ fn enforce_child_terminal_outcome(
     result
 }
 
+fn is_sqlite_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("sqlite_busy")
+            || message.contains("(code: 5)")
+    })
+}
+
 fn worker_profile_id(kind: SpecialistKind) -> String {
     format!("profile-{}", kind.as_str().replace('_', "-"))
 }
@@ -811,6 +821,47 @@ impl Agent {
     }
 
     async fn finalize_executor_task_outcome(
+        &self,
+        task_id: &str,
+        attempt: Option<&crate::traits::TaskAttempt>,
+        response: Option<&str>,
+        error: Option<&str>,
+        child_session: &str,
+    ) -> anyhow::Result<()> {
+        const MAX_BUSY_RETRIES: usize = 3;
+        let mut busy_retry = 0_usize;
+        loop {
+            match self
+                .finalize_executor_task_outcome_once(
+                    task_id,
+                    attempt,
+                    response,
+                    error,
+                    child_session,
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(finalize_error)
+                    if busy_retry < MAX_BUSY_RETRIES && is_sqlite_busy(&finalize_error) =>
+                {
+                    let delay_ms = 25_u64 << busy_retry;
+                    busy_retry += 1;
+                    warn!(
+                        task_id,
+                        busy_retry,
+                        delay_ms,
+                        error = %finalize_error,
+                        "Retrying durable executor finalization after SQLite contention"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(finalize_error) => return Err(finalize_error),
+            }
+        }
+    }
+
+    async fn finalize_executor_task_outcome_once(
         &self,
         task_id: &str,
         attempt: Option<&crate::traits::TaskAttempt>,
@@ -2517,9 +2568,21 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_completed_task_results_context, task_references_parent_context, Agent};
+    use super::{
+        bounded_completed_task_results_context, is_sqlite_busy, task_references_parent_context,
+        Agent,
+    };
     use crate::traits::{AgentRole, SpecialistKind};
     use uuid::Uuid;
+
+    #[test]
+    fn sqlite_busy_retry_classifier_is_narrow() {
+        assert!(is_sqlite_busy(&anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        )));
+        assert!(is_sqlite_busy(&anyhow::anyhow!("SQLITE_BUSY")));
+        assert!(!is_sqlite_busy(&anyhow::anyhow!("executor lease was lost")));
+    }
 
     #[test]
     fn executor_parent_context_reference_gets_bounded_recent_results() {

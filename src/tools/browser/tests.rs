@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
 use crate::tools::ApprovalBroker;
-use crate::traits::Tool;
+use crate::traits::{AttachmentProvenance, Tool};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
 
 fn mock_tool() -> (
@@ -179,9 +179,25 @@ async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
         path.file_name().and_then(|name| name.to_str()),
         Some("quarterly-investor-brief.pdf")
     );
-    assert_eq!(
-        outcome.metadata.attachments.len(),
-        1,
+    assert_eq!(outcome.metadata.attachments.len(), 2);
+    let artifact = outcome
+        .metadata
+        .attachments
+        .iter()
+        .find(|attachment| attachment.provenance == AttachmentProvenance::ToolArtifact)
+        .expect("render_pdf should register the PDF as a durable artifact");
+    assert_eq!(artifact.mime_type, "application/pdf");
+    assert_eq!(artifact.local_path, path.to_string_lossy());
+    assert!(artifact
+        .resource_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("res_")));
+    assert!(artifact.sha256.is_some());
+    assert!(
+        outcome.metadata.attachments.iter().any(|attachment| {
+            attachment.provenance == AttachmentProvenance::ToolObservation
+                && attachment.mime_type == "image/png"
+        }),
         "render_pdf should return a source preview for visual inspection"
     );
 

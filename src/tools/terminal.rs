@@ -405,7 +405,6 @@ fn describe_delivery_error(err: &crate::tools::file_delivery::DeliveryError) -> 
         DeliveryError::RecoveryFailed { error, .. } => {
             format!("recovery into the inbox failed ({error})")
         }
-        DeliveryError::Ambiguous(_) => "multiple files matched the name".to_string(),
     }
 }
 

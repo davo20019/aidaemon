@@ -233,6 +233,16 @@ impl Tool for RecordingSearchFilesTool {
         let path = args["path"].as_str().unwrap_or(".");
         Ok(format!("No matches found (0 files scanned in {})", path))
     }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
 }
 
 struct RecordingProjectInspectTool {
@@ -281,6 +291,16 @@ impl Tool for RecordingProjectInspectTool {
             primary
         ))
     }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
 }
 
 struct MockProjectInspectTool;
@@ -318,6 +338,16 @@ impl Tool for MockProjectInspectTool {
             path
         ))
     }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
 }
 
 struct CountingSendFileTool {
@@ -353,6 +383,29 @@ impl Tool for CountingSendFileTool {
     async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok("File sent successfully.".to_string())
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| {
+                args.get("file_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
+            .with_target_hint(ToolTargetHintKind::Path, path)
     }
 }
 

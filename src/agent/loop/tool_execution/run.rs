@@ -397,6 +397,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 project_scope: prefetch_project_scope,
                 session_id,
                 task_id,
+                iteration,
                 status_tx: &status_tx,
                 channel_ctx,
                 user_role,
@@ -1305,6 +1306,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         project_scope: allowed_project_scope,
                         session_id,
                         task_id,
+                        iteration,
                         status_tx: &status_tx,
                         channel_ctx,
                         user_role,
@@ -1465,6 +1467,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             Some(&effective_arguments),
             Some(&result_metadata),
         );
+        let outcome_evidence = tool_outcome_evidence_source(&result_metadata);
         let is_error = tool_outcome_status.is_failure();
         let outcome_satisfied = tool_outcome_status.satisfies_requested_condition();
 
@@ -1962,8 +1965,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             importance: 0.3, // Tool outputs default to lower importance
             ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
         };
+        let receipt = crate::events::ToolReceiptV1::from_metadata(
+            &result_metadata,
+            tool_outcome_status,
+            outcome_evidence,
+            execution_state
+                .current_step
+                .as_ref()
+                .and_then(|step| step.idempotency_key.clone()),
+        );
         agent
-            .append_tool_message_with_result_event_policy(
+            .append_tool_message_with_receipt_event_policy(
                 emitter,
                 &tool_msg,
                 !is_error,
@@ -1975,6 +1987,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 },
                 Some(task_id),
                 result_metadata.persistent_output.as_deref(),
+                Some(receipt),
             )
             .await?;
 

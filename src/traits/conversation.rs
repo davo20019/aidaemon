@@ -47,11 +47,17 @@ pub enum AttachmentProvenance {
     Inbound,
     /// Produced by a tool observation (browser screenshot, MCP image, etc.).
     ToolObservation,
+    /// Produced as a durable artifact by a tool (PDF, document, archive, etc.).
+    ToolArtifact,
 }
 
 /// Metadata for a file saved from an inbound channel message or tool observation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MessageAttachment {
+    /// Stable opaque handle used by tools and policy. Legacy attachments omit
+    /// it and receive one when they next cross the canonical event boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
     pub local_path: String,
     pub filename: String,
     pub mime_type: String,
@@ -60,6 +66,10 @@ pub struct MessageAttachment {
     pub provenance: AttachmentProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool: Option<String>,
+    /// Content digest captured when the attachment was registered. Execution
+    /// re-checks this before sensitive use to detect stale/replaced files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 pub fn infer_message_annotations(content: &str) -> Vec<MessageAnnotation> {

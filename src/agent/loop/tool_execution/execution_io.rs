@@ -19,6 +19,7 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     pub project_scope: Option<&'a str>,
     pub session_id: &'a str,
     pub task_id: &'a str,
+    pub iteration: usize,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
     pub channel_ctx: &'a ChannelContext,
     pub user_role: UserRole,
@@ -33,6 +34,20 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     /// into tool args (the correction sandbox overrides trusted-session semantics).
     /// False on all normal paths.
     pub suppress_trusted_session: bool,
+}
+
+fn should_replay_durable_result(
+    result: &crate::events::ToolResultData,
+    tool_is_idempotent: bool,
+) -> bool {
+    // A producer-owned retryable failure may be attempted again only when the
+    // adapter also declares repeated invocation safe. Every other durable
+    // outcome—including backgrounded and blocked—is replayed to avoid
+    // duplicating an indeterminate or already-completed effect.
+    !(tool_is_idempotent
+        && result.receipt.as_ref().is_some_and(|receipt| {
+            receipt.outcome_status == crate::traits::ToolOutcomeStatus::FailedRetryable
+        }))
 }
 
 pub(super) async fn execute_tool_call_io(
@@ -58,8 +73,57 @@ pub(super) async fn execute_tool_call_io(
         );
     }
 
+    // Claim/replay preflight happens before the new ToolCall row is appended.
+    // A completed key reuses its durable receipt; a claimed key with no result
+    // is indeterminate after a crash and is blocked for reconciliation.
+    let tool_is_idempotent = agent
+        .tools
+        .iter()
+        .find(|tool| tool.name() == tc.name && tool.is_available())
+        .is_some_and(|tool| tool.capabilities().idempotent);
+    let mut replayed_result: Option<crate::events::ToolResultData> = None;
+    let mut idempotency_block_reason: Option<String> = None;
+    if let Some(idempotency_key) = ctx.idempotency_key {
+        match agent
+            .event_store
+            .get_tool_result_by_idempotency_key(ctx.session_id, idempotency_key)
+            .await
+        {
+            Ok(Some(result)) => {
+                if should_replay_durable_result(&result, tool_is_idempotent) {
+                    replayed_result = Some(result);
+                }
+            }
+            Ok(None) => match agent
+                .event_store
+                .has_unresolved_tool_call_for_idempotency_key(ctx.session_id, idempotency_key)
+                .await
+            {
+                Ok(true) => {
+                    idempotency_block_reason = Some(format!(
+                        "A prior `{}` invocation with idempotency key `{}` has no durable result. Its side effect is indeterminate after interruption; inspect the target before issuing a different operation.",
+                        tc.name, idempotency_key
+                    ));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    idempotency_block_reason = Some(format!(
+                        "Could not verify whether `{}` was already executed ({error}); refusing a potentially duplicate side effect.",
+                        tc.name
+                    ));
+                }
+            },
+            Err(error) => {
+                idempotency_block_reason = Some(format!(
+                    "Could not read the durable receipt for `{}` ({error}); refusing a potentially duplicate side effect.",
+                    tc.name
+                ));
+            }
+        }
+    }
+
     // Emit ToolCall event
-    let _ = ctx
+    let claim_result = ctx
         .emitter
         .emit(
             EventType::ToolCall,
@@ -78,6 +142,108 @@ pub(super) async fn execute_tool_call_io(
             ),
         )
         .await;
+
+    if let (Some(idempotency_key), Err(error)) = (ctx.idempotency_key, claim_result) {
+        let reason = format!(
+            "Could not persist the durable execution claim for `{}` ({error}); refusing to run a mutation without replay protection.",
+            tc.name
+        );
+        agent
+            .emit_warning_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::IdempotencyIndeterminateBlock,
+                "Blocked mutation because its durable claim could not be persisted".to_string(),
+                serde_json::json!({
+                    "condition": "idempotency_claim_persist_failed",
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "idempotency_key": idempotency_key,
+                    "error": error.to_string(),
+                }),
+            )
+            .await;
+        let semantics = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tc.name && tool.is_available())
+            .map(|tool| tool.call_semantics(ctx.effective_arguments))
+            .unwrap_or_default();
+        return ToolExecutionIoResult {
+            result_text: format!("Error: {reason}"),
+            tool_duration_ms: 0,
+            result_metadata: crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                semantics,
+                ..crate::traits::ToolCallMetadata::default()
+            },
+        };
+    }
+
+    if let Some(previous) = replayed_result {
+        let mut metadata = previous
+            .receipt
+            .as_ref()
+            .map(crate::events::ToolReceiptV1::to_metadata)
+            .unwrap_or_default();
+        metadata.attachments = previous.attachments;
+        agent
+            .emit_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::IdempotencyReceiptReplayed,
+                format!("Replayed durable receipt for {} without repeating I/O", tc.name),
+                serde_json::json!({
+                    "condition": "idempotency_receipt_replayed",
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "idempotency_key": ctx.idempotency_key,
+                    "receipt_outcome": previous.receipt.as_ref().map(|receipt| receipt.outcome_status),
+                }),
+            )
+            .await;
+        return ToolExecutionIoResult {
+            result_text: previous.result,
+            tool_duration_ms: 0,
+            result_metadata: metadata,
+        };
+    }
+
+    if let Some(reason) = idempotency_block_reason {
+        let semantics = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == tc.name && tool.is_available())
+            .map(|tool| tool.call_semantics(ctx.effective_arguments))
+            .unwrap_or_default();
+        agent
+            .emit_warning_decision_point(
+                ctx.emitter,
+                ctx.task_id,
+                ctx.iteration,
+                DecisionType::IdempotencyIndeterminateBlock,
+                format!("Blocked indeterminate replay for {}", tc.name),
+                serde_json::json!({
+                    "condition": "idempotency_indeterminate_block",
+                    "tool": tc.name,
+                    "tool_call_id": tc.id,
+                    "idempotency_key": ctx.idempotency_key,
+                    "reason": reason,
+                }),
+            )
+            .await;
+        return ToolExecutionIoResult {
+            result_text: format!("Error: {reason}"),
+            tool_duration_ms: 0,
+            result_metadata: crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Blocked),
+                semantics,
+                ..crate::traits::ToolCallMetadata::default()
+            },
+        };
+    }
 
     let tool_exec_start = Instant::now();
     touch_heartbeat(ctx.heartbeat);
@@ -334,6 +500,60 @@ pub(super) async fn execute_tool_call_io(
         result_text,
         tool_duration_ms,
         result_metadata,
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn result_with_status(
+        status: crate::traits::ToolOutcomeStatus,
+    ) -> crate::events::ToolResultData {
+        let metadata = crate::traits::ToolCallMetadata {
+            outcome_status: Some(status),
+            semantics: crate::traits::ToolCallSemantics::mutation(),
+            ..crate::traits::ToolCallMetadata::default()
+        };
+        crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: "call-1".to_string(),
+            name: "probe".to_string(),
+            result: "result".to_string(),
+            success: status == crate::traits::ToolOutcomeStatus::Succeeded,
+            duration_ms: 1,
+            error: None,
+            task_id: None,
+            annotations: Vec::new(),
+            turn_id: None,
+            attachments: Vec::new(),
+            receipt: Some(crate::events::ToolReceiptV1::from_metadata(
+                &metadata,
+                status,
+                crate::events::ToolOutcomeEvidenceSource::ToolReported,
+                Some("exec:e1:probe:abc".to_string()),
+            )),
+        }
+    }
+
+    #[test]
+    fn durable_replay_only_reexecutes_safe_retryable_failures() {
+        let retryable = result_with_status(crate::traits::ToolOutcomeStatus::FailedRetryable);
+        assert!(!should_replay_durable_result(&retryable, true));
+        assert!(should_replay_durable_result(&retryable, false));
+
+        for status in [
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult,
+            crate::traits::ToolOutcomeStatus::FailedPermanent,
+            crate::traits::ToolOutcomeStatus::Blocked,
+            crate::traits::ToolOutcomeStatus::Backgrounded,
+        ] {
+            assert!(should_replay_durable_result(
+                &result_with_status(status),
+                true
+            ));
+        }
     }
 }
 

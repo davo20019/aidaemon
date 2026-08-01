@@ -1127,7 +1127,13 @@ impl BrowserTool {
             .await
             .map_err(|e| format!("Failed to save rendered PDF: {e}"))?;
 
-        let mut attachments = Vec::new();
+        let mut attachments = vec![crate::channels::attachments::tool_artifact_attachment(
+            &output_path,
+            output_filename.to_string(),
+            "application/pdf".to_string(),
+            pdf_bytes.len() as u64,
+            "browser",
+        )];
         if let Some(preview_bytes) = preview {
             let preview_hint = format!(
                 "{}-preview.png",

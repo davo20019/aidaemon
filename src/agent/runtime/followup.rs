@@ -81,94 +81,6 @@ pub(super) fn looks_like_retry_followup(text: &str) -> bool {
         )
 }
 
-/// Detect short revision/delivery commands whose object exists only in the
-/// immediately preceding conversation: "make it one page", "send that PDF",
-/// "use the shorter version instead". These must be classified before the
-/// standalone-mutation heuristics, which otherwise treat the format words as
-/// a complete new task and detach the request from its actual subject.
-pub(super) fn looks_like_anaphoric_revision_followup(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 160 {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if looks_like_explicit_task_switch(&lower) {
-        return false;
-    }
-
-    let has_strong_prior_object_reference = text_contains_any_phrase(
-        &lower,
-        &[
-            "it",
-            "that",
-            "the same",
-            "the file",
-            "the pdf",
-            "the document",
-            "the report",
-            "the version",
-            "the attachment",
-        ],
-    );
-    let has_this_reference = contains_keyword_as_words(&lower, "this");
-    let has_revision_modifier = text_contains_any_phrase(
-        &lower,
-        &[
-            "instead",
-            "shorter",
-            "longer",
-            "one page",
-            "1 page",
-            "two pages",
-            "2 pages",
-            "another version",
-            "different format",
-        ],
-    );
-    if !has_strong_prior_object_reference && !(has_this_reference && has_revision_modifier) {
-        return false;
-    }
-
-    let starts_with_revision_verb = [
-        "make ", "change ", "convert ", "turn ", "rewrite ", "revise ", "update ", "shorten ",
-        "expand ", "render ", "export ", "save ", "send ", "use ",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix));
-
-    starts_with_revision_verb || has_revision_modifier
-}
-
-/// Artifact revisions are unsafe to execute without a resolvable antecedent:
-/// a broad file search can select an unrelated old deliverable that happens to
-/// have the requested extension.
-pub(super) fn looks_like_anaphoric_artifact_revision(text: &str) -> bool {
-    if !looks_like_anaphoric_revision_followup(text) {
-        return false;
-    }
-    let lower = text.to_ascii_lowercase();
-    text_contains_any_phrase(
-        &lower,
-        &[
-            "pdf",
-            "file",
-            "document",
-            "docx",
-            "report",
-            "attachment",
-            "presentation",
-            "slides",
-            "spreadsheet",
-            "image",
-            "photo",
-            "one page",
-            "1 page",
-            "two pages",
-            "2 pages",
-        ],
-    )
-}
-
 pub(super) fn find_previous_turns(
     history: &[Message],
     current_user_text: &str,
@@ -857,10 +769,9 @@ pub(super) fn classify_followup_mode(
         return (FollowupMode::Followup, reasons);
     }
 
-    if prev_assistant.is_some() && looks_like_anaphoric_revision_followup(trimmed) {
-        reasons.push(TurnContextReason::ExplicitFollowup);
-        return (FollowupMode::Followup, reasons);
-    }
+    // Do not infer an artifact binding from English pronouns or format words.
+    // The model receives canonical history plus opaque resource handles and
+    // chooses the antecedent; execution then validates that exact handle.
 
     // Strong followup indicators that should override the length heuristic.
     // Phrases like "follow-up on the X you just created" clearly reference
@@ -1021,14 +932,12 @@ mod tests {
     }
 
     #[test]
-    fn anaphoric_artifact_revision_keeps_immediate_parent_context() {
+    fn artifact_pronouns_do_not_create_a_deterministic_binding() {
         let current = "Make it 1 page PDF instead.";
         let previous = "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.";
-        let (mode, reasons) = classify_followup_mode(current, Some(previous));
+        let (mode, _) = classify_followup_mode(current, Some(previous));
 
-        assert_eq!(mode, FollowupMode::Followup);
-        assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
-        assert!(looks_like_anaphoric_artifact_revision(current));
+        assert_eq!(mode, FollowupMode::NewTask);
     }
 
     #[test]
@@ -1041,9 +950,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_instead_task_switch_is_not_anaphoric_revision() {
+    fn explicit_instead_task_switch_stays_a_new_task() {
         let current = "Instead make a new one-page PDF about rice farming.";
-        assert!(!looks_like_anaphoric_revision_followup(current));
+        let (mode, _) = classify_followup_mode(current, Some("Previous PDF"));
+        assert_eq!(mode, FollowupMode::NewTask);
     }
 
     #[test]

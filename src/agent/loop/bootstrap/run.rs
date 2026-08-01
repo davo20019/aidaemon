@@ -259,19 +259,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     )
     .await;
 
-    if let Some(reply) = super::shortcuts::maybe_handle_unresolved_artifact_reference(
-        agent,
-        session_id,
-        user_text,
-        !ctx.attachments.is_empty(),
-        &task_id,
-        &emitter,
-    )
-    .await?
-    {
-        return Ok(BootstrapOutcome::Return(Ok(reply)));
-    }
-
     if let Some(reply) = super::shortcuts::maybe_handle_non_resolving_confirmation_shortcut(
         agent, session_id, user_text, &task_id, &emitter,
     )
@@ -914,6 +901,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
 
     let data = BootstrapData {
         task_id,
+        resume_execution_snapshot: resume_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.execution_snapshot.clone()),
         emitter,
         learning_ctx,
         is_personal_memory_recall_turn,

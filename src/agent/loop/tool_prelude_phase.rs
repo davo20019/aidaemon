@@ -766,17 +766,50 @@ fn should_run_pre_execution_critique(
     capabilities.high_impact_write || capabilities.external_side_effect
 }
 
-fn tool_call_has_concrete_target(tc: &ToolCall) -> bool {
-    let Ok(args) = serde_json::from_str::<Value>(&tc.arguments) else {
+fn tool_call_has_concrete_target(agent: &Agent, tc: &ToolCall) -> bool {
+    if agent
+        .tools
+        .iter()
+        .find(|tool| tool.name() == tc.name && tool.is_available())
+        .map(|tool| tool.call_semantics(&tc.arguments))
+        .is_some_and(|semantics| {
+            semantics
+                .target_hints
+                .iter()
+                .any(|target| !target.value.trim().is_empty())
+        })
+    {
+        return true;
+    }
+
+    // Compatibility fallback for adapters that have not yet declared typed
+    // target hints. This inspects schema fields only; it never interprets the
+    // user's sentence or invents a target value.
+    arguments_have_concrete_target(&tc.arguments)
+}
+
+fn arguments_have_concrete_target(arguments: &str) -> bool {
+    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
         return false;
     };
     [
+        "resource_id",
         "path",
+        "file_path",
         "url",
+        "target",
+        "target_path",
         "command",
         "project",
+        "project_path",
+        "project_dir",
         "repo",
         "repository",
+        "repo_path",
+        "repo_dir",
+        "working_dir",
+        "directory",
+        "dir",
         "account",
         "channel",
         "recipient",
@@ -1230,10 +1263,13 @@ pub(super) async fn run_tool_prelude_phase(
             uncertainty_guard_blocks_tool(
                 &tc.name,
                 tool_call_is_side_effecting(agent, tc, available_capabilities),
-            ) && !tool_call_has_concrete_target(tc)
+            ) && !tool_call_has_concrete_target(agent, tc)
         });
+        // Ambiguity is a property of the proposed operation, not of a word in
+        // the user's sentence. The model may resolve "it" from conversation
+        // history, but a side effect still cannot run until its structured tool
+        // call contains a concrete target/resource handle.
         if unresolved_side_effecting_call.is_some()
-            && super::policy_signals::user_text_looks_ambiguous(user_text)
             && agent
                 .supervision_gate_enforced_with_context(
                     "uncertainty_clarify_gate",
@@ -1828,6 +1864,15 @@ mod tests {
             arguments: arguments.to_string(),
             extra_content: None,
         }
+    }
+
+    #[test]
+    fn resource_handles_are_concrete_structural_targets() {
+        assert!(arguments_have_concrete_target(
+            r#"{"resource_id":"res_exact"}"#
+        ));
+        assert!(!arguments_have_concrete_target(r#"{"resource_id":"   "}"#));
+        assert!(!arguments_have_concrete_target(r#"{"caption":"send it"}"#));
     }
 
     #[test]

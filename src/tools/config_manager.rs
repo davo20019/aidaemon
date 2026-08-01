@@ -9,7 +9,10 @@ use crate::config::AppConfig;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects,
+};
 use crate::types::ApprovalResponse;
 
 /// Key names that contain secrets and must be redacted before showing to the LLM.
@@ -1512,6 +1515,19 @@ impl Tool for ConfigManagerTool {
 
     fn schema(&self) -> Value {
         manage_config_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &[
+                "read",
+                "get",
+                "list_provider_presets",
+                "list_failover_providers",
+            ],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

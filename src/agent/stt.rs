@@ -337,6 +337,7 @@ mod tests {
             size_bytes: 1024,
             provenance: crate::traits::AttachmentProvenance::Inbound,
             source_tool: None,
+            ..MessageAttachment::default()
         }
     }
 
@@ -363,6 +364,7 @@ mod tests {
             size_bytes: 16,
             provenance: crate::traits::AttachmentProvenance::Inbound,
             source_tool: None,
+            ..MessageAttachment::default()
         }];
         assert!(!should_run_stt_fallback(
             &stt_config(),

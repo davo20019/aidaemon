@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
-use crate::mcp::{McpClient, McpTool};
+use crate::mcp::{capabilities_from_tool_definition, McpClient, McpTool};
 use crate::traits::{DynamicMcpServer, StateStore, Tool};
 
 /// A running MCP server entry in the registry.
@@ -121,6 +121,7 @@ impl McpRegistry {
                 Arc::clone(&client),
                 name.to_string(),
                 self.clone(),
+                capabilities_from_tool_definition(td),
             )));
         }
 

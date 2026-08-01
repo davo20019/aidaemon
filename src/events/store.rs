@@ -13,8 +13,9 @@ use tracing::{info, warn};
 
 use super::conversation_turn::{group_rows_into_turns, FetchedRow, FetchedTurn};
 use super::{
-    DecisionPointData, DecisionType, Event, EventType, LlmCallData, PolicyDecisionData,
-    TaskEndData, TaskStatus, ToolResultData,
+    DecisionPointData, DecisionType, Event, EventType, InteractionRequestedData,
+    InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, TaskEndData,
+    TaskStatus, ToolResultData,
 };
 use crate::traits::Message;
 
@@ -29,6 +30,8 @@ pub struct TaskWindowStats {
     pub completed: u64,
     pub failed: u64,
     pub cancelled: u64,
+    #[serde(default)]
+    pub interrupted: u64,
     pub stalled: u64,
     pub error_events: u64,
     pub outcome_succeeded: u64,
@@ -130,6 +133,7 @@ impl Default for TaskWindowStats {
             completed: 0,
             failed: 0,
             cancelled: 0,
+            interrupted: 0,
             stalled: 0,
             error_events: 0,
             outcome_succeeded: 0,
@@ -443,6 +447,49 @@ impl EventStore {
         let mut events = self.rows_to_events(rows)?;
         events.reverse();
         Ok(events)
+    }
+
+    /// Reconstruct approvals that have a durable request but no later durable
+    /// resolution. The projection deliberately reads the full interaction
+    /// lifecycle for the session: silently dropping an old unresolved request
+    /// because of an arbitrary recency limit would be unsafe.
+    pub async fn get_pending_interactions(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<InteractionRequestedData>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
+            FROM events
+            WHERE session_id = ?
+              AND event_type IN ('interaction_requested', 'interaction_resolved')
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let events = self.rows_to_events(rows)?;
+        let mut pending =
+            std::collections::HashMap::<String, (i64, InteractionRequestedData)>::new();
+        for event in events {
+            match event.event_type {
+                EventType::InteractionRequested => {
+                    if let Ok(data) = event.parse_data::<InteractionRequestedData>() {
+                        pending.insert(data.interaction_id.clone(), (event.id, data));
+                    }
+                }
+                EventType::InteractionResolved => {
+                    if let Ok(data) = event.parse_data::<InteractionResolvedData>() {
+                        pending.remove(&data.interaction_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut pending = pending.into_values().collect::<Vec<_>>();
+        pending.sort_by_key(|(event_id, _)| *event_id);
+        Ok(pending.into_iter().map(|(_, data)| data).collect())
     }
 
     /// Query events for a specific task
@@ -1033,6 +1080,94 @@ impl EventStore {
         .await
     }
 
+    /// Resolve the latest state of an opaque resource handle inside one
+    /// session. The latest lifecycle event wins, so an invalidation prevents a
+    /// stale locator from being used even when an older registration exists.
+    pub async fn get_resource(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+    ) -> anyhow::Result<Option<ResourceRegisteredData>> {
+        let row = sqlx::query(
+            r#"
+            SELECT event_type, data
+            FROM events
+            WHERE session_id = ?
+              AND event_type IN ('resource_registered', 'resource_invalidated')
+              AND json_extract(data, '$.resource_id') = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(resource_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let event_type: String = row.get("event_type");
+        if event_type == EventType::ResourceInvalidated.as_str() {
+            return Ok(None);
+        }
+        let data: String = row.get("data");
+        Ok(Some(serde_json::from_str(&data)?))
+    }
+
+    /// Return the latest durable result for an exact idempotency key.
+    pub async fn get_tool_result_by_idempotency_key(
+        &self,
+        session_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<ToolResultData>> {
+        let row = sqlx::query(
+            r#"
+            SELECT data
+            FROM events
+            WHERE session_id = ?
+              AND event_type = 'tool_result'
+              AND json_extract(data, '$.receipt.idempotency_key') = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let data: String = row.get("data");
+        Ok(Some(serde_json::from_str(&data)?))
+    }
+
+    /// Whether execution was durably claimed for this key without a result.
+    /// This is an indeterminate side effect after a crash and must be
+    /// reconciled rather than blindly replayed.
+    pub async fn has_unresolved_tool_call_for_idempotency_key(
+        &self,
+        session_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM events
+            WHERE session_id = ?
+              AND event_type = 'tool_call'
+              AND json_extract(data, '$.idempotency_key') = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn get_tool_stats(
         &self,
         tool_name: &str,
@@ -1478,6 +1613,7 @@ impl EventStore {
                     TaskStatus::Completed => stats.completed += 1,
                     TaskStatus::Failed => stats.failed += 1,
                     TaskStatus::Cancelled => stats.cancelled += 1,
+                    TaskStatus::Interrupted => stats.interrupted += 1,
                 }
                 match data.effective_outcome() {
                     crate::events::TaskOutcome::Succeeded => stats.outcome_succeeded += 1,
@@ -1751,6 +1887,7 @@ mod tests {
             outcome: Some(match status {
                 TaskStatus::Completed => crate::events::TaskOutcome::Succeeded,
                 TaskStatus::Cancelled | TaskStatus::Failed => crate::events::TaskOutcome::Failed,
+                TaskStatus::Interrupted => crate::events::TaskOutcome::Partial,
             }),
             duration_secs: 1,
             iterations: 1,

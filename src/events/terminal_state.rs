@@ -17,7 +17,7 @@ impl TerminalState {
             Some(TaskStatus::Completed) => Self::Completed,
             Some(TaskStatus::Failed) => Self::Failed,
             Some(TaskStatus::Cancelled) => Self::Cancelled,
-            None => Self::Interrupted,
+            Some(TaskStatus::Interrupted) | None => Self::Interrupted,
         }
     }
     /// Fixed deterministic placeholder for a no-text-reply turn (spec §Rendering).
@@ -58,6 +58,10 @@ mod tests {
         assert_eq!(
             TerminalState::from_task_status(Some(TaskStatus::Cancelled)),
             TerminalState::Cancelled
+        );
+        assert_eq!(
+            TerminalState::from_task_status(Some(TaskStatus::Interrupted)),
+            TerminalState::Interrupted
         );
         // No TaskEnd record for the turn → crash/interrupted.
         assert_eq!(

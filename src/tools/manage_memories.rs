@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
-use crate::traits::{StateStore, Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
+    ToolMutationEffects,
+};
 use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy};
 
 /// Split text into lowercased word tokens, breaking on every non-alphanumeric
@@ -404,6 +407,23 @@ impl Tool for ManageMemoriesTool {
 
     fn schema(&self) -> Value {
         manage_memories_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &[
+                "list",
+                "health",
+                "search",
+                "search_episodes",
+                "list_goals",
+                "list_scheduled",
+                "list_scheduled_matching",
+                "diagnose_scheduled",
+            ],
+            ToolMutationEffects::NONE,
+        )
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {

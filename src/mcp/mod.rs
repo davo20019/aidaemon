@@ -8,7 +8,9 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::config::McpServerConfig;
-use crate::traits::Tool;
+use crate::traits::{
+    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolVerificationMode,
+};
 
 pub use client::McpClient;
 pub use registry::McpRegistry;
@@ -23,11 +25,17 @@ pub struct McpTool {
     tool_schema: Value,
     client: Arc<McpClient>,
     registry: Option<McpRegistry>,
+    capabilities: ToolCapabilities,
 }
 
 impl McpTool {
     #[allow(dead_code)] // Used by discover_mcp_tools for static configs
-    pub fn new(tool_name: String, tool_schema: Value, client: Arc<McpClient>) -> Self {
+    pub fn new(
+        tool_name: String,
+        tool_schema: Value,
+        client: Arc<McpClient>,
+        capabilities: ToolCapabilities,
+    ) -> Self {
         let server_tool_name = tool_name.clone();
         Self {
             tool_name,
@@ -36,6 +44,7 @@ impl McpTool {
             tool_schema,
             client,
             registry: None,
+            capabilities,
         }
     }
 
@@ -47,6 +56,7 @@ impl McpTool {
         client: Arc<McpClient>,
         server_name: String,
         registry: McpRegistry,
+        capabilities: ToolCapabilities,
     ) -> Self {
         Self {
             tool_name: prefixed_name,
@@ -55,7 +65,43 @@ impl McpTool {
             tool_schema,
             client,
             registry: Some(registry),
+            capabilities,
         }
+    }
+}
+
+/// Derive execution semantics from MCP's structured ToolAnnotations.
+///
+/// MCP defines these fields as hints with conservative defaults. AIdaemon MCP
+/// servers are explicitly configured/installed by the owner (dynamic installs
+/// are approval-gated), so their annotations are treated as trusted adapter
+/// metadata. Missing annotations retain the MCP defaults: mutating,
+/// destructive, non-idempotent, and open-world.
+pub(crate) fn capabilities_from_tool_definition(definition: &Value) -> ToolCapabilities {
+    let annotations = definition.get("annotations");
+    let read_only = annotations
+        .and_then(|value| value.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let destructive = annotations
+        .and_then(|value| value.get("destructiveHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let idempotent = annotations
+        .and_then(|value| value.get("idempotentHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let open_world = annotations
+        .and_then(|value| value.get("openWorldHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    ToolCapabilities {
+        read_only,
+        external_side_effect: open_world || !read_only,
+        needs_approval: !read_only,
+        idempotent: read_only || idempotent,
+        high_impact_write: !read_only && destructive,
     }
 }
 
@@ -85,6 +131,22 @@ impl Tool for McpTool {
 
     fn schema(&self) -> Value {
         self.tool_schema.clone()
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        self.capabilities
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        if self.capabilities.read_only {
+            return ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent);
+        }
+        let mut effects = ToolMutationEffects::REMOTE_MUTATION;
+        if self.capabilities.high_impact_write {
+            effects = effects.union(ToolMutationEffects::DESTRUCTIVE);
+        }
+        ToolCallSemantics::mutation_with(effects)
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -224,6 +286,7 @@ pub async fn discover_mcp_tools(
                                 name,
                                 tool_schema,
                                 Arc::clone(&client),
+                                capabilities_from_tool_definition(&td),
                             )));
                         }
                     }
@@ -239,6 +302,48 @@ pub async fn discover_mcp_tools(
     }
 
     Ok(tools)
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_annotations_map_to_typed_capabilities_without_name_guessing() {
+        let read = capabilities_from_tool_definition(&serde_json::json!({
+            "name": "delete_everything_but_actually_read_only",
+            "annotations": {
+                "readOnlyHint": true,
+                "openWorldHint": false
+            }
+        }));
+        assert!(read.read_only);
+        assert!(read.idempotent);
+        assert!(!read.needs_approval);
+        assert!(!read.high_impact_write);
+
+        let write = capabilities_from_tool_definition(&serde_json::json!({
+            "name": "list_but_actually_mutates",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        }));
+        assert!(!write.read_only);
+        assert!(write.needs_approval);
+        assert!(write.idempotent);
+        assert!(!write.high_impact_write);
+
+        let unspecified = capabilities_from_tool_definition(&serde_json::json!({
+            "name": "unknown"
+        }));
+        assert!(!unspecified.read_only);
+        assert!(unspecified.needs_approval);
+        assert!(!unspecified.idempotent);
+        assert!(unspecified.high_impact_write);
+    }
 }
 
 /// Patterns in MCP tool arguments that may indicate an attack or misuse.

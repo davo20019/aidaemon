@@ -1,4 +1,5 @@
 use super::*;
+use crate::events::ToolOutcomeEvidenceSource;
 use crate::testing::{setup_test_agent, MockProvider};
 use crate::types::{ChannelContext, UserRole};
 use serde_json::json;
@@ -84,6 +85,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
                 annotations: Vec::new(),
                 turn_id: None,
                 attachments: Vec::new(),
+                receipt: None,
             },
         )
         .await
@@ -145,6 +147,36 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         )
         .await
         .unwrap();
+    let receipt = ToolReceiptV1::from_metadata(
+        &crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedPermanent),
+            semantics: crate::traits::ToolCallSemantics::observation(),
+            ..crate::traits::ToolCallMetadata::default()
+        },
+        crate::traits::ToolOutcomeStatus::FailedPermanent,
+        ToolOutcomeEvidenceSource::ToolReported,
+        Some("exec:exec-orphan-1:2:system_info:call_pending".to_string()),
+    );
+    emitter
+        .emit(
+            EventType::ToolResult,
+            ToolResultData {
+                message_id: None,
+                tool_call_id: "call_pending".to_string(),
+                name: "system_info".to_string(),
+                result: "legacy success flag is weaker than the receipt".to_string(),
+                success: true,
+                duration_ms: 8,
+                error: None,
+                task_id: Some(orphan_task_id.to_string()),
+                annotations: Vec::new(),
+                turn_id: None,
+                attachments: Vec::new(),
+                receipt: Some(receipt),
+            },
+        )
+        .await
+        .unwrap();
 
     let checkpoint = crate::agent::resume::build_resume_checkpoint(&harness.agent, session_id)
         .await
@@ -166,6 +198,15 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
     assert_eq!(
         execution_snapshot.current_target.as_deref(),
         Some("/tmp/demo")
+    );
+    assert_eq!(
+        execution_snapshot.last_outcome,
+        Some(crate::agent::execution_state::StepExecutionOutcome::NonrecoverableFailure),
+        "typed receipt must override stale snapshot/legacy success fields"
+    );
+    assert_eq!(
+        execution_snapshot.idempotency_key.as_deref(),
+        Some("exec:exec-orphan-1:2:system_info:call_pending")
     );
 
     let reply = harness
@@ -208,7 +249,11 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         .find(|e| e.event_type == EventType::TaskEnd)
         .expect("expected orphan task_end after resume");
     let orphan_end_data = orphan_end.parse_data::<TaskEndData>().unwrap();
-    assert_eq!(orphan_end_data.status, TaskStatus::Failed);
+    assert_eq!(orphan_end_data.status, TaskStatus::Interrupted);
+    assert_eq!(
+        orphan_end_data.effective_outcome(),
+        crate::events::TaskOutcome::Partial
+    );
     // Legacy case: the orphan TaskStart had turn_id = None, so the recovery
     // TaskEnd must NOT borrow the new resume turn — it stays None.
     assert!(
@@ -217,7 +262,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
     );
     assert!(
         orphan_end_data
-            .error
+            .summary
             .unwrap_or_default()
             .contains("Resumed in task"),
         "expected interruption reason to reference resumed task"

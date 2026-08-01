@@ -323,6 +323,9 @@ pub(super) fn target_hint_allowed_for_step(
     candidate_target: &ToolTargetHint,
 ) -> bool {
     match (&allowed_target.kind, &candidate_target.kind) {
+        (ToolTargetHintKind::ResourceId, ToolTargetHintKind::ResourceId) => {
+            allowed_target.value == candidate_target.value
+        }
         (ToolTargetHintKind::Url, ToolTargetHintKind::Url) => allowed_target
             .value
             .eq_ignore_ascii_case(&candidate_target.value),
@@ -720,6 +723,7 @@ pub(super) fn tool_target_hint_matches_contract_target(
         // Observing a project root is not evidence that a particular child
         // path was observed.
         (ToolTargetHintKind::ProjectScope, VerificationTargetKind::Path) => false,
+        (ToolTargetHintKind::ResourceId, _) => false,
         _ => false,
     }
 }

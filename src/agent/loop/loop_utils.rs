@@ -764,6 +764,31 @@ pub(super) fn classify_tool_outcome_status(
     ToolOutcomeStatus::Succeeded
 }
 
+/// Report the strength of the evidence used by `classify_tool_outcome_status`.
+/// This is persisted with the receipt so recovery and completion logic can
+/// distinguish an authoritative typed outcome from a compatibility parse of
+/// model-visible text.
+pub(super) fn tool_outcome_evidence_source(
+    metadata: &crate::traits::ToolCallMetadata,
+) -> crate::events::ToolOutcomeEvidenceSource {
+    if metadata.receipt_replayed {
+        return crate::events::ToolOutcomeEvidenceSource::DurableReplay;
+    }
+    if metadata.outcome_status.is_some() {
+        return crate::events::ToolOutcomeEvidenceSource::ToolReported;
+    }
+    if metadata.exit_code.is_some()
+        || metadata.timed_out
+        || metadata.background_started
+        || metadata.detached
+        || metadata.transport_error.is_some()
+        || metadata.http_status.is_some()
+    {
+        return crate::events::ToolOutcomeEvidenceSource::StructuredMetadata;
+    }
+    crate::events::ToolOutcomeEvidenceSource::LegacyText
+}
+
 pub(super) fn classify_execution_failure_kind(
     tool_name: &str,
     result_text: &str,

@@ -1062,6 +1062,141 @@ async fn test_execution_state_snapshots_and_idempotency_key_are_emitted_for_muta
     );
 }
 
+struct IdempotencyProbeTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for IdempotencyProbeTool {
+    fn name(&self) -> &str {
+        "idempotency_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only non-idempotent mutation"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": self.name(),
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": { "value": { "type": "string" } },
+                "required": ["value"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        let value = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| value.get("value").and_then(|value| value.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::CONFIGURATION,
+        )
+        .with_target_hint(crate::traits::ToolTargetHintKind::ResourceId, value)
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("mutation applied".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_duplicate_mutation_replays_durable_receipt_without_second_side_effect() {
+    let args = r#"{"value":"same-operation"}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("idempotency_probe", args),
+        MockProvider::text_response(
+            r#"{"goal":"Apply one test mutation","success_criteria":["The mutation is applied once"],"first_action":{"tool":"idempotency_probe","target":"same-operation","description":"Apply the mutation"},"requires_verification":false,"risky_actions":[]}"#,
+        ),
+        MockProvider::tool_call_response("idempotency_probe", args),
+        MockProvider::text_response("The mutation was applied once."),
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![Arc::new(IdempotencyProbeTool {
+            calls: calls.clone(),
+        })],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "idempotency_receipt_replay",
+            "Apply the idempotency probe mutation once.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "The mutation was applied once.");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "side effect ran twice");
+    let results = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "idempotency_receipt_replay",
+            &[crate::events::EventType::ToolResult],
+            20,
+        )
+        .await
+        .unwrap();
+    let receipts = results
+        .iter()
+        .filter_map(|event| event.parse_data::<crate::events::ToolResultData>().ok())
+        .filter_map(|result| result.receipt)
+        .collect::<Vec<_>>();
+    assert!(receipts.len() >= 2);
+    assert!(receipts.iter().any(|receipt| {
+        receipt.outcome_evidence == crate::events::ToolOutcomeEvidenceSource::DurableReplay
+    }));
+    assert_eq!(
+        receipts[0].idempotency_key,
+        receipts[1].idempotency_key,
+        "same operation in one durable execution must keep the same key"
+    );
+    let decisions = harness
+        .agent
+        .event_store()
+        .query_events_by_types(
+            "idempotency_receipt_replay",
+            &[crate::events::EventType::DecisionPoint],
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(decisions.iter().any(|event| {
+        event
+            .parse_data::<crate::events::DecisionPointData>()
+            .is_ok_and(|decision| {
+                decision.decision_type
+                    == crate::events::DecisionType::IdempotencyReceiptReplayed
+            })
+    }));
+}
+
 #[tokio::test]
 async fn test_evidence_gate_blocks_edit_until_file_is_read_then_plans_first_mutation() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2519,6 +2654,16 @@ impl crate::traits::Tool for FlakyProbeTool {
         }
         self.successes.fetch_add(1, Ordering::SeqCst);
         Ok("probe data recovered".to_string())
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
     }
 }
 

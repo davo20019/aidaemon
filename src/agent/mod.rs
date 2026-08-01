@@ -207,7 +207,8 @@ use loop_utils::{
     classify_tool_result_failure_with_context, extract_command_from_args,
     extract_file_path_from_args, extract_key_error_line, extract_send_file_dedupe_key_from_args,
     fixup_message_ordering, hash_tool_call, is_trigger_session, semantic_failure_limit,
-    strip_appended_diagnostics, ExecutionFailureKind, ToolFailureClass,
+    strip_appended_diagnostics, tool_outcome_evidence_source, ExecutionFailureKind,
+    ToolFailureClass,
 };
 #[path = "runtime/post_task.rs"]
 mod post_task;

@@ -1027,6 +1027,7 @@ mod tests {
                     size_bytes: 8,
                     provenance: AttachmentProvenance::ToolObservation,
                     source_tool: Some("browser".to_string()),
+                    ..MessageAttachment::default()
                 }],
                 ..Message::runtime_defaults()
             },
@@ -1082,6 +1083,7 @@ mod tests {
             size_bytes: 8,
             provenance: AttachmentProvenance::ToolObservation,
             source_tool: Some("computer_use".to_string()),
+            ..MessageAttachment::default()
         };
 
         let turn = vec![

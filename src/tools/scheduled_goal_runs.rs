@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::traits::{Goal, StateStore, Task, TaskActivity, Tool, ToolCapabilities};
+use crate::traits::{
+    semantics_for_exact_read_actions, Goal, StateStore, Task, TaskActivity, Tool,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+};
 
 pub struct ScheduledGoalRunsTool {
     state: Arc<dyn StateStore>,
@@ -722,6 +725,14 @@ impl Tool for ScheduledGoalRunsTool {
 
     fn schema(&self) -> Value {
         scheduled_goal_runs_schema()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        semantics_for_exact_read_actions(
+            arguments,
+            &["run_history", "last_failure", "unblock_hints"],
+            ToolMutationEffects::NONE,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {

@@ -1046,9 +1046,10 @@ mod tests {
             );
         }
 
-        assert!(ToolMutationEffects::UNSPECIFIED.satisfies(
+        assert!(!ToolMutationEffects::UNSPECIFIED.satisfies(
             ToolMutationEffects::LOCAL_SOURCE_WRITE.union(ToolMutationEffects::REMOTE_DEPLOY)
         ));
+        assert!(ToolMutationEffects::LOCAL_SOURCE_WRITE.satisfies(ToolMutationEffects::UNSPECIFIED));
     }
 
     #[test]

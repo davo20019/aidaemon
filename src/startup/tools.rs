@@ -420,7 +420,7 @@ pub async fn build_base_tools(
     .await?;
 
     let (approval_tx, approval_rx) = mpsc::channel(approval_queue_capacity);
-    let approval_tx = ApprovalBroker::new(approval_tx);
+    let approval_tx = ApprovalBroker::new(approval_tx).with_event_store(event_store.clone());
     let (media_tx, media_rx) = mpsc::channel::<MediaMessage>(media_queue_capacity);
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(BASE_TOOL_REGISTRY.len());
@@ -542,11 +542,10 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
-                tools.push(Arc::new(SendFileTool::new(
-                    media_tx.clone(),
-                    &config.files.outbox_dirs,
-                    &inbox_dir,
-                )));
+                tools.push(Arc::new(
+                    SendFileTool::new(media_tx.clone(), &config.files.outbox_dirs, &inbox_dir)
+                        .with_event_store(event_store.clone()),
+                ));
             }
             OptionalToolId::CliAgents => {
                 let register_cli = config.tools.is_enabled("cli_agent");

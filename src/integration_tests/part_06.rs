@@ -288,15 +288,15 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
     let provider = MockProvider::with_responses(vec![
         // 1) First call (with tools): deferral text, bounced by the
         //    deferred-action gate
-        MockProvider::text_response("I'll check and send it over."),
+        MockProvider::text_response("I'll check the system information for you."),
         // 2) Execution loop (bad): deferred action text, no tool calls
         MockProvider::text_response(
-            "I'll find your resume and send it over right away.\nStarting the send-resume workflow...",
+            "I'll check your system information now.\nStarting the system-information workflow...",
         ),
         // 3) Execution loop (good): actual tool execution
         MockProvider::tool_call_response("system_info", "{}"),
         // 4) Final answer
-        MockProvider::text_response("Found it and sent it."),
+        MockProvider::text_response("I checked the system information."),
     ]);
 
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
@@ -307,7 +307,7 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
         .agent
         .handle_message(
             "test_session",
-            "send me my resume",
+            "check my current system information",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
@@ -316,7 +316,7 @@ async fn test_deferred_action_no_tool_calls_does_not_complete_task() {
         .await
         .unwrap();
 
-    assert_eq!(response, "Found it and sent it.");
+    assert_eq!(response, "I checked the system information.");
     assert_eq!(harness.provider.call_count().await, 4);
 
     let calls = harness.provider.call_log.lock().await;

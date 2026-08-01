@@ -162,6 +162,7 @@ impl Agent {
         .await?;
         let BootstrapData {
             task_id,
+            resume_execution_snapshot,
             emitter,
             mut learning_ctx,
             is_personal_memory_recall_turn,
@@ -608,6 +609,12 @@ impl Agent {
                 ExecutionPersistence::Ephemeral
             },
         );
+        if let Some(snapshot) = resume_execution_snapshot {
+            execution_state.execution_id = snapshot.execution_id;
+            execution_state.last_outcome = snapshot.last_outcome;
+            execution_state.background_handoff_active = snapshot.background_handoff_active;
+            execution_state.persistence = ExecutionPersistence::Durable;
+        }
         execution_state.mark_persisted_now();
         self.emit_decision_point(
             &emitter,

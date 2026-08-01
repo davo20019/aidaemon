@@ -460,117 +460,6 @@ pub(super) async fn maybe_handle_non_resolving_confirmation_shortcut(
     Ok(Some(reply))
 }
 
-fn has_explicit_artifact_source(user_text: &str) -> bool {
-    user_text.split_whitespace().any(|raw| {
-        let token = raw
-            .trim_matches(|c: char| c.is_ascii_punctuation() && !matches!(c, '/' | '.' | '~'))
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        token.contains("/")
-            || token.contains("://")
-            || [
-                ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".png", ".jpg",
-                ".jpeg", ".webp",
-            ]
-            .iter()
-            .any(|extension| token.ends_with(extension))
-    })
-}
-
-fn unresolved_anaphoric_artifact_reference(
-    history: &[Message],
-    user_text: &str,
-    has_current_attachments: bool,
-) -> bool {
-    if !crate::agent::followup::looks_like_anaphoric_artifact_revision(user_text)
-        || has_current_attachments
-        || has_explicit_artifact_source(user_text)
-    {
-        return false;
-    }
-
-    // `find_previous_turns` expects the persisted current message to be in the
-    // history. State implementations are normally synchronous here, but append
-    // a synthetic copy for stores whose read can lag the write.
-    let latest_user_is_current = history
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .and_then(|message| message.content.as_deref())
-        .is_some_and(|content| content.trim().eq_ignore_ascii_case(user_text.trim()));
-    let mut with_current = history.to_vec();
-    if !latest_user_is_current {
-        with_current.push(Message {
-            content: Some(user_text.to_string()),
-            ..Message::new_runtime(
-                Uuid::new_v4().to_string(),
-                "artifact-reference-guard",
-                "user",
-            )
-        });
-    }
-
-    let (previous_assistant, previous_user) =
-        crate::agent::followup::find_previous_turns(&with_current, user_text);
-    previous_assistant.is_none() || previous_user.is_none()
-}
-
-/// Fail closed before tool selection when an artifact command says only
-/// "it/that/this" and no antecedent survived. Without this gate, a wildcard
-/// file search can silently select and send an unrelated old PDF.
-pub(super) async fn maybe_handle_unresolved_artifact_reference(
-    agent: &Agent,
-    session_id: &str,
-    user_text: &str,
-    has_current_attachments: bool,
-    task_id: &str,
-    emitter: &crate::events::EventEmitter,
-) -> anyhow::Result<Option<String>> {
-    if agent.depth != 0
-        || !crate::agent::followup::looks_like_anaphoric_artifact_revision(user_text)
-    {
-        return Ok(None);
-    }
-
-    let history = agent
-        .state
-        .get_history(session_id, 40)
-        .await
-        .unwrap_or_default();
-    let mut unresolved =
-        unresolved_anaphoric_artifact_reference(&history, user_text, has_current_attachments);
-    if unresolved {
-        // A single tool-heavy turn can exceed the flat history limit. Confirm
-        // against the two most recent canonical whole turns before blocking.
-        if let Ok(turns) = agent
-            .event_store()
-            .get_recent_turns_page(session_id, None, 2)
-            .await
-        {
-            let event_history: Vec<Message> =
-                turns.into_iter().flat_map(|turn| turn.messages).collect();
-            unresolved = unresolved_anaphoric_artifact_reference(
-                &event_history,
-                user_text,
-                has_current_attachments,
-            );
-        }
-    }
-    if !unresolved {
-        return Ok(None);
-    }
-
-    warn!(
-        session_id,
-        "Blocked unresolved anaphoric artifact request before tool selection"
-    );
-    let reply = "I can make that revision, but the referenced file or content is not available in this conversation context. Please attach it or name the exact file/topic. I won't search for and send a different artifact.";
-    let reply =
-        emit_bootstrap_direct_reply(agent, emitter, task_id, session_id, Instant::now(), reply)
-            .await?;
-    Ok(Some(reply))
-}
-
 pub(super) async fn maybe_handle_trivial_ack_shortcut(
     agent: &Agent,
     session_id: &str,
@@ -880,17 +769,8 @@ fn build_specific_answer_request(prev_assistant: &str) -> String {
 mod tests {
     use super::{
         assistant_question_requires_specific_answer, build_specific_answer_request,
-        is_bare_confirmation, looks_like_mid_task_pivot, unresolved_anaphoric_artifact_reference,
+        is_bare_confirmation, looks_like_mid_task_pivot,
     };
-    use crate::traits::Message;
-
-    fn message(role: &str, content: &str) -> Message {
-        Message {
-            content: Some(content.to_string()),
-            ..Message::new_runtime(format!("{role}-{content}"), "session", role)
-        }
-    }
-
     #[test]
     fn test_looks_like_mid_task_pivot_detects_explicit_pivot() {
         assert!(looks_like_mid_task_pivot(
@@ -960,43 +840,5 @@ mod tests {
                 .as_str(),
         );
         assert!(reply2.starts_with("I still need the specific"));
-    }
-
-    #[test]
-    fn artifact_reference_guard_allows_resolved_immediate_parent() {
-        let current = "Make it 1 page PDF instead.";
-        let history = vec![
-            message("user", "Create a two-page PDF about headless WordPress."),
-            message(
-                "assistant",
-                "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.",
-            ),
-            message("user", current),
-        ];
-
-        assert!(!unresolved_anaphoric_artifact_reference(
-            &history, current, false
-        ));
-    }
-
-    #[test]
-    fn artifact_reference_guard_blocks_missing_antecedent() {
-        let current = "Make it 1 page PDF instead.";
-        let history = vec![message("user", current)];
-
-        assert!(unresolved_anaphoric_artifact_reference(
-            &history, current, false
-        ));
-    }
-
-    #[test]
-    fn artifact_reference_guard_allows_current_attachment_or_named_source() {
-        let current = "Make it 1 page PDF instead.";
-        assert!(!unresolved_anaphoric_artifact_reference(&[], current, true));
-        assert!(!unresolved_anaphoric_artifact_reference(
-            &[],
-            "Make it 1 page PDF instead from ./draft.docx.",
-            false,
-        ));
     }
 }
