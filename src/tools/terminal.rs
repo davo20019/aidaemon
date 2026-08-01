@@ -3299,14 +3299,13 @@ impl TerminalTool {
 
                                         ping_count += 1;
                                         if ping_count > MAX_BACKGROUND_PROGRESS_PINGS {
-                                            // Periodic pings are exhausted. A process still
-                                            // alive at this point is likely long-lived (dev
-                                            // server, watcher) and may never exit, so the
-                                            // completion path below may never run. Re-engage
-                                            // the agent ONCE with the output so far so it can
-                                            // report status to the user (e.g. "server is up on
-                                            // port X") and close out the original task; then
-                                            // stay silent and keep waiting for completion.
+                                            // Periodic pings are exhausted. Liveness alone does
+                                            // not identify the process: it may be stalled,
+                                            // awaiting input, or intentionally long-lived. Re-
+                                            // engage the agent ONCE with the command/output so it
+                                            // can inspect the evidence, report an accurate status,
+                                            // and close out the original task; then stay silent and
+                                            // keep waiting for completion.
                                             if !still_running_notice_sent {
                                                 still_running_notice_sent = true;
                                                 let elapsed_secs =
@@ -3358,15 +3357,16 @@ impl TerminalTool {
                                                          Command: `{}`\n\
                                                          Running for: {}\n\
                                                          Output so far:\n{}\n\n\
-                                                         This process shows no sign of exiting on its own — it is \
-                                                         likely a long-lived process such as a dev server or watcher. \
+                                                         This process is still alive after repeated checks. It may be \
+                                                         stalled, awaiting input, or intentionally long-lived; do not \
+                                                         infer that it is a server or watcher from liveness alone. \
                                                          It keeps running in the background (pid={}); use the terminal \
                                                          tool with action=\"check\" or action=\"kill\" if needed, but \
                                                          do NOT re-run the command and do NOT wait for it to finish. \
                                                          This command was part of your previous task: check your \
-                                                         session history for the original user request, tell the user \
-                                                         the current status (for a server, include the URL/port it is \
-                                                         listening on), and complete any remaining steps of that task now.",
+                                                         session history and inspect the command/output before naming \
+                                                         its type. Tell the user the evidence-backed current status \
+                                                         and complete any remaining steps of that task now.",
                                                         command_summary,
                                                         humanize_elapsed(elapsed_secs),
                                                         output,
@@ -3426,7 +3426,7 @@ impl TerminalTool {
                                                         combined.push_str(&stderr);
                                                     }
                                                     let fallback = format!(
-                                                        "ℹ️ Still running after {} — this looks like a long-lived process (such as a dev server), so it may not finish on its own. It keeps running in the background; I'll send a final update if it stops. Latest output:\n{}",
+                                                        "ℹ️ Still running after {} — the process may be stalled or long-lived, but its type cannot be inferred from liveness alone. It remains in the background; I'll send a final update if it stops. Latest output:\n{}",
                                                         humanize_elapsed(elapsed_secs),
                                                         summarize_progress_output(&combined)
                                                     );

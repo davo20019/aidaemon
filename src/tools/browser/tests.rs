@@ -141,6 +141,144 @@ async fn schema_exposes_scroll_direction_and_amount() {
 }
 
 #[tokio::test]
+async fn render_pdf_uses_chromium_and_persists_a_valid_artifact() {
+    use crate::traits::ToolCallOutcome;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("investor brief.html");
+    std::fs::write(
+        &source,
+        "<!doctype html><style>@page{size:letter;margin:0}body{background:#063;color:white}</style><h1>Investor brief</h1>",
+    )
+    .unwrap();
+
+    let (tool, backend, _rx) = mock_tool();
+    let tool = tool.with_inbox_dir(temp.path().join("inbox"));
+    let args = json!({
+        "action": "render_pdf",
+        "source_path": source,
+        "output_filename": "quarterly-investor-brief.pdf",
+        "_session_id": "sess-pdf"
+    });
+    let outcome: ToolCallOutcome = tool
+        .call_with_status_outcome(&args.to_string(), None)
+        .await
+        .unwrap();
+
+    assert!(outcome.output.starts_with("PDF rendered with Chromium"));
+    assert!(outcome.output.contains("The PDF has not been sent"));
+    let path = outcome
+        .output
+        .split_once("saved to: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .map(std::path::PathBuf::from)
+        .expect("render result should contain the saved PDF path");
+    let bytes = std::fs::read(&path).expect("rendered PDF should persist");
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("quarterly-investor-brief.pdf")
+    );
+    assert_eq!(
+        outcome.metadata.attachments.len(),
+        1,
+        "render_pdf should return a source preview for visual inspection"
+    );
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(calls.iter().any(|call| matches!(
+        call,
+        MockCall::Goto(url) if url.starts_with("file://") && url.contains("investor%20brief.html")
+    )));
+    assert!(calls.contains(&MockCall::WaitForNavigation));
+    assert!(calls.contains(&MockCall::RenderPdf));
+    assert!(calls.contains(&MockCall::Screenshot(None, true)));
+    assert!(calls
+        .iter()
+        .any(|call| matches!(call, MockCall::CloseTarget(_))));
+}
+
+#[tokio::test]
+async fn render_pdf_rejects_non_html_and_output_path_traversal_before_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("document.ps");
+    std::fs::write(&source, "%!PS-Adobe-3.0").unwrap();
+    let (tool, backend, _rx) = mock_tool();
+
+    let non_html = tool
+        .call(
+            &json!({
+                "action": "render_pdf",
+                "source_path": source,
+                "_session_id": "sess-pdf-invalid"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(non_html.contains("only .html or .htm"));
+
+    let html = temp.path().join("document.html");
+    std::fs::write(&html, "<p>safe</p>").unwrap();
+    let traversal = tool
+        .call(
+            &json!({
+                "action": "render_pdf",
+                "source_path": html,
+                "output_filename": "../escaped.pdf",
+                "_session_id": "sess-pdf-invalid"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(traversal.contains("plain filename"));
+    assert!(
+        backend.calls().lock().await.is_empty(),
+        "invalid render arguments must not launch or touch Chromium"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("document.html");
+    std::fs::write(&source, "<h1>Bounded render</h1>").unwrap();
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new().with_pdf_never_finishes());
+    let tool = tool
+        .with_inbox_dir(temp.path().join("inbox"))
+        .with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+
+    let result = tool
+        .call(
+            &json!({
+                "action": "render_pdf",
+                "source_path": source,
+                "output_filename": "never-produced.pdf",
+                "_session_id": "sess-pdf-timeout"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(result.contains("timed out after 2 seconds"), "{result}");
+    assert!(result.contains("no PDF was produced"), "{result}");
+    assert!(!temp.path().join("inbox/browser-render").exists());
+
+    let calls = backend.calls();
+    let calls = calls.lock().await;
+    assert!(calls.contains(&MockCall::RenderPdf));
+    assert!(calls
+        .iter()
+        .any(|call| matches!(call, MockCall::CloseTarget(_))));
+}
+
+#[tokio::test]
 async fn dispatch_mutation_click_routes_through_backend() {
     let (tool, backend, _rx) = mock_tool();
 

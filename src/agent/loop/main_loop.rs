@@ -1455,6 +1455,13 @@ impl Agent {
                     pending_system_messages: message_build_directives.pending_system_messages,
                     empty_response_retry_pending: message_build_recovery
                         .empty_response_retry_pending,
+                    redact_archived_shared_context: user_role != UserRole::Owner
+                        && matches!(
+                            channel_ctx.visibility,
+                            ChannelVisibility::PrivateGroup
+                                | ChannelVisibility::Public
+                                | ChannelVisibility::PublicExternal
+                        ),
                     status_tx: &status_tx,
                 },
             )

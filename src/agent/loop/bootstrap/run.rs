@@ -105,7 +105,10 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     )
     .await;
     let user_text = user_text_enriched.as_str();
-    let resume_checkpoint = if is_resume_request(user_text) {
+    // Resume checkpoints can contain prior tool arguments/results and broader
+    // owner authority. A collaborator starts a fresh scoped turn instead of
+    // inheriting an interrupted owner task from the shared session.
+    let resume_checkpoint = if user_role == UserRole::Owner && is_resume_request(user_text) {
         match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
             Ok(checkpoint) => checkpoint,
             Err(e) => {
@@ -255,6 +258,19 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         &task_id,
     )
     .await;
+
+    if let Some(reply) = super::shortcuts::maybe_handle_unresolved_artifact_reference(
+        agent,
+        session_id,
+        user_text,
+        !ctx.attachments.is_empty(),
+        &task_id,
+        &emitter,
+    )
+    .await?
+    {
+        return Ok(BootstrapOutcome::Return(Ok(reply)));
+    }
 
     if let Some(reply) = super::shortcuts::maybe_handle_non_resolving_confirmation_shortcut(
         agent, session_id, user_text, &task_id, &emitter,
@@ -428,12 +444,14 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             4
         };
 
-    // Tool access is owner-only.
+    // Tools are owner-only by default. A Guest can receive a tiny file-tool
+    // subset only through an explicit, active, channel-bound workspace grant.
     // Orchestrator (depth 0) now keeps tools available from iteration 1.
     // Deterministic control-plane routing still handles cancel/schedule/goal fast-paths
     // before the first LLM call.
     // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
-    let tools_allowed_for_user = user_role == UserRole::Owner;
+    let workspace_grant = channel_ctx.active_workspace_grant(user_role);
+    let tools_allowed_for_user = user_role == UserRole::Owner || workspace_grant.is_some();
 
     let mut available_capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
     let mut base_tool_defs: Vec<Value> = Vec::new();
@@ -444,11 +462,34 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         let (mut defs, mut caps) = agent.tool_definitions_with_capabilities(user_text).await;
         initial_tool_count = defs.len();
         tool_filter_stages.push(GateFilterStage::new(
-            "owner_role",
+            if workspace_grant.is_some() {
+                "workspace_grant"
+            } else {
+                "owner_role"
+            },
             initial_tool_count,
             initial_tool_count,
             "passed",
         ));
+
+        if let Some(grant) = workspace_grant {
+            let before = defs.len();
+            defs.retain(|definition| {
+                Agent::tool_name_from_definition(definition)
+                    .is_some_and(|name| grant.allows_tool(name))
+            });
+            caps.retain(|name, _| grant.allows_tool(name));
+            tool_filter_stages.push(GateFilterStage::new(
+                "workspace_tool_allowlist",
+                before,
+                defs.len(),
+                if before == defs.len() {
+                    "passed"
+                } else {
+                    "filtered"
+                },
+            ));
+        }
 
         // Filter tools by channel visibility
         if channel_ctx.visibility == ChannelVisibility::PublicExternal {
@@ -799,7 +840,17 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // 2a. Load conversation summary BEFORE building the prompt. Pillar A: the
     // session summary now participates in the per-task context tail, so it must
     // be available when `build_system_prompt_for_message` compiles the tail.
-    let session_summary = if agent.context_window_config.enabled && !straightforward_artifact_task {
+    let non_owner_shared_context = user_role != UserRole::Owner
+        && matches!(
+            channel_ctx.visibility,
+            ChannelVisibility::PrivateGroup
+                | ChannelVisibility::Public
+                | ChannelVisibility::PublicExternal
+        );
+    let session_summary = if agent.context_window_config.enabled
+        && !straightforward_artifact_task
+        && !non_owner_shared_context
+    {
         agent
             .state
             .get_conversation_summary(session_id)

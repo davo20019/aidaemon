@@ -28,6 +28,38 @@ fn assert_no_orphaned_tools(messages: &[Value]) {
     }
 }
 
+/// Helper: every tool result must follow (and consume) a matching assistant
+/// tool call. Set membership alone would miss a result that appears before its
+/// call or a duplicate result for the same call.
+fn assert_tool_results_follow_calls(messages: &[Value]) {
+    let mut pending = std::collections::HashSet::new();
+    for message in messages {
+        match message.get("role").and_then(|role| role.as_str()) {
+            Some("assistant") => {
+                if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                    pending.extend(
+                        tool_calls
+                            .iter()
+                            .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
+                            .map(str::to_string),
+                    );
+                }
+            }
+            Some("tool") => {
+                let id = message
+                    .get("tool_call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                assert!(
+                    pending.remove(id),
+                    "Tool result {id} has no preceding unmatched assistant tool call"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Helper: assert no assistant tool_call exists without a matching tool result.
 fn assert_no_orphaned_tool_calls(messages: &[Value]) {
     let tool_result_ids: std::collections::HashSet<String> = messages
@@ -107,9 +139,76 @@ fn assert_no_leading_tool(messages: &[Value]) {
 
 fn assert_all_invariants(messages: &[Value]) {
     assert_no_orphaned_tools(messages);
+    assert_tool_results_follow_calls(messages);
     assert_no_orphaned_tool_calls(messages);
     assert_no_consecutive_same_role(messages);
     assert_no_leading_tool(messages);
+}
+
+#[test]
+fn test_tool_result_before_matching_call_is_dropped() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "continue"}),
+        json!({"role": "tool", "tool_call_id": "c1", "name": "write_file", "content": "ok"}),
+        json!({"role": "assistant", "content": "late", "tool_calls": [tc("c1", "write_file")]}),
+        json!({"role": "user", "content": "next"}),
+    ];
+
+    fixup_message_ordering(&mut msgs);
+
+    assert_all_invariants(&msgs);
+    assert!(msgs
+        .iter()
+        .all(|message| message.get("tool_call_id").and_then(Value::as_str) != Some("c1")));
+}
+
+#[test]
+fn test_post_fitting_fixup_removes_tool_result_whose_call_was_trimmed() {
+    let oversized_arguments = "x".repeat(8_000);
+    let messages = vec![
+        json!({"role": "user", "content": "current task"}),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_trimmed",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": oversized_arguments}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "call_trimmed", "name": "write_file", "content": "written"}),
+        json!({"role": "assistant", "content": "", "tool_calls": [tc("c2", "browser")]}),
+        json!({"role": "tool", "tool_call_id": "c2", "name": "browser", "content": "ok"}),
+        json!({"role": "assistant", "content": "", "tool_calls": [tc("c3", "browser")]}),
+        json!({"role": "tool", "tool_call_id": "c3", "name": "browser", "content": "ok"}),
+        json!({"role": "assistant", "content": "", "tool_calls": [tc("c4", "browser")]}),
+        json!({"role": "tool", "tool_call_id": "c4", "name": "browser", "content": "ok"}),
+        json!({"role": "system", "content": "checkpoint"}),
+    ];
+
+    let (mut fitted, dropped) =
+        crate::memory::context_window::fit_messages_with_source_quotas(messages, 400);
+    assert!(dropped > 0);
+    assert!(fitted.iter().any(|message| {
+        message.get("tool_call_id").and_then(Value::as_str) == Some("call_trimmed")
+    }));
+    assert!(fitted.iter().all(|message| {
+        message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_none_or(|calls| {
+                calls
+                    .iter()
+                    .all(|call| call.get("id").and_then(Value::as_str) != Some("call_trimmed"))
+            })
+    }));
+
+    fixup_message_ordering(&mut fitted);
+
+    assert_all_invariants(&fitted);
+    assert!(fitted.iter().all(|message| {
+        message.get("tool_call_id").and_then(Value::as_str) != Some("call_trimmed")
+    }));
 }
 
 fn tc(id: &str, name: &str) -> Value {

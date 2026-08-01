@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, PrintToPdfParams};
 use chromiumoxide::cdp::browser_protocol::target::{
     CloseTargetParams, CreateTargetParams, GetTargetsParams, TargetId,
 };
@@ -107,6 +107,11 @@ pub trait PageHandle: Send + Sync {
     /// `full_page=true`. Defaulting to the viewport keeps captures within
     /// downstream channel (e.g. Telegram) dimension/byte limits.
     async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String>;
+
+    /// Print the current page to PDF with the page's CSS paper size and painted
+    /// backgrounds preserved. Keeping this as a CDP primitive avoids routing
+    /// designed HTML through office, PostScript, or Quick Look converters.
+    async fn render_pdf(&self) -> Result<Vec<u8>, String>;
 
     /// Current page URL, if available.
     ///
@@ -1047,6 +1052,18 @@ impl PageHandle for ChromiumoxidePage {
         }
     }
 
+    async fn render_pdf(&self) -> Result<Vec<u8>, String> {
+        let params = PrintToPdfParams::builder()
+            .display_header_footer(false)
+            .print_background(true)
+            .prefer_css_page_size(true)
+            .build();
+        self.page
+            .pdf(params)
+            .await
+            .map_err(|e| format!("Failed to render PDF with Chromium: {}", e))
+    }
+
     async fn url(&self) -> Option<String> {
         self.page.url().await.ok().flatten()
     }
@@ -1150,6 +1167,8 @@ pub enum MockCall {
     /// Recorded by `screenshot`. Fields: (selector, full_page) — lets tests
     /// assert the viewport default (`full_page=false`) vs. explicit full-page.
     Screenshot(Option<String>, bool),
+    /// Recorded by the deterministic Chromium PDF primitive.
+    RenderPdf,
     Url,
     /// Recorded by `MockBackend::reconnect`. Asserting on its count proves the
     /// tool layer reconnected exactly once on a connection-class error.
@@ -1238,6 +1257,9 @@ pub struct MockBackend {
     /// the timeout instantly. The default (`false`) makes `wait_for_navigation`
     /// return immediately, keeping ordinary navigation tests fast. Shared with pages.
     nav_never_settles: Arc<AtomicBool>,
+    /// When true, the mock Chromium print call never resolves. Used to prove
+    /// the render action's outer timeout cancels a stalled conversion.
+    pdf_never_finishes: Arc<AtomicBool>,
     /// Deterministic element-state scripting, shared with every `MockPage`.
     ///
     /// Each state predicate (present/visible/enabled) reads a per-condition
@@ -1304,6 +1326,7 @@ impl Default for MockBackend {
             headless: AtomicBool::new(true),
             click_navigates: Arc::new(AtomicBool::new(false)),
             nav_never_settles: Arc::new(AtomicBool::new(false)),
+            pdf_never_finishes: Arc::new(AtomicBool::new(false)),
             element_state: Arc::new(Mutex::new(MockElementState::default())),
             diagnostic_console: Arc::new(Mutex::new(Vec::new())),
             diagnostic_network: Arc::new(Mutex::new(Vec::new())),
@@ -1407,6 +1430,13 @@ impl MockBackend {
     /// `#[tokio::test(start_paused = true)]` so the fake clock elapses instantly.
     pub fn with_nav_never_settles(self) -> Self {
         self.nav_never_settles.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Model a Chromium print command that never returns. The caller's action
+    /// timeout—not the mock—must end the operation.
+    pub fn with_pdf_never_finishes(self) -> Self {
+        self.pdf_never_finishes.store(true, Ordering::SeqCst);
         self
     }
 
@@ -1514,6 +1544,8 @@ struct MockPage {
     /// Shared never-settles flag: when `true`, `wait_for_navigation` sleeps the
     /// full timeout (opt-in for bounded-timeout tests under paused clock).
     nav_never_settles: Arc<AtomicBool>,
+    /// Shared print-stall flag used by the render timeout regression.
+    pdf_never_finishes: Arc<AtomicBool>,
     /// Scripted console logs flushed into the diagnostics store on attach.
     diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
     /// Scripted network errors flushed into the diagnostics store on attach.
@@ -1677,6 +1709,14 @@ impl PageHandle for MockPage {
         Ok(self.screenshot_bytes.clone())
     }
 
+    async fn render_pdf(&self) -> Result<Vec<u8>, String> {
+        self.record(MockCall::RenderPdf).await;
+        if self.pdf_never_finishes.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        Ok(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n".to_vec())
+    }
+
     async fn url(&self) -> Option<String> {
         self.record(MockCall::Url).await;
         self.url.clone()
@@ -1751,6 +1791,7 @@ impl BrowserBackend for MockBackend {
                 element_state: Arc::clone(&self.element_state),
                 click_navigates: Arc::clone(&self.click_navigates),
                 nav_never_settles: Arc::clone(&self.nav_never_settles),
+                pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
                 diagnostic_console: Arc::clone(&self.diagnostic_console),
                 diagnostic_network: Arc::clone(&self.diagnostic_network),
             }),
@@ -1832,6 +1873,7 @@ impl BrowserBackend for MockBackend {
             element_state: Arc::clone(&self.element_state),
             click_navigates: Arc::clone(&self.click_navigates),
             nav_never_settles: Arc::clone(&self.nav_never_settles),
+            pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
             diagnostic_console: Arc::clone(&self.diagnostic_console),
             diagnostic_network: Arc::clone(&self.diagnostic_network),
         }))

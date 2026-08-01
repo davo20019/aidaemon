@@ -89,6 +89,38 @@ pub fn build_inbound_text(user_text: &str, attachments: &[MessageAttachment]) ->
     }
 }
 
+/// Build non-owner attachment context without exposing the daemon's local
+/// inbox path. The structured attachment still travels separately for vision
+/// and file handling; only the model-visible text stub is redacted.
+pub fn build_inbound_text_without_local_paths(
+    user_text: &str,
+    attachments: &[MessageAttachment],
+) -> String {
+    let stubs = attachments
+        .iter()
+        .map(|attachment| {
+            let size_display = if attachment.size_bytes > 1_048_576 {
+                format!("{:.1} MB", attachment.size_bytes as f64 / 1_048_576.0)
+            } else {
+                format!("{:.0} KB", attachment.size_bytes as f64 / 1024.0)
+            };
+            format!(
+                "[File received: {} ({}, {})]",
+                attachment.filename, size_display, attachment.mime_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user_text = user_text.trim();
+    if stubs.is_empty() {
+        user_text.to_string()
+    } else if user_text.is_empty() {
+        stubs
+    } else {
+        format!("{stubs}\n{user_text}")
+    }
+}
+
 pub fn message_attachment(
     dest_path: PathBuf,
     filename: String,
@@ -171,6 +203,22 @@ mod tests {
         assert!(stub.starts_with("[File received: doc.pdf"));
         assert!(stub.contains("512 KB"));
         assert!(stub.contains("application/pdf"));
+    }
+
+    #[test]
+    fn non_owner_attachment_context_hides_local_path() {
+        let attachments = vec![MessageAttachment {
+            local_path: "/Users/owner/.aidaemon/inbox/private.txt".to_string(),
+            filename: "private.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size_bytes: 1024,
+            ..MessageAttachment::default()
+        }];
+        let text = build_inbound_text_without_local_paths("please review", &attachments);
+        assert!(text.contains("private.txt"));
+        assert!(text.contains("please review"));
+        assert!(!text.contains("/Users/owner"));
+        assert!(!text.contains("Saved to:"));
     }
 
     #[test]

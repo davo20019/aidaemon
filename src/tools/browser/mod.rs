@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -422,6 +422,32 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// returns fast. Bounded well under `action_timeout`.
 const CLICK_SETTLE: Duration = Duration::from_millis(300);
 
+fn validate_pdf_filename(filename: &str) -> Result<(), String> {
+    if filename.is_empty()
+        || filename.len() > 240
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.chars().any(char::is_control)
+        || Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(filename)
+    {
+        return Err(
+            "output_filename must be a plain filename without directories or control characters"
+                .to_string(),
+        );
+    }
+    let is_pdf = Path::new(filename)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return Err("output_filename must end in .pdf".to_string());
+    }
+    Ok(())
+}
+
 impl BrowserTool {
     /// Construct the browser tool, resolving and validating the session
     /// isolation mode up front.
@@ -521,6 +547,13 @@ impl BrowserTool {
         self.nav_timeout = nav;
         self.element_timeout = element;
         self.action_timeout = action;
+        self
+    }
+
+    /// Test-only: direct generated artifacts into an isolated temporary inbox.
+    #[cfg(test)]
+    pub fn with_inbox_dir(mut self, inbox_dir: impl Into<PathBuf>) -> Self {
+        self.inbox_dir = inbox_dir.into();
         self
     }
 
@@ -966,6 +999,166 @@ impl BrowserTool {
         })
     }
 
+    /// Render a local HTML document through Chromium's native print pipeline.
+    ///
+    /// This is intentionally a dedicated browser action instead of a shell
+    /// recipe: office converters treat PostScript as editable text, ImageMagick
+    /// shells out to optional Ghostscript, and Quick Look can wait forever. CDP
+    /// gives us one deterministic renderer, a hard timeout, print backgrounds,
+    /// and CSS `@page` sizing in a single operation.
+    async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, String> {
+        if crate::execution::active_execution_backend().kind()
+            != crate::execution::BackendKind::Local
+        {
+            return Err("render_pdf is only available with local execution".to_string());
+        }
+
+        let raw_source = args
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
+        let source = crate::tools::fs_utils::validate_path(raw_source)
+            .map_err(|e| format!("Invalid source_path: {e}"))?;
+        if crate::tools::fs_utils::is_sensitive_path(&source) {
+            return Err("Cannot render a sensitive source path".to_string());
+        }
+        let source = source
+            .canonicalize()
+            .map_err(|e| format!("Could not resolve HTML source: {e}"))?;
+        if crate::tools::fs_utils::is_sensitive_path(&source) {
+            return Err("Cannot render a sensitive source path".to_string());
+        }
+        if !source.is_file() {
+            return Err("source_path must identify a regular HTML file".to_string());
+        }
+        let is_html = source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"));
+        if !is_html {
+            return Err("render_pdf accepts only .html or .htm source files".to_string());
+        }
+
+        let default_filename = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .map(|stem| format!("{stem}.pdf"))
+            .unwrap_or_else(|| "document.pdf".to_string());
+        let output_filename = args
+            .get("output_filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&default_filename)
+            .trim();
+        validate_pdf_filename(output_filename)?;
+
+        let source_url = reqwest::Url::from_file_path(&source)
+            .map_err(|_| "Could not convert source_path to a local file URL".to_string())?;
+
+        // Use a disposable page/context so rendering never navigates away from
+        // the session's active tab or destroys in-progress browser state.
+        self.backend.ensure_ready().await?;
+        let (target_id, context_id, page) = self.backend.create_page().await?;
+        let context_ids = context_id.into_iter().collect::<Vec<_>>();
+
+        let render = tokio::time::timeout(self.action_timeout, async {
+            page.goto(source_url.as_str()).await?;
+            page.wait_for_navigation(self.nav_timeout.min(self.action_timeout))
+                .await?;
+            page.render_pdf().await
+        })
+        .await;
+
+        let pdf_bytes = match render {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                self.backend
+                    .dispose_session(std::slice::from_ref(&target_id), &context_ids)
+                    .await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.backend
+                    .dispose_session(std::slice::from_ref(&target_id), &context_ids)
+                    .await;
+                return Err(format!(
+                    "Chromium PDF rendering timed out after {} seconds; no PDF was produced",
+                    self.action_timeout.as_secs()
+                ));
+            }
+        };
+
+        // A source-page preview is useful visual evidence for the agent. It is
+        // best-effort and separately bounded: a very tall page must not turn a
+        // successful PDF render into another hung conversion.
+        let preview =
+            match tokio::time::timeout(Duration::from_secs(5), page.screenshot(None, true)).await {
+                Ok(Ok(bytes)) if !bytes.is_empty() => Some(bytes),
+                Ok(Err(error)) => {
+                    warn!(error = %error, "PDF rendered but source preview capture failed");
+                    None
+                }
+                Err(_) => {
+                    warn!("PDF rendered but source preview capture timed out");
+                    None
+                }
+                _ => None,
+            };
+
+        self.backend
+            .dispose_session(std::slice::from_ref(&target_id), &context_ids)
+            .await;
+
+        if pdf_bytes.len() < 32 || !pdf_bytes.starts_with(b"%PDF-") {
+            return Err("Chromium returned invalid PDF data; no output file was saved".to_string());
+        }
+
+        // A per-render directory prevents accidental overwrites while preserving
+        // the clean requested basename when `send_file` delivers the artifact.
+        let output_dir = self
+            .inbox_dir
+            .join("browser-render")
+            .join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&output_dir)
+            .await
+            .map_err(|e| format!("Failed to create PDF output directory: {e}"))?;
+        let output_path = output_dir.join(output_filename);
+        tokio::fs::write(&output_path, &pdf_bytes)
+            .await
+            .map_err(|e| format!("Failed to save rendered PDF: {e}"))?;
+
+        let mut attachments = Vec::new();
+        if let Some(preview_bytes) = preview {
+            let preview_hint = format!(
+                "{}-preview.png",
+                Path::new(output_filename)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("document")
+            );
+            match crate::channels::attachments::save_tool_observation_image(
+                &self.inbox_dir,
+                &preview_bytes,
+                &preview_hint,
+                "image/png",
+                "browser",
+            ) {
+                Ok(attachment) => attachments.push(attachment),
+                Err(error) => warn!(error = %error, "PDF rendered but preview could not be saved"),
+            }
+        }
+
+        Ok(DispatchResult {
+            text: format!(
+                "PDF rendered with Chromium ({} bytes) and saved to: {}\n\
+                 The PDF has not been sent. Inspect the attached source preview, then call send_file with this exact path.",
+                pdf_bytes.len(),
+                output_path.display()
+            ),
+            attachments,
+        })
+    }
+
     async fn action_click(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let selector = args
             .get("selector")
@@ -1358,6 +1551,7 @@ impl BrowserTool {
                 .await
                 .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id).await,
+            "render_pdf" => self.action_render_pdf(args).await,
             "click" => self
                 .action_click(args, session_id)
                 .await
@@ -1412,7 +1606,7 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "close" => self.action_close().await.map(DispatchResult::text_only),
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, click, fill, get_text, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, render_pdf, click, fill, get_text, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
         }
@@ -1776,20 +1970,28 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a browser to navigate pages, click elements, fill forms, scroll, take screenshots, extract text, and execute JavaScript. Supports headless and visible modes."
+        "Control a browser to navigate pages, click elements, fill forms, scroll, take screenshots, render local HTML to PDF, extract text, and execute JavaScript. Supports headless and visible modes."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions. Actions: navigate (go to URL), screenshot (capture page as photo), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), scroll (move the active page up or down), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
+            "description": "Control a browser for web interactions and deterministic document rendering. Actions: navigate (go to URL), screenshot (capture page as photo), render_pdf (render a local HTML file with Chromium, preserving print backgrounds and CSS page size; returns a local path for send_file), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), scroll (move the active page up or down), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "click", "fill", "get_text", "scroll", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
+                        "enum": ["navigate", "screenshot", "render_pdf", "click", "fill", "get_text", "scroll", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
                         "description": "The browser action to perform"
+                    },
+                    "source_path": {
+                        "type": "string",
+                        "description": "Local .html or .htm source path for 'render_pdf'"
+                    },
+                    "output_filename": {
+                        "type": "string",
+                        "description": "Plain .pdf filename for 'render_pdf' (default: source basename with .pdf); directories are not allowed"
                     },
                     "url": {
                         "type": "string",
@@ -1898,8 +2100,13 @@ impl Tool for BrowserTool {
             .and_then(|value| value.get("script"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let output_filename = args
+            .as_ref()
+            .and_then(|value| value.get("output_filename"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
 
-        browser_call_semantics(action.as_deref(), url, selector, script)
+        browser_call_semantics(action.as_deref(), url, selector, script, output_filename)
     }
 }
 
@@ -1908,6 +2115,7 @@ fn browser_call_semantics(
     url: &str,
     selector: &str,
     script: &str,
+    output_filename: &str,
 ) -> ToolCallSemantics {
     match action {
         Some("navigate") => {
@@ -1919,6 +2127,10 @@ fn browser_call_semantics(
         Some("wait") => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
         Some("screenshot") => ToolCallSemantics::observation(),
+        Some("render_pdf") => {
+            ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_WORKSPACE_WRITE)
+                .with_target_hint(ToolTargetHintKind::Path, output_filename)
+        }
         Some("list_tabs") => ToolCallSemantics::observation(),
         Some("get_console_logs" | "get_network_errors") => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
@@ -1981,6 +2193,7 @@ mod prompt_tests {
         browser_call_semantics, browser_script_has_mutation_signal, format_browser_approval_prompt,
     };
     use crate::tools::browser::policy::{self, BrowserRiskClass};
+    use crate::traits::ToolMutationEffects;
 
     fn sample_risk() -> policy::BrowserActionRisk {
         policy::BrowserActionRisk {
@@ -1994,7 +2207,7 @@ mod prompt_tests {
     fn read_only_dom_extraction_is_observation_semantics() {
         let script =
             "JSON.stringify([...document.querySelectorAll('button')].map((b,i)=>({i,text:b.innerText})))";
-        let semantics = browser_call_semantics(Some("execute_js"), "", "", script);
+        let semantics = browser_call_semantics(Some("execute_js"), "", "", script, "");
         assert!(semantics.observes_state());
         assert!(!semantics.mutates_state());
         assert!(!browser_script_has_mutation_signal(script));
@@ -2005,11 +2218,23 @@ mod prompt_tests {
         assert!(browser_script_has_mutation_signal(
             "document.querySelector('#publish').click()"
         ));
-        assert!(browser_call_semantics(Some("click"), "", "#publish", "").mutates_state());
+        assert!(browser_call_semantics(Some("click"), "", "#publish", "", "").mutates_state());
         assert!(
-            browser_call_semantics(Some("click"), "", "button:nth-of-type(197)", "")
+            browser_call_semantics(Some("click"), "", "button:nth-of-type(197)", "", "")
                 .observes_state()
         );
+    }
+
+    #[test]
+    fn render_pdf_records_a_local_workspace_write() {
+        let semantics =
+            browser_call_semantics(Some("render_pdf"), "", "", "", "investor-brief.pdf");
+        assert!(semantics.mutates_state());
+        assert!(semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::LOCAL_WORKSPACE_WRITE));
+        assert_eq!(semantics.target_hints.len(), 1);
+        assert_eq!(semantics.target_hints[0].value, "investor-brief.pdf");
     }
 
     #[test]

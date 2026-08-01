@@ -287,7 +287,8 @@ pub(in crate::agent) use history::{
     parse_planned_mutation_effects, parse_planned_task_kind,
 };
 pub(in crate::agent) use history::{
-    completion_contract_allows_force_text, mutation_contract_fulfilled,
+    authored_artifact_still_needs_delivery_recovery, completion_contract_allows_force_text,
+    mutation_contract_fulfilled,
 };
 #[path = "loop/compaction.rs"]
 mod compaction;

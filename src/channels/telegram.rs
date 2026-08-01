@@ -37,7 +37,7 @@ use crate::channels::{spawn_discord_channel, DiscordChannel};
 #[cfg(feature = "slack")]
 use crate::channels::{spawn_slack_channel, SlackChannel};
 use crate::config::{AppConfig, TelegramWebhookConfig};
-use crate::tasks::{QueueOutcome, TaskRegistry};
+use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{
@@ -3594,6 +3594,8 @@ impl TelegramChannel {
                     app_token,
                     bot_token,
                     allowed_user_ids_str, // Slack uses String user IDs
+                    Vec::new(),           // Empty preserves legacy allowed-user owner behavior
+                    Vec::new(),           // Dynamic bot starts without delegated workspaces
                     false,                // use_threads default
                     Arc::clone(&self.agent),
                     self.config_path.clone(),
@@ -4319,7 +4321,14 @@ impl TelegramChannel {
             return;
         }
 
-        let text = super::attachments::build_inbound_text(&body_text, &inbound_attachments);
+        let text = if user_role == UserRole::Owner {
+            super::attachments::build_inbound_text(&body_text, &inbound_attachments)
+        } else {
+            super::attachments::build_inbound_text_without_local_paths(
+                &body_text,
+                &inbound_attachments,
+            )
+        };
 
         // Handle slash commands.
         // `/setup` is spawned in a separate task because `handle_setup_command`
@@ -4414,6 +4423,7 @@ impl TelegramChannel {
                 platform: "telegram".to_string(),
                 channel_name: msg.chat.title().map(|s| s.to_string()),
                 channel_id,
+                workspace_id: None,
                 sender_name: msg.from.as_ref().map(|u| match &u.last_name {
                     Some(last) => format!("{} {}", u.first_name, last),
                     None => u.first_name.clone(),
@@ -4421,6 +4431,7 @@ impl TelegramChannel {
                 sender_id: msg.from.as_ref().map(|u| format!("telegram:{}", u.id.0)),
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             }
         };
@@ -4525,7 +4536,16 @@ impl TelegramChannel {
             // instead of stranding the message in an undrained queue.
             match self
                 .task_registry
-                .queue_message_if_running(&session_id, &text, Some(&dedup_key))
+                .queue_message_if_running(
+                    &session_id,
+                    QueuedMessage::new(
+                        &text,
+                        user_role,
+                        channel_ctx.clone(),
+                        inbound_attachments.clone(),
+                    ),
+                    Some(&dedup_key),
+                )
                 .await
             {
                 QueueOutcome::Queued(queue_pos) => {
@@ -4716,8 +4736,9 @@ impl TelegramChannel {
             let _typing_guard = TypingGuard(typing_guard_token.clone());
 
             let mut current_text = text;
-            let inbound_attachments = inbound_attachments;
-            let mut attachments_sent = false;
+            let mut current_attachments = inbound_attachments;
+            let mut current_user_role = user_role;
+            let mut current_channel_ctx = channel_ctx;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -4735,13 +4756,8 @@ impl TelegramChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
-                let attachments_for_call = if attachments_sent {
-                    &[][..]
-                } else {
-                    &inbound_attachments[..]
-                };
                 let result = tokio::select! {
-                    r = agent.handle_message_with_attachments(&session_id, &current_text, attachments_for_call, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    r = agent.handle_message_with_attachments(&session_id, &current_text, &current_attachments, Some(current_status_tx), current_user_role, current_channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 4), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -4755,7 +4771,6 @@ impl TelegramChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
-                attachments_sent = true;
                 current_typing_cancel.cancel();
                 // Abort the status display task to prevent blocking if a background
                 // CLI agent monitoring task still holds a status_tx clone.
@@ -4893,6 +4908,9 @@ impl TelegramChannel {
 
                     // Set up for next iteration
                     current_text = queued.text;
+                    current_user_role = queued.user_role;
+                    current_channel_ctx = queued.channel_ctx;
+                    current_attachments = queued.attachments;
                     let desc: String = current_text.chars().take(80).collect();
                     let (new_task_id, new_cancel_token) =
                         registry.register(&session_id, &desc).await;

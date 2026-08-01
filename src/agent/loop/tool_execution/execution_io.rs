@@ -122,6 +122,7 @@ pub(super) async fn execute_tool_call_io(
                 project_scope: ctx.project_scope,
                 trusted: ctx.channel_ctx.trusted,
                 user_role: ctx.user_role,
+                workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
                 correction_preapproved: ctx.correction_preapproved,
                 suppress_trusted_session: ctx.suppress_trusted_session,
             },
@@ -350,6 +351,18 @@ async fn maybe_retry_edit_file_not_found_recovery(
         return None;
     }
 
+    // The generic recovery below performs a direct backend read so it can map
+    // whitespace before retrying. Scoped collaborators must never enter a
+    // secondary path that is not itself rooted and canonicalized by the
+    // workspace gate; they can retry with an exact edit after `read_file`.
+    if ctx
+        .channel_ctx
+        .active_workspace_grant(ctx.user_role)
+        .is_some()
+    {
+        return None;
+    }
+
     let args: Value = serde_json::from_str(arguments).ok()?;
     let path = args.get("path")?.as_str()?.to_string();
     let old_text = args.get("old_text")?.as_str()?.to_string();
@@ -366,6 +379,7 @@ async fn maybe_retry_edit_file_not_found_recovery(
         project_scope: ctx.project_scope,
         trusted: ctx.channel_ctx.trusted,
         user_role: ctx.user_role,
+        workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
         correction_preapproved: ctx.correction_preapproved,
         suppress_trusted_session: ctx.suppress_trusted_session,
     };

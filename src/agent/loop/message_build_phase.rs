@@ -24,6 +24,10 @@ pub(super) struct MessageBuildCtx<'a> {
     pub policy_bundle: &'a PolicyBundle,
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub empty_response_retry_pending: bool,
+    /// Shared-channel non-owners keep visible conversation history but must not
+    /// receive hidden tool calls/results or local attachment metadata from an
+    /// owner's earlier turn in the same session.
+    pub redact_archived_shared_context: bool,
     pub status_tx: &'a Option<mpsc::Sender<StatusUpdate>>,
 }
 
@@ -49,6 +53,119 @@ const TOKEN_ESTIMATE_SAFETY_MARGIN: usize = 256;
 const CURRENT_TURN_RESERVE_TOKENS: usize = 4_000;
 /// Pillar B (Task 7): safety margin applied to the archived-region budget.
 const ARCHIVED_BUDGET_SAFETY_MARGIN: f64 = 0.10;
+const COMPACT_PARENT_USER_CHARS: usize = 1_200;
+const COMPACT_PARENT_ASSISTANT_CHARS: usize = 1_000;
+const COMPACT_PARENT_DELIVERY_CHARS: usize = 320;
+
+fn redact_archived_shared_turns(turns: &mut Vec<crate::events::FetchedTurn>) {
+    for turn in turns.iter_mut() {
+        turn.messages.retain(|message| message.role != "tool");
+        for message in &mut turn.messages {
+            if message.role == "assistant" {
+                message.tool_calls_json = None;
+                message.tool_call_id = None;
+                message.tool_name = None;
+            }
+            if let Some(content) = message.content.as_mut() {
+                let without_attachment_paths = if message.role == "user" {
+                    crate::channels::attachments::strip_inbound_file_stubs(content)
+                } else {
+                    content.clone()
+                };
+                *content = crate::tools::sanitize::redact_secrets(&without_attachment_paths);
+            }
+            message.attachments.clear();
+            message.annotations.clear();
+        }
+        turn.messages.retain(|message| {
+            message.role == "user"
+                || message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+        });
+    }
+    turns.retain(|turn| !turn.messages.is_empty());
+}
+
+fn compact_parent_text(content: &str, max_chars: usize, strip_file_stubs: bool) -> String {
+    let content = if strip_file_stubs {
+        crate::channels::attachments::strip_inbound_file_stubs(content)
+    } else {
+        content.to_string()
+    };
+    let redacted = crate::tools::sanitize::redact_secrets(&content);
+    truncate_for_resume(redacted.trim(), max_chars)
+}
+
+/// Provider-valid shell for the immediately preceding turn when its complete
+/// archived rendering cannot fit even the low-water window. Retain the human
+/// request, final answer, and delivery evidence; discard tool protocol and
+/// binary observations. This is intentionally not used for older turns.
+fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
+    let prior_user = turn_messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        let content = compact_parent_text(
+            message.content.as_deref().unwrap_or_default(),
+            COMPACT_PARENT_USER_CHARS,
+            true,
+        );
+        (!content.is_empty()).then_some(content)
+    });
+    let prior_assistant = turn_messages.iter().rev().find_map(|message| {
+        if message.role != "assistant" {
+            return None;
+        }
+        let raw = message.content.as_deref().unwrap_or_default();
+        if raw.trim().is_empty() || super::turn_render::is_failure_boilerplate(raw) {
+            return None;
+        }
+        let content = compact_parent_text(raw, COMPACT_PARENT_ASSISTANT_CHARS, false);
+        (!content.is_empty()).then_some(content)
+    });
+    let delivery_evidence = turn_messages.iter().rev().find_map(|message| {
+        if message.role != "tool"
+            || !matches!(
+                message.tool_name.as_deref(),
+                Some("send_file" | "send_media")
+            )
+        {
+            return None;
+        }
+        let primary = message.primary_content().unwrap_or_default();
+        let content = compact_parent_text(&primary, COMPACT_PARENT_DELIVERY_CHARS, false);
+        (!content.is_empty()).then_some(content)
+    });
+
+    let mut compact = Vec::with_capacity(2);
+    if let Some(prior_user) = prior_user {
+        compact.push(json!({
+            "role": "user",
+            "content": prior_user,
+        }));
+    }
+
+    let mut assistant_lines = vec![
+        "[Immediate prior turn retained in compact form; binary observations and tool protocol omitted.]"
+            .to_string(),
+    ];
+    if let Some(prior_assistant) = prior_assistant {
+        assistant_lines.push(prior_assistant);
+    }
+    if let Some(delivery_evidence) = delivery_evidence {
+        assistant_lines.push(format!("Delivery evidence: {delivery_evidence}"));
+    }
+    if assistant_lines.len() > 1 {
+        compact.push(json!({
+            "role": "assistant",
+            "content": assistant_lines.join("\n"),
+        }));
+    }
+
+    compact
+}
 
 fn trimmed_message_content(message: &Value) -> Option<String> {
     message
@@ -306,6 +423,7 @@ pub(super) async fn run_message_build_phase(
                 let mut before: Option<i64> = None;
                 let mut accumulated: usize = 0;
                 let mut init_anchor: Option<i64> = None;
+                let mut archived_turns_seen: usize = 0;
                 loop {
                     let page = agent
                         .event_store
@@ -321,9 +439,10 @@ pub(super) async fn run_message_build_phase(
                         super::turn_render::RENDERER_VERSION,
                         &render_options,
                     );
-                    let est = crate::memory::context_window::estimate_tokens(
-                        &serde_json::to_string(&rendered).unwrap_or_default(),
-                    );
+                    let full_est =
+                        crate::memory::context_window::estimate_multimodal_message_tokens(
+                            &rendered,
+                        );
                     if init_anchor.is_none() {
                         // The newest turn is the (about-to-be) current turn. It is
                         // not part of the archived region, so its tokens are NOT
@@ -333,9 +452,34 @@ pub(super) async fn run_message_build_phase(
                         before = Some(turn.turn_seq);
                         continue;
                     }
+                    let (est, compacted_parent) =
+                        if archived_turns_seen == 0 && full_est > low_water {
+                            let compact = compact_immediate_parent_turn(&turn.messages);
+                            let compact_est =
+                                crate::memory::context_window::estimate_multimodal_message_tokens(
+                                    &compact,
+                                );
+                            if !compact.is_empty() && compact_est <= low_water {
+                                (compact_est, true)
+                            } else {
+                                (full_est, false)
+                            }
+                        } else {
+                            (full_est, false)
+                        };
+                    archived_turns_seen = archived_turns_seen.saturating_add(1);
                     // Stop once adding this archived turn would exceed low_water.
                     if accumulated + est > low_water {
                         break;
+                    }
+                    if compacted_parent {
+                        info!(
+                            session_id,
+                            turn_seq = turn.turn_seq,
+                            full_est_tokens = full_est,
+                            compact_est_tokens = est,
+                            "Oversized immediate parent retained as compact shell during cold start"
+                        );
                     }
                     accumulated = accumulated.saturating_add(est);
                     init_anchor = Some(turn.turn_seq);
@@ -418,6 +562,9 @@ pub(super) async fn run_message_build_phase(
     // Split off the current turn (always the last entry now).
     let current_turn = turns.pop().expect("at least the current turn is present");
     // `turns` now holds only archived turns (oldest→newest).
+    if ctx.redact_archived_shared_context {
+        redact_archived_shared_turns(&mut turns);
+    }
 
     // Step 3: evict. Render each archived turn (Archived mode) to estimate over
     // the FINAL bytes, then plan_eviction. Cache the renders so step 4 reuses
@@ -426,7 +573,11 @@ pub(super) async fn run_message_build_phase(
         turn_id: Option<String>,
         turn_seq: i64,
         content_fp: String,
+        /// Bytes assembled into this provider request (possibly the compact
+        /// immediate-parent shell).
         bytes: Vec<Value>,
+        /// Canonical full archived render retained in the render cache.
+        cache_bytes: Vec<Value>,
         cache_hit: bool,
         cache_reason: &'static str,
     }
@@ -437,7 +588,7 @@ pub(super) async fn run_message_build_phase(
         // writes happen after the loop to avoid holding the lock across renders.
         let prev_cache = agent.turn_renders.read().await;
         let session_cache = prev_cache.get(session_id);
-        for turn in &turns {
+        for (turn_idx, turn) in turns.iter().enumerate() {
             let terminal_state = TerminalState::from_task_status(turn.terminal_status);
             let fp = super::turn_render_cache::content_fp(&turn.messages, terminal_state);
             let prev = turn
@@ -452,7 +603,7 @@ pub(super) async fn run_message_build_phase(
                     &render_options,
                 )
             };
-            let (bytes, hit, reason) = super::turn_render_cache::render_cache_decision(
+            let (cache_bytes, hit, reason) = super::turn_render_cache::render_cache_decision(
                 prev,
                 &fp,
                 super::turn_render::RENDERER_VERSION,
@@ -472,16 +623,41 @@ pub(super) async fn run_message_build_phase(
                     &render_options,
                 );
                 assert_eq!(
-                    fresh, bytes,
+                    fresh, cache_bytes,
                     "archived render must be deterministic for turn {:?}",
                     turn.turn_id
                 );
             }
+            let full_est =
+                crate::memory::context_window::estimate_multimodal_message_tokens(&cache_bytes);
+            let is_immediate_parent = turn_idx + 1 == turns.len();
+            let bytes = if is_immediate_parent
+                && full_est > super::turn_eviction::low_water(archived_budget)
+            {
+                let compact = compact_immediate_parent_turn(&turn.messages);
+                if compact.is_empty() {
+                    cache_bytes.clone()
+                } else {
+                    let compact_est =
+                        crate::memory::context_window::estimate_multimodal_message_tokens(&compact);
+                    info!(
+                        session_id,
+                        turn_seq = turn.turn_seq,
+                        full_est_tokens = full_est,
+                        compact_est_tokens = compact_est,
+                        "Oversized immediate parent rendered as compact shell"
+                    );
+                    compact
+                }
+            } else {
+                cache_bytes.clone()
+            };
             archived_renders.push(ArchivedRender {
                 turn_id: turn.turn_id.clone(),
                 turn_seq: turn.turn_seq,
                 content_fp: fp,
                 bytes,
+                cache_bytes,
                 cache_hit: hit,
                 cache_reason: reason,
             });
@@ -492,9 +668,7 @@ pub(super) async fn run_message_build_phase(
         .iter()
         .map(|r| super::turn_eviction::RenderedTurn {
             turn_seq: r.turn_seq,
-            est_tokens: crate::memory::context_window::estimate_tokens(
-                &serde_json::to_string(&r.bytes).unwrap_or_default(),
-            ),
+            est_tokens: crate::memory::context_window::estimate_multimodal_message_tokens(&r.bytes),
         })
         .collect();
     let plan = super::turn_eviction::plan_eviction(&rendered_for_plan, archived_budget);
@@ -572,7 +746,7 @@ pub(super) async fn run_message_build_phase(
                         content_fp: r.content_fp.clone(),
                         renderer_version: super::turn_render::RENDERER_VERSION,
                         mode_tag: "archived".to_string(),
-                        bytes: r.bytes.clone(),
+                        bytes: r.cache_bytes.clone(),
                     },
                 );
             }
@@ -843,9 +1017,8 @@ pub(super) async fn run_message_build_phase(
         let current_region: Vec<Value> = messages[current_region_idx..].to_vec();
         // The archived prefix already consumed `archived_budget`; the current
         // region is fit against the remaining budget.
-        let archived_prefix_tokens = crate::memory::context_window::estimate_tokens(
-            &serde_json::to_string(&archived_prefix).unwrap_or_default(),
-        );
+        let archived_prefix_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&archived_prefix);
         let current_budget = effective_budget.saturating_sub(archived_prefix_tokens);
         let (fitted_current, dropped) =
             crate::memory::context_window::fit_messages_with_source_quotas(
@@ -905,6 +1078,24 @@ pub(super) async fn run_message_build_phase(
                 "Prefix mutation"
             );
         }
+    }
+
+    // History fitting and empty-response recovery select individual messages
+    // and can therefore bisect an assistant tool-call/tool-result exchange.
+    // Re-establish provider transcript invariants after those destructive
+    // rewrites. In particular, the Responses API rejects a
+    // `function_call_output` when its matching `function_call` was trimmed.
+    let before_fixup = messages.len();
+    fixup_message_ordering(&mut messages);
+    if messages.len() != before_fixup {
+        info!(
+            session_id,
+            iteration,
+            before = before_fixup,
+            after = messages.len(),
+            reason = "post_fitting_provider_validity",
+            "Prefix mutation"
+        );
     }
 
     // Pillar A: insert the per-task context TAIL immediately BEFORE the current
@@ -1031,10 +1222,6 @@ pub(super) async fn run_message_build_phase(
     // elements off the latest read.
     collapse_superseded_computer_use_trees(&mut messages);
 
-    // Serialize messages once; reused for final-enforcement token count, debug logging,
-    // and the final est_input_tokens. Messages are not mutated after this point.
-    let messages_json = serde_json::to_string(&messages).unwrap_or_default();
-
     // Final enforcement must happen after every prompt component has been inserted.
     // Earlier trimming cannot account for execution checkpoints and one-shot directives.
     if agent.context_window_config.enabled {
@@ -1098,8 +1285,8 @@ pub(super) async fn run_message_build_phase(
             })
             .collect();
 
-        // Estimate tokens: ~4 chars per token for English text
-        let est_msg_tokens = messages_json.len() / 4;
+        let est_msg_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let est_tool_tokens =
             crate::memory::context_window::estimate_tool_definition_tokens(tool_defs);
         let est_total_tokens = est_msg_tokens + est_tool_tokens;
@@ -1161,7 +1348,8 @@ pub(super) async fn run_message_build_phase(
     Agent::sort_tool_definitions_by_name(&mut effective_tool_defs);
 
     let est_input_tokens = {
-        let est_msg_tokens = messages_json.len() / 4;
+        let est_msg_tokens =
+            crate::memory::context_window::estimate_multimodal_message_tokens(&messages);
         let est_tool_tokens =
             crate::memory::context_window::estimate_tool_definition_tokens(&effective_tool_defs);
         (est_msg_tokens + est_tool_tokens) as u32
@@ -1208,6 +1396,73 @@ get_app_state below. Call get_app_state to re-read the current screen if you nee
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn shared_non_owner_archive_keeps_dialogue_but_removes_hidden_execution_details() {
+        let mut turns = vec![crate::events::FetchedTurn {
+            turn_id: Some("turn-owner".to_string()),
+            turn_seq: 1,
+            terminal_status: Some(crate::events::TaskStatus::Completed),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: Some(
+                        "[File received: private.txt (1 KB, text/plain)\nSaved to: /Users/owner/inbox/private.txt]\nPlease review it."
+                            .to_string(),
+                    ),
+                    attachments: vec![MessageAttachment {
+                        local_path: "/Users/owner/inbox/private.txt".to_string(),
+                        filename: "private.txt".to_string(),
+                        ..MessageAttachment::default()
+                    }],
+                    ..Message::runtime_defaults()
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    tool_calls_json: Some("[{\"name\":\"terminal\"}]".to_string()),
+                    ..Message::runtime_defaults()
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: Some("SECRET_TOOL_OUTPUT".to_string()),
+                    tool_name: Some("terminal".to_string()),
+                    ..Message::runtime_defaults()
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Some(
+                        "Done using /Users/owner/private/file.txt and sk-abcdefghijklmnopqrstuvwxyz123456"
+                            .to_string(),
+                    ),
+                    ..Message::runtime_defaults()
+                },
+            ],
+        }];
+
+        redact_archived_shared_turns(&mut turns);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].messages.len(), 2);
+        assert_eq!(
+            turns[0].messages[0].content.as_deref(),
+            Some("Please review it.")
+        );
+        assert!(turns[0].messages[0].attachments.is_empty());
+        let rendered = turns[0]
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("SECRET_TOOL_OUTPUT"));
+        assert!(!rendered.contains("/Users/owner"));
+        assert!(!rendered.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(rendered.contains("[REDACTED:API key]"));
+        assert!(turns[0]
+            .messages
+            .iter()
+            .all(|message| message.tool_calls_json.is_none()));
+    }
 
     #[test]
     fn collapse_keeps_only_latest_computer_use_tree() {
@@ -1274,6 +1529,47 @@ mod tests {
             importance: 0.5,
             ..Message::runtime_defaults()
         }
+    }
+
+    #[test]
+    fn oversized_immediate_parent_shell_keeps_request_answer_and_delivery() {
+        let mut noisy_tool = tool_msg("browser", &"SCREENSHOT_STATE ".repeat(20_000));
+        noisy_tool.attachments.push(MessageAttachment {
+            local_path: "/tmp/large-preview.png".to_string(),
+            filename: "large-preview.png".to_string(),
+            mime_type: "image/png".to_string(),
+            size_bytes: 2_000_000,
+            provenance: crate::traits::AttachmentProvenance::ToolObservation,
+            source_tool: Some("browser".to_string()),
+        });
+        let messages = vec![
+            msg(
+                "user",
+                "Create a two-page PDF about Headless WordPress and AI agents.",
+            ),
+            noisy_tool,
+            tool_msg("send_file", "File sent: Headless-WordPress-AI-Agents.pdf"),
+            msg(
+                "assistant",
+                "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.",
+            ),
+        ];
+
+        let compact = compact_immediate_parent_turn(&messages);
+        let serialized = serde_json::to_string(&compact).expect("serialize compact parent");
+
+        assert!(serialized.contains("Create a two-page PDF"));
+        assert!(serialized.contains("Headless WordPress in the Age of AI Agents"));
+        assert!(serialized.contains("Headless-WordPress-AI-Agents.pdf"));
+        assert!(!serialized.contains("SCREENSHOT_STATE"));
+        assert!(!serialized.contains("large-preview.png"));
+        assert!(serialized.len() < 4_000, "compact shell was {serialized}");
+        assert!(compact.iter().all(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            )
+        }));
     }
 
     // ====================================================================
@@ -1470,6 +1766,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -1538,6 +1835,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut first_pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         let first = run_message_build_phase(
@@ -1561,6 +1859,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut second_pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         let second = run_message_build_phase(
@@ -1657,6 +1956,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -1732,6 +2032,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -1846,6 +2147,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -1973,6 +2275,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -2049,6 +2352,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
 
@@ -2170,6 +2474,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p1,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         let built1 = run_message_build_phase(
@@ -2193,6 +2498,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut p2,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         let built2 = run_message_build_phase(
@@ -2259,6 +2565,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         let built = run_message_build_phase(
@@ -2312,6 +2619,7 @@ mod tests {
             policy_bundle: &policy_bundle,
             pending_system_messages: &mut pending_system_messages,
             empty_response_retry_pending: false,
+            redact_archived_shared_context: false,
             status_tx: &status_tx,
         };
         run_message_build_phase(
@@ -2403,6 +2711,114 @@ mod tests {
         assert!(
             first_q_pos < tail_pos,
             "archived turns must precede the tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_keeps_prior_turn_with_inline_preview_image() {
+        use std::io::Write;
+
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let store = seed_store(&harness).await;
+        let mut preview = tempfile::NamedTempFile::new().expect("preview tempfile");
+        preview
+            .write_all(&vec![0xA5; 359_123])
+            .expect("write preview bytes");
+
+        let session = "s-cold-multimodal";
+        let prior_turn = "t-pdf";
+        let call_id = "call-browser-preview";
+        store
+            .append(Event::new(
+                session,
+                EventType::UserMessage,
+                json!({
+                    "content": "Create a two-page PDF about Headless WordPress and AI agents.",
+                    "turn_id": prior_turn,
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                session,
+                EventType::AssistantResponse,
+                json!({
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{"id": call_id, "name": "browser", "arguments": "{}"}],
+                    "turn_id": prior_turn,
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                session,
+                EventType::ToolResult,
+                json!({
+                    "tool_call_id": call_id,
+                    "name": "browser",
+                    "result": "Rendered Headless-WordPress-AI-Agents preview",
+                    "success": true,
+                    "duration_ms": 1,
+                    "turn_id": prior_turn,
+                    "attachments": [{
+                        "local_path": preview.path().to_string_lossy(),
+                        "filename": "Headless-WordPress-AI-Agents-preview.png",
+                        "mime_type": "image/png",
+                        "size_bytes": 359123,
+                        "provenance": "tool_observation",
+                        "source_tool": "browser"
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                session,
+                EventType::AssistantResponse,
+                json!({
+                    "content": "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.",
+                    "turn_id": prior_turn,
+                }),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(Event::new(
+                session,
+                EventType::TaskEnd,
+                json!({"status": "completed", "turn_id": prior_turn}),
+            ))
+            .await
+            .unwrap();
+        seed_turn(
+            &store,
+            session,
+            "t-current",
+            "Make it 1 page PDF instead.",
+            None,
+            "",
+            "in_progress",
+        )
+        .await;
+        set_current_turn(&harness, session, "t-current").await;
+
+        let messages = build_payload(&harness, session, "Make it 1 page PDF instead.", 1).await;
+        let serialized = serde_json::to_string(&messages).unwrap();
+
+        assert!(
+            serialized.contains("Create a two-page PDF about Headless WordPress"),
+            "cold-start anchor dropped the prior request"
+        );
+        assert!(
+            serialized.contains("Headless WordPress in the Age of AI Agents"),
+            "cold-start anchor dropped the prior answer"
+        );
+        assert!(
+            serialized.contains("data:image/png;base64,"),
+            "archived preview should remain available to the follow-up"
         );
     }
 
@@ -2933,6 +3349,7 @@ mod tests {
                 policy_bundle: _,
                 pending_system_messages: _,
                 empty_response_retry_pending: _,
+                redact_archived_shared_context: _,
                 status_tx: _,
             } = c;
         };

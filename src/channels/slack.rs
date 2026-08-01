@@ -17,14 +17,102 @@ use super::formatting::{
 };
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
-use crate::tasks::{QueueOutcome, TaskRegistry};
+use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
-use crate::types::{ChannelContext, ChannelVisibility, StatusUpdate, UserRole};
+use crate::types::{
+    ChannelContext, ChannelVisibility, StatusUpdate, UserRole, WorkspaceAccessLevel, WorkspaceGrant,
+};
 
 /// Maximum message length for Slack (actual limit is 40,000 but leave margin).
 const MAX_MESSAGE_LEN: usize = 39_000;
+const DEFAULT_WORKSPACE_GRANT_HOURS: i64 = 24;
+const MAX_WORKSPACE_GRANT_HOURS: i64 = 168;
+
+/// Serialize config mutations across every Slack bot in this process. Without
+/// one shared lock, simultaneous grants/auto-claims could overwrite each other.
+static SLACK_CONFIG_WRITE_LOCK: once_cell::sync::Lazy<Mutex<()>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(()));
+
+enum WorkspaceGrantMutation {
+    Upsert(WorkspaceGrant),
+    Revoke {
+        platform: String,
+        workspace_id: String,
+        channel_id: String,
+        user_id: String,
+    },
+}
+
+async fn load_workspace_grants_from_config(
+    config_path: &std::path::Path,
+) -> anyhow::Result<Vec<WorkspaceGrant>> {
+    let _read_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
+    let content = tokio::fs::read_to_string(config_path).await?;
+    let doc: toml::Table = content.parse()?;
+    let grants = doc
+        .get("users")
+        .and_then(toml::Value::as_table)
+        .and_then(|users| users.get("workspace_grants"))
+        .cloned()
+        .map(|value| value.try_into())
+        .transpose()?
+        .unwrap_or_default();
+    Ok(grants)
+}
+
+/// Revalidation can only preserve or reduce a queued request's original
+/// authority. A later grant must never expand its project, access level, or
+/// lifetime before that queued request begins executing.
+fn retain_queued_workspace_grant(
+    original: &WorkspaceGrant,
+    current: &WorkspaceGrant,
+) -> Option<WorkspaceGrant> {
+    if !original.is_active()
+        || !current.is_active()
+        || original.platform != current.platform
+        || original.workspace_id != current.workspace_id
+        || original.channel_id != current.channel_id
+        || original.user_id != current.user_id
+        || original.project_root != current.project_root
+    {
+        return None;
+    }
+
+    let mut retained = original.clone();
+    retained.access = if original.access == WorkspaceAccessLevel::Read
+        || current.access == WorkspaceAccessLevel::Read
+    {
+        WorkspaceAccessLevel::Read
+    } else {
+        WorkspaceAccessLevel::Edit
+    };
+    retained.expires_at = std::cmp::min(original.expires_at, current.expires_at);
+    retained.is_active().then_some(retained)
+}
+
+async fn revalidate_queued_workspace_grant(
+    config_path: &std::path::Path,
+    original: &WorkspaceGrant,
+) -> anyhow::Result<Option<WorkspaceGrant>> {
+    let grants = load_workspace_grants_from_config(config_path).await?;
+    let mut matching = grants.iter().filter(|grant| {
+        grant.platform == original.platform
+            && grant.workspace_id == original.workspace_id
+            && grant.channel_id == original.channel_id
+            && grant.user_id == original.user_id
+    });
+    let Some(current) = matching.next() else {
+        return Ok(None);
+    };
+    // Ambiguous duplicate grants are a malformed configuration. Fail closed
+    // instead of selecting whichever entry happened to deserialize first.
+    if matching.next().is_some() {
+        return Ok(None);
+    }
+    Ok(retain_queued_workspace_grant(original, current))
+}
 
 /// Commands available in the Slack channel (shared Core + Restart).
 fn slack_commands() -> Vec<CommandDef> {
@@ -32,6 +120,12 @@ fn slack_commands() -> Vec<CommandDef> {
         .into_iter()
         .filter(|c| matches!(c.category, CommandCategory::Core))
         .collect();
+    cmds.push(CommandDef {
+        name: "workspace",
+        description: "Grant or revoke expiring project access (owner only)",
+        usage: Some("grant <@user> <read|edit> <project-path> [hours] | revoke <@user> | list"),
+        category: CommandCategory::Core,
+    });
     cmds.push(CommandDef {
         name: "restart",
         description: "Restart the daemon",
@@ -56,6 +150,10 @@ pub struct SlackChannel {
     app_token: String,
     bot_token: String,
     allowed_user_ids: std::sync::RwLock<Vec<String>>,
+    /// Explicit owners from `users.owner_ids.slack`. When empty, allowed users
+    /// retain legacy owner behavior for backward compatibility.
+    owner_user_ids: std::sync::RwLock<Vec<String>>,
+    workspace_grants: std::sync::RwLock<Vec<WorkspaceGrant>>,
     use_threads: bool,
     agent: Arc<Agent>,
     config_path: PathBuf,
@@ -70,6 +168,8 @@ pub struct SlackChannel {
     http: reqwest::Client,
     /// Our own bot user ID, resolved on first connection.
     bot_user_id: Mutex<Option<String>>,
+    /// Slack team/workspace ID from `auth.test`; grants fail closed until known.
+    team_id: std::sync::RwLock<Option<String>>,
     /// Reference to the channel hub for dynamic bot registration.
     channel_hub: std::sync::RwLock<Option<Weak<ChannelHub>>>,
     /// Seconds of no heartbeat before declaring the agent stuck (0 = disabled).
@@ -84,12 +184,41 @@ pub struct SlackChannel {
     started_at: Instant,
 }
 
+fn determine_slack_role(
+    allowed_user_ids: &[String],
+    owner_user_ids: &[String],
+    user_id: &str,
+    has_workspace_grant: bool,
+    directly_addressed: bool,
+) -> Option<UserRole> {
+    let is_allowed = allowed_user_ids.iter().any(|id| id == user_id);
+    let is_owner = if owner_user_ids.is_empty() {
+        // Backward-compatible migration: existing installations historically
+        // treated every Slack allowlist entry as an owner.
+        is_allowed
+    } else {
+        owner_user_ids.iter().any(|id| id == user_id)
+    };
+
+    if is_owner {
+        Some(UserRole::Owner)
+    } else if is_allowed || has_workspace_grant {
+        Some(UserRole::Guest)
+    } else if directly_addressed {
+        Some(UserRole::Public)
+    } else {
+        None
+    }
+}
+
 impl SlackChannel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_token: &str,
         bot_token: &str,
         allowed_user_ids: Vec<String>,
+        owner_user_ids: Vec<String>,
+        workspace_grants: Vec<WorkspaceGrant>,
         use_threads: bool,
         agent: Arc<Agent>,
         config_path: PathBuf,
@@ -106,6 +235,8 @@ impl SlackChannel {
             app_token: app_token.to_string(),
             bot_token: bot_token.to_string(),
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
+            owner_user_ids: std::sync::RwLock::new(owner_user_ids),
+            workspace_grants: std::sync::RwLock::new(workspace_grants),
             use_threads,
             agent,
             config_path,
@@ -118,6 +249,7 @@ impl SlackChannel {
             state,
             http: reqwest::Client::new(),
             bot_user_id: Mutex::new(None),
+            team_id: std::sync::RwLock::new(None),
             channel_hub: std::sync::RwLock::new(None),
             watchdog_stale_threshold_secs,
             user_cache: RwLock::new(HashMap::new()),
@@ -134,14 +266,32 @@ impl SlackChannel {
         }
     }
 
-    /// Persist the current allowed_user_ids list to config.toml.
-    /// Handles both `[slack]` and `[[slack_bots]]` config formats.
-    async fn persist_allowed_user_ids(&self, ids: &[String]) -> anyhow::Result<()> {
+    /// How long a resolved approval card stays visible before it is auto-deleted,
+    /// matching Telegram's approval-card behavior. On by default (10s); override
+    /// with `AIDAEMON_APPROVAL_DISMISS_SECS`, or set it to `0` to keep resolved
+    /// cards in the conversation.
+    fn resolved_approval_dismiss_delay() -> Option<Duration> {
+        let secs = std::env::var("AIDAEMON_APPROVAL_DISMISS_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(10);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
+    /// Persist Slack allowlist and owner IDs together so auto-claim cannot leave
+    /// a user authorized but accidentally downgraded (or vice versa).
+    async fn persist_access_ids(
+        &self,
+        allowed_ids: &[String],
+        owner_ids: &[String],
+    ) -> anyhow::Result<()> {
+        let _write_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
         let content = tokio::fs::read_to_string(&self.config_path).await?;
         let mut doc: toml::Table = content.parse()?;
 
         let ids_toml = toml::Value::Array(
-            ids.iter()
+            allowed_ids
+                .iter()
                 .map(|id| toml::Value::String(id.clone()))
                 .collect(),
         );
@@ -162,10 +312,420 @@ impl SlackChannel {
             anyhow::bail!("No [slack] or [[slack_bots]] section found in config");
         }
 
+        let users = doc
+            .entry("users".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("[users] must be a TOML table"))?;
+        let owner_table = users
+            .entry("owner_ids".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("[users.owner_ids] must be a TOML table"))?;
+        owner_table.insert(
+            "slack".to_string(),
+            toml::Value::Array(
+                owner_ids
+                    .iter()
+                    .map(|id| toml::Value::String(id.clone()))
+                    .collect(),
+            ),
+        );
+
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
         tokio::fs::write(&self.config_path, &new_content).await?;
-        info!("Persisted Slack allowed_user_ids to config.toml");
+        Self::restrict_config_permissions(&self.config_path);
+        info!("Persisted Slack access IDs to config.toml");
         Ok(())
+    }
+
+    /// Apply one grant mutation against the latest on-disk configuration. Each
+    /// Slack bot keeps a local cache for message routing, but config writes must
+    /// merge from disk so one bot cannot erase another bot's grants with a
+    /// stale snapshot.
+    async fn mutate_workspace_grants(
+        &self,
+        mutation: WorkspaceGrantMutation,
+    ) -> anyhow::Result<(Vec<WorkspaceGrant>, bool)> {
+        let _write_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut doc: toml::Table = content.parse()?;
+        let users = doc
+            .entry("users".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("[users] must be a TOML table"))?;
+
+        let mut grants: Vec<WorkspaceGrant> = users
+            .get("workspace_grants")
+            .cloned()
+            .map(|value| value.try_into())
+            .transpose()?
+            .unwrap_or_default();
+        grants.retain(WorkspaceGrant::is_active);
+
+        let affected = match mutation {
+            WorkspaceGrantMutation::Upsert(grant) => {
+                grants.retain(|existing| {
+                    !(existing.platform == grant.platform
+                        && existing.workspace_id == grant.workspace_id
+                        && existing.channel_id == grant.channel_id
+                        && existing.user_id == grant.user_id)
+                });
+                grants.push(grant);
+                true
+            }
+            WorkspaceGrantMutation::Revoke {
+                platform,
+                workspace_id,
+                channel_id,
+                user_id,
+            } => {
+                let before = grants.len();
+                grants.retain(|grant| {
+                    !(grant.platform == platform
+                        && grant.workspace_id == workspace_id
+                        && grant.channel_id == channel_id
+                        && grant.user_id == user_id)
+                });
+                grants.len() != before
+            }
+        };
+
+        users.insert(
+            "workspace_grants".to_string(),
+            toml::Value::try_from(&grants)?,
+        );
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        tokio::fs::write(&self.config_path, &new_content).await?;
+        Self::restrict_config_permissions(&self.config_path);
+        info!(count = grants.len(), "Persisted Slack workspace grants");
+        Ok((grants, affected))
+    }
+
+    async fn load_workspace_grants(&self) -> anyhow::Result<Vec<WorkspaceGrant>> {
+        load_workspace_grants_from_config(&self.config_path).await
+    }
+
+    #[cfg(unix)]
+    fn restrict_config_permissions(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            warn!(%error, "Could not enforce owner-only config permissions");
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn restrict_config_permissions(_path: &std::path::Path) {}
+
+    fn is_owner_id(&self, user_id: &str) -> bool {
+        let owners = self
+            .owner_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !owners.is_empty() {
+            return owners.iter().any(|id| id == user_id);
+        }
+        drop(owners);
+        self.allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|id| id == user_id)
+    }
+
+    async fn active_workspace_grant(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Option<WorkspaceGrant> {
+        let team_id = self
+            .team_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+
+        // Refresh on every group request. Multiple configured Slack bots can
+        // share one config file, and a revocation must not be delayed by another
+        // bot's stale process-local cache. Read failures fail closed.
+        let grants = match self.load_workspace_grants().await {
+            Ok(grants) => grants,
+            Err(error) => {
+                warn!(%error, "Could not refresh workspace grants; denying scoped access");
+                return None;
+            }
+        };
+        let active = grants
+            .iter()
+            .find(|grant| {
+                grant.is_active()
+                    && grant.platform == "slack"
+                    && grant.workspace_id == team_id
+                    && grant.channel_id == channel_id
+                    && grant.user_id == user_id
+            })
+            .cloned();
+        *self
+            .workspace_grants
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = grants;
+        active
+    }
+
+    fn parse_slack_user_mention(token: &str) -> anyhow::Result<String> {
+        let inner = token
+            .strip_prefix("<@")
+            .and_then(|value| value.strip_suffix('>'))
+            .ok_or_else(|| anyhow::anyhow!("Use an actual Slack @mention for the collaborator"))?;
+        let user_id = inner.split('|').next().unwrap_or_default();
+        anyhow::ensure!(
+            (user_id.starts_with('U') || user_id.starts_with('W'))
+                && (3..=32).contains(&user_id.len())
+                && user_id.chars().all(|ch| ch.is_ascii_alphanumeric()),
+            "Invalid Slack user mention"
+        );
+        Ok(user_id.to_string())
+    }
+
+    async fn resolve_workspace_project_root(&self, raw_path: &str) -> anyhow::Result<String> {
+        let backend = crate::execution::active_execution_backend();
+        anyhow::ensure!(
+            backend.kind() == crate::execution::BackendKind::Local,
+            "Workspace collaboration is currently available only with the local execution backend"
+        );
+
+        let resolved = backend.resolve_path(raw_path).await?;
+        let metadata = backend
+            .metadata(&resolved)
+            .await
+            .map_err(|_| anyhow::anyhow!("Project directory does not exist"))?;
+        anyhow::ensure!(metadata.is_dir(), "The project path must be a directory");
+
+        let canonical = backend.canonicalize(&resolved).await?;
+        let project_root = std::path::PathBuf::from(canonical.as_str());
+        anyhow::ensure!(
+            project_root.parent().is_some(),
+            "The filesystem root cannot be delegated"
+        );
+        if let Ok(home) = backend.canonicalize(backend.home_hint()).await {
+            anyhow::ensure!(
+                canonical != home,
+                "The home directory cannot be delegated; choose one project"
+            );
+        }
+        anyhow::ensure!(
+            !crate::tools::fs_utils::is_sensitive_path(&project_root),
+            "A sensitive directory cannot be delegated"
+        );
+        anyhow::ensure!(
+            crate::tools::fs_utils::find_nearest_project_root(&project_root)
+                .is_some_and(|root| root == project_root),
+            "The path must be a project root (for example, a Git, Cargo, Node, Python, Go, or similar project)"
+        );
+
+        Ok(canonical.as_str().to_string())
+    }
+
+    async fn handle_workspace_command(
+        &self,
+        raw_command: &str,
+        channel_id: &str,
+        channel_type: &str,
+        user_role: UserRole,
+    ) -> String {
+        const USAGE: &str = "Usage:\n\
+            `!workspace grant <@user> <read|edit> <project-path> [hours]`\n\
+            `!workspace revoke <@user>`\n\
+            `!workspace list`\n\n\
+            Grants work only in this private group, expire automatically (24h default, 168h max), and never include shell, deployment, credentials, memory, browser control, configuration, or sub-agents.";
+
+        if user_role != UserRole::Owner {
+            return "Only a configured owner can manage workspace access.".to_string();
+        }
+        if !matches!(channel_type, "mpim" | "group") {
+            return "Workspace access can only be managed from the private Slack group where it will apply."
+                .to_string();
+        }
+        let team_id = match self
+            .team_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            Some(team_id) => team_id,
+            None => {
+                return "Slack workspace identity is unavailable, so access was not changed. Try again after the connection refreshes."
+                    .to_string()
+            }
+        };
+
+        let tokens = match shell_words::split(raw_command) {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                return format!(
+                    "Could not parse the command. Quote paths containing spaces.\n\n{USAGE}"
+                )
+            }
+        };
+        if tokens.len() < 2 {
+            return USAGE.to_string();
+        }
+
+        match tokens[1].as_str() {
+            "grant" => {
+                if !(tokens.len() == 5 || tokens.len() == 6) {
+                    return USAGE.to_string();
+                }
+                let user_id = match Self::parse_slack_user_mention(&tokens[2]) {
+                    Ok(user_id) => user_id,
+                    Err(error) => return format!("{error}\n\n{USAGE}"),
+                };
+                if self.is_owner_id(&user_id) {
+                    return "That member is already an owner and does not need a workspace grant."
+                        .to_string();
+                }
+                let access = match tokens[3].as_str() {
+                    "read" => WorkspaceAccessLevel::Read,
+                    "edit" => WorkspaceAccessLevel::Edit,
+                    _ => return format!("Access must be `read` or `edit`.\n\n{USAGE}"),
+                };
+                let hours = if tokens.len() == 6 {
+                    match tokens[5].parse::<i64>() {
+                        Ok(hours) if (1..=MAX_WORKSPACE_GRANT_HOURS).contains(&hours) => hours,
+                        _ => {
+                            return format!(
+                                "Hours must be between 1 and {MAX_WORKSPACE_GRANT_HOURS}."
+                            )
+                        }
+                    }
+                } else {
+                    DEFAULT_WORKSPACE_GRANT_HOURS
+                };
+                let project_root = match self.resolve_workspace_project_root(&tokens[4]).await {
+                    Ok(root) => root,
+                    Err(error) => return format!("Access was not changed: {error}"),
+                };
+                let grant = WorkspaceGrant {
+                    platform: "slack".to_string(),
+                    workspace_id: team_id.clone(),
+                    channel_id: channel_id.to_string(),
+                    user_id: user_id.clone(),
+                    project_root,
+                    access,
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(hours),
+                };
+                let project_name = grant.project_name().to_string();
+                let next_grants = match self
+                    .mutate_workspace_grants(WorkspaceGrantMutation::Upsert(grant))
+                    .await
+                {
+                    Ok((grants, _)) => grants,
+                    Err(error) => {
+                        warn!(%error, "Failed to persist workspace grant");
+                        return "Access was not changed because the secure configuration update failed."
+                            .to_string();
+                    }
+                };
+                *self
+                    .workspace_grants
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_grants;
+                let collaborator = self
+                    .resolve_user_name(&user_id)
+                    .await
+                    .unwrap_or_else(|| "the collaborator".to_string());
+                format!(
+                    "Granted @{collaborator} {access} access to project `{project_name}` in this private group for {hours} hour(s). Shell, deployment, secrets, memory, configuration, browser control, and sub-agents remain unavailable."
+                )
+            }
+            "revoke" => {
+                if tokens.len() != 3 {
+                    return USAGE.to_string();
+                }
+                let user_id = match Self::parse_slack_user_mention(&tokens[2]) {
+                    Ok(user_id) => user_id,
+                    Err(error) => return format!("{error}\n\n{USAGE}"),
+                };
+                let (next_grants, revoked) = match self
+                    .mutate_workspace_grants(WorkspaceGrantMutation::Revoke {
+                        platform: "slack".to_string(),
+                        workspace_id: team_id.clone(),
+                        channel_id: channel_id.to_string(),
+                        user_id: user_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(%error, "Failed to persist workspace revocation");
+                        return "Access was not changed because the secure configuration update failed."
+                            .to_string();
+                    }
+                };
+                *self
+                    .workspace_grants
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_grants;
+                if !revoked {
+                    return "No active workspace grant exists for that member in this group."
+                        .to_string();
+                }
+                let collaborator = self
+                    .resolve_user_name(&user_id)
+                    .await
+                    .unwrap_or_else(|| "that collaborator".to_string());
+                format!("Revoked workspace access for @{collaborator} in this group.")
+            }
+            "list" => {
+                if tokens.len() != 2 {
+                    return USAGE.to_string();
+                }
+                let latest = match self.load_workspace_grants().await {
+                    Ok(grants) => grants,
+                    Err(error) => {
+                        warn!(%error, "Failed to refresh workspace grant list");
+                        return "Workspace grants could not be read securely; no access details were shown."
+                            .to_string();
+                    }
+                };
+                *self
+                    .workspace_grants
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = latest;
+                let grants = self
+                    .workspace_grants
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .filter(|grant| {
+                        grant.is_active()
+                            && grant.platform == "slack"
+                            && grant.workspace_id == team_id
+                            && grant.channel_id == channel_id
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if grants.is_empty() {
+                    return "No active workspace grants exist in this group.".to_string();
+                }
+                let mut lines = vec!["Active workspace grants in this group:".to_string()];
+                for grant in grants {
+                    let collaborator = self
+                        .resolve_user_name(&grant.user_id)
+                        .await
+                        .unwrap_or_else(|| "Slack member".to_string());
+                    lines.push(format!(
+                        "- @{collaborator}: {} on `{}` until {} UTC",
+                        grant.access,
+                        grant.project_name(),
+                        grant.expires_at.format("%Y-%m-%d %H:%M")
+                    ));
+                }
+                lines.join("\n")
+            }
+            _ => USAGE.to_string(),
+        }
     }
 
     /// Get the bot's name (cached after first connection).
@@ -346,6 +906,11 @@ impl SlackChannel {
                 if let Some(user_id) = resp.get("user_id").and_then(|v| v.as_str()) {
                     let mut guard = self.bot_user_id.lock().await;
                     *guard = Some(user_id.to_string());
+                }
+                if let Some(team_id) = resp.get("team_id").and_then(|v| v.as_str()) {
+                    if let Ok(mut guard) = self.team_id.write() {
+                        *guard = Some(team_id.to_string());
+                    }
                 }
                 // Extract bot name from response (field is "user")
                 if let Some(bot_name) = resp.get("user").and_then(|v| v.as_str()) {
@@ -711,47 +1276,47 @@ impl SlackChannel {
         };
         let is_dm = channel_type == "im";
 
-        // Auto-claim: if no allowed_user_ids and this is a DM, claim the sender as owner
-        let auto_claimed;
-        let is_whitelisted = {
-            let allowed = self
+        // Auto-claim only when neither an allowlist nor an explicit owner exists.
+        // Persist both lists together so the claimed user is unambiguously Owner.
+        let auto_claimed = if is_dm {
+            let mut allowed = self
                 .allowed_user_ids
-                .read()
+                .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() {
-                if is_dm {
-                    drop(allowed);
-                    warn!(
-                        user = %user,
-                        "No allowed_user_ids configured — auto-claiming first DM user as owner."
-                    );
-                    {
-                        let mut allowed = self
-                            .allowed_user_ids
-                            .write()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        allowed.push(user.clone());
-                    }
-                    auto_claimed = true;
-                    true
-                } else {
-                    auto_claimed = false;
-                    false
-                }
+            let mut owners = self
+                .owner_user_ids
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if allowed.is_empty() && owners.is_empty() {
+                allowed.push(user.clone());
+                owners.push(user.clone());
+                true
             } else {
-                auto_claimed = false;
-                allowed.contains(&user)
+                false
             }
+        } else {
+            false
         };
+        if auto_claimed {
+            warn!(
+                user = %user,
+                "No Slack users configured — auto-claiming first DM user as owner."
+            );
+        }
 
         if auto_claimed {
             // Persist to config.toml (must be outside RwLock scope to avoid Send issues)
-            let ids = self
+            let allowed_ids = self
                 .allowed_user_ids
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            if let Err(e) = self.persist_allowed_user_ids(&ids).await {
+            let owner_ids = self
+                .owner_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Err(e) = self.persist_access_ids(&allowed_ids, &owner_ids).await {
                 warn!(user = %user, "Failed to persist auto-claimed user ID to config: {}", e);
             }
             let _ = self.post_message(
@@ -761,23 +1326,61 @@ impl SlackChannel {
             ).await;
         }
 
-        // Determine user role: Owner if whitelisted, Public if @mention/DM, otherwise ignore
-        let user_role = if is_whitelisted {
-            // Owner in a non-DM channel who didn't mention the bot and is mentioning
-            // someone else — they're talking to that person, not the bot. Stay silent.
-            if !is_dm && !bot_mentioned && raw_text.contains("<@") {
-                return;
-            }
-            UserRole::Owner
-        } else if bot_mentioned || is_dm {
-            UserRole::Public
+        let allowed_snapshot = self
+            .allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let owner_snapshot = self
+            .owner_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let directly_addressed = bot_mentioned || is_dm;
+        let role_without_grant = determine_slack_role(
+            &allowed_snapshot,
+            &owner_snapshot,
+            &user,
+            false,
+            directly_addressed,
+        );
+        // A grant can matter only for an addressed, non-owner group member.
+        // Avoid a config read for ordinary group chatter and owner traffic.
+        let workspace_grant = if matches!(channel_type, "mpim" | "group")
+            && bot_mentioned
+            && role_without_grant != Some(UserRole::Owner)
+        {
+            self.active_workspace_grant(&channel_id, &user).await
         } else {
-            // Non-whitelisted user, no @mention, not a DM — silently ignore
-            return;
+            None
         };
 
+        // Explicit owners retain full access. Allowlisted non-owners are Guests;
+        // an active workspace grant also confers Guest status for its exact group.
+        let user_role = match determine_slack_role(
+            &allowed_snapshot,
+            &owner_snapshot,
+            &user,
+            workspace_grant.is_some(),
+            directly_addressed,
+        ) {
+            Some(role) => role,
+            None => return,
+        };
+
+        // In groups, collaborators must address the bot explicitly. This keeps
+        // ordinary participant-to-participant chat from becoming agent input.
+        if user_role == UserRole::Guest && !is_dm && !bot_mentioned {
+            return;
+        }
+        // An authorized owner mentioning another person (but not the bot) is
+        // talking to that person, not issuing an agent request.
+        if user_role == UserRole::Owner && !is_dm && !bot_mentioned && raw_text.contains("<@") {
+            return;
+        }
+
         // Strip bot @mention from text before processing
-        let text = {
+        let raw_agent_text = {
             let bot_id_guard = self.bot_user_id.lock().await;
             let stripped = if let Some(ref bid) = *bot_id_guard {
                 raw_text
@@ -787,10 +1390,11 @@ impl SlackChannel {
             } else {
                 raw_text.clone()
             };
-            drop(bot_id_guard);
-            // Resolve remaining <@USERID> mentions to display names
-            self.resolve_user_mentions(&stripped).await
+            stripped
         };
+        // Resolve remaining <@USERID> mentions to display names for ordinary
+        // model input, but retain raw stable IDs for security-sensitive commands.
+        let text = self.resolve_user_mentions(&raw_agent_text).await;
 
         let ts = event
             .get("ts")
@@ -830,12 +1434,19 @@ impl SlackChannel {
             }
             text.clone()
         } else {
-            super::attachments::build_inbound_text(&text, &inbound_attachments)
+            if user_role == UserRole::Owner {
+                super::attachments::build_inbound_text(&text, &inbound_attachments)
+            } else {
+                super::attachments::build_inbound_text_without_local_paths(
+                    &text,
+                    &inbound_attachments,
+                )
+            }
         };
 
         // Handle slash commands sent as text (block Public users)
         // Accept both /command and !command (Slack reserves / for native slash commands)
-        if agent_text.starts_with('/') || agent_text.starts_with('!') {
+        if raw_agent_text.starts_with('/') || raw_agent_text.starts_with('!') {
             if user_role == UserRole::Public {
                 let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
                 let _ = self
@@ -849,9 +1460,22 @@ impl SlackChannel {
             }
             let session_id = self.build_session_id(&channel_id, thread_ts.as_deref());
             let reply_thread = self.reply_thread_ts(&ts, thread_ts.as_deref());
-            let (reply, buttons) = self
-                .dispatch_command_with_buttons(&agent_text, &session_id, user_role)
-                .await;
+            let command_name = raw_agent_text.split_whitespace().next().unwrap_or_default();
+            let (reply, buttons) = if matches!(command_name, "!workspace" | "/workspace") {
+                (
+                    self.handle_workspace_command(
+                        &raw_agent_text,
+                        &channel_id,
+                        channel_type,
+                        user_role,
+                    )
+                    .await,
+                    Vec::new(),
+                )
+            } else {
+                self.dispatch_command_with_buttons(&agent_text, &session_id, user_role)
+                    .await
+            };
             let mrkdwn = markdown_to_slack_mrkdwn(&reply);
             let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
             let last_idx = chunks.len().saturating_sub(1);
@@ -998,10 +1622,16 @@ impl SlackChannel {
                 platform: "slack".to_string(),
                 channel_name,
                 channel_id: Some(format!("slack:{}", channel_id)),
+                workspace_id: self
+                    .team_id
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
                 sender_name,
                 sender_id: Some(format!("slack:{}", user)),
                 channel_member_names,
                 user_id_map,
+                workspace_grant,
                 trusted: false,
             }
         };
@@ -1046,7 +1676,16 @@ impl SlackChannel {
             // direct processing instead of stranding the message.
             match self
                 .task_registry
-                .queue_message_if_running(&session_id, &agent_text, dedup_key)
+                .queue_message_if_running(
+                    &session_id,
+                    QueuedMessage::new(
+                        &agent_text,
+                        user_role,
+                        channel_ctx.clone(),
+                        inbound_attachments.clone(),
+                    ),
+                    dedup_key,
+                )
                 .await
             {
                 QueueOutcome::Queued(queue_pos) => {
@@ -1340,6 +1979,7 @@ impl SlackChannel {
         let reply_thread_ts = reply_thread.clone();
         let bot_token = self.bot_token.clone();
         let http = self.http.clone();
+        let config_path = self.config_path.clone();
         // Snapshot user_cache for restoring @mentions in the reply
         let user_cache_snapshot = self.user_cache.read().await.clone();
         tokio::spawn(async move {
@@ -1356,8 +1996,9 @@ impl SlackChannel {
             let _typing_guard = TypingGuard(typing_guard_token.clone());
 
             let mut current_text = agent_text;
-            let inbound_attachments = inbound_attachments;
-            let mut attachments_sent = false;
+            let mut current_attachments = inbound_attachments;
+            let mut current_user_role = user_role;
+            let mut current_channel_ctx = channel_ctx;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -1367,13 +2008,8 @@ impl SlackChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
-                let attachments_for_call = if attachments_sent {
-                    &[][..]
-                } else {
-                    &inbound_attachments[..]
-                };
                 let result = tokio::select! {
-                    r = agent.handle_message_with_attachments(&session_id, &current_text, attachments_for_call, Some(current_status_tx), user_role, channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
+                    r = agent.handle_message_with_attachments(&session_id, &current_text, &current_attachments, Some(current_status_tx), current_user_role, current_channel_ctx.clone(), Some(current_heartbeat.clone())) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
                     stale_mins = super::wait_for_stale_heartbeat(current_heartbeat.clone(), stale_threshold_secs, 10), if stale_threshold_secs > 0 => {
                         Err(anyhow::anyhow!(
@@ -1387,7 +2023,6 @@ impl SlackChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
-                attachments_sent = true;
                 current_typing_cancel.cancel();
                 // Abort the status display task to prevent blocking if a background
                 // CLI agent monitoring task still holds a status_tx clone.
@@ -1450,12 +2085,27 @@ impl SlackChannel {
                 // Finalize the current task AFTER sending the response/error,
                 // draining the queue in the same critical section so no
                 // concurrent message can be stranded between the two steps.
-                if let Some(queued) = registry
+                if let Some(mut queued) = registry
                     .finalize_and_drain(current_task_id, &session_id, task_error.as_deref())
                     .await
                 {
                     // Small delay to ensure previous message is fully committed to DB
                     tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    if queued.user_role == UserRole::Guest {
+                        if let Some(original) = queued.channel_ctx.workspace_grant.clone() {
+                            queued.channel_ctx.workspace_grant =
+                                match revalidate_queued_workspace_grant(&config_path, &original)
+                                    .await
+                                {
+                                    Ok(grant) => grant,
+                                    Err(error) => {
+                                        warn!(%error, "Could not revalidate queued workspace grant; denying scoped access");
+                                        None
+                                    }
+                                };
+                        }
+                    }
 
                     info!(
                         session_id,
@@ -1476,6 +2126,9 @@ impl SlackChannel {
 
                     // Set up for next iteration
                     current_text = queued.text;
+                    current_user_role = queued.user_role;
+                    current_channel_ctx = queued.channel_ctx;
+                    current_attachments = queued.attachments;
                     let desc: String = current_text.chars().take(80).collect();
                     let (new_task_id, new_cancel_token) =
                         registry.register(&session_id, &desc).await;
@@ -1585,16 +2238,10 @@ impl SlackChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Authorization check: fail-closed - deny if no users configured or user not in list
-        {
-            let allowed = self
-                .allowed_user_ids
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
-                warn!(user_id, "Unauthorized Slack interactive action");
-                return;
-            }
+        // Only owners can approve tools or invoke privileged command buttons.
+        if !self.is_owner_id(user_id) {
+            warn!(user_id, "Unauthorized Slack interactive action");
+            return;
         }
 
         let actions = match payload.get("actions").and_then(|v| v.as_array()) {
@@ -1652,6 +2299,17 @@ impl SlackChannel {
                 _ => continue,
             };
 
+            // Resolve only a currently pending approval. In particular, do not
+            // update or auto-dismiss a stale card after a daemon restart.
+            let response_tx = {
+                let mut pending = self.pending_approvals.lock().await;
+                pending.remove(approval_id)
+            };
+            let Some(response_tx) = response_tx else {
+                warn!(approval_id, "Stale Slack approval callback");
+                continue;
+            };
+
             // Update the original message via response_url
             if let Some(response_url) = payload.get("response_url").and_then(|v| v.as_str()) {
                 let original_text = payload
@@ -1670,17 +2328,25 @@ impl SlackChannel {
                     .json(&updated_payload)
                     .send()
                     .await;
-            }
 
-            // Send the response via oneshot channel
-            {
-                let mut pending = self.pending_approvals.lock().await;
-                if let Some(tx) = pending.remove(approval_id) {
-                    let _ = tx.send(response);
-                } else {
-                    warn!(approval_id, "Stale Slack approval callback");
+                // Keep the resolved state visible briefly, then delete the
+                // interactive source message via its short-lived response URL.
+                // Slack permits response URLs to delete source messages, and
+                // the default 10-second delay is well inside their validity.
+                if let Some(delay) = Self::resolved_approval_dismiss_delay() {
+                    let http = self.http.clone();
+                    let response_url = response_url.to_string();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let delete_payload = serde_json::json!({
+                            "delete_original": true,
+                        });
+                        let _ = http.post(response_url).json(&delete_payload).send().await;
+                    });
                 }
             }
+
+            let _ = response_tx.send(response);
         }
     }
 
@@ -1700,16 +2366,10 @@ impl SlackChannel {
             .unwrap_or("");
         let text_arg = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Authorization check: fail-closed - deny if no users configured or user not in list
-        {
-            let allowed = self
-                .allowed_user_ids
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() || !allowed.contains(&user_id.to_string()) {
-                warn!(user_id, "Unauthorized Slack slash command");
-                return;
-            }
+        // Native slash commands are privileged control-plane actions.
+        if !self.is_owner_id(user_id) {
+            warn!(user_id, "Unauthorized Slack slash command");
+            return;
         }
 
         let cmd_text = if text_arg.is_empty() {
@@ -1765,6 +2425,10 @@ impl SlackChannel {
             "/restart" => {
                 restart_process();
                 "Restart failed. You may need to restart manually.".to_string()
+            }
+            "/workspace" => {
+                "Use `!workspace ...` as a message in the private Slack group where the grant should apply. Type `!help` for the exact syntax."
+                    .to_string()
             }
             "/help" | "/start" => build_help_text(&slack_commands(), "!"),
             _ => format!(
@@ -2388,4 +3052,89 @@ pub fn spawn_slack_channel(channel: Arc<SlackChannel>) {
     tokio::spawn(async move {
         channel.start_with_retry().await;
     });
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn explicit_slack_owners_are_distinct_from_allowed_guests() {
+        let allowed = ids(&["U_OWNER", "U_GUEST"]);
+        let owners = ids(&["U_OWNER"]);
+        assert_eq!(
+            determine_slack_role(&allowed, &owners, "U_OWNER", false, true),
+            Some(UserRole::Owner)
+        );
+        assert_eq!(
+            determine_slack_role(&allowed, &owners, "U_GUEST", false, true),
+            Some(UserRole::Guest)
+        );
+    }
+
+    #[test]
+    fn legacy_allowlist_remains_owner_when_no_owner_ids_exist() {
+        assert_eq!(
+            determine_slack_role(&ids(&["U_LEGACY"]), &[], "U_LEGACY", false, true),
+            Some(UserRole::Owner)
+        );
+    }
+
+    #[test]
+    fn grant_confers_guest_only_in_addressed_group_flow() {
+        assert_eq!(
+            determine_slack_role(&[], &ids(&["U_OWNER"]), "U_COLLAB", true, true),
+            Some(UserRole::Guest)
+        );
+        assert_eq!(
+            determine_slack_role(&[], &ids(&["U_OWNER"]), "U_OUTSIDER", false, true),
+            Some(UserRole::Public)
+        );
+        assert_eq!(
+            determine_slack_role(&[], &ids(&["U_OWNER"]), "U_OUTSIDER", false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_mentions_require_stable_slack_user_ids() {
+        assert_eq!(
+            SlackChannel::parse_slack_user_mention("<@U123ABC>").unwrap(),
+            "U123ABC"
+        );
+        assert!(SlackChannel::parse_slack_user_mention("@display-name").is_err());
+        assert!(SlackChannel::parse_slack_user_mention("<@../../etc>").is_err());
+    }
+
+    #[test]
+    fn queued_grant_revalidation_never_expands_authority() {
+        let original = WorkspaceGrant {
+            platform: "slack".to_string(),
+            workspace_id: "T1".to_string(),
+            channel_id: "G1".to_string(),
+            user_id: "U1".to_string(),
+            project_root: "/tmp/project-a".to_string(),
+            access: WorkspaceAccessLevel::Edit,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        };
+
+        let mut extended = original.clone();
+        extended.expires_at = chrono::Utc::now() + chrono::Duration::hours(2);
+        let retained = retain_queued_workspace_grant(&original, &extended).unwrap();
+        assert_eq!(retained.expires_at, original.expires_at);
+        assert_eq!(retained.access, WorkspaceAccessLevel::Edit);
+
+        let mut downgraded = extended.clone();
+        downgraded.access = WorkspaceAccessLevel::Read;
+        let retained = retain_queued_workspace_grant(&original, &downgraded).unwrap();
+        assert_eq!(retained.access, WorkspaceAccessLevel::Read);
+
+        let mut moved = extended;
+        moved.project_root = "/tmp/project-b".to_string();
+        assert!(retain_queued_workspace_grant(&original, &moved).is_none());
+    }
 }

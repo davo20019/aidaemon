@@ -6,7 +6,7 @@
 //! [`VerificationTargetKind`], `CompletionSignals`) and the `infer_*` /
 //! `extract_verification_*` helpers.
 
-use super::followup::text_contains_any_phrase;
+use super::followup::{looks_like_retry_followup, text_contains_any_phrase};
 use super::project_scope::{
     normalize_project_scope_path_with_aliases, push_project_scope, token_looks_like_filesystem_path,
 };
@@ -210,6 +210,32 @@ pub(super) fn mutation_contract_fulfilled(
             || progress
                 .observed_mutation_effects
                 .satisfies(contract.required_mutation_effects))
+}
+
+/// A delivery task has produced a local artifact but has not actually sent it.
+///
+/// This is deliberately narrower than a generic unfulfilled delivery: a request
+/// to locate and send an existing file may truthfully end with "not found".
+/// Once the agent has authored a local artifact, however, an honest converter
+/// failure is usually recoverable by trying a different local conversion path.
+pub(super) fn authored_artifact_still_needs_delivery_recovery(
+    contract: &CompletionContract,
+    progress: &CompletionProgress,
+) -> bool {
+    let local_artifact_effects =
+        ToolMutationEffects::LOCAL_SOURCE_WRITE.union(ToolMutationEffects::LOCAL_WORKSPACE_WRITE);
+
+    contract.task_kind == CompletionTaskKind::Deliver
+        && contract.expects_mutation
+        && contract
+            .required_mutation_effects
+            .intersects(ToolMutationEffects::EXTERNAL_DELIVERY)
+        && progress
+            .observed_mutation_effects
+            .intersects(local_artifact_effects)
+        && !progress
+            .observed_mutation_effects
+            .intersects(ToolMutationEffects::EXTERNAL_DELIVERY)
 }
 
 pub(super) fn completion_contract_allows_force_text(
@@ -471,6 +497,9 @@ pub(super) struct CompletionProgress {
     /// report failed external mutations honestly, it first gets one
     /// evidence-fed chance to fix them with a DIFFERENT approach.
     pub external_mutation_recovery_attempted: bool,
+    /// True after the one-shot recovery for an authored local artifact that
+    /// has not yet been delivered to the user.
+    pub undelivered_artifact_recovery_attempted: bool,
     /// Cumulative count of times the verification guard blocked completion.
     /// Unlike `stall_count` (which is shared with other stall mechanisms and
     /// gets reset), this counter only increments and is used as a safety valve
@@ -550,6 +579,10 @@ impl CompletionProgress {
 
     pub(super) fn mark_external_mutation_recovery_attempted(&mut self) {
         self.external_mutation_recovery_attempted = true;
+    }
+
+    pub(super) fn mark_undelivered_artifact_recovery_attempted(&mut self) {
+        self.undelivered_artifact_recovery_attempted = true;
     }
 
     pub(super) fn clear_failed_external_mutation_gate(&mut self) {
@@ -786,6 +819,8 @@ const CHANGE_KEYWORDS: &[&str] = &[
     "retry",
     "redo",
     "try again",
+    "try one more time",
+    "one more time",
     "do it again",
 ];
 
@@ -834,6 +869,8 @@ const STRONG_MUTATION_KEYWORDS: &[&str] = &[
     "retry",
     "redo",
     "try again",
+    "try one more time",
+    "one more time",
     "do it again",
 ];
 
@@ -1095,6 +1132,8 @@ fn infer_completion_signals(
                 "redo",
                 "rerun",
                 "try again",
+                "try one more time",
+                "one more time",
                 "do it again",
             ],
         )
@@ -1232,6 +1271,18 @@ fn current_request_segment(text: &str) -> &str {
     text
 }
 
+/// Return the request that preceded an enriched `Current request:` segment.
+/// `sanitize_carryover_blocks` may already have removed the `Original request:`
+/// label, so the surviving current marker is the reliable split point.
+fn prior_request_segment(text: &str) -> Option<&str> {
+    let marker_start = ["Current request:", "Follow-up:"]
+        .iter()
+        .filter_map(|marker| text.rfind(marker))
+        .max()?;
+    let prior = text[..marker_start].trim();
+    (!prior.is_empty()).then_some(prior)
+}
+
 /// Narrow a freshly inferred contract to what a delegated executor child can
 /// actually satisfy on its own.
 ///
@@ -1254,12 +1305,21 @@ pub(super) fn scope_contract_for_delegated_executor(
 fn infer_required_mutation_effects(
     lower_text: &str,
     expects_mutation: bool,
+    task_kind: CompletionTaskKind,
 ) -> ToolMutationEffects {
     if !expects_mutation {
         return ToolMutationEffects::NONE;
     }
 
     let mut required = ToolMutationEffects::NONE;
+    // Delivery is a semantic outcome, not a synonym list. Once the request is
+    // classified as Deliver, a local write must never satisfy it. Live repro:
+    // "Send me a pdf about imerkar" wrote HTML and PostScript, failed both
+    // conversions, and was incorrectly persisted as succeeded without calling
+    // send_file because the old phrase list only recognized "send me the file".
+    if task_kind == CompletionTaskKind::Deliver {
+        required = required.union(ToolMutationEffects::EXTERNAL_DELIVERY);
+    }
     if text_contains_any_phrase(
         lower_text,
         &[
@@ -1396,14 +1456,23 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
     // full text so prior URLs/paths the follow-up refers back to remain
     // observable.
     let current = current_request_segment(trimmed);
-    let lower = current.to_ascii_lowercase();
+    // A retry-only turn inherits the substantive request it asks us to repeat.
+    // Other follow-ups continue to use only the current segment, preserving the
+    // observational-followup guard below.
+    let contract_request = if looks_like_retry_followup(current) {
+        prior_request_segment(trimmed).unwrap_or(current)
+    } else {
+        current
+    };
+    let lower = contract_request.to_ascii_lowercase();
     let forbids_mutation = explicitly_forbids_mutation(&lower);
     let forbidden_mutation_actions = scoped_forbidden_mutation_actions(&lower);
     let mutation_signal_text = remove_scoped_negative_mutation_phrases(&lower);
 
     let verification_targets = extract_verification_targets(text, alias_roots);
     let signals = infer_completion_signals(&mutation_signal_text, &verification_targets);
-    let connected_content_mode = super::intent_routing::classify_connected_content_mode(current);
+    let connected_content_mode =
+        super::intent_routing::classify_connected_content_mode(contract_request);
     let mut task_kind = infer_completion_task_kind(&signals);
     // "Run X and provide the output" is an observation delivered as text —
     // the bare run verb must not make it a Change (observed live: successful
@@ -1436,7 +1505,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         signals.mutation_obligation
     };
     let required_mutation_effects =
-        infer_required_mutation_effects(&mutation_signal_text, expects_mutation);
+        infer_required_mutation_effects(&mutation_signal_text, expects_mutation, task_kind);
     let requires_observation = signals.explicit_verification_requested
         || signals.observable_target_request
         || signals.visible_state_problem
@@ -1746,6 +1815,25 @@ mod tests {
             "asking what was seen is observational, not a mutation"
         );
     }
+
+    #[test]
+    fn retry_only_followup_inherits_pdf_delivery_contract() {
+        let enriched = "Original request:\nSend me a pdf about Imerkar. Make it nice since we are pitching the idea to investors.\n\nCurrent request:\nCan you try one more time?";
+        let contract = infer_completion_contract(enriched, &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
+        assert!(contract.expects_mutation);
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+    }
+
+    #[test]
+    fn bare_one_more_time_is_still_a_mutation_retry() {
+        let contract = infer_completion_contract("Can you try one more time?", &[]);
+        assert_eq!(contract.task_kind, CompletionTaskKind::Change);
+        assert!(contract.expects_mutation);
+    }
+
     #[test]
     fn sanitized_enriched_followup_uses_current_request_not_prior_mutation() {
         // Regression (live-confirmed): turn_context enriches a follow-up as
@@ -1798,8 +1886,56 @@ mod tests {
         let contract = infer_completion_contract("Email this note to Alice.", &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
         assert!(contract.expects_mutation);
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
         assert!(!contract.requires_observation);
         assert!(!contract.requires_reverification_after_mutation);
+    }
+
+    #[test]
+    fn send_me_pdf_requires_delivery_not_just_a_local_write() {
+        let contract = infer_completion_contract(
+            "Send me a pdf about imerkar. Make it nice since we are pitching the idea to investors.",
+            &[],
+        );
+        assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
+        assert!(contract.expects_mutation);
+        assert!(contract
+            .required_mutation_effects
+            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+
+        let mut progress = CompletionProgress::new(&contract);
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
+        );
+
+        assert!(!mutation_contract_fulfilled(&contract, &progress));
+        assert!(authored_artifact_still_needs_delivery_recovery(
+            &contract, &progress
+        ));
+
+        progress.mark_mutation(
+            &contract,
+            &ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY),
+        );
+
+        assert!(mutation_contract_fulfilled(&contract, &progress));
+        assert!(!authored_artifact_still_needs_delivery_recovery(
+            &contract, &progress
+        ));
+    }
+
+    #[test]
+    fn missing_existing_file_does_not_arm_authored_artifact_recovery() {
+        let contract =
+            infer_completion_contract("Send me the SOW PDF from the Lodestar project.", &[]);
+        let progress = CompletionProgress::new(&contract);
+
+        assert!(!authored_artifact_still_needs_delivery_recovery(
+            &contract, &progress
+        ));
     }
     #[test]
     fn rewrite_request_expects_mutation() {

@@ -137,6 +137,31 @@ impl Tool for SearchFilesTool {
         if !search_metadata.is_dir() {
             anyhow::bail!("Not a directory: {}", search_dir);
         }
+        let collaboration_root = if let Some(root) = args
+            .get("_workspace_collaboration_root")
+            .and_then(Value::as_str)
+        {
+            anyhow::ensure!(
+                backend.kind() == crate::execution::BackendKind::Local,
+                "Workspace collaboration requires a local execution backend"
+            );
+            let resolved_root = backend.resolve_path(root).await?;
+            let canonical_root = backend.canonicalize(&resolved_root).await?;
+            anyhow::ensure!(
+                canonical_root.as_str() == root,
+                "Delegated project path changed after authorization"
+            );
+            let canonical_search = backend.canonicalize(&search_dir).await?;
+            anyhow::ensure!(
+                std::path::Path::new(canonical_search.as_str())
+                    .starts_with(std::path::Path::new(canonical_root.as_str())),
+                "Search path is outside the delegated project"
+            );
+            search_dir = canonical_search;
+            Some(canonical_root)
+        } else {
+            None
+        };
 
         let content_regex = if let Some(pat) = content_pattern {
             Some(Regex::new(pat).map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pat, e))?)
@@ -160,6 +185,7 @@ impl Tool for SearchFilesTool {
             &glob_matcher,
             max_results,
             MAX_ENTRIES_VISITED,
+            collaboration_root.as_ref(),
             &mut results,
             &mut stats,
         )
@@ -324,6 +350,7 @@ async fn walk_dir(
     glob_matcher: &Option<GlobMatcher>,
     max_results: usize,
     max_entries: usize,
+    collaboration_root: Option<&BackendPath>,
     results: &mut Vec<SearchResult>,
     stats: &mut SearchStats,
 ) {
@@ -354,7 +381,22 @@ async fn walk_dir(
                 return;
             }
 
-            let path = entry.path;
+            let mut path = entry.path;
+            if let Some(root) = collaboration_root {
+                if fs_utils::is_sensitive_path(std::path::Path::new(path.as_str())) {
+                    continue;
+                }
+                let Ok(canonical) = backend.canonicalize(&path).await else {
+                    continue;
+                };
+                if !std::path::Path::new(canonical.as_str())
+                    .starts_with(std::path::Path::new(root.as_str()))
+                    || fs_utils::is_sensitive_path(std::path::Path::new(canonical.as_str()))
+                {
+                    continue;
+                }
+                path = canonical;
+            }
             let file_name = path.file_name().unwrap_or_default().to_string();
 
             if entry.metadata.file_type == BackendFileType::Directory {
@@ -446,6 +488,7 @@ mod tests {
             &Some(glob),
             10,
             50, // entry budget far smaller than the deep tree
+            None,
             &mut results,
             &mut stats,
         )
@@ -477,6 +520,7 @@ mod tests {
             &Some(glob),
             10,
             10,
+            None,
             &mut results,
             &mut stats,
         )
@@ -514,6 +558,7 @@ mod tests {
             &Some(glob),
             10,
             5,
+            None,
             &mut results,
             &mut stats,
         )
@@ -544,6 +589,25 @@ mod tests {
             "no-match default-path output must suggest user dirs, got: {result}"
         );
         assert!(result.contains("'path'"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_search_skips_sensitive_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("safe.txt"), "COLLAB_NEEDLE").unwrap();
+        std::fs::write(root.path().join(".env.local"), "COLLAB_NEEDLE=secret").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let args = serde_json::json!({
+            "pattern": "COLLAB_NEEDLE",
+            "path": canonical_root,
+            "_workspace_collaboration_root": canonical_root,
+        })
+        .to_string();
+
+        let result = SearchFilesTool.call(&args).await.unwrap();
+        assert!(result.contains("safe.txt"));
+        assert!(!result.contains(".env.local"));
+        assert!(!result.contains("secret"));
     }
 
     #[tokio::test]

@@ -183,22 +183,29 @@ impl Agent {
     /// - per-turn policy filtering, personal-memory restriction, and
     ///   untrusted-external-reference restriction.
     ///
-    /// Non-owners receive tools based on role (no tool access), so the roster is
-    /// empty for any non-`Owner` role — matching the `tools_allowed_for_user`
-    /// gate in bootstrap.
+    /// Non-owners receive no tools unless the exact context carries an active,
+    /// explicit workspace grant. That case is narrowed to the grant allowlist.
     pub(super) fn session_static_tool_roster(
         &self,
         user_role: UserRole,
-        visibility: ChannelVisibility,
+        channel_ctx: &ChannelContext,
     ) -> Vec<(String, String)> {
-        if user_role != UserRole::Owner {
+        let workspace_grant = channel_ctx.active_workspace_grant(user_role);
+        if user_role != UserRole::Owner && workspace_grant.is_none() {
             return Vec::new();
         }
 
         let (mut defs, _caps) = self.registered_tool_definitions_with_capabilities();
 
+        if let Some(grant) = workspace_grant {
+            defs.retain(|definition| {
+                Self::tool_name_from_definition(definition)
+                    .is_some_and(|name| grant.allows_tool(name))
+            });
+        }
+
         // Channel-visibility class is session-static and so stays in the core.
-        if visibility == ChannelVisibility::PublicExternal {
+        if channel_ctx.visibility == ChannelVisibility::PublicExternal {
             let allowed = ["web_search", "remember_fact", "system_info"];
             defs.retain(|d| {
                 Self::tool_name_from_definition(d).is_some_and(|name| allowed.contains(&name))
@@ -206,7 +213,7 @@ impl Agent {
         }
         // Keep the core-prompt roster consistent with the per-turn tool set:
         // desktop control is never advertised outside DMs/internal sessions.
-        if !Self::visibility_allows_desktop_control(visibility) {
+        if !Self::visibility_allows_desktop_control(channel_ctx.visibility) {
             defs.retain(|d| {
                 Self::tool_name_from_definition(d)
                     .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
@@ -592,6 +599,7 @@ mod tests {
     use super::*;
     use crate::testing::{setup_full_stack_test_agent_with_extra_tools, MockProvider, MockTool};
     use crate::traits::Tool;
+    use crate::types::{WorkspaceAccessLevel, WorkspaceGrant};
     use proptest::prelude::*;
     use std::sync::Arc;
 
@@ -825,13 +833,14 @@ mod tests {
             setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![t1, t2])
                 .await
                 .unwrap();
+        let channel_ctx = ChannelContext::private("test");
 
         let roster_a = harness
             .agent
-            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::Private);
+            .session_static_tool_roster(UserRole::Owner, &channel_ctx);
         let roster_b = harness
             .agent
-            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::Private);
+            .session_static_tool_roster(UserRole::Owner, &channel_ctx);
         // Deterministic: identical output on repeated calls (function takes no query).
         assert_eq!(roster_a, roster_b);
 
@@ -850,15 +859,62 @@ mod tests {
         let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![t1])
             .await
             .unwrap();
+        let channel_ctx = ChannelContext::private("test");
 
         assert!(harness
             .agent
-            .session_static_tool_roster(UserRole::Guest, ChannelVisibility::Private)
+            .session_static_tool_roster(UserRole::Guest, &channel_ctx)
             .is_empty());
         assert!(harness
             .agent
-            .session_static_tool_roster(UserRole::Public, ChannelVisibility::Private)
+            .session_static_tool_roster(UserRole::Public, &channel_ctx)
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_static_roster_limits_scoped_guest_to_granted_file_tools() {
+        let read = Arc::new(MockTool::new("read_file", "read", "ok")) as Arc<dyn Tool>;
+        let write = Arc::new(MockTool::new("write_file", "write", "ok")) as Arc<dyn Tool>;
+        let terminal = Arc::new(MockTool::new("terminal", "shell", "ok")) as Arc<dyn Tool>;
+        let harness = setup_full_stack_test_agent_with_extra_tools(
+            MockProvider::new(),
+            vec![read, write, terminal],
+        )
+        .await
+        .unwrap();
+        let grant = WorkspaceGrant {
+            platform: "slack".to_string(),
+            workspace_id: "T_TEST".to_string(),
+            channel_id: "C_PRIVATE".to_string(),
+            user_id: "U_GUEST".to_string(),
+            project_root: "/project".to_string(),
+            access: WorkspaceAccessLevel::Read,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        };
+        let channel_ctx = ChannelContext {
+            visibility: ChannelVisibility::PrivateGroup,
+            platform: "slack".to_string(),
+            channel_name: Some("project-chat".to_string()),
+            channel_id: Some("slack:C_PRIVATE".to_string()),
+            workspace_id: Some("T_TEST".to_string()),
+            sender_name: Some("Guest".to_string()),
+            sender_id: Some("slack:U_GUEST".to_string()),
+            channel_member_names: vec![],
+            user_id_map: HashMap::new(),
+            workspace_grant: Some(grant),
+            trusted: false,
+        };
+
+        let roster = harness
+            .agent
+            .session_static_tool_roster(UserRole::Guest, &channel_ctx);
+        let names = roster
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"terminal"));
     }
 
     #[tokio::test]
@@ -869,10 +925,12 @@ mod tests {
             setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![web, other])
                 .await
                 .unwrap();
+        let mut channel_ctx = ChannelContext::private("test");
+        channel_ctx.visibility = ChannelVisibility::PublicExternal;
 
         let roster = harness
             .agent
-            .session_static_tool_roster(UserRole::Owner, ChannelVisibility::PublicExternal);
+            .session_static_tool_roster(UserRole::Owner, &channel_ctx);
         let names: Vec<&str> = roster.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"web_search"));
         assert!(!names.contains(&"alpha_tool"));

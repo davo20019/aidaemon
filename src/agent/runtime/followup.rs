@@ -55,6 +55,120 @@ impl TurnContextReason {
     }
 }
 
+/// A short request whose meaning is specifically "repeat the previous attempt."
+/// These turns must retain the prior task contract; treating them as standalone
+/// questions is how "Can you try one more time?" lost an outstanding PDF
+/// delivery obligation in the live incident.
+pub(super) fn looks_like_retry_followup(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 120 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !looks_like_explicit_task_switch(&lower)
+        && text_contains_any_phrase(
+            &lower,
+            &[
+                "retry",
+                "redo",
+                "rerun",
+                "re-run",
+                "try again",
+                "try one more time",
+                "one more time",
+                "do it again",
+            ],
+        )
+}
+
+/// Detect short revision/delivery commands whose object exists only in the
+/// immediately preceding conversation: "make it one page", "send that PDF",
+/// "use the shorter version instead". These must be classified before the
+/// standalone-mutation heuristics, which otherwise treat the format words as
+/// a complete new task and detach the request from its actual subject.
+pub(super) fn looks_like_anaphoric_revision_followup(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 160 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if looks_like_explicit_task_switch(&lower) {
+        return false;
+    }
+
+    let has_strong_prior_object_reference = text_contains_any_phrase(
+        &lower,
+        &[
+            "it",
+            "that",
+            "the same",
+            "the file",
+            "the pdf",
+            "the document",
+            "the report",
+            "the version",
+            "the attachment",
+        ],
+    );
+    let has_this_reference = contains_keyword_as_words(&lower, "this");
+    let has_revision_modifier = text_contains_any_phrase(
+        &lower,
+        &[
+            "instead",
+            "shorter",
+            "longer",
+            "one page",
+            "1 page",
+            "two pages",
+            "2 pages",
+            "another version",
+            "different format",
+        ],
+    );
+    if !has_strong_prior_object_reference && !(has_this_reference && has_revision_modifier) {
+        return false;
+    }
+
+    let starts_with_revision_verb = [
+        "make ", "change ", "convert ", "turn ", "rewrite ", "revise ", "update ", "shorten ",
+        "expand ", "render ", "export ", "save ", "send ", "use ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+
+    starts_with_revision_verb || has_revision_modifier
+}
+
+/// Artifact revisions are unsafe to execute without a resolvable antecedent:
+/// a broad file search can select an unrelated old deliverable that happens to
+/// have the requested extension.
+pub(super) fn looks_like_anaphoric_artifact_revision(text: &str) -> bool {
+    if !looks_like_anaphoric_revision_followup(text) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    text_contains_any_phrase(
+        &lower,
+        &[
+            "pdf",
+            "file",
+            "document",
+            "docx",
+            "report",
+            "attachment",
+            "presentation",
+            "slides",
+            "spreadsheet",
+            "image",
+            "photo",
+            "one page",
+            "1 page",
+            "two pages",
+            "2 pages",
+        ],
+    )
+}
+
 pub(super) fn find_previous_turns(
     history: &[Message],
     current_user_text: &str,
@@ -65,6 +179,7 @@ pub(super) fn find_previous_turns(
     let mut saw_current_user = false;
     let mut prev_assistant: Option<String> = None;
     let mut prev_user: Option<String> = None;
+    let current_is_retry = looks_like_retry_followup(current_user_text);
     for msg in history.iter().rev() {
         match msg.role.as_str() {
             "user" => {
@@ -75,6 +190,12 @@ pub(super) fn find_previous_turns(
                 if let Some(content) = msg.content.as_deref() {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
+                        // Collapse a chain of "retry" turns to the nearest
+                        // substantive request instead of enriching one retry
+                        // with another and losing the actual task again.
+                        if current_is_retry && looks_like_retry_followup(trimmed) {
+                            continue;
+                        }
                         prev_user = Some(trimmed.to_string());
                         break;
                     }
@@ -731,6 +852,16 @@ pub(super) fn classify_followup_mode(
         return (FollowupMode::Followup, reasons);
     }
 
+    if looks_like_retry_followup(trimmed) {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
+    if prev_assistant.is_some() && looks_like_anaphoric_revision_followup(trimmed) {
+        reasons.push(TurnContextReason::ExplicitFollowup);
+        return (FollowupMode::Followup, reasons);
+    }
+
     // Strong followup indicators that should override the length heuristic.
     // Phrases like "follow-up on the X you just created" clearly reference
     // prior context regardless of message length.
@@ -874,6 +1005,74 @@ mod tests {
             assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
         }
     }
+
+    #[test]
+    fn retry_phrases_are_followups_not_standalone_questions() {
+        for retry in [
+            "Retry",
+            "Try again",
+            "Can you try one more time?",
+            "Please do it again.",
+        ] {
+            let (mode, reasons) = classify_followup_mode(retry, Some("The conversion failed."));
+            assert_eq!(mode, FollowupMode::Followup, "retry={retry:?}");
+            assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
+        }
+    }
+
+    #[test]
+    fn anaphoric_artifact_revision_keeps_immediate_parent_context() {
+        let current = "Make it 1 page PDF instead.";
+        let previous = "Here's the two-page PDF: Headless WordPress in the Age of AI Agents.";
+        let (mode, reasons) = classify_followup_mode(current, Some(previous));
+
+        assert_eq!(mode, FollowupMode::Followup);
+        assert!(reasons.contains(&TurnContextReason::ExplicitFollowup));
+        assert!(looks_like_anaphoric_artifact_revision(current));
+    }
+
+    #[test]
+    fn anaphoric_artifact_revision_without_antecedent_stays_new_task() {
+        let current = "Make it 1 page PDF instead.";
+        let (mode, reasons) = classify_followup_mode(current, None);
+
+        assert_eq!(mode, FollowupMode::NewTask);
+        assert!(reasons.contains(&TurnContextReason::DefaultNewTask));
+    }
+
+    #[test]
+    fn explicit_instead_task_switch_is_not_anaphoric_revision() {
+        let current = "Instead make a new one-page PDF about rice farming.";
+        assert!(!looks_like_anaphoric_revision_followup(current));
+    }
+
+    #[test]
+    fn self_contained_this_object_is_not_forced_into_followup() {
+        let current = "Make this repository compile.";
+        let (mode, _) = classify_followup_mode(current, Some("Here is yesterday's weather."));
+        assert_eq!(mode, FollowupMode::NewTask);
+    }
+
+    #[test]
+    fn retry_chain_resolves_to_nearest_substantive_user_request() {
+        fn message(role: &str, content: &str) -> Message {
+            Message {
+                content: Some(content.to_string()),
+                ..Message::new_runtime(uuid::Uuid::new_v4().to_string(), "session", role)
+            }
+        }
+
+        let history = vec![
+            message("user", "Send me the investor PDF."),
+            message("assistant", "The conversion failed."),
+            message("user", "Retry"),
+            message("assistant", "That converter also failed."),
+            message("user", "Can you try one more time?"),
+        ];
+        let (_, previous_user) = find_previous_turns(&history, "Can you try one more time?");
+        assert_eq!(previous_user.as_deref(), Some("Send me the investor PDF."));
+    }
+
     #[test]
     fn followup_detects_answer_to_clarifying_question() {
         let followup =

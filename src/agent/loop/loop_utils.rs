@@ -1536,32 +1536,42 @@ pub(super) fn fixup_message_ordering(messages: &mut Vec<Value>) {
     // Pass 0: initial coalescing helps reduce edge cases.
     merge_consecutive_messages(messages);
 
-    // Build index sets once per pass.
-    let assistant_tool_call_ids: std::collections::HashSet<String> = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-        .filter_map(|m| m.get("tool_calls"))
-        .filter_map(|tcs| tcs.as_array())
-        .flat_map(|arr| arr.iter())
-        .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
-        .map(|s| s.to_string())
-        .collect();
-
-    // Pass 1: remove orphaned tool messages.
-    messages.retain(|m| {
-        if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
-            return true;
-        }
-        let tc_id = m
-            .get("tool_call_id")
-            .and_then(|id| id.as_str())
-            .unwrap_or("");
-        if assistant_tool_call_ids.contains(tc_id) {
+    // Pass 1: remove orphaned, out-of-order, and duplicate tool messages. A
+    // provider can only consume a tool result after the matching assistant
+    // tool call has appeared in the transcript. A global ID-membership check is
+    // insufficient here: context fitting can retain a tool result while moving
+    // or dropping its call, and a later call with the same ID must not make that
+    // earlier result look valid.
+    let mut pending_tool_call_ids = std::collections::HashSet::new();
+    messages.retain(|m| match m.get("role").and_then(|r| r.as_str()) {
+        Some("assistant") => {
+            if let Some(tool_calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                pending_tool_call_ids.extend(
+                    tool_calls
+                        .iter()
+                        .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()))
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string),
+                );
+            }
             true
-        } else {
-            warn!(tool_call_id = tc_id, "Dropping orphaned tool message");
-            false
         }
+        Some("tool") => {
+            let tc_id = m
+                .get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("");
+            if pending_tool_call_ids.remove(tc_id) {
+                true
+            } else {
+                warn!(
+                    tool_call_id = tc_id,
+                    "Dropping tool message without a preceding unmatched assistant tool call"
+                );
+                false
+            }
+        }
+        _ => true,
     });
 
     let tool_result_ids: std::collections::HashSet<String> = messages

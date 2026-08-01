@@ -174,3 +174,76 @@ async fn browser_smoke_real_chrome() {
         "close message unexpected: {close}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires local Chrome; run with --ignored"]
+async fn browser_render_pdf_real_chrome() {
+    let fixture = TempDir::new().expect("temp fixture");
+    let source = fixture.path().join("designed-document.html");
+    std::fs::write(
+        &source,
+        r#"<!doctype html>
+<style>
+@page { size: letter; margin: 0 }
+* { box-sizing: border-box }
+html, body { margin: 0; background: #08352d; color: white }
+.page { width: 8.5in; height: 11in; padding: 1in; page-break-after: always }
+</style>
+<section class="page"><h1>General PDF renderer</h1><p>Page one.</p></section>
+<section class="page"><h2>Second page</h2><p>Backgrounds and CSS page size are preserved.</p></section>"#,
+    )
+    .expect("write PDF fixture");
+
+    let config = BrowserConfig {
+        enabled: true,
+        headless: true,
+        user_data_dir: None,
+        session_isolation: Some(crate::config::SessionIsolation::BrowserContext),
+        ..BrowserConfig::default()
+    };
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        config,
+        media_tx,
+        auto_approve_broker(),
+        fixture.path().join("inbox"),
+    )
+    .expect("construct browser tool");
+
+    let rendered = tool
+        .call(
+            &json!({
+                "action": "render_pdf",
+                "source_path": source,
+                "output_filename": "designed-document.pdf",
+                "_session_id": "pdf-smoke"
+            })
+            .to_string(),
+        )
+        .await
+        .expect("render action");
+    assert!(
+        rendered.starts_with("PDF rendered with Chromium"),
+        "render failed: {rendered}"
+    );
+    let output_path = rendered
+        .split_once("saved to: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .map(std::path::PathBuf::from)
+        .expect("render response should expose output path");
+    let bytes = std::fs::read(&output_path).expect("read rendered PDF");
+    assert!(bytes.starts_with(b"%PDF-"));
+    assert!(bytes.len() > 1_000, "real PDF should be nontrivial");
+
+    if let Ok(qa_dir) = std::env::var("AIDAEMON_DEPLOY_QA_DIR") {
+        let qa_dir = std::path::PathBuf::from(qa_dir);
+        std::fs::create_dir_all(&qa_dir).expect("create persistent PDF QA directory");
+        let qa_pdf = qa_dir.join("deployed-render-regression.pdf");
+        let qa_html = qa_dir.join("deployed-render-regression.html");
+        std::fs::copy(&output_path, &qa_pdf).expect("preserve rendered PDF for visual QA");
+        std::fs::copy(&source, &qa_html).expect("preserve source HTML for visual QA");
+        println!("QA_PDF={}", qa_pdf.display());
+    }
+
+    let _ = tool.call(&json!({ "action": "close" }).to_string()).await;
+}

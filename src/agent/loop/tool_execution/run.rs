@@ -324,9 +324,13 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         };
     }
 
+    let workspace_project_root = channel_ctx
+        .active_workspace_grant(user_role)
+        .map(|grant| grant.project_root.clone());
     if known_project_dir.is_none() {
-        known_project_dir =
-            extract_project_dir_hint_with_aliases(_user_text, &agent.path_aliases.projects);
+        known_project_dir = workspace_project_root.clone().or_else(|| {
+            extract_project_dir_hint_with_aliases(_user_text, &agent.path_aliases.projects)
+        });
     }
 
     let mut successful_tool_calls = 0;
@@ -682,25 +686,30 @@ pub(in crate::agent) async fn run_tool_execution_phase(
 
         let mut effective_arguments = tc.arguments.clone();
         let mut injected_project_dir: Option<String> = None;
-        if let Some(explicit_dir) = project_dir_from_tool_args(&tc.name, &effective_arguments) {
-            known_project_dir = Some(explicit_dir);
-        }
-        if let Some((updated_args, injected)) = maybe_inject_project_dir_into_tool_args(
-            &tc.name,
-            &effective_arguments,
-            known_project_dir.as_deref(),
-        ) {
-            effective_arguments = updated_args;
-            injected_project_dir = Some(injected);
-            // Do NOT update known_project_dir from the injection result.
-            // resolve_injected_working_dir may fall back to a parent directory
-            // when the target doesn't exist yet (new project creation), which
-            // downgrades known_project_dir from the correct target (e.g.
-            // ai-news-hub-2026) to the parent (e.g. ~/projects).  Subsequent
-            // tool calls then latch onto an unrelated existing project inside
-            // that parent.  known_project_dir should only be updated from the
-            // model's explicit tool arguments (line 894) or from tool result
-            // learning (project_inspect / search_files).
+        // Scoped file tools resolve relative/default paths inside their own
+        // canonical gate. Do not inject the host's absolute project root into
+        // model arguments, status summaries, events, or recovery notices.
+        if workspace_project_root.is_none() {
+            if let Some(explicit_dir) = project_dir_from_tool_args(&tc.name, &effective_arguments) {
+                known_project_dir = Some(explicit_dir);
+            }
+            if let Some((updated_args, injected)) = maybe_inject_project_dir_into_tool_args(
+                &tc.name,
+                &effective_arguments,
+                known_project_dir.as_deref(),
+            ) {
+                effective_arguments = updated_args;
+                injected_project_dir = Some(injected);
+                // Do NOT update known_project_dir from the injection result.
+                // resolve_injected_working_dir may fall back to a parent directory
+                // when the target doesn't exist yet (new project creation), which
+                // downgrades known_project_dir from the correct target (e.g.
+                // ai-news-hub-2026) to the parent (e.g. ~/projects).  Subsequent
+                // tool calls then latch onto an unrelated existing project inside
+                // that parent.  known_project_dir should only be updated from the
+                // model's explicit tool arguments (line 894) or from tool result
+                // learning (project_inspect / search_files).
+            }
         }
         let attempted_required_file_recheck = require_file_recheck_before_answer
             && is_file_recheck_tool(&tc.name)
@@ -1337,6 +1346,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             project_scope: allowed_project_scope,
                             trusted: channel_ctx.trusted,
                             user_role,
+                            workspace_grant: channel_ctx.active_workspace_grant(user_role),
                             correction_preapproved: false,
                             suppress_trusted_session: false,
                         },

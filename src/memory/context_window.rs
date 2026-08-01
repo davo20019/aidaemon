@@ -80,7 +80,7 @@ pub fn prompt_composition(messages: &[Value], tools: &[Value]) -> PromptComposit
     let mut system_tokens = 0usize;
     let mut history_tokens = 0usize;
     for m in messages {
-        let toks = estimate_tokens(&serde_json::to_string(m).unwrap_or_default());
+        let toks = estimate_multimodal_message_tokens(std::slice::from_ref(m));
         if m.get("role").and_then(|r| r.as_str()) == Some("system") {
             system_tokens += toks;
         } else {
@@ -106,49 +106,59 @@ fn estimate_audio_tokens_from_base64_len(base64_len: usize) -> usize {
         .max(64)
 }
 
-fn surrogate_multimodal_content_tokens(content: &Value) -> Option<usize> {
-    let blocks = content.as_array()?;
-    let mut total = 0usize;
-    for block in blocks {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    total = total.saturating_add(estimate_tokens(text));
-                }
-            }
-            Some("image_url") => {
-                total = total.saturating_add(MULTIMODAL_IMAGE_TOKEN_SURROGATE);
-            }
-            Some("input_audio") => {
-                let b64_len = block
-                    .get("input_audio")
-                    .and_then(|a| a.get("data"))
-                    .and_then(|d| d.as_str())
-                    .map(str::len)
-                    .unwrap_or(0);
-                total = total.saturating_add(estimate_audio_tokens_from_base64_len(b64_len));
-            }
-            _ => {}
-        }
-    }
-    Some(total)
-}
-
-/// Estimate tokens for a message array, substituting surrogates for multimodal base64 payloads.
+/// Estimate tokens for a message array, substituting bounded provider-token
+/// surrogates for inline multimodal bytes.
+///
+/// The serialized `data:` URL is transport encoding, not prompt text. Counting
+/// its characters made one ordinary screenshot look larger than the entire
+/// context window during cold-start anchor selection. Keep the surrounding
+/// JSON/text in the chars/4 estimate, remove only the binary payload, then add
+/// the explicit image/audio token surrogate as a number (rather than embedding
+/// that number in a short string, which previously undercounted it again).
 pub fn estimate_multimodal_message_tokens(messages: &[Value]) -> usize {
     let mut surrogate_messages = messages.to_vec();
     let mut used_surrogate = false;
+    let mut multimodal_tokens = 0usize;
 
     for msg in surrogate_messages.iter_mut() {
         if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
             continue;
         }
-        let Some(content) = msg.get("content") else {
+        let Some(blocks) = msg.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        if let Some(tokens) = surrogate_multimodal_content_tokens(content) {
-            msg["content"] = json!(format!("[multimodal-surrogate:{tokens}]"));
-            used_surrogate = true;
+
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("image_url") => {
+                    multimodal_tokens =
+                        multimodal_tokens.saturating_add(MULTIMODAL_IMAGE_TOKEN_SURROGATE);
+                    *block = json!({
+                        "type": "image_url",
+                        "image_url": {"url": "[image-bytes-omitted-for-token-estimate]"}
+                    });
+                    used_surrogate = true;
+                }
+                Some("input_audio") => {
+                    let b64_len = block
+                        .get("input_audio")
+                        .and_then(|a| a.get("data"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    multimodal_tokens = multimodal_tokens
+                        .saturating_add(estimate_audio_tokens_from_base64_len(b64_len));
+                    *block = json!({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "[audio-bytes-omitted-for-token-estimate]",
+                            "format": "unknown"
+                        }
+                    });
+                    used_surrogate = true;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -160,7 +170,7 @@ pub fn estimate_multimodal_message_tokens(messages: &[Value]) -> usize {
     if used_surrogate {
         tracing::debug!("Using multimodal surrogate token estimate for context budget");
     }
-    estimate_tokens(&json)
+    estimate_tokens(&json).saturating_add(multimodal_tokens)
 }
 
 /// Estimate the serialized token cost of OpenAI-format tool definitions.
@@ -333,8 +343,7 @@ pub fn fit_messages_with_source_quotas(
     budget_tokens: usize,
 ) -> (Vec<Value>, usize) {
     let input_len = messages.len();
-    let messages_json = serde_json::to_string(&messages).unwrap_or_default();
-    let current_tokens = estimate_tokens(&messages_json);
+    let current_tokens = estimate_multimodal_message_tokens(&messages);
     if current_tokens <= budget_tokens {
         return (messages, 0);
     }
@@ -400,8 +409,7 @@ pub fn fit_messages_with_source_quotas(
 
     // Trim oldest non-anchor messages until under budget.
     loop {
-        let json = serde_json::to_string(&result).unwrap_or_default();
-        if estimate_tokens(&json) <= budget_tokens || result.len() <= 2 {
+        if estimate_multimodal_message_tokens(&result) <= budget_tokens || result.len() <= 2 {
             break;
         }
 
@@ -1432,7 +1440,35 @@ mod tests {
             surrogate < naive / 10,
             "surrogate {surrogate} vs naive {naive}"
         );
+        assert!(
+            surrogate >= 10_500,
+            "audio surrogate was not added: {surrogate}"
+        );
         assert!(surrogate < 50_000);
+    }
+
+    #[test]
+    fn multimodal_image_surrogate_is_bounded_and_actually_charged() {
+        let huge_data_url = format!("data:image/png;base64,{}", "A".repeat(800_000));
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "PDF preview"},
+                {"type": "image_url", "image_url": {"url": huge_data_url}}
+            ]
+        })];
+        let naive = estimate_tokens(&serde_json::to_string(&messages).unwrap());
+        let surrogate = estimate_multimodal_message_tokens(&messages);
+
+        assert!(
+            surrogate >= MULTIMODAL_IMAGE_TOKEN_SURROGATE,
+            "image surrogate was not added: {surrogate}"
+        );
+        assert!(
+            surrogate < naive / 10,
+            "surrogate {surrogate} vs naive {naive}"
+        );
+        assert!(surrogate < 2_000);
     }
 
     #[test]

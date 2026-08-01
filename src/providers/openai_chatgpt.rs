@@ -526,6 +526,11 @@ fn user_content_parts(content: Option<&Value>) -> Vec<Value> {
 fn build_input(messages: &[Value]) -> (String, Vec<Value>) {
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
+    // Final wire-level guard: a function_call_output is only valid after a
+    // matching function_call item. Upstream history fitting should preserve
+    // this invariant, but enforcing it here keeps malformed stored or trimmed
+    // history from reaching the Responses endpoint as a hard 400.
+    let mut pending_function_call_ids = std::collections::HashSet::new();
 
     for message in messages {
         let role = message
@@ -546,6 +551,13 @@ fn build_input(messages: &[Value]) -> (String, Vec<Value>) {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if !pending_function_call_ids.remove(call_id) {
+                    warn!(
+                        call_id,
+                        "Dropping function call output without a preceding unmatched function call"
+                    );
+                    continue;
+                }
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -568,15 +580,19 @@ fn build_input(messages: &[Value]) -> (String, Vec<Value>) {
                     .unwrap_or_default()
                 {
                     let function = call.get("function").unwrap_or(call);
+                    let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
                     input.push(json!({
                         "type": "function_call",
-                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "call_id": call_id,
                         "name": function.get("name").and_then(Value::as_str).unwrap_or_default(),
                         "arguments": function
                             .get("arguments")
                             .and_then(Value::as_str)
                             .unwrap_or("{}"),
                     }));
+                    if !call_id.is_empty() {
+                        pending_function_call_ids.insert(call_id.to_string());
+                    }
                 }
             }
             _ => {
@@ -780,6 +796,39 @@ mod tests {
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call-1");
         assert_eq!(input[2]["output"], "12:00");
+    }
+
+    #[test]
+    fn orphaned_function_call_output_is_not_sent() {
+        let messages = vec![
+            json!({"role": "user", "content": "continue"}),
+            // Mirrors a context-window cut that retained the result but dropped
+            // the assistant function_call that originally preceded it.
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_trimmed",
+                "content": "written"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_live",
+                    "function": {"name": "browser", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_live", "content": "ok"}),
+        ];
+
+        let (_, input) = build_input(&messages);
+
+        assert!(input
+            .iter()
+            .all(|item| { item.get("call_id").and_then(Value::as_str) != Some("call_trimmed") }));
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_live");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_live");
     }
 
     #[test]

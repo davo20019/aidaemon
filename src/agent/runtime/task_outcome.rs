@@ -197,6 +197,14 @@ pub fn response_has_user_value(reply: &str, total_successful_tool_calls: usize) 
     if trimmed.is_empty() {
         return false;
     }
+    // This is a progress receipt, not task completion. Live failure: a hung
+    // Quick Look conversion was moved to the background, the friendly handoff
+    // was counted as user value, and the unfinished retry was persisted as
+    // Succeeded. Keeping it valueless lets `deferred_to_background` derive the
+    // honest Partial outcome until the background follow-up actually finishes.
+    if super::post_task::is_friendly_background_handoff(trimmed) {
+        return false;
+    }
     if is_low_signal_task_lead_reply(trimmed) {
         return false;
     }
@@ -445,6 +453,16 @@ mod tests {
         let mut d = base_derivation();
         d.deferred_to_background = true;
         assert_eq!(d.derive_outcome(), TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn friendly_background_handoff_cannot_persist_an_unfinished_task_as_succeeded() {
+        let handoff = "⏳ Still on it — this is taking a bit longer, so it's running in the background now. I'll send the result the moment it's ready.";
+        let mut d = base_derivation();
+        d.deferred_to_background = true;
+        d.response_has_user_value = response_has_user_value(handoff, 5);
+        assert!(!d.response_has_user_value);
+        assert_eq!(d.derive_outcome(), TaskOutcome::Partial);
     }
 
     #[test]
@@ -705,6 +723,10 @@ mod tests {
     fn response_has_user_value_rejects_low_signal_replies() {
         assert!(!response_has_user_value("Done.", 3));
         assert!(!response_has_user_value("", 0));
+        assert!(!response_has_user_value(
+            "⏳ Still on it — this is taking a bit longer, so it's running in the background now. I'll send the result the moment it's ready.",
+            4
+        ));
         assert!(response_has_user_value(
             "The homepage shows the product catalog with 12 items.",
             2

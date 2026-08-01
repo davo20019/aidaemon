@@ -361,10 +361,12 @@ fn build_child_channel_context(args: &SpawnArgs) -> ChannelContext {
         platform: "internal".to_string(),
         channel_name: None,
         channel_id: None,
+        workspace_id: None,
         sender_name: None,
         sender_id: None,
         channel_member_names: vec![],
         user_id_map: std::collections::HashMap::new(),
+        workspace_grant: None,
         trusted: args._trusted_session.unwrap_or(false),
     }
 }

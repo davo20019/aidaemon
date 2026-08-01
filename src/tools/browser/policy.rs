@@ -12,7 +12,7 @@
 //! | `Observation`    | get_text, screenshot, scroll, wait, list_tabs | Read-only; no page mutations       |
 //! | `Navigation`     | navigate, new_tab, switch_tab           | Changes current URL / active tab        |
 //! | `Mutation`       | click, fill, execute_js                 | Alters page state; `execute_js` always sensitive |
-//! | `Administrative` | close, close_tab, set_mode              | Lifecycle ops; not in the plan's 3 buckets but needed for completeness |
+//! | `Administrative` | render_pdf, close, close_tab, set_mode  | Local rendering/lifecycle operations |
 //!
 //! Unknown actions (not in the schema) default to `Mutation` with
 //! `sensitive = false` and `consequential = false`.  This is the *most
@@ -94,7 +94,8 @@ pub enum BrowserRiskClass {
     Navigation,
     /// Modifies page state: click, fill, execute_js.
     Mutation,
-    /// Lifecycle operations: close, close_tab, set_mode.
+    /// Local rendering/lifecycle operations: render_pdf, close, close_tab,
+    /// set_mode.
     ///
     /// Not listed in the task's three named buckets but required for exhaustive
     /// coverage.  Task 7 can treat these as low-risk (session teardown / mode
@@ -205,7 +206,7 @@ pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> B
         },
 
         // ── Administrative ────────────────────────────────────────────────────
-        "close" | "close_tab" | "set_mode" => BrowserActionRisk {
+        "render_pdf" | "close" | "close_tab" | "set_mode" => BrowserActionRisk {
             class: BrowserRiskClass::Administrative,
             sensitive: false,
             consequential: false,
@@ -307,7 +308,7 @@ mod tests {
 
     #[test]
     fn administrative_actions_map_correctly() {
-        for action in &["close", "close_tab", "set_mode"] {
+        for action in &["render_pdf", "close", "close_tab", "set_mode"] {
             let r = classify(action, None, None);
             assert_eq!(
                 r.class,
@@ -517,6 +518,7 @@ mod tests {
         let schema_actions = [
             "navigate",
             "screenshot",
+            "render_pdf",
             "click",
             "fill",
             "get_text",
@@ -533,6 +535,7 @@ mod tests {
         let expected_classes = [
             BrowserRiskClass::Navigation,     // navigate
             BrowserRiskClass::Observation,    // screenshot
+            BrowserRiskClass::Administrative, // render_pdf
             BrowserRiskClass::Mutation,       // click
             BrowserRiskClass::Mutation,       // fill
             BrowserRiskClass::Observation,    // get_text

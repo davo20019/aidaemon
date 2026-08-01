@@ -203,7 +203,7 @@ async fn ensure_orchestrator_tools_loaded(
         return Ok(());
     }
 
-    let (defs, base_defs, caps) = agent
+    let (mut defs, mut base_defs, mut caps) = agent
         .load_policy_tool_set(
             ctx.user_text,
             ctx.channel_ctx.visibility,
@@ -212,6 +212,24 @@ async fn ensure_orchestrator_tools_loaded(
             agent.policy_config.tool_filter_enforce,
         )
         .await;
+
+    if ctx.user_role != UserRole::Owner {
+        if let Some(grant) = ctx.channel_ctx.active_workspace_grant(ctx.user_role) {
+            defs.retain(|definition| {
+                Agent::tool_name_from_definition(definition)
+                    .is_some_and(|name| grant.allows_tool(name))
+            });
+            base_defs.retain(|definition| {
+                Agent::tool_name_from_definition(definition)
+                    .is_some_and(|name| grant.allows_tool(name))
+            });
+            caps.retain(|name, _| grant.allows_tool(name));
+        } else {
+            defs.clear();
+            base_defs.clear();
+            caps.clear();
+        }
+    }
 
     *ctx.tool_defs = defs;
     *ctx.base_tool_defs = base_defs;
@@ -236,6 +254,25 @@ pub(super) async fn maybe_handle_generic_cancel_request(
     // through normal tool routing so selection can be explicit.
     if !generic_cancel_request {
         return Ok(None);
+    }
+
+    if ctx.user_role != UserRole::Owner {
+        let msg = "Only the owner can cancel running work or goals in this session.".to_string();
+        agent
+            .emit_direct_return_task_end(
+                ctx.emitter,
+                ctx.task_id,
+                TaskStatus::Completed,
+                TaskOutcome::Succeeded,
+                ctx.task_start,
+                ctx.iteration,
+                0,
+                None,
+                Some(msg.clone()),
+                true,
+            )
+            .await;
+        return Ok(Some(direct_return_ok(msg)));
     }
 
     let active_goals = agent

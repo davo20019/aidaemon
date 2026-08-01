@@ -126,6 +126,15 @@ fn parse_owner_ids(config: &AppConfig, platform: &str) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+fn parse_string_owner_ids(config: &AppConfig, platform: &str) -> Vec<String> {
+    config
+        .users
+        .owner_ids
+        .get(platform)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn parse_u64_ids(ids: &[String]) -> Vec<u64> {
     ids.iter().filter_map(|s| s.parse::<u64>().ok()).collect()
 }
@@ -253,6 +262,10 @@ pub async fn build_channels(
         .collect();
 
     #[cfg(feature = "slack")]
+    let slack_owner_ids = parse_string_owner_ids(config, "slack");
+    #[cfg(feature = "slack")]
+    let slack_workspace_grants = config.users.workspace_grants.clone();
+    #[cfg(feature = "slack")]
     let make_slack = |app_token: &str,
                       bot_token: &str,
                       allowed_user_ids: Vec<String>,
@@ -262,6 +275,8 @@ pub async fn build_channels(
             app_token,
             bot_token,
             allowed_user_ids,
+            slack_owner_ids.clone(),
+            slack_workspace_grants.clone(),
             use_threads,
             Arc::clone(&agent),
             config_path.clone(),

@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::types::WorkspaceGrant;
+
 /// Helper to format a redacted secret field for Debug output.
 /// Shows "[REDACTED]" if the value is non-empty, "\"\"" if empty.
 fn redact(secret: &str) -> &'static str {
@@ -2516,6 +2518,9 @@ fn default_update_confirmation_timeout_mins() -> u64 {
 pub struct UsersConfig {
     #[serde(default)]
     pub owner_ids: HashMap<String, Vec<String>>,
+    /// Explicit, expiring project grants created by an owner command.
+    #[serde(default)]
+    pub workspace_grants: Vec<WorkspaceGrant>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

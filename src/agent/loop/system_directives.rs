@@ -162,6 +162,11 @@ pub(in crate::agent) enum SystemDirective {
     /// but no write_file or edit_file tool was called.  Nudge the model to
     /// complete the requested file modification before declaring completion.
     MutationStillRequired,
+    /// The user requested delivery and the model authored a local artifact,
+    /// but no typed external-delivery success occurred. Give the model one
+    /// bounded chance to pivot conversion/delivery strategy before reporting
+    /// an honest blocker.
+    UndeliveredArtifactRecoveryRequired,
     /// The model's final answer was mostly harness scaffolding (tool-result
     /// envelopes, [SYSTEM] notices) and was gutted by sanitization. Ask it to
     /// restate the answer in plain language once before any deterministic
@@ -553,6 +558,7 @@ impl SystemDirective {
             ),
             Self::TaskPlanContext(plan) => plan.clone(),
             Self::MutationStillRequired => "[SYSTEM] INCOMPLETE: Your request requires modifying or creating a file, but you have NOT called write_file or edit_file yet. You have the information from your reads — now WRITE the file. Use write_file to save the result, then provide a brief summary of what you changed.".to_string(),
+            Self::UndeliveredArtifactRecoveryRequired => "[SYSTEM] INCOMPLETE: The user asked you to DELIVER a file. You created a local artifact, but no delivery tool succeeded, so a local pathname or converter failure is not completion. Take ONE recovery pass now. Do not repeat the same failing conversion command. For local HTML-to-PDF work, use the browser tool's bounded `render_pdf` action (it preserves print backgrounds and CSS page sizing); do not route designed HTML through office, PostScript, ImageMagick, or Quick Look converters. For other formats, enumerate available export options independently (do not short-circuit capability checks with `||`) and choose a genuinely different path. Verify that the final file exists and has the requested type, then use the appropriate delivery tool (`send_file` for a chat attachment). If no different approach can work, report the exact blocker honestly after this recovery pass.".to_string(),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
             Self::GuiCoordinateClickUnverified => "[SYSTEM] You are about to report a GUI action done, but your last click was a COORDINATE click at a raw point — it has no element identity, so it is NOT verified: it may have hit empty space, not the target. Do NOT claim success yet. Call computer_use get_app_state (or screenshot) NOW, look at the fresh screen, and confirm the intended change actually happened (e.g. the Like heart is filled/red, the count changed). If it did not, click again; if the target now shows a stable element_title, click by title (auto-verified). Only report done after you have visually confirmed the change.".to_string(),            Self::ResponseQualityNudge { user_text_hint } => format!(
@@ -863,6 +869,17 @@ mod tests {
         assert!(rendered.contains("[SYSTEM]"));
         assert!(rendered.contains("write_file"));
         assert!(rendered.contains("NOT called"));
+    }
+
+    #[test]
+    fn undelivered_artifact_recovery_requires_a_different_delivery_path() {
+        let rendered = SystemDirective::UndeliveredArtifactRecoveryRequired.render();
+        assert!(rendered.contains("DELIVER"));
+        assert!(rendered.contains("Do not repeat"));
+        assert!(rendered.contains("do not short-circuit"));
+        assert!(rendered.contains("render_pdf"));
+        assert!(rendered.contains("For other formats"));
+        assert!(rendered.contains("send_file"));
     }
 
     #[test]

@@ -416,6 +416,47 @@ pub(super) async fn run_completion_phase(
         let assistant_claimed_delegation = claims_delegation_started(&reply);
         let typed_mutation_fulfilled =
             mutation_contract_fulfilled(&turn_context.completion_contract, &completion_progress);
+        let authored_artifact_undelivered = authored_artifact_still_needs_delivery_recovery(
+            &turn_context.completion_contract,
+            &completion_progress,
+        );
+
+        // A local artifact is progress toward a delivery, not delivery itself.
+        // Give this recoverable state one explicit strategy-pivot pass even
+        // when the model honestly admits the converter failed. Missing-file
+        // requests never enter this branch because they have no local write.
+        if authored_artifact_undelivered
+            && !completion_progress.undelivered_artifact_recovery_attempted
+            && agent.depth == 0
+            && !force_text_response
+            && !tool_defs.is_empty()
+        {
+            completion_progress.mark_undelivered_artifact_recovery_attempted();
+            execution_state.record_validation_round();
+            consecutive_clean_iterations = 0;
+            pending_system_messages.push(SystemDirective::UndeliveredArtifactRecoveryRequired);
+            agent
+                .emit_warning_decision_point(
+                    emitter,
+                    task_id,
+                    iteration,
+                    DecisionType::PostExecutionValidation,
+                    "Blocked completion: authored artifact was not delivered".to_string(),
+                    json!({
+                        "condition": "authored_artifact_undelivered",
+                        "required_mutation_effects": turn_context.completion_contract.required_mutation_effects,
+                        "observed_mutation_effects": completion_progress.observed_mutation_effects,
+                    }),
+                )
+                .await;
+            warn!(
+                session_id,
+                iteration,
+                "Authored artifact remains undelivered — one recovery pass before reporting"
+            );
+            commit_state!();
+            return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+        }
         let unbacked_mutation_claim = assistant_claimed_mutation
             && if turn_context.completion_contract.expects_mutation {
                 !typed_mutation_fulfilled

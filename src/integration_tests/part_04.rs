@@ -66,10 +66,12 @@ async fn test_public_external_no_memory() {
                 platform: "twitter".to_string(),
                 channel_name: None,
                 channel_id: Some("twitter:ext_123".to_string()),
+                workspace_id: None,
                 sender_name: None,
                 sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             },
             None,
@@ -126,10 +128,12 @@ async fn test_tool_restriction_public_external() {
                 platform: "twitter".to_string(),
                 channel_name: None,
                 channel_id: Some("twitter:ext_456".to_string()),
+                workspace_id: None,
                 sender_name: None,
                 sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             },
             None,
@@ -498,10 +502,12 @@ async fn test_private_group_fact_access() {
                 platform: "telegram".to_string(),
                 channel_name: Some("Team Group".to_string()),
                 channel_id: Some("tg:group42".to_string()),
+                workspace_id: None,
                 sender_name: None,
                 sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             },
             None,
@@ -522,4 +528,3 @@ async fn test_private_group_fact_access() {
         "Private facts should NOT appear in PrivateGroup channels"
     );
 }
-

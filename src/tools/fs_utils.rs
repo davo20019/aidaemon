@@ -31,11 +31,20 @@ pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".vs",
 ];
 
-/// Sensitive path patterns that should not be written to.
+/// Sensitive path patterns that should not be exposed through file tools.
 pub const SENSITIVE_PATTERNS: &[&str] = &[
+    ".git",
     ".ssh",
     ".gnupg",
+    ".aws",
+    ".azure",
+    ".docker",
+    ".kube",
+    ".pulumi",
+    ".terraform",
     ".env",
+    ".envrc",
+    ".dev.vars",
     ".key",
     ".pem",
     ".aws/credentials",
@@ -44,6 +53,11 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
     "credentials",
     "id_rsa",
     "id_ed25519",
+    ".npmrc",
+    ".pypirc",
+    ".htpasswd",
+    ".git-credentials",
+    "secrets",
 ];
 
 /// Files/directories that strongly indicate a project/workspace root.
@@ -581,11 +595,12 @@ pub fn resolve_project_scope_reference(raw: &str, alias_roots: &[String]) -> Opt
 /// (e.g., "my_environment.txt" won't match ".env").
 pub fn is_sensitive_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
-    SENSITIVE_PATTERNS.iter().any(|pat| {
+    let path_lower = path_str.to_ascii_lowercase();
+    let pattern_match = SENSITIVE_PATTERNS.iter().any(|pat| {
         if pat.contains('/') {
             // Multi-component patterns (e.g., ".aws/credentials"): substring match is fine
             // because the slash provides enough specificity.
-            path_str.contains(pat)
+            path_lower.contains(&pat.to_ascii_lowercase())
         } else {
             // Single-component patterns: match as an exact path component or filename.
             path.components()
@@ -594,6 +609,23 @@ pub fn is_sensitive_path(path: &Path) -> bool {
                     .file_name()
                     .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(pat))
         }
+    });
+    if pattern_match {
+        return true;
+    }
+
+    path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        component.starts_with(".env.")
+            || component.starts_with(".dev.vars.")
+            || component.ends_with(".key")
+            || component.ends_with(".pem")
+            || component.ends_with(".p12")
+            || component.ends_with(".pfx")
+            || component.ends_with(".jks")
+            || component.ends_with(".keystore")
+            || component == "terraform.tfstate"
+            || component.starts_with("terraform.tfstate.")
     })
 }
 
@@ -937,8 +969,16 @@ mod tests {
     fn test_is_sensitive_path() {
         assert!(is_sensitive_path(Path::new("/home/user/.ssh/id_rsa")));
         assert!(is_sensitive_path(Path::new("/home/user/.env")));
+        assert!(is_sensitive_path(Path::new("/repo/.env.production/value")));
+        assert!(is_sensitive_path(Path::new("/repo/.dev.vars.local")));
+        assert!(is_sensitive_path(Path::new("/repo/.git/config")));
+        assert!(is_sensitive_path(Path::new("/repo/certificates/app.PEM")));
+        assert!(is_sensitive_path(Path::new(
+            "/repo/terraform.tfstate.backup"
+        )));
         assert!(is_sensitive_path(Path::new("/home/user/.gnupg/key")));
         assert!(!is_sensitive_path(Path::new("/home/user/code/main.rs")));
+        assert!(!is_sensitive_path(Path::new("/repo/src/environment.rs")));
     }
 
     #[tokio::test]

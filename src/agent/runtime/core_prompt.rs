@@ -337,8 +337,11 @@ pub(crate) fn assemble_core_inputs(
     } else {
         specialists
     };
-    // Non-owner roles have no tool access (matches `session_static_tool_roster`).
-    let tool_roster = if user_role != crate::types::UserRole::Owner {
+    // Non-owners have no tools unless this exact context carries an active
+    // workspace grant (matches `session_static_tool_roster`).
+    let tool_roster = if user_role != crate::types::UserRole::Owner
+        && channel_ctx.active_workspace_grant(user_role).is_none()
+    {
         Vec::new()
     } else {
         tool_roster

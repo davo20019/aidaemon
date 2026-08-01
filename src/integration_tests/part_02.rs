@@ -271,10 +271,12 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
                 platform: "test".to_string(),
                 channel_name: Some("#eng".to_string()),
                 channel_id: Some("test:eng".to_string()),
+                workspace_id: None,
                 sender_name: Some("Alice".to_string()),
                 sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             },
             None,
@@ -345,6 +347,43 @@ async fn test_memory_user_profile_affects_prompt() {
         "System prompt should include user profile preferences. Tail: ...{}",
         &content[content.len().saturating_sub(800)..]
     );
+}
+
+/// A private transport is not automatically the owner's private context.
+/// Guest DMs must not inherit the owner's communication profile.
+#[tokio::test]
+async fn test_guest_dm_does_not_receive_owner_profile() {
+    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let profile = UserProfile {
+        id: 1,
+        tone_preference: "owner-private-tone-marker".to_string(),
+        updated_at: Utc::now(),
+        ..UserProfile::default()
+    };
+    harness.state.update_user_profile(&profile).await.unwrap();
+
+    harness
+        .agent
+        .handle_message(
+            "guest_profile_session",
+            "hello",
+            None,
+            UserRole::Guest,
+            ChannelContext::private("slack"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let call_log = harness.provider.call_log.lock().await;
+    let system_content = call_log[0]
+        .messages
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!system_content.contains("owner-private-tone-marker"));
 }
 
 /// Minimal context: system prompt has capability summary + profile, NOT bulk data.
@@ -503,10 +542,12 @@ async fn test_public_channel_hides_personal_memory() {
                 platform: "slack".to_string(),
                 channel_name: Some("general".to_string()),
                 channel_id: Some("slack:C_TEST".to_string()),
+                workspace_id: None,
                 sender_name: None,
                 sender_id: None,
                 channel_member_names: vec![],
                 user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
                 trusted: false,
             },
             None,

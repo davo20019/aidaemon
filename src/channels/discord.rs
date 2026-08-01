@@ -22,7 +22,7 @@ use super::commands::{shared_commands, CommandCategory, CommandDef};
 use super::formatting::{build_help_text, sanitize_filename, split_message};
 use crate::agent::Agent;
 use crate::channels::{should_ignore_lightweight_interjection, ChannelHub, SessionMap};
-use crate::tasks::{QueueOutcome, TaskRegistry};
+use crate::tasks::{QueueOutcome, QueuedMessage, TaskRegistry};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::traits::{Channel, ChannelCapabilities, StateStore};
 use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
@@ -561,7 +561,15 @@ impl DiscordChannel {
                 return;
             };
 
-        let text = super::attachments::build_inbound_text(&body_text, &inbound_attachments);
+        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+        let text = if user_role == UserRole::Owner {
+            super::attachments::build_inbound_text(&body_text, &inbound_attachments)
+        } else {
+            super::attachments::build_inbound_text_without_local_paths(
+                &body_text,
+                &inbound_attachments,
+            )
+        };
 
         // Handle slash-style commands (text commands starting with /)
         if text.starts_with('/') {
@@ -570,7 +578,40 @@ impl DiscordChannel {
         }
 
         let session_id = self.session_id_from_message(&msg);
-        let user_role = super::telegram::determine_role(&self.owner_user_ids, user_id);
+        // Capture sender/channel context before any queue decision. A session
+        // worker may drain messages from several group members, so each queued
+        // item must carry its own authorization identity.
+        let author_name = msg.author.name.clone();
+        let author_id = msg.author.id;
+        let channel_ctx = if msg.guild_id.is_some() {
+            ChannelContext {
+                visibility: ChannelVisibility::Public,
+                platform: "discord".to_string(),
+                channel_name: None,
+                channel_id: Some(format!("discord:{}", msg.channel_id)),
+                workspace_id: None,
+                sender_name: Some(author_name),
+                sender_id: Some(format!("discord:{}", author_id)),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
+                trusted: false,
+            }
+        } else {
+            ChannelContext {
+                visibility: ChannelVisibility::Private,
+                platform: "discord".to_string(),
+                channel_name: None,
+                channel_id: Some(format!("discord:dm:{}", author_id)),
+                workspace_id: None,
+                sender_name: Some(author_name),
+                sender_id: Some(format!("discord:{}", author_id)),
+                channel_member_names: vec![],
+                user_id_map: std::collections::HashMap::new(),
+                workspace_grant: None,
+                trusted: false,
+            }
+        };
 
         // Register this session with the channel hub (in-memory + persistent)
         {
@@ -689,7 +730,16 @@ impl DiscordChannel {
             // direct processing instead of stranding the message.
             match self
                 .task_registry
-                .queue_message_if_running(&session_id, &text, Some(&dedup_key))
+                .queue_message_if_running(
+                    &session_id,
+                    QueuedMessage::new(
+                        &text,
+                        user_role,
+                        channel_ctx.clone(),
+                        inbound_attachments.clone(),
+                    ),
+                    Some(&dedup_key),
+                )
                 .await
             {
                 QueueOutcome::Queued(queue_pos) => {
@@ -746,35 +796,6 @@ impl DiscordChannel {
         let description: String = text.chars().take(80).collect();
         let (task_id, cancel_token) = self.task_registry.register(&session_id, &description).await;
 
-        // Build channel context from Discord message
-        let author_name = msg.author.name.clone();
-        let author_id = msg.author.id;
-        let channel_ctx = if msg.guild_id.is_some() {
-            ChannelContext {
-                visibility: ChannelVisibility::Public,
-                platform: "discord".to_string(),
-                channel_name: None,
-                channel_id: Some(format!("discord:{}", msg.channel_id)),
-                sender_name: Some(author_name),
-                sender_id: Some(format!("discord:{}", author_id)),
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                trusted: false,
-            }
-        } else {
-            ChannelContext {
-                visibility: ChannelVisibility::Private,
-                platform: "discord".to_string(),
-                channel_name: None,
-                channel_id: Some(format!("discord:dm:{}", author_id)),
-                sender_name: Some(author_name),
-                sender_id: Some(format!("discord:{}", author_id)),
-                channel_member_names: vec![],
-                user_id_map: std::collections::HashMap::new(),
-                trusted: false,
-            }
-        };
-
         // Create heartbeat for watchdog — agent bumps this on every activity point.
         let heartbeat = Arc::new(AtomicU64::new(
             SystemTime::now()
@@ -811,8 +832,9 @@ impl DiscordChannel {
         let http = ctx.http.clone();
         tokio::spawn(async move {
             let mut current_text = text;
-            let inbound_attachments = inbound_attachments;
-            let mut attachments_sent = false;
+            let mut current_attachments = inbound_attachments;
+            let mut current_user_role = user_role;
+            let mut current_channel_ctx = channel_ctx;
             let mut current_task_id = task_id;
             let mut current_cancel_token = cancel_token;
             let mut current_status_tx = status_tx;
@@ -822,19 +844,14 @@ impl DiscordChannel {
             let task_wall_deadline = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
 
             loop {
-                let attachments_for_call = if attachments_sent {
-                    &[][..]
-                } else {
-                    &inbound_attachments[..]
-                };
                 let result = tokio::select! {
                     r = agent.handle_message_with_attachments(
                         &session_id,
                         &current_text,
-                        attachments_for_call,
+                        &current_attachments,
                         Some(current_status_tx.clone()),
-                        user_role,
-                        channel_ctx.clone(),
+                        current_user_role,
+                        current_channel_ctx.clone(),
                         Some(current_heartbeat.clone()),
                     ) => r,
                     _ = current_cancel_token.cancelled() => Err(anyhow::anyhow!("Task cancelled")),
@@ -850,7 +867,6 @@ impl DiscordChannel {
                         Err(anyhow::anyhow!("Task exceeded maximum wall-clock time (20 minutes). This may indicate a hang."))
                     },
                 };
-                attachments_sent = true;
                 current_typing_cancel.cancel();
                 current_status_task.abort();
 
@@ -905,6 +921,9 @@ impl DiscordChannel {
                         .await;
 
                     current_text = queued.text;
+                    current_user_role = queued.user_role;
+                    current_channel_ctx = queued.channel_ctx;
+                    current_attachments = queued.attachments;
                     let desc: String = current_text.chars().take(80).collect();
                     let (new_task_id, new_cancel_token) =
                         registry.register(&session_id, &desc).await;
