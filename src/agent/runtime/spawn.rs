@@ -1381,7 +1381,7 @@ impl Agent {
                     intention.mandate_id == mandate.id
                         && intention.goal_run_id == run.id
                         && intention.decision_cycle_id == decision.id
-                        && intention.status == "committed"
+                        && intention.status == crate::traits::IntentionStatus::Committed
                         && intention.completed_at.is_none()
                 });
             anyhow::ensure!(

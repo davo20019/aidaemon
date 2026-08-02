@@ -47,6 +47,84 @@ pub(super) struct CompletionCtx<'a> {
     pub validation_state: &'a mut ValidationState,
 }
 
+/// Owned completion-phase state accumulated while the ordered completion gates
+/// run. Applying this delta is deliberately separate from evaluating the gates:
+/// every successful, retry, and error exit must restore the state moved out of
+/// [`CompletionCtx`] exactly once.
+struct CompletionStateDelta {
+    tool_defs: Vec<Value>,
+    model: String,
+    stall_count: usize,
+    consecutive_clean_iterations: usize,
+    deferred_no_tool_streak: usize,
+    deferred_no_tool_model_switches: usize,
+    fallback_expanded_once: bool,
+    empty_response_retry_used: bool,
+    empty_response_retry_pending: bool,
+    empty_response_retry_note: Option<String>,
+    identity_prefill_text: Option<String>,
+    pending_background_ack: Option<String>,
+    pending_external_action_ack: Option<String>,
+    require_file_recheck_before_answer: bool,
+    completion_progress: CompletionProgress,
+    force_text_response: bool,
+    validation_state: ValidationState,
+}
+
+/// Narrow destination view for the mutable state owned by the caller. Keeping
+/// this separate from `CompletionCtx` makes the application boundary testable
+/// without constructing provider, policy, or event services.
+struct CompletionStateTargets<'a> {
+    tool_defs: &'a mut Vec<Value>,
+    model: &'a mut String,
+    stall_count: &'a mut usize,
+    consecutive_clean_iterations: &'a mut usize,
+    deferred_no_tool_streak: &'a mut usize,
+    deferred_no_tool_model_switches: &'a mut usize,
+    fallback_expanded_once: &'a mut bool,
+    empty_response_retry_used: &'a mut bool,
+    empty_response_retry_pending: &'a mut bool,
+    empty_response_retry_note: &'a mut Option<String>,
+    identity_prefill_text: &'a mut Option<String>,
+    pending_background_ack: &'a mut Option<String>,
+    pending_external_action_ack: &'a mut Option<String>,
+    require_file_recheck_before_answer: &'a mut bool,
+    completion_progress: &'a mut CompletionProgress,
+    force_text_response: &'a mut bool,
+    validation_state: &'a mut ValidationState,
+}
+
+impl CompletionStateDelta {
+    fn apply(self, targets: CompletionStateTargets<'_>) {
+        *targets.tool_defs = self.tool_defs;
+        *targets.model = self.model;
+        *targets.stall_count = self.stall_count;
+        *targets.consecutive_clean_iterations = self.consecutive_clean_iterations;
+        *targets.deferred_no_tool_streak = self.deferred_no_tool_streak;
+        *targets.deferred_no_tool_model_switches = self.deferred_no_tool_model_switches;
+        *targets.fallback_expanded_once = self.fallback_expanded_once;
+        *targets.empty_response_retry_used = self.empty_response_retry_used;
+        *targets.empty_response_retry_pending = self.empty_response_retry_pending;
+        *targets.empty_response_retry_note = self.empty_response_retry_note;
+        *targets.identity_prefill_text = self.identity_prefill_text;
+        *targets.pending_background_ack = self.pending_background_ack;
+        *targets.pending_external_action_ack = self.pending_external_action_ack;
+        *targets.require_file_recheck_before_answer = self.require_file_recheck_before_answer;
+        *targets.completion_progress = self.completion_progress;
+        *targets.force_text_response = self.force_text_response;
+        *targets.validation_state = self.validation_state;
+    }
+}
+
+fn finish_completion_phase<T>(
+    outcome: anyhow::Result<T>,
+    delta: CompletionStateDelta,
+    targets: CompletionStateTargets<'_>,
+) -> anyhow::Result<T> {
+    delta.apply(targets);
+    outcome
+}
+
 fn build_final_sanitization_gate_telemetry(
     original_chars: usize,
     final_chars: usize,
@@ -134,6 +212,97 @@ mod gate_telemetry_tests {
             (true, true)
         );
     }
+
+    #[test]
+    fn completion_state_delta_is_applied_before_error_propagation() {
+        let mut tool_defs = vec![serde_json::json!({"name": "old"})];
+        let mut model = "old-model".to_string();
+        let mut stall_count = 0;
+        let mut consecutive_clean_iterations = 0;
+        let mut deferred_no_tool_streak = 0;
+        let mut deferred_no_tool_model_switches = 0;
+        let mut fallback_expanded_once = false;
+        let mut empty_response_retry_used = false;
+        let mut empty_response_retry_pending = false;
+        let mut empty_response_retry_note = Some("old-retry".to_string());
+        let mut identity_prefill_text = Some("old-prefill".to_string());
+        let mut pending_background_ack = Some("old-background".to_string());
+        let mut pending_external_action_ack = None;
+        let mut require_file_recheck_before_answer = false;
+        let mut completion_progress = CompletionProgress::default();
+        let mut force_text_response = false;
+        let mut validation_state = ValidationState::default();
+
+        let mut updated_progress = CompletionProgress::default();
+        updated_progress.quality_nudge_count = 4;
+        let mut updated_validation = ValidationState::default();
+        updated_validation.note_retry(LoopRepetitionReason::RetryStep);
+
+        let outcome: anyhow::Result<()> = finish_completion_phase(
+            Err(anyhow::anyhow!("synthetic phase failure")),
+            CompletionStateDelta {
+                tool_defs: vec![serde_json::json!({"name": "new"})],
+                model: "new-model".to_string(),
+                stall_count: 7,
+                consecutive_clean_iterations: 3,
+                deferred_no_tool_streak: 2,
+                deferred_no_tool_model_switches: 1,
+                fallback_expanded_once: true,
+                empty_response_retry_used: true,
+                empty_response_retry_pending: true,
+                empty_response_retry_note: Some("new-retry".to_string()),
+                identity_prefill_text: None,
+                pending_background_ack: None,
+                pending_external_action_ack: Some("external-ack".to_string()),
+                require_file_recheck_before_answer: true,
+                completion_progress: updated_progress,
+                force_text_response: true,
+                validation_state: updated_validation,
+            },
+            CompletionStateTargets {
+                tool_defs: &mut tool_defs,
+                model: &mut model,
+                stall_count: &mut stall_count,
+                consecutive_clean_iterations: &mut consecutive_clean_iterations,
+                deferred_no_tool_streak: &mut deferred_no_tool_streak,
+                deferred_no_tool_model_switches: &mut deferred_no_tool_model_switches,
+                fallback_expanded_once: &mut fallback_expanded_once,
+                empty_response_retry_used: &mut empty_response_retry_used,
+                empty_response_retry_pending: &mut empty_response_retry_pending,
+                empty_response_retry_note: &mut empty_response_retry_note,
+                identity_prefill_text: &mut identity_prefill_text,
+                pending_background_ack: &mut pending_background_ack,
+                pending_external_action_ack: &mut pending_external_action_ack,
+                require_file_recheck_before_answer: &mut require_file_recheck_before_answer,
+                completion_progress: &mut completion_progress,
+                force_text_response: &mut force_text_response,
+                validation_state: &mut validation_state,
+            },
+        );
+
+        assert!(outcome.is_err());
+        assert_eq!(tool_defs, vec![serde_json::json!({"name": "new"})]);
+        assert_eq!(model, "new-model");
+        assert_eq!(stall_count, 7);
+        assert_eq!(consecutive_clean_iterations, 3);
+        assert_eq!(deferred_no_tool_streak, 2);
+        assert_eq!(deferred_no_tool_model_switches, 1);
+        assert!(fallback_expanded_once);
+        assert!(empty_response_retry_used);
+        assert!(empty_response_retry_pending);
+        assert_eq!(empty_response_retry_note.as_deref(), Some("new-retry"));
+        assert_eq!(identity_prefill_text, None);
+        assert_eq!(pending_background_ack, None);
+        assert_eq!(pending_external_action_ack.as_deref(), Some("external-ack"));
+        assert!(require_file_recheck_before_answer);
+        assert_eq!(completion_progress.quality_nudge_count, 4);
+        assert!(force_text_response);
+        assert_eq!(validation_state.retry_count, 1);
+        assert_eq!(
+            validation_state.loop_repetition_reason,
+            Some(LoopRepetitionReason::RetryStep)
+        );
+    }
 }
 
 pub(super) async fn run_completion_phase(
@@ -192,29 +361,9 @@ pub(super) async fn run_completion_phase(
     #[cfg(not(feature = "computer_use"))]
     let computer_use_pin_active = false;
 
-    macro_rules! commit_state {
-        () => {
-            *ctx.tool_defs = tool_defs;
-            *ctx.model = model.clone();
-            *ctx.stall_count = stall_count;
-            *ctx.consecutive_clean_iterations = consecutive_clean_iterations;
-            *ctx.deferred_no_tool_streak = deferred_no_tool_streak;
-            *ctx.deferred_no_tool_model_switches = deferred_no_tool_model_switches;
-            *ctx.fallback_expanded_once = fallback_expanded_once;
-            *ctx.empty_response_retry_used = empty_response_retry_used;
-            *ctx.empty_response_retry_pending = empty_response_retry_pending;
-            *ctx.empty_response_retry_note = empty_response_retry_note.clone();
-            *ctx.identity_prefill_text = identity_prefill_text.clone();
-            *ctx.pending_background_ack = pending_background_ack.clone();
-            *ctx.pending_external_action_ack = pending_external_action_ack.clone();
-            *ctx.require_file_recheck_before_answer = require_file_recheck_before_answer;
-            *ctx.completion_progress = completion_progress.clone();
-            *ctx.force_text_response = force_text_response;
-            *ctx.validation_state = validation_state.clone();
-        };
-    }
-    // === NATURAL COMPLETION: No tool calls ===
-    if resp.tool_calls.is_empty() {
+    let outcome: anyhow::Result<Option<ResponsePhaseOutcome>> = async {
+        // === NATURAL COMPLETION: No tool calls ===
+        if resp.tool_calls.is_empty() {
         let mut reply = resp
             .content
             .clone()
@@ -269,7 +418,6 @@ pub(super) async fn run_completion_phase(
                     )
                     .await?;
 
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::Return(Ok(background_ack))));
             }
         }
@@ -437,7 +585,6 @@ pub(super) async fn run_completion_phase(
                         deferred_no_tool_streak,
                         "Blocked no-tool completion because current turn requires tools"
                     );
-                    commit_state!();
                     return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
@@ -486,7 +633,6 @@ pub(super) async fn run_completion_phase(
                 iteration,
                 "Authored artifact remains undelivered — one recovery pass before reporting"
             );
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
         let unbacked_mutation_claim = assistant_claimed_mutation
@@ -605,7 +751,6 @@ pub(super) async fn run_completion_phase(
                 session_id,
                 iteration, "Blocked GUI success claim: unverified coordinate click outstanding"
             );
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
@@ -681,7 +826,6 @@ pub(super) async fn run_completion_phase(
                     }
                 }
 
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
             }
         }
@@ -716,7 +860,6 @@ pub(super) async fn run_completion_phase(
                     reply_preview = %reply.chars().take(180).collect::<String>(),
                     "Rejected completion that denied live capabilities after successful tool use"
                 );
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
             }
 
@@ -937,7 +1080,6 @@ pub(super) async fn run_completion_phase(
                     iteration,
                     "Synthesis retry scheduled — continuing loop for structured output synthesis"
                 );
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
             }
         }
@@ -1030,7 +1172,6 @@ pub(super) async fn run_completion_phase(
                         "Empty-response recovery: issuing one retry before fallback"
                     );
 
-                    commit_state!();
                     return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
 
@@ -1109,12 +1250,10 @@ pub(super) async fn run_completion_phase(
                     });
                 }
 
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::Return(Ok(fallback))));
             }
             // First iteration or sub-agent — stay silent
             info!(session_id, iteration, "Agent completed with empty response");
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::Return(Ok(String::new()))));
         }
 
@@ -1176,7 +1315,6 @@ pub(super) async fn run_completion_phase(
                     stall_count,
                     "Blocking completion until required file re-check is performed"
                 );
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
             }
         }
@@ -1221,7 +1359,6 @@ pub(super) async fn run_completion_phase(
                         iteration,
                         "Unfixed failed external mutations at completion — one recovery pass before reporting"
                     );
-                    commit_state!();
                     return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
 
@@ -1232,7 +1369,6 @@ pub(super) async fn run_completion_phase(
                     ));
                     completion_progress.mark_external_mutation_reconciliation_attempted();
                     execution_state.record_validation_round();
-                    commit_state!();
                     return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
 
@@ -1488,7 +1624,6 @@ pub(super) async fn run_completion_phase(
                             verification_block_count = completion_progress.verification_block_count,
                             "Blocking completion until request outcome verification is performed"
                         );
-                        commit_state!();
                         return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     }
                 }
@@ -1556,7 +1691,6 @@ pub(super) async fn run_completion_phase(
                 total_successful_tool_calls,
                 "Blocked completion: side-effect claim has mutation_count=0"
             );
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
@@ -1704,7 +1838,6 @@ pub(super) async fn run_completion_phase(
                                 tool = %candidate.tool_name,
                                 "Force-text active: retrying once so the model synthesizes the structured tool result"
                             );
-                            commit_state!();
                             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                         } else if let Some(tool_reply) =
                             build_structured_tool_output_completion_reply(
@@ -2011,7 +2144,6 @@ pub(super) async fn run_completion_phase(
                             );
                         }
 
-                        commit_state!();
                         return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     } // end force_text hard escape else
                 } // end recovered_post_tool_deferral else
@@ -2139,7 +2271,6 @@ pub(super) async fn run_completion_phase(
             empty_response_retry_pending = true;
             empty_response_retry_note = Some("final_reply_gutted_by_sanitization".to_string());
             pending_system_messages.push(SystemDirective::FinalAnswerRejectedInternalMarkers);
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
         // The model shipped a recent tool result verbatim instead of answering.
@@ -2178,7 +2309,6 @@ pub(super) async fn run_completion_phase(
             empty_response_retry_pending = true;
             empty_response_retry_note = Some("final_reply_tool_output_paste".to_string());
             pending_system_messages.push(SystemDirective::FinalAnswerWasFilePaste);
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
         let reply = if gutted_by_sanitization {
@@ -2247,7 +2377,7 @@ pub(super) async fn run_completion_phase(
                 )
                 .await
         {
-            // Increment the LOCAL copy — commit_state! writes the local back
+            // Increment the LOCAL copy; the single phase boundary applies it
             // over ctx, so a direct ctx increment would be clobbered and the
             // "fires once" guarantee silently lost.
             completion_progress.file_access_retry_count += 1;
@@ -2261,7 +2391,6 @@ pub(super) async fn run_completion_phase(
                 reply_preview = &reply.chars().take(200).collect::<String>() as &str,
                 "Reply defers file access to user despite available lookup tools — forcing retry"
             );
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
@@ -2311,7 +2440,6 @@ pub(super) async fn run_completion_phase(
                 is_plain_text_tool_call,
                 "Response quality too low for multi-part request — nudging for better response"
             );
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
@@ -2353,7 +2481,6 @@ pub(super) async fn run_completion_phase(
                 pending_system_messages.push(SystemDirective::UngroundedListEntities {
                     entities: ungrounded,
                 });
-                commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
             }
         }
@@ -2428,7 +2555,6 @@ pub(super) async fn run_completion_phase(
                         pending_system_messages.push(SystemDirective::UnsearchedEntityDenial {
                             entities: unsearched,
                         });
-                        commit_state!();
                         return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                     }
                 }
@@ -2489,7 +2615,6 @@ pub(super) async fn run_completion_phase(
             pending_system_messages.push(SystemDirective::SingleSourceEnumeration {
                 sources_read: execution_state.web_source_domains.len(),
             });
-            commit_state!();
             return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
         }
 
@@ -2556,10 +2681,52 @@ pub(super) async fn run_completion_phase(
             outcome = outcome.as_str(),
             "Agent completed naturally"
         );
-        commit_state!();
-        return Ok(Some(ResponsePhaseOutcome::Return(Ok(reply))));
-    }
+            return Ok(Some(ResponsePhaseOutcome::Return(Ok(reply))));
+        }
 
-    commit_state!();
-    Ok(None)
+        Ok(None)
+    }
+    .await;
+
+    finish_completion_phase(
+        outcome,
+        CompletionStateDelta {
+            tool_defs,
+            model,
+            stall_count,
+            consecutive_clean_iterations,
+            deferred_no_tool_streak,
+            deferred_no_tool_model_switches,
+            fallback_expanded_once,
+            empty_response_retry_used,
+            empty_response_retry_pending,
+            empty_response_retry_note,
+            identity_prefill_text,
+            pending_background_ack,
+            pending_external_action_ack,
+            require_file_recheck_before_answer,
+            completion_progress,
+            force_text_response,
+            validation_state,
+        },
+        CompletionStateTargets {
+            tool_defs: ctx.tool_defs,
+            model: ctx.model,
+            stall_count: ctx.stall_count,
+            consecutive_clean_iterations: ctx.consecutive_clean_iterations,
+            deferred_no_tool_streak: ctx.deferred_no_tool_streak,
+            deferred_no_tool_model_switches: ctx.deferred_no_tool_model_switches,
+            fallback_expanded_once: ctx.fallback_expanded_once,
+            empty_response_retry_used: ctx.empty_response_retry_used,
+            empty_response_retry_pending: ctx.empty_response_retry_pending,
+            empty_response_retry_note: ctx.empty_response_retry_note,
+            identity_prefill_text: ctx.identity_prefill_text,
+            pending_background_ack: ctx.pending_background_ack,
+            pending_external_action_ack: ctx.pending_external_action_ack,
+            require_file_recheck_before_answer: ctx.require_file_recheck_before_answer,
+            completion_progress: ctx.completion_progress,
+            force_text_response: ctx.force_text_response,
+            validation_state: ctx.validation_state,
+        },
+    )
 }

@@ -51,6 +51,61 @@ fn canonical_scoped_resource_suffix(value: &str) -> bool {
 /// A mandate delegates an objective and a bounded set of actions to the agent.
 /// It is deliberately separate from a personal goal (a desired outcome) and
 /// from an intention (the agent's revocable commitment for one decision cycle).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateStatus {
+    Active,
+    Paused,
+    AwaitingInput,
+    Completed,
+    Cancelled,
+}
+
+impl MandateStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "awaiting_input" => Some(Self::AwaitingInput),
+            "completed" => Some(Self::Completed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Legal authority-epoch transitions. Terminal states never reopen.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Active,
+                Self::Paused | Self::AwaitingInput | Self::Completed | Self::Cancelled
+            ) | (Self::Paused, Self::Active | Self::Cancelled)
+                | (Self::AwaitingInput, Self::Active | Self::Cancelled)
+        )
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
+    }
+}
+
+impl std::fmt::Display for MandateStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mandate {
     pub id: String,
@@ -59,8 +114,7 @@ pub struct Mandate {
     /// Optional personal goal that motivated this delegation.
     pub source_goal_id: Option<String>,
     pub objective: String,
-    /// "active", "paused", "awaiting_input", "completed", or "cancelled".
-    pub status: String,
+    pub status: MandateStatus,
     pub authority: MandateAuthority,
     pub constraints: Vec<String>,
     pub success_criteria: Vec<String>,
@@ -107,7 +161,7 @@ impl Mandate {
             goal_id: goal_id.to_string(),
             source_goal_id,
             objective: objective.trim().to_string(),
-            status: "active".to_string(),
+            status: MandateStatus::Active,
             authority,
             constraints: Vec::new(),
             success_criteria: Vec::new(),
@@ -130,7 +184,7 @@ impl Mandate {
     }
 
     pub fn is_active(&self) -> bool {
-        if self.status != "active" || self.confirmed_at.is_none() {
+        if self.status != MandateStatus::Active || self.confirmed_at.is_none() {
             return false;
         }
         match self.expires_at.as_deref() {
@@ -601,6 +655,57 @@ impl MandateDecisionCycle {
 }
 
 /// Agent-selected, revocable commitment made under an owner mandate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentionStatus {
+    Committed,
+    Satisfied,
+    Failed,
+    Suspended,
+    Abandoned,
+}
+
+impl IntentionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Satisfied => "satisfied",
+            Self::Failed => "failed",
+            Self::Suspended => "suspended",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "committed" => Some(Self::Committed),
+            "satisfied" => Some(Self::Satisfied),
+            "failed" => Some(Self::Failed),
+            "suspended" => Some(Self::Suspended),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    /// An intention belongs to one decision cycle. Once its commitment ends,
+    /// a later cycle must create a fresh intention rather than resurrecting it.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Committed,
+                Self::Satisfied | Self::Failed | Self::Suspended | Self::Abandoned
+            )
+        )
+    }
+}
+
+impl std::fmt::Display for IntentionStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Intention {
     pub id: String,
@@ -612,8 +717,7 @@ pub struct Intention {
     pub expected_benefit: Option<String>,
     pub risk: Option<String>,
     pub invalidation_criteria: Option<String>,
-    /// "committed", "satisfied", "failed", "suspended", or "abandoned".
-    pub status: String,
+    pub status: IntentionStatus,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -638,7 +742,7 @@ impl Intention {
             expected_benefit: None,
             risk: None,
             invalidation_criteria: None,
-            status: "committed".to_string(),
+            status: IntentionStatus::Committed,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -1157,6 +1261,102 @@ impl MandateRunNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mandate_status_legal_transition_matrix_is_explicit() {
+        let statuses = [
+            MandateStatus::Active,
+            MandateStatus::Paused,
+            MandateStatus::AwaitingInput,
+            MandateStatus::Completed,
+            MandateStatus::Cancelled,
+        ];
+        let legal = [
+            (MandateStatus::Active, MandateStatus::Paused),
+            (MandateStatus::Active, MandateStatus::AwaitingInput),
+            (MandateStatus::Active, MandateStatus::Completed),
+            (MandateStatus::Active, MandateStatus::Cancelled),
+            (MandateStatus::Paused, MandateStatus::Active),
+            (MandateStatus::Paused, MandateStatus::Cancelled),
+            (MandateStatus::AwaitingInput, MandateStatus::Active),
+            (MandateStatus::AwaitingInput, MandateStatus::Cancelled),
+        ];
+
+        for from in statuses {
+            for to in statuses {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal.contains(&(from, to)),
+                    "unexpected mandate transition {from} -> {to}"
+                );
+            }
+            assert_eq!(
+                from.is_terminal(),
+                matches!(from, MandateStatus::Completed | MandateStatus::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn intention_status_legal_transition_matrix_is_explicit() {
+        let statuses = [
+            IntentionStatus::Committed,
+            IntentionStatus::Satisfied,
+            IntentionStatus::Failed,
+            IntentionStatus::Suspended,
+            IntentionStatus::Abandoned,
+        ];
+        let legal = [
+            (IntentionStatus::Committed, IntentionStatus::Satisfied),
+            (IntentionStatus::Committed, IntentionStatus::Failed),
+            (IntentionStatus::Committed, IntentionStatus::Suspended),
+            (IntentionStatus::Committed, IntentionStatus::Abandoned),
+        ];
+
+        for from in statuses {
+            for to in statuses {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal.contains(&(from, to)),
+                    "unexpected intention transition {from} -> {to}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_status_wire_values_remain_stable() {
+        for status in [
+            MandateStatus::Active,
+            MandateStatus::Paused,
+            MandateStatus::AwaitingInput,
+            MandateStatus::Completed,
+            MandateStatus::Cancelled,
+        ] {
+            let encoded = format!("\"{}\"", status.as_str());
+            assert_eq!(serde_json::to_string(&status).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_str::<MandateStatus>(&encoded).unwrap(),
+                status
+            );
+            assert_eq!(MandateStatus::parse(status.as_str()), Some(status));
+        }
+        for status in [
+            IntentionStatus::Committed,
+            IntentionStatus::Satisfied,
+            IntentionStatus::Failed,
+            IntentionStatus::Suspended,
+            IntentionStatus::Abandoned,
+        ] {
+            let encoded = format!("\"{}\"", status.as_str());
+            assert_eq!(serde_json::to_string(&status).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_str::<IntentionStatus>(&encoded).unwrap(),
+                status
+            );
+            assert_eq!(IntentionStatus::parse(status.as_str()), Some(status));
+        }
+    }
 
     #[test]
     fn authority_rejects_global_wildcard_and_unknown_effects() {

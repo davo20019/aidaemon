@@ -348,6 +348,8 @@ pub(crate) mod turn_eviction;
 pub(crate) mod turn_render;
 #[path = "loop/turn_render_cache.rs"]
 pub(crate) mod turn_render_cache;
+#[path = "loop/turn_transition.rs"]
+mod turn_transition;
 pub(crate) mod vision;
 
 pub(in crate::agent) use eval::{

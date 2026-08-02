@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
 use crate::traits::ProviderResponse;
@@ -346,6 +347,16 @@ pub(super) enum LlmPhaseOutcome {
     ContinueLoop,
     Return(anyhow::Result<String>),
     Proceed(ProviderResponse),
+}
+
+impl LlmPhaseOutcome {
+    pub(super) fn into_turn_transition(self) -> TurnTransition<ProviderResponse> {
+        match self {
+            Self::ContinueLoop => TurnTransition::Restart(TurnRestartReason::LlmPhaseRecovery),
+            Self::Return(result) => TurnTransition::Finish(result),
+            Self::Proceed(response) => TurnTransition::Advance(response),
+        }
+    }
 }
 
 pub(super) struct LlmPhaseCtx<'a> {

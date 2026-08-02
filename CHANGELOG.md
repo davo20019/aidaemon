@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.35] - 2026-08-02
+
+### Changed
+
+- **The turn loop now has explicit typed control flow.** Phase-local outcomes converge on a shared `Advance`, `Restart`, or `Finish` transition with typed restart reasons, a single restart preparation boundary, and an explicit iteration-entry boundary. The model-directed tool loop remains lightweight, while durable dependency work continues to use the existing task DAG and ongoing mandates retain their separate leased state machine.
+- **Mandate and intention lifecycles are typed end to end.** Rust enums now define every persisted lifecycle state and legal transition while preserving the existing lowercase SQLite and JSON wire values. Invalid stored states fail closed, and exhaustive transition-matrix tests protect terminal-state and owner-resume rules.
+
+### Fixed
+
+- **Turn state is no longer lost on phase error exits.** Completion, stopping, and tool-execution phases apply their accumulated state exactly once after evaluation, including error paths, instead of relying on scattered per-return copies.
+
 ## [0.11.34] - 2026-08-01
 
 ### Added

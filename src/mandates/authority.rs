@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::traits::{
     Mandate, MandateAuthorityGrant, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateMutationTarget, ToolCallEffect, ToolCallSemantics, ToolMutationEffects,
+    MandateMutationTarget, MandateStatus, ToolCallEffect, ToolCallSemantics, ToolMutationEffects,
     ToolTargetHintKind,
 };
 
@@ -317,7 +317,7 @@ fn validate_current_mandate(
     // Treat an impossible/corrupt active-without-confirmation row exactly like
     // any other inactive authority state so the pure gate cannot be bypassed
     // even if a caller loads a mandate outside the guarded SQL paths.
-    if mandate.status != "active" || mandate.confirmed_at.is_none() {
+    if mandate.status != MandateStatus::Active || mandate.confirmed_at.is_none() {
         return Err(MandateAuthorityDenial::MandateInactive);
     }
     if let Some(expires_at) = mandate.expires_at.as_deref() {
@@ -1200,7 +1200,7 @@ mod tests {
     fn paused_expired_and_malformed_expiration_are_denied() {
         let mut mandate = mandate();
         let cycle = cycle(&mandate);
-        mandate.status = "paused".to_string();
+        mandate.status = MandateStatus::Paused;
         assert_eq!(
             denial(decide(
                 &mandate,
@@ -1212,7 +1212,7 @@ mod tests {
             MandateAuthorityDenial::MandateInactive
         );
 
-        mandate.status = "active".to_string();
+        mandate.status = MandateStatus::Active;
         mandate.confirmed_at = None;
         assert_eq!(
             denial(decide(
@@ -1994,7 +1994,7 @@ mod tests {
         reserved_cycle.action_attempts = 1;
 
         let mut paused = mandate.clone();
-        paused.status = "paused".to_string();
+        paused.status = MandateStatus::Paused;
         assert_eq!(
             validate_mandate_grant(
                 &paused,

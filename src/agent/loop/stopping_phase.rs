@@ -5,6 +5,7 @@ use super::stopping_progress::{
     has_any_concrete_execution, has_task_relevant_progress, only_final_response_remains,
     turn_contract_is_text_only,
 };
+use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
@@ -18,6 +19,27 @@ pub(super) enum StoppingPhaseOutcome {
     PivotApproach {
         failure_record: String,
     },
+}
+
+impl StoppingPhaseOutcome {
+    pub(super) fn into_turn_transition(self) -> TurnTransition<()> {
+        match self {
+            Self::ContinueLoop => TurnTransition::Restart(TurnRestartReason::StoppingPhaseControl),
+            Self::Return(result) => TurnTransition::Finish(result),
+            Self::Proceed => TurnTransition::Advance(()),
+            Self::PivotApproach { failure_record } => {
+                TurnTransition::Restart(TurnRestartReason::ApproachPivot { failure_record })
+            }
+        }
+    }
+}
+
+fn finish_stopping_phase<T>(
+    outcome: anyhow::Result<T>,
+    apply_state: impl FnOnce(),
+) -> anyhow::Result<T> {
+    apply_state();
+    outcome
 }
 
 pub(super) struct StoppingPhaseCtx<'a> {
@@ -80,6 +102,18 @@ mod boundary_tests {
     fn stopping_boundary_types_are_module_owned() {
         accepts_context_type(None);
         let _ = StoppingPhaseOutcome::Proceed;
+    }
+
+    #[test]
+    fn state_application_runs_before_error_propagation() {
+        let mut applied = false;
+        let outcome: anyhow::Result<()> = finish_stopping_phase(
+            Err(anyhow::anyhow!("synthetic stopping phase failure")),
+            || applied = true,
+        );
+
+        assert!(outcome.is_err());
+        assert!(applied);
     }
 }
 
@@ -145,7 +179,7 @@ pub(super) async fn run_stopping_phase(
     let turn_context = ctx.turn_context;
     let mut validation_state = ctx.validation_state.clone();
 
-    macro_rules! commit_state {
+    macro_rules! apply_stopping_state {
         () => {
             *ctx.effective_task_budget = effective_task_budget;
             *ctx.budget_warning_sent = budget_warning_sent;
@@ -163,6 +197,8 @@ pub(super) async fn run_stopping_phase(
             *ctx.validation_state = validation_state.clone();
         };
     }
+
+    let outcome: anyhow::Result<StoppingPhaseOutcome> = async {
 
     if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed()) {
         let text_only_turn = turn_contract_is_text_only(turn_context);
@@ -220,7 +256,6 @@ pub(super) async fn run_stopping_phase(
                     }),
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Proceed);
         }
 
@@ -256,7 +291,6 @@ pub(super) async fn run_stopping_phase(
                     }),
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Proceed);
         }
 
@@ -289,7 +323,6 @@ pub(super) async fn run_stopping_phase(
                     }),
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Proceed);
         }
 
@@ -422,7 +455,6 @@ pub(super) async fn run_stopping_phase(
                 Some(reply.chars().take(200).collect()),
             )
             .await;
-        commit_state!();
         return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
     }
 
@@ -541,7 +573,6 @@ pub(super) async fn run_stopping_phase(
                 // Re-enable tools so the LLM can call curl / other tools
                 // for the remaining steps.
                 force_text_response = false;
-                commit_state!();
                 // Fall through to ContinueLoop below
             } else {
                 info!(
@@ -619,7 +650,6 @@ pub(super) async fn run_stopping_phase(
                         Some(reply.chars().take(200).collect()),
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
             }
         }
@@ -681,7 +711,6 @@ pub(super) async fn run_stopping_phase(
                         summary,
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(result));
             }
             StoppingCondition::TaskTimeout {
@@ -731,7 +760,6 @@ pub(super) async fn run_stopping_phase(
                         summary,
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(result));
             }
             _ => {}
@@ -867,7 +895,6 @@ pub(super) async fn run_stopping_phase(
                         }),
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::ContinueLoop);
             }
 
@@ -909,7 +936,6 @@ pub(super) async fn run_stopping_phase(
                         }),
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::ContinueLoop);
             }
 
@@ -974,7 +1000,6 @@ pub(super) async fn run_stopping_phase(
                     summary,
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Return(result));
         }
     }
@@ -1089,7 +1114,6 @@ pub(super) async fn run_stopping_phase(
                             summary,
                         )
                         .await;
-                    commit_state!();
                     return Ok(StoppingPhaseOutcome::Return(result));
                 }
             }
@@ -1202,7 +1226,6 @@ pub(super) async fn run_stopping_phase(
                                     summary,
                                 )
                                 .await;
-                            commit_state!();
                             return Ok(StoppingPhaseOutcome::Return(result));
                         }
                     }
@@ -1289,7 +1312,6 @@ pub(super) async fn run_stopping_phase(
                             }),
                         )
                         .await;
-                    commit_state!();
                     return Ok(StoppingPhaseOutcome::ContinueLoop);
                 }
                 if daily_budget < cap_u64
@@ -1331,7 +1353,6 @@ pub(super) async fn run_stopping_phase(
                             }),
                         )
                         .await;
-                    commit_state!();
                     return Ok(StoppingPhaseOutcome::ContinueLoop);
                 }
 
@@ -1376,7 +1397,6 @@ pub(super) async fn run_stopping_phase(
                         None,
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(Err(anyhow::anyhow!(
                     error_msg
                 ))));
@@ -1458,7 +1478,6 @@ pub(super) async fn run_stopping_phase(
             )
             .await;
         record_failed_task_tokens(task_tokens_used);
-        commit_state!();
         return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
     }
 
@@ -1519,7 +1538,6 @@ pub(super) async fn run_stopping_phase(
                     Some(reply.chars().take(200).collect()),
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
         }
 
@@ -1607,7 +1625,6 @@ pub(super) async fn run_stopping_phase(
                         }),
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::PivotApproach { failure_record });
             }
 
@@ -1730,7 +1747,6 @@ pub(super) async fn run_stopping_phase(
                             Some(reply.chars().take(200).collect()),
                         )
                         .await;
-                    commit_state!();
                     return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
                 }
             }
@@ -1768,7 +1784,6 @@ pub(super) async fn run_stopping_phase(
                     summary,
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Return(result));
         }
 
@@ -1843,7 +1858,6 @@ pub(super) async fn run_stopping_phase(
                         Some(reply.chars().take(200).collect()),
                     )
                     .await;
-                commit_state!();
                 return Ok(StoppingPhaseOutcome::Return(Ok(reply)));
             }
         }
@@ -1918,7 +1932,6 @@ pub(super) async fn run_stopping_phase(
                         .map(|r| r.chars().take(200).collect::<String>()),
                 )
                 .await;
-            commit_state!();
             return Ok(StoppingPhaseOutcome::Return(result));
         }
 
@@ -1971,7 +1984,6 @@ pub(super) async fn run_stopping_phase(
                 summary,
             )
             .await;
-        commit_state!();
         return Ok(StoppingPhaseOutcome::Return(result));
     }
 
@@ -2119,8 +2131,13 @@ pub(super) async fn run_stopping_phase(
         }
     }
 
-    commit_state!();
     Ok(StoppingPhaseOutcome::Proceed)
+    }
+    .await;
+
+    finish_stopping_phase(outcome, || {
+        apply_stopping_state!();
+    })
 }
 
 /// Last-resort stall recovery surfaces the latest tool output — but only when

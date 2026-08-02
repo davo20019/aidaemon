@@ -979,8 +979,8 @@ pub trait MandateStore: Send + Sync {
     async fn transition_mandate_status(
         &self,
         _mandate_id: &str,
-        _from_status: &str,
-        _to_status: &str,
+        _from_status: super::MandateStatus,
+        _to_status: super::MandateStatus,
     ) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -991,7 +991,7 @@ pub trait MandateStore: Send + Sync {
     async fn resume_mandate_with_context(
         &self,
         _mandate_id: &str,
-        _from_status: &str,
+        _from_status: super::MandateStatus,
         _expected_version: i64,
         _controller_context: Option<&str>,
     ) -> anyhow::Result<bool> {

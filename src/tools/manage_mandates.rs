@@ -8,8 +8,9 @@ use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome, StateStore,
-    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
+    Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
+    MandateStatus, StateStore, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
+    ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
@@ -148,7 +149,11 @@ impl ManageMandatesTool {
     async fn cancel_unconfirmed(&self, mandate: &Mandate) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.state
-                .transition_mandate_status(&mandate.id, "paused", "cancelled")
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Paused,
+                    MandateStatus::Cancelled,
+                )
                 .await?,
             "unconfirmed mandate could not be cancelled"
         );
@@ -225,7 +230,7 @@ impl ManageMandatesTool {
         );
         // Pending/paused records are safe if approval delivery is interrupted.
         // Once activated, this timestamp makes the first deliberation immediately due.
-        mandate.status = "paused".to_string();
+        mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
         mandate.next_review_at = chrono::Utc::now().to_rfc3339();
         mandate.constraints = clean_strings(args.constraints.as_deref());
@@ -407,7 +412,7 @@ impl ManageMandatesTool {
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
         let mandate = self.resolve_owned_mandate(id, owner).await?;
         anyhow::ensure!(
-            !matches!(mandate.status.as_str(), "completed" | "cancelled"),
+            !mandate.status.is_terminal(),
             "terminal mandates cannot be changed"
         );
         if action != "resume" {
@@ -431,7 +436,7 @@ impl ManageMandatesTool {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            if mandate.status == "awaiting_input" {
+            if mandate.status == MandateStatus::AwaitingInput {
                 anyhow::ensure!(
                     guidance.is_some(),
                     "guidance is required when resuming a mandate that asked the owner"
@@ -450,10 +455,12 @@ impl ManageMandatesTool {
             None
         };
         let (from, to) = match action {
-            "pause" => ("active", "paused"),
-            "resume" if mandate.status == "awaiting_input" => ("awaiting_input", "active"),
-            "resume" => ("paused", "active"),
-            "cancel" => (mandate.status.as_str(), "cancelled"),
+            "pause" => (MandateStatus::Active, MandateStatus::Paused),
+            "resume" if mandate.status == MandateStatus::AwaitingInput => {
+                (MandateStatus::AwaitingInput, MandateStatus::Active)
+            }
+            "resume" => (MandateStatus::Paused, MandateStatus::Active),
+            "cancel" => (mandate.status, MandateStatus::Cancelled),
             _ => unreachable!(),
         };
         let transitioned = if action == "resume" {
@@ -506,7 +513,7 @@ impl ManageMandatesTool {
             || args.expires_at.is_some();
         anyhow::ensure!(has_change, "update requires at least one changed field");
         anyhow::ensure!(
-            !matches!(mandate.status.as_str(), "completed" | "cancelled"),
+            !mandate.status.is_terminal(),
             "terminal mandates cannot be updated"
         );
         if let Some(objective) = args.objective.as_deref() {
@@ -1290,7 +1297,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mandates.len(), 1);
-        assert_eq!(mandates[0].status, "active");
+        assert_eq!(mandates[0].status, MandateStatus::Active);
         let controller = state.get_goal(&mandates[0].goal_id).await.unwrap().unwrap();
         assert_eq!(controller.status, "active");
         assert_eq!(controller.domain, "orchestration");
@@ -1382,7 +1389,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mandates.len(), 1);
-        assert_eq!(mandates[0].status, "cancelled");
+        assert_eq!(mandates[0].status, MandateStatus::Cancelled);
         assert_eq!(
             state
                 .get_goal(&mandates[0].goal_id)
@@ -1414,7 +1421,7 @@ mod tests {
             3_600,
             300,
         );
-        mandate.status = "paused".to_string();
+        mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
         state
             .create_mandate_controller(&goal, &mandate)
@@ -1566,7 +1573,7 @@ mod tests {
             .unwrap();
         assert!(resumed.contains("now active"));
         let resumed_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(resumed_mandate.status, "active");
+        assert_eq!(resumed_mandate.status, MandateStatus::Active);
         let resumed_review_at =
             chrono::DateTime::parse_from_rfc3339(&resumed_mandate.next_review_at)
                 .unwrap()

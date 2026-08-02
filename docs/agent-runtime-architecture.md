@@ -37,6 +37,44 @@ resumable run state rather than becoming a fabricated final answer.
 - <https://developers.openai.com/api/docs/guides/function-calling>
 - <https://github.com/modelcontextprotocol/specification/blob/main/schema/2025-06-18/schema.ts>
 
+### Layered control topology
+
+AIdaemon deliberately uses three control shapes instead of forcing every task
+through one graph runtime:
+
+```text
+natural-language request
+          |
+          v
+ semantic task contract
+    +-----+----------------+
+    |                      |
+    v                      v
+one turn             durable complex work
+typed phase cycle    dependency DAG
+    |                      |
+    +---- model/tool loop -+
+
+ongoing mandate -> leased mandate state machine
+                    ACT | WAIT | ASK | STOP
+                     |
+                     +-- ACT may create DAG work whose nodes use the same loop
+```
+
+The per-turn runtime is an explicit typed cyclic state machine: phases advance,
+finish, or restart with a typed reason. The model remains free to choose and
+revise its approach inside that cycle. Complex durable goals use the existing
+versioned, cycle-checked task dependency DAG for ordering and bounded
+parallelism. Long-lived mandates use their separately persisted lifecycle and
+decision state machine. A general graph framework is intentionally unnecessary:
+the Rust type system, event log, SQLite transactions, leases, and receipts are
+the authoritative control and recovery surfaces.
+
+Simple requests do not acquire graph overhead. A richer model-proposed plan DAG
+is warranted only when a finite task truly needs branching or parallelism; it
+must reuse the durable task graph rather than create a second orchestration
+system inside the turn loop.
+
 ## Target runtime
 
 ```text

@@ -14,7 +14,7 @@ use crate::events::TaskOutcome;
 use crate::traits::{
     AgentRole, Mandate, MandateDecisionOutcome, MandateFinalizationRejectReason,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, StateStore,
+    MandateRunNotificationKind, MandateStatus, StateStore,
 };
 use crate::types::{ChannelContext, UserRole};
 
@@ -448,7 +448,7 @@ async fn keep_mandate_controller_open(
 ) {
     // Do not overwrite an owner pause/cancel that raced this review. Runtime
     // repair is allowed only while the mandate itself still says `active`.
-    if mandate.status != "active" {
+    if mandate.status != MandateStatus::Active {
         return;
     }
     if matches!(goal.status.as_str(), "active" | "pending") && goal.dispatch_failures == 0 {
@@ -2672,7 +2672,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "active"
+            MandateStatus::Active
         );
         assert_eq!(
             state.get_goal_runs(&goal.id).await.unwrap()[0].status,
@@ -2816,7 +2816,10 @@ mod tests {
         assert!(notification.is_none());
         let intentions = state.list_intentions(&mandate.id, 10).await.unwrap();
         assert_eq!(intentions.len(), 1);
-        assert_eq!(intentions[0].status, "suspended");
+        assert_eq!(
+            intentions[0].status,
+            crate::traits::IntentionStatus::Suspended
+        );
         assert_eq!(
             state.get_goal_runs(&goal.id).await.unwrap()[0].status,
             "cancelled"

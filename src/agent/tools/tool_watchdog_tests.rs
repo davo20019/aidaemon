@@ -720,7 +720,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
             .unwrap()
             .unwrap()
             .status,
-        "awaiting_input",
+        crate::traits::MandateStatus::AwaitingInput,
         "policy revision after a dispatch claim without a strict receipt must pause for reconciliation"
     );
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
@@ -861,12 +861,20 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
 
     assert!(harness
         .state
-        .transition_mandate_status(&mandate.id, "active", "paused")
+        .transition_mandate_status(
+            &mandate.id,
+            crate::traits::MandateStatus::Active,
+            crate::traits::MandateStatus::Paused,
+        )
         .await
         .unwrap());
     assert!(harness
         .state
-        .transition_mandate_status(&mandate.id, "paused", "active")
+        .transition_mandate_status(
+            &mandate.id,
+            crate::traits::MandateStatus::Paused,
+            crate::traits::MandateStatus::Active,
+        )
         .await
         .unwrap());
 

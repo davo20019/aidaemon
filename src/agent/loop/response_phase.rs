@@ -1,4 +1,5 @@
 use super::completion_phase::CompletionCtx;
+use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
@@ -7,6 +8,24 @@ pub(super) enum ResponsePhaseOutcome {
     ContinueLoop,
     Return(anyhow::Result<String>),
     ProceedToToolExecution,
+}
+
+impl ResponsePhaseOutcome {
+    pub(super) fn into_orchestration_transition(self) -> TurnTransition<()> {
+        self.into_turn_transition(TurnRestartReason::OrchestrationFallthrough)
+    }
+
+    pub(super) fn into_response_transition(self) -> TurnTransition<()> {
+        self.into_turn_transition(TurnRestartReason::ResponsePhaseRecovery)
+    }
+
+    fn into_turn_transition(self, restart_reason: TurnRestartReason) -> TurnTransition<()> {
+        match self {
+            Self::ContinueLoop => TurnTransition::Restart(restart_reason),
+            Self::Return(result) => TurnTransition::Finish(result),
+            Self::ProceedToToolExecution => TurnTransition::Advance(()),
+        }
+    }
 }
 
 #[allow(dead_code)]

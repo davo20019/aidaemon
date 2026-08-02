@@ -465,6 +465,14 @@ async fn defer_tool_calls_for_new_project_instructions(
     Ok(())
 }
 
+fn finish_tool_execution_phase<T>(
+    outcome: anyhow::Result<T>,
+    apply_state: impl FnOnce(),
+) -> anyhow::Result<T> {
+    apply_state();
+    outcome
+}
+
 pub(in crate::agent) async fn run_tool_execution_phase(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &mut ToolExecutionCtx<'_>,
@@ -546,7 +554,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let mut tool_result_cache = std::mem::take(ctx.tool_result_cache);
     let execution_state = &mut *ctx.execution_state;
 
-    macro_rules! commit_state {
+    macro_rules! apply_tool_execution_state {
         () => {
             *ctx.tool_defs = tool_defs;
             *ctx.total_tool_calls_attempted = total_tool_calls_attempted;
@@ -590,6 +598,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             *ctx.tool_result_cache = tool_result_cache;
         };
     }
+
+    let outcome: anyhow::Result<ToolExecutionOutcome> = async {
 
     let workspace_project_root = channel_ctx
         .active_workspace_grant(user_role)
@@ -1101,7 +1111,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             .await?;
                             total_tool_calls_attempted =
                                 total_tool_calls_attempted.saturating_sub(1);
-                            commit_state!();
                             return Ok(ToolExecutionOutcome::NextIteration);
                         }
                         Ok(None) => {}
@@ -1508,11 +1517,9 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             );
                             // Return NextIteration so the main loop runs the
                             // re-planner and re-injects the updated plan.
-                            commit_state!();
                             return Ok(ToolExecutionOutcome::NextIteration);
                         }
                     }
-                    commit_state!();
                     return Ok(outcome);
                 }
             }
@@ -2219,7 +2226,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             result_text.push_str(&crate::utils::render_truncation_notice(info));
         }
         if let Some(outcome) = learning_outcome.control_flow {
-            commit_state!();
             return Ok(outcome);
         }
         if outcome_satisfied {
@@ -2592,7 +2598,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 });
             }
 
-            commit_state!();
             return Ok(ToolExecutionOutcome::Return(Ok(reply)));
         }
 
@@ -2672,7 +2677,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 }
             });
         }
-        commit_state!();
         return Ok(ToolExecutionOutcome::Return(Ok(blocker_summary)));
     }
 
@@ -2714,11 +2718,33 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             fallback_expanded_once: &mut fallback_expanded_once,
         },
     );
-    commit_state!();
     Ok(ToolExecutionOutcome::NextIteration)
+    }
+    .await;
+
+    finish_tool_execution_phase(outcome, || {
+        apply_tool_execution_state!();
+    })
 }
 
 // ── P2.4 tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod state_application_tests {
+    use super::finish_tool_execution_phase;
+
+    #[test]
+    fn state_application_runs_before_error_propagation() {
+        let mut applied = false;
+        let outcome: anyhow::Result<()> = finish_tool_execution_phase(
+            Err(anyhow::anyhow!("synthetic tool phase failure")),
+            || applied = true,
+        );
+
+        assert!(outcome.is_err());
+        assert!(applied);
+    }
+}
 
 #[cfg(test)]
 mod correction_gate_tests {

@@ -1,4 +1,5 @@
 use crate::agent::loop_state::ReadFileObservationTracker;
+use crate::agent::turn_transition::{TurnRestartReason, TurnTransition};
 use crate::agent::*;
 use crate::execution_policy::PolicyBundle;
 use crate::traits::ProviderResponse;
@@ -6,6 +7,17 @@ use crate::traits::ProviderResponse;
 pub(in crate::agent) enum ToolExecutionOutcome {
     Return(anyhow::Result<String>),
     NextIteration,
+}
+
+impl ToolExecutionOutcome {
+    pub(in crate::agent) fn into_turn_transition(self) -> TurnTransition<std::convert::Infallible> {
+        match self {
+            Self::Return(result) => TurnTransition::Finish(result),
+            Self::NextIteration => {
+                TurnTransition::Restart(TurnRestartReason::ToolExecutionCompleted)
+            }
+        }
+    }
 }
 
 /// A JoinHandle wrapper that aborts the task when dropped.

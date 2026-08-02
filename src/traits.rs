@@ -39,13 +39,14 @@ pub use goals::{
     WorkerProfile, DEFAULT_PROJECT_ID,
 };
 pub use mandates::{
-    Intention, Mandate, MandateAuthority, MandateAuthorityGrant, MandateDecisionCycle,
-    MandateDecisionOutcome, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
-    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
-    MandateReconciliationReason, MandateRunFinalizationRequest, MandateRunFinalizationResult,
-    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts,
+    Intention, IntentionStatus, Mandate, MandateAuthority, MandateAuthorityGrant,
+    MandateDecisionCycle, MandateDecisionOutcome, MandateFinalizationRejectReason,
+    MandateFinalizationStaleReason, MandateMutationAttempt, MandateMutationAttemptStatus,
+    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationOutcomeProjection,
+    MandateMutationQuotaBlockReason, MandateMutationQuotaState, MandateMutationReservation,
+    MandateMutationTarget, MandateReconciliationReason, MandateRunFinalizationRequest,
+    MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
+    MandateRunProofCounts, MandateStatus,
 };
 #[allow(unused_imports)]
 pub use memory::{

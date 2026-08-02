@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::agent::{build_goal_task_results_summary, is_group_session, Agent};
 use crate::channels::ChannelHub;
 use crate::goal_tokens::GoalTokenRegistry;
-use crate::traits::{GoalSchedule, Mandate, StateStore};
+use crate::traits::{GoalSchedule, Mandate, MandateStatus, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
 const TASK_ESCALATION_SETTLE_SECS: i64 = 8;
@@ -1827,7 +1827,11 @@ impl HeartbeatCoordinator {
         let Some(goal) = self.state.get_goal(&mandate.goal_id).await? else {
             let _ = self
                 .state
-                .transition_mandate_status(&mandate.id, "active", "paused")
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
                 .await;
             let retry_at = mandate_retry_at(&mandate, None);
             let _ = self
@@ -1843,7 +1847,11 @@ impl HeartbeatCoordinator {
         {
             let _ = self
                 .state
-                .transition_mandate_status(&mandate.id, "active", "paused")
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Paused,
+                )
                 .await;
             let retry_at = mandate_retry_at(&mandate, None);
             let _ = self

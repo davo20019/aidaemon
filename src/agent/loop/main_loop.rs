@@ -1,11 +1,12 @@
 use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use super::llm_phase::{LlmPhaseCtx, LlmPhaseOutcome};
+use super::llm_phase::LlmPhaseCtx;
 use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
 use super::orchestration_phase::OrchestrationCtx;
-use super::response_phase::{ResponsePhaseCtx, ResponsePhaseOutcome};
-use super::stopping_phase::{StoppingPhaseCtx, StoppingPhaseOutcome};
-use super::tool_execution_phase::{ToolExecutionCtx, ToolExecutionOutcome};
-use super::tool_prelude_phase::{ToolPreludeCtx, ToolPreludeOutcome};
+use super::response_phase::ResponsePhaseCtx;
+use super::stopping_phase::StoppingPhaseCtx;
+use super::tool_execution_phase::ToolExecutionCtx;
+use super::tool_prelude_phase::ToolPreludeCtx;
+use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
 
@@ -124,6 +125,85 @@ fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecisi
         });
     }
     intent_gate
+}
+
+/// Enter one agent-loop iteration and update the state that is common to every
+/// phase path. Keeping this boundary small avoids threading the full turn
+/// context through another driver object while making iteration entry explicit.
+async fn begin_turn_iteration(
+    task_id: &str,
+    model: &mut String,
+    turn_state: &mut super::loop_state::TurnState,
+    execution_state: &ExecutionState,
+    completion_progress: &CompletionProgress,
+    heartbeat: &Option<Arc<AtomicU64>>,
+) -> usize {
+    let iteration = turn_state.counters.advance_iteration();
+    touch_heartbeat(heartbeat);
+    let plan_progress = execution_state
+        .active_linear_intent_plan
+        .as_ref()
+        .map(|plan| {
+            (
+                plan.steps.iter().filter(|step| step.completed).count() as u32,
+                plan.steps.len() as u32,
+            )
+        });
+    #[cfg(feature = "computer_use")]
+    {
+        let resolved_model =
+            crate::agent::computer_use::resolve_model_for_task(task_id, model.as_str()).await;
+        *model = resolved_model;
+    }
+    #[cfg(not(feature = "computer_use"))]
+    let _ = (task_id, model);
+
+    turn_state
+        .with_harness_eval(|eval| {
+            eval.record_completion_progress(completion_progress);
+            eval.record_iteration_progress(
+                iteration as u32,
+                turn_state.counters.total_tool_calls_attempted() as u32,
+                turn_state.counters.total_successful_tool_calls() as u32,
+                turn_state.evidence.evidence_gain_count() as u32,
+                false,
+            );
+            if let Some((completed, total)) = plan_progress {
+                eval.record_plan_progress(completed, total);
+            }
+        })
+        .await;
+    iteration
+}
+
+/// Apply restart-only state changes at one shared driver boundary. Most
+/// restarts merely select the loop back-edge; approach pivots additionally
+/// reset stale evidence and inject the next-attempt directive.
+fn prepare_turn_restart(
+    agent: &Agent,
+    reason: TurnRestartReason,
+    turn_state: &mut super::loop_state::TurnState,
+    approach_pivots_used: &mut usize,
+    model: &str,
+) {
+    let TurnRestartReason::ApproachPivot { failure_record } = reason else {
+        return;
+    };
+
+    *approach_pivots_used += 1;
+    turn_state.stall.reset_for_pivot();
+    turn_state
+        .directives
+        .push_system_message(SystemDirective::ApproachPivotRequired {
+            attempt: *approach_pivots_used,
+            failure_record,
+        });
+    crate::agent::heuristic_telemetry::global().record(
+        "approach_pivot",
+        model,
+        agent.trust_tier_for_model(model),
+        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
+    );
 }
 
 // impl-Agent justification: handle_message_impl drives the turn lifecycle and owns TurnState construction.
@@ -983,37 +1063,15 @@ impl Agent {
         let correction_context = self.correction_context_for_current_goal().await;
 
         loop {
-            let iteration = turn_state.counters.advance_iteration();
-            touch_heartbeat(&heartbeat);
-            let plan_progress = execution_state
-                .active_linear_intent_plan
-                .as_ref()
-                .map(|plan| {
-                    (
-                        plan.steps.iter().filter(|step| step.completed).count() as u32,
-                        plan.steps.len() as u32,
-                    )
-                });
-            #[cfg(feature = "computer_use")]
-            {
-                model =
-                    crate::agent::computer_use::resolve_model_for_task(&task_id, &model).await;
-            }
-            turn_state
-                .with_harness_eval(|eval| {
-                    eval.record_completion_progress(&completion_progress);
-                    eval.record_iteration_progress(
-                        iteration as u32,
-                        turn_state.counters.total_tool_calls_attempted() as u32,
-                        turn_state.counters.total_successful_tool_calls() as u32,
-                        turn_state.evidence.evidence_gain_count() as u32,
-                        false,
-                    );
-                    if let Some((completed, total)) = plan_progress {
-                        eval.record_plan_progress(completed, total);
-                    }
-                })
-                .await;
+            let iteration = begin_turn_iteration(
+                &task_id,
+                &mut model,
+                &mut turn_state,
+                &execution_state,
+                &completion_progress,
+                &heartbeat,
+            )
+            .await;
 
             // Check for cancellation (cascades via token hierarchy)
             if let Some(ref ct) = self.cancel_token {
@@ -1250,30 +1308,19 @@ impl Agent {
                 },
             )
             .await?;
-            match stopping_outcome {
-                StoppingPhaseOutcome::ContinueLoop => continue,
-                StoppingPhaseOutcome::Return(result) => return result,
-                StoppingPhaseOutcome::PivotApproach { failure_record } => {
-                    approach_pivots_used += 1;
-                    // Fresh runway: the stall evidence belongs to the failed
-                    // approach. The failure stays referenced in the directive
-                    // and verbatim in history — nothing is discarded.
-                    turn_state.stall.reset_for_pivot();
-                    turn_state.directives.push_system_message(
-                        SystemDirective::ApproachPivotRequired {
-                            attempt: approach_pivots_used,
-                            failure_record,
-                        },
-                    );
-                    crate::agent::heuristic_telemetry::global().record(
-                        "approach_pivot",
+            match stopping_outcome.into_turn_transition() {
+                TurnTransition::Restart(reason) => {
+                    prepare_turn_restart(
+                        self,
+                        reason,
+                        &mut turn_state,
+                        &mut approach_pivots_used,
                         &model,
-                        self.trust_tier_for_model(&model),
-                        crate::agent::heuristic_telemetry::HeuristicAction::Enforced,
                     );
                     continue;
                 }
-                StoppingPhaseOutcome::Proceed => {}
+                TurnTransition::Finish(result) => return result,
+                TurnTransition::Advance(()) => {}
             }
 
             // Deterministic control-plane routing on iteration 1:
@@ -1317,15 +1364,22 @@ impl Agent {
                 )
                 .await?
                 {
-                    match outcome {
-                        ResponsePhaseOutcome::ContinueLoop => {
+                    match outcome.into_orchestration_transition() {
+                        TurnTransition::Restart(reason) => {
                             turn_state
                                 .with_harness_eval(|eval| eval.record_response_fallthrough())
                                 .await;
+                            prepare_turn_restart(
+                                self,
+                                reason,
+                                &mut turn_state,
+                                &mut approach_pivots_used,
+                                &model,
+                            );
                             continue;
                         }
-                        ResponsePhaseOutcome::Return(result) => return result,
-                        ResponsePhaseOutcome::ProceedToToolExecution => {}
+                        TurnTransition::Finish(result) => return result,
+                        TurnTransition::Advance(()) => {}
                     }
                 }
             }
@@ -1447,23 +1501,30 @@ impl Agent {
                 },
             )
             .await?;
-            let mut resp = match llm_outcome {
-                LlmPhaseOutcome::ContinueLoop => {
+            let mut resp = match llm_outcome.into_turn_transition() {
+                TurnTransition::Restart(reason) => {
                     if execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
                     }
                     // Propagate accumulated timeout to execution state so
                     // wall-clock budget excludes provider-caused delays.
                     execution_state.provider_timeout_ms = turn_state.budget.provider_timeout_ms();
+                    prepare_turn_restart(
+                        self,
+                        reason,
+                        &mut turn_state,
+                        &mut approach_pivots_used,
+                        &model,
+                    );
                     continue;
                 }
-                LlmPhaseOutcome::Return(result) => {
+                TurnTransition::Finish(result) => {
                     if execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
                     }
                     return result;
                 }
-                LlmPhaseOutcome::Proceed(resp) => resp,
+                TurnTransition::Advance(resp) => resp,
             };
 
             let response_stall = turn_state.stall.for_response_phase();
@@ -1522,20 +1583,27 @@ impl Agent {
                 },
             )
             .await?;
-            match response_outcome {
-                ResponsePhaseOutcome::ContinueLoop => {
+            match response_outcome.into_response_transition() {
+                TurnTransition::Restart(reason) => {
                     if execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
                     }
+                    prepare_turn_restart(
+                        self,
+                        reason,
+                        &mut turn_state,
+                        &mut approach_pivots_used,
+                        &model,
+                    );
                     continue;
                 }
-                ResponsePhaseOutcome::Return(result) => {
+                TurnTransition::Finish(result) => {
                     if execution_state.execution_budget_applies() {
                         execution_state.record_llm_call();
                     }
                     return result;
                 }
-                ResponsePhaseOutcome::ProceedToToolExecution => {
+                TurnTransition::Advance(()) => {
                     if !resp.tool_calls.is_empty() && !execution_state.execution_budget_applies() {
                         execution_state.activate_budget_envelope(
                             turn_state.budget.task_tokens_used(),
@@ -1577,10 +1645,19 @@ impl Agent {
                 },
             )
             .await?;
-            match tool_prelude_outcome {
-                ToolPreludeOutcome::ContinueLoop => continue,
-                ToolPreludeOutcome::Return(result) => return result,
-                ToolPreludeOutcome::Proceed => {}
+            match tool_prelude_outcome.into_turn_transition() {
+                TurnTransition::Restart(reason) => {
+                    prepare_turn_restart(
+                        self,
+                        reason,
+                        &mut turn_state,
+                        &mut approach_pivots_used,
+                        &model,
+                    );
+                    continue;
+                }
+                TurnTransition::Finish(result) => return result,
+                TurnTransition::Advance(()) => {}
             }
 
             // Capture baseline for tracking tool calls per plan step
@@ -1684,10 +1761,11 @@ impl Agent {
                 },
             )
             .await?;
-            match tool_execution_outcome {
-                ToolExecutionOutcome::Return(result) => return result,
-                ToolExecutionOutcome::NextIteration => {}
-            }
+            let iteration_restart_reason = match tool_execution_outcome.into_turn_transition() {
+                TurnTransition::Restart(reason) => reason,
+                TurnTransition::Finish(result) => return result,
+                TurnTransition::Advance(never) => match never {},
+            };
 
             // Guided-only re-planner. Autonomous models self-direct and never
             // spend an auxiliary model call evaluating their own step progress.
@@ -1796,6 +1874,13 @@ impl Agent {
                     }
                 }
             }
+            prepare_turn_restart(
+                self,
+                iteration_restart_reason,
+                &mut turn_state,
+                &mut approach_pivots_used,
+                &model,
+            );
         }
         }, turn_span)
         .await

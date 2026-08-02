@@ -1,4 +1,5 @@
 use super::execution_state::LinearIntentStep;
+use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
 use crate::execution_policy::PolicyBundle;
@@ -9,6 +10,16 @@ pub(super) enum ToolPreludeOutcome {
     ContinueLoop,
     Return(anyhow::Result<String>),
     Proceed,
+}
+
+impl ToolPreludeOutcome {
+    pub(super) fn into_turn_transition(self) -> TurnTransition<()> {
+        match self {
+            Self::ContinueLoop => TurnTransition::Restart(TurnRestartReason::ToolPreludeRecovery),
+            Self::Return(result) => TurnTransition::Finish(result),
+            Self::Proceed => TurnTransition::Advance(()),
+        }
+    }
 }
 
 pub(super) struct ToolPreludeCtx<'a> {

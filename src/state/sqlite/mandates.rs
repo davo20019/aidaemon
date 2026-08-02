@@ -1,11 +1,12 @@
 use super::*;
 use crate::traits::{
-    GoalRun, Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateMutationAttempt,
-    MandateMutationAttemptStatus, MandateMutationDispatchClaim, MandateMutationEvidence,
-    MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
-    MandateMutationReservation, MandateReconciliationReason, MandateRunFinalizationRequest,
-    MandateRunFinalizationResult, MandateRunProofCounts, MandateStore, Task,
+    GoalRun, Intention, IntentionStatus, Mandate, MandateAuthority, MandateDecisionCycle,
+    MandateDecisionOutcome, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
+    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
+    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
+    MandateMutationQuotaState, MandateMutationReservation, MandateReconciliationReason,
+    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
+    MandateStatus, MandateStore, Task,
 };
 
 const MANDATE_COLUMNS: &str =
@@ -38,12 +39,15 @@ fn qualified_columns(alias: &str, columns: &str) -> String {
 }
 
 fn mandate_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Mandate> {
+    let status_raw: String = row.get("status");
+    let status = MandateStatus::parse(&status_raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid mandate status `{status_raw}`"))?;
     Ok(Mandate {
         id: row.get("id"),
         goal_id: row.get("goal_id"),
         source_goal_id: row.get("source_goal_id"),
         objective: row.get("objective"),
-        status: row.get("status"),
+        status,
         authority: serde_json::from_str::<MandateAuthority>(
             &row.get::<String, _>("authority_json"),
         )?,
@@ -85,8 +89,11 @@ fn decision_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateDec
     })
 }
 
-fn intention_from_row(row: &sqlx::sqlite::SqliteRow) -> Intention {
-    Intention {
+fn intention_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Intention> {
+    let status_raw: String = row.get("status");
+    let status = IntentionStatus::parse(&status_raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid intention status `{status_raw}`"))?;
+    Ok(Intention {
         id: row.get("id"),
         mandate_id: row.get("mandate_id"),
         decision_cycle_id: row.get("decision_cycle_id"),
@@ -96,11 +103,11 @@ fn intention_from_row(row: &sqlx::sqlite::SqliteRow) -> Intention {
         expected_benefit: row.get("expected_benefit"),
         risk: row.get("risk"),
         invalidation_criteria: row.get("invalidation_criteria"),
-        status: row.get("status"),
+        status,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),
-    }
+    })
 }
 
 fn mutation_attempt_from_row(
@@ -166,13 +173,6 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
         !mandate.created_by_session.trim().is_empty(),
         "mandate owner session is required"
     );
-    anyhow::ensure!(
-        matches!(
-            mandate.status.as_str(),
-            "active" | "paused" | "awaiting_input" | "completed" | "cancelled"
-        ),
-        "invalid mandate status"
-    );
     mandate.authority.validate().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         mandate.min_review_secs > 0
@@ -189,7 +189,7 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
         validate_timestamp("confirmed_at", confirmed_at)?;
     }
     anyhow::ensure!(
-        mandate.status != "active" || mandate.confirmed_at.is_some(),
+        mandate.status != MandateStatus::Active || mandate.confirmed_at.is_some(),
         "an active mandate requires durable owner confirmation"
     );
     match (
@@ -221,14 +221,24 @@ fn validate_new_mandate(mandate: &Mandate) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn controller_goal_status(mandate_status: &str) -> &'static str {
+fn controller_goal_status(mandate_status: MandateStatus) -> &'static str {
     match mandate_status {
-        "active" => "active",
-        "paused" | "awaiting_input" => "paused",
-        "completed" => "completed",
-        "cancelled" => "cancelled",
-        _ => "paused",
+        MandateStatus::Active => "active",
+        MandateStatus::Paused | MandateStatus::AwaitingInput => "paused",
+        MandateStatus::Completed => "completed",
+        MandateStatus::Cancelled => "cancelled",
     }
+}
+
+fn intention_transition(
+    from: IntentionStatus,
+    to: IntentionStatus,
+) -> anyhow::Result<(&'static str, &'static str)> {
+    anyhow::ensure!(
+        from.can_transition_to(to),
+        "invalid intention status transition {from} -> {to}"
+    );
+    Ok((from.as_str(), to.as_str()))
 }
 
 fn clamped_next_review_at(
@@ -479,7 +489,7 @@ async fn insert_mandate_row(
     .bind(&mandate.goal_id)
     .bind(&mandate.source_goal_id)
     .bind(&mandate.objective)
-    .bind(&mandate.status)
+    .bind(mandate.status.as_str())
     .bind(serde_json::to_string(&mandate.authority)?)
     .bind(serde_json::to_string(&mandate.constraints)?)
     .bind(serde_json::to_string(&mandate.success_criteria)?)
@@ -528,7 +538,7 @@ async fn validate_source_goal(
 async fn update_controller_status(
     connection: &mut sqlx::SqliteConnection,
     goal_id: &str,
-    mandate_status: &str,
+    mandate_status: MandateStatus,
     now: &str,
 ) -> anyhow::Result<()> {
     let goal_status = controller_goal_status(mandate_status);
@@ -700,18 +710,22 @@ async fn invalidate_open_mandate_runs(
     .bind(goal_id)
     .execute(&mut *connection)
     .await?;
+    let (intention_from, intention_to) =
+        intention_transition(IntentionStatus::Committed, IntentionStatus::Suspended)?;
     sqlx::query(
         "UPDATE intentions
-         SET status = 'suspended', completed_at = COALESCE(completed_at, ?), updated_at = ?
+         SET status = ?, completed_at = COALESCE(completed_at, ?), updated_at = ?
          WHERE goal_run_id IN (
              SELECT id FROM goal_runs
              WHERE goal_id = ? AND trigger_type = 'mandate'
                AND status IN ('pending', 'running', 'blocked')
-         ) AND status = 'committed'",
+         ) AND status = ?",
     )
+    .bind(intention_to)
     .bind(now)
     .bind(now)
     .bind(goal_id)
+    .bind(intention_from)
     .execute(&mut *connection)
     .await?;
     sqlx::query(
@@ -793,7 +807,7 @@ async fn reconcile_orphaned_mandate_runs(
         }
 
         let claimed_unresolved = invalidate_open_mandate_runs(connection, &goal_id, now).await?;
-        update_controller_status(connection, &goal_id, "awaiting_input", now).await?;
+        update_controller_status(connection, &goal_id, MandateStatus::AwaitingInput, now).await?;
         if claimed_unresolved == 0 {
             let notice = crate::traits::MandateRunNotification::new(
                 &mandate_id,
@@ -835,12 +849,12 @@ impl MandateStore for SqliteStateStore {
             matches!(
                 (
                     goal.status.as_str(),
-                    mandate.status.as_str(),
+                    mandate.status,
                     mandate.confirmed_at.is_some()
                 ),
-                ("active", "active", true)
-                    | ("pending_confirmation", "paused", false)
-                    | ("paused", "paused", true)
+                ("active", MandateStatus::Active, true)
+                    | ("pending_confirmation", MandateStatus::Paused, false)
+                    | ("paused", MandateStatus::Paused, true)
             ),
             "a new mandate controller must carry confirmation exactly when its lifecycle requires it"
         );
@@ -1005,7 +1019,7 @@ impl MandateStore for SqliteStateStore {
         .bind(&mandate.id)
         .bind(&mandate.goal_id)
         .bind(expected_version)
-        .bind(&mandate.status)
+        .bind(mandate.status.as_str())
         .execute(&mut *tx)
         .await?;
         anyhow::ensure!(
@@ -1037,7 +1051,13 @@ impl MandateStore for SqliteStateStore {
                 paused.rows_affected() == 1,
                 "claimed mutation invalidation requires an awaiting-input mandate"
             );
-            update_controller_status(&mut tx, &mandate.goal_id, "awaiting_input", &now).await?;
+            update_controller_status(
+                &mut tx,
+                &mandate.goal_id,
+                MandateStatus::AwaitingInput,
+                &now,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1072,7 +1092,7 @@ impl MandateStore for SqliteStateStore {
             tx.rollback().await?;
             return Ok(false);
         };
-        update_controller_status(&mut tx, &goal_id, "active", &now).await?;
+        update_controller_status(&mut tx, &goal_id, MandateStatus::Active, &now).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1080,19 +1100,9 @@ impl MandateStore for SqliteStateStore {
     async fn transition_mandate_status(
         &self,
         mandate_id: &str,
-        from_status: &str,
-        to_status: &str,
+        from_status: MandateStatus,
+        to_status: MandateStatus,
     ) -> anyhow::Result<bool> {
-        anyhow::ensure!(
-            matches!(
-                from_status,
-                "active" | "paused" | "awaiting_input" | "completed" | "cancelled"
-            ) && matches!(
-                to_status,
-                "active" | "paused" | "awaiting_input" | "completed" | "cancelled"
-            ),
-            "invalid mandate status transition"
-        );
         anyhow::ensure!(
             from_status != to_status,
             "mandate status transition is a no-op"
@@ -1101,14 +1111,7 @@ impl MandateStore for SqliteStateStore {
         // and only owner-mediated resume paths may leave paused/ASK states.
         // Invalid-but-known transitions report a failed CAS rather than an
         // error so callers cannot distinguish them from a concurrent change.
-        if !matches!(
-            (from_status, to_status),
-            (
-                "active",
-                "paused" | "awaiting_input" | "completed" | "cancelled"
-            ) | ("paused", "active" | "cancelled")
-                | ("awaiting_input", "active" | "cancelled")
-        ) {
+        if !from_status.can_transition_to(to_status) {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
@@ -1123,13 +1126,13 @@ impl MandateStore for SqliteStateStore {
                AND (? != 'active' OR confirmed_at IS NOT NULL)
              RETURNING goal_id",
         )
-        .bind(to_status)
-        .bind(to_status)
+        .bind(to_status.as_str())
+        .bind(to_status.as_str())
         .bind(&now)
         .bind(&now)
         .bind(mandate_id)
-        .bind(from_status)
-        .bind(to_status)
+        .bind(from_status.as_str())
+        .bind(to_status.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         let Some(goal_id) = goal_id else {
@@ -1149,12 +1152,15 @@ impl MandateStore for SqliteStateStore {
     async fn resume_mandate_with_context(
         &self,
         mandate_id: &str,
-        from_status: &str,
+        from_status: MandateStatus,
         expected_version: i64,
         controller_context: Option<&str>,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            matches!(from_status, "paused" | "awaiting_input"),
+            matches!(
+                from_status,
+                MandateStatus::Paused | MandateStatus::AwaitingInput
+            ) && from_status.can_transition_to(MandateStatus::Active),
             "only paused or awaiting-input mandates can resume"
         );
         anyhow::ensure!(expected_version > 0, "mandate version must be positive");
@@ -1179,7 +1185,7 @@ impl MandateStore for SqliteStateStore {
         .bind(&now)
         .bind(&now)
         .bind(mandate_id)
-        .bind(from_status)
+        .bind(from_status.as_str())
         .bind(expected_version)
         .fetch_optional(&mut *tx)
         .await?;
@@ -2012,7 +2018,7 @@ impl MandateStore for SqliteStateStore {
                 .validate_content_bounds()
                 .map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
-                intention.status == "committed" && intention.completed_at.is_none(),
+                intention.status == IntentionStatus::Committed && intention.completed_at.is_none(),
                 "a new intention must be committed and incomplete"
             );
             sqlx::query(
@@ -2031,7 +2037,7 @@ impl MandateStore for SqliteStateStore {
             .bind(&intention.expected_benefit)
             .bind(&intention.risk)
             .bind(&intention.invalidation_criteria)
-            .bind(&intention.status)
+            .bind(intention.status.as_str())
             .bind(&intention.created_at)
             .bind(&intention.updated_at)
             .bind(&intention.completed_at)
@@ -2108,7 +2114,7 @@ impl MandateStore for SqliteStateStore {
             .bind(limit.clamp(1, 200))
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.iter().map(intention_from_row).collect())
+        rows.iter().map(intention_from_row).collect()
     }
 
     async fn reserve_mandate_action_attempt(
@@ -2643,8 +2649,13 @@ impl MandateStore for SqliteStateStore {
                     run_updated.rows_affected() == 1 && mandate_updated.rows_affected() == 1,
                     "mandate review-failure retry state changed during finalization"
                 );
-                update_controller_status(&mut tx, &goal_id, "active", &request.finalized_at)
-                    .await?;
+                update_controller_status(
+                    &mut tx,
+                    &goal_id,
+                    MandateStatus::Active,
+                    &request.finalized_at,
+                )
+                .await?;
                 let notice = crate::traits::MandateRunNotification::new(
                     &request.mandate_id,
                     request.expected_mandate_version,
@@ -2704,14 +2715,20 @@ impl MandateStore for SqliteStateStore {
                 .bind(&request.goal_run_id)
                 .execute(&mut *tx)
                 .await?;
+                let (intention_from, intention_to) = intention_transition(
+                    IntentionStatus::Committed,
+                    IntentionStatus::Suspended,
+                )?;
                 sqlx::query(
                     "UPDATE intentions
-                     SET status = 'suspended', updated_at = ?, completed_at = ?
-                     WHERE goal_run_id = ? AND status = 'committed'",
+                     SET status = ?, updated_at = ?, completed_at = ?
+                     WHERE goal_run_id = ? AND status = ?",
                 )
+                .bind(intention_to)
                 .bind(&request.finalized_at)
                 .bind(&request.finalized_at)
                 .bind(&request.goal_run_id)
+                .bind(intention_from)
                 .execute(&mut *tx)
                 .await?;
                 let run_updated = sqlx::query(
@@ -2743,7 +2760,7 @@ impl MandateStore for SqliteStateStore {
                 update_controller_status(
                     &mut tx,
                     &goal_id,
-                    "awaiting_input",
+                    MandateStatus::AwaitingInput,
                     &request.finalized_at,
                 )
                 .await?;
@@ -2787,8 +2804,11 @@ impl MandateStore for SqliteStateStore {
         let Some(decision_action_attempts) = decision_action_attempts else {
             close_invalid_decision_state!();
         };
-        let mandate_status: String = row.get("mandate_status");
-        let expected_status = "active";
+        let mandate_status_raw: String = row.get("mandate_status");
+        let Some(mandate_status) = MandateStatus::parse(&mandate_status_raw) else {
+            close_invalid_decision_state!();
+        };
+        let expected_status = MandateStatus::Active;
         if mandate_status != expected_status {
             tx.rollback().await?;
             return Ok(MandateRunFinalizationResult::Stale {
@@ -2912,14 +2932,20 @@ impl MandateStore for SqliteStateStore {
                 .bind(&request.goal_run_id)
                 .execute(&mut *tx)
                 .await?;
+                let (intention_from, intention_to) = intention_transition(
+                    IntentionStatus::Committed,
+                    IntentionStatus::Suspended,
+                )?;
                 sqlx::query(
                     "UPDATE intentions
-                     SET status = 'suspended', updated_at = ?, completed_at = ?
-                     WHERE goal_run_id = ? AND status = 'committed'",
+                     SET status = ?, updated_at = ?, completed_at = ?
+                     WHERE goal_run_id = ? AND status = ?",
                 )
+                .bind(intention_to)
                 .bind(&request.finalized_at)
                 .bind(&request.finalized_at)
                 .bind(&request.goal_run_id)
+                .bind(intention_from)
                 .execute(&mut *tx)
                 .await?;
                 let run_updated = sqlx::query(
@@ -2942,7 +2968,7 @@ impl MandateStore for SqliteStateStore {
                 .bind(&request.finalized_at)
                 .bind(&request.mandate_id)
                 .bind(request.expected_mandate_version)
-                .bind(expected_status)
+                .bind(expected_status.as_str())
                 .execute(&mut *tx)
                 .await?;
                 if run_updated.rows_affected() != 1 || mandate_updated.rows_affected() != 1 {
@@ -2954,7 +2980,7 @@ impl MandateStore for SqliteStateStore {
                 update_controller_status(
                     &mut tx,
                     &goal_id,
-                    "awaiting_input",
+                    MandateStatus::AwaitingInput,
                     &request.finalized_at,
                 )
                 .await?;
@@ -3020,13 +3046,17 @@ impl MandateStore for SqliteStateStore {
                 if mutation_succeeded == 0 {
                     reconcile_fail_closed!(MandateReconciliationReason::ActMissingVerifiedMutation);
                 }
+                let (intention_from, intention_to) =
+                    intention_transition(IntentionStatus::Committed, IntentionStatus::Satisfied)?;
                 let intention_updated = sqlx::query(
-                    "UPDATE intentions SET status = 'satisfied', updated_at = ?, completed_at = ?
-                     WHERE id = ? AND status = 'committed' AND completed_at IS NULL",
+                    "UPDATE intentions SET status = ?, updated_at = ?, completed_at = ?
+                     WHERE id = ? AND status = ? AND completed_at IS NULL",
                 )
+                .bind(intention_to)
                 .bind(&request.finalized_at)
                 .bind(&request.finalized_at)
                 .bind(&intention_id)
+                .bind(intention_from)
                 .execute(&mut *tx)
                 .await?;
                 if intention_updated.rows_affected() != 1 {
@@ -3091,9 +3121,9 @@ impl MandateStore for SqliteStateStore {
                     close_invalid_decision_state!();
                 }
                 let final_mandate_status = match decision_outcome {
-                    MandateDecisionOutcome::Wait => "active",
-                    MandateDecisionOutcome::Ask => "awaiting_input",
-                    MandateDecisionOutcome::Stop => "completed",
+                    MandateDecisionOutcome::Wait => MandateStatus::Active,
+                    MandateDecisionOutcome::Ask => MandateStatus::AwaitingInput,
+                    MandateDecisionOutcome::Stop => MandateStatus::Completed,
                     MandateDecisionOutcome::Act => unreachable!(),
                 };
                 let mandate_updated = sqlx::query(
@@ -3102,7 +3132,7 @@ impl MandateStore for SqliteStateStore {
                          review_lease_expires_at = NULL, updated_at = ?
                      WHERE id = ? AND version = ? AND status = 'active'",
                 )
-                .bind(final_mandate_status)
+                .bind(final_mandate_status.as_str())
                 .bind(&request.finalized_at)
                 .bind(&request.mandate_id)
                 .bind(request.expected_mandate_version)
@@ -3505,7 +3535,7 @@ mod tests {
             3_600,
             300,
         );
-        pending_mandate.status = "paused".to_string();
+        pending_mandate.status = MandateStatus::Paused;
         pending_mandate.confirmed_at = None;
         store
             .create_mandate_controller(&pending_goal, &pending_mandate)
@@ -3527,7 +3557,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "paused"
+            MandateStatus::Paused
         );
 
         let (bad_goal, mut bad_mandate) = controller("owner-session", 2);
@@ -3629,10 +3659,10 @@ mod tests {
 
         let mut attempted_pause = loaded;
         attempted_pause.version += 1;
-        attempted_pause.status = "paused".to_string();
+        attempted_pause.status = MandateStatus::Paused;
         assert!(store.update_mandate(&attempted_pause).await.is_err());
         assert!(store
-            .transition_mandate_status(&mandate.id, "active", "paused")
+            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
             .await
             .unwrap());
         assert_eq!(
@@ -3660,7 +3690,7 @@ mod tests {
             3_600,
             300,
         );
-        mandate.status = "paused".to_string();
+        mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
         store
             .create_mandate_controller(&goal, &mandate)
@@ -3668,14 +3698,14 @@ mod tests {
             .unwrap();
 
         assert!(!store
-            .transition_mandate_status(&mandate.id, "paused", "active")
+            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
             .await
             .unwrap());
         assert!(store.confirm_mandate(&mandate.id).await.unwrap());
         assert!(!store.confirm_mandate(&mandate.id).await.unwrap());
 
         let confirmed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(confirmed.status, "active");
+        assert_eq!(confirmed.status, MandateStatus::Active);
         assert_eq!(confirmed.version, 2);
         assert!(confirmed.confirmed_at.is_some());
         assert!(confirmed.is_active());
@@ -3700,7 +3730,7 @@ mod tests {
             3_600,
             300,
         );
-        mandate.status = "paused".to_string();
+        mandate.status = MandateStatus::Paused;
         mandate.confirmed_at = None;
         store
             .create_mandate_controller(&goal, &mandate)
@@ -3721,17 +3751,23 @@ mod tests {
             1
         );
         let cancelled = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.status, MandateStatus::Cancelled);
         assert!(cancelled.confirmed_at.is_none());
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "cancelled"
         );
         assert!(!store.confirm_mandate(&mandate.id).await.unwrap());
-        assert!(!store
-            .transition_mandate_status(&mandate.id, "cancelled", "active")
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Cancelled,
+                    MandateStatus::Active,
+                )
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3913,7 +3949,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "active"
+            MandateStatus::Active
         );
         assert_eq!(
             store.get_task(&child_id).await.unwrap().unwrap().status,
@@ -3940,7 +3976,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "awaiting_input"
+            MandateStatus::AwaitingInput
         );
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
@@ -3974,10 +4010,16 @@ mod tests {
             .create_mandate_controller(&goal, &mandate)
             .await
             .unwrap();
-        assert!(store
-            .transition_mandate_status(&mandate.id, "active", "cancelled")
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Cancelled,
+                )
+                .await
+                .unwrap()
+        );
 
         assert!(!store
             .keep_mandate_controller_active(&mandate.id, mandate.version)
@@ -4019,11 +4061,11 @@ mod tests {
         stale_update.objective = "A stale owner snapshot".to_string();
 
         assert!(store
-            .transition_mandate_status(&mandate.id, "active", "paused")
+            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
             .await
             .unwrap());
         let paused = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.status, MandateStatus::Paused);
         assert_eq!(paused.version, mandate.version + 1);
         assert!(store
             .get_current_goal_run(&goal.id)
@@ -4036,7 +4078,7 @@ mod tests {
         );
         assert_eq!(
             store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
-            "suspended"
+            IntentionStatus::Suspended
         );
         assert!(!store
             .reserve_mandate_action_attempt(&reservation(
@@ -4053,7 +4095,7 @@ mod tests {
             .is_some());
 
         assert!(store
-            .transition_mandate_status(&mandate.id, "paused", "active")
+            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
             .await
             .unwrap());
         let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
@@ -4071,13 +4113,19 @@ mod tests {
         let mut stale_cancel_racer = resumed;
         stale_cancel_racer.version += 1;
         stale_cancel_racer.objective = "Must not resurrect after cancel".to_string();
-        assert!(store
-            .transition_mandate_status(&mandate.id, "active", "cancelled")
-            .await
-            .unwrap());
+        assert!(
+            store
+                .transition_mandate_status(
+                    &mandate.id,
+                    MandateStatus::Active,
+                    MandateStatus::Cancelled,
+                )
+                .await
+                .unwrap()
+        );
         assert!(store.update_mandate(&stale_cancel_racer).await.is_err());
         let cancelled = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.status, MandateStatus::Cancelled);
         assert_eq!(cancelled.version, mandate.version + 3);
     }
 
@@ -4184,7 +4232,7 @@ mod tests {
             .unwrap());
 
         assert!(store
-            .transition_mandate_status(&mandate.id, "active", "paused")
+            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
             .await
             .unwrap());
         let attempts = store
@@ -4266,7 +4314,7 @@ mod tests {
 
         let stored = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(stored.version, updated.version);
-        assert_eq!(stored.status, "awaiting_input");
+        assert_eq!(stored.status, MandateStatus::AwaitingInput);
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "paused"
@@ -4351,7 +4399,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "completed"
+            MandateStatus::Completed
         );
         let controller = store.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(controller.status, "completed");
@@ -4403,7 +4451,7 @@ mod tests {
             .unwrap();
 
         let loaded = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(loaded.status, "active");
+        assert_eq!(loaded.status, MandateStatus::Active);
         assert!(loaded.review_lease_token.is_none());
         let next = chrono::DateTime::parse_from_rfc3339(&loaded.next_review_at)
             .unwrap()
@@ -4774,11 +4822,11 @@ mod tests {
             .await
             .unwrap());
         assert!(store
-            .transition_mandate_status(&mandate.id, "active", "paused")
+            .transition_mandate_status(&mandate.id, MandateStatus::Active, MandateStatus::Paused,)
             .await
             .unwrap());
         assert!(store
-            .transition_mandate_status(&mandate.id, "paused", "active")
+            .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
             .await
             .unwrap());
         let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
@@ -4952,7 +5000,7 @@ mod tests {
                     .is_none());
                 assert_eq!(
                     store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
-                    "suspended"
+                    IntentionStatus::Suspended
                 );
                 assert_eq!(
                     store
@@ -4961,7 +5009,7 @@ mod tests {
                         .unwrap()
                         .unwrap()
                         .status,
-                    "awaiting_input"
+                    MandateStatus::AwaitingInput
                 );
                 assert_eq!(
                     store.get_goal(&goal.id).await.unwrap().unwrap().status,
@@ -4978,7 +5026,7 @@ mod tests {
                 );
                 assert_eq!(
                     store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
-                    "satisfied"
+                    IntentionStatus::Satisfied
                 );
             }
         }
@@ -5117,7 +5165,7 @@ mod tests {
             "failed"
         );
         let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
-        assert_eq!(current.status, "active");
+        assert_eq!(current.status, MandateStatus::Active);
         assert!(
             chrono::DateTime::parse_from_rfc3339(&current.next_review_at)
                 .unwrap()
@@ -5213,7 +5261,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "awaiting_input"
+            MandateStatus::AwaitingInput
         );
         assert_eq!(
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
@@ -5238,8 +5286,16 @@ mod tests {
     #[tokio::test]
     async fn ask_and_stop_atomically_change_mandate_and_controller_status() {
         for (outcome, expected_mandate, expected_goal) in [
-            (MandateDecisionOutcome::Ask, "awaiting_input", "paused"),
-            (MandateDecisionOutcome::Stop, "completed", "completed"),
+            (
+                MandateDecisionOutcome::Ask,
+                MandateStatus::AwaitingInput,
+                "paused",
+            ),
+            (
+                MandateDecisionOutcome::Stop,
+                MandateStatus::Completed,
+                "completed",
+            ),
         ] {
             let (store, _database) = test_store().await;
             let (goal, mandate) = controller("owner-session", 1);
@@ -5275,7 +5331,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .status,
-                "active",
+                MandateStatus::Active,
                 "the lifecycle transition remains provisional until proof finalization"
             );
             assert_eq!(
@@ -5363,7 +5419,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .status,
-                "active"
+                MandateStatus::Active
             );
             sqlx::query("UPDATE task_attempts SET lease_expires_at = ? WHERE id = ?")
                 .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
@@ -5384,7 +5440,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .status,
-                "awaiting_input"
+                MandateStatus::AwaitingInput
             );
             assert_eq!(
                 store.get_goal(&goal.id).await.unwrap().unwrap().status,
