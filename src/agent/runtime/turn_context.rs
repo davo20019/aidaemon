@@ -487,6 +487,10 @@ impl Agent {
         has_attachments: bool,
     ) -> anyhow::Result<()> {
         let normalized_msg = normalize_message_resources(msg);
+        let execution_origin = self
+            .mandate_execution
+            .as_ref()
+            .map(|_| "mandate".to_string());
         emitter
             .emit(
                 EventType::UserMessage,
@@ -502,6 +506,10 @@ impl Agent {
                     "platform": channel_ctx.platform.clone(),
                     "sender_id": channel_ctx.sender_id.clone(),
                     "user_role": user_role.to_string(),
+                    // Durable, explicit provenance. Memory isolation must not
+                    // depend on the worker's generated session name or on an
+                    // owner role inherited by an internal mandate worker.
+                    "execution_origin": execution_origin,
                     // Pillar B: stamp the turn_id onto the emitted event so the
                     // turn-anchored fetch (which filters turn_id IS NOT NULL)
                     // returns this message. Without this the row is NULL.

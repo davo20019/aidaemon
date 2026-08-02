@@ -51,6 +51,11 @@ pub struct ChatOptions {
     /// Used for truncation recovery: when a thinking model spends all tokens on
     /// reasoning with no usable output, the retry reduces effort to "low".
     pub reasoning_effort_override: Option<String>,
+    /// Security-sensitive callers can require exactly one physical provider
+    /// attempt. Any provider error must return immediately instead of retrying,
+    /// cascading, or stripping controls; otherwise failed attempts can consume
+    /// unknowable tokens outside a hard aggregate budget.
+    pub single_attempt_fail_closed: bool,
     /// llama.cpp KV-cache slot pin (`id_slot`) for this call only.
     ///
     /// `None` (the default) means "use the provider's background slot" when slot

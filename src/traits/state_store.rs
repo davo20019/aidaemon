@@ -306,6 +306,71 @@ pub trait TokenUsageStore: Send + Sync {
     ) -> anyhow::Result<Vec<(String, i64, i64, i64)>> {
         Ok(vec![]) // default no-op
     }
+
+    /// Create (once) and read the immutable token budget for one mandate
+    /// decision run. Implementations must validate the exact active mandate
+    /// authority epoch and running goal-run fence. Returning success without
+    /// durable enforcement would make autonomous execution fail open, so the
+    /// default is deliberately unsupported.
+    async fn ensure_mandate_run_token_budget(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _budget_per_cycle: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Try to serialize one model call across every worker in a mandate run.
+    /// Returns `(acquired, tokens_used, budget_per_cycle)`. `acquired = false`
+    /// means either another call holds the lease or the immutable cycle budget
+    /// is exhausted; callers distinguish those states from the counters.
+    async fn try_acquire_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<(bool, i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Mark the exact acquired lease as physically dispatched and
+    /// pessimistically reserve its entire remaining cycle balance. This must
+    /// commit before provider I/O begins.
+    async fn mark_mandate_run_token_lease_dispatched(
+        &self,
+        _goal_run_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Atomically replace a dispatched call's pessimistic reservation with
+    /// trusted actual usage and release the exact call lease. Returns
+    /// `(tokens_used, budget_per_cycle)`.
+    async fn settle_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+        _delta_tokens: i64,
+    ) -> anyhow::Result<(i64, i64)> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
+
+    /// Release a call lease only when the caller proves provider dispatch never
+    /// began. A stale/mismatched lease must not release a newer worker's call.
+    async fn release_mandate_run_token_lease(
+        &self,
+        _goal_run_id: &str,
+        _lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("durable mandate run token budgets are not supported by this store")
+    }
 }
 
 /// Learning system: procedures, expertise, behavior patterns, and error solutions.
@@ -864,6 +929,245 @@ pub trait GoalStore: Send + Sync {
     /// Returns true when the status transition was applied.
     async fn activate_goal(&self, _goal_id: &str) -> anyhow::Result<bool> {
         Ok(false)
+    }
+}
+
+/// Owner mandates, agent deliberation cycles, and intentions.
+#[async_trait]
+pub trait MandateStore: Send + Sync {
+    /// Atomically create the continuous controller goal and its mandate.
+    /// Adaptive review timing lives on the mandate, not in `goal_schedules`.
+    async fn create_mandate_controller(
+        &self,
+        _goal: &super::Goal,
+        _mandate: &super::Mandate,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("mandate controllers are not supported by this store")
+    }
+
+    async fn get_mandate(&self, _id: &str) -> anyhow::Result<Option<super::Mandate>> {
+        Ok(None)
+    }
+
+    async fn get_mandate_for_goal(&self, _goal_id: &str) -> anyhow::Result<Option<super::Mandate>> {
+        Ok(None)
+    }
+
+    async fn list_mandates(
+        &self,
+        _session_id: Option<&str>,
+        _include_terminal: bool,
+    ) -> anyhow::Result<Vec<super::Mandate>> {
+        Ok(Vec::new())
+    }
+
+    /// Optimistic owner-policy update. `mandate.version` must be exactly one
+    /// greater than the currently stored version.
+    async fn update_mandate(&self, _mandate: &super::Mandate) -> anyhow::Result<()> {
+        anyhow::bail!("mandates are not supported by this store")
+    }
+
+    /// Atomically consume an explicit owner confirmation and activate both the
+    /// mandate and its continuous controller. This is the only path that may
+    /// turn an unconfirmed mandate into active authority.
+    async fn confirm_mandate(&self, _mandate_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Atomic lifecycle/authority-epoch transition. Implementations must
+    /// invalidate open decision runs and stale ACT authority before returning.
+    async fn transition_mandate_status(
+        &self,
+        _mandate_id: &str,
+        _from_status: &str,
+        _to_status: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Resume a paused/awaiting-input mandate and update its controller
+    /// context in the same expected-version transaction. This prevents owner
+    /// guidance from overwriting a concurrent cancel/pause lifecycle state.
+    async fn resume_mandate_with_context(
+        &self,
+        _mandate_id: &str,
+        _from_status: &str,
+        _expected_version: i64,
+        _controller_context: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Atomically create one mandate review run and its root task under the
+    /// caller's current review lease. A failed root insert must
+    /// leave no open run behind.
+    async fn create_mandate_review_run(
+        &self,
+        _mandate_id: &str,
+        _review_lease_token: &str,
+        _goal_run_id: &str,
+        _root_task: &super::Task,
+    ) -> anyhow::Result<super::GoalRun> {
+        anyhow::bail!("mandate review runs are not supported by this store")
+    }
+
+    /// Repair controller runtime state only while the exact mandate authority
+    /// epoch is still active. The state check and goal update must be one
+    /// atomic database statement so a racing owner pause/cancel wins.
+    async fn keep_mandate_controller_active(
+        &self,
+        _mandate_id: &str,
+        _expected_version: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Claim due reviews with a durable lease. Concurrent callers must never
+    /// receive the same mandate before the lease expires.
+    async fn claim_due_mandates(
+        &self,
+        _limit: i64,
+        _lease_owner: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<Vec<super::Mandate>> {
+        Ok(Vec::new())
+    }
+
+    async fn release_mandate_review_lease(
+        &self,
+        _mandate_id: &str,
+        _lease_token: &str,
+        _retry_at: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Insert one non-root action task into an exact mandate run while the
+    /// dispatcher-owned root attempt remains current. Implementations must
+    /// validate the mandate/run/attempt fence and task cap atomically and must
+    /// never create or rebind a goal run by goal id.
+    async fn create_mandate_task_from_attempt(
+        &self,
+        _task: &super::Task,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _goal_run_id: &str,
+        _root_task_attempt_id: &str,
+        _max_non_root_tasks: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Claim one pending non-root task inside an exact running mandate cycle.
+    /// The root task-attempt remains the control-plane lease; the returned
+    /// child attempt deliberately carries no worker-profile/workspace binding.
+    /// The independently fenced identifiers remain explicit because wrapping
+    /// them would churn the stable store API without reducing validation work.
+    #[allow(clippy::too_many_arguments)]
+    async fn claim_mandate_task_from_attempt(
+        &self,
+        _task_id: &str,
+        _worker_instance_id: &str,
+        _mandate_id: &str,
+        _mandate_version: i64,
+        _goal_run_id: &str,
+        _root_task_attempt_id: &str,
+        _lease_secs: i64,
+    ) -> anyhow::Result<Option<super::TaskAttempt>> {
+        Ok(None)
+    }
+
+    /// Insert exactly one deliberation result for a goal run, plus its ACT
+    /// intention when present. Implementations must commit both atomically.
+    async fn record_mandate_decision(
+        &self,
+        _decision: &super::MandateDecisionCycle,
+        _intention: Option<&super::Intention>,
+        _task_attempt_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("mandate decisions are not supported by this store")
+    }
+
+    async fn get_mandate_decision_for_run(
+        &self,
+        _goal_run_id: &str,
+    ) -> anyhow::Result<Option<super::MandateDecisionCycle>> {
+        Ok(None)
+    }
+
+    async fn list_mandate_decisions(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::MandateDecisionCycle>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_intentions(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::Intention>> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically reserve the exact next mutation attempt under the current
+    /// cycle, rolling-24h, cooldown, mandate, run, intention, task, and lease
+    /// fences. Implementations must insert the durable ledger row and advance
+    /// the cycle counter in one transaction.
+    async fn reserve_mandate_action_attempt(
+        &self,
+        _reservation: &super::MandateMutationReservation,
+    ) -> anyhow::Result<Option<super::MandateMutationAttempt>> {
+        Ok(None)
+    }
+
+    /// Atomically claim one exact reserved mutation at the last common
+    /// dispatcher. A claim is one-use and must fail if any authority, run,
+    /// task-attempt, tool-call, digest, or reservation field is stale.
+    async fn claim_mandate_mutation_dispatch(
+        &self,
+        _claim: &super::MandateMutationDispatchClaim,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Read the typed, cross-cycle mutation quota projection at one instant.
+    /// This is advisory for deliberation; reservation remains authoritative.
+    async fn get_mandate_mutation_quota_state(
+        &self,
+        _mandate_id: &str,
+        _as_of: &str,
+    ) -> anyhow::Result<Option<super::MandateMutationQuotaState>> {
+        Ok(None)
+    }
+
+    /// Project one strict common-dispatch receipt into an existing reservation.
+    /// Only exact grant/task/call matches may transition a reserved row.
+    async fn project_mandate_mutation_outcome(
+        &self,
+        _projection: &super::MandateMutationOutcomeProjection,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn list_mandate_mutation_attempts_for_run(
+        &self,
+        _goal_run_id: &str,
+    ) -> anyhow::Result<Vec<super::MandateMutationAttempt>> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically prove and close a mandate run. Satisfied outcomes close the
+    /// goal run (and ACT intention) inside the proof transaction; reconciliation
+    /// results leave lifecycle state untouched for the caller's explicit path.
+    async fn finalize_mandate_run_from_proof(
+        &self,
+        _request: &super::MandateRunFinalizationRequest,
+    ) -> anyhow::Result<super::MandateRunFinalizationResult> {
+        Ok(super::MandateRunFinalizationResult::Rejected {
+            reason: super::MandateFinalizationRejectReason::InvalidRequest,
+        })
     }
 }
 
@@ -1456,6 +1760,7 @@ pub trait StateStore:
     + PeopleStore
     + OAuthStore
     + GoalStore
+    + MandateStore
     + TaskStore
     + GoalScheduleStore
     + GoalBudgetStore
@@ -1488,6 +1793,7 @@ impl<T> StateStore for T where
         + PeopleStore
         + OAuthStore
         + GoalStore
+        + MandateStore
         + TaskStore
         + GoalScheduleStore
         + GoalBudgetStore

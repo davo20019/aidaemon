@@ -11,15 +11,19 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::events::TaskOutcome;
-use crate::traits::AgentRole;
+use crate::traits::{
+    AgentRole, Mandate, MandateDecisionOutcome, MandateFinalizationRejectReason,
+    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
+    MandateRunNotificationKind, StateStore,
+};
 use crate::types::{ChannelContext, UserRole};
 
 use super::parent_delivery;
 use super::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
-    extract_file_paths_from_text, goal_has_scheduled_provenance, is_group_session,
-    is_low_signal_task_lead_reply, is_scheduled_task_description, parse_goal_leading_wait,
+    extract_file_paths_from_text, goal_has_scheduled_provenance, is_goal_run_root_task_description,
+    is_group_session, is_low_signal_task_lead_reply, parse_goal_leading_wait,
     parse_wait_task_seconds, persist_scheduled_run_state, strip_leading_wait,
     truncate_goal_result_text, user_facing_task_description, Agent,
 };
@@ -437,6 +441,149 @@ fn failed_run_summary(tasks: &[crate::traits::Task], fallback: Option<&str>) -> 
         .to_string()
 }
 
+async fn keep_mandate_controller_open(
+    state: &Arc<dyn StateStore>,
+    mandate: &Mandate,
+    goal: &crate::traits::Goal,
+) {
+    // Do not overwrite an owner pause/cancel that raced this review. Runtime
+    // repair is allowed only while the mandate itself still says `active`.
+    if mandate.status != "active" {
+        return;
+    }
+    if matches!(goal.status.as_str(), "active" | "pending") && goal.dispatch_failures == 0 {
+        return;
+    }
+    // The state store checks the current mandate status and exact authority
+    // epoch in the same SQL statement that repairs the goal. A pause/cancel or
+    // policy update racing this stale finalizer snapshot therefore wins.
+    if let Err(error) = state
+        .keep_mandate_controller_active(&mandate.id, mandate.version)
+        .await
+    {
+        warn!(
+            mandate_id = %mandate.id,
+            goal_id = %goal.id,
+            %error,
+            "Failed to keep mandate controller goal active"
+        );
+    }
+}
+
+/// Finalize one mandate deliberation independently from scheduled-run state.
+///
+/// Any returned notice was already committed by the state store in the same
+/// transaction as the terminal proof state. The caller may attempt prompt
+/// delivery, but must never enqueue a second, post-commit copy.
+async fn finalize_mandate_review(
+    state: &Arc<dyn StateStore>,
+    goal: &crate::traits::Goal,
+    goal_run_id: &str,
+    _trigger_status: Option<&str>,
+    _run_tasks: &[crate::traits::Task],
+    _fallback_error: Option<&str>,
+    _executor_results_already_sent: bool,
+) -> Option<MandateRunNotification> {
+    let mandate = match state.get_mandate_for_goal(&goal.id).await {
+        Ok(Some(mandate)) => mandate,
+        Ok(None) => {
+            warn!(goal_id = %goal.id, run_id = %goal_run_id, "Mandate run has no mandate record");
+            return None;
+        }
+        Err(error) => {
+            warn!(goal_id = %goal.id, run_id = %goal_run_id, %error, "Failed to load mandate during finalization");
+            return None;
+        }
+    };
+
+    let finalized_at = chrono::Utc::now().to_rfc3339();
+    let proof = match state
+        .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+            mandate_id: mandate.id.clone(),
+            expected_mandate_version: mandate.version,
+            goal_run_id: goal_run_id.to_string(),
+            finalized_at: finalized_at.clone(),
+        })
+        .await
+    {
+        Ok(proof) => proof,
+        Err(error) => {
+            warn!(
+                mandate_id = %mandate.id,
+                run_id = %goal_run_id,
+                %error,
+                "Atomic mandate proof finalization failed"
+            );
+            return None;
+        }
+    };
+
+    let notice = |kind, counts| {
+        MandateRunNotification::new(
+            &mandate.id,
+            mandate.version,
+            &goal.id,
+            goal_run_id,
+            &goal.session_id,
+            kind,
+            counts,
+            &finalized_at,
+        )
+    };
+    match proof {
+        MandateRunFinalizationResult::ActSatisfied { counts } => {
+            keep_mandate_controller_open(state, &mandate, goal).await;
+            Some(notice(MandateRunNotificationKind::ActSatisfied, counts))
+        }
+        MandateRunFinalizationResult::NonActionSatisfied { outcome, counts } => match outcome {
+            MandateDecisionOutcome::Wait => {
+                keep_mandate_controller_open(state, &mandate, goal).await;
+                None
+            }
+            MandateDecisionOutcome::Ask => Some(notice(MandateRunNotificationKind::Ask, counts)),
+            MandateDecisionOutcome::Stop => {
+                Some(notice(MandateRunNotificationKind::Stopped, counts))
+            }
+            MandateDecisionOutcome::Act => {
+                warn!(
+                    mandate_id = %mandate.id,
+                    run_id = %goal_run_id,
+                    "State store returned ACT as a non-action proof"
+                );
+                None
+            }
+        },
+        MandateRunFinalizationResult::ReconciliationRequired { reason, counts } => Some(notice(
+            MandateRunNotificationKind::ReconciliationRequired { reason },
+            counts,
+        )),
+        MandateRunFinalizationResult::Stale { reason } => {
+            info!(
+                mandate_id = %mandate.id,
+                run_id = %goal_run_id,
+                ?reason,
+                "Mandate review finalization was already stale"
+            );
+            None
+        }
+        MandateRunFinalizationResult::Rejected { reason } => match reason {
+            MandateFinalizationRejectReason::InvalidRequest => {
+                warn!(
+                    mandate_id = %mandate.id,
+                    run_id = %goal_run_id,
+                    "State store rejected an internally constructed mandate finalization request"
+                );
+                None
+            }
+            MandateFinalizationRejectReason::DecisionMissing
+            | MandateFinalizationRejectReason::InvalidDecisionState => Some(notice(
+                MandateRunNotificationKind::ReviewFailed { reason },
+                Default::default(),
+            )),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContinuousDispatchOutcome {
     Progress,
@@ -529,12 +676,12 @@ pub fn spawn_background_task_lead(
         let body = async move {
             let goal_id = goal.id.clone();
             let mission = goal.description.clone();
-            let goal_run_id = state
-                .get_current_goal_run(&goal_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|run| run.id);
+            let initial_goal = goal.clone();
+            let goal_run = state.get_current_goal_run(&goal_id).await.ok().flatten();
+            let goal_run_id = goal_run.as_ref().map(|run| run.id.clone());
+            let is_mandate_run = goal_run
+                .as_ref()
+                .is_some_and(|run| run.trigger_type == "mandate");
             let dispatch_attempt =
                 if let Some(trigger_task_id) = dispatch_trigger_task_id.as_deref() {
                     state
@@ -693,6 +840,8 @@ pub fn spawn_background_task_lead(
             let keepalive_state = state.clone();
             let keepalive_task_id = dispatch_trigger_task_id.clone();
             let keepalive_attempt = dispatch_attempt.clone();
+            let task_lead_lease_lost = Arc::new(AtomicBool::new(false));
+            let keepalive_lease_lost = task_lead_lease_lost.clone();
             let keepalive_handle = tokio::spawn(async move {
                 let Some(task_id) = keepalive_task_id else {
                     let _ = keepalive_cancel_rx.await;
@@ -711,6 +860,7 @@ pub fn spawn_background_task_lead(
                                     .await
                                     .unwrap_or(false);
                                 if !renewed {
+                                    keepalive_lease_lost.store(true, Ordering::Release);
                                     warn!(
                                         task_id = %task_id,
                                         attempt_id = %attempt.id,
@@ -753,11 +903,16 @@ pub fn spawn_background_task_lead(
             let heartbeat_goal_run_id = goal_run_id.clone();
             let heartbeat_trigger_task_id = dispatch_trigger_task_id.clone();
             let heartbeat_initial_surface = initial_surface_id;
+            let suppress_mandate_progress = is_mandate_run;
             let (heartbeat_cancel_tx, mut heartbeat_cancel_rx) =
                 tokio::sync::oneshot::channel::<()>();
             let heartbeat_handle = tokio::spawn(async move {
-                if is_group_channel {
-                    // In group channels, just wait for cancellation — no progress spam
+                if is_group_channel || suppress_mandate_progress {
+                    // Shared channels avoid progress spam. Mandate runs also
+                    // suppress it because generated task descriptions and
+                    // external-derived state are not control-plane-safe owner
+                    // notifications; only the static finalizer may surface a
+                    // mandate cycle outcome.
                     let _ = heartbeat_cancel_rx.await;
                     return;
                 }
@@ -813,7 +968,7 @@ pub fn spawn_background_task_lead(
                             // Skip the parent "Scheduled check: <goal>" task — its
                             // description is the full (often huge) goal text, which
                             // is internal noise, not a user-facing step.
-                            .filter(|t| !is_scheduled_task_description(&t.description))
+                            .filter(|t| !is_goal_run_root_task_description(&t.description))
                             .take(2)
                             // Keep each step label short so the progress line stays a
                             // glanceable one-liner, never a wall of text.
@@ -877,111 +1032,116 @@ pub fn spawn_background_task_lead(
             // remainder — but only if there actually IS a remainder after the wait.
             let effective_mission;
             let effective_user_text;
-            if let Some(wait_secs) = parse_goal_leading_wait(&mission) {
-                let remainder = strip_leading_wait(&mission);
-                info!(
-                    goal_id = %goal_id,
-                    wait_secs,
-                    has_remainder = !remainder.is_empty(),
-                    "Intercepted wait prefix in goal — sleeping locally"
-                );
-                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            if !is_mandate_run {
+                if let Some(wait_secs) = parse_goal_leading_wait(&mission) {
+                    let remainder = strip_leading_wait(&mission);
+                    info!(
+                        goal_id = %goal_id,
+                        wait_secs,
+                        has_remainder = !remainder.is_empty(),
+                        "Intercepted wait prefix in goal — sleeping locally"
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 
-                if remainder.is_empty() {
-                    // Pure wait goal with nothing after — mark complete, skip LLM entirely.
-                    let _ = heartbeat_cancel_tx.send(());
-                    let _ = heartbeat_handle.await;
-                    let _ = keepalive_cancel_tx.send(());
-                    let _ = keepalive_handle.await;
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let msg = format!("Waited for {} second(s).", wait_secs);
-                    if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
-                        if g.status == "active" || g.status == "pending" {
-                            g.status = "completed".to_string();
-                            g.completed_at = Some(now.clone());
-                            g.updated_at = now.clone();
-                            let _ = state.update_goal(&g).await;
-                        }
-                    }
-
-                    // Finalize any non-terminal tasks so we don't leave pending rows behind
-                    // after a local pure-wait short-circuit.
-                    for task in
-                        tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await
-                    {
-                        if task.status != "completed"
-                            && task.status != "failed"
-                            && task.status != "cancelled"
-                        {
-                            if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref() {
-                                if let Some(attempt) = dispatch_attempt.as_ref() {
-                                    let handoff = crate::traits::TaskHandoff {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        task_id: task.id.clone(),
-                                        attempt_id: attempt.id.clone(),
-                                        summary: msg.clone(),
-                                        artifacts: Vec::new(),
-                                        verification: vec![
-                                            "Timer elapsed without cancellation.".to_string()
-                                        ],
-                                        remaining_risk: None,
-                                        next_step: None,
-                                        created_at: now.clone(),
-                                    };
-                                    let patch = crate::traits::TaskAttemptPatch {
-                                        status: "completed".to_string(),
-                                        result: Some(msg.clone()),
-                                        handoff: Some(handoff),
-                                        ..Default::default()
-                                    };
-                                    let _ = state
-                                        .patch_task_from_attempt(
-                                            &attempt.id,
-                                            &attempt.lease_token,
-                                            &patch,
-                                        )
-                                        .await;
-                                    continue;
-                                }
+                    if remainder.is_empty() {
+                        // Pure wait goal with nothing after — mark complete, skip LLM entirely.
+                        let _ = heartbeat_cancel_tx.send(());
+                        let _ = heartbeat_handle.await;
+                        let _ = keepalive_cancel_tx.send(());
+                        let _ = keepalive_handle.await;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let msg = format!("Waited for {} second(s).", wait_secs);
+                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await {
+                            if g.status == "active" || g.status == "pending" {
+                                g.status = "completed".to_string();
+                                g.completed_at = Some(now.clone());
+                                g.updated_at = now.clone();
+                                let _ = state.update_goal(&g).await;
                             }
-                            let mut updated = task.clone();
-                            updated.status = "completed".to_string();
-                            updated.error = None;
-                            updated.result = Some(msg.clone());
-                            updated.completed_at = Some(now.clone());
-                            let _ = state.update_task(&updated).await;
                         }
-                    }
-                    if let Some(run_id) = goal_run_id.as_deref() {
-                        let _ = state.finish_goal_run(run_id, "completed", Some(&msg)).await;
-                    }
 
-                    if let Err(err) = agent
-                        .deliver_parent_text_result(
-                            hub.as_ref(),
-                            &session_id,
-                            &msg,
-                            parent_delivery::ParentDeliveryKind::WaitResult,
-                        )
-                        .await
-                    {
-                        warn!(
-                            session_id = %session_id,
-                            error = %err,
-                            "Failed to record parent-mediated wait result"
-                        );
+                        // Finalize any non-terminal tasks so we don't leave pending rows behind
+                        // after a local pure-wait short-circuit.
+                        for task in
+                            tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await
+                        {
+                            if task.status != "completed"
+                                && task.status != "failed"
+                                && task.status != "cancelled"
+                            {
+                                if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref() {
+                                    if let Some(attempt) = dispatch_attempt.as_ref() {
+                                        let handoff = crate::traits::TaskHandoff {
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            task_id: task.id.clone(),
+                                            attempt_id: attempt.id.clone(),
+                                            summary: msg.clone(),
+                                            artifacts: Vec::new(),
+                                            verification: vec![
+                                                "Timer elapsed without cancellation.".to_string(),
+                                            ],
+                                            remaining_risk: None,
+                                            next_step: None,
+                                            created_at: now.clone(),
+                                        };
+                                        let patch = crate::traits::TaskAttemptPatch {
+                                            status: "completed".to_string(),
+                                            result: Some(msg.clone()),
+                                            handoff: Some(handoff),
+                                            ..Default::default()
+                                        };
+                                        let _ = state
+                                            .patch_task_from_attempt(
+                                                &attempt.id,
+                                                &attempt.lease_token,
+                                                &patch,
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                }
+                                let mut updated = task.clone();
+                                updated.status = "completed".to_string();
+                                updated.error = None;
+                                updated.result = Some(msg.clone());
+                                updated.completed_at = Some(now.clone());
+                                let _ = state.update_task(&updated).await;
+                            }
+                        }
+                        if let Some(run_id) = goal_run_id.as_deref() {
+                            let _ = state.finish_goal_run(run_id, "completed", Some(&msg)).await;
+                        }
+
+                        if let Err(err) = agent
+                            .deliver_parent_text_result(
+                                hub.as_ref(),
+                                &session_id,
+                                &msg,
+                                parent_delivery::ParentDeliveryKind::WaitResult,
+                            )
+                            .await
+                        {
+                            warn!(
+                                session_id = %session_id,
+                                error = %err,
+                                "Failed to record parent-mediated wait result"
+                            );
+                        }
+                        return;
                     }
-                    return;
+                    effective_mission = remainder.clone();
+                    effective_user_text = remainder;
+                } else {
+                    effective_mission = mission.clone();
+                    effective_user_text = user_text.clone();
                 }
-                effective_mission = remainder.clone();
-                effective_user_text = remainder;
             } else {
                 effective_mission = mission.clone();
                 effective_user_text = user_text.clone();
             }
 
             let task_lead_run = agent
-                .spawn_child_with_outcome(
+                .spawn_child_with_outcome_and_attempt(
                     &effective_mission,
                     &effective_user_text,
                     None,
@@ -989,12 +1149,37 @@ pub fn spawn_background_task_lead(
                     fallback_user_role,
                     Some(AgentRole::TaskLead),
                     Some(goal_id.as_str()),
-                    None,
+                    dispatch_trigger_task_id.as_deref(),
                     None,
                     None, // arg_specialist (task lead spawn — not LLM-tool-selectable)
                     Some(&session_id),
+                    dispatch_attempt.clone(),
                 )
                 .await;
+
+            // A child can finish after its keepalive observed a revoked or
+            // expired lease. Revalidate the exact attempt before consuming its
+            // response or dispatching any tasks it planned. The conditional
+            // heartbeat is both a renewal and an authoritative ownership read.
+            if let Some(attempt) = dispatch_attempt.as_ref() {
+                let lease_live = !task_lead_lease_lost.load(Ordering::Acquire)
+                    && state
+                        .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
+                        .await
+                        .unwrap_or(false);
+                if !lease_live {
+                    warn!(
+                        goal_id = %goal_id,
+                        attempt_id = %attempt.id,
+                        "Discarding task-lead result after execution lease loss"
+                    );
+                    let _ = heartbeat_cancel_tx.send(());
+                    let _ = heartbeat_handle.await;
+                    let _ = keepalive_cancel_tx.send(());
+                    let _ = keepalive_handle.await;
+                    return;
+                }
+            }
             let task_lead_outcome = task_lead_run.as_ref().ok().map(|run| run.outcome);
             let result = task_lead_run.map(|run| run.response);
 
@@ -1021,17 +1206,24 @@ pub fn spawn_background_task_lead(
                 project_scope: dispatch_project_scope.clone(),
             };
 
-            // Auto-dispatch: dispatch remaining pending tasks after task lead returns.
-            // This handles both cases: LLMs that create tasks but don't spawn executors,
-            // AND task leads that completed some tasks but left others pending.
-            // Uses a loop to re-evaluate after each batch — completing a task may
-            // unblock dependent tasks that weren't dispatchable in the previous pass.
-            {
+            // Generic runs may auto-dispatch pending work. Mandate runs must use
+            // the explicit control-plane claim path, which atomically binds the
+            // child attempt to the root lease, current ACT, committed intention,
+            // and immutable mandate version. The generic profile-based claimant
+            // is therefore unavailable for mandate-origin work.
+            if !is_mandate_run {
                 let max_dispatch_rounds = 4; // safety limit — keep low to bound token usage
                 const AUTO_DISPATCH_MAX_BUDGET_EXTENSIONS: usize = 0;
                 const AUTO_DISPATCH_HARD_TOKEN_CAP: i64 = 2_000_000;
                 let mut budget_exhausted = false;
                 for _round in 0..max_dispatch_rounds {
+                    if task_lead_lease_lost.load(Ordering::Acquire) {
+                        warn!(
+                            goal_id = %goal_id,
+                            "Stopping task-lead auto-dispatch after execution lease loss"
+                        );
+                        break;
+                    }
                     let all_tasks = work_tasks_for_current_run(
                         &state,
                         &goal_id,
@@ -1253,13 +1445,34 @@ pub fn spawn_background_task_lead(
                 .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id.as_deref())
                 .cloned()
                 .collect::<Vec<_>>();
+            let mandate_decision_ready = if !is_mandate_run {
+                true
+            } else {
+                match goal_run_id.as_deref() {
+                    Some(run_id) => match state.get_mandate_decision_for_run(run_id).await {
+                        Ok(Some(decision)) => state
+                            .get_mandate_for_goal(&goal_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|mandate| mandate.version == decision.mandate_version),
+                        _ => false,
+                    },
+                    None => false,
+                }
+            };
+            // When a durable attempt exists, no goal/run/mandate finalization
+            // below is authoritative until this exact lease atomically commits
+            // the trigger result. A stale finalizer must not close the run that
+            // a replacement task lead now owns.
+            let mut trigger_finalization_authoritative = dispatch_attempt.is_none();
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
                 if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
                     if trigger_task.status == "running" || trigger_task.status == "claimed" {
                         let success = dispatch_trigger_succeeded(
                             task_lead_outcome == Some(TaskOutcome::Succeeded),
                             &trigger_work_tasks,
-                        );
+                        ) && mandate_decision_ready;
                         let status = if success {
                             "completed".to_string()
                         } else {
@@ -1267,6 +1480,11 @@ pub fn spawn_background_task_lead(
                         };
                         let error = if success {
                             None
+                        } else if is_mandate_run && !mandate_decision_ready {
+                            Some(
+                                "Mandate review ended without exactly one current durable decision."
+                                    .to_string(),
+                            )
                         } else {
                             Some(failed_run_summary(
                                 &trigger_work_tasks,
@@ -1305,7 +1523,7 @@ pub fn spawn_background_task_lead(
                             match patch_task_attempt_with_transient_retry(&state, attempt, &patch)
                                 .await
                             {
-                                Ok(true) => {}
+                                Ok(true) => trigger_finalization_authoritative = true,
                                 Ok(false) => {
                                     let persisted_status = state
                                         .get_task(trigger_task_id)
@@ -1321,6 +1539,7 @@ pub fn spawn_background_task_lead(
                                         persisted_status,
                                         "Ignored stale task-lead finalization"
                                     );
+                                    trigger_finalization_authoritative = false;
                                 }
                                 Err(error) => {
                                     error!(
@@ -1330,6 +1549,7 @@ pub fn spawn_background_task_lead(
                                         %error,
                                         "Failed to finalize task-lead attempt after retries"
                                     );
+                                    trigger_finalization_authoritative = false;
                                 }
                             }
                         } else {
@@ -1356,6 +1576,14 @@ pub fn spawn_background_task_lead(
             let _ = keepalive_cancel_tx.send(());
             let _ = keepalive_handle.await;
 
+            if !trigger_finalization_authoritative {
+                warn!(
+                    goal_id = %goal_id,
+                    "Aborting goal-run finalization because the task-lead lease was lost"
+                );
+                return;
+            }
+
             // Check the actual goal status from DB — the task lead may have already
             // set it via complete_goal/fail_goal. Only update if still "active".
             let current_goal = state.get_goal(&goal.id).await;
@@ -1364,7 +1592,7 @@ pub fn spawn_background_task_lead(
                 _ => true, // fallback: update if we can't read
             };
 
-            if needs_status_update {
+            if needs_status_update && !is_mandate_run {
                 // Task lead returned without explicitly completing/failing the goal.
                 // Use progress-based circuit breaker: compare completed task count
                 // before vs after to detect whether the dispatch made progress.
@@ -1415,7 +1643,13 @@ pub fn spawn_background_task_lead(
                 let any_completed = tasks.iter().any(|t| t.status == "completed");
                 let no_tasks_completed_finite = is_finite && !tasks.is_empty() && !any_completed;
 
-                if all_done {
+                if is_mandate_run {
+                    // ACT/WAIT/ASK/STOP are legitimate cycle outcomes. In
+                    // particular, WAIT has no child work by design and must not
+                    // increment the generic continuous-goal no-progress breaker.
+                    // The mandate finalizer below owns controller/mandate state.
+                    updated_goal.dispatch_failures = 0;
+                } else if all_done {
                     // A recurring goal completes a run, not the goal itself.
                     // Keep it active for the next schedule fire.
                     if run_completion_should_close_goal(&updated_goal.goal_type, all_done) {
@@ -1611,6 +1845,67 @@ pub fn spawn_background_task_lead(
             } else {
                 None
             };
+
+            // Mandate cycles have their own lifecycle and wake clock. They are
+            // never recurring scheduled runs, even though their backing goal is
+            // continuous, so finalize the decision/intention/lease and return
+            // before the generic scheduled-run notification branch below.
+            if is_mandate_run {
+                if let Some(run_id) = goal_run_id.as_deref() {
+                    let controller_goal = final_goal
+                        .as_ref()
+                        .ok()
+                        .and_then(|goal| goal.as_ref())
+                        .unwrap_or(&initial_goal);
+                    let fallback_error = result.as_ref().err().map(|error| error.to_string());
+                    if let Some(notice) = finalize_mandate_review(
+                        &state,
+                        controller_goal,
+                        run_id,
+                        trigger_status.as_deref(),
+                        &final_run_tasks,
+                        fallback_error.as_deref(),
+                        any_executor_results_sent,
+                    )
+                    .await
+                    {
+                        // The state finalizer already committed this exact
+                        // deterministic outbox row with terminal proof state.
+                        // Immediate delivery is only a latency optimization;
+                        // failures leave the critical row pending for retry.
+                        let entry = notice.to_notification_entry();
+                        let notification_id = entry.id.clone();
+                        match agent
+                            .deliver_parent_text_result(
+                                hub.as_ref(),
+                                &session_id,
+                                &entry.message,
+                                parent_delivery::ParentDeliveryKind::GoalNotification,
+                            )
+                            .await
+                        {
+                            Ok(outcome) if outcome.sent => {
+                                let _ = state.mark_notification_delivered(&notification_id).await;
+                            }
+                            Ok(_) => {}
+                            Err(error) => warn!(
+                                goal_id = %goal_id,
+                                run_id,
+                                %error,
+                                "Failed to deliver mandate-review notification"
+                            ),
+                        }
+                    }
+                } else {
+                    warn!(goal_id = %goal_id, "Mandate task lead had no durable goal run");
+                }
+
+                if let Some(registry) = goal_token_registry.as_ref() {
+                    registry.remove(&goal_id).await;
+                }
+                return;
+            }
+
             if let Some(run_id) = goal_run_id.as_deref() {
                 let run_status = if final_run_tasks.iter().any(|task| task.status == "blocked") {
                     Some("blocked")
@@ -2229,6 +2524,304 @@ pub fn spawn_background_task_lead(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::embeddings::EmbeddingService;
+    use crate::state::SqliteStateStore;
+    use crate::traits::{Goal, Intention, MandateAuthority, MandateDecisionCycle, Task};
+
+    async fn mandate_test_state() -> (Arc<dyn StateStore>, tempfile::NamedTempFile) {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                database.path().to_str().unwrap(),
+                100,
+                None,
+                Arc::new(EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        (store, database)
+    }
+
+    fn due_mandate_controller(session_id: &str) -> (Goal, Mandate) {
+        let goal = Goal::new_continuous(
+            "Steward an account",
+            session_id,
+            Some(10_000),
+            Some(100_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Maintain a useful account presence",
+            session_id,
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        (goal, mandate)
+    }
+
+    async fn claimed_mandate_run(
+        state: &Arc<dyn StateStore>,
+        goal: &Goal,
+        mandate: &Mandate,
+    ) -> crate::traits::GoalRun {
+        state
+            .create_mandate_controller(goal, mandate)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .claim_due_mandates(1, "background-finalizer-test", 300)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let run = state
+            .start_goal_run(&goal.id, "mandate", None, Some(&root_task_id))
+            .await
+            .unwrap();
+        state
+            .create_task(&Task {
+                id: root_task_id.clone(),
+                goal_id: goal.id.clone(),
+                description: "Run one bounded mandate review".to_string(),
+                status: "pending".to_string(),
+                priority: goal.priority.clone(),
+                task_order: 0,
+                parallel_group: None,
+                depends_on: None,
+                agent_id: None,
+                context: None,
+                result: None,
+                error: None,
+                blocker: None,
+                idempotent: false,
+                retry_count: 0,
+                max_retries: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                started_at: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        let attempt = state
+            .claim_task_with_lease(
+                &root_task_id,
+                "background-finalizer-test-root",
+                Some("profile-task-lead"),
+                300,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .patch_task_from_attempt(
+                &attempt.id,
+                &attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("bounded review completed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        run
+    }
+
+    #[tokio::test]
+    async fn wait_finalization_keeps_controller_active_and_does_not_require_a_live_lease() {
+        let (state, _database) = mandate_test_state().await;
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        let run = claimed_mandate_run(&state, &goal, &mandate).await;
+        let mut decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Wait,
+            "No useful action is available yet",
+            mandate.version,
+        );
+        decision.reconsider_at =
+            Some((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339());
+        state
+            .record_mandate_decision(&decision, None, None)
+            .await
+            .unwrap();
+        let after_decision = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert!(after_decision.review_lease_token.is_none());
+
+        let notification =
+            finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)
+                .await;
+
+        assert!(notification.is_none());
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            state
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0].status,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_notifications_never_promote_generated_question_or_task_prose() {
+        let (state, _database) = mandate_test_state().await;
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        let run = claimed_mandate_run(&state, &goal, &mandate).await;
+        let sentinel = "UNTRUSTED_QUESTION_DO_NOT_PROMOTE";
+        let mut decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Ask,
+            &format!("generated rationale {sentinel}"),
+            mandate.version,
+        );
+        decision.question = Some(format!("generated question {sentinel}"));
+        state
+            .record_mandate_decision(&decision, None, None)
+            .await
+            .unwrap();
+
+        let notification =
+            finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)
+                .await
+                .expect("ASK emits a static control notification");
+        let entry = notification.to_notification_entry();
+
+        assert_eq!(entry.notification_type, "mandate_ask");
+        assert_eq!(entry.priority, "critical");
+        assert!(entry.expires_at.is_none());
+        assert!(!entry.message.contains(sentinel));
+        assert!(entry
+            .message
+            .contains("stored as untrusted mandate-local data"));
+        assert!(entry.message.contains("manage_mandates(action=\"get\""));
+        let pending = state.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, entry.id);
+        assert_eq!(pending[0].message, entry.message);
+        assert!(finalize_mandate_review(
+            &state,
+            &goal,
+            &run.id,
+            Some("completed"),
+            &[],
+            None,
+            false,
+        )
+        .await
+        .is_none());
+        assert_eq!(state.get_pending_notifications(10).await.unwrap().len(), 1);
+        let finalized = state.get_goal_runs(&goal.id).await.unwrap();
+        let summary = finalized[0].outcome_summary.as_deref().unwrap_or_default();
+        assert!(!summary.contains(sentinel));
+        assert_eq!(summary, "mandate_non_action_satisfied");
+    }
+
+    #[tokio::test]
+    async fn failed_review_without_a_decision_releases_lease_for_bounded_retry() {
+        let (state, _database) = mandate_test_state().await;
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        let run = claimed_mandate_run(&state, &goal, &mandate).await;
+        let before = chrono::Utc::now();
+
+        let notification = finalize_mandate_review(
+            &state,
+            &goal,
+            &run.id,
+            Some("failed"),
+            &[],
+            Some("deliberator exited"),
+            false,
+        )
+        .await;
+
+        let entry = notification.unwrap().to_notification_entry();
+        assert_eq!(entry.notification_type, "mandate_review_failed");
+        let pending = state.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, entry.id);
+        assert_eq!(pending[0].message, entry.message);
+        let retriable = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert!(retriable.review_lease_token.is_none());
+        let retry_at = chrono::DateTime::parse_from_rfc3339(&retriable.next_review_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(retry_at >= before + chrono::Duration::seconds(mandate.min_review_secs));
+        assert!(retry_at <= chrono::Utc::now() + chrono::Duration::seconds(65));
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0].status,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revision_suspends_an_act_intention_instead_of_satisfying_it() {
+        let (state, _database) = mandate_test_state().await;
+        let (goal, mut mandate) = due_mandate_controller("owner-session");
+        mandate.authority = MandateAuthority {
+            allowed_tools: vec!["http_request".to_string()],
+            allowed_mutation_effects: vec!["external_delivery".to_string()],
+            allowed_target_prefixes: vec!["https://api.example.test/v1/".to_string()],
+            max_mutating_actions_per_cycle: 1,
+            max_mutating_actions_per_rolling_24h: 1,
+            min_seconds_between_mutations: 900,
+            ..MandateAuthority::default()
+        };
+        let run = claimed_mandate_run(&state, &goal, &mandate).await;
+        let decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "A useful action is available",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &decision.id,
+            &run.id,
+            "Publish one relevant update",
+            "It advances the mandate",
+        );
+        state
+            .record_mandate_decision(&decision, Some(&intention), None)
+            .await
+            .unwrap();
+        let mut revised = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        revised.version += 1;
+        revised.objective = "Revised owner policy".to_string();
+        state.update_mandate(&revised).await.unwrap();
+
+        let notification =
+            finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)
+                .await;
+
+        assert!(notification.is_none());
+        let intentions = state.list_intentions(&mandate.id, 10).await.unwrap();
+        assert_eq!(intentions.len(), 1);
+        assert_eq!(intentions[0].status, "suspended");
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0].status,
+            "cancelled"
+        );
+    }
 
     #[test]
     fn heartbeat_backoff_starts_fast_then_grows() {

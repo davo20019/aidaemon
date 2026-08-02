@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod agent;
 mod agent_handoff;
 mod backoff;
@@ -24,6 +26,7 @@ mod heartbeat;
 mod llm_markers;
 mod llm_runtime;
 mod logging;
+mod mandates;
 mod mcp;
 mod memory;
 mod oauth;

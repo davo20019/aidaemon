@@ -83,6 +83,26 @@ fn build_final_sanitization_gate_telemetry(
     )
 }
 
+/// Decide whether ordinary conversational memory maintenance may run after a
+/// completed turn. Mandate workers have their own bounded, typed continuity;
+/// allowing either background path here would both leak mandate content into
+/// global owner memory and make unmetered provider calls outside the durable
+/// per-run token lease.
+fn post_completion_memory_plan(
+    mandate_execution: bool,
+    progressive_facts_enabled: bool,
+    fact_extraction_eligible: bool,
+    summarization_enabled: bool,
+) -> (bool, bool) {
+    if mandate_execution {
+        return (false, false);
+    }
+    (
+        progressive_facts_enabled && fact_extraction_eligible,
+        summarization_enabled,
+    )
+}
+
 #[cfg(test)]
 mod gate_telemetry_tests {
     use super::*;
@@ -101,6 +121,18 @@ mod gate_telemetry_tests {
         assert_eq!(metadata["gutted_by_sanitization"], false);
         assert_eq!(metadata["original_chars"], 120);
         assert_eq!(metadata["final_chars"], 80);
+    }
+
+    #[test]
+    fn mandate_completion_disables_fact_extraction_and_summarization() {
+        assert_eq!(
+            post_completion_memory_plan(true, true, true, true),
+            (false, false)
+        );
+        assert_eq!(
+            post_completion_memory_plan(false, true, true, true),
+            (true, true)
+        );
     }
 }
 
@@ -1065,14 +1097,17 @@ pub(super) async fn run_completion_phase(
                     .await;
                 learning_ctx.completed_naturally = true;
                 learning_ctx.task_outcome = Some(outcome);
-                let learning_ctx_for_task = learning_ctx.clone();
-                let state = agent.state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await
-                    {
-                        warn!("Learning failed: {}", e);
-                    }
-                });
+                if agent.mandate_execution.is_none() {
+                    let learning_ctx_for_task = learning_ctx.clone();
+                    let state = agent.state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            post_task::process_learning(&state, learning_ctx_for_task).await
+                        {
+                            warn!("Learning failed: {}", e);
+                        }
+                    });
+                }
 
                 commit_state!();
                 return Ok(Some(ResponsePhaseOutcome::Return(Ok(fallback))));
@@ -2017,10 +2052,16 @@ pub(super) async fn run_completion_phase(
             .map(|r| r.select(crate::router::Tier::Fast).to_string())
             .unwrap_or_else(|| model.clone());
 
-        // Progressive fact extraction: extract durable facts immediately.
-        if agent.context_window_config.progressive_facts
-            && crate::memory::context_window::should_extract_facts(user_text)
-        {
+        let (spawn_progressive_facts, spawn_summary_maintenance) = post_completion_memory_plan(
+            agent.mandate_execution.is_some(),
+            agent.context_window_config.progressive_facts,
+            crate::memory::context_window::should_extract_facts(user_text),
+            agent.context_window_config.enabled,
+        );
+
+        // Progressive fact extraction: extract durable facts immediately for
+        // ordinary conversations only. Mandates cannot write global memory.
+        if spawn_progressive_facts {
             crate::memory::context_window::spawn_progressive_extraction(
                 llm_provider.clone(),
                 fast_model.clone(),
@@ -2037,7 +2078,7 @@ pub(super) async fn run_completion_phase(
         // Summary maintenance is independent of fact-extraction eligibility:
         // short acknowledgements and follow-ups still advance conversation
         // history and must not leave the summary cursor frozen.
-        if agent.context_window_config.enabled {
+        if spawn_summary_maintenance {
             let summary_token_threshold = agent
                 .context_window_config
                 .summarize_token_threshold_for(&fast_model);
@@ -2326,7 +2367,8 @@ pub(super) async fn run_completion_phase(
         // group chats, or sub-agent internal sessions.
         let is_owner_dm = user_role == UserRole::Owner
             && channel_ctx.visibility == crate::types::ChannelVisibility::Private;
-        if completion_progress.denial_gate_count == 0
+        if agent.mandate_execution.is_none()
+            && completion_progress.denial_gate_count == 0
             && is_owner_dm
             && !completion_progress.coreference_fired
             && !execution_state.tool_output_evidence_overflow
@@ -2495,13 +2537,15 @@ pub(super) async fn run_completion_phase(
 
         learning_ctx.completed_naturally = true;
         learning_ctx.task_outcome = Some(outcome);
-        let learning_ctx_for_task = learning_ctx.clone();
-        let state = agent.state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                warn!("Learning failed: {}", e);
-            }
-        });
+        if agent.mandate_execution.is_none() {
+            let learning_ctx_for_task = learning_ctx.clone();
+            let state = agent.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                    warn!("Learning failed: {}", e);
+                }
+            });
+        }
 
         info!(
             session_id,

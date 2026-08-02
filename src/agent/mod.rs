@@ -421,6 +421,23 @@ type TurnRenderCache =
 /// then.
 type TurnAnchorMemory = Arc<tokio::sync::RwLock<HashMap<String, i64>>>;
 
+/// Immutable execution identity for one worker inside one autonomous mandate
+/// decision cycle. The lease token is Rust-side control state and must never be
+/// serialized, logged, or exposed to the model.
+#[derive(Clone)]
+pub(crate) struct MandateExecutionFence {
+    pub(crate) mandate_id: String,
+    pub(crate) mandate_version: i64,
+    pub(crate) authority: crate::traits::MandateAuthority,
+    pub(crate) goal_id: String,
+    pub(crate) goal_run_id: String,
+    pub(crate) root_task_id: String,
+    pub(crate) root_task_attempt_id: String,
+    pub(crate) worker_task_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) lease_token: String,
+}
+
 pub struct Agent {
     llm_runtime: SharedLlmRuntime,
     state: Arc<dyn StateStore>,
@@ -445,10 +462,13 @@ pub struct Agent {
     mcp_registry: Option<McpRegistry>,
     /// Role for this agent instance.
     role: AgentRole,
-    /// Task ID for executor agents — enables activity logging.
+    /// Durable task ID for executor agents and run-bound mandate task leads.
     task_id: Option<String>,
     /// Goal ID for task lead agents — enables context injection into spawn calls.
     goal_id: Option<String>,
+    /// Exact mandate run/task-attempt identity inherited at child creation.
+    /// Unlike `goal_id`, this can never be rebound to a later decision cycle.
+    mandate_execution: Option<MandateExecutionFence>,
     /// Cancellation token — checked each iteration; cancelled by parent or user.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Goal cancellation token registry — shared across agent hierarchy.
@@ -635,7 +655,7 @@ pub use goal_dispatch::is_group_session;
 pub(in crate::agent) use goal_dispatch::{
     active_scheduled_root_task_id, auto_dispatch_scheduled_run_extension_budget,
     clear_scheduled_run_state, effective_goal_daily_budget, goal_has_scheduled_provenance,
-    is_low_signal_task_lead_reply, is_scheduled_task_description,
+    is_goal_run_root_task_description, is_low_signal_task_lead_reply,
     looks_like_evidence_grounding_challenge, looks_like_false_capability_denial_after_tool_success,
     looks_like_incomplete_live_work_summary, parse_goal_leading_wait, parse_wait_task_seconds,
     persist_scheduled_run_state, strip_leading_wait, task_has_scheduled_provenance,
@@ -663,6 +683,87 @@ mod construct;
 
 // impl-Agent justification: public entry surface (handle_message, hub/self-ref wiring, role/depth accessors, goal cancellation) — Agent's API to channels and core.
 impl Agent {
+    /// Revalidate the immutable mandate run and exact task-attempt lease. This
+    /// runs before grant issuance and again at the final adapter boundary.
+    pub(crate) async fn require_live_mandate_execution(
+        &self,
+        expected_goal_id: &str,
+    ) -> anyhow::Result<()> {
+        const FENCE_RENEWAL_SECS: i64 = 180;
+
+        let fence = self.mandate_execution.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Mandate execution is missing its immutable run/task fence.")
+        })?;
+        anyhow::ensure!(
+            fence.goal_id == expected_goal_id
+                && self.goal_id.as_deref() == Some(expected_goal_id)
+                && self.task_id.as_deref() == Some(fence.worker_task_id.as_str()),
+            "Mandate execution identity does not match this child agent."
+        );
+        let mandate = self
+            .state
+            .get_mandate_for_goal(expected_goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate authority record disappeared."))?;
+        anyhow::ensure!(
+            mandate.id == fence.mandate_id
+                && mandate.version == fence.mandate_version
+                && mandate.authority == fence.authority
+                && mandate.is_active(),
+            "Mandate authority changed or is no longer active."
+        );
+
+        let task = self
+            .state
+            .get_task(&fence.worker_task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate worker task no longer exists."))?;
+        anyhow::ensure!(
+            task.goal_id == expected_goal_id
+                && matches!(task.status.as_str(), "claimed" | "running")
+                && !task.has_error()
+                && !task.has_blocker(),
+            "Mandate worker task is no longer executable."
+        );
+
+        let attempt = self
+            .state
+            .get_current_task_attempt(&fence.worker_task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate task-attempt lease is no longer active."))?;
+        anyhow::ensure!(
+            attempt.id == fence.attempt_id
+                && attempt.lease_token == fence.lease_token
+                && attempt.task_id == fence.worker_task_id
+                && attempt.goal_run_id == fence.goal_run_id
+                && matches!(attempt.status.as_str(), "claimed" | "running"),
+            "Mandate task-attempt lease was replaced or lost."
+        );
+        anyhow::ensure!(
+            self.state
+                .heartbeat_task_attempt(&fence.attempt_id, &fence.lease_token, FENCE_RENEWAL_SECS,)
+                .await?,
+            "Mandate task-attempt lease expired or was revoked."
+        );
+
+        // Reload after the atomic lease check so a closed cycle cannot be
+        // rebound by goal ID to a later run.
+        let run = self
+            .state
+            .get_current_goal_run(expected_goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate decision cycle is no longer active."))?;
+        anyhow::ensure!(
+            run.id == fence.goal_run_id
+                && run.goal_id == expected_goal_id
+                && run.trigger_type == "mandate"
+                && run.status == "running"
+                && run.root_task_id.as_deref() == Some(fence.root_task_id.as_str()),
+            "Mandate execution is stale, blocked, or bound to a different decision cycle."
+        );
+        Ok(())
+    }
+
     /// Set the ChannelHub reference (called after hub creation in core.rs).
     pub async fn set_hub(&self, hub: Weak<ChannelHub>) {
         *self.hub.write().await = Some(hub);

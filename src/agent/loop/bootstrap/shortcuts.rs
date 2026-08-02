@@ -49,6 +49,8 @@ pub(super) async fn maybe_handle_stop_command(
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;
@@ -136,6 +138,8 @@ pub(super) async fn maybe_cancel_work_for_mid_task_pivot(
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::traits::{
     Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolTargetHintKind, ToolVerificationMode,
+    ToolExecutionContext, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::StatusUpdate;
 
@@ -423,10 +423,13 @@ pub fn classify_blocked_host(url: &str) -> Option<BlockedHostClass> {
 
 /// Build an HTTP client with browser-like headers.
 /// Shared by WebFetchTool and DuckDuckGo search backend.
-pub fn build_browser_client() -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+fn redirects_allowed_for_execution(mandate_execution: bool) -> bool {
+    !mandate_execution
+}
+
+fn build_browser_client_with_redirects(follow_redirects: bool) -> Client {
+    let redirect_policy = if follow_redirects {
+        reqwest::redirect::Policy::custom(|attempt| {
             // Re-validate each redirect hop against SSRF rules
             let url = attempt.url().to_string();
             if let Err(_reason) = validate_url_for_ssrf(&url) {
@@ -436,7 +439,14 @@ pub fn build_browser_client() -> Client {
             } else {
                 attempt.follow()
             }
-        }))
+        })
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(redirect_policy)
         .user_agent(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:142.0) Gecko/20100101 Firefox/142.0",
         )
@@ -463,14 +473,20 @@ pub fn build_browser_client() -> Client {
         .expect("failed to build browser HTTP client")
 }
 
+pub fn build_browser_client() -> Client {
+    build_browser_client_with_redirects(true)
+}
+
 pub struct WebFetchTool {
     client: Client,
+    mandate_client: Client,
 }
 
 impl WebFetchTool {
     pub fn new() -> Self {
         Self {
             client: build_browser_client(),
+            mandate_client: build_browser_client_with_redirects(false),
         }
     }
 
@@ -480,6 +496,7 @@ impl WebFetchTool {
     async fn execute(
         &self,
         arguments: &str,
+        mandate_execution: bool,
     ) -> anyhow::Result<(String, Option<crate::traits::TruncationInfo>)> {
         let args: Value = serde_json::from_str(arguments)?;
         let url = args["url"]
@@ -496,7 +513,12 @@ impl WebFetchTool {
             return Ok((format!("Request blocked: {}", reason), None));
         }
 
-        let resp = self.client.get(url).send().await?;
+        let client = if redirects_allowed_for_execution(mandate_execution) {
+            &self.client
+        } else {
+            &self.mandate_client
+        };
+        let resp = client.get(url).send().await?;
         if !resp.status().is_success() {
             return Ok((
                 format!("Error fetching {}: HTTP {}", url, resp.status()),
@@ -568,7 +590,9 @@ impl Tool for WebFetchTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments).await.map(|(output, _)| output)
+        self.execute(arguments, false)
+            .await
+            .map(|(output, _)| output)
     }
 
     async fn call_with_status_outcome(
@@ -577,7 +601,24 @@ impl Tool for WebFetchTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, truncation) = self.execute(arguments).await?;
+        let (output, truncation) = self.execute(arguments, false).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                truncation,
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn call_with_execution_context(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        exec_ctx: ToolExecutionContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let _ = status_tx;
+        let (output, truncation) = self.execute(arguments, exec_ctx.mandate_execution).await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
@@ -911,6 +952,12 @@ mod ssrf_policy_tests {
 #[cfg(test)]
 mod format_tests {
     use super::*;
+
+    #[test]
+    fn mandate_web_fetch_never_follows_redirects() {
+        assert!(redirects_allowed_for_execution(false));
+        assert!(!redirects_allowed_for_execution(true));
+    }
 
     #[test]
     fn truncated_fetch_carries_instructional_notice() {

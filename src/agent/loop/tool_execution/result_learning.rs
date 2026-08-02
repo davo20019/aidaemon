@@ -230,6 +230,12 @@ pub(super) async fn apply_result_learning(
     env: &ResultLearningEnv<'_>,
     state: &mut ResultLearningState<'_>,
 ) -> anyhow::Result<ResultLearningOutcome> {
+    // Mandate workers are isolated from the owner's global behavioral-memory
+    // plane. They still receive deterministic local retry/control guidance,
+    // but may neither retrieve prior solutions/telemetry nor write patterns,
+    // reflections, or recovery outcomes. A provenance-scoped mandate learning
+    // store can be added separately in a later version.
+    let global_learning_allowed = agent.mandate_execution.is_none();
     if is_error {
         *state.no_evidence_result_streak = 0;
         *state.iteration_had_tool_failures = true;
@@ -432,7 +438,7 @@ pub(super) async fn apply_result_learning(
                 *state.last_tool_failure = Some(key);
 
                 // Persist repeated dead-end workflows as explicit failure patterns.
-                if *pattern_count >= 3 {
+                if global_learning_allowed && *pattern_count >= 3 {
                     let state_store = agent.state.clone();
                     let tool_name = tc.name.clone();
                     let error_pattern = err_pattern.clone();
@@ -465,7 +471,7 @@ pub(super) async fn apply_result_learning(
             }
 
             // DIAGNOSTIC LOOP: On first semantic failure, query memory for similar errors.
-            if semantic_count == 1 {
+            if global_learning_allowed && semantic_count == 1 {
                 state.pending_error_solution_ids.clear();
                 if let Ok(solutions) = agent
                     .state
@@ -541,7 +547,7 @@ pub(super) async fn apply_result_learning(
                 }
             }
 
-            if semantic_count >= 2 {
+            if global_learning_allowed && semantic_count >= 2 {
                 // Hint was shown but the same tool failed again: record a miss.
                 if let Some(solution_id) = state.pending_error_solution_ids.first().copied() {
                     state.pending_error_solution_ids.clear();
@@ -745,7 +751,7 @@ pub(super) async fn apply_result_learning(
         }
     }
 
-    if !state.learning_ctx.errors.is_empty() {
+    if global_learning_allowed && !state.learning_ctx.errors.is_empty() {
         // Credit any injected diagnostic hints if we recovered after they were shown.
         if let Some(solution_id) = state.pending_error_solution_ids.first().copied() {
             state.pending_error_solution_ids.clear();

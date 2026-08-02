@@ -71,6 +71,10 @@ pub struct UserMessageData {
     /// Role of the speaker when the message was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_role: Option<String>,
+    /// Durable execution provenance for memory and retention policy. Mandate
+    /// workers stamp `mandate`; ordinary owner turns omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_origin: Option<String>,
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -235,6 +239,10 @@ pub struct ToolReceiptV1 {
     pub truncation: Option<TruncationInfo>,
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
+    /// Exact owner-mandate grant checked for this call. This is an audit fact,
+    /// not a reusable capability; replay still revalidates current policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate_authority: Option<crate::traits::MandateAuthorityGrant>,
 }
 
 impl ToolReceiptV1 {
@@ -260,6 +268,7 @@ impl ToolReceiptV1 {
             http_status: metadata.http_status,
             truncation: metadata.truncation.clone(),
             semantics: metadata.semantics.clone(),
+            mandate_authority: None,
         }
     }
 
@@ -648,6 +657,8 @@ pub enum DecisionType {
     ExecutionCritiquePass,
     ExecutionBudgetSelection,
     ExecutionStateSnapshot,
+    MandateDeliberation,
+    MandateAuthorityGate,
     IdempotencyReceiptReplayed,
     IdempotencyIndeterminateBlock,
     EvidenceGate,
@@ -1480,12 +1491,14 @@ mod tests {
             has_attachments: false,
             annotations: vec![],
             user_role: None,
+            execution_origin: Some("mandate".to_string()),
             turn_id: Some("t1".to_string()),
             attachments: vec![],
         };
         let back: UserMessageData =
             serde_json::from_value(serde_json::to_value(&um).unwrap()).unwrap();
         assert_eq!(back.turn_id.as_deref(), Some("t1"));
+        assert_eq!(back.execution_origin.as_deref(), Some("mandate"));
 
         // AssistantResponseData
         let ar = AssistantResponseData {
@@ -1572,6 +1585,7 @@ mod tests {
         // Minimal JSON without a turn_id key deserializes to None (back-compat).
         let um: UserMessageData = serde_json::from_value(json!({"content": "hi"})).unwrap();
         assert!(um.turn_id.is_none());
+        assert!(um.execution_origin.is_none());
 
         let ar: AssistantResponseData = serde_json::from_value(json!({"model": "m"})).unwrap();
         assert!(ar.turn_id.is_none());

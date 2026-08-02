@@ -1667,6 +1667,333 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Owner-authorized autonomy. A mandate is intentionally separate from a
+    // personal goal (desire) and from an intention (one agent commitment).
+    // Every decision cycle is bound to exactly one durable goal run.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandates (
+            id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL UNIQUE REFERENCES goals(id) ON DELETE CASCADE,
+            source_goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+            objective TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'paused', 'awaiting_input', 'completed', 'cancelled')),
+            authority_json TEXT NOT NULL,
+            constraints_json TEXT NOT NULL DEFAULT '[]',
+            success_criteria_json TEXT NOT NULL DEFAULT '[]',
+            stop_conditions_json TEXT NOT NULL DEFAULT '[]',
+            min_review_secs INTEGER NOT NULL CHECK (min_review_secs > 0),
+            max_review_secs INTEGER NOT NULL CHECK (max_review_secs >= min_review_secs),
+            default_review_secs INTEGER NOT NULL
+                CHECK (default_review_secs BETWEEN min_review_secs AND max_review_secs),
+            next_review_at TEXT NOT NULL,
+            review_lease_token TEXT,
+            review_lease_expires_at TEXT,
+            expires_at TEXT,
+            confirmed_at TEXT,
+            version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            created_by_session TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // One immutable aggregate budget per autonomous decision cycle. The
+    // short-lived call lease serializes lead/executor model calls so they
+    // cannot each observe the same remaining balance and overspend in
+    // parallel. Usage survives daemon restarts and is never auto-extended.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_run_token_budgets (
+            goal_run_id TEXT PRIMARY KEY REFERENCES goal_runs(id) ON DELETE CASCADE,
+            budget_per_cycle INTEGER NOT NULL CHECK (budget_per_cycle > 0),
+            tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
+            call_lease_token TEXT,
+            call_lease_expires_at TEXT,
+            call_dispatched INTEGER NOT NULL DEFAULT 0 CHECK (call_dispatched IN (0, 1)),
+            call_tokens_used_before INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK (
+                (call_lease_token IS NULL AND call_lease_expires_at IS NULL
+                    AND call_dispatched = 0 AND call_tokens_used_before IS NULL)
+                OR (call_lease_token IS NOT NULL AND call_lease_expires_at IS NOT NULL
+                    AND ((call_dispatched = 0 AND call_tokens_used_before IS NULL)
+                         OR (call_dispatched = 1 AND call_tokens_used_before IS NOT NULL)))
+            )
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query(
+        "ALTER TABLE mandate_run_token_budgets
+         ADD COLUMN call_dispatched INTEGER NOT NULL DEFAULT 0 CHECK (call_dispatched IN (0, 1))",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "ALTER TABLE mandate_run_token_budgets ADD COLUMN call_tokens_used_before INTEGER",
+    )
+    .execute(pool)
+    .await;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_decision_cycles (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL UNIQUE REFERENCES goal_runs(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
+            rationale TEXT NOT NULL,
+            belief_snapshot TEXT,
+            question TEXT,
+            reconsider_at TEXT,
+            action_attempts INTEGER NOT NULL DEFAULT 0 CHECK (action_attempts >= 0),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Pre-release development databases may already contain the first mandate
+    // draft. Keep startup migration idempotent while backfilling the durable
+    // wake/lease and policy-version columns added before the first release.
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN next_review_at TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN review_lease_token TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN review_lease_expires_at TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN confirmed_at TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "UPDATE mandates
+         SET next_review_at = COALESCE(next_review_at, updated_at, created_at, datetime('now'))",
+    )
+    .execute(pool)
+    .await?;
+    // Backfill only states that could have been reached after confirmation in
+    // the pre-release schema. A paused mandate whose controller is still
+    // pending confirmation deliberately remains unconfirmed, as do cancelled
+    // records where provenance can no longer be inferred safely.
+    sqlx::query(
+        "UPDATE mandates
+         SET confirmed_at = COALESCE(confirmed_at, created_at, updated_at, datetime('now'))
+         WHERE confirmed_at IS NULL
+           AND (
+               status IN ('active', 'awaiting_input', 'completed')
+               OR (
+                   status = 'paused'
+                   AND EXISTS (
+                       SELECT 1 FROM goals g
+                       WHERE g.id = mandates.goal_id AND g.status = 'paused'
+                   )
+               )
+           )",
+    )
+    .execute(pool)
+    .await?;
+    let added_mandate_version = sqlx::query(
+        "ALTER TABLE mandate_decision_cycles
+         ADD COLUMN mandate_version INTEGER NOT NULL DEFAULT 1",
+    )
+    .execute(pool)
+    .await
+    .is_ok();
+    if added_mandate_version {
+        sqlx::query(
+            "UPDATE mandate_decision_cycles
+             SET mandate_version = COALESCE(
+                 (SELECT m.version FROM mandates m
+                  WHERE m.id = mandate_decision_cycles.mandate_id),
+                 mandate_version
+             )",
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS intentions (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            decision_cycle_id TEXT NOT NULL UNIQUE REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            expected_benefit TEXT,
+            risk TEXT,
+            invalidation_criteria TEXT,
+            status TEXT NOT NULL DEFAULT 'committed',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Cross-cycle mutation safety ledger. This table intentionally contains
+    // only typed identifiers and compact execution facts; raw tool arguments,
+    // bodies, outputs, errors, and credentials belong nowhere in this ledger.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_mutation_attempts (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            decision_cycle_id TEXT NOT NULL REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            intention_id TEXT NOT NULL REFERENCES intentions(id) ON DELETE CASCADE,
+            root_task_id TEXT NOT NULL,
+            root_task_attempt_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            task_attempt_id TEXT NOT NULL,
+            reserved_action_attempt INTEGER NOT NULL CHECK (reserved_action_attempt > 0),
+            action_digest TEXT NOT NULL UNIQUE CHECK (length(action_digest) = 64),
+            tool_call_id TEXT NOT NULL UNIQUE,
+            tool_name TEXT NOT NULL,
+            mutation_effects_json TEXT NOT NULL CHECK (json_valid(mutation_effects_json)),
+            targets_json TEXT NOT NULL CHECK (json_valid(targets_json)),
+            account_identifiers_json TEXT NOT NULL CHECK (json_valid(account_identifiers_json)),
+            status TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (status IN ('reserved', 'never_dispatched', 'succeeded', 'failed', 'ambiguous')),
+            outcome_evidence TEXT
+                CHECK (outcome_evidence IS NULL OR outcome_evidence IN ('tool_reported', 'structured_metadata')),
+            http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+            exit_code INTEGER,
+            reserved_at TEXT NOT NULL,
+            dispatch_claimed_at TEXT,
+            completed_at TEXT,
+            UNIQUE (decision_cycle_id, reserved_action_attempt)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // Development and upgrade databases may already have the v1 ledger from
+    // an earlier build. Duplicate-column is the expected no-op on fresh/newer
+    // schemas; a successful ALTER upgrades the old table in place.
+    let _added_dispatch_claim = sqlx::query(
+        "ALTER TABLE mandate_mutation_attempts
+         ADD COLUMN dispatch_claimed_at TEXT",
+    )
+    .execute(pool)
+    .await
+    .is_ok();
+
+    // SQLite cannot widen an inline CHECK constraint in place. Rebuild the
+    // pre-release ledger once so invalidated reservations that never crossed
+    // the final dispatcher boundary can be closed without misclassifying them
+    // as an ambiguous external effect.
+    let mutation_attempts_schema = sqlx::query(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'mandate_mutation_attempts'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .and_then(|row| row.try_get::<Option<String>, _>("sql").ok().flatten())
+    .unwrap_or_default();
+    if !mutation_attempts_schema.contains("never_dispatched") {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP TABLE IF EXISTS mandate_mutation_attempts_v2")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE mandate_mutation_attempts_v2 (
+                id TEXT PRIMARY KEY,
+                mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+                mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+                decision_cycle_id TEXT NOT NULL REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+                goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+                intention_id TEXT NOT NULL REFERENCES intentions(id) ON DELETE CASCADE,
+                root_task_id TEXT NOT NULL,
+                root_task_attempt_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task_attempt_id TEXT NOT NULL,
+                reserved_action_attempt INTEGER NOT NULL CHECK (reserved_action_attempt > 0),
+                action_digest TEXT NOT NULL UNIQUE CHECK (length(action_digest) = 64),
+                tool_call_id TEXT NOT NULL UNIQUE,
+                tool_name TEXT NOT NULL,
+                mutation_effects_json TEXT NOT NULL CHECK (json_valid(mutation_effects_json)),
+                targets_json TEXT NOT NULL CHECK (json_valid(targets_json)),
+                account_identifiers_json TEXT NOT NULL CHECK (json_valid(account_identifiers_json)),
+                status TEXT NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved', 'never_dispatched', 'succeeded', 'failed', 'ambiguous')),
+                outcome_evidence TEXT
+                    CHECK (outcome_evidence IS NULL OR outcome_evidence IN ('tool_reported', 'structured_metadata')),
+                http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+                exit_code INTEGER,
+                reserved_at TEXT NOT NULL,
+                dispatch_claimed_at TEXT,
+                completed_at TEXT,
+                UNIQUE (decision_cycle_id, reserved_action_attempt)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO mandate_mutation_attempts_v2
+                (id, mandate_id, mandate_version, decision_cycle_id, goal_run_id,
+                 intention_id, root_task_id, root_task_attempt_id, task_id,
+                 task_attempt_id, reserved_action_attempt, action_digest,
+                 tool_call_id, tool_name, mutation_effects_json, targets_json,
+                 account_identifiers_json, status, outcome_evidence, http_status,
+                 exit_code, reserved_at, dispatch_claimed_at, completed_at)
+             SELECT id, mandate_id, mandate_version, decision_cycle_id, goal_run_id,
+                    intention_id, root_task_id, root_task_attempt_id, task_id,
+                    task_attempt_id, reserved_action_attempt, action_digest,
+                    tool_call_id, tool_name, mutation_effects_json, targets_json,
+                    account_identifiers_json, status, outcome_evidence, http_status,
+                    exit_code, reserved_at, dispatch_claimed_at, completed_at
+             FROM mandate_mutation_attempts",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE mandate_mutation_attempts")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("ALTER TABLE mandate_mutation_attempts_v2 RENAME TO mandate_mutation_attempts")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandates_due
+         ON mandates(status, next_review_at, review_lease_expires_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_cycles_mandate
+         ON mandate_decision_cycles(mandate_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_intentions_mandate
+         ON intentions(mandate_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_mutations_quota
+         ON mandate_mutation_attempts(mandate_id, reserved_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_mutations_run_status
+         ON mandate_mutation_attempts(goal_run_id, status)",
+    )
+    .execute(pool)
+    .await?;
+
     let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN goal_run_id TEXT")
         .execute(pool)
         .await;
@@ -2759,4 +3086,270 @@ pub(crate) async fn rebuild_memory_fts_projections(pool: &SqlitePool) -> anyhow:
         .execute(pool)
         .await?;
     create_memory_fts(pool).await
+}
+
+#[cfg(test)]
+mod mandate_ledger_upgrade_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn upgrades_legacy_mutation_status_check_to_never_dispatched() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        // Start from a fully migrated database so the fixture exercises the
+        // production foreign-key graph rather than inserting orphaned dummy
+        // identifiers. Then replace only the ledger with its pre-upgrade
+        // shape and seed one valid row that the rebuild must preserve.
+        migrate_state(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO goals
+                (id, description, domain, goal_type, status, session_id)
+             VALUES ('goal', 'upgrade fixture', 'orchestration', 'continuous',
+                     'active', 'owner-session')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO goal_runs
+                (id, project_id, goal_id, trigger_type, status)
+             VALUES ('run', 'default', 'goal', 'mandate', 'running')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mandates
+                (id, goal_id, objective, status, authority_json,
+                 constraints_json, success_criteria_json, stop_conditions_json,
+                 min_review_secs, max_review_secs, default_review_secs,
+                 next_review_at, confirmed_at, version, created_by_session)
+             VALUES ('mandate', 'goal', 'upgrade fixture', 'active', '{}',
+                     '[]', '[]', '[]', 60, 3600, 300,
+                     '2026-08-02T12:00:00Z', '2026-08-02T11:00:00Z', 1,
+                     'owner-session')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mandate_decision_cycles
+                (id, mandate_id, goal_run_id, mandate_version, outcome,
+                 rationale, action_attempts)
+             VALUES ('decision', 'mandate', 'run', 1, 'act',
+                     'upgrade fixture', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO intentions
+                (id, mandate_id, decision_cycle_id, goal_run_id, description,
+                 rationale, status)
+             VALUES ('intention', 'mandate', 'decision', 'run',
+                     'upgrade fixture', 'upgrade fixture', 'committed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DROP TABLE mandate_mutation_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // This is the pre-upgrade ledger shape: it has neither the final
+        // dispatch marker nor the terminal never_dispatched status, but it
+        // retains the real production foreign keys and uniqueness rules.
+        sqlx::query(
+            "CREATE TABLE mandate_mutation_attempts (
+                id TEXT PRIMARY KEY,
+                mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+                mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+                decision_cycle_id TEXT NOT NULL REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+                goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+                intention_id TEXT NOT NULL REFERENCES intentions(id) ON DELETE CASCADE,
+                root_task_id TEXT NOT NULL,
+                root_task_attempt_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task_attempt_id TEXT NOT NULL,
+                reserved_action_attempt INTEGER NOT NULL CHECK (reserved_action_attempt > 0),
+                action_digest TEXT NOT NULL UNIQUE CHECK (length(action_digest) = 64),
+                tool_call_id TEXT NOT NULL UNIQUE,
+                tool_name TEXT NOT NULL,
+                mutation_effects_json TEXT NOT NULL CHECK (json_valid(mutation_effects_json)),
+                targets_json TEXT NOT NULL CHECK (json_valid(targets_json)),
+                account_identifiers_json TEXT NOT NULL CHECK (json_valid(account_identifiers_json)),
+                status TEXT NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved', 'succeeded', 'failed', 'ambiguous')),
+                outcome_evidence TEXT
+                    CHECK (outcome_evidence IS NULL OR outcome_evidence IN ('tool_reported', 'structured_metadata')),
+                http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+                exit_code INTEGER,
+                reserved_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE (decision_cycle_id, reserved_action_attempt)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for statement in [
+            "CREATE INDEX idx_mandate_mutations_quota
+             ON mandate_mutation_attempts(mandate_id, reserved_at)",
+            "CREATE INDEX idx_mandate_mutations_run_status
+             ON mandate_mutation_attempts(goal_run_id, status)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO mandate_mutation_attempts
+                (id, mandate_id, mandate_version, decision_cycle_id, goal_run_id,
+                 intention_id, root_task_id, root_task_attempt_id, task_id,
+                 task_attempt_id, reserved_action_attempt, action_digest,
+                 tool_call_id, tool_name, mutation_effects_json, targets_json,
+                 account_identifiers_json, status, reserved_at)
+             VALUES ('legacy-row', 'mandate', 1, 'decision', 'run', 'intention',
+                     'root', 'root-attempt', 'task', 'task-attempt', 1,
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'tool-legacy', 'http_request', '[\"external_delivery\"]',
+                     '[]', '[]', 'reserved', '2026-08-02T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_state(&pool).await.unwrap();
+
+        let schema = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'mandate_mutation_attempts'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(schema.contains("never_dispatched"));
+        let columns = sqlx::query("PRAGMA table_info(mandate_mutation_attempts)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "dispatch_claimed_at"));
+
+        let preserved = sqlx::query(
+            "SELECT status, action_digest, tool_call_id, dispatch_claimed_at
+             FROM mandate_mutation_attempts WHERE id = 'legacy-row'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved.get::<String, _>("status"), "reserved");
+        assert_eq!(
+            preserved.get::<String, _>("action_digest"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(preserved.get::<String, _>("tool_call_id"), "tool-legacy");
+        assert!(preserved
+            .get::<Option<String>, _>("dispatch_claimed_at")
+            .is_none());
+
+        sqlx::query(
+            "UPDATE mandate_mutation_attempts
+             SET status = 'never_dispatched' WHERE id = 'legacy-row'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE mandate_mutation_attempts
+             SET status = 'invented_status' WHERE id = 'legacy-row'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        let foreign_tables = sqlx::query("PRAGMA foreign_key_list(mandate_mutation_attempts)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("table"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            foreign_tables,
+            [
+                "mandates".to_string(),
+                "mandate_decision_cycles".to_string(),
+                "goal_runs".to_string(),
+                "intentions".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check(mandate_mutation_attempts)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let index_names = sqlx::query("PRAGMA index_list(mandate_mutation_attempts)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(index_names.contains("idx_mandate_mutations_quota"));
+        assert!(index_names.contains("idx_mandate_mutations_run_status"));
+
+        // The rebuilt references remain enforced, including their cascade.
+        assert!(sqlx::query(
+            "INSERT INTO mandate_mutation_attempts
+                (id, mandate_id, mandate_version, decision_cycle_id, goal_run_id,
+                 intention_id, root_task_id, root_task_attempt_id, task_id,
+                 task_attempt_id, reserved_action_attempt, action_digest,
+                 tool_call_id, tool_name, mutation_effects_json, targets_json,
+                 account_identifiers_json, status, reserved_at)
+             VALUES ('orphan', 'missing-mandate', 1, 'decision', 'run',
+                     'intention', 'root', 'root-attempt', 'task', 'task-attempt',
+                     2,
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     'tool-orphan', 'http_request', '[\"external_delivery\"]',
+                     '[]', '[]', 'reserved', '2026-08-02T12:00:01Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query("DELETE FROM mandates WHERE id = 'mandate'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mandate_mutation_attempts WHERE id = 'legacy-row'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
 }

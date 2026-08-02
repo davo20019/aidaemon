@@ -159,6 +159,19 @@ pub(in crate::agent) fn is_scheduled_task_description(text: &str) -> bool {
         || trimmed.starts_with("manual scheduled run:")
 }
 
+/// Root tasks are orchestration envelopes, not user-facing work results.
+///
+/// Keep scheduled provenance deliberately narrower than this helper: mandate
+/// reviews have their own trigger type and must never inherit schedule trust or
+/// schedule lifecycle behavior merely because they are also goal-run roots.
+pub(in crate::agent) fn is_goal_run_root_task_description(text: &str) -> bool {
+    is_scheduled_task_description(text)
+        || text
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("mandate review:")
+}
+
 pub(in crate::agent) fn user_facing_task_description(description: &str) -> String {
     static SCHEDULED_TASK_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"(?i)^\s*(?:execute scheduled goal:|scheduled check:|manual scheduled run:)\s*")
@@ -667,7 +680,7 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
         // is the full goal text (plus internal [SYSTEM: …] markers) and its
         // result is a generic "completed via sub-tasks" — pure noise next to the
         // real sub-task deliverables.
-        .filter(|t| !is_scheduled_task_description(&t.description))
+        .filter(|t| !is_goal_run_root_task_description(&t.description))
         .collect();
 
     if successful.is_empty() {
@@ -746,6 +759,13 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
 #[cfg(test)]
 mod summary_tests {
     use super::*;
+
+    #[test]
+    fn mandate_roots_are_filtered_without_gaining_scheduled_provenance() {
+        let description = "Mandate review: steward the account";
+        assert!(is_goal_run_root_task_description(description));
+        assert!(!is_scheduled_task_description(description));
+    }
 
     fn completed_task(id: &str, order: i32, completed_at: &str, result: &str) -> Task {
         Task {

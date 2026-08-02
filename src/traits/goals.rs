@@ -340,7 +340,7 @@ pub struct GoalRun {
     pub id: String,
     pub project_id: String,
     pub goal_id: String,
-    /// "finite", "scheduled", "manual", or "legacy"
+    /// "finite", "scheduled", "manual", "mandate", or "legacy"
     pub trigger_type: String,
     pub schedule_id: Option<String>,
     pub root_task_id: Option<String>,
@@ -618,7 +618,17 @@ impl NotificationEntry {
     pub fn new(goal_id: &str, session_id: &str, notification_type: &str, message: &str) -> Self {
         let now = chrono::Utc::now();
         let priority = match notification_type {
-            "completed" | "failed" | "escalation" | "evergreen_alert" | "token_alert" => "critical",
+            "completed"
+            | "failed"
+            | "escalation"
+            | "evergreen_alert"
+            | "token_alert"
+            | "mandate_action"
+            | "mandate_ask"
+            | "mandate_stopped"
+            | "mandate_review_failed"
+            | "mandate_reconciliation"
+            | "mandate_reconciliation_required" => "critical",
             _ => "status_update",
         };
         let expires_at = if priority == "status_update" {

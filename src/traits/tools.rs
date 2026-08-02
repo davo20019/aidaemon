@@ -706,11 +706,21 @@ fn default_semantics_from_identity(
 /// Do NOT add fields here that duplicate information already in the enriched args.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolExecutionContext {
-    /// When true, the dispatcher has already classified this specific tool call
-    /// as safe for unattended execution.  Tools that honor this (currently
-    /// `terminal` and `http_request`) may skip their user-approval prompt.
-    /// Hard blocks, command-safety checks, and all other validations still run.
+    /// When true, the correction sandbox has already classified this exact tool
+    /// call as safe for unattended execution. Tools that honor this (currently
+    /// `terminal` and `http_request`) may skip their redundant approval prompt.
+    /// Hard blocks, command-safety checks, scope, and all other validations run.
     pub correction_preapproved: bool,
+    /// True only after the final common dispatcher revalidated an exact,
+    /// action-bound `MandateAuthorityGrant` for this mutating call. This is
+    /// deliberately separate from correction preapproval so tools can honor
+    /// owner-delegated autonomy without conflating the two authority sources.
+    pub mandate_preapproved: bool,
+    /// True only when the common dispatcher resolved this call to an active
+    /// autonomous mandate. Network adapters use this control-plane bit to keep
+    /// one target-bound call from following redirects outside the target that
+    /// was evaluated by the mandate authority kernel.
+    pub mandate_execution: bool,
 }
 
 /// Tool trait — system tools, terminal, MCP-proxied tools.

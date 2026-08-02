@@ -97,6 +97,8 @@ pub(super) async fn prefetch_read_only_batch(
             policy_bundle: ctx.policy_bundle,
             correction_preapproved: false,
             suppress_trusted_session: false,
+            mandate_authority: None,
+            mandate_execution: false,
         };
         let io = execute_tool_call_io(agent, tc, &io_ctx).await;
         (

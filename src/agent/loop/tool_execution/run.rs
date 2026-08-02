@@ -22,6 +22,7 @@ use crate::agent::recall_guardrails::is_personal_memory_tool;
 use crate::agent::self_correction::AttemptDecision;
 use crate::agent::*;
 use crate::events::TaskOutcome;
+use crate::traits::ToolCallSemantics;
 
 // ── Correction gate (P2.4) ───────────────────────────────────────────────────
 
@@ -37,6 +38,235 @@ enum CorrectionGateDecision {
     BlockedToolResult { redacted_reason: String },
     /// Budget/repeat limit exhausted; return the give-up report as tool result.
     GiveUpToolResult { report: String },
+}
+
+enum MandateGateDecision {
+    NotApplicable,
+    Allow {
+        grant: Option<crate::traits::MandateAuthorityGrant>,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+async fn mandate_gate_for_tool_call(
+    agent: &Agent,
+    goal_id: &str,
+    task_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    effective_arguments: &str,
+    semantics: &ToolCallSemantics,
+) -> anyhow::Result<MandateGateDecision> {
+    let Some(mandate) = agent.state.get_mandate_for_goal(goal_id).await? else {
+        return Ok(if agent.mandate_execution.is_some() {
+            MandateGateDecision::Deny {
+                reason: "mandate_record_missing".to_string(),
+            }
+        } else {
+            MandateGateDecision::NotApplicable
+        });
+    };
+    if !mandate.is_active() {
+        return Ok(MandateGateDecision::Deny {
+            reason: "mandate_inactive".to_string(),
+        });
+    }
+    if agent.require_live_mandate_execution(goal_id).await.is_err() {
+        return Ok(MandateGateDecision::Deny {
+            reason: "mandate_execution_fence_lost".to_string(),
+        });
+    }
+    let Some(goal_run) = agent.state.get_current_goal_run(goal_id).await? else {
+        return Ok(MandateGateDecision::Deny {
+            reason: "mandate_run_missing".to_string(),
+        });
+    };
+    if goal_run.trigger_type != "mandate" || goal_run.status != "running" {
+        return Ok(MandateGateDecision::Deny {
+            reason: "invalid_mandate_run".to_string(),
+        });
+    }
+
+    let class = crate::mandates::classify_mandate_call(tool_name, effective_arguments, semantics);
+    let Some(fence) = agent.mandate_execution.as_ref() else {
+        return Ok(MandateGateDecision::Deny {
+            reason: "mandate_role_fence_missing".to_string(),
+        });
+    };
+    if task_id != fence.worker_task_id {
+        return Ok(MandateGateDecision::Deny {
+            reason: "mandate_worker_identity_mismatch".to_string(),
+        });
+    }
+    let is_task_lead = fence.worker_task_id == fence.root_task_id;
+    if !crate::mandates::role_allows_mandate_call(class, tool_name, is_task_lead) {
+        return Ok(MandateGateDecision::Deny {
+            reason: if is_task_lead && class == crate::mandates::MandateCallClass::GovernedMutation
+            {
+                // This check deliberately precedes authorization and durable
+                // reservation so a task-lead mistake cannot burn quota.
+                "mandate_task_lead_mutation_forbidden"
+            } else {
+                "mandate_role_forbidden"
+            }
+            .to_string(),
+        });
+    }
+    if class == crate::mandates::MandateCallClass::ProtocolObservation {
+        return Ok(MandateGateDecision::Allow { grant: None });
+    }
+    if class == crate::mandates::MandateCallClass::RecordDecision {
+        return Ok(MandateGateDecision::Allow { grant: None });
+    }
+    if class == crate::mandates::MandateCallClass::Observation {
+        return Ok(
+            match crate::mandates::authority::authorize_mandate_observation(
+                &mandate,
+                tool_name,
+                effective_arguments,
+                semantics,
+                &chrono::Utc::now(),
+            ) {
+                Ok(()) => MandateGateDecision::Allow { grant: None },
+                Err(reason) => MandateGateDecision::Deny {
+                    reason: reason.as_str().to_string(),
+                },
+            },
+        );
+    }
+
+    let decision = agent
+        .state
+        .get_mandate_decision_for_run(&goal_run.id)
+        .await?;
+    let Some(decision) = decision else {
+        return Ok(MandateGateDecision::Deny {
+            reason: "act_decision_required".to_string(),
+        });
+    };
+    if decision.goal_run_id != goal_run.id
+        || decision.mandate_id != mandate.id
+        || decision.mandate_version != mandate.version
+        || decision.outcome != crate::traits::MandateDecisionOutcome::Act
+    {
+        return Ok(MandateGateDecision::Deny {
+            reason: "current_act_decision_required".to_string(),
+        });
+    }
+
+    match class {
+        crate::mandates::MandateCallClass::ActControl => {
+            Ok(MandateGateDecision::Allow { grant: None })
+        }
+        crate::mandates::MandateCallClass::GovernedMutation => {
+            match crate::mandates::authority::authorize_mandate_action(
+                &mandate,
+                &decision,
+                tool_name,
+                effective_arguments,
+                semantics,
+                &chrono::Utc::now(),
+            ) {
+                crate::mandates::authority::MandateAuthorityDecision::Allow(mut grant) => {
+                    if !grant.counts_toward_cycle_budget {
+                        return Ok(MandateGateDecision::Deny {
+                            reason: "mutation_grant_not_metered".to_string(),
+                        });
+                    }
+                    grant.tool_call_id = Some(tool_call_id.to_string());
+                    // This is an uncommitted capability candidate. Durable
+                    // quota reservation happens only at the final common
+                    // dispatcher, after every local no-I/O guard has passed.
+                    Ok(MandateGateDecision::Allow { grant: Some(grant) })
+                }
+                crate::mandates::authority::MandateAuthorityDecision::Deny(reason) => {
+                    Ok(MandateGateDecision::Deny {
+                        reason: reason.as_str().to_string(),
+                    })
+                }
+            }
+        }
+        crate::mandates::MandateCallClass::Deny => Ok(MandateGateDecision::Deny {
+            reason: "unsupported_mandate_call".to_string(),
+        }),
+        crate::mandates::MandateCallClass::ProtocolObservation
+        | crate::mandates::MandateCallClass::Observation
+        | crate::mandates::MandateCallClass::RecordDecision => unreachable!(),
+    }
+}
+
+fn mandate_mutation_outcome_projection(
+    fence: &MandateExecutionFence,
+    task_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    call_semantics: &ToolCallSemantics,
+    grant: &crate::traits::MandateAuthorityGrant,
+    receipt: &crate::events::ToolReceiptV1,
+) -> crate::traits::MandateMutationOutcomeProjection {
+    let evidence = match receipt.outcome_evidence {
+        crate::events::ToolOutcomeEvidenceSource::ToolReported => {
+            Some(crate::traits::MandateMutationEvidence::ToolReported)
+        }
+        crate::events::ToolOutcomeEvidenceSource::StructuredMetadata => {
+            Some(crate::traits::MandateMutationEvidence::StructuredMetadata)
+        }
+        crate::events::ToolOutcomeEvidenceSource::DurableReplay
+        | crate::events::ToolOutcomeEvidenceSource::LegacyText => None,
+    };
+    let semantics_match = &receipt.semantics == call_semantics;
+    let transport_is_clean = receipt.transport_error.is_none()
+        && !receipt.timed_out
+        && !receipt.background_started
+        && !receipt.detached
+        && !receipt.completion_notifications_enabled;
+    let exit_is_success = receipt.exit_code.is_none_or(|code| code == 0);
+    let http_is_success = tool_name != "http_request"
+        || receipt
+            .http_status
+            .is_some_and(|status| (200..300).contains(&status) && status != 202);
+    let strict_success = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+        && receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
+        && evidence.is_some()
+        && transport_is_clean
+        && exit_is_success
+        && http_is_success
+        && semantics_match
+        && receipt.mandate_authority.as_ref() == Some(grant);
+    let explicit_failure = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+        && receipt.outcome_status.is_failure()
+        && evidence.is_some()
+        && transport_is_clean
+        && semantics_match
+        && receipt.mandate_authority.as_ref() == Some(grant);
+    let status = if strict_success {
+        crate::traits::MandateMutationAttemptStatus::Succeeded
+    } else if explicit_failure {
+        crate::traits::MandateMutationAttemptStatus::Failed
+    } else {
+        crate::traits::MandateMutationAttemptStatus::Ambiguous
+    };
+    crate::traits::MandateMutationOutcomeProjection {
+        grant: grant.clone(),
+        goal_run_id: fence.goal_run_id.clone(),
+        task_id: task_id.to_string(),
+        task_attempt_id: fence.attempt_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        status,
+        receipt_schema_version: receipt.schema_version,
+        outcome_evidence: evidence,
+        timed_out: receipt.timed_out,
+        background_started: receipt.background_started,
+        detached: receipt.detached,
+        completion_notifications_enabled: receipt.completion_notifications_enabled,
+        transport_error_present: receipt.transport_error.is_some(),
+        semantics_match,
+        http_status: receipt.http_status,
+        exit_code: receipt.exit_code,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 async fn reconcile_successful_tool_checklist(
@@ -388,6 +618,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         _user_text,
         is_scheduled_goal,
     );
+    let is_mandate_execution = match resolved_goal_id {
+        Some(goal_id) => agent.state.get_mandate_for_goal(goal_id).await?.is_some(),
+        None => false,
+    };
     info!(
         session_id,
         iteration,
@@ -408,6 +642,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let mut prefetched_io = if project_instruction_tracker.is_none()
         && !restrict_untrusted_external_reference_tools
         && ctx.correction.is_none()
+        && !is_mandate_execution
         && super::parallel_prefetch::batch_is_prefetch_eligible(
             &resp.tool_calls,
             available_capabilities,
@@ -783,87 +1018,103 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let allowed_project_scope = (!turn_context.allow_multi_project_scope)
             .then_some(turn_context.primary_project_scope.as_deref())
             .flatten();
-        let call_semantics = agent
+        let registered_call_semantics = agent
             .tools
             .iter()
             .find(|tool| tool.name() == tc.name && tool.is_available())
-            .map(|tool| tool.call_semantics(&effective_arguments))
-            .unwrap_or_default();
+            .map(|tool| tool.call_semantics(&effective_arguments));
+        let call_semantics = if let Some(semantics) = registered_call_semantics {
+            semantics
+        } else if let Some(registry) = agent.mcp_registry.as_ref() {
+            registry
+                .find_tool(&tc.name)
+                .await
+                .map(|tool| tool.call_semantics(&effective_arguments))
+                .unwrap_or_default()
+        } else {
+            ToolCallSemantics::default()
+        };
         let tool_caps = available_capabilities
             .get(&tc.name)
             .copied()
             .unwrap_or_default();
 
-        if let Some(tracker) = project_instruction_tracker.as_mut() {
-            let instruction_targets = project_instruction_targets_for_tool_call(
-                &tc.name,
-                &effective_arguments,
-                &call_semantics,
-            );
-            if !instruction_targets.is_empty() {
-                match tracker
-                    .discover_for_targets(
-                        crate::execution::active_execution_backend(),
-                        &instruction_targets,
-                    )
-                    .await
-                {
-                    Ok(Some(instructions)) => {
-                        let source_paths = instructions.source_paths();
-                        if !task_context_tail.is_empty() {
-                            task_context_tail.push_str("\n\n");
-                        }
-                        task_context_tail.push_str(
+        if !is_mandate_execution {
+            if let Some(tracker) = project_instruction_tracker.as_mut() {
+                let instruction_targets = project_instruction_targets_for_tool_call(
+                    &tc.name,
+                    &effective_arguments,
+                    &call_semantics,
+                );
+                if !instruction_targets.is_empty() {
+                    match tracker
+                        .discover_for_targets(
+                            crate::execution::active_execution_backend(),
+                            &instruction_targets,
+                        )
+                        .await
+                    {
+                        Ok(Some(instructions)) => {
+                            let source_paths = instructions.source_paths();
+                            if !task_context_tail.is_empty() {
+                                task_context_tail.push_str("\n\n");
+                            }
+                            task_context_tail.push_str(
                             "[Just-in-time Project Instructions — loaded before subtree work]\n",
                         );
-                        task_context_tail.push_str(&instructions.render_for_prompt());
-                        info!(
-                            session_id,
-                            iteration,
-                            tool = %tc.name,
-                            instruction_targets = ?instruction_targets,
-                            instruction_sources = ?source_paths,
-                            "Deferred tool call to load nested project instructions"
-                        );
-                        agent
-                            .emit_decision_point(
-                                emitter,
-                                task_id,
+                            task_context_tail.push_str(&instructions.render_for_prompt());
+                            info!(
+                                session_id,
                                 iteration,
-                                DecisionType::InstructionsSnapshot,
-                                format!("Loaded nested project instructions before {}", tc.name),
-                                json!({
-                                    "condition": "jit_project_instructions_discovered",
-                                    "tool": tc.name,
-                                    "targets": &instruction_targets,
-                                    "sources": &source_paths,
-                                    "action_executed": false,
-                                }),
+                                tool = %tc.name,
+                                instruction_targets = ?instruction_targets,
+                                instruction_sources = ?source_paths,
+                                "Deferred tool call to load nested project instructions"
+                            );
+                            agent
+                                .emit_decision_point(
+                                    emitter,
+                                    task_id,
+                                    iteration,
+                                    DecisionType::InstructionsSnapshot,
+                                    format!(
+                                        "Loaded nested project instructions before {}",
+                                        tc.name
+                                    ),
+                                    json!({
+                                        "condition": "jit_project_instructions_discovered",
+                                        "tool": tc.name,
+                                        "targets": &instruction_targets,
+                                        "sources": &source_paths,
+                                        "action_executed": false,
+                                    }),
+                                )
+                                .await;
+                            defer_tool_calls_for_new_project_instructions(
+                                agent,
+                                emitter,
+                                session_id,
+                                task_id,
+                                &resp.tool_calls[tool_call_index..],
+                                &source_paths,
                             )
-                            .await;
-                        defer_tool_calls_for_new_project_instructions(
-                            agent,
-                            emitter,
-                            session_id,
-                            task_id,
-                            &resp.tool_calls[tool_call_index..],
-                            &source_paths,
-                        )
-                        .await?;
-                        total_tool_calls_attempted = total_tool_calls_attempted.saturating_sub(1);
-                        commit_state!();
-                        return Ok(ToolExecutionOutcome::NextIteration);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        warn!(
-                            session_id,
-                            iteration,
-                            tool = %tc.name,
-                            instruction_targets = ?instruction_targets,
-                            %error,
-                            "Could not perform just-in-time project instruction discovery"
-                        );
+                            .await?;
+                            total_tool_calls_attempted =
+                                total_tool_calls_attempted.saturating_sub(1);
+                            commit_state!();
+                            return Ok(ToolExecutionOutcome::NextIteration);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(
+                                session_id,
+                                iteration,
+                                tool = %tc.name,
+                                instruction_targets = ?instruction_targets,
+                                %error,
+                                "Could not perform just-in-time project instruction discovery"
+                            );
+                        }
                     }
                 }
             }
@@ -1397,6 +1648,100 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         }
         // ── End correction gate ──────────────────────────────────────────────
 
+        // Owner mandates are a separate authority boundary from scheduled-goal
+        // trust and ordinary tool approval. Keep this gate immediately before
+        // adapter I/O: all deterministic local contract, budget, repetition,
+        // duplicate, and correction guards above can therefore block without
+        // consuming a durable mutation attempt. The final common dispatcher
+        // still claims and revalidates the exact one-use reservation.
+        let mandate_authority_grant = if let Some(goal_id) = resolved_goal_id {
+            match mandate_gate_for_tool_call(
+                agent,
+                goal_id,
+                task_id,
+                &tc.id,
+                &tc.name,
+                &effective_arguments,
+                &call_semantics,
+            )
+            .await?
+            {
+                MandateGateDecision::NotApplicable => None,
+                MandateGateDecision::Allow { grant } => {
+                    if let Some(grant) = grant.as_ref() {
+                        agent
+                            .emit_decision_point(
+                                emitter,
+                                task_id,
+                                iteration,
+                                DecisionType::MandateAuthorityGate,
+                                format!("Authorized bounded mandate action for {}", tc.name),
+                                json!({
+                                    "condition": "mandate_action_authorized",
+                                    "tool": tc.name,
+                                    "mandate_id": grant.mandate_id,
+                                    "mandate_version": grant.mandate_version,
+                                    "decision_cycle_id": grant.decision_cycle_id,
+                                    "action_digest": grant.action_digest,
+                                }),
+                            )
+                            .await;
+                    }
+                    grant
+                }
+                MandateGateDecision::Deny { reason } => {
+                    *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+                    let result_text = format!(
+                        "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). Record a current ACT, choose a permitted action, WAIT, or ASK the owner.",
+                        tc.name
+                    );
+                    let tool_msg = Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: "tool".to_string(),
+                        content: Some(result_text),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
+                        tool_calls_json: None,
+                        created_at: Utc::now(),
+                        importance: 0.3,
+                        ..Message::runtime_defaults()
+                    };
+                    agent
+                        .append_tool_message_with_result_event(
+                            emitter,
+                            &tool_msg,
+                            false,
+                            0,
+                            Some(reason.clone()),
+                            Some(task_id),
+                        )
+                        .await?;
+                    agent
+                        .emit_warning_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::MandateAuthorityGate,
+                            format!("Blocked mandate action for {}", tc.name),
+                            json!({
+                                "condition": "mandate_action_blocked",
+                                "tool": tc.name,
+                                "reason": reason,
+                            }),
+                        )
+                        .await;
+                    execution_state
+                        .complete_current_step(StepExecutionOutcome::NonrecoverableFailure);
+                    execution_state.mark_persisted_now();
+                    iteration_had_tool_failures = true;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
         let prefetched = match prefetched_io.remove(&tc.id) {
             Some(entry) if entry.arguments == effective_arguments => Some(entry.io),
             Some(_) => {
@@ -1446,6 +1791,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         policy_bundle,
                         correction_preapproved: io_correction_preapproved,
                         suppress_trusted_session: io_suppress_trusted_session,
+                        mandate_authority: mandate_authority_grant.as_ref(),
+                        mandate_execution: is_mandate_execution,
                     },
                 )
                 .await
@@ -1482,6 +1829,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             workspace_grant: channel_ctx.active_workspace_grant(user_role),
                             correction_preapproved: false,
                             suppress_trusted_session: false,
+                            mandate_authority: None,
+                            mandate_tool_call_id: None,
                         },
                     )
                     .await;
@@ -1884,38 +2233,40 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             )
             .await;
         }
-        if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
-            if let Some(diagnosis) = super::reflection::maybe_trigger_reflection(
-                agent,
-                &tc.name,
-                &effective_arguments,
-                failure,
-                _user_text,
-                active_skill_names,
-                &tool_error_history,
-                &mut reflection_completed,
-                session_id,
-            )
-            .await
-            {
-                let failure_key = (tc.name.clone(), failure.signature.clone());
-                pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
-                    tool_name: tc.name.clone(),
-                    root_cause: diagnosis.root_cause.clone(),
-                    recommended_action: diagnosis.recommended_action.clone(),
-                });
-                if let Some(draft) = diagnosis.learning {
-                    if let Some(solution_id) =
-                        super::reflection::store_reflection_learning(&agent.state, draft).await
-                    {
-                        pending_reflection_recoveries.insert(
-                            tc.name.clone(),
-                            super::reflection::PendingReflectionRecovery {
-                                signature: failure_key.1,
-                                solution_ids: vec![solution_id],
-                                verify_on_iteration: iteration.saturating_add(1),
-                            },
-                        );
+        if agent.mandate_execution.is_none() {
+            if let Some(failure) = learning_outcome.semantic_failure.as_ref() {
+                if let Some(diagnosis) = super::reflection::maybe_trigger_reflection(
+                    agent,
+                    &tc.name,
+                    &effective_arguments,
+                    failure,
+                    _user_text,
+                    active_skill_names,
+                    &tool_error_history,
+                    &mut reflection_completed,
+                    session_id,
+                )
+                .await
+                {
+                    let failure_key = (tc.name.clone(), failure.signature.clone());
+                    pending_system_messages.push(SystemDirective::ReflectionDiagnosis {
+                        tool_name: tc.name.clone(),
+                        root_cause: diagnosis.root_cause.clone(),
+                        recommended_action: diagnosis.recommended_action.clone(),
+                    });
+                    if let Some(draft) = diagnosis.learning {
+                        if let Some(solution_id) =
+                            super::reflection::store_reflection_learning(&agent.state, draft).await
+                        {
+                            pending_reflection_recoveries.insert(
+                                tc.name.clone(),
+                                super::reflection::PendingReflectionRecovery {
+                                    signature: failure_key.1,
+                                    solution_ids: vec![solution_id],
+                                    verify_on_iteration: iteration.saturating_add(1),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -2096,7 +2447,29 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             importance: 0.3, // Tool outputs default to lower importance
             ..Message::new_runtime(Uuid::new_v4().to_string(), session_id, "tool")
         };
-        let receipt = crate::events::ToolReceiptV1::from_metadata(
+        if outcome_satisfied && tc.name == "manage_mandates" {
+            if let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&effective_arguments) {
+                if arguments.get("action").and_then(serde_json::Value::as_str)
+                    == Some("record_decision")
+                {
+                    agent
+                        .emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::MandateDeliberation,
+                            "Committed durable mandate deliberation".to_string(),
+                            json!({
+                                "condition": "mandate_decision_committed",
+                                "outcome": arguments.get("outcome"),
+                                "reconsider_minutes": arguments.get("reconsider_minutes"),
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
             &result_metadata,
             tool_outcome_status,
             outcome_evidence,
@@ -2105,6 +2478,21 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .as_ref()
                 .and_then(|step| step.idempotency_key.clone()),
         );
+        receipt.mandate_authority = mandate_authority_grant.clone();
+        let mandate_outcome_projection = mandate_authority_grant
+            .as_ref()
+            .zip(agent.mandate_execution.as_ref())
+            .map(|(grant, fence)| {
+                mandate_mutation_outcome_projection(
+                    fence,
+                    task_id,
+                    &tc.id,
+                    &tc.name,
+                    &call_semantics,
+                    grant,
+                    &receipt,
+                )
+            });
         agent
             .append_tool_message_with_receipt_event_policy(
                 emitter,
@@ -2121,6 +2509,28 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 Some(receipt),
             )
             .await?;
+        if let Some(projection) = mandate_outcome_projection.as_ref() {
+            match agent
+                .state
+                .project_mandate_mutation_outcome(projection)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    mandate_id = %projection.grant.mandate_id,
+                    decision_cycle_id = %projection.grant.decision_cycle_id,
+                    tool_call_id = %projection.tool_call_id,
+                    "Mandate mutation receipt did not match its durable reservation; leaving it ambiguous"
+                ),
+                Err(error) => warn!(
+                    mandate_id = %projection.grant.mandate_id,
+                    decision_cycle_id = %projection.grant.decision_cycle_id,
+                    tool_call_id = %projection.tool_call_id,
+                    %error,
+                    "Failed to project mandate mutation receipt; leaving the reservation ambiguous"
+                ),
+            }
+        }
 
         if outcome_satisfied && tc.name == "report_blocker" && agent.task_id.is_some() {
             // Capture the raw structured summary — the untrusted-data wrapper
@@ -2171,13 +2581,16 @@ pub(in crate::agent) async fn run_tool_execution_phase(
 
             learning_ctx.completed_naturally = true;
             learning_ctx.task_outcome = Some(crate::events::TaskOutcome::Succeeded);
-            let learning_ctx_for_task = learning_ctx.clone();
-            let state = agent.state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                    warn!("Learning failed: {}", e);
-                }
-            });
+            if agent.mandate_execution.is_none() {
+                let learning_ctx_for_task = learning_ctx.clone();
+                let state = agent.state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await
+                    {
+                        warn!("Learning failed: {}", e);
+                    }
+                });
+            }
 
             commit_state!();
             return Ok(ToolExecutionOutcome::Return(Ok(reply)));
@@ -2250,13 +2663,15 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .await;
         learning_ctx.completed_naturally = true;
         learning_ctx.task_outcome = Some(TaskOutcome::Partial);
-        let learning_ctx_for_task = learning_ctx.clone();
-        let state = agent.state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-                warn!("Learning failed: {}", e);
-            }
-        });
+        if agent.mandate_execution.is_none() {
+            let learning_ctx_for_task = learning_ctx.clone();
+            let state = agent.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                    warn!("Learning failed: {}", e);
+                }
+            });
+        }
         commit_state!();
         return Ok(ToolExecutionOutcome::Return(Ok(blocker_summary)));
     }

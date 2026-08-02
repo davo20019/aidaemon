@@ -905,6 +905,9 @@ impl Agent {
         user_text: &str,
         error_summary: &str,
     ) -> Option<String> {
+        if self.mandate_execution.is_some() {
+            return None;
+        }
         let system = format!(
             "The user asked a question but all tool-based approaches failed ({}).\n\
              Answer the question from your training knowledge if possible.\n\

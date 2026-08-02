@@ -129,6 +129,7 @@ impl Agent {
             role: AgentRole::Orchestrator,
             task_id: None,
             goal_id: None,
+            mandate_execution: None,
             cancel_token: None,
             goal_token_registry,
             hub: RwLock::new(hub),
@@ -256,6 +257,33 @@ impl Agent {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_mandate_execution(
+        &mut self,
+        mandate_id: &str,
+        mandate_version: i64,
+        authority: crate::traits::MandateAuthority,
+        goal_id: &str,
+        root_task_id: &str,
+        root_task_attempt_id: &str,
+        attempt: &crate::traits::TaskAttempt,
+    ) {
+        self.task_id = Some(attempt.task_id.clone());
+        self.goal_id = Some(goal_id.to_string());
+        self.mandate_execution = Some(super::MandateExecutionFence {
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            authority,
+            goal_id: goal_id.to_string(),
+            goal_run_id: attempt.goal_run_id.clone(),
+            root_task_id: root_task_id.to_string(),
+            root_task_attempt_id: root_task_attempt_id.to_string(),
+            worker_task_id: attempt.task_id.clone(),
+            attempt_id: attempt.id.clone(),
+            lease_token: attempt.lease_token.clone(),
+        });
+    }
+
+    #[cfg(test)]
     pub async fn set_test_schedule_approval_for_session(&self, session_id: &str, approved: bool) {
         let mut sessions = self.schedule_approved_sessions.write().await;
         if approved {
@@ -293,6 +321,7 @@ impl Agent {
         role: AgentRole,
         task_id: Option<String>,
         goal_id: Option<String>,
+        mandate_execution: Option<super::MandateExecutionFence>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
@@ -353,6 +382,7 @@ impl Agent {
             role,
             task_id,
             goal_id,
+            mandate_execution,
             cancel_token,
             goal_token_registry,
             hub: RwLock::new(hub),

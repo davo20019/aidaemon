@@ -84,6 +84,162 @@ fn build_tool_filter_gate_telemetry(
     )
 }
 
+/// Build mandate worker bootstrap state without consulting any owner-turn
+/// routing surface. Mandate child agents already carry an immutable execution
+/// fence and a role/authority-scoped registered tool set from spawn. Their
+/// bootstrap must therefore be query-independent: no local skill matching,
+/// conversation/project history, generic policy filtering, route fail-safe, or
+/// model routing may reinterpret the model-authored task message.
+#[allow(clippy::too_many_arguments)]
+async fn build_isolated_mandate_bootstrap(
+    agent: &Agent,
+    session_id: &str,
+    user_text: &str,
+    user_role: UserRole,
+    channel_ctx: &ChannelContext,
+    task_id: String,
+    user_msg_id: String,
+    emitter: crate::events::EventEmitter,
+) -> anyhow::Result<BootstrapOutcome> {
+    anyhow::ensure!(
+        agent.mandate_execution.is_some(),
+        "isolated mandate bootstrap requires an immutable execution fence"
+    );
+    anyhow::ensure!(
+        user_role == UserRole::Owner && channel_ctx.visibility == ChannelVisibility::Internal,
+        "mandate workers require the internal owner execution channel"
+    );
+
+    // This is the registered child roster only. `tool_definitions_with_capabilities`
+    // additionally performs message-triggered MCP composition, which is outside
+    // v1 mandate authority even when the resulting view would later fail closed.
+    let (mut tool_defs, available_capabilities) =
+        agent.registered_tool_definitions_with_capabilities();
+    Agent::sort_tool_definitions_by_name(&mut tool_defs);
+    let base_tool_defs = tool_defs.clone();
+
+    let llm_runtime_snapshot = agent.llm_runtime.snapshot();
+    let llm_provider = llm_runtime_snapshot.provider();
+    // Spawn selected this worker's model before its immutable fence was built.
+    // Keep that exact model and expose no generic router to later loop phases.
+    let model = match tokio::time::timeout(Duration::from_secs(2), agent.model.read()).await {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            warn!(
+                session_id,
+                "Timed out reading mandate worker model; using the runtime primary"
+            );
+            llm_runtime_snapshot.primary_model()
+        }
+    };
+
+    let (core_prompt_bytes, task_context_tail, active_skill_names, project_instruction_tracker) =
+        agent
+            .build_system_prompt_for_message(
+                &emitter,
+                &task_id,
+                session_id,
+                user_text,
+                user_role,
+                channel_ctx,
+                tool_defs.len(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+    anyhow::ensure!(
+        active_skill_names.is_empty() && project_instruction_tracker.is_none(),
+        "isolated mandate prompt unexpectedly returned generic instruction state"
+    );
+
+    let mut harness_eval = HarnessEvalAccumulator::new(HarnessEvalSeed {
+        task_id: task_id.clone(),
+        turn_id: Some(user_msg_id),
+        depth: agent.depth as u32,
+        parent_task_id: agent.task_id.clone(),
+        goal_id: agent.goal_id.clone(),
+        durable_task_id: agent.task_id.clone(),
+        completion_task_kind: "mandate_protocol".to_string(),
+        followup_mode: None,
+        config: agent.harness_eval_config.clone(),
+    });
+    harness_eval.record_bootstrap(
+        "isolated_mandate_continue",
+        Vec::new(),
+        Some(ModelProfile::Strong),
+        false,
+    );
+
+    let learning_ctx = LearningContext {
+        user_text: user_text.to_string(),
+        intent_domains: Vec::new(),
+        tool_calls: Vec::new(),
+        errors: Vec::new(),
+        first_error: None,
+        recovery_actions: Vec::new(),
+        start_time: Utc::now(),
+        completed_naturally: false,
+        explicit_positive_signals: 0,
+        explicit_negative_signals: 0,
+        task_outcome: None,
+        replay_notes: Vec::new(),
+    };
+    let turn_context = TurnContext {
+        // This fixed daemon string prevents a model-authored task from becoming
+        // a generic follow-up, project, or completion-routing instruction.
+        goal_user_text:
+            "Execute the built-in bounded mandate protocol for this exact worker fence.".to_string(),
+        completion_contract: CompletionContract {
+            task_kind: CompletionTaskKind::Monitor,
+            requires_observation: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let policy_bundle = crate::execution_policy::PolicyBundle {
+        // The generic policy is retained only because downstream loop state has
+        // a common shape. Strong keeps the already-scoped roster intact; it does
+        // not select a model because mandate bootstrap exposes no router.
+        policy: ExecutionPolicy::for_profile(ModelProfile::Strong),
+        risk_score: 1.0,
+        uncertainty_score: 0.0,
+        confidence: 1.0,
+    };
+
+    Ok(BootstrapOutcome::Continue(Box::new(BootstrapData {
+        user_text: user_text.to_string(),
+        task_id,
+        resume_execution_snapshot: None,
+        emitter,
+        learning_ctx,
+        is_personal_memory_recall_turn: false,
+        is_reaffirmation_challenge_turn: false,
+        requests_external_verification: false,
+        restrict_to_personal_memory_tools: false,
+        active_skill_names,
+        active_untrusted_external_reference_skills: Vec::new(),
+        restrict_untrusted_external_reference_tools: false,
+        personal_memory_tool_call_cap: 0,
+        tools_allowed_for_user: true,
+        available_capabilities,
+        base_tool_defs,
+        tool_defs,
+        policy_bundle,
+        llm_provider,
+        llm_router: None,
+        model,
+        route_failsafe_active: false,
+        turn_context,
+        project_instruction_tracker,
+        core_prompt_bytes,
+        task_context_tail,
+        session_summary: None,
+        harness_eval,
+    })))
+}
+
 pub(in crate::agent) async fn run_bootstrap_phase(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &BootstrapCtx<'_>,
@@ -95,34 +251,44 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let channel_ctx = ctx.channel_ctx.clone();
     info!(session_id, "Bootstrap phase started");
 
+    let is_mandate_execution = agent.mandate_execution.is_some();
+    anyhow::ensure!(
+        !is_mandate_execution || ctx.attachments.is_empty(),
+        "mandate workers cannot receive attachment-derived context"
+    );
     let model_for_stt = agent.llm_runtime.snapshot().primary_model();
-    let user_text_enriched = crate::agent::stt::maybe_enrich_user_text(
-        ctx.user_text,
-        ctx.attachments,
-        &agent.stt_config,
-        &agent.audio_config,
-        &model_for_stt,
-    )
-    .await;
+    let user_text_enriched = if is_mandate_execution {
+        ctx.user_text.to_string()
+    } else {
+        crate::agent::stt::maybe_enrich_user_text(
+            ctx.user_text,
+            ctx.attachments,
+            &agent.stt_config,
+            &agent.audio_config,
+            &model_for_stt,
+        )
+        .await
+    };
     let user_text = user_text_enriched.as_str();
     // Resume checkpoints can contain prior tool arguments/results and broader
     // owner authority. A collaborator starts a fresh scoped turn instead of
     // inheriting an interrupted owner task from the shared session.
-    let resume_checkpoint = if user_role == UserRole::Owner && is_resume_request(user_text) {
-        match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
-            Ok(checkpoint) => checkpoint,
-            Err(e) => {
-                warn!(
-                    session_id,
-                    error = %e,
-                    "Failed to build resume checkpoint; continuing without resume context"
-                );
-                None
+    let resume_checkpoint =
+        if !is_mandate_execution && user_role == UserRole::Owner && is_resume_request(user_text) {
+            match crate::agent::resume::build_resume_checkpoint(agent, session_id).await {
+                Ok(checkpoint) => checkpoint,
+                Err(e) => {
+                    warn!(
+                        session_id,
+                        error = %e,
+                        "Failed to build resume checkpoint; continuing without resume context"
+                    );
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let resumed_from_task_id = resume_checkpoint.as_ref().map(|c| c.task_id.clone());
 
     // Generate task ID for this request
@@ -177,15 +343,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             },
         )
         .await;
-    if let Err(err) =
-        crate::agent::dialogue_state::record_dialogue_task_start(agent, session_id, &task_id).await
-    {
-        warn!(
-            session_id,
-            task_id,
-            error = %err,
-            "Failed to record dialogue task start"
-        );
+    if !is_mandate_execution {
+        if let Err(err) =
+            crate::agent::dialogue_state::record_dialogue_task_start(agent, session_id, &task_id)
+                .await
+        {
+            warn!(
+                session_id,
+                task_id,
+                error = %err,
+                "Failed to record dialogue task start"
+            );
+        }
     }
 
     // 1. Persist the user message
@@ -219,6 +388,24 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             !ctx.attachments.is_empty(),
         )
         .await?;
+
+    // All generic owner-turn interpretation begins below this point. Mandate
+    // workers leave here with a deterministic built-in bootstrap state, so an
+    // exact `stop`, a local skill trigger, or path-bearing prior history can
+    // never divert/re-scope the immutable worker protocol.
+    if is_mandate_execution {
+        return build_isolated_mandate_bootstrap(
+            agent,
+            session_id,
+            user_text,
+            user_role,
+            &channel_ctx,
+            task_id,
+            user_msg_id,
+            emitter,
+        )
+        .await;
+    }
 
     // A current schedule proposal owns an exact confirm/cancel response. Check
     // it before the generic task-cancel shortcut so `cancel` discards the
@@ -847,6 +1034,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // tail/cursor snapshot is built, so this turn can safely use the refreshed
     // state. Normal maintenance remains the coalesced post-turn worker.
     if agent.context_window_config.enabled
+        && agent.mandate_execution.is_none()
         && user_role.can_persist_owner_memory()
         && !straightforward_artifact_task
         && !non_owner_shared_context
@@ -887,6 +1075,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     }
 
     let session_summary = if agent.context_window_config.enabled
+        && agent.mandate_execution.is_none()
         && !straightforward_artifact_task
         && !non_owner_shared_context
     {
@@ -1033,5 +1222,204 @@ mod gate_telemetry_tests {
         assert_eq!(metadata["removed_tool_count"], 10);
         assert_eq!(metadata["stages"][1]["removed_count"], 9);
         assert_eq!(metadata["stages"][2]["stage"], "policy_filter");
+    }
+}
+
+#[cfg(test)]
+mod mandate_bootstrap_isolation_tests {
+    use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::traits::{Mandate, MandateAuthority, MandateStore, MessageStore, TaskAttempt};
+
+    fn attempt(id: &str, task_id: &str) -> TaskAttempt {
+        TaskAttempt {
+            id: id.to_string(),
+            task_id: task_id.to_string(),
+            goal_run_id: "mandate-bootstrap-run".to_string(),
+            worker_profile_id: None,
+            worker_instance_id: "mandate-bootstrap-worker".to_string(),
+            lease_token: format!("lease-{id}"),
+            status: "running".to_string(),
+            lease_expires_at: (chrono::Utc::now() + chrono::Duration::minutes(3)).to_rfc3339(),
+            last_heartbeat_at: chrono::Utc::now().to_rfc3339(),
+            workspace_id: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+        }
+    }
+
+    async fn run_isolated_turn(
+        agent: &Agent,
+        session_id: &str,
+        user_text: &str,
+    ) -> Box<BootstrapData> {
+        let services = crate::agent::services::AgentServices::new(agent);
+        match run_bootstrap_phase(
+            &services,
+            &BootstrapCtx {
+                session_id,
+                user_text,
+                attachments: &[],
+                status_tx: None,
+                user_role: UserRole::Owner,
+                channel_ctx: &ChannelContext::internal(),
+            },
+        )
+        .await
+        .expect("isolated mandate bootstrap")
+        {
+            BootstrapOutcome::Continue(data) => data,
+            BootstrapOutcome::Return(_) => {
+                panic!("generic bootstrap shortcut diverted a mandate worker")
+            }
+        }
+    }
+
+    fn assert_isolated(data: &BootstrapData, forbidden: &[&str]) {
+        assert!(data.active_skill_names.is_empty());
+        assert!(data.active_untrusted_external_reference_skills.is_empty());
+        assert!(!data.restrict_untrusted_external_reference_tools);
+        assert!(data.session_summary.is_none());
+        assert!(data.project_instruction_tracker.is_none());
+        assert!(data.llm_router.is_none());
+        assert!(!data.route_failsafe_active);
+        assert!(data.turn_context.recent_messages.is_empty());
+        assert!(data.turn_context.project_hints.is_empty());
+        assert!(data.turn_context.primary_project_scope.is_none());
+        assert_eq!(
+            data.turn_context.goal_user_text,
+            "Execute the built-in bounded mandate protocol for this exact worker fence."
+        );
+        let prompt = format!("{}\n{}", data.core_prompt_bytes, data.task_context_tail);
+        for sentinel in forbidden {
+            assert!(
+                !prompt.contains(sentinel),
+                "isolated bootstrap leaked {sentinel:?}"
+            );
+        }
+    }
+
+    async fn assert_durable_mandate_origin(agent: &Agent, session_id: &str) {
+        let events = agent
+            .event_store
+            .query_events_by_types(session_id, &[EventType::UserMessage], 10)
+            .await
+            .expect("query mandate user message");
+        let user_message = events
+            .first()
+            .expect("mandate bootstrap emitted a canonical user message");
+        assert_eq!(
+            user_message
+                .data
+                .get("execution_origin")
+                .and_then(serde_json::Value::as_str),
+            Some("mandate")
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_lead_and_executor_bypass_shortcuts_skills_and_history_routing() {
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup test agent");
+
+        let skill_dir = tempfile::tempdir().expect("skill tempdir");
+        std::fs::write(
+            skill_dir.path().join("private-api-guide.md"),
+            "---\nname: private-api-guide\ndescription: PRIVATE SKILL DESCRIPTION\ntriggers: stop, private-api-guide\nsource: docs\n---\nPRIVATE SKILL BODY\n",
+        )
+        .expect("write custom skill");
+        harness.agent.skills_dir = skill_dir.path().to_path_buf();
+        harness.agent.skill_cache = crate::skills::SkillCache::new(skill_dir.path().to_path_buf());
+
+        let goal = Goal::new_continuous(
+            "Mandate bootstrap controller",
+            "owner-mandate-bootstrap",
+            Some(10_000),
+            Some(50_000),
+        );
+        let authority = MandateAuthority::default();
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Exercise the bounded protocol",
+            &goal.session_id,
+            authority.clone(),
+            60,
+            3_600,
+            300,
+        );
+        harness
+            .state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .expect("persist mandate controller");
+
+        for session_id in ["mandate-lead-session", "mandate-executor-session"] {
+            let prior = Message {
+                content: Some(
+                    "PRIVATE PRIOR HISTORY in /tmp/private-project with PRIVATE PROJECT SCOPE"
+                        .to_string(),
+                ),
+                ..Message::new_runtime(uuid::Uuid::new_v4().to_string(), session_id, "assistant")
+            };
+            harness
+                .state
+                .append_message(&prior)
+                .await
+                .expect("persist prior history sentinel");
+        }
+
+        let root = attempt("root-attempt", "mandate-root-task");
+        harness.agent.set_test_mandate_execution(
+            &mandate.id,
+            mandate.version,
+            authority.clone(),
+            &goal.id,
+            &root.task_id,
+            &root.id,
+            &root,
+        );
+        let lead = run_isolated_turn(&harness.agent, "mandate-lead-session", "stop").await;
+        assert_durable_mandate_origin(&harness.agent, "mandate-lead-session").await;
+        assert_eq!(lead.user_text, "stop");
+        assert_isolated(
+            &lead,
+            &[
+                "PRIVATE SKILL DESCRIPTION",
+                "PRIVATE SKILL BODY",
+                "PRIVATE PRIOR HISTORY",
+                "PRIVATE PROJECT SCOPE",
+                "/tmp/private-project",
+            ],
+        );
+
+        let executor = attempt("executor-attempt", "mandate-executor-task");
+        harness.agent.set_test_mandate_execution(
+            &mandate.id,
+            mandate.version,
+            authority,
+            &goal.id,
+            &root.task_id,
+            &root.id,
+            &executor,
+        );
+        let executor_data = run_isolated_turn(
+            &harness.agent,
+            "mandate-executor-session",
+            "$private-api-guide inspect /tmp/private-project",
+        )
+        .await;
+        assert_durable_mandate_origin(&harness.agent, "mandate-executor-session").await;
+        assert_isolated(
+            &executor_data,
+            &[
+                "PRIVATE SKILL DESCRIPTION",
+                "PRIVATE SKILL BODY",
+                "PRIVATE PRIOR HISTORY",
+                "PRIVATE PROJECT SCOPE",
+            ],
+        );
+        assert!(executor_data.core_prompt_bytes.contains("role: executor"));
     }
 }

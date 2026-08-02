@@ -1713,6 +1713,7 @@ mod goals;
 mod health_checks;
 pub(crate) mod history_search;
 mod learning;
+mod mandates;
 pub(crate) mod memory;
 mod messages;
 pub(crate) mod migrations;

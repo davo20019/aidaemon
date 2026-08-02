@@ -263,7 +263,10 @@ impl WorkCoordinationStore for SqliteStateStore {
         root_task_id: Option<&str>,
     ) -> anyhow::Result<GoalRun> {
         anyhow::ensure!(
-            matches!(trigger_type, "finite" | "scheduled" | "manual" | "legacy"),
+            matches!(
+                trigger_type,
+                "finite" | "scheduled" | "manual" | "mandate" | "legacy"
+            ),
             "unsupported goal run trigger type"
         );
         let mut tx = self.pool.begin().await?;

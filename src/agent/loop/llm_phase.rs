@@ -35,6 +35,245 @@ fn spawn_heartbeat_keeper(heartbeat: &Option<Arc<AtomicU64>>) -> Option<AbortOnD
     })
 }
 
+#[derive(Debug)]
+struct MandateRunTokenLease {
+    goal_run_id: String,
+    lease_token: String,
+    tokens_used_before: i64,
+    budget_per_cycle: i64,
+}
+
+enum MandateRunTokenAdmission {
+    NotApplicable,
+    Acquired(MandateRunTokenLease),
+    Exhausted {
+        tokens_used: i64,
+        budget_per_cycle: i64,
+    },
+}
+
+/// Serialize every task-lead/executor model call through the exact mandate
+/// goal run and its immutable durable token balance. Waiting workers poll the
+/// short lease. If a process dies after dispatch, expiry consumes the remaining
+/// balance fail-closed instead of admitting a retry with unknowable prior spend.
+async fn acquire_mandate_run_token_lease(
+    agent: &Agent,
+    lease_secs: i64,
+    heartbeat: &Option<Arc<AtomicU64>>,
+) -> anyhow::Result<MandateRunTokenAdmission> {
+    let Some(fence) = agent.mandate_execution.as_ref() else {
+        return Ok(MandateRunTokenAdmission::NotApplicable);
+    };
+    let goal = agent
+        .state
+        .get_goal(&fence.goal_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
+    let configured_budget = goal
+        .budget_per_check
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| anyhow::anyhow!("mandate controller has no positive cycle token budget"))?;
+    let (budget_per_cycle, tokens_used) = agent
+        .state
+        .ensure_mandate_run_token_budget(
+            &fence.goal_run_id,
+            &fence.mandate_id,
+            fence.mandate_version,
+            configured_budget,
+        )
+        .await?;
+    if tokens_used >= budget_per_cycle {
+        return Ok(MandateRunTokenAdmission::Exhausted {
+            tokens_used,
+            budget_per_cycle,
+        });
+    }
+
+    let lease_token = Uuid::new_v4().to_string();
+    loop {
+        let (acquired, current_tokens, current_budget) = agent
+            .state
+            .try_acquire_mandate_run_token_lease(
+                &fence.goal_run_id,
+                &fence.mandate_id,
+                fence.mandate_version,
+                &lease_token,
+                lease_secs,
+            )
+            .await?;
+        if acquired {
+            return Ok(MandateRunTokenAdmission::Acquired(MandateRunTokenLease {
+                goal_run_id: fence.goal_run_id.clone(),
+                lease_token,
+                tokens_used_before: current_tokens,
+                budget_per_cycle: current_budget,
+            }));
+        }
+        if current_tokens >= current_budget {
+            return Ok(MandateRunTokenAdmission::Exhausted {
+                tokens_used: current_tokens,
+                budget_per_cycle: current_budget,
+            });
+        }
+        if agent
+            .cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            anyhow::bail!("mandate model-call admission cancelled while waiting for cycle lease");
+        }
+        touch_heartbeat(heartbeat);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn release_mandate_run_token_lease_without_dispatch(
+    agent: &Agent,
+    lease: Option<&MandateRunTokenLease>,
+    session_id: &str,
+) {
+    let Some(lease) = lease else {
+        return;
+    };
+    match agent
+        .state
+        .release_mandate_run_token_lease(&lease.goal_run_id, &lease.lease_token)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            session_id,
+            goal_run_id = %lease.goal_run_id,
+            "Mandate model-call token lease was not released before provider dispatch"
+        ),
+        Err(error) => warn!(
+            session_id,
+            goal_run_id = %lease.goal_run_id,
+            error = %error,
+            "Failed to release mandate model-call token lease before provider dispatch"
+        ),
+    }
+}
+
+/// Once dispatch begins, a provider error or timeout does not prove that no
+/// tokens were consumed. Charge the entire remaining balance and release the
+/// lease atomically; retrying unknown spend would fail open.
+async fn exhaust_mandate_run_token_lease_after_ambiguous_call(
+    agent: &Agent,
+    lease: Option<&MandateRunTokenLease>,
+    session_id: &str,
+) {
+    let Some(lease) = lease else {
+        return;
+    };
+    let remaining = lease
+        .budget_per_cycle
+        .saturating_sub(lease.tokens_used_before);
+    match agent
+        .state
+        .settle_mandate_run_token_lease(&lease.goal_run_id, &lease.lease_token, remaining)
+        .await
+    {
+        Ok((tokens_used, budget_per_cycle)) => warn!(
+            session_id,
+            goal_run_id = %lease.goal_run_id,
+            tokens_used,
+            budget_per_cycle,
+            "Provider call failed without trustworthy usage; exhausted mandate cycle budget"
+        ),
+        Err(error) => warn!(
+            session_id,
+            goal_run_id = %lease.goal_run_id,
+            error = %error,
+            "Failed to settle ambiguous mandate provider spend; lease remains fail-closed"
+        ),
+    }
+}
+
+const MANDATE_MAX_LLM_CALL_TIMEOUT: Duration = Duration::from_secs(840);
+const MANDATE_INPUT_RESERVATION_MARGIN_NUMERATOR: i64 = 5;
+const MANDATE_INPUT_RESERVATION_MARGIN_DENOMINATOR: i64 = 4;
+const MANDATE_INPUT_RESERVATION_FIXED_TOKENS: i64 = 512;
+
+/// Prompt estimates are calibrated but can undercount. Reserve 125% plus a
+/// fixed 512-token cushion before deriving the provider-side output ceiling.
+fn mandate_input_token_reservation(estimated_input_tokens: u32) -> i64 {
+    i64::from(estimated_input_tokens)
+        .saturating_mul(MANDATE_INPUT_RESERVATION_MARGIN_NUMERATOR)
+        .saturating_add(MANDATE_INPUT_RESERVATION_MARGIN_DENOMINATOR - 1)
+        / MANDATE_INPUT_RESERVATION_MARGIN_DENOMINATOR
+        + MANDATE_INPUT_RESERVATION_FIXED_TOKENS
+}
+
+fn mandate_output_token_ceiling(remaining: i64, estimated_input_tokens: u32) -> Option<u32> {
+    let available =
+        remaining.saturating_sub(mandate_input_token_reservation(estimated_input_tokens));
+    (available > 0).then(|| u32::try_from(available).unwrap_or(u32::MAX))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mandate_cycle_budget_stop(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    task_id: &str,
+    session_id: &str,
+    iteration: usize,
+    task_start: Instant,
+    learning_ctx: &LearningContext,
+    task_tokens_used: u64,
+    condition: &str,
+    tokens_used: i64,
+    budget_per_cycle: i64,
+    detail: &str,
+) -> LlmPhaseOutcome {
+    let error_message = format!(
+        "Mandate cycle token budget stopped execution: {detail} (used {tokens_used} / limit {budget_per_cycle})."
+    );
+    warn!(
+        session_id,
+        task_id,
+        iteration,
+        tokens_used,
+        budget_per_cycle,
+        condition,
+        "Mandate cycle token budget stopped execution"
+    );
+    agent
+        .emit_warning_decision_point(
+            emitter,
+            task_id,
+            iteration,
+            DecisionType::StoppingCondition,
+            "Stopping condition fired: immutable mandate cycle token budget".to_string(),
+            json!({
+                "condition": condition,
+                "goal_run_id": agent
+                    .mandate_execution
+                    .as_ref()
+                    .map(|fence| fence.goal_run_id.as_str()),
+                "tokens_used": tokens_used,
+                "budget_per_cycle": budget_per_cycle,
+                "detail": detail,
+            }),
+        )
+        .await;
+    record_failed_task_tokens(task_tokens_used);
+    agent
+        .emit_task_end(
+            emitter,
+            task_id,
+            TaskStatus::Failed,
+            TaskOutcome::Failed,
+            task_start,
+            iteration,
+            learning_ctx.tool_calls.len(),
+            Some(error_message.clone()),
+            None,
+        )
+        .await;
+    LlmPhaseOutcome::Return(Err(anyhow::anyhow!(error_message)))
+}
+
 /// Observation-only predicate: the model hit the output token limit
 /// (`finish_reason=length`) while answering inline (no tool call). Used to
 /// emit `inline_dump` telemetry — does NOT change behavior.
@@ -208,13 +447,15 @@ async fn finalize_external_action_timeout_ack(
 
     learning_ctx.completed_naturally = true;
     learning_ctx.task_outcome = Some(TaskOutcome::Failed);
-    let learning_ctx_for_task = learning_ctx.clone();
-    let state = agent.state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
-            warn!("Learning failed: {}", e);
-        }
-    });
+    if agent.mandate_execution.is_none() {
+        let learning_ctx_for_task = learning_ctx.clone();
+        let state = agent.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = post_task::process_learning(&state, learning_ctx_for_task).await {
+                warn!("Learning failed: {}", e);
+            }
+        });
+    }
 
     Ok(reply)
 }
@@ -540,7 +781,83 @@ pub(super) async fn run_llm_phase(
             .llm_call_timeout
             .unwrap_or(DEFAULT_LLM_TIMEOUT)
     };
-    let timeout_dur = effective_llm_timeout;
+    let timeout_dur = if services.agent.mandate_execution.is_some() {
+        effective_llm_timeout.min(MANDATE_MAX_LLM_CALL_TIMEOUT)
+    } else {
+        effective_llm_timeout
+    };
+
+    // Mandate runs use one durable immutable balance across the task lead and
+    // every executor. The lease also prevents parallel model calls from each
+    // spending the same remaining balance. Reserve enough room for the
+    // conservatively estimated input, then cap decoded output to what remains.
+    let mandate_budget_lease = match acquire_mandate_run_token_lease(
+        services.agent,
+        i64::try_from(timeout_dur.as_secs())
+            .unwrap_or(900)
+            .saturating_add(30),
+        heartbeat,
+    )
+    .await?
+    {
+        MandateRunTokenAdmission::NotApplicable => None,
+        MandateRunTokenAdmission::Exhausted {
+            tokens_used,
+            budget_per_cycle,
+        } => {
+            return Ok(mandate_cycle_budget_stop(
+                services.agent,
+                emitter,
+                task_id,
+                session_id,
+                iteration,
+                task_start,
+                learning_ctx,
+                *task_tokens_used,
+                "mandate_cycle_token_budget",
+                tokens_used,
+                budget_per_cycle,
+                "the aggregate lead/executor balance is exhausted",
+            )
+            .await);
+        }
+        MandateRunTokenAdmission::Acquired(lease) => {
+            let remaining = lease
+                .budget_per_cycle
+                .saturating_sub(lease.tokens_used_before);
+            let Some(output_ceiling) = mandate_output_token_ceiling(remaining, est_input_tokens)
+            else {
+                release_mandate_run_token_lease_without_dispatch(
+                    services.agent,
+                    Some(&lease),
+                    session_id,
+                )
+                .await;
+                return Ok(mandate_cycle_budget_stop(
+                    services.agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    iteration,
+                    task_start,
+                    learning_ctx,
+                    *task_tokens_used,
+                    "mandate_cycle_token_admission",
+                    lease.tokens_used_before,
+                    lease.budget_per_cycle,
+                    "the remaining balance cannot admit the next prompt conservatively",
+                )
+                .await);
+            };
+            llm_options.max_tokens_override = Some(
+                llm_options
+                    .max_tokens_override
+                    .map_or(output_ceiling, |configured| configured.min(output_ceiling)),
+            );
+            llm_options.single_attempt_fail_closed = true;
+            Some(lease)
+        }
+    };
 
     // Phase 0 observability — prefix fingerprint of the final provider payload.
     // Emitted once per LLM phase, here (after security-message injection and
@@ -659,6 +976,27 @@ pub(super) async fn run_llm_phase(
     // channel stale-watchdog does not cancel a slow-but-progressing
     // generation.  Auto-aborted on drop; bounded by the LLM timeout.
     let _llm_heartbeat_keeper = spawn_heartbeat_keeper(heartbeat);
+    if let Some(lease) = mandate_budget_lease.as_ref() {
+        let fence = services
+            .agent
+            .mandate_execution
+            .as_ref()
+            .expect("mandate token lease requires execution fence");
+        let dispatched = services
+            .agent
+            .state
+            .mark_mandate_run_token_lease_dispatched(
+                &lease.goal_run_id,
+                &fence.mandate_id,
+                fence.mandate_version,
+                &lease.lease_token,
+            )
+            .await?;
+        anyhow::ensure!(
+            dispatched,
+            "mandate model call was not durably reserved before provider dispatch"
+        );
+    }
     let mut resp = match tokio::time::timeout(
         timeout_dur,
         services.agent.call_llm_with_recovery(
@@ -678,6 +1016,12 @@ pub(super) async fn run_llm_phase(
         Ok(Err(error)) => {
             drop(_llm_heartbeat_keeper);
             touch_heartbeat(heartbeat);
+            exhaust_mandate_run_token_lease_after_ambiguous_call(
+                services.agent,
+                mandate_budget_lease.as_ref(),
+                session_id,
+            )
+            .await;
             let error_message = error.to_string();
             let mut failed_call = base_llm_call.clone();
             failed_call.final_model = Some(if llm_telemetry.final_model.is_empty() {
@@ -715,6 +1059,12 @@ pub(super) async fn run_llm_phase(
         Err(_elapsed) => {
             drop(_llm_heartbeat_keeper);
             touch_heartbeat(heartbeat);
+            exhaust_mandate_run_token_lease_after_ambiguous_call(
+                services.agent,
+                mandate_budget_lease.as_ref(),
+                session_id,
+            )
+            .await;
             // Record the timeout duration so the wall-clock budget
             // can exclude time lost to provider slowness.
             *provider_timeout_ms += timeout_dur.as_millis() as u64;
@@ -796,6 +1146,40 @@ pub(super) async fn run_llm_phase(
     };
     drop(_llm_heartbeat_keeper);
     touch_heartbeat(heartbeat);
+
+    // Settle the serialized mandate call before doing any fallible telemetry
+    // work or exposing tool calls. Missing provider usage is unknowable spend,
+    // so consume the remaining balance and fail closed for subsequent calls.
+    let mandate_run_budget_after_call = if let Some(lease) = mandate_budget_lease.as_ref() {
+        let usage_reported = resp.usage.is_some();
+        let delta_tokens = resp
+            .usage
+            .as_ref()
+            .map(|usage| i64::try_from(usage.budget_tokens()).unwrap_or(i64::MAX))
+            .unwrap_or_else(|| {
+                lease
+                    .budget_per_cycle
+                    .saturating_sub(lease.tokens_used_before)
+            });
+        let (tokens_used, budget_per_cycle) = services
+            .agent
+            .state
+            .settle_mandate_run_token_lease(&lease.goal_run_id, &lease.lease_token, delta_tokens)
+            .await?;
+        info!(
+            session_id,
+            iteration,
+            goal_run_id = %lease.goal_run_id,
+            delta_tokens,
+            tokens_used,
+            budget_per_cycle,
+            usage_reported,
+            "Settled aggregate mandate cycle token usage"
+        );
+        Some((tokens_used, budget_per_cycle, usage_reported))
+    } else {
+        None
+    };
 
     // Per-call observability: latency, actual-vs-estimated tokens, and fallback
     // metadata. Persisted as an `LlmCall` event so the request can be fully
@@ -1208,6 +1592,56 @@ pub(super) async fn run_llm_phase(
         }
     }
 
+    if let Some((tokens_used, budget_per_cycle, usage_reported)) = mandate_run_budget_after_call {
+        if tokens_used >= budget_per_cycle {
+            if llm_budget_closeout_candidate && usage_reported {
+                services
+                    .agent
+                    .emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::StoppingCondition,
+                        "Allowing final text closeout after immutable mandate cycle budget exhaustion"
+                            .to_string(),
+                        json!({
+                            "condition": "mandate_cycle_token_budget_closeout_grace",
+                            "goal_run_id": services
+                                .agent
+                                .mandate_execution
+                                .as_ref()
+                                .map(|fence| fence.goal_run_id.as_str()),
+                            "tokens_used": tokens_used,
+                            "budget_per_cycle": budget_per_cycle,
+                            "provider_usage_reported": usage_reported,
+                        }),
+                    )
+                    .await;
+            } else {
+                let detail = if usage_reported {
+                    "the aggregate balance was exhausted by the completed model call"
+                } else {
+                    "the provider omitted usage, so the remaining balance was consumed fail-closed"
+                };
+                return Ok(mandate_cycle_budget_stop(
+                    services.agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    iteration,
+                    task_start,
+                    learning_ctx,
+                    *task_tokens_used,
+                    "mandate_cycle_token_budget_post_llm",
+                    tokens_used,
+                    budget_per_cycle,
+                    detail,
+                )
+                .await);
+            }
+        }
+    }
+
     // Log LLM call activity for executor agents
     if let Some(tid) = services.agent.task_id.as_ref() {
         let tokens = resp
@@ -1471,6 +1905,24 @@ fn should_require_initial_execution_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mandate_output_ceiling_reserves_margin_and_never_exceeds_remaining_balance() {
+        assert_eq!(mandate_input_token_reservation(1_000), 1_762);
+        assert_eq!(mandate_output_token_ceiling(2_000, 1_000), Some(238));
+        assert_eq!(mandate_output_token_ceiling(1_762, 1_000), None);
+        assert_eq!(mandate_output_token_ceiling(1_700, 1_000), None);
+    }
+
+    #[test]
+    fn mandate_provider_timeout_cannot_outlive_token_lease() {
+        const SQLITE_MANDATE_TOKEN_LEASE_MAX_SECS: u64 = 900;
+        const LEASE_GRACE_SECS: u64 = 30;
+        assert!(
+            MANDATE_MAX_LLM_CALL_TIMEOUT.as_secs() + LEASE_GRACE_SECS
+                <= SQLITE_MANDATE_TOKEN_LEASE_MAX_SECS
+        );
+    }
 
     #[test]
     fn suppresses_thinking_only_in_computer_use_flow() {

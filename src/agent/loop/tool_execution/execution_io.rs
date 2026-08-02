@@ -34,6 +34,10 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     /// into tool args (the correction sandbox overrides trusted-session semantics).
     /// False on all normal paths.
     pub suppress_trusted_session: bool,
+    pub mandate_authority: Option<&'a crate::traits::MandateAuthorityGrant>,
+    /// Mandate results must remain bounded inline; spilling would create an
+    /// ungranted local file containing potentially sensitive observations.
+    pub mandate_execution: bool,
 }
 
 fn should_replay_durable_result(
@@ -291,6 +295,8 @@ pub(super) async fn execute_tool_call_io(
                 workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
                 correction_preapproved: ctx.correction_preapproved,
                 suppress_trusted_session: ctx.suppress_trusted_session,
+                mandate_authority: ctx.mandate_authority,
+                mandate_tool_call_id: Some(tc.id.as_str()),
             },
         )
         .await;
@@ -433,7 +439,12 @@ pub(super) async fn execute_tool_call_io(
                 .tools
                 .iter()
                 .any(|t| matches!(t.name(), "read_file" | "terminal") && t.is_available());
-            let spilled = if over_cap && !result_is_err && has_fs_recovery && !keep_inline {
+            let spilled = if over_cap
+                && !result_is_err
+                && has_fs_recovery
+                && !keep_inline
+                && !ctx.mandate_execution
+            {
                 crate::tools::result_spill::build_spilled_preview_for_backend(
                     &tc.name,
                     ctx.session_id,
@@ -571,6 +582,13 @@ async fn maybe_retry_edit_file_not_found_recovery(
         return None;
     }
 
+    // Mandate grants are bound to the exact action arguments and consume one
+    // attempt. This recovery rewrites the edit arguments, so it must return to
+    // deliberation instead of silently reusing or minting authority.
+    if ctx.mandate_authority.is_some() {
+        return None;
+    }
+
     // The generic recovery below performs a direct backend read so it can map
     // whitespace before retrying. Scoped collaborators must never enter a
     // secondary path that is not itself rooted and canonicalized by the
@@ -602,6 +620,8 @@ async fn maybe_retry_edit_file_not_found_recovery(
         workspace_grant: ctx.channel_ctx.active_workspace_grant(ctx.user_role),
         correction_preapproved: ctx.correction_preapproved,
         suppress_trusted_session: ctx.suppress_trusted_session,
+        mandate_authority: None,
+        mandate_tool_call_id: None,
     };
 
     // Deterministic self-recovery path:

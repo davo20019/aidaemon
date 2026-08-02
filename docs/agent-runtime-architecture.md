@@ -164,6 +164,117 @@ Unstructured response analysis remains a compatibility layer for providers that
 cannot yet emit structured final-output metadata. It must not override the
 effect ledger.
 
+### 7. Bounded autonomous mandates
+
+Long-lived autonomy is represented as a durable control loop, not a frequent
+prompt and not a standing trusted session:
+
+```text
+owner Mandate vN
+  objective | constraints | success/stop conditions | authority envelope
+             |
+             v
+leased review -> observations/beliefs -> ACT | WAIT | ASK | STOP
+                                      ACT |
+                                          v
+                              one revocable Intention
+                                          |
+                                          v
+                               ordinary tasks + receipts
+```
+
+This combines established patterns without giving the model protocol authority:
+
+- the MAPE-K autonomic-computing loop supplies the recurring
+  monitor/analyze/plan/execute shape and durable knowledge;
+- BDI-style separation keeps an owner's desired objective (`Mandate`) distinct
+  from current evidence (`belief_snapshot`) and the agent's one-cycle commitment
+  (`Intention`);
+- lease/fencing and optimistic-version patterns provide single-writer review
+  admission and immediate revocation of stale decisions;
+- capability-style least authority becomes an exact observation/action-tool,
+  mutation-effect, target, and action-count envelope, checked by the
+  deterministic dispatcher rather than the prompt.
+
+The model may decide that an action is worthwhile, but the kernel grants no
+mutation until that run has committed ACT against the current mandate version.
+The grant is bound to the mandate, decision cycle, canonical tool arguments, and
+typed semantics by a SHA-256 digest. After all local guards pass, the dispatcher
+durably reserves the operation, then atomically claims that exact reservation
+at the final I/O boundary while revalidating the grant. A claimed reservation
+consumes its cycle, rolling-24-hour, and cooldown slots even if the adapter
+fails or the result is ambiguous; a reservation that never reaches the claim is
+recorded as `never_dispatched` and does not consume the rolling quota. Only a
+strict typed success receipt can satisfy ACT. Unknown tools and mutation effects
+fail closed.
+Observation tools are scoped by the same explicit allowlist, preventing an
+output mandate from reading unrelated private data before it acts.
+
+Changing, pausing, or cancelling a mandate invalidates work that has not crossed
+the final I/O boundary; ordinary scheduled-goal trust cannot satisfy this
+boundary. Revocation cannot undo an external request that was already issued,
+so unresolved reserved actions enter reconciliation instead of being replayed.
+
+WAIT is a first-class successful outcome: it advances the adaptive review clock
+without manufacturing work or notifying the owner. ASK pauses the controller
+and emits one concrete question. STOP completes the mandate. A failed cycle is
+retried within its owner-approved timing bounds, while ambiguous external
+effects remain subject to the ordinary idempotency/reconciliation rules.
+
+V1 deliberately exposes a narrow autonomous execution surface:
+
+- a personal goal is not authority and is never auto-converted into a mandate;
+  creation or expansion requires explicit owner confirmation in a verified
+  private control channel;
+- only directly governed, deterministic adapters can be delegated. MCP,
+  terminal/shell, filesystem/project, browser/computer-use, scheduler/health,
+  and other opaque nested-action tools are denied;
+- scoped HTTP authority binds the exact canonical URL scope, exact
+  authentication-profile resource identifier, and (for every authenticated
+  request) exact stable remote account ID. The adapter verifies the
+  model-supplied `account_id` against the profile's configured `user_id` before
+  network I/O. Autonomous requests do not follow redirects, refresh or replay
+  OAuth after a 401, accept argument/query/authority drift, or treat a 202/3xx
+  response as completion evidence. An expired or rejected OAuth credential
+  therefore becomes ASK/manual reauthorization, never an autonomous refresh.
+  Rotating credentials or changing a
+  profile's `user_id` can rebind its remote identity: pause or revoke every
+  mandate that references that profile, make the change, and explicitly
+  reconfirm its profile and account scopes before resuming. V1 persists the
+  exact profile name and stable account ID, but not an immutable credential
+  generation, so this operational pause/reconfirmation is a required boundary;
+- mandate workers use a fixed isolated prompt. They do not inherit a private
+  session persona, user memory, custom skills, project instructions,
+  checkpoints, result spill, or global learning/reflection channels;
+- canonical mandate turns carry durable execution provenance. Completion-time
+  fact extraction and summaries, periodic memory/episode/activity jobs, and
+  delayed event consolidation all reject that provenance before global writes,
+  embeddings, or auxiliary model calls;
+- continuity is limited to a byte-bounded, typed view of the same mandate's
+  recent outcomes, receipts, and quota state. Generated rationale, questions,
+  task prose, tool bodies, errors, and cross-mandate history are excluded and
+  cannot become authority. Adaptive durable `LearningNote` synthesis remains
+  future work rather than silently reusing the daemon's global learning path;
+- success means satisfying the owner-authored criteria with typed evidence. It
+  does not promise engagement, follower counts, availability of a third-party
+  API, or any other external outcome.
+
+These restrictions are capability boundaries, not prompt suggestions. Broader
+adapters can be added only after they provide owner-pinned semantics, exact
+target identity, per-action metering, strict receipts, and replay-safe behavior.
+
+Design lineage:
+
+- J. O. Kephart and D. M. Chess, *The Vision of Autonomic Computing*,
+  <https://doi.org/10.1109/MC.2003.1160055>.
+- A. S. Rao and M. P. Georgeff, *BDI Agents: From Theory to Practice*,
+  ICMAS 1995, <https://www.math.pku.edu.cn/teachers/linzq/teaching/stm/references/BDI%20Agents%20From%20Theory%20to%20Practice.pdf>.
+- C. G. Gray and D. R. Cheriton, *Leases: An Efficient Fault-Tolerant
+  Mechanism for Distributed File Cache Consistency*,
+  <https://doi.org/10.1145/74850.74870>.
+- J. H. Saltzer and M. D. Schroeder, *The Protection of Information in
+  Computer Systems*, <https://doi.org/10.1109/PROC.1975.9939>.
+
 ## Natural-language word-list inventory
 
 This inventory covers production lists that interpret user/model language. It

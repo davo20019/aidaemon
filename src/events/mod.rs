@@ -36,6 +36,87 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Returns true when a session is an implementation-internal worker whose
+/// transcript must not feed owner/global memory. Keep this as a legacy
+/// defense: mandate execution also carries explicit durable provenance below.
+pub(crate) fn is_memory_isolated_worker_session(session_id: &str) -> bool {
+    session_id.starts_with("specialist:")
+        || session_id.starts_with("sub-")
+        || session_id.starts_with("background:")
+}
+
+/// Resolve durable mandate-execution provenance for a session.
+///
+/// New mandate workers stamp `execution_origin = "mandate"` on their canonical
+/// opening user-message event. The task/run join is a second durable signal for
+/// run-bound workers and protects sessions recorded during a partially upgraded
+/// process. Both paths use existing indexed event/task identities; no session
+/// naming convention or claimed speaker role grants the classification.
+pub(crate) async fn session_has_mandate_execution_provenance(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    // A malformed canonical payload cannot safely prove ordinary provenance.
+    // Treat its session as isolated, and guard json_extract so legacy bad JSON
+    // never aborts retention/consolidation.
+    let explicit_or_unreadable: i64 = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM events e
+            WHERE e.session_id = ?
+              AND CASE
+                    WHEN NOT json_valid(e.data) THEN 1
+                    WHEN e.event_type = 'user_message'
+                    THEN COALESCE(
+                        json_extract(e.data, '$.execution_origin') = 'mandate',
+                        0
+                    )
+                    ELSE 0
+                  END
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    if explicit_or_unreadable != 0 {
+        return Ok(true);
+    }
+
+    // Some narrow EventStore-only fixtures intentionally omit the work model.
+    // The explicit marker above remains authoritative there; only attempt the
+    // compatibility task/run join when both durable tables exist.
+    let work_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name IN ('tasks', 'goal_runs')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if work_tables != 2 {
+        return Ok(false);
+    }
+
+    let run_bound: i64 = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM events e
+            JOIN tasks t ON t.id = e.task_id
+            JOIN goal_runs gr ON gr.id = t.goal_run_id
+            WHERE e.session_id = ?
+              AND gr.trigger_type = 'mandate'
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(run_bound != 0)
+}
+
 /// A single immutable event in the event store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {

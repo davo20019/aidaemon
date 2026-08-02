@@ -311,12 +311,22 @@ impl MemoryManager {
         }
     }
 
+    async fn session_is_memory_isolated(&self, session_id: &str) -> anyhow::Result<bool> {
+        if crate::events::is_memory_isolated_worker_session(session_id) {
+            return Ok(true);
+        }
+        crate::events::session_has_mandate_execution_provenance(&self.pool, session_id).await
+    }
+
     async fn fact_consolidation_batch_is_owner_only(
         &self,
         session_id: &str,
         cutoff: &str,
         after_event_id: i64,
     ) -> anyhow::Result<bool> {
+        if self.session_is_memory_isolated(session_id).await? {
+            return Ok(false);
+        }
         let rows = sqlx::query(
             r#"
             SELECT data
@@ -357,6 +367,9 @@ impl MemoryManager {
         &self,
         session_id: &str,
     ) -> anyhow::Result<bool> {
+        if self.session_is_memory_isolated(session_id).await? {
+            return Ok(false);
+        }
         let last_episode = sqlx::query(
             "SELECT end_event_id, end_time FROM episodes
              WHERE session_id = ?
@@ -459,7 +472,7 @@ impl MemoryManager {
         &self,
         cutoff: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query_scalar(
+        let rows: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT DISTINCT session_id
             FROM events
@@ -470,7 +483,20 @@ impl MemoryManager {
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        self.exclude_memory_isolated_sessions(rows).await
+    }
+
+    async fn exclude_memory_isolated_sessions(
+        &self,
+        candidates: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut eligible = Vec::with_capacity(candidates.len());
+        for session_id in candidates {
+            if !self.session_is_memory_isolated(&session_id).await? {
+                eligible.push(session_id);
+            }
+        }
+        Ok(eligible)
     }
 
     async fn fetch_fact_consolidation_messages(
@@ -647,6 +673,8 @@ impl MemoryManager {
         // (Progressive extraction is already disabled; this closes the consolidation path.)
         let mut skipped_public_external: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut skipped_memory_isolated: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         let system_prompt = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array. Each item has \
@@ -686,6 +714,17 @@ impl MemoryManager {
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
         for (session_id, messages) in &sessions {
+            // Defense in depth immediately before the provider call. Candidate
+            // selection already applies this gate, but durable provenance may
+            // have arrived between selection and execution.
+            if self.session_is_memory_isolated(session_id).await? {
+                skipped_memory_isolated.insert(session_id.clone());
+                info!(
+                    session_id = session_id.as_str(),
+                    "Skipping memory fact consolidation for isolated worker session"
+                );
+                continue;
+            }
             if self
                 .session_visibility_from_events(session_id)
                 .await
@@ -893,9 +932,16 @@ impl MemoryManager {
             let session_ids: Vec<String> = sessions
                 .keys()
                 .filter(|sid| !skipped_public_external.contains(*sid))
+                .filter(|sid| !skipped_memory_isolated.contains(*sid))
                 .cloned()
                 .collect();
             for session_id in &session_ids {
+                // Consolidator enforces the same boundary itself. Recheck here
+                // as well so this background caller never knowingly enters a
+                // learning pipeline for a newly classified mandate session.
+                if self.session_is_memory_isolated(session_id).await? {
+                    continue;
+                }
                 if let Err(e) = consolidator.consolidate_session(session_id).await {
                     warn!(
                         "Event consolidation failed for session {}: {}",
@@ -1298,6 +1344,10 @@ impl MemoryManager {
         session_id: &str,
         messages: &[Message],
     ) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            !self.session_is_memory_isolated(session_id).await?,
+            "Memory-isolated worker sessions cannot create global episodes"
+        );
         if messages.is_empty() {
             return Err(anyhow::anyhow!("No messages to create episode from"));
         }
@@ -1948,6 +1998,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .bind(&thirty_mins_ago)
         .fetch_all(&self.pool)
         .await?;
+        let idle_sessions = self.exclude_memory_isolated_sessions(idle_sessions).await?;
 
         if idle_sessions.is_empty() {
             return Ok(());
@@ -2005,6 +2056,7 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         )
         .fetch_all(&self.pool)
         .await?;
+        let session_ids = self.exclude_memory_isolated_sessions(session_ids).await?;
 
         for session_id in session_ids {
             if !self
@@ -2240,9 +2292,21 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .await?;
 
         let mut messages = Vec::with_capacity(rows.len());
+        let mut isolation_by_session: HashMap<String, bool> = HashMap::new();
         for row in rows {
             let event_id: i64 = row.get("id");
             let session_id: String = row.get("session_id");
+            let memory_isolated = match isolation_by_session.get(&session_id) {
+                Some(isolated) => *isolated,
+                None => {
+                    let isolated = self.session_is_memory_isolated(&session_id).await?;
+                    isolation_by_session.insert(session_id.clone(), isolated);
+                    isolated
+                }
+            };
+            if memory_isolated {
+                continue;
+            }
             let event_type: String = row.get("event_type");
             let created_str: String = row.get("created_at");
             let created_at = DateTime::parse_from_rfc3339(&created_str)
@@ -2289,9 +2353,21 @@ emotional_intensity is 0.0-1.0 scale (0=calm, 1=highly emotional)"#;
         .await?;
 
         let mut messages = Vec::with_capacity(rows.len());
+        let mut isolation_by_session: HashMap<String, bool> = HashMap::new();
         for row in rows {
             let event_id: i64 = row.get("id");
             let session_id: String = row.get("session_id");
+            let memory_isolated = match isolation_by_session.get(&session_id) {
+                Some(isolated) => *isolated,
+                None => {
+                    let isolated = self.session_is_memory_isolated(&session_id).await?;
+                    isolation_by_session.insert(session_id.clone(), isolated);
+                    isolated
+                }
+            };
+            if memory_isolated {
+                continue;
+            }
             let event_type: String = row.get("event_type");
             let created_str: String = row.get("created_at");
             let created_at = DateTime::parse_from_rfc3339(&created_str)
@@ -2549,6 +2625,237 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::Arc;
+
+    async fn setup_memory_manager_with_responses(
+        responses: Vec<crate::traits::ProviderResponse>,
+    ) -> (
+        Arc<SqliteStateStore>,
+        Arc<MockProvider>,
+        MemoryManager,
+        tempfile::NamedTempFile,
+    ) {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+        let store = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().expect("db path"),
+                100,
+                None,
+                embedding_service.clone(),
+            )
+            .await
+            .expect("state store"),
+        );
+        let provider = Arc::new(MockProvider::with_responses(responses));
+        let llm_runtime = SharedLlmRuntime::new(
+            provider.clone(),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let manager = MemoryManager::new(
+            store.pool(),
+            embedding_service,
+            llm_runtime,
+            Duration::from_secs(60),
+            None,
+        )
+        .with_state(store.clone());
+        (store, provider, manager, db_file)
+    }
+
+    async fn insert_owner_session_events(
+        pool: &SqlitePool,
+        session_id: &str,
+        count: usize,
+        age: chrono::Duration,
+        execution_origin: Option<&str>,
+        content_sentinel: &str,
+    ) {
+        let base = Utc::now() - age;
+        for index in 0..count {
+            let mut data = json!({
+                "content": format!("{content_sentinel} message {index}"),
+                "message_id": format!("{session_id}-message-{index}"),
+                "has_attachments": false,
+                "user_role": "owner",
+                "channel_visibility": "private"
+            });
+            if index == 0 {
+                if let Some(origin) = execution_origin {
+                    data["execution_origin"] = json!(origin);
+                }
+            }
+            sqlx::query(
+                "INSERT INTO events (session_id, event_type, data, created_at)
+                 VALUES (?, 'user_message', ?, ?)",
+            )
+            .bind(session_id)
+            .bind(data.to_string())
+            .bind((base + chrono::Duration::seconds(index as i64)).to_rfc3339())
+            .execute(pool)
+            .await
+            .expect("insert owner session event");
+        }
+    }
+
+    #[tokio::test]
+    async fn mandate_sessions_are_excluded_from_fact_consolidation_by_durable_origin() {
+        let response = MockProvider::text_response(
+            r#"[{"category":"preference","key":"editor","value":"Helix","privacy":"global"}]"#,
+        );
+        let (store, provider, manager, _db_file) =
+            setup_memory_manager_with_responses(vec![response]).await;
+        insert_owner_session_events(
+            &store.pool(),
+            "ordinary-owner-fact-session",
+            1,
+            chrono::Duration::hours(2),
+            None,
+            "Important: remember that I prefer Helix as my editor.",
+        )
+        .await;
+        insert_owner_session_events(
+            &store.pool(),
+            "owner-looking-mandate-fact-session",
+            1,
+            chrono::Duration::hours(2),
+            Some("mandate"),
+            "MANDATE_PRIVATE_SENTINEL must never become global memory.",
+        )
+        .await;
+
+        manager
+            .consolidate_memories()
+            .await
+            .expect("fact consolidation");
+
+        assert_eq!(provider.call_count().await, 1);
+        let calls = provider.call_log.lock().await;
+        let prompt = serde_json::to_string(&calls[0].messages).expect("serialize call");
+        assert!(prompt.contains("prefer Helix"));
+        assert!(!prompt.contains("MANDATE_PRIVATE_SENTINEL"));
+        drop(calls);
+
+        let fact_value: String = sqlx::query_scalar(
+            "SELECT value FROM facts
+             WHERE category = 'preference' AND key = 'editor' AND superseded_at IS NULL",
+        )
+        .fetch_one(&store.pool())
+        .await
+        .expect("ordinary fact learned");
+        assert_eq!(fact_value, "Helix");
+    }
+
+    #[tokio::test]
+    async fn mandate_sessions_are_excluded_from_idle_episode_candidates() {
+        let response = MockProvider::text_response(
+            r#"{
+                "summary":"Ordinary owner idle session",
+                "topics":["ordinary"],
+                "emotional_tone":"productive",
+                "outcome":"resolved",
+                "goals_mentioned":[],
+                "emotional_intensity":0.2
+            }"#,
+        );
+        let (store, provider, manager, _db_file) =
+            setup_memory_manager_with_responses(vec![response]).await;
+        insert_owner_session_events(
+            &store.pool(),
+            "ordinary-owner-idle-session",
+            5,
+            chrono::Duration::minutes(45),
+            None,
+            "ORDINARY_IDLE_SENTINEL",
+        )
+        .await;
+        insert_owner_session_events(
+            &store.pool(),
+            "owner-looking-mandate-idle-session",
+            5,
+            chrono::Duration::minutes(45),
+            Some("mandate"),
+            "MANDATE_IDLE_SENTINEL",
+        )
+        .await;
+
+        manager
+            .create_episodes_for_idle_sessions()
+            .await
+            .expect("idle episode pass");
+
+        assert_eq!(provider.call_count().await, 1);
+        let ordinary_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE session_id = ?")
+                .bind("ordinary-owner-idle-session")
+                .fetch_one(&store.pool())
+                .await
+                .expect("ordinary episode count");
+        let mandate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE session_id = ?")
+                .bind("owner-looking-mandate-idle-session")
+                .fetch_one(&store.pool())
+                .await
+                .expect("mandate episode count");
+        assert_eq!(ordinary_count, 1);
+        assert_eq!(mandate_count, 0);
+    }
+
+    #[tokio::test]
+    async fn mandate_sessions_are_excluded_from_long_episode_candidates() {
+        let response = MockProvider::text_response(
+            r#"{
+                "summary":"Ordinary owner long session",
+                "topics":["ordinary"],
+                "emotional_tone":"productive",
+                "outcome":"ongoing",
+                "goals_mentioned":[],
+                "emotional_intensity":0.2
+            }"#,
+        );
+        let (store, provider, manager, _db_file) =
+            setup_memory_manager_with_responses(vec![response]).await;
+        insert_owner_session_events(
+            &store.pool(),
+            "ordinary-owner-long-session",
+            20,
+            chrono::Duration::minutes(10),
+            None,
+            "ORDINARY_LONG_SENTINEL",
+        )
+        .await;
+        insert_owner_session_events(
+            &store.pool(),
+            "owner-looking-mandate-long-session",
+            20,
+            chrono::Duration::minutes(10),
+            Some("mandate"),
+            "MANDATE_LONG_SENTINEL",
+        )
+        .await;
+
+        manager
+            .create_episodes_for_active_long_sessions()
+            .await
+            .expect("long episode pass");
+
+        assert_eq!(provider.call_count().await, 1);
+        let ordinary_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE session_id = ?")
+                .bind("ordinary-owner-long-session")
+                .fetch_one(&store.pool())
+                .await
+                .expect("ordinary episode count");
+        let mandate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE session_id = ?")
+                .bind("owner-looking-mandate-long-session")
+                .fetch_one(&store.pool())
+                .await
+                .expect("mandate episode count");
+        assert_eq!(ordinary_count, 1);
+        assert_eq!(mandate_count, 0);
+    }
 
     #[test]
     fn consolidation_parser_isolates_bad_items_and_nullable_fields() {

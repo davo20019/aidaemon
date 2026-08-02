@@ -22,11 +22,12 @@ use crate::tools::ReadChannelHistoryTool;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
     GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMcpTool,
-    ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ProjectInspectTool,
-    ReadFileTool, RememberFactTool, RunCommandTool, ScheduledGoalRunsTool, SearchFilesTool,
-    SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool, SpawnAgentTool,
-    SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
+    ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
+    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
+    ScheduledGoalRunsTool, SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool,
+    ShareMemoryTool, SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use crate::traits::store_prelude::*;
 use crate::traits::Tool;
@@ -60,6 +61,7 @@ enum BaseToolId {
     RememberFact,
     ShareMemory,
     ManageMemories,
+    ManageMandates,
     SearchHistory,
     ScheduledGoalRuns,
     GoalTrace,
@@ -105,6 +107,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
         name: "manage_memories",
+    },
+    BaseToolSpec {
+        id: BaseToolId::ManageMandates,
+        name: "manage_mandates",
     },
     BaseToolSpec {
         id: BaseToolId::SearchHistory,
@@ -909,6 +915,10 @@ async fn build_base_tool(
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
             tool: Arc::new(ManageMemoriesTool::new(state).with_approval_tx(approval_tx.clone())),
+            terminal_tool: None,
+        },
+        BaseToolId::ManageMandates => BuiltBaseTool {
+            tool: Arc::new(ManageMandatesTool::new(state, approval_tx)),
             terminal_tool: None,
         },
         BaseToolId::SearchHistory => BuiltBaseTool {

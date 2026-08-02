@@ -439,6 +439,9 @@ impl Agent {
                         affordable_tokens: None,
                         malformed_reason: None,
                     };
+                    if options.single_attempt_fail_closed {
+                        return Err(anyhow::anyhow!("{}", billing_err.user_message()));
+                    }
                     return self
                         .cascade_fallback(
                             &provider,
@@ -478,6 +481,13 @@ impl Agent {
                     "LLM call failed: {}",
                     provider_err
                 );
+                if options.single_attempt_fail_closed {
+                    warn!(
+                        model,
+                        "Provider attempt failed under a single-attempt budget fence; refusing retries and fallback"
+                    );
+                    return Err(anyhow::anyhow!("{}", provider_err.user_message()));
+                }
                 let provider_label =
                     provider_kind_metric_label(self.llm_runtime.snapshot().provider_kind());
 
@@ -810,6 +820,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use async_trait::async_trait;
     use serde_json::Value;
@@ -818,7 +829,10 @@ mod tests {
     use crate::llm_runtime::ProviderRuntimeTarget;
     use crate::providers::ProviderError;
     use crate::testing::{setup_test_agent, MockProvider};
-    use crate::traits::{ChatOptions, ModelProvider, ProviderResponse};
+    use crate::traits::store_prelude::*;
+    use crate::traits::{
+        ChatOptions, Goal, Mandate, MandateAuthority, ModelProvider, ProviderResponse,
+    };
 
     struct ScriptedProvider {
         responses: Mutex<Vec<anyhow::Result<ProviderResponse>>>,
@@ -971,5 +985,157 @@ mod tests {
             "expected multiple attempts, got {}",
             telemetry.attempts
         );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_budget_fence_never_retries_or_falls_back() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let goal = Goal::new_continuous(
+            "Single-attempt mandate provider call",
+            "owner-single-attempt",
+            Some(100),
+            Some(1_000),
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Never retry ambiguous provider spend",
+            &goal.session_id,
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        harness
+            .state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let run = harness
+            .state
+            .start_goal_run(&goal.id, "mandate", None, None)
+            .await
+            .unwrap();
+        harness
+            .state
+            .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .state
+                .try_acquire_mandate_run_token_lease(
+                    &run.id,
+                    &mandate.id,
+                    mandate.version,
+                    "one-provider-attempt",
+                    60,
+                )
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(harness
+            .state
+            .mark_mandate_run_token_lease_dispatched(
+                &run.id,
+                &mandate.id,
+                mandate.version,
+                "one-provider-attempt",
+            )
+            .await
+            .unwrap());
+        let provider = Arc::new(ScriptedProvider::with_results(vec![
+            Err(ProviderError::from_status(500, "ambiguous provider failure").into()),
+            Ok(MockProvider::text_response("retry must not run")),
+        ]));
+        let options = ChatOptions {
+            max_tokens_override: Some(100),
+            single_attempt_fail_closed: true,
+            ..ChatOptions::default()
+        };
+        let mut telemetry = super::LlmCallTelemetry::default();
+
+        let result = harness
+            .agent
+            .call_llm_with_recovery(
+                provider.clone() as Arc<dyn ModelProvider>,
+                None,
+                "primary-model",
+                &[],
+                &[],
+                &options,
+                &mut telemetry,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(provider.models_called().await.len(), 1);
+        let reserved_after_error: i64 = sqlx::query_scalar(
+            "SELECT tokens_used FROM mandate_run_token_budgets WHERE goal_run_id = ?",
+        )
+        .bind(&run.id)
+        .fetch_one(&harness.state.pool())
+        .await
+        .unwrap();
+        assert_eq!(reserved_after_error, 100);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_budget_fence_does_not_cascade_cached_billing_failure() {
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("build test harness");
+        let primary = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("primary must not run while cached"),
+        )]));
+        let alternate = Arc::new(ScriptedProvider::with_results(vec![Ok(
+            MockProvider::text_response("fallback must not run"),
+        )]));
+        harness.agent.llm_runtime.swap(
+            primary.clone() as Arc<dyn ModelProvider>,
+            None,
+            crate::config::ProviderKind::OpenaiCompatible,
+            "primary-model".to_string(),
+            vec![ProviderRuntimeTarget::new(
+                alternate.clone() as Arc<dyn ModelProvider>,
+                None,
+                crate::config::ProviderKind::Anthropic,
+                "secondary-model".to_string(),
+            )],
+        );
+        harness
+            .agent
+            .billing_failed_models
+            .write()
+            .await
+            .insert("primary-model".to_string(), Instant::now());
+        let options = ChatOptions {
+            max_tokens_override: Some(100),
+            single_attempt_fail_closed: true,
+            ..ChatOptions::default()
+        };
+        let mut telemetry = super::LlmCallTelemetry::default();
+
+        let result = harness
+            .agent
+            .call_llm_with_recovery(
+                primary.clone() as Arc<dyn ModelProvider>,
+                None,
+                "primary-model",
+                &[],
+                &[],
+                &options,
+                &mut telemetry,
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(primary.models_called().await.is_empty());
+        assert!(alternate.models_called().await.is_empty());
     }
 }

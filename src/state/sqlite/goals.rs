@@ -562,6 +562,7 @@ impl crate::traits::TaskStore for SqliteStateStore {
         if normalized.starts_with("execute scheduled goal:")
             || normalized.starts_with("scheduled check:")
             || normalized.starts_with("manual scheduled run:")
+            || normalized.starts_with("mandate review:")
         {
             sqlx::query(
                 "UPDATE goal_runs SET root_task_id = COALESCE(root_task_id, ?),
@@ -1049,6 +1050,26 @@ impl crate::traits::GoalScheduleStore for SqliteStateStore {
                SELECT id FROM goals WHERE status = 'pending_confirmation' AND created_at < ?
              )",
         )
+        .bind(&cutoff)
+        .execute(&mut *tx)
+        .await?;
+
+        // A mandate pending confirmation carries no authority yet, but the
+        // proof must remain coherent with its controller. Cancel both records
+        // atomically so generic pending-confirmation cleanup cannot leave a
+        // resumable paused mandate behind.
+        sqlx::query(
+            "UPDATE mandates
+             SET status = 'cancelled', review_lease_token = NULL,
+                 review_lease_expires_at = NULL, version = version + 1,
+                 updated_at = ?
+             WHERE status = 'paused' AND confirmed_at IS NULL
+               AND goal_id IN (
+                   SELECT id FROM goals
+                   WHERE status = 'pending_confirmation' AND created_at < ?
+               )",
+        )
+        .bind(&now)
         .bind(&cutoff)
         .execute(&mut *tx)
         .await?;

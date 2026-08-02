@@ -78,6 +78,12 @@ pub(super) struct ToolExecCtx<'a> {
     /// into tool args (the correction sandbox overrides trusted-session semantics).
     /// False on all normal paths.
     pub suppress_trusted_session: bool,
+    /// Exact action-bound authority for a call made under an autonomous
+    /// mandate. It is issued by the execution loop and never model-visible.
+    pub mandate_authority: Option<&'a crate::traits::MandateAuthorityGrant>,
+    /// Actual dispatcher-owned call identity carried independently from the
+    /// grant so the final ledger claim cannot validate a grant against itself.
+    pub mandate_tool_call_id: Option<&'a str>,
 }
 
 async fn scoped_workspace_arguments(
@@ -209,6 +215,288 @@ async fn scoped_workspace_arguments(
 
 // impl-Agent justification: tool dispatch with watchdog over tools/state/event_store/verification_tracker.
 impl Agent {
+    async fn mandate_goal_id_for_tool_exec(
+        &self,
+        ctx: &ToolExecCtx<'_>,
+    ) -> anyhow::Result<Option<String>> {
+        // A run-bound child remains a mandate execution even if its controller
+        // record is concurrently removed or corrupted. Never downgrade that
+        // child into the ordinary owner/tool path.
+        if let Some(fence) = self.mandate_execution.as_ref() {
+            anyhow::ensure!(
+                self.goal_id.as_deref() == Some(fence.goal_id.as_str()),
+                "Mandate child goal identity is inconsistent."
+            );
+            return Ok(Some(fence.goal_id.clone()));
+        }
+        if let Some(goal_id) = self.goal_id.as_deref() {
+            if self.state.get_mandate_for_goal(goal_id).await?.is_some() {
+                return Ok(Some(goal_id.to_string()));
+            }
+        }
+        for task_id in [self.task_id.as_deref(), ctx.task_id].into_iter().flatten() {
+            if let Some(task) = self.state.get_task(task_id).await? {
+                if self
+                    .state
+                    .get_mandate_for_goal(&task.goal_id)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(Some(task.goal_id));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn semantics_for_exact_tool_call(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> crate::traits::ToolCallSemantics {
+        if let Some(tool) = self
+            .tools
+            .iter()
+            .find(|tool| tool.name() == name && tool.is_available())
+        {
+            return tool.call_semantics(arguments);
+        }
+        if let Some(registry) = self.mcp_registry.as_ref() {
+            if let Some(tool) = registry.find_tool(name).await {
+                return tool.call_semantics(arguments);
+            }
+        }
+        crate::traits::ToolCallSemantics::default()
+    }
+
+    /// Final complete-mediation check at the last common dispatcher. The
+    /// execution loop issues grants, but this boundary reloads mandate/run
+    /// state and compares the exact digest immediately before adapter I/O.
+    async fn validate_mandate_dispatch(
+        &self,
+        name: &str,
+        arguments: &str,
+        ctx: &ToolExecCtx<'_>,
+        claim_dispatch: bool,
+    ) -> anyhow::Result<bool> {
+        let Some(goal_id) = self.mandate_goal_id_for_tool_exec(ctx).await? else {
+            anyhow::ensure!(
+                ctx.mandate_authority.is_none(),
+                "Mandate authority is not valid outside its controller goal."
+            );
+            return Ok(false);
+        };
+        let mandate = self
+            .state
+            .get_mandate_for_goal(&goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate authority record disappeared."))?;
+        anyhow::ensure!(mandate.is_active(), "Mandate is no longer active.");
+        self.require_live_mandate_execution(&goal_id).await?;
+        let goal_run = self
+            .state
+            .get_current_goal_run(&goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Mandate has no active decision cycle."))?;
+        anyhow::ensure!(
+            goal_run.trigger_type == "mandate" && goal_run.status == "running",
+            "Mandate action is outside a mandate run."
+        );
+        let semantics = self.semantics_for_exact_tool_call(name, arguments).await;
+        let class = crate::mandates::classify_mandate_call(name, arguments, &semantics);
+        let fence = self.mandate_execution.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Mandate dispatch is missing its immutable execution role fence.")
+        })?;
+        let is_task_lead = fence.worker_task_id == fence.root_task_id;
+        anyhow::ensure!(
+            crate::mandates::role_allows_mandate_call(class, name, is_task_lead),
+            if is_task_lead && class == crate::mandates::MandateCallClass::GovernedMutation {
+                "The mandate task lead cannot perform governed mutations."
+            } else {
+                "This call is not permitted for this mandate execution role."
+            }
+        );
+
+        match class {
+            crate::mandates::MandateCallClass::ProtocolObservation => {
+                anyhow::ensure!(
+                    ctx.mandate_authority.is_none(),
+                    "Protocol observations cannot carry mutation authority."
+                );
+                Ok(true)
+            }
+            crate::mandates::MandateCallClass::RecordDecision => {
+                anyhow::ensure!(
+                    ctx.mandate_authority.is_none(),
+                    "Decision recording cannot carry mutation authority."
+                );
+                Ok(true)
+            }
+            crate::mandates::MandateCallClass::Observation => {
+                anyhow::ensure!(
+                    ctx.mandate_authority.is_none(),
+                    "Observation calls cannot carry mutation authority."
+                );
+                if let Err(reason) = crate::mandates::authority::authorize_mandate_observation(
+                    &mandate,
+                    name,
+                    arguments,
+                    &semantics,
+                    &chrono::Utc::now(),
+                ) {
+                    anyhow::bail!(
+                        "Mandate observation authority was revoked before dispatch ({}).",
+                        reason.as_str()
+                    );
+                }
+                Ok(true)
+            }
+            crate::mandates::MandateCallClass::ActControl
+            | crate::mandates::MandateCallClass::GovernedMutation => {
+                let decision = self
+                    .state
+                    .get_mandate_decision_for_run(&goal_run.id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("A current ACT decision is required."))?;
+                anyhow::ensure!(
+                    decision.mandate_id == mandate.id
+                        && decision.goal_run_id == goal_run.id
+                        && decision.mandate_version == mandate.version
+                        && decision.outcome == crate::traits::MandateDecisionOutcome::Act,
+                    "The mandate no longer has a current ACT decision."
+                );
+                if class == crate::mandates::MandateCallClass::ActControl {
+                    anyhow::ensure!(
+                        ctx.mandate_authority.is_none(),
+                        "Control-plane calls cannot carry mutation authority."
+                    );
+                    return Ok(true);
+                }
+
+                anyhow::ensure!(
+                    fence.worker_task_id != fence.root_task_id,
+                    "The mandate task lead may deliberate and orchestrate, but only a fenced non-root executor may perform mutations."
+                );
+
+                let grant = ctx.mandate_authority.ok_or_else(|| {
+                    anyhow::anyhow!("This mutation has no action-bound mandate grant.")
+                })?;
+                anyhow::ensure!(
+                    grant.counts_toward_cycle_budget
+                        && decision.action_attempts >= 0
+                        && decision.action_attempts
+                            < i64::from(mandate.authority.max_mutating_actions_per_cycle)
+                        && grant.reserved_action_attempt == decision.action_attempts + 1,
+                    "The mandate action candidate is invalid."
+                );
+
+                let mut expected = match crate::mandates::authority::authorize_mandate_action(
+                    &mandate,
+                    &decision,
+                    name,
+                    arguments,
+                    &semantics,
+                    &chrono::Utc::now(),
+                ) {
+                    crate::mandates::authority::MandateAuthorityDecision::Allow(expected) => {
+                        expected
+                    }
+                    crate::mandates::authority::MandateAuthorityDecision::Deny(reason) => {
+                        anyhow::bail!(
+                            "Mandate authority was revoked before dispatch ({}).",
+                            reason.as_str()
+                        );
+                    }
+                };
+                expected.tool_call_id.clone_from(&grant.tool_call_id);
+                anyhow::ensure!(
+                    &expected == grant,
+                    "Mandate authority was revoked before dispatch (grant_mismatch)."
+                );
+                if claim_dispatch {
+                    let bound_tool_call_id = grant.tool_call_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("The mandate grant is not bound to this tool call.")
+                    })?;
+                    let actual_tool_call_id = ctx.mandate_tool_call_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "The mandate dispatch is missing its actual tool call identity."
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        actual_tool_call_id == bound_tool_call_id,
+                        "The mandate grant belongs to a different tool call."
+                    );
+                    let (mutation_effects, targets, account_identifiers) =
+                        crate::mandates::authority::mutation_audit_scope(&semantics)
+                            .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let reservation = crate::traits::MandateMutationReservation {
+                        grant: grant.clone(),
+                        goal_run_id: fence.goal_run_id.clone(),
+                        root_task_id: fence.root_task_id.clone(),
+                        root_task_attempt_id: fence.root_task_attempt_id.clone(),
+                        task_id: fence.worker_task_id.clone(),
+                        task_attempt_id: fence.attempt_id.clone(),
+                        tool_call_id: actual_tool_call_id.to_string(),
+                        tool_name: name.to_string(),
+                        mutation_effects,
+                        targets,
+                        account_identifiers,
+                        reserved_at: now.clone(),
+                    };
+                    let reserved = self
+                        .state
+                        .reserve_mandate_action_attempt(&reservation)
+                        .await?;
+                    anyhow::ensure!(
+                        reserved.is_some(),
+                        "The mandate action budget, policy, or execution fence changed before dispatch."
+                    );
+                    let mut reserved_decision = decision.clone();
+                    reserved_decision.action_attempts = grant.reserved_action_attempt;
+                    if let Err(reason) = crate::mandates::authority::validate_mandate_grant(
+                        &mandate,
+                        &reserved_decision,
+                        name,
+                        arguments,
+                        &semantics,
+                        &chrono::Utc::now(),
+                        grant,
+                    ) {
+                        anyhow::bail!(
+                            "The exact reserved mandate grant failed final validation ({}).",
+                            reason.as_str()
+                        );
+                    }
+                    let claimed = self
+                        .state
+                        .claim_mandate_mutation_dispatch(
+                            &crate::traits::MandateMutationDispatchClaim {
+                                grant: grant.clone(),
+                                goal_run_id: fence.goal_run_id.clone(),
+                                root_task_id: fence.root_task_id.clone(),
+                                root_task_attempt_id: fence.root_task_attempt_id.clone(),
+                                task_id: fence.worker_task_id.clone(),
+                                task_attempt_id: fence.attempt_id.clone(),
+                                tool_call_id: actual_tool_call_id.to_string(),
+                                tool_name: name.to_string(),
+                                claimed_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                        )
+                        .await?;
+                    anyhow::ensure!(
+                        claimed,
+                        "The exact mandate mutation reservation is stale, mismatched, or already dispatched."
+                    );
+                }
+                Ok(true)
+            }
+            crate::mandates::MandateCallClass::Deny => {
+                anyhow::bail!("This call is not supported inside a mandate run.")
+            }
+        }
+    }
+
     pub(super) async fn execute_tool_with_watchdog(
         &self,
         name: &str,
@@ -266,12 +554,15 @@ impl Agent {
         let task_id = ctx.task_id;
         let channel_visibility = ctx.channel_visibility;
         let channel_id = ctx.channel_id;
+        let under_mandate = self
+            .validate_mandate_dispatch(name, arguments, ctx, false)
+            .await?;
         // Trust suppression: when the correction gate sets suppress_trusted_session,
         // we must NOT inject `_trusted_session` even if ChannelContext.trusted is true
         // or scheduled provenance would ordinarily authorize it.  Setting ctx.trusted=false
         // alone is insufficient because the OR below would still pick up scheduled
         // provenance; the entire expression must short-circuit to false.
-        let trusted = if ctx.suppress_trusted_session {
+        let trusted = if ctx.suppress_trusted_session || under_mandate {
             false
         } else {
             ctx.trusted
@@ -370,7 +661,14 @@ impl Agent {
                 // (goal.session_id), since internal child-agent sessions are not routable.
                 //
                 // `terminal` uses this for the same reason when commands move to background.
-                if matches!(name, "spawn_agent" | "cli_agent" | "terminal") {
+                if matches!(
+                    name,
+                    "spawn_agent"
+                        | "cli_agent"
+                        | "terminal"
+                        | "manage_mandates"
+                        | "manage_goal_tasks"
+                ) {
                     if let Some(ref gid) = self.goal_id {
                         map.insert("_goal_id".to_string(), json!(gid));
                     } else if matches!(name, "cli_agent" | "terminal") {
@@ -379,6 +677,28 @@ impl Agent {
                         if let Some(ref executor_task_id) = self.task_id {
                             if let Ok(Some(task)) = self.state.get_task(executor_task_id).await {
                                 map.insert("_goal_id".to_string(), json!(task.goal_id));
+                            }
+                        }
+                    }
+                    if matches!(name, "manage_mandates" | "manage_goal_tasks") {
+                        if let Some(fence) = self.mandate_execution.as_ref() {
+                            map.insert(
+                                "_goal_run_id".to_string(),
+                                json!(fence.goal_run_id.as_str()),
+                            );
+                            map.insert(
+                                "_task_attempt_id".to_string(),
+                                json!(fence.attempt_id.as_str()),
+                            );
+                            if name == "manage_goal_tasks" {
+                                map.insert(
+                                    "_mandate_id".to_string(),
+                                    json!(fence.mandate_id.as_str()),
+                                );
+                                map.insert(
+                                    "_mandate_version".to_string(),
+                                    json!(fence.mandate_version),
+                                );
                             }
                         }
                     }
@@ -429,13 +749,24 @@ impl Agent {
         }
 
         if let Some(grant) = active_workspace_grant {
-            if matches!(name, "write_file" | "edit_file") {
+            if !under_mandate && matches!(name, "write_file" | "edit_file") {
                 if let Some(manager) = crate::checkpoints::active_manager() {
                     manager.begin_for_tool(name, &enriched_args).await?;
                 }
             }
+            let mandate_preapproved = if under_mandate {
+                self.validate_mandate_dispatch(name, arguments, ctx, true)
+                    .await?;
+                true
+            } else {
+                false
+            };
             let exec_ctx = crate::traits::ToolExecutionContext {
+                // Workspace-grant builtins are outside the correction approval
+                // bypass; preserve the existing boundary between authority paths.
                 correction_preapproved: false,
+                mandate_preapproved,
+                mandate_execution: under_mandate,
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -463,7 +794,8 @@ impl Agent {
 
         for tool in &self.tools {
             if tool.name() == name {
-                if name != "terminal"
+                if !under_mandate
+                    && name != "terminal"
                     && matches!(
                         name,
                         "write_file" | "edit_file" | "run_command" | "cli_agent"
@@ -473,8 +805,17 @@ impl Agent {
                         manager.begin_for_tool(name, &enriched_args).await?;
                     }
                 }
+                let mandate_preapproved = if under_mandate {
+                    self.validate_mandate_dispatch(name, arguments, ctx, true)
+                        .await?;
+                    true
+                } else {
+                    false
+                };
                 let exec_ctx = crate::traits::ToolExecutionContext {
                     correction_preapproved: ctx.correction_preapproved,
+                    mandate_preapproved,
+                    mandate_execution: under_mandate,
                 };
                 let result = tool
                     .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
@@ -530,12 +871,22 @@ impl Agent {
         }
 
         // Search MCP registry for dynamically registered tools.
-        // MCP tools are never correction-preapproved in 3b; they receive the
-        // default exec_ctx (correction_preapproved=false).
+        // MCP adapters remain outside the correction approval bypass. A mandate
+        // bit can reach one only after the same exact-grant revalidation used
+        // for builtins (MCP tools are non-delegable under the v1 policy).
         if let Some(ref registry) = self.mcp_registry {
             if let Some(tool) = registry.find_tool(name).await {
+                let mandate_preapproved = if under_mandate {
+                    self.validate_mandate_dispatch(name, arguments, ctx, true)
+                        .await?;
+                    true
+                } else {
+                    false
+                };
                 let exec_ctx = crate::traits::ToolExecutionContext {
                     correction_preapproved: false,
+                    mandate_preapproved,
+                    mandate_execution: under_mandate,
                 };
                 return tool
                     .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)

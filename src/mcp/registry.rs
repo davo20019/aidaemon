@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::config::{store_in_keychain, McpServerConfig};
 use crate::mcp::{capabilities_from_tool_definition, McpClient, McpTool};
-use crate::traits::{DynamicMcpServer, StateStore, Tool};
+use crate::traits::{DynamicMcpServer, MandateAuthority, StateStore, Tool};
 
 /// A running MCP server entry in the registry.
 pub struct McpServerEntry {
@@ -38,6 +38,7 @@ pub struct ServerInfo {
 pub struct McpRegistry {
     servers: Arc<RwLock<HashMap<String, McpServerEntry>>>,
     state: Arc<dyn StateStore>,
+    mandate_authority: Option<Arc<MandateAuthority>>,
 }
 
 impl McpRegistry {
@@ -45,7 +46,26 @@ impl McpRegistry {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             state,
+            mandate_authority: None,
         }
+    }
+
+    /// Create a read/execution view that exposes only MCP tools named in one
+    /// immutable mandate authority snapshot. V1 mandates expose no MCP tools:
+    /// server-advertised safety metadata is not an owner-pinned authority fact.
+    /// The snapshot is retained so a future pinned-manifest implementation can
+    /// safely narrow this view without changing child construction.
+    pub fn scoped_to_mandate(&self, authority: &MandateAuthority) -> Self {
+        Self {
+            servers: self.servers.clone(),
+            state: self.state.clone(),
+            mandate_authority: Some(Arc::new(authority.clone())),
+        }
+    }
+
+    fn allows_tool_name(&self, tool_name: &str) -> bool {
+        let _ = tool_name;
+        self.mandate_authority.is_none()
     }
 
     /// Validate an MCP server name: lowercase alphanumeric + underscores, 1-32 chars.
@@ -414,21 +434,39 @@ impl McpRegistry {
         let servers = self.servers.read().await;
         servers
             .values()
-            .map(|e| ServerInfo {
-                name: e.name.clone(),
-                command: e.config.command.clone(),
-                args: e.config.args.clone(),
-                tool_names: e.tools.iter().map(|t| t.name().to_string()).collect(),
-                env_keys: e.config.env.keys().cloned().collect(),
-                triggers: e.triggers.clone(),
-                db_id: e.db_id,
-                enabled: true,
+            .filter_map(|e| {
+                let tool_names = e
+                    .tools
+                    .iter()
+                    .filter(|tool| self.allows_tool_name(tool.name()))
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>();
+                if self.mandate_authority.is_some() && tool_names.is_empty() {
+                    return None;
+                }
+                Some(ServerInfo {
+                    name: e.name.clone(),
+                    command: e.config.command.clone(),
+                    args: e.config.args.clone(),
+                    tool_names,
+                    env_keys: if self.mandate_authority.is_some() {
+                        Vec::new()
+                    } else {
+                        e.config.env.keys().cloned().collect()
+                    },
+                    triggers: e.triggers.clone(),
+                    db_id: e.db_id,
+                    enabled: true,
+                })
             })
             .collect()
     }
 
     /// List known MCP servers with enabled status, including disabled dynamic servers.
     pub async fn list_servers_with_status(&self) -> anyhow::Result<Vec<ServerInfo>> {
+        if self.mandate_authority.is_some() {
+            return Ok(self.list_servers().await);
+        }
         let mut merged: HashMap<String, ServerInfo> = self
             .list_servers()
             .await
@@ -537,7 +575,13 @@ impl McpRegistry {
                     .map(|t| t.to_lowercase())
                     .any(|alias| refs.iter().any(|r| r == &alias));
             if matches {
-                matched_tools.extend(entry.tools.iter().cloned());
+                matched_tools.extend(
+                    entry
+                        .tools
+                        .iter()
+                        .filter(|tool| self.allows_tool_name(tool.name()))
+                        .cloned(),
+                );
             }
         }
 
@@ -546,6 +590,9 @@ impl McpRegistry {
 
     /// Find a specific tool by name across all MCP servers.
     pub async fn find_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if !self.allows_tool_name(name) {
+            return None;
+        }
         let servers = self.servers.read().await;
         for entry in servers.values() {
             for tool in &entry.tools {
@@ -564,6 +611,11 @@ impl McpRegistry {
         raw_tool_name: &str,
         arguments: Value,
     ) -> anyhow::Result<String> {
+        let prefixed_name = format!("{server_name}__{raw_tool_name}");
+        anyhow::ensure!(
+            self.allows_tool_name(&prefixed_name),
+            "MCP tool is outside the mandate registry view"
+        );
         let client = {
             let servers = self.servers.read().await;
             let entry = servers
@@ -582,10 +634,12 @@ impl McpRegistry {
         let mut defs = Vec::new();
         for entry in servers.values() {
             for tool in &entry.tools {
-                defs.push(serde_json::json!({
-                    "type": "function",
-                    "function": tool.schema()
-                }));
+                if self.allows_tool_name(tool.name()) {
+                    defs.push(serde_json::json!({
+                        "type": "function",
+                        "function": tool.schema()
+                    }));
+                }
             }
         }
         defs

@@ -354,7 +354,14 @@ fn structured_rewrite_chat_options(base: &ChatOptions, draft: &str) -> ChatOptio
     // reasoning ramble can't burn decode. The truncation retry ladder still
     // doubles this if the cap ever bites.
     let draft_tokens = (draft.len() / 4) as u32;
-    opts.max_tokens_override = Some((draft_tokens * 2 + 256).max(512));
+    let rewrite_cap = (draft_tokens * 2 + 256).max(512);
+    // A caller-provided cap may be a security boundary (for example, the
+    // remaining balance in an autonomous mandate cycle). A structured rewrite
+    // pass may narrow that ceiling but must never raise it.
+    opts.max_tokens_override = Some(
+        base.max_tokens_override
+            .map_or(rewrite_cap, |base_cap| base_cap.min(rewrite_cap)),
+    );
     opts
 }
 
@@ -1368,6 +1375,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
         let first = self
             .execute_chat_request(model, messages, tools, options)
             .await?;
+        // A mandate budget lease covers exactly one physical provider attempt.
+        // The ordinary structured-answer pass is a second request (and may
+        // retry); skip it when attempt-level unknown spend must fail closed.
+        if options.single_attempt_fail_closed {
+            return Ok(first);
+        }
         if !needs_structured_answer_pass(
             &self.structured_answer_models,
             model,
@@ -1777,6 +1790,18 @@ mod tests {
     }
 
     #[test]
+    fn structured_rewrite_never_raises_caller_token_ceiling() {
+        let base = ChatOptions {
+            max_tokens_override: Some(100),
+            single_attempt_fail_closed: true,
+            ..Default::default()
+        };
+        let opts = structured_rewrite_chat_options(&base, &"draft ".repeat(2_000));
+        assert_eq!(opts.max_tokens_override, Some(100));
+        assert!(opts.single_attempt_fail_closed);
+    }
+
+    #[test]
     fn structured_pass_mode_selects_rewrite_for_clean_draft() {
         assert_eq!(
             structured_pass_mode("A clean, complete draft.", false, false),
@@ -1825,13 +1850,13 @@ mod tests {
     fn rewrite_options_cap_tokens_proportional_to_draft() {
         let base = ChatOptions {
             id_slot: Some(3),
-            max_tokens_override: Some(4096),
             ..Default::default()
         };
         // Small draft: floor applies.
         let small = structured_rewrite_chat_options(&base, "short draft");
         assert_eq!(small.max_tokens_override, Some(512));
-        // Big draft (~6K tokens): cap scales with the draft, not the base.
+        // Big draft (~6K tokens): without a caller ceiling, the cap scales
+        // with the draft.
         let big_draft = "x".repeat(24_000);
         let big = structured_rewrite_chat_options(&base, &big_draft);
         assert_eq!(big.max_tokens_override, Some(24_000 / 4 * 2 + 256));

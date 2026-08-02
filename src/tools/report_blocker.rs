@@ -20,6 +20,7 @@ pub struct ReportBlockerTool {
     task_id: String,
     state: Arc<dyn StateStore>,
     attempt: Option<TaskAttempt>,
+    mandate_execution: bool,
 }
 
 impl ReportBlockerTool {
@@ -29,14 +30,21 @@ impl ReportBlockerTool {
             task_id,
             state,
             attempt: None,
+            mandate_execution: false,
         }
     }
 
-    pub fn for_attempt(task_id: String, state: Arc<dyn StateStore>, attempt: TaskAttempt) -> Self {
+    pub fn for_attempt(
+        task_id: String,
+        state: Arc<dyn StateStore>,
+        attempt: TaskAttempt,
+        mandate_execution: bool,
+    ) -> Self {
         Self {
             task_id,
             state,
             attempt: Some(attempt),
+            mandate_execution,
         }
     }
 }
@@ -60,6 +68,39 @@ struct ReportBlockerArgs {
     artifacts: Option<Vec<String>>,
     #[serde(default)]
     options: Option<Vec<String>>,
+}
+
+fn sanitize_mandate_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn sanitize_mandate_blocker_args(args: &mut ReportBlockerArgs) {
+    args.reason = sanitize_mandate_text(&args.reason, 500);
+    for value in [
+        &mut args.partial_work,
+        &mut args.exact_need,
+        &mut args.next_step,
+        &mut args.target,
+        &mut args.consequence_if_not_provided,
+    ] {
+        if let Some(text) = value.as_mut() {
+            *text = sanitize_mandate_text(text, 500);
+        }
+    }
+    for values in [&mut args.artifacts, &mut args.options] {
+        if let Some(values) = values.as_mut() {
+            values.truncate(8);
+            for value in values {
+                *value = sanitize_mandate_text(value, 300);
+            }
+        }
+    }
 }
 
 fn suppresses_immediate_blocker_notification(context: Option<&str>) -> bool {
@@ -167,7 +208,14 @@ impl Tool for ReportBlockerTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ReportBlockerArgs = serde_json::from_str(arguments)?;
+        let mut args: ReportBlockerArgs = serde_json::from_str(arguments)?;
+        if self.mandate_execution {
+            anyhow::ensure!(
+                self.attempt.is_some(),
+                "A mandate blocker requires an exact durable task-attempt fence"
+            );
+            sanitize_mandate_blocker_args(&mut args);
+        }
 
         if is_self_resolvable_execution_preflight(&args) {
             return Ok(
@@ -258,8 +306,8 @@ impl Tool for ReportBlockerTool {
         // compatibility path is retained for direct unit tests and older
         // callers that do not execute under a durable claim.
         if let Ok(Some(mut task)) = self.state.get_task(&self.task_id).await {
-            let suppress_immediate_notification =
-                suppresses_immediate_blocker_notification(task.context.as_deref());
+            let suppress_immediate_notification = self.mandate_execution
+                || suppresses_immediate_blocker_notification(task.context.as_deref());
             let result_summary = if task
                 .result
                 .as_deref()
@@ -358,7 +406,8 @@ impl Tool for ReportBlockerTool {
             } else {
                 info!(
                     task_id = %self.task_id,
-                    "Suppressed duplicate blocker escalation for terminal recovery task"
+                    mandate_execution = self.mandate_execution,
+                    "Suppressed immediate blocker escalation for controlled task finalization"
                 );
             }
         }

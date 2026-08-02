@@ -652,10 +652,11 @@ impl ManageHttpAuthTool {
         };
 
         let approval_description = format!(
-            "Update manual API auth profile '{}' (type={}, domains={})",
+            "Update manual API auth profile '{}' (type={}, domains={}, user_id={})",
             profile_name,
             Self::auth_type_name(&auth_type),
-            allowed_domains.join(", ")
+            allowed_domains.join(", "),
+            args.user_id.as_deref().unwrap_or("unchanged")
         );
         match self
             .request_approval(
@@ -665,6 +666,8 @@ impl ManageHttpAuthTool {
                 vec![
                     "Modifies API auth configuration".to_string(),
                     "Can change which domains receive credentials".to_string(),
+                    "Changing user_id or rebinding credentials can change the remote account behind this profile. Pause or revoke affected autonomous mandates before the change, then reconfirm their account scope."
+                        .to_string(),
                 ],
             )
             .await?
@@ -1041,7 +1044,7 @@ impl ManageHttpAuthTool {
 fn manage_http_auth_schema() -> Value {
     json!({
         "name": "manage_http_auth",
-        "description": "HTTP auth CRUD. No secrets in chat—keychain. verify after upsert/rotate refreshes runtime auth.",
+        "description": "HTTP auth CRUD; keychain secrets; verify refreshes.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1055,13 +1058,16 @@ fn manage_http_auth_schema() -> Value {
                     "enum": ["oauth1a", "bearer", "header", "basic"]
                 },
                 "allowed_domains": {
-                    "description": "Hosts allowed to receive this profile's credentials",
+                    "description": "Auth hosts",
                     "type": "array",
                     "items": { "type": "string" }
                 },
                 "header_name": { "type": "string", "description": "header auth" },
                 "username": { "type": "string", "description": "basic" },
-                "user_id": { "type": "string" },
+                "user_id": {
+                    "type": "string",
+                    "description": "OAuth1a account ID; pause/revoke mandates before rebind, then reconfirm."
+                },
                 "url": { "type": "string" },
                 "method": { "type": "string", "enum": ["GET", "HEAD"] },
                 "timeout_secs": { "type": "integer" }

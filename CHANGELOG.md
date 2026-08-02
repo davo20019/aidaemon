@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.34] - 2026-08-01
+
 ### Added
 
+- **Bounded autonomous mandates.** Owners can now delegate an objective, constraints, stop/success conditions, adaptive review bounds, and an explicit observation/action-tool, mutation-effect, target, per-cycle, rolling-24-hour, and cooldown envelope instead of relying on a fixed posting schedule. Each durable review records exactly one ACT, WAIT, ASK, or STOP decision and creates an intention only for ACT; WAIT is a successful no-op, ASK pauses for owner judgment, and STOP ends the controller. Mandate reviews use their own leased wake clock rather than scheduled-goal provenance. Mutations require a current fenced ACT and intention, reserve the exact operation, atomically claim quota at the final I/O boundary, revalidate exact tool/effect/target/account scope, and satisfy ACT only through strict typed receipts. Mandate workers use an isolated built-in prompt plus bounded same-mandate typed history, without private memory, custom skills/personas, project context, opaque MCP/shell/UI adapters, or global learning channels. Durable execution provenance also excludes mandate turns from completion hooks, periodic memory jobs, activity analysis, and delayed event consolidation before any global learning or auxiliary model call.
 - **Best-in-class scoped project instructions for direct and delegated work.** AIDaemon now resolves repository guidance broad-to-specific from the selected project root, gives `AGENTS.override.md` precedence over `AGENTS.md`, supports `CLAUDE.md` and `GEMINI.md` as compatibility fallbacks, and injects guidance without making the daemon's process directory globally authoritative. Before a high-intent tool enters a deeper subtree, newly applicable instructions are loaded into the system task context and the entire tool batch is explicitly deferred without execution; task-local source deduplication, post-injection defense-in-depth checks, workspace confinement, symlink containment, authority boundaries, and prompt-size limits keep the behavior safe and bounded.
 
 ## [0.11.33] - 2026-08-01

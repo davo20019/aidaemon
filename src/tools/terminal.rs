@@ -7107,6 +7107,7 @@ mod tests {
 
         let exec_ctx = ToolExecutionContext {
             correction_preapproved: true,
+            ..Default::default()
         };
 
         let result = tool
@@ -7148,6 +7149,7 @@ mod tests {
 
         let exec_ctx = ToolExecutionContext {
             correction_preapproved: true,
+            ..Default::default()
         };
 
         // "check" with no pid should return an error (normal path), not be silently
@@ -7219,6 +7221,7 @@ mod tests {
 
             let exec_ctx = ToolExecutionContext {
                 correction_preapproved: true,
+                ..Default::default()
             };
             let result = tool
                 .call_with_execution_context(
@@ -7258,6 +7261,7 @@ mod tests {
                 None,
                 ToolExecutionContext {
                     correction_preapproved: false,
+                    ..Default::default()
                 },
             )
             .await

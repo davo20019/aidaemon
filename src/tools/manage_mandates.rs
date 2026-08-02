@@ -1,0 +1,1641 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::tools::command_risk::{PermissionMode, RiskLevel};
+use crate::tools::terminal::ApprovalRequest;
+use crate::tools::ApprovalBroker;
+use crate::traits::{
+    Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome, StateStore,
+    Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
+};
+use crate::types::{ApprovalKind, ApprovalResponse};
+
+const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
+const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
+const DEFAULT_REVIEW_SECS: i64 = 4 * 60 * 60;
+const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
+const MAX_POLICY_ENTRIES: usize = 16;
+const MAX_POLICY_ENTRY_TEXT: usize = 500;
+const MAX_POLICY_TEXT: usize = 8 * 1024;
+const MAX_RATIONALE_TEXT: usize = 2 * 1024;
+const MAX_OBSERVATIONS: usize = 8;
+const MAX_OBSERVATION_TEXT: usize = 750;
+const MAX_OBSERVATIONS_JSON: usize = 6 * 1024;
+const MAX_QUESTION_TEXT: usize = 500;
+const MAX_INTENTION_TEXT: usize = 1024;
+const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
+const MAX_GUIDANCE_ENTRIES: usize = 10;
+const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
+const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
+const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only in v1; update rejects this field.";
+
+/// Owner-facing mandate administration and the internal deliberation commit point.
+///
+/// This tool deliberately does not execute delegated actions. It records the
+/// owner's authority envelope and the task lead's ACT/WAIT/ASK/STOP choice; the
+/// dispatcher enforces the envelope when an action is attempted.
+pub struct ManageMandatesTool {
+    state: Arc<dyn StateStore>,
+    approval_tx: ApprovalBroker,
+}
+
+impl ManageMandatesTool {
+    pub fn new(state: Arc<dyn StateStore>, approval_tx: ApprovalBroker) -> Self {
+        Self { state, approval_tx }
+    }
+
+    fn is_owner(args: &ManageMandatesArgs) -> bool {
+        args._user_role
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case("owner"))
+    }
+
+    fn is_internal(args: &ManageMandatesArgs) -> bool {
+        args._channel_visibility
+            .as_deref()
+            .is_some_and(|visibility| visibility.eq_ignore_ascii_case("internal"))
+            || args._session_id.as_deref().is_some_and(|session| {
+                session.starts_with("specialist:") || session.starts_with("sub-")
+            })
+    }
+
+    fn is_private_owner_control(args: &ManageMandatesArgs) -> bool {
+        Self::is_owner(args)
+            && !Self::is_internal(args)
+            && args
+                ._channel_visibility
+                .as_deref()
+                .is_some_and(|visibility| visibility.eq_ignore_ascii_case("private"))
+    }
+
+    fn owner_session(args: &ManageMandatesArgs) -> anyhow::Result<&str> {
+        let session = args
+            ._session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session| !session.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("manage_mandates requires an owner session"))?;
+        Ok(session)
+    }
+
+    fn authority_from_args(args: &ManageMandatesArgs) -> MandateAuthority {
+        MandateAuthority {
+            allow_observations: args.allow_observations.unwrap_or(true),
+            allowed_tools: args.allowed_tools.clone().unwrap_or_default(),
+            allowed_mutation_effects: args.allowed_mutation_effects.clone().unwrap_or_default(),
+            allowed_target_prefixes: args.allowed_target_prefixes.clone().unwrap_or_default(),
+            max_mutating_actions_per_cycle: args.max_mutating_actions_per_cycle.unwrap_or(0),
+            max_mutating_actions_per_rolling_24h: args
+                .max_mutating_actions_per_rolling_24h
+                .unwrap_or(0),
+            min_seconds_between_mutations: args.min_seconds_between_mutations.unwrap_or(0),
+        }
+    }
+
+    fn reject_create_only_update_fields(args: &ManageMandatesArgs) -> anyhow::Result<()> {
+        let mut fields = Vec::new();
+        if args.source_goal_id.is_some() {
+            fields.push("source_goal_id");
+        }
+        if args.priority.is_some() {
+            fields.push("priority");
+        }
+        if args.budget_per_cycle.is_some() {
+            fields.push("budget_per_cycle");
+        }
+        if args.budget_daily.is_some() {
+            fields.push("budget_daily");
+        }
+        anyhow::ensure!(
+            fields.is_empty(),
+            "update does not support create-only fields in v1: {}; create a new mandate to change them",
+            fields.join(", ")
+        );
+        Ok(())
+    }
+
+    async fn resolve_owned_mandate(
+        &self,
+        raw_id: &str,
+        owner_session: &str,
+    ) -> anyhow::Result<Mandate> {
+        let raw_id = raw_id.trim();
+        anyhow::ensure!(!raw_id.is_empty(), "mandate_id must not be empty");
+        if let Some(mandate) = self.state.get_mandate(raw_id).await? {
+            anyhow::ensure!(
+                mandate.created_by_session == owner_session,
+                "mandate not found in this owner session"
+            );
+            return Ok(mandate);
+        }
+        let matches = self
+            .state
+            .list_mandates(Some(owner_session), true)
+            .await?
+            .into_iter()
+            .filter(|mandate| mandate.id.starts_with(raw_id))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [mandate] => Ok(mandate.clone()),
+            [] => anyhow::bail!("mandate not found: {raw_id}"),
+            _ => anyhow::bail!("mandate ID prefix is ambiguous; use the full ID"),
+        }
+    }
+
+    async fn cancel_unconfirmed(&self, mandate: &Mandate) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state
+                .transition_mandate_status(&mandate.id, "paused", "cancelled")
+                .await?,
+            "unconfirmed mandate could not be cancelled"
+        );
+        Ok(())
+    }
+
+    async fn create(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be created by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let session_id = Self::owner_session(args)?;
+        let objective =
+            required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let authority = Self::authority_from_args(args);
+        authority.validate().map_err(anyhow::Error::msg)?;
+
+        let min_review_secs = minutes_to_secs(
+            args.min_review_minutes,
+            DEFAULT_MIN_REVIEW_SECS,
+            "min_review_minutes",
+        )?;
+        let max_review_secs = minutes_to_secs(
+            args.max_review_minutes,
+            DEFAULT_MAX_REVIEW_SECS,
+            "max_review_minutes",
+        )?;
+        let default_review_secs = minutes_to_secs(
+            args.default_review_minutes,
+            DEFAULT_REVIEW_SECS,
+            "default_review_minutes",
+        )?;
+        anyhow::ensure!(
+            min_review_secs <= default_review_secs && default_review_secs <= max_review_secs,
+            "review bounds must satisfy min <= default <= max"
+        );
+
+        let mut goal = crate::traits::Goal::new_continuous_pending(
+            &format!("Mandate: {objective}"),
+            session_id,
+            args.budget_per_cycle,
+            args.budget_daily,
+        );
+        let budget_per_cycle = goal.budget_per_check.unwrap_or_default();
+        let budget_daily = goal.budget_daily.unwrap_or_default();
+        anyhow::ensure!(
+            budget_per_cycle > 0 && budget_daily > 0,
+            "mandate token budgets must be greater than zero"
+        );
+        anyhow::ensure!(
+            budget_daily >= budget_per_cycle,
+            "budget_daily must be at least budget_per_cycle"
+        );
+        goal.priority = args.priority.clone().unwrap_or_else(|| "high".to_string());
+        anyhow::ensure!(
+            matches!(
+                goal.priority.as_str(),
+                "low" | "medium" | "high" | "critical"
+            ),
+            "priority must be low, medium, high, or critical"
+        );
+
+        let mut mandate = Mandate::new(
+            &goal.id,
+            args.source_goal_id.clone(),
+            objective,
+            session_id,
+            authority,
+            min_review_secs,
+            max_review_secs,
+            default_review_secs,
+        );
+        // Pending/paused records are safe if approval delivery is interrupted.
+        // Once activated, this timestamp makes the first deliberation immediately due.
+        mandate.status = "paused".to_string();
+        mandate.confirmed_at = None;
+        mandate.next_review_at = chrono::Utc::now().to_rfc3339();
+        mandate.constraints = clean_strings(args.constraints.as_deref());
+        mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
+        mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
+        validate_policy_text(
+            &mandate.constraints,
+            &mandate.success_criteria,
+            &mandate.stop_conditions,
+        )?;
+        mandate.expires_at = args.expires_at.clone();
+        if let Some(expires_at) = mandate.expires_at.as_deref() {
+            let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+                .map_err(|_| anyhow::anyhow!("expires_at must be an RFC3339 timestamp"))?;
+            anyhow::ensure!(
+                parsed > chrono::Utc::now(),
+                "expires_at must be in the future"
+            );
+        }
+        goal.conditions = if mandate.success_criteria.is_empty() {
+            None
+        } else {
+            Some(mandate.success_criteria.join("\n"))
+        };
+        goal.context = Some(serde_json::to_string(&json!({
+            "mandate_id": &mandate.id,
+            "source_goal_id": &mandate.source_goal_id,
+        }))?);
+
+        self.state
+            .create_mandate_controller(&goal, &mandate)
+            .await?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let warnings = vec![
+            format!(
+                "Resolved token budgets: {budget_per_cycle} tokens per decision cycle; {budget_daily} tokens per UTC day"
+            ),
+            format!(
+                "Allowed observation/action tools: {}",
+                display_allowlist(&mandate.authority.allowed_tools)
+            ),
+            format!(
+                "Allowed effects: {}",
+                display_allowlist(&mandate.authority.allowed_mutation_effects)
+            ),
+            format!(
+                "Allowed targets: {}",
+                display_target_scope(&mandate.authority.allowed_target_prefixes)
+            ),
+            format!(
+                "Mutation limit: {} per decision cycle",
+                mandate.authority.max_mutating_actions_per_cycle
+            ),
+            format!(
+                "Rolling mutation limit: {} per 24 hours; minimum spacing: {} seconds",
+                mandate.authority.max_mutating_actions_per_rolling_24h,
+                mandate.authority.min_seconds_between_mutations
+            ),
+            format!(
+                "Review interval: {}–{} minutes (default {})",
+                mandate.min_review_secs / 60,
+                mandate.max_review_secs / 60,
+                mandate.default_review_secs / 60
+            ),
+        ];
+        let request = ApprovalRequest {
+            command: format!("Delegate mandate: {objective}"),
+            session_id: session_id.to_string(),
+            risk_level: if mandate.authority.max_mutating_actions_per_cycle == 0 {
+                RiskLevel::Medium
+            } else {
+                RiskLevel::High
+            },
+            warnings,
+            permission_mode: PermissionMode::Cautious,
+            response_tx,
+            kind: ApprovalKind::GoalConfirmation,
+        };
+        if let Err(error) = self.approval_tx.send(request).await {
+            self.cancel_unconfirmed(&mandate).await?;
+            return Ok(format!(
+                "Mandate confirmation could not be delivered, so the pending mandate was cancelled: {error}"
+            ));
+        }
+
+        match response_rx.await {
+            Ok(
+                ApprovalResponse::AllowOnce
+                | ApprovalResponse::AllowSession
+                | ApprovalResponse::AllowAlways,
+            ) => {
+                anyhow::ensure!(
+                    self.state.confirm_mandate(&mandate.id).await?,
+                    "mandate could not be activated"
+                );
+                Ok(format!(
+                    "Activated mandate {}. Its first review is due now; future reviews are chosen within {}–{} minutes.",
+                    mandate.id,
+                    mandate.min_review_secs / 60,
+                    mandate.max_review_secs / 60
+                ))
+            }
+            Ok(ApprovalResponse::Deny) => {
+                self.cancel_unconfirmed(&mandate).await?;
+                Ok(format!(
+                    "Cancelled mandate {}; confirmation was declined.",
+                    mandate.id
+                ))
+            }
+            Err(_) => {
+                self.cancel_unconfirmed(&mandate).await?;
+                Ok(format!(
+                    "Mandate {} was cancelled because the confirmation response became unavailable.",
+                    mandate.id
+                ))
+            }
+        }
+    }
+
+    async fn list(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be listed by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let session_id = Self::owner_session(args)?;
+        let mandates = self
+            .state
+            .list_mandates(Some(session_id), args.include_terminal.unwrap_or(false))
+            .await?;
+        if mandates.is_empty() {
+            return Ok("No mandates in this owner session.".to_string());
+        }
+        let mut output = format!("Mandates ({}):\n", mandates.len());
+        for mandate in mandates {
+            output.push_str(&format!(
+                "- {} [{} v{}] {} — next review {}; {}/cycle, {}/rolling-24h mutations\n",
+                mandate.id,
+                mandate.status,
+                mandate.version,
+                mandate.objective,
+                mandate.next_review_at,
+                mandate.authority.max_mutating_actions_per_cycle,
+                mandate.authority.max_mutating_actions_per_rolling_24h
+            ));
+        }
+        Ok(output)
+    }
+
+    async fn get(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be inspected by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let owner = Self::owner_session(args)?;
+        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
+        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let decisions = self.state.list_mandate_decisions(&mandate.id, 5).await?;
+        let recent = self.state.list_intentions(&mandate.id, 5).await?;
+        Ok(serde_json::to_string_pretty(&json!({
+            "mandate": mandate,
+            "recent_decisions": decisions,
+            "recent_intentions": recent,
+        }))?)
+    }
+
+    async fn transition(&self, args: &ManageMandatesArgs, action: &str) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be changed by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let owner = Self::owner_session(args)?;
+        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
+        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        anyhow::ensure!(
+            !matches!(mandate.status.as_str(), "completed" | "cancelled"),
+            "terminal mandates cannot be changed"
+        );
+        if action != "resume" {
+            anyhow::ensure!(
+                args.guidance.is_none(),
+                "guidance is valid only with resume"
+            );
+        }
+        let resume_controller_context = if action == "resume" {
+            anyhow::ensure!(
+                mandate.confirmed_at.is_some(),
+                "an unconfirmed mandate cannot be resumed; cancel it and create a fresh confirmed mandate"
+            );
+            let controller = self
+                .state
+                .get_goal(&mandate.goal_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
+            let guidance = args
+                .guidance
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if mandate.status == "awaiting_input" {
+                anyhow::ensure!(
+                    guidance.is_some(),
+                    "guidance is required when resuming a mandate that asked the owner"
+                );
+            }
+            if let Some(guidance) = guidance {
+                validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
+                Some(append_owner_guidance(
+                    controller.context.as_deref(),
+                    guidance,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (from, to) = match action {
+            "pause" => ("active", "paused"),
+            "resume" if mandate.status == "awaiting_input" => ("awaiting_input", "active"),
+            "resume" => ("paused", "active"),
+            "cancel" => (mandate.status.as_str(), "cancelled"),
+            _ => unreachable!(),
+        };
+        let transitioned = if action == "resume" {
+            self.state
+                .resume_mandate_with_context(
+                    &mandate.id,
+                    from,
+                    mandate.version,
+                    resume_controller_context.as_deref(),
+                )
+                .await?
+        } else {
+            self.state
+                .transition_mandate_status(&mandate.id, from, to)
+                .await?
+        };
+        anyhow::ensure!(
+            transitioned,
+            "mandate is {}, so it cannot be changed with {action}",
+            mandate.status
+        );
+        Ok(format!("Mandate {} is now {to}.", mandate.id))
+    }
+
+    async fn update(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandate authority can only be changed by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        Self::reject_create_only_update_fields(args)?;
+        let owner = Self::owner_session(args)?;
+        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
+        let mut mandate = self.resolve_owned_mandate(id, owner).await?;
+        let has_change = args.objective.is_some()
+            || args.allow_observations.is_some()
+            || args.allowed_tools.is_some()
+            || args.allowed_mutation_effects.is_some()
+            || args.allowed_target_prefixes.is_some()
+            || args.max_mutating_actions_per_cycle.is_some()
+            || args.max_mutating_actions_per_rolling_24h.is_some()
+            || args.min_seconds_between_mutations.is_some()
+            || args.constraints.is_some()
+            || args.success_criteria.is_some()
+            || args.stop_conditions.is_some()
+            || args.min_review_minutes.is_some()
+            || args.max_review_minutes.is_some()
+            || args.default_review_minutes.is_some()
+            || args.expires_at.is_some();
+        anyhow::ensure!(has_change, "update requires at least one changed field");
+        anyhow::ensure!(
+            !matches!(mandate.status.as_str(), "completed" | "cancelled"),
+            "terminal mandates cannot be updated"
+        );
+        if let Some(objective) = args.objective.as_deref() {
+            mandate.objective =
+                required_bounded_trimmed(Some(objective), "objective", MAX_OBJECTIVE_TEXT)?
+                    .to_string();
+        }
+        if args.allow_observations.is_some()
+            || args.allowed_tools.is_some()
+            || args.allowed_mutation_effects.is_some()
+            || args.allowed_target_prefixes.is_some()
+            || args.max_mutating_actions_per_cycle.is_some()
+            || args.max_mutating_actions_per_rolling_24h.is_some()
+            || args.min_seconds_between_mutations.is_some()
+        {
+            mandate.authority = MandateAuthority {
+                allow_observations: args
+                    .allow_observations
+                    .unwrap_or(mandate.authority.allow_observations),
+                allowed_tools: args
+                    .allowed_tools
+                    .clone()
+                    .unwrap_or(mandate.authority.allowed_tools),
+                allowed_mutation_effects: args
+                    .allowed_mutation_effects
+                    .clone()
+                    .unwrap_or(mandate.authority.allowed_mutation_effects),
+                allowed_target_prefixes: args
+                    .allowed_target_prefixes
+                    .clone()
+                    .unwrap_or(mandate.authority.allowed_target_prefixes),
+                max_mutating_actions_per_cycle: args
+                    .max_mutating_actions_per_cycle
+                    .unwrap_or(mandate.authority.max_mutating_actions_per_cycle),
+                max_mutating_actions_per_rolling_24h: args
+                    .max_mutating_actions_per_rolling_24h
+                    .unwrap_or(mandate.authority.max_mutating_actions_per_rolling_24h),
+                min_seconds_between_mutations: args
+                    .min_seconds_between_mutations
+                    .unwrap_or(mandate.authority.min_seconds_between_mutations),
+            };
+        }
+        if let Some(values) = args.constraints.as_deref() {
+            mandate.constraints = clean_strings(Some(values));
+        }
+        if let Some(values) = args.success_criteria.as_deref() {
+            mandate.success_criteria = clean_strings(Some(values));
+        }
+        if let Some(values) = args.stop_conditions.as_deref() {
+            mandate.stop_conditions = clean_strings(Some(values));
+        }
+        validate_policy_text(
+            &mandate.constraints,
+            &mandate.success_criteria,
+            &mandate.stop_conditions,
+        )?;
+        mandate.min_review_secs = minutes_to_secs(
+            args.min_review_minutes,
+            mandate.min_review_secs,
+            "min_review_minutes",
+        )?;
+        mandate.max_review_secs = minutes_to_secs(
+            args.max_review_minutes,
+            mandate.max_review_secs,
+            "max_review_minutes",
+        )?;
+        mandate.default_review_secs = minutes_to_secs(
+            args.default_review_minutes,
+            mandate.default_review_secs,
+            "default_review_minutes",
+        )?;
+        anyhow::ensure!(
+            mandate.min_review_secs <= mandate.default_review_secs
+                && mandate.default_review_secs <= mandate.max_review_secs,
+            "review bounds must satisfy min <= default <= max"
+        );
+        if let Some(expires_at) = args.expires_at.as_ref() {
+            let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+                .map_err(|_| anyhow::anyhow!("expires_at must be an RFC3339 timestamp"))?;
+            anyhow::ensure!(
+                parsed > chrono::Utc::now(),
+                "expires_at must be in the future"
+            );
+            mandate.expires_at = Some(expires_at.clone());
+        }
+        mandate.authority.validate().map_err(anyhow::Error::msg)?;
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.approval_tx
+            .send(ApprovalRequest {
+                command: format!("Update delegated mandate: {}", mandate.objective),
+                session_id: owner.to_string(),
+                risk_level: RiskLevel::High,
+                warnings: vec![
+                    format!(
+                        "New observation/action tools: {}",
+                        display_allowlist(&mandate.authority.allowed_tools)
+                    ),
+                    format!(
+                        "New effects: {}",
+                        display_allowlist(&mandate.authority.allowed_mutation_effects)
+                    ),
+                    format!(
+                        "New targets: {}",
+                        display_target_scope(&mandate.authority.allowed_target_prefixes)
+                    ),
+                    format!(
+                        "New mutation limit: {} per cycle",
+                        mandate.authority.max_mutating_actions_per_cycle
+                    ),
+                    format!(
+                        "New rolling mutation limit: {} per 24 hours; minimum spacing: {} seconds",
+                        mandate.authority.max_mutating_actions_per_rolling_24h,
+                        mandate.authority.min_seconds_between_mutations
+                    ),
+                ],
+                permission_mode: PermissionMode::Cautious,
+                response_tx,
+                kind: ApprovalKind::GoalConfirmation,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("mandate update confirmation unavailable: {error}"))?;
+        match response_rx.await {
+            Ok(
+                ApprovalResponse::AllowOnce
+                | ApprovalResponse::AllowSession
+                | ApprovalResponse::AllowAlways,
+            ) => {}
+            Ok(ApprovalResponse::Deny) => {
+                return Ok(
+                    "Mandate update cancelled; the existing envelope is unchanged.".to_string(),
+                )
+            }
+            Err(_) => anyhow::bail!("mandate update confirmation became unavailable"),
+        }
+        mandate.version += 1;
+        mandate.updated_at = chrono::Utc::now().to_rfc3339();
+        self.state.update_mandate(&mandate).await?;
+        Ok(format!(
+            "Updated mandate {} to policy version {}. In-flight decisions on older versions are revoked.",
+            mandate.id, mandate.version
+        ))
+    }
+
+    async fn record_decision(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_internal(args) {
+            return Ok(
+                "record_decision is reserved for the internal mandate deliberator.".to_string(),
+            );
+        }
+        let goal_id = required_trimmed(args._goal_id.as_deref(), "internal _goal_id")?;
+        let pinned_run_id =
+            required_trimmed(args._goal_run_id.as_deref(), "internal _goal_run_id")?;
+        let pinned_attempt_id = required_trimmed(
+            args._task_attempt_id.as_deref(),
+            "internal _task_attempt_id",
+        )?;
+        let mandate = self
+            .state
+            .get_mandate_for_goal(goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current goal is not a mandate controller"))?;
+        anyhow::ensure!(mandate.is_active(), "mandate is not active");
+        let run = self
+            .state
+            .get_goal_runs(goal_id)
+            .await?
+            .into_iter()
+            .find(|run| run.id == pinned_run_id)
+            .ok_or_else(|| anyhow::anyhow!("pinned mandate decision run does not exist"))?;
+        anyhow::ensure!(
+            run.trigger_type == "mandate" && run.status == "running",
+            "pinned mandate decision run is no longer executable"
+        );
+        let current_run = self
+            .state
+            .get_current_goal_run(goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mandate has no active decision run"))?;
+        anyhow::ensure!(
+            current_run.id == pinned_run_id,
+            "pinned mandate decision run is no longer current"
+        );
+        anyhow::ensure!(
+            self.state
+                .get_mandate_decision_for_run(&run.id)
+                .await?
+                .is_none(),
+            "this mandate run already has a decision"
+        );
+        let outcome_raw =
+            required_trimmed(args.outcome.as_deref(), "outcome")?.to_ascii_lowercase();
+        let outcome = MandateDecisionOutcome::parse(&outcome_raw)
+            .ok_or_else(|| anyhow::anyhow!("outcome must be act, wait, ask, or stop"))?;
+        anyhow::ensure!(
+            outcome != MandateDecisionOutcome::Act
+                || mandate.authority.max_mutating_actions_per_cycle > 0,
+            "ACT requires a positive governed mutation budget; choose WAIT, ASK, or STOP for an observation-only cycle"
+        );
+        if outcome == MandateDecisionOutcome::Act {
+            let quota = self
+                .state
+                .get_mandate_mutation_quota_state(&mandate.id, &chrono::Utc::now().to_rfc3339())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("mandate mutation quota state is missing"))?;
+            if !quota.available_now {
+                let earliest = quota
+                    .earliest_next_slot_at
+                    .as_deref()
+                    .unwrap_or("unavailable");
+                anyhow::bail!(
+                    "mandate_mutation_quota_unavailable: choose WAIT; earliest_next_slot_at={earliest}"
+                );
+            }
+        }
+        let rationale =
+            required_bounded_trimmed(args.rationale.as_deref(), "rationale", MAX_RATIONALE_TEXT)?;
+        let mut decision =
+            MandateDecisionCycle::new(&mandate.id, &run.id, outcome, rationale, mandate.version);
+        let observations = clean_strings(args.observations.as_deref());
+        validate_bounded_strings(
+            &observations,
+            "observations",
+            MAX_OBSERVATIONS,
+            MAX_OBSERVATION_TEXT,
+            MAX_OBSERVATIONS_JSON,
+        )?;
+        if !observations.is_empty() {
+            decision.belief_snapshot = Some(serde_json::to_string(&observations)?);
+        }
+        decision.question = args
+            .question
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(question) = decision.question.as_deref() {
+            validate_bounded_text(question, "question", MAX_QUESTION_TEXT)?;
+        }
+        if outcome == MandateDecisionOutcome::Ask {
+            anyhow::ensure!(
+                decision.question.is_some(),
+                "question is required when outcome is ask"
+            );
+        }
+        let review_secs = mandate.clamp_review_secs(
+            args.reconsider_minutes
+                .map(|minutes| minutes.saturating_mul(60)),
+        );
+        if outcome != MandateDecisionOutcome::Stop {
+            decision.reconsider_at =
+                Some((chrono::Utc::now() + chrono::Duration::seconds(review_secs)).to_rfc3339());
+        }
+        let intention = if outcome == MandateDecisionOutcome::Act {
+            let description = required_bounded_trimmed(
+                args.intention.as_deref(),
+                "intention",
+                MAX_INTENTION_TEXT,
+            )?;
+            let mut intention =
+                Intention::new(&mandate.id, &decision.id, &run.id, description, rationale);
+            intention.expected_benefit = bounded_optional_text(
+                args.expected_benefit.as_deref(),
+                "expected_benefit",
+                MAX_INTENTION_METADATA_TEXT,
+            )?;
+            intention.risk =
+                bounded_optional_text(args.risk.as_deref(), "risk", MAX_INTENTION_METADATA_TEXT)?;
+            intention.invalidation_criteria = bounded_optional_text(
+                args.invalidation_criteria.as_deref(),
+                "invalidation_criteria",
+                MAX_INTENTION_METADATA_TEXT,
+            )?;
+            let metadata = [
+                intention.expected_benefit.as_deref(),
+                intention.risk.as_deref(),
+                intention.invalidation_criteria.as_deref(),
+            ];
+            anyhow::ensure!(
+                metadata
+                    .iter()
+                    .flatten()
+                    .map(|value| value.chars().count())
+                    .sum::<usize>()
+                    <= MAX_INTENTION_METADATA_TEXT
+                    && metadata
+                        .iter()
+                        .flatten()
+                        .map(|value| value.len())
+                        .sum::<usize>()
+                        <= MAX_INTENTION_METADATA_TEXT,
+                "intention metadata exceeds its combined 4 KiB bound"
+            );
+            Some(intention)
+        } else {
+            None
+        };
+        self.state
+            .record_mandate_decision(&decision, intention.as_ref(), Some(pinned_attempt_id))
+            .await?;
+        Ok(match outcome {
+            MandateDecisionOutcome::Act => {
+                format!(
+                "ACT committed for mandate {}. Create only tasks necessary for this intention: {}",
+                mandate.id,
+                intention.as_ref().map(|value| value.description.as_str()).unwrap_or("")
+            )
+            }
+            MandateDecisionOutcome::Wait => format!(
+                "WAIT recorded. No action tasks should be created; review again at {}.",
+                decision
+                    .reconsider_at
+                    .as_deref()
+                    .unwrap_or("the bounded default")
+            ),
+            MandateDecisionOutcome::Ask => format!(
+                "ASK recorded. The mandate is awaiting owner input: {}",
+                decision.question.as_deref().unwrap_or("")
+            ),
+            MandateDecisionOutcome::Stop => {
+                "STOP recorded. The mandate has been completed; create no tasks.".to_string()
+            }
+        })
+    }
+
+    async fn list_intentions(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandate intentions can only be inspected by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let owner = Self::owner_session(args)?;
+        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
+        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let intentions = self
+            .state
+            .list_intentions(&mandate.id, args.limit.unwrap_or(20).clamp(1, 100))
+            .await?;
+        Ok(serde_json::to_string_pretty(&intentions)?)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ManageMandatesArgs {
+    action: String,
+    mandate_id: Option<String>,
+    objective: Option<String>,
+    source_goal_id: Option<String>,
+    allow_observations: Option<bool>,
+    allowed_tools: Option<Vec<String>>,
+    allowed_mutation_effects: Option<Vec<String>>,
+    allowed_target_prefixes: Option<Vec<String>>,
+    max_mutating_actions_per_cycle: Option<u32>,
+    max_mutating_actions_per_rolling_24h: Option<u32>,
+    min_seconds_between_mutations: Option<u32>,
+    constraints: Option<Vec<String>>,
+    success_criteria: Option<Vec<String>>,
+    stop_conditions: Option<Vec<String>>,
+    min_review_minutes: Option<i64>,
+    max_review_minutes: Option<i64>,
+    default_review_minutes: Option<i64>,
+    expires_at: Option<String>,
+    priority: Option<String>,
+    budget_per_cycle: Option<i64>,
+    budget_daily: Option<i64>,
+    include_terminal: Option<bool>,
+    limit: Option<i64>,
+    outcome: Option<String>,
+    rationale: Option<String>,
+    observations: Option<Vec<String>>,
+    question: Option<String>,
+    reconsider_minutes: Option<i64>,
+    intention: Option<String>,
+    expected_benefit: Option<String>,
+    risk: Option<String>,
+    invalidation_criteria: Option<String>,
+    guidance: Option<String>,
+    #[serde(default)]
+    _session_id: Option<String>,
+    #[serde(default)]
+    _user_role: Option<String>,
+    #[serde(default)]
+    _channel_visibility: Option<String>,
+    #[serde(default)]
+    _goal_id: Option<String>,
+    #[serde(default)]
+    _goal_run_id: Option<String>,
+    #[serde(default)]
+    _task_attempt_id: Option<String>,
+}
+
+#[async_trait]
+impl Tool for ManageMandatesTool {
+    fn name(&self) -> &str {
+        "manage_mandates"
+    }
+
+    fn description(&self) -> &str {
+        "Create/administer owner-confirmed bounded mandates or record internal ACT/WAIT/ASK/STOP. v1 delegates exact http_request/web_fetch only: no wildcards, MCP, local/private-state, or configuration tools. Every observation or mutation needs a typed target; authenticated HTTP needs exact URL, auth_profile:<name>, and account:<stable-id> scopes. Mutations require positive cycle/rolling caps (rolling >= cycle) and at least 900s cooldown. source_goal_id, priority, and token budgets are create-only; defaults are high, 400000/cycle, and 1000000/day, with daily >= cycle. expires_at is RFC3339. ASK guidance cannot widen authority."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "manage_mandates",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["create", "list", "get", "update", "pause", "resume", "cancel", "record_decision", "list_intentions"] },
+                    "mandate_id": { "type": "string", "maxLength": 256 },
+                    "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT },
+                    "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "allow_observations": { "type": "boolean" },
+                    "allowed_tools": { "type": "array", "maxItems": 64, "items": { "type": "string", "enum": ["http_request", "web_fetch"] } },
+                    "allowed_mutation_effects": { "type": "array", "maxItems": MandateAuthority::EFFECT_NAMES.len(), "items": { "type": "string", "enum": MandateAuthority::EFFECT_NAMES } },
+                    "allowed_target_prefixes": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2048 } },
+                    "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 },
+                    "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 },
+                    "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
+                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "min_review_minutes": { "type": "integer", "minimum": 1 },
+                    "max_review_minutes": { "type": "integer", "minimum": 1 },
+                    "default_review_minutes": { "type": "integer", "minimum": 1 },
+                    "expires_at": { "type": "string" },
+                    "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "budget_per_cycle": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "budget_daily": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "include_terminal": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] },
+                    "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
+                    "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } },
+                    "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
+                    "reconsider_minutes": { "type": "integer", "minimum": 1 },
+                    "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT },
+                    "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
+                    "risk": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
+                    "invalidation_criteria": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
+                    "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: ManageMandatesArgs = serde_json::from_str(arguments)?;
+        match args.action.as_str() {
+            "create" => self.create(&args).await,
+            "list" => self.list(&args).await,
+            "get" => self.get(&args).await,
+            "update" => self.update(&args).await,
+            "pause" | "resume" | "cancel" => self.transition(&args, &args.action).await,
+            "record_decision" => self.record_decision(&args).await,
+            "list_intentions" => self.list_intentions(&args).await,
+            other => anyhow::bail!("unknown manage_mandates action `{other}`"),
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Management
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        match action.as_deref() {
+            Some("list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
+            Some("record_decision") => ToolCallSemantics::administrative(),
+            _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+}
+
+fn required_trimmed<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
+}
+
+fn required_bounded_trimmed<'a>(
+    value: Option<&'a str>,
+    name: &str,
+    max_text: usize,
+) -> anyhow::Result<&'a str> {
+    let value = required_trimmed(value, name)?;
+    validate_bounded_text(value, name, max_text)?;
+    Ok(value)
+}
+
+fn validate_bounded_text(value: &str, name: &str, max_text: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.chars().count() <= max_text && value.len() <= max_text,
+        "{name} exceeds its {max_text}-character/byte bound"
+    );
+    Ok(())
+}
+
+fn bounded_optional_text(
+    value: Option<&str>,
+    name: &str,
+    max_text: usize,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    validate_bounded_text(value, name, max_text)?;
+    Ok(Some(value.to_string()))
+}
+
+fn clean_strings(values: Option<&[String]>) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_bounded_strings(
+    values: &[String],
+    name: &str,
+    max_entries: usize,
+    max_entry_text: usize,
+    max_serialized_bytes: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.len() <= max_entries,
+        "{name} cannot contain more than {max_entries} entries"
+    );
+    for value in values {
+        validate_bounded_text(value, &format!("one {name} entry"), max_entry_text)?;
+    }
+    anyhow::ensure!(
+        serde_json::to_vec(values)?.len() <= max_serialized_bytes,
+        "{name} exceed their serialized {max_serialized_bytes}-byte bound"
+    );
+    Ok(())
+}
+
+fn validate_policy_text(
+    constraints: &[String],
+    success_criteria: &[String],
+    stop_conditions: &[String],
+) -> anyhow::Result<()> {
+    for (name, values) in [
+        ("constraints", constraints),
+        ("success_criteria", success_criteria),
+        ("stop_conditions", stop_conditions),
+    ] {
+        validate_bounded_strings(
+            values,
+            name,
+            MAX_POLICY_ENTRIES,
+            MAX_POLICY_ENTRY_TEXT,
+            MAX_POLICY_TEXT,
+        )?;
+    }
+    let values = constraints
+        .iter()
+        .chain(success_criteria)
+        .chain(stop_conditions);
+    let chars = values
+        .clone()
+        .map(|value| value.chars().count())
+        .sum::<usize>();
+    let bytes = values.map(String::len).sum::<usize>();
+    anyhow::ensure!(
+        chars <= MAX_POLICY_TEXT && bytes <= MAX_POLICY_TEXT,
+        "constraints, success_criteria, and stop_conditions exceed their combined 8 KiB bound"
+    );
+    Ok(())
+}
+
+fn minutes_to_secs(value: Option<i64>, default_secs: i64, field: &str) -> anyhow::Result<i64> {
+    let Some(minutes) = value else {
+        return Ok(default_secs);
+    };
+    anyhow::ensure!(minutes > 0, "{field} must be greater than zero");
+    minutes
+        .checked_mul(60)
+        .ok_or_else(|| anyhow::anyhow!("{field} is too large"))
+}
+
+fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Result<String> {
+    validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
+    let mut context = existing
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let entries = context
+        .as_object_mut()
+        .expect("context was normalized to an object")
+        .entry("owner_guidance")
+        .or_insert_with(|| json!([]));
+    if !entries.is_array() {
+        *entries = json!([]);
+    }
+    let entries = entries
+        .as_array_mut()
+        .expect("owner_guidance was normalized to an array");
+    entries.push(json!({
+        "guidance": guidance,
+        "recorded_at": chrono::Utc::now().to_rfc3339(),
+    }));
+    let mut newest_first = Vec::new();
+    let mut total_chars = 0usize;
+    let mut total_bytes = 0usize;
+    for entry in entries.iter().rev() {
+        if newest_first.len() == MAX_GUIDANCE_ENTRIES {
+            break;
+        }
+        let Some(text) = entry
+            .get("guidance")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let chars = text.chars().count();
+        let bytes = text.len();
+        if chars > MAX_GUIDANCE_ENTRY_TEXT
+            || bytes > MAX_GUIDANCE_ENTRY_TEXT
+            || total_chars.saturating_add(chars) > MAX_GUIDANCE_TEXT
+            || total_bytes.saturating_add(bytes) > MAX_GUIDANCE_TEXT
+        {
+            continue;
+        }
+        total_chars += chars;
+        total_bytes += bytes;
+        newest_first.push(entry.clone());
+    }
+    newest_first.reverse();
+    *entries = newest_first;
+    Ok(serde_json::to_string(&context)?)
+}
+
+fn display_allowlist(values: &[String]) -> String {
+    if values.is_empty() {
+        "none (controller protocol only)".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn display_target_scope(values: &[String]) -> String {
+    if values.is_empty() {
+        "none configured (mutation authority requires explicit targets)".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{setup_test_agent, MockProvider};
+    use crate::traits::store_prelude::*;
+
+    #[test]
+    fn clean_strings_removes_empty_constraints() {
+        let values = vec!["  truthful ".to_string(), " ".to_string()];
+        assert_eq!(clean_strings(Some(&values)), vec!["truthful"]);
+    }
+
+    #[test]
+    fn review_minutes_are_checked() {
+        assert_eq!(minutes_to_secs(Some(15), 1, "review").unwrap(), 900);
+        assert!(minutes_to_secs(Some(0), 1, "review").is_err());
+    }
+
+    #[test]
+    fn owner_guidance_is_bounded_durable_context() {
+        let context =
+            append_owner_guidance(Some(r#"{"mandate_id":"m-1"}"#), "Prefer replies").unwrap();
+        let value: Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(value["mandate_id"], "m-1");
+        assert_eq!(value["owner_guidance"][0]["guidance"], "Prefer replies");
+    }
+
+    #[test]
+    fn mandate_text_bounds_are_byte_authoritative() {
+        assert!(validate_bounded_text(&"é".repeat(1_025), "objective", 2_048).is_err());
+        assert!(validate_bounded_text(&"x".repeat(2_048), "objective", 2_048).is_ok());
+
+        let constraints = vec!["x".repeat(500); 16];
+        let success = vec!["y".repeat(500)];
+        assert!(validate_policy_text(&constraints, &success, &[]).is_err());
+        assert!(validate_policy_text(&vec!["x".to_string(); 17], &[], &[]).is_err());
+    }
+
+    #[test]
+    fn owner_guidance_write_path_keeps_only_whole_bounded_entries() {
+        let mut context = None;
+        for index in 0..12 {
+            let guidance = format!("{index:02}{}", "x".repeat(1_022));
+            context = Some(append_owner_guidance(context.as_deref(), &guidance).unwrap());
+        }
+        let value: Value = serde_json::from_str(context.as_deref().unwrap()).unwrap();
+        let entries = value["owner_guidance"].as_array().unwrap();
+        assert_eq!(entries.len(), 8);
+        let total = entries
+            .iter()
+            .filter_map(|entry| entry["guidance"].as_str())
+            .map(str::len)
+            .sum::<usize>();
+        assert!(total <= MAX_GUIDANCE_TEXT);
+        assert!(entries[0]["guidance"].as_str().unwrap().starts_with("04"));
+        assert!(entries[7]["guidance"].as_str().unwrap().starts_with("11"));
+    }
+
+    #[tokio::test]
+    async fn owner_confirmation_activates_one_unscheduled_controller_atomically() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let call = tokio::spawn(async move {
+            tool.call(
+                r#"{
+                    "action":"create",
+                    "objective":"Steward @aidaemon_ai thoughtfully",
+                    "allowed_tools":["http_request"],
+                    "allowed_mutation_effects":["remote_mutation","external_delivery"],
+                    "allowed_target_prefixes":["https://api.x.com/2/","auth_profile:twitter","account:12345"],
+                    "max_mutating_actions_per_cycle":1,
+                    "max_mutating_actions_per_rolling_24h":8,
+                    "min_seconds_between_mutations":900,
+                    "constraints":["No fabrication"],
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+        });
+
+        let request = approval_rx.recv().await.expect("confirmation request");
+        assert!(matches!(request.kind, ApprovalKind::GoalConfirmation));
+        assert!(request.command.contains("Steward @aidaemon_ai"));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("http_request")));
+        assert!(request.warnings.iter().any(|warning| {
+            warning
+                == "Resolved token budgets: 400000 tokens per decision cycle; 1000000 tokens per UTC day"
+        }));
+        request
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .unwrap();
+        let result = call.await.unwrap().unwrap();
+        assert!(result.contains("Activated mandate"));
+
+        let mandates = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap();
+        assert_eq!(mandates.len(), 1);
+        assert_eq!(mandates[0].status, "active");
+        let controller = state.get_goal(&mandates[0].goal_id).await.unwrap().unwrap();
+        assert_eq!(controller.status, "active");
+        assert_eq!(controller.domain, "orchestration");
+        assert_eq!(controller.goal_type, "continuous");
+        assert_eq!(controller.budget_per_check, Some(400_000));
+        assert_eq!(controller.budget_daily, Some(1_000_000));
+        assert!(state
+            .get_schedules_for_goal(&controller.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_rejects_and_documents_create_only_fields() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+
+        let schema = tool.schema();
+        for field in [
+            "source_goal_id",
+            "priority",
+            "budget_per_cycle",
+            "budget_daily",
+        ] {
+            let description = schema["parameters"]["properties"][field]["description"]
+                .as_str()
+                .expect("create-only field description");
+            assert!(description.contains("Create only in v1"), "{field}");
+            let description = description.to_ascii_lowercase();
+            assert!(description.contains("update"), "{field}");
+            assert!(description.contains("reject"), "{field}");
+        }
+
+        let error = tool
+            .call(
+                r#"{
+                    "action":"update",
+                    "mandate_id":"not-consulted",
+                    "source_goal_id":"source-goal",
+                    "priority":"critical",
+                    "budget_per_cycle":12345,
+                    "budget_daily":67890,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("create-only fields in v1"));
+        for field in [
+            "source_goal_id",
+            "priority",
+            "budget_per_cycle",
+            "budget_daily",
+        ] {
+            assert!(message.contains(field), "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_confirmation_cancels_instead_of_leaving_resumable_authority() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
+        drop(approval_rx);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(
+                r#"{
+                    "action":"create",
+                    "objective":"Never activate without confirmation",
+                    "allowed_tools":[],
+                    "allowed_mutation_effects":[],
+                    "max_mutating_actions_per_cycle":0,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("pending mandate was cancelled"));
+        let mandates = state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap();
+        assert_eq!(mandates.len(), 1);
+        assert_eq!(mandates[0].status, "cancelled");
+        assert_eq!(
+            state
+                .get_goal(&mandates[0].goal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_requires_durable_confirmation_not_only_a_paused_status() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous_pending(
+            "Unconfirmed mandate controller",
+            "owner-session",
+            None,
+            None,
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Do not resume without confirmation",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.status = "paused".to_string();
+        mandate.confirmed_at = None;
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let error = tool
+            .call(&format!(
+                r#"{{"action":"resume","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unconfirmed mandate cannot be resumed"));
+    }
+
+    #[tokio::test]
+    async fn ask_resume_requires_and_persists_owner_guidance() {
+        use crate::traits::{
+            Goal, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
+            MandateRunFinalizationRequest, MandateRunFinalizationResult, Task,
+        };
+
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = Goal::new_continuous("Await owner judgment", "owner-session", None, None);
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Use owner judgment when quality is ambiguous",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        state
+            .claim_due_mandates(1, "test-heartbeat", 300)
+            .await
+            .unwrap();
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let run = state
+            .start_goal_run(&goal.id, "mandate", None, Some(&root_task_id))
+            .await
+            .unwrap();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        state
+            .create_task(&Task {
+                id: root_task_id.clone(),
+                goal_id: goal.id.clone(),
+                description: "Deliberate and record one ASK decision".to_string(),
+                status: "pending".to_string(),
+                priority: "high".to_string(),
+                task_order: 0,
+                parallel_group: None,
+                depends_on: None,
+                agent_id: None,
+                context: None,
+                result: None,
+                error: None,
+                blocker: None,
+                idempotent: false,
+                retry_count: 0,
+                max_retries: 0,
+                created_at,
+                started_at: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        let root_attempt = state
+            .claim_task_with_lease(
+                &root_task_id,
+                "ask-resume-task-lead",
+                Some("profile-task-lead"),
+                7_200,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ask = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Ask,
+            "Owner preference is material",
+            mandate.version,
+        );
+        ask.question = Some("Should replies be preferred?".to_string());
+        state
+            .record_mandate_decision(&ask, None, Some(&root_attempt.id))
+            .await
+            .unwrap();
+        assert!(state
+            .patch_task_from_attempt(
+                &root_attempt.id,
+                &root_attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("ASK decision durably recorded".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        assert!(matches!(
+            state
+                .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                    mandate_id: mandate.id.clone(),
+                    expected_mandate_version: mandate.version,
+                    goal_run_id: run.id.clone(),
+                    finalized_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+                .unwrap(),
+            MandateRunFinalizationResult::NonActionSatisfied {
+                outcome: MandateDecisionOutcome::Ask,
+                ..
+            }
+        ));
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let missing = tool
+            .call(&format!(
+                r#"{{"action":"resume","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await;
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("guidance is required"));
+
+        let resumed = tool
+            .call(&format!(
+                r#"{{"action":"resume","mandate_id":"{}","guidance":"Prefer thoughtful replies over original posts.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await
+            .unwrap();
+        assert!(resumed.contains("now active"));
+        let resumed_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(resumed_mandate.status, "active");
+        let resumed_review_at =
+            chrono::DateTime::parse_from_rfc3339(&resumed_mandate.next_review_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        assert!(resumed_review_at <= chrono::Utc::now() + chrono::Duration::seconds(2));
+        assert!(resumed_review_at >= chrono::Utc::now() - chrono::Duration::seconds(2));
+        let controller = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(controller.status, "active");
+        assert!(controller
+            .context
+            .as_deref()
+            .unwrap()
+            .contains("Prefer thoughtful replies"));
+    }
+
+    #[tokio::test]
+    async fn stale_internal_decision_cannot_rebind_to_a_newer_goal_run() {
+        use crate::traits::{Goal, Mandate, MandateAuthority};
+
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = Goal::new_continuous("Pinned decision cycle", "owner-session", None, None);
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Never move a stale decision onto a newer run",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        state
+            .claim_due_mandates(1, "pinned-run-test", 300)
+            .await
+            .unwrap();
+
+        let stale_run = state
+            .start_goal_run(&goal.id, "mandate", None, None)
+            .await
+            .unwrap();
+        state
+            .finish_goal_run(&stale_run.id, "failed", Some("superseded"))
+            .await
+            .unwrap();
+        let current_run = state
+            .start_goal_run(&goal.id, "mandate", None, None)
+            .await
+            .unwrap();
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let error = tool
+            .call(&format!(
+                r#"{{"action":"record_decision","outcome":"wait","rationale":"stale","_goal_id":"{}","_goal_run_id":"{}","_task_attempt_id":"stale-attempt","_session_id":"sub-task-lead","_channel_visibility":"internal"}}"#,
+                goal.id, stale_run.id
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer executable"));
+        assert!(state
+            .get_mandate_decision_for_run(&current_run.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

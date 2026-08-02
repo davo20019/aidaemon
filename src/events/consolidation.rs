@@ -112,6 +112,36 @@ impl Consolidator {
         &self,
         session_id: &str,
     ) -> anyhow::Result<ConsolidationResult> {
+        // Resolve isolation before deserializing any event payload. This also
+        // makes malformed legacy JSON fail closed: the provenance resolver
+        // classifies the session as isolated, and we can retire its rows by ID
+        // without asking EventStore to parse the unreadable payload.
+        let memory_isolated = super::is_memory_isolated_worker_session(session_id)
+            || super::session_has_mandate_execution_provenance(&self.pool, session_id).await?;
+        if memory_isolated {
+            let event_ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM events
+                 WHERE session_id = ? AND consolidated_at IS NULL",
+            )
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if event_ids.is_empty() {
+                return Ok(ConsolidationResult::empty());
+            }
+            self.event_store.mark_consolidated(&event_ids).await?;
+            info!(
+                session_id,
+                events = event_ids.len(),
+                "Marked memory-isolated worker events consolidated without learning"
+            );
+            return Ok(ConsolidationResult {
+                events_processed: event_ids.len(),
+                events_consolidated: event_ids.len(),
+                ..Default::default()
+            });
+        }
+
         // Get unconsolidated events
         let events = self.event_store.query_unconsolidated(session_id).await?;
 
@@ -1596,10 +1626,13 @@ fn failure_pattern_confidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderKind;
     use crate::events::{DiagnosticSeverity, Event, EventType, TaskStatus};
+    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::plans::PlanStore;
     use crate::state::SqliteStateStore;
+    use crate::testing::MockProvider;
     use crate::traits::StateStore;
     use serde_json::json;
     use std::sync::Arc;
@@ -1657,6 +1690,193 @@ mod tests {
             Consolidator::new(event_store.clone(), plan_store, state.pool(), None, None)
                 .with_state(state.clone() as Arc<dyn StateStore>);
         (state, event_store, consolidator, db_file)
+    }
+
+    async fn append_old_procedure_trace(
+        event_store: &EventStore,
+        session_id: &str,
+        task_id: &str,
+        execution_origin: Option<&str>,
+    ) {
+        let base = Utc::now() - Duration::days(9);
+        let mut user_data = json!({
+            "content": "Run the repeatable release workflow.",
+            "message_id": format!("message-{task_id}"),
+            "has_attachments": false,
+            "user_role": "owner"
+        });
+        if let Some(origin) = execution_origin {
+            user_data["execution_origin"] = json!(origin);
+        }
+
+        let events = vec![
+            (EventType::UserMessage, user_data),
+            (
+                EventType::TaskStart,
+                json!({
+                    "task_id": task_id,
+                    "description": format!("release workflow for {task_id}")
+                }),
+            ),
+            (
+                EventType::ToolCall,
+                json!({
+                    "tool_call_id": format!("call-1-{task_id}"),
+                    "name": "terminal",
+                    "arguments": {"command": "cargo test"},
+                    "summary": "run tests",
+                    "task_id": task_id
+                }),
+            ),
+            (
+                EventType::ToolCall,
+                json!({
+                    "tool_call_id": format!("call-2-{task_id}"),
+                    "name": "terminal",
+                    "arguments": {"command": "cargo build --release"},
+                    "summary": "build release",
+                    "task_id": task_id
+                }),
+            ),
+            (
+                EventType::TaskEnd,
+                serde_json::to_value(TaskEndData {
+                    task_id: task_id.to_string(),
+                    status: TaskStatus::Completed,
+                    outcome: Some(TaskOutcome::Succeeded),
+                    duration_secs: 30,
+                    iterations: 2,
+                    tool_calls_count: 2,
+                    error: None,
+                    summary: Some("release verified".to_string()),
+                    efficiency: None,
+                    turn_id: None,
+                    harness_eval: None,
+                })
+                .expect("serialize task end"),
+            ),
+        ];
+
+        for (offset, (event_type, data)) in events.into_iter().enumerate() {
+            let mut event = Event::new(session_id, event_type, data);
+            event.created_at = base + Duration::seconds(offset as i64);
+            event_store.append(event).await.expect("append old event");
+        }
+    }
+
+    #[tokio::test]
+    async fn pruner_marks_mandate_and_internal_sessions_without_learning() {
+        let db_file = tempfile::NamedTempFile::new().expect("temp db file");
+        let db_path = db_file.path().to_str().expect("db path");
+        let embedding_service = Arc::new(EmbeddingService::new().expect("embedding service"));
+        let state = Arc::new(
+            SqliteStateStore::new(db_path, 100, None, embedding_service)
+                .await
+                .expect("state store"),
+        );
+        let event_store = Arc::new(EventStore::new(state.pool()).await.expect("event store"));
+        let plan_store = Arc::new(PlanStore::new(state.pool()).await.expect("plan store"));
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{
+                    "name":"verified-release-workflow",
+                    "trigger_pattern":"when preparing a verified release",
+                    "steps":["run tests","build release"],
+                    "skip":false
+                }"#,
+            ),
+        ]));
+        let runtime = SharedLlmRuntime::new(
+            provider.clone(),
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock".to_string(),
+        );
+        let consolidator = Arc::new(
+            Consolidator::new(
+                event_store.clone(),
+                plan_store,
+                state.pool(),
+                Some(runtime),
+                None,
+            )
+            .with_state(state.clone() as Arc<dyn StateStore>),
+        );
+
+        // Deliberately use an owner-looking session ID for the mandate: the
+        // explicit event provenance, not a prefix or role, must isolate it.
+        append_old_procedure_trace(
+            &event_store,
+            "owner-looking-mandate-session",
+            "mandate-task",
+            Some("mandate"),
+        )
+        .await;
+        append_old_procedure_trace(
+            &event_store,
+            "specialist:executor:isolated",
+            "specialist-task",
+            None,
+        )
+        .await;
+        append_old_procedure_trace(
+            &event_store,
+            "ordinary-owner-session",
+            "ordinary-task",
+            None,
+        )
+        .await;
+        append_old_procedure_trace(
+            &event_store,
+            "malformed-origin-session",
+            "malformed-task",
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE events SET data = '{not-json'
+             WHERE session_id = 'malformed-origin-session'
+               AND event_type = 'user_message'",
+        )
+        .execute(&state.pool())
+        .await
+        .expect("corrupt legacy user-message payload");
+
+        let stats = Pruner::new(event_store.clone(), consolidator, 7)
+            .prune()
+            .await
+            .expect("prune consolidation pass");
+        assert_eq!(stats.consolidation_errors, 0);
+        assert_eq!(provider.call_count().await, 1);
+
+        let procedures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM procedures")
+            .fetch_one(&state.pool())
+            .await
+            .expect("count procedures");
+        assert_eq!(procedures, 1, "only the ordinary owner session may learn");
+
+        let learned_trigger: String =
+            sqlx::query_scalar("SELECT trigger_pattern FROM procedures LIMIT 1")
+                .fetch_one(&state.pool())
+                .await
+                .expect("ordinary procedure");
+        assert_eq!(learned_trigger, "when preparing a verified release");
+
+        for session_id in [
+            "owner-looking-mandate-session",
+            "specialist:executor:isolated",
+            "malformed-origin-session",
+            "ordinary-owner-session",
+        ] {
+            assert!(
+                event_store
+                    .query_unconsolidated(session_id)
+                    .await
+                    .expect("query unconsolidated")
+                    .is_empty(),
+                "{session_id} should not remain a perpetual prune candidate"
+            );
+        }
     }
 
     #[tokio::test]

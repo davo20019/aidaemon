@@ -16,10 +16,38 @@ use tracing::{error, info, warn};
 use crate::agent::{build_goal_task_results_summary, is_group_session, Agent};
 use crate::channels::ChannelHub;
 use crate::goal_tokens::GoalTokenRegistry;
-use crate::traits::{GoalSchedule, StateStore};
+use crate::traits::{GoalSchedule, Mandate, StateStore};
 use crate::types::{ChannelContext, UserRole};
 
 const TASK_ESCALATION_SETTLE_SECS: i64 = 8;
+const MANDATE_REVIEW_LEASE_SECS: i64 = 30 * 60;
+const MANDATE_REVIEW_BATCH_SIZE: i64 = 20;
+
+fn mandate_retry_at(mandate: &Mandate, requested_secs: Option<i64>) -> String {
+    let delay = mandate.clamp_review_secs(requested_secs);
+    (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+}
+
+fn mandate_review_task_description(mandate: &Mandate, goal_run_id: &str) -> String {
+    // Owner text and authority targets intentionally do not enter ordinary
+    // task prose. The isolated mandate system prompt loads the exact current
+    // policy from durable state and labels its JSON fields as policy or data.
+    format!(
+        "Run one bounded autonomous review for mandate {} version {} in goal run {}. \
+         Use only the isolated built-in mandate protocol and immutable policy supplied \
+         by the runtime.",
+        mandate.id, mandate.version, goal_run_id
+    )
+}
+
+fn mandate_review_task_context(mandate: &Mandate) -> String {
+    serde_json::json!({
+        "mandate_id": mandate.id,
+        "mandate_version": mandate.version,
+        "provenance": "runtime_mandate_fence_only",
+    })
+    .to_string()
+}
 
 fn is_scheduled_task_description(text: &str) -> bool {
     let trimmed = text.trim_start().to_ascii_lowercase();
@@ -670,7 +698,12 @@ impl HeartbeatCoordinator {
         self.block_pending_tasks_with_terminal_failed_dependencies()
             .await;
 
-        // Phase 2: Fire due schedules (recurring + one-shot)
+        // Phase 2a: Review due owner mandates. Mandates have their own durable
+        // wake clock and lease; they must never flow through goal_schedules or
+        // acquire scheduled-run provenance.
+        self.check_due_mandates().await;
+
+        // Phase 2b: Fire due schedules (recurring + one-shot)
         self.check_due_goal_schedules().await;
 
         // Phase 3: Detect stuck tasks
@@ -1008,6 +1041,34 @@ impl HeartbeatCoordinator {
                 continue;
             }
 
+            // Mandate controllers are not ordinary unscheduled goals. Generic
+            // orphan recovery may provide a fallback for the exact pending root
+            // of the current mandate run, but it must never promote a model-
+            // authored non-root action task into a task lead. Such tasks remain
+            // owned by mandate finalization/orphan reconciliation.
+            let mandate_controller = match self.state.get_mandate_for_goal(goal_id).await {
+                Ok(mandate) => mandate.is_some(),
+                Err(error) => {
+                    warn!(
+                        goal_id,
+                        %error,
+                        "Skipping orphan dispatch because mandate ownership could not be resolved"
+                    );
+                    continue;
+                }
+            };
+            let current_mandate_root_task_id = if mandate_controller {
+                self.state
+                    .get_current_goal_run(goal_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|run| run.trigger_type == "mandate" && run.status == "running")
+                    .and_then(|run| run.root_task_id)
+            } else {
+                None
+            };
+
             let schedules_for_goal = self.state.get_schedules_for_goal(goal_id).await.ok();
             let is_scheduled_goal = if let Some(ref schedules) = schedules_for_goal {
                 !schedules.is_empty()
@@ -1074,7 +1135,9 @@ impl HeartbeatCoordinator {
             };
             let mut eligible_tasks: Vec<&crate::traits::Task> = Vec::with_capacity(tasks.len());
             for task in tasks.iter().copied() {
-                let eligible = if !is_scheduled_goal {
+                let eligible = if mandate_controller {
+                    current_mandate_root_task_id.as_deref() == Some(task.id.as_str())
+                } else if !is_scheduled_goal {
                     true
                 } else if let Some(run_task_ids) = current_goal_run_task_ids.as_ref() {
                     // Durable run membership is authoritative and avoids
@@ -1095,6 +1158,13 @@ impl HeartbeatCoordinator {
                 };
                 if eligible {
                     eligible_tasks.push(task);
+                    continue;
+                }
+
+                if mandate_controller {
+                    // Non-root mandate tasks are intentionally invisible to
+                    // generic orphan recovery. Leave their state untouched for
+                    // the mandate finalizer/reconciler that owns this run.
                     continue;
                 }
 
@@ -1157,7 +1227,9 @@ impl HeartbeatCoordinator {
             // should not block dispatch forever.
             let stale_threshold_secs: i64 = 600; // 10 minutes
             let has_active_nonstale = all_tasks.iter().any(|t| {
-                let belongs_to_current_run = if !is_scheduled_goal {
+                let belongs_to_current_run = if mandate_controller {
+                    current_mandate_root_task_id.as_deref() == Some(t.id.as_str())
+                } else if !is_scheduled_goal {
                     true
                 } else if let Some(run_task_ids) = current_goal_run_task_ids.as_ref() {
                     run_task_ids.contains(&t.id)
@@ -1689,6 +1761,242 @@ impl HeartbeatCoordinator {
         }
     }
 
+    /// Claim and dispatch due mandate reviews from the mandate-owned wake clock.
+    ///
+    /// This path is deliberately independent from `goal_schedules`: a mandate
+    /// review gets `trigger_type = "mandate"`, no schedule id, and a distinct
+    /// root-task description. The mandate lease is the admission fence; the
+    /// task-attempt lease and per-goal run guard remain execution fences.
+    async fn check_due_mandates(&self) {
+        let lease_owner = format!("heartbeat-mandate-{}", uuid::Uuid::new_v4());
+        let due = match self
+            .state
+            .claim_due_mandates(
+                MANDATE_REVIEW_BATCH_SIZE,
+                &lease_owner,
+                MANDATE_REVIEW_LEASE_SECS,
+            )
+            .await
+        {
+            Ok(mandates) => mandates,
+            Err(error) => {
+                error!(%error, "Failed to claim due mandate reviews");
+                return;
+            }
+        };
+
+        if due.is_empty() {
+            return;
+        }
+
+        info!(count = due.len(), "Found due mandate reviews");
+        for mandate in due {
+            let mandate_id = mandate.id.clone();
+            let lease_token = mandate.review_lease_token.clone();
+            if let Err(error) = self.dispatch_due_mandate(mandate.clone()).await {
+                error!(
+                    mandate_id,
+                    goal_id = %mandate.goal_id,
+                    %error,
+                    "Failed to dispatch due mandate review"
+                );
+                if let Some(token) = lease_token.as_deref() {
+                    let retry_at = mandate_retry_at(&mandate, Some(mandate.min_review_secs));
+                    if let Err(release_error) = self
+                        .state
+                        .release_mandate_review_lease(&mandate.id, token, &retry_at)
+                        .await
+                    {
+                        warn!(
+                            mandate_id = %mandate.id,
+                            %release_error,
+                            "Failed to release mandate review lease after dispatch error"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn dispatch_due_mandate(&self, mandate: Mandate) -> anyhow::Result<()> {
+        let lease_token = mandate
+            .review_lease_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("claimed mandate did not carry a review lease token"))?;
+
+        let Some(goal) = self.state.get_goal(&mandate.goal_id).await? else {
+            let _ = self
+                .state
+                .transition_mandate_status(&mandate.id, "active", "paused")
+                .await;
+            let retry_at = mandate_retry_at(&mandate, None);
+            let _ = self
+                .state
+                .release_mandate_review_lease(&mandate.id, lease_token, &retry_at)
+                .await;
+            anyhow::bail!("mandate backing goal is missing");
+        };
+
+        if goal.domain != "orchestration"
+            || goal.goal_type != "continuous"
+            || goal.status != "active"
+        {
+            let _ = self
+                .state
+                .transition_mandate_status(&mandate.id, "active", "paused")
+                .await;
+            let retry_at = mandate_retry_at(&mandate, None);
+            let _ = self
+                .state
+                .release_mandate_review_lease(&mandate.id, lease_token, &retry_at)
+                .await;
+            let message = format!(
+                "Mandate paused because its backing controller goal is not active: {}",
+                crate::tools::sanitize::short_goal_label(&mandate.objective)
+            );
+            let entry = crate::traits::NotificationEntry::new(
+                &goal.id,
+                &goal.session_id,
+                "mandate_paused",
+                &message,
+            );
+            let _ = self.state.enqueue_notification(&entry).await;
+            return Ok(());
+        }
+
+        // The mandate lease prevents concurrent claims. The durable open-run
+        // check is the crash/lease-expiry backstop: never create a second review
+        // while an earlier mandate run still owns work for this controller.
+        if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
+            let retry_at = mandate_retry_at(&mandate, Some(mandate.min_review_secs));
+            let released = self
+                .state
+                .release_mandate_review_lease(&mandate.id, lease_token, &retry_at)
+                .await?;
+            info!(
+                mandate_id = %mandate.id,
+                goal_id = %goal.id,
+                run_id = %open_run.id,
+                trigger_type = %open_run.trigger_type,
+                lease_released = released,
+                "Deferred mandate review because the controller already has an open run"
+            );
+            return Ok(());
+        }
+
+        let budget_today = chrono::Utc::now().date_naive().to_string();
+        if daily_budget_exhausted(
+            goal.budget_daily,
+            goal.tokens_used_today,
+            &goal.tokens_used_day,
+            &budget_today,
+        ) || !daily_budget_has_run_capacity(
+            goal.budget_daily,
+            goal.budget_per_check,
+            goal.tokens_used_today,
+            &goal.tokens_used_day,
+            &budget_today,
+        ) {
+            let retry_at = mandate_retry_at(&mandate, None);
+            self.state
+                .release_mandate_review_lease(&mandate.id, lease_token, &retry_at)
+                .await?;
+            info!(
+                mandate_id = %mandate.id,
+                goal_id = %goal.id,
+                "Deferred mandate review because its daily goal budget cannot fund a full cycle"
+            );
+            return Ok(());
+        }
+
+        let goal_run_id = uuid::Uuid::new_v4().to_string();
+        let root_task_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::traits::Task {
+            id: root_task_id,
+            goal_id: goal.id.clone(),
+            description: mandate_review_task_description(&mandate, &goal_run_id),
+            status: "pending".to_string(),
+            priority: goal.priority.clone(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: Some(mandate_review_task_context(&mandate)),
+            result: None,
+            error: None,
+            blocker: None,
+            // A mandate can authorize external side effects. Never retry the
+            // entire deliberation root after an ambiguous outcome.
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        let goal_run = self
+            .state
+            .create_mandate_review_run(&mandate.id, lease_token, &goal_run_id, &task)
+            .await?;
+
+        info!(
+            mandate_id = %mandate.id,
+            goal_id = %goal.id,
+            run_id = %goal_run.id,
+            task_id = %task.id,
+            "Enqueued mandate review root task"
+        );
+
+        // Immediate dispatch avoids the orphan-recovery grace period. If the
+        // agent or worker slot is unavailable, the pending task remains durable
+        // and the ordinary orphan dispatcher may claim this same root later.
+        if let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) {
+            let worker = format!("heartbeat-dispatch-mandate-{}", uuid::Uuid::new_v4());
+            match self
+                .state
+                .claim_task_with_lease(&task.id, &worker, Some("profile-task-lead"), 180)
+                .await
+            {
+                Ok(Some(_)) => {
+                    if let Some(registry) = self.goal_token_registry.as_ref() {
+                        registry.register(&goal.id).await;
+                    }
+                    crate::agent::spawn_background_task_lead(
+                        agent,
+                        goal.clone(),
+                        task.description.clone(),
+                        goal.session_id.clone(),
+                        ChannelContext::internal(),
+                        UserRole::Owner,
+                        self.state.clone(),
+                        self.hub.clone(),
+                        self.goal_token_registry.clone(),
+                        Some(task.id.clone()),
+                        None,
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        mandate_id = %mandate.id,
+                        task_id = %task.id,
+                        "Mandate root remains pending because no task-lead slot was available"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        mandate_id = %mandate.id,
+                        task_id = %task.id,
+                        %error,
+                        "Failed to claim mandate root for immediate dispatch"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Check for due schedules across active orchestration goals and enqueue tasks.
     ///
     /// Scheduling is per-schedule (`goal_schedules`) rather than a goal column.
@@ -2218,7 +2526,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
-    use crate::traits::{Goal, Task, TaskActivity};
+    use crate::traits::{Goal, Mandate, MandateAuthority, Task, TaskActivity};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn synthetic_task(desc: &str, status: &str) -> Task {
@@ -2243,6 +2551,234 @@ mod tests {
             started_at: None,
             completed_at: None,
         }
+    }
+
+    fn due_mandate_controller(session_id: &str) -> (Goal, Mandate) {
+        let goal = Goal::new_continuous(
+            "Steward an account autonomously",
+            session_id,
+            Some(10_000),
+            Some(100_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Maintain a useful and authentic account presence",
+            session_id,
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        (goal, mandate)
+    }
+
+    #[tokio::test]
+    async fn due_mandate_creates_a_distinct_run_without_a_goal_schedule() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                Arc::new(EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.check_due_mandates().await;
+
+        let run = state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .expect("mandate review should create an open run");
+        assert_eq!(run.trigger_type, "mandate");
+        assert!(run.schedule_id.is_none());
+        let tasks = state.get_tasks_for_goal_run(&run.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(run.root_task_id.as_deref(), Some(tasks[0].id.as_str()));
+        assert!(tasks[0]
+            .description
+            .starts_with("Run one bounded autonomous review"));
+        assert!(tasks[0]
+            .description
+            .contains("isolated built-in mandate protocol"));
+        assert!(!tasks[0].description.contains(&mandate.objective));
+        assert!(!tasks[0].description.contains("allowed tools"));
+        assert!(!is_scheduled_task_description(&tasks[0].description));
+        let context: serde_json::Value =
+            serde_json::from_str(tasks[0].context.as_deref().expect("minimal fence context"))
+                .unwrap();
+        assert_eq!(context["mandate_id"], mandate.id);
+        assert_eq!(context["mandate_version"], mandate.version);
+        assert_eq!(context["provenance"], "runtime_mandate_fence_only");
+        assert_eq!(context.as_object().unwrap().len(), 3);
+        assert!(state
+            .get_schedules_for_goal(&goal.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .get_scheduled_run_state(&goal.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .get_mandate(&mandate.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_lease_token
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn open_mandate_run_prevents_a_duplicate_review_after_lease_release() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                Arc::new(EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.check_due_mandates().await;
+        let first_run = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        let claimed = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        let lease_token = claimed.review_lease_token.as_deref().unwrap();
+        assert!(state
+            .release_mandate_review_lease(
+                &mandate.id,
+                lease_token,
+                &(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+            )
+            .await
+            .unwrap());
+
+        coordinator.check_due_mandates().await;
+
+        let still_open = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+        assert_eq!(still_open.id, first_run.id);
+        assert_eq!(state.get_goal_runs(&goal.id).await.unwrap().len(), 1);
+        assert_eq!(
+            state
+                .get_tasks_for_goal_run(&first_run.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_orphan_dispatch_leaves_non_root_mandate_tasks_untouched() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                Arc::new(EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.check_due_mandates().await;
+        let run = state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .expect("mandate run");
+        let root_id = run.root_task_id.clone().expect("mandate root");
+        let mut root = state.get_task(&root_id).await.unwrap().expect("root task");
+        root.status = "running".to_string();
+        root.started_at = Some((chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339());
+        state.update_task(&root).await.unwrap();
+
+        let non_root = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Model-authored exact action task".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 1,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&non_root).await.unwrap();
+        assert!(state
+            .get_tasks_for_goal_run(&run.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.id == non_root.id));
+
+        coordinator.dispatch_pending_tasks().await;
+
+        let after = state
+            .get_task(&non_root.id)
+            .await
+            .unwrap()
+            .expect("non-root task remains");
+        assert_eq!(after.status, "pending");
+        assert!(after.agent_id.is_none());
+        assert!(after.started_at.is_none());
+        assert!(state
+            .get_current_task_attempt(&non_root.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            state
+                .get_pending_notifications(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "generic orphan recovery must not announce or claim mandate child work"
+        );
     }
 
     #[test]

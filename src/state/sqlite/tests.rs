@@ -2092,6 +2092,269 @@ async fn test_token_usage_since_filter() {
     assert_eq!(none.len(), 0);
 }
 
+async fn setup_mandate_token_budget_run(
+    store: &SqliteStateStore,
+    budget_per_cycle: i64,
+) -> (Goal, crate::traits::Mandate, crate::traits::GoalRun) {
+    let goal = Goal::new_continuous(
+        "Exercise one aggregate mandate token budget",
+        "owner-budget-session",
+        Some(budget_per_cycle),
+        Some(budget_per_cycle.saturating_mul(10)),
+    );
+    let mandate = crate::traits::Mandate::new(
+        &goal.id,
+        None,
+        "Bound every worker in this decision cycle",
+        &goal.session_id,
+        crate::traits::MandateAuthority::default(),
+        60,
+        3_600,
+        300,
+    );
+    store
+        .create_mandate_controller(&goal, &mandate)
+        .await
+        .unwrap();
+    let run = store
+        .start_goal_run(&goal.id, "mandate", None, None)
+        .await
+        .unwrap();
+    (goal, mandate, run)
+}
+
+#[tokio::test]
+async fn mandate_cycle_budget_aggregates_lead_and_executor_and_serializes_calls() {
+    let (store, _db) = setup_test_store().await;
+    let (_goal, mandate, run) = setup_mandate_token_budget_run(&store, 100).await;
+    assert_eq!(
+        store
+            .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)
+            .await
+            .unwrap(),
+        (100, 0)
+    );
+
+    let (lead_acquired, used, cap) = store
+        .try_acquire_mandate_run_token_lease(&run.id, &mandate.id, mandate.version, "lead-call", 60)
+        .await
+        .unwrap();
+    assert!(lead_acquired);
+    assert_eq!((used, cap), (0, 100));
+
+    // An executor cannot make a concurrent model call against the same
+    // apparent balance while the lead owns the durable call lease.
+    let (executor_acquired_early, used, cap) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "executor-call-early",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(!executor_acquired_early);
+    assert_eq!((used, cap), (0, 100));
+
+    assert!(
+        store
+            .mark_mandate_run_token_lease_dispatched(
+                &run.id,
+                &mandate.id,
+                mandate.version,
+                "lead-call",
+            )
+            .await
+            .unwrap()
+    );
+    let pessimistically_reserved: i64 = sqlx::query_scalar(
+        "SELECT tokens_used FROM mandate_run_token_budgets WHERE goal_run_id = ?",
+    )
+    .bind(&run.id)
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(pessimistically_reserved, 100);
+    assert_eq!(
+        store
+            .settle_mandate_run_token_lease(&run.id, "lead-call", 40)
+            .await
+            .unwrap(),
+        (40, 100)
+    );
+    let (executor_acquired, used, cap) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "executor-call",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(executor_acquired);
+    assert_eq!((used, cap), (40, 100));
+    assert!(store
+        .mark_mandate_run_token_lease_dispatched(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "executor-call",
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .settle_mandate_run_token_lease(&run.id, "executor-call", 60)
+            .await
+            .unwrap(),
+        (100, 100)
+    );
+
+    let (admitted_after_cap, used, cap) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "lead-after-cap",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(!admitted_after_cap);
+    assert_eq!((used, cap), (100, 100));
+}
+
+#[tokio::test]
+async fn mandate_cycle_budget_is_immutable_and_cannot_auto_extend() {
+    let (store, _db) = setup_test_store().await;
+    let (goal, mandate, run) = setup_mandate_token_budget_run(&store, 100).await;
+    store
+        .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)
+        .await
+        .unwrap();
+
+    // Simulate a generic runtime/task budget extension changing the controller
+    // goal. It must not rewrite the already-started decision cycle's cap.
+    store
+        .set_goal_budgets(&goal.id, Some(1_000), None)
+        .await
+        .unwrap();
+    let error = store
+        .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 1_000)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("immutable"));
+    let stored_cap: i64 = sqlx::query_scalar(
+        "SELECT budget_per_cycle FROM mandate_run_token_budgets WHERE goal_run_id = ?",
+    )
+    .bind(&run.id)
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_cap, 100);
+}
+
+#[tokio::test]
+async fn expired_unsettled_mandate_call_exhausts_cycle_fail_closed() {
+    let (store, _db) = setup_test_store().await;
+    let (_goal, mandate, run) = setup_mandate_token_budget_run(&store, 100).await;
+    store
+        .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)
+        .await
+        .unwrap();
+    let (acquired, _, _) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "crashed-provider-call",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(acquired);
+    assert!(store
+        .mark_mandate_run_token_lease_dispatched(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "crashed-provider-call",
+        )
+        .await
+        .unwrap());
+    sqlx::query(
+        "UPDATE mandate_run_token_budgets
+         SET call_lease_expires_at = datetime('now', '-1 second')
+         WHERE goal_run_id = ?",
+    )
+    .bind(&run.id)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let (retry_acquired, used, cap) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "unsafe-retry",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(!retry_acquired);
+    assert_eq!((used, cap), (100, 100));
+}
+
+#[tokio::test]
+async fn expired_undispatched_mandate_lease_recovers_without_charge() {
+    let (store, _db) = setup_test_store().await;
+    let (_goal, mandate, run) = setup_mandate_token_budget_run(&store, 100).await;
+    store
+        .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)
+        .await
+        .unwrap();
+    let (acquired, _, _) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "pre-dispatch-crash",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(acquired);
+    sqlx::query(
+        "UPDATE mandate_run_token_budgets
+         SET call_lease_expires_at = datetime('now', '-1 second')
+         WHERE goal_run_id = ?",
+    )
+    .bind(&run.id)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    let (recovered, used, cap) = store
+        .try_acquire_mandate_run_token_lease(
+            &run.id,
+            &mandate.id,
+            mandate.version,
+            "safe-retry",
+            60,
+        )
+        .await
+        .unwrap();
+    assert!(recovered);
+    assert_eq!((used, cap), (0, 100));
+    assert!(store
+        .release_mandate_run_token_lease(&run.id, "safe-retry")
+        .await
+        .unwrap());
+}
+
 // ==================== Dynamic Bot Tests ====================
 
 #[tokio::test]

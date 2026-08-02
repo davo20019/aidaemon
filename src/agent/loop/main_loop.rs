@@ -318,7 +318,9 @@ impl Agent {
                 }
                 TaskAssessmentMode::AutonomousRouting => crate::events::DecisionType::IntentGate,
             };
-            let planner_skip_reason = if matches!(
+            let planner_skip_reason = if self.mandate_execution.is_some() {
+                Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
+            } else if matches!(
                 assessment_mode,
                 TaskAssessmentMode::AutonomousRouting
             ) && (self.depth > 0 || self.role != AgentRole::Orchestrator)
@@ -1689,7 +1691,8 @@ impl Agent {
 
             // Guided-only re-planner. Autonomous models self-direct and never
             // spend an auxiliary model call evaluating their own step progress.
-            if self.trust_tier_for_model(&model)
+            if self.mandate_execution.is_none()
+                && self.trust_tier_for_model(&model)
                 == crate::agent::trust_tier::ModelTrustTier::Guided
             {
                 let tool_calls_this_round = learning_ctx

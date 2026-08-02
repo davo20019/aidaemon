@@ -50,6 +50,8 @@ pub struct HttpRequestTool {
     approval_tx: ApprovalBroker,
     session_approvals: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     oauth_gateway: Arc<RwLock<Option<crate::oauth::OAuthGateway>>>,
+    #[cfg(test)]
+    oauth_refresh_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HttpRequestTool {
@@ -62,6 +64,8 @@ impl HttpRequestTool {
             approval_tx,
             session_approvals: Arc::new(RwLock::new(HashMap::new())),
             oauth_gateway: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            oauth_refresh_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -158,7 +162,7 @@ impl HttpRequestTool {
             let mut strip_from_url = false;
 
             match normalized.as_str() {
-                "auth_profile" | "content_type" => {
+                "auth_profile" | "account_id" | "content_type" => {
                     strip_from_url = true;
                     if !map.contains_key(normalized.as_str()) {
                         map.insert(normalized.clone(), Value::String(value_owned.clone()));
@@ -241,6 +245,7 @@ impl HttpRequestTool {
             let is_reserved_tool_param = matches!(
                 normalized.as_str(),
                 "auth_profile"
+                    | "account_id"
                     | "content_type"
                     | "follow_redirects"
                     | "timeout_secs"
@@ -264,6 +269,7 @@ impl HttpRequestTool {
         let lowered_path = url.path().to_ascii_lowercase();
         for needle in [
             "auth_profile=",
+            "account_id=",
             "content_type=",
             "follow_redirects=",
             "timeout_secs=",
@@ -356,6 +362,72 @@ impl HttpRequestTool {
         blocked
     }
 
+    fn method_override_headers(headers: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+        let mut overrides: Vec<String> = headers
+            .into_iter()
+            .flat_map(|map| map.keys())
+            .filter(|name| {
+                matches!(
+                    Self::normalize_header_name(name).as_str(),
+                    "xhttpmethodoverride" | "xmethodoverride" | "xhttpmethod"
+                )
+            })
+            .cloned()
+            .collect();
+        overrides.sort();
+        overrides.dedup();
+        overrides
+    }
+
+    fn authority_override_headers(headers: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+        let mut overrides: Vec<String> = headers
+            .into_iter()
+            .flat_map(|map| map.keys())
+            .filter(|name| {
+                let trimmed = name.trim();
+                trimmed.eq_ignore_ascii_case("host") || trimmed.eq_ignore_ascii_case(":authority")
+            })
+            .cloned()
+            .collect();
+        overrides.sort();
+        overrides.dedup();
+        overrides
+    }
+
+    /// Stable opaque identity for a policy resource. Percent-encoding every
+    /// byte outside the narrow identifier alphabet prevents distinct profile
+    /// or account keys from collapsing onto one authority target. Credentials
+    /// are never included.
+    fn scoped_resource_id(kind: &str, identifier: &str) -> String {
+        let mut encoded = String::with_capacity(identifier.len());
+        for byte in identifier.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        format!("{kind}:{encoded}")
+    }
+
+    fn auth_profile_resource_id(profile_name: &str) -> String {
+        Self::scoped_resource_id("auth_profile", profile_name)
+    }
+
+    fn account_resource_id(account_id: &str) -> String {
+        Self::scoped_resource_id("account", account_id)
+    }
+
+    fn outcome_status_for_http(status: u16, mandate_execution: bool) -> ToolOutcomeStatus {
+        if ((200..300).contains(&status) && !(mandate_execution && status == 202))
+            || (!mandate_execution && (300..400).contains(&status))
+        {
+            ToolOutcomeStatus::Succeeded
+        } else {
+            ToolOutcomeStatus::CompletedWithNegativeResult
+        }
+    }
+
     fn same_origin(original: &reqwest::Url, candidate: &reqwest::Url) -> bool {
         original.scheme().eq_ignore_ascii_case(candidate.scheme())
             && original
@@ -371,6 +443,13 @@ impl HttpRequestTool {
             307 | 308 => (method.to_string(), has_body),
             _ => (method.to_string(), false),
         }
+    }
+
+    /// A mandate grant is bound to the URL present in the canonical tool
+    /// arguments. Following even an otherwise-safe redirect would execute a
+    /// request against a URL that the authority kernel never evaluated.
+    fn should_follow_redirects(requested: bool, mandate_execution: bool) -> bool {
+        requested && !mandate_execution
     }
 
     fn append_chunk_with_limit(
@@ -905,6 +984,10 @@ impl HttpRequestTool {
         &self,
         profile_name: &str,
     ) -> anyhow::Result<Option<String>> {
+        #[cfg(test)]
+        self.oauth_refresh_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let gateway = self.oauth_gateway.read().await.clone();
         let Some(gateway) = gateway else {
             return Ok(None);
@@ -914,6 +997,12 @@ impl HttpRequestTool {
         }
         let result = gateway.refresh_token(profile_name).await?;
         Ok(Some(result))
+    }
+
+    #[cfg(test)]
+    fn oauth_refresh_attempt_count(&self) -> usize {
+        self.oauth_refresh_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1091,13 +1180,21 @@ impl HttpRequestTool {
     /// Returns the formatted output string, the HTTP status code (if one was
     /// observed), and truncation info (if the response body was truncated).
     ///
-    /// `correction_preapproved` is a Rust-side control-plane flag — it must never be
-    /// derived from tool arguments or model output.  When true, the user-approval prompt
-    /// is bypassed after all safety checks (SSRF, secret detection, etc.) have passed.
+    /// All three booleans are Rust-side control-plane flags and must never be
+    /// derived from tool arguments or model output. `correction_preapproved`
+    /// and `mandate_preapproved` identify independent, exact-call authority
+    /// sources that can bypass the redundant approval prompt after safety
+    /// checks. Correction preapproval applies only outside mandate execution;
+    /// mandate preapproval applies only when `mandate_execution` is also true.
+    /// Mandate execution disables redirects and automatic OAuth replay so
+    /// execution cannot leave or repeat the exact action covered by the
+    /// action-bound mandate grant.
     async fn execute(
         &self,
         arguments: &str,
         correction_preapproved: bool,
+        mandate_preapproved: bool,
+        mandate_execution: bool,
     ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
@@ -1115,6 +1212,28 @@ impl HttpRequestTool {
             reqwest::Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
         let recovered_tool_params =
             Self::recover_embedded_tool_params_from_url(&mut args, &mut parsed_url)?;
+        if mandate_execution && !recovered_tool_params.is_empty() {
+            return Ok((
+                format!(
+                    "Request blocked: mandate execution cannot recover tool parameters embedded in the URL ({}); the executed target must exactly match the authorized arguments.",
+                    recovered_tool_params.join(", ")
+                ),
+                None,
+                None,
+            ));
+        }
+        if mandate_execution
+            && args["query_params"]
+                .as_object()
+                .is_some_and(|params| !params.is_empty())
+        {
+            return Ok((
+                "Request blocked: mandate execution cannot append `query_params`; include the exact query string in `url` so the authorized and executed targets are identical."
+                    .to_string(),
+                None,
+                None,
+            ));
+        }
         if let Some(qp) = args["query_params"].as_object() {
             for (k, v) in qp {
                 let val_owned = v
@@ -1126,9 +1245,26 @@ impl HttpRequestTool {
         }
         let url = parsed_url.to_string();
         let auth_profile_name = args["auth_profile"].as_str();
+        let account_id = args["account_id"].as_str();
         let body = args["body"].as_str();
         let content_type_param = args["content_type"].as_str();
-        let follow_redirects = args["follow_redirects"].as_bool().unwrap_or(true);
+        if mandate_execution
+            && matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+            && body.is_some_and(|value| !value.is_empty())
+        {
+            return Ok((
+                format!(
+                    "Request blocked: mandate execution does not allow a non-empty body on {}; observation methods must not carry an unscoped action payload.",
+                    method
+                ),
+                None,
+                None,
+            ));
+        }
+        let follow_redirects = Self::should_follow_redirects(
+            args["follow_redirects"].as_bool().unwrap_or(true),
+            mandate_execution,
+        );
         let timeout_secs = args["timeout_secs"]
             .as_u64()
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -1138,6 +1274,29 @@ impl HttpRequestTool {
             .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
             .min(ABSOLUTE_MAX_RESPONSE_BYTES);
         let custom_headers = args["headers"].as_object();
+        let method_override_headers = Self::method_override_headers(custom_headers);
+        let authority_override_headers = Self::authority_override_headers(custom_headers);
+
+        if mandate_execution && !method_override_headers.is_empty() {
+            return Ok((
+                format!(
+                    "Request blocked: HTTP method-override headers are not allowed during mandate execution ({}); the executed method must exactly match the authorized method.",
+                    method_override_headers.join(", ")
+                ),
+                None,
+                None,
+            ));
+        }
+        if mandate_execution && !authority_override_headers.is_empty() {
+            return Ok((
+                format!(
+                    "Request blocked: HTTP authority override headers are not allowed during mandate execution ({}); the executed authority must exactly match the authorized URL.",
+                    authority_override_headers.join(", ")
+                ),
+                None,
+                None,
+            ));
+        }
 
         // Step 1: HTTPS enforcement (with localhost exception for local dev/testing)
         let is_localhost = parsed_url
@@ -1211,6 +1370,48 @@ impl HttpRequestTool {
             None
         };
 
+        // An authenticated mandate request is authorized for both a profile
+        // alias and the stable remote account declared by that profile. The
+        // model supplies the expected account as an exact top-level argument;
+        // this adapter check prevents a mutable alias from silently selecting
+        // a different configured account after policy evaluation.
+        if mandate_execution && auth_profile_name.is_some() {
+            let Some(expected_account_id) =
+                account_id.filter(|value| !value.is_empty() && value.trim() == *value)
+            else {
+                return Ok((
+                    "Request blocked: authenticated mandate requests require a non-empty top-level `account_id` bound by the owner mandate."
+                        .to_string(),
+                    None,
+                    None,
+                ));
+            };
+            let Some(configured_account_id) = profile
+                .as_ref()
+                .and_then(|resolved| resolved.user_id.as_deref())
+                .filter(|value| !value.is_empty() && value.trim() == *value)
+            else {
+                return Ok((
+                    format!(
+                        "Request blocked: auth profile '{}' has no valid configured user_id, so its remote account cannot be proven for mandate execution.",
+                        auth_profile_name.unwrap_or_default()
+                    ),
+                    None,
+                    None,
+                ));
+            };
+            if expected_account_id != configured_account_id {
+                return Ok((
+                    format!(
+                        "Request blocked: account_id does not match the configured user_id for auth profile '{}'.",
+                        auth_profile_name.unwrap_or_default()
+                    ),
+                    None,
+                    None,
+                ));
+            }
+        }
+
         // Step 6: Auto-detect content type
         let content_type = content_type_param
             .map(|s| s.to_string())
@@ -1239,10 +1440,15 @@ impl HttpRequestTool {
         // Step 8: Classify risk and request approval.
         //
         // Approval is skipped when:
-        //   a) correction_preapproved=true (Rust-side gate, never from JSON args), OR
-        //   b) request is session-approved, OR
-        //   c) is_trusted_session (scheduled task context)
-        let risk = Self::classify_risk(&method, profile.is_some());
+        //   a) correction_preapproved && !mandate_execution, OR
+        //   b) mandate_execution && mandate_preapproved (Rust-side exact grant), OR
+        //   c) an ordinary (non-mandate) request is session-approved, OR
+        //   d) an ordinary request has trusted scheduled-task context.
+        let risk = if method_override_headers.is_empty() && authority_override_headers.is_empty() {
+            Self::classify_risk(&method, profile.is_some())
+        } else {
+            RiskLevel::High
+        };
         let session_id = args["_session_id"].as_str().unwrap_or("unknown");
         let is_trusted_session = args["_trusted_session"].as_bool().unwrap_or(false);
         let approval_key = Self::approval_scope_key(
@@ -1252,12 +1458,20 @@ impl HttpRequestTool {
             content_type.as_deref(),
         );
 
-        if !correction_preapproved
-            && Self::requires_runtime_approval(
-                risk,
-                self.is_session_approved(session_id, &approval_key).await,
-                is_trusted_session,
-            )
+        // Authority paths are deliberately disjoint. Once the common
+        // dispatcher marks a call as mandate execution, correction authority
+        // cannot stand in for the mandate's exact action grant.
+        let correction_grant_preapproved = correction_preapproved && !mandate_execution;
+        let mandate_grant_preapproved = mandate_execution && mandate_preapproved;
+        let session_approved = if mandate_execution {
+            false
+        } else {
+            self.is_session_approved(session_id, &approval_key).await
+        };
+        let trusted_for_approval = is_trusted_session && !mandate_execution;
+        if !correction_grant_preapproved
+            && !mandate_grant_preapproved
+            && Self::requires_runtime_approval(risk, session_approved, trusted_for_approval)
         {
             let mut desc = format!("{} {}", method, url);
             if let Some(name) = auth_profile_name {
@@ -1318,7 +1532,14 @@ impl HttpRequestTool {
             .await?;
 
         let mut oauth_retry_note: Option<String> = None;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if mandate_execution && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(profile_name) = auth_profile_name {
+                oauth_retry_note = Some(format!(
+                    "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. Automatic OAuth refresh and request replay are disabled during mandate execution; the original 401 is returned for a later bounded decision cycle.",
+                    profile_name
+                ));
+            }
+        } else if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(profile_name) = auth_profile_name {
                 let is_bearer_profile = profile.as_ref().is_some_and(|resolved| {
                     matches!(resolved.auth_type, crate::config::HttpAuthType::Bearer)
@@ -1573,7 +1794,7 @@ impl Tool for HttpRequestTool {
     fn schema(&self) -> Value {
         json!({
             "name": "http_request",
-            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Write operations require user approval.",
+            "description": "Make HTTP requests to external APIs with pre-configured auth profiles. Supports OAuth 1.0a, Bearer, Header, and Basic auth. HTTPS only; each profile's credentials are sent only to its bound domains. Pass only the real endpoint URL in `url`; keep `auth_profile`, `account_id`, `headers`, `body`, `content_type`, `query_params`, and other request options as top-level arguments, never inside the URL. Every authenticated mandate request requires account_id to exactly match the profile's configured user_id. Write operations require user approval.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1584,11 +1805,15 @@ impl Tool for HttpRequestTool {
                     },
                     "url": {
                         "type": "string",
-                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
+                        "description": "Full HTTPS endpoint URL only. Do NOT append tool arguments like auth_profile, account_id, headers, body, content_type, timeout_secs, follow_redirects, or max_response_bytes to this URL."
                     },
                     "auth_profile": {
                         "type": "string",
                         "description": "Top-level auth profile name (e.g. 'twitter', 'stripe'). Do not embed this in the URL."
+                    },
+                    "account_id": {
+                        "type": "string",
+                        "description": "Expected stable remote account ID. Required for every authenticated mandate request (read or write) and must exactly match the selected auth profile's configured user_id. Do not embed this in the URL."
                     },
                     "headers": {
                         "type": "object",
@@ -1626,7 +1851,7 @@ impl Tool for HttpRequestTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        self.execute(arguments, false)
+        self.execute(arguments, false, false, false)
             .await
             .map(|(output, _, _)| output)
     }
@@ -1637,17 +1862,13 @@ impl Tool for HttpRequestTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
-        let (output, http_status, truncation) = self.execute(arguments, false).await?;
+        let (output, http_status, truncation) =
+            self.execute(arguments, false, false, false).await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
-                outcome_status: http_status.map(|status| {
-                    if (200..400).contains(&status) {
-                        ToolOutcomeStatus::Succeeded
-                    } else {
-                        ToolOutcomeStatus::CompletedWithNegativeResult
-                    }
-                }),
+                outcome_status: http_status
+                    .map(|status| Self::outcome_status_for_http(status, false)),
                 http_status,
                 truncation,
                 ..Default::default()
@@ -1663,17 +1884,18 @@ impl Tool for HttpRequestTool {
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
         let (output, http_status, truncation) = self
-            .execute(arguments, exec_ctx.correction_preapproved)
+            .execute(
+                arguments,
+                exec_ctx.correction_preapproved,
+                exec_ctx.mandate_preapproved,
+                exec_ctx.mandate_execution,
+            )
             .await?;
         Ok(ToolCallOutcome {
             output,
             metadata: ToolCallMetadata {
                 outcome_status: http_status.map(|status| {
-                    if (200..400).contains(&status) {
-                        ToolOutcomeStatus::Succeeded
-                    } else {
-                        ToolOutcomeStatus::CompletedWithNegativeResult
-                    }
+                    Self::outcome_status_for_http(status, exec_ctx.mandate_execution)
                 }),
                 http_status,
                 truncation,
@@ -1705,18 +1927,68 @@ impl Tool for HttpRequestTool {
             .and_then(|value| value.get("url"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let auth_profile_name = args
+            .as_ref()
+            .and_then(|value| value.get("auth_profile"))
+            .and_then(|value| value.as_str());
+        let auth_profile_resource = auth_profile_name.map(Self::auth_profile_resource_id);
+        let account_resource = args
+            .as_ref()
+            .and_then(|value| value.get("account_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty() && value.trim() == *value)
+            .map(Self::account_resource_id);
+        let has_method_override = args
+            .as_ref()
+            .and_then(|value| value.get("headers"))
+            .and_then(|value| value.as_object())
+            .is_some_and(|headers| !Self::method_override_headers(Some(headers)).is_empty());
+        let has_authority_override = args
+            .as_ref()
+            .and_then(|value| value.get("headers"))
+            .and_then(|value| value.as_object())
+            .is_some_and(|headers| !Self::authority_override_headers(Some(headers)).is_empty());
+        let observation_method_with_body = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+            && args
+                .as_ref()
+                .and_then(|value| value.get("body"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|body| !body.is_empty());
+        let carries_external_body = args
+            .as_ref()
+            .and_then(|value| value.get("body"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|body| !body.is_empty());
+        let mutation_effects = if carries_external_body {
+            ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::EXTERNAL_DELIVERY)
+        } else {
+            ToolMutationEffects::REMOTE_MUTATION
+        };
 
-        match method.as_str() {
-            "GET" | "HEAD" | "OPTIONS" => ToolCallSemantics::observation()
-                .with_verification_mode(ToolVerificationMode::ResultContent)
-                .with_target_hint(ToolTargetHintKind::Url, url),
-            "POST" | "PUT" | "PATCH" | "DELETE" => {
-                ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
+        let mut semantics =
+            if has_method_override || has_authority_override || observation_method_with_body {
+                ToolCallSemantics::mutation_with(mutation_effects)
                     .with_target_hint(ToolTargetHintKind::Url, url)
-            }
-            _ => ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION)
-                .with_target_hint(ToolTargetHintKind::Url, url),
+            } else {
+                match method.as_str() {
+                    "GET" | "HEAD" | "OPTIONS" => ToolCallSemantics::observation()
+                        .with_verification_mode(ToolVerificationMode::ResultContent)
+                        .with_target_hint(ToolTargetHintKind::Url, url),
+                    "POST" | "PUT" | "PATCH" | "DELETE" => {
+                        ToolCallSemantics::mutation_with(mutation_effects)
+                            .with_target_hint(ToolTargetHintKind::Url, url)
+                    }
+                    _ => ToolCallSemantics::mutation_with(mutation_effects)
+                        .with_target_hint(ToolTargetHintKind::Url, url),
+                }
+            };
+        if let Some(resource_id) = auth_profile_resource {
+            semantics = semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id);
         }
+        if let Some(resource_id) = account_resource {
+            semantics = semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id);
+        }
+        semantics
     }
 }
 
@@ -1794,6 +2066,63 @@ mod tests {
             username: None,
             password: None,
         }
+    }
+
+    fn make_local_bearer_profile() -> HttpAuthProfile {
+        let mut profile = make_bearer_profile();
+        profile.allowed_domains = vec!["localhost".to_string()];
+        profile.user_id = Some("12345".to_string());
+        profile
+    }
+
+    async fn spawn_counting_status_server(
+        status_line: &str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let address = listener.local_addr().expect("test server address");
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+        let response =
+            format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let mut request = [0_u8; 8192];
+                if stream.read(&mut request).await.is_err() {
+                    continue;
+                }
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    continue;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        (
+            format!("http://localhost:{}/resource", address.port()),
+            request_count,
+            server,
+        )
+    }
+
+    async fn spawn_counting_unauthorized_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_counting_status_server("401 Unauthorized").await
     }
 
     fn make_header_profile() -> HttpAuthProfile {
@@ -1978,6 +2307,14 @@ mod tests {
     }
 
     #[test]
+    fn mandate_execution_never_follows_redirects() {
+        assert!(HttpRequestTool::should_follow_redirects(true, false));
+        assert!(!HttpRequestTool::should_follow_redirects(false, false));
+        assert!(!HttpRequestTool::should_follow_redirects(true, true));
+        assert!(!HttpRequestTool::should_follow_redirects(false, true));
+    }
+
+    #[test]
     fn test_append_chunk_with_limit_stops_at_configured_size() {
         let mut collected = Vec::new();
         let mut observed = 0;
@@ -2084,6 +2421,788 @@ mod tests {
         assert_eq!(
             diagnostic,
             "OAuth diagnostic: retried the request once".to_string()
+        );
+    }
+
+    #[test]
+    fn authenticated_call_semantics_bind_url_and_exact_profile_identity() {
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let semantics = tool.call_semantics(
+            r#"{"method":"POST","url":"https://api.x.com/2/tweets","auth_profile":"twitter-prod","account_id":"2244994945","body":"{\"text\":\"hello\"}"}"#,
+        );
+
+        assert!(semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::REMOTE_MUTATION));
+        assert!(
+            semantics
+                .mutation_effects
+                .contains(ToolMutationEffects::EXTERNAL_DELIVERY),
+            "a body-bearing HTTP mutation must require external-delivery authority"
+        );
+        assert_eq!(semantics.target_hints.len(), 3);
+        assert!(semantics.target_hints.iter().any(|target| {
+            target.kind == ToolTargetHintKind::Url && target.value == "https://api.x.com/2/tweets"
+        }));
+        assert!(semantics.target_hints.iter().any(|target| {
+            target.kind == ToolTargetHintKind::ResourceId
+                && target.value == "auth_profile:twitter-prod"
+        }));
+        assert!(semantics.target_hints.iter().any(|target| {
+            target.kind == ToolTargetHintKind::ResourceId && target.value == "account:2244994945"
+        }));
+        assert!(semantics
+            .target_hints
+            .iter()
+            .all(|target| !target.value.contains("token")));
+
+        assert_eq!(
+            HttpRequestTool::auth_profile_resource_id("Twitter Prod/account"),
+            "auth_profile:Twitter%20Prod%2Faccount"
+        );
+        assert_eq!(
+            HttpRequestTool::account_resource_id("tenant/account 1"),
+            "account:tenant%2Faccount%201"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_authenticated_mutation_requires_exact_configured_account_before_io() {
+        let cases = [
+            ("exact", Some("12345"), Some("12345"), 1_usize, None),
+            (
+                "missing-argument",
+                None,
+                Some("12345"),
+                0,
+                Some("require a non-empty top-level `account_id`"),
+            ),
+            (
+                "mismatch",
+                Some("99999"),
+                Some("12345"),
+                0,
+                Some("does not match the configured user_id"),
+            ),
+            (
+                "unconfigured-profile",
+                Some("12345"),
+                None,
+                0,
+                Some("has no valid configured user_id"),
+            ),
+        ];
+
+        for (case, supplied_account, configured_account, expected_requests, blocked_message) in
+            cases
+        {
+            let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
+            let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+            let mut profile = make_local_bearer_profile();
+            profile.user_id = configured_account.map(str::to_string);
+            let mut profiles = HashMap::new();
+            profiles.insert("local_oauth".to_string(), profile);
+            let tool = HttpRequestTool::new(
+                Arc::new(RwLock::new(profiles)),
+                ApprovalBroker::new(approval_tx),
+            );
+            let mut arguments = json!({
+                "method": "POST",
+                "url": url,
+                "auth_profile": "local_oauth",
+                "body": "{\"text\":\"bounded update\"}",
+                "_session_id": format!("mandate:account-fence:{case}")
+            });
+            if let Some(account_id) = supplied_account {
+                arguments["account_id"] = Value::String(account_id.to_string());
+            }
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                tool.call_with_execution_context(
+                    &arguments.to_string(),
+                    None,
+                    ToolExecutionContext {
+                        mandate_preapproved: true,
+                        mandate_execution: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("account fence must not wait for redundant approval")
+            .expect("account-fence result is a normal tool outcome");
+
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::SeqCst),
+                expected_requests,
+                "case={case}"
+            );
+            if let Some(message) = blocked_message {
+                assert!(outcome.metadata.http_status.is_none(), "case={case}");
+                assert!(
+                    outcome.output.contains(message),
+                    "case={case}: {}",
+                    outcome.output
+                );
+            } else {
+                assert_eq!(outcome.metadata.http_status, Some(204), "case={case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mandate_authenticated_observation_uses_exact_account_preapproval() {
+        for (case, supplied_account, expected_requests, blocked_message) in [
+            ("exact", Some("12345"), 1_usize, None),
+            (
+                "missing-account",
+                None,
+                0,
+                Some("require a non-empty top-level `account_id`"),
+            ),
+            (
+                "wrong-account",
+                Some("99999"),
+                0,
+                Some("does not match the configured user_id"),
+            ),
+        ] {
+            let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
+            let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+            let mut profile = make_local_bearer_profile();
+            profile.user_id = Some("12345".to_string());
+            let mut profiles = HashMap::new();
+            profiles.insert("local_oauth".to_string(), profile);
+            let tool = HttpRequestTool::new(
+                Arc::new(RwLock::new(profiles)),
+                ApprovalBroker::new(approval_tx),
+            );
+            let mut arguments = json!({
+                "method": "GET",
+                "url": url,
+                "auth_profile": "local_oauth",
+                "_session_id": format!("mandate:authenticated-read:{case}")
+            });
+            if let Some(account_id) = supplied_account {
+                arguments["account_id"] = Value::String(account_id.to_string());
+            }
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                tool.call_with_execution_context(
+                    &arguments.to_string(),
+                    None,
+                    ToolExecutionContext {
+                        mandate_preapproved: true,
+                        mandate_execution: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("governed authenticated read must not wait for redundant approval")
+            .expect("authenticated-read result is a normal tool outcome");
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::SeqCst),
+                expected_requests,
+                "case={case}"
+            );
+            if let Some(message) = blocked_message {
+                assert!(
+                    outcome.output.contains(message),
+                    "case={case}: {}",
+                    outcome.output
+                );
+            } else {
+                assert_eq!(outcome.metadata.http_status, Some(204), "case={case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_ungranted_mandate_posts_still_require_approval() {
+        let cases = [
+            (
+                "ordinary",
+                ToolExecutionContext {
+                    // Even a malformed internal context must not let mandate
+                    // preapproval escape the mandate execution boundary.
+                    mandate_preapproved: true,
+                    mandate_execution: false,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "ungranted-mandate",
+                ToolExecutionContext {
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "ungranted-mandate-cannot-inherit-trusted-session",
+                ToolExecutionContext {
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "correction-cannot-substitute-for-mandate-grant",
+                ToolExecutionContext {
+                    correction_preapproved: true,
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                },
+                false,
+            ),
+        ];
+
+        for (case, exec_ctx, trusted_session_argument) in cases {
+            let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
+            let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+            let approval_seen = tokio::spawn(async move {
+                let request = tokio::time::timeout(Duration::from_secs(2), approval_rx.recv())
+                    .await
+                    .expect("write must reach the approval boundary")
+                    .expect("approval channel remains open");
+                request
+                    .response_tx
+                    .send(ApprovalResponse::Deny)
+                    .expect("deny request");
+            });
+            let tool = HttpRequestTool::new(
+                Arc::new(RwLock::new(HashMap::new())),
+                ApprovalBroker::new(approval_tx),
+            );
+            let arguments = json!({
+                "method": "POST",
+                "url": url,
+                // A model-supplied lookalike is inert and never becomes the
+                // Rust execution-context field.
+                "_mandate_preapproved": true,
+                "_trusted_session": trusted_session_argument,
+                "_session_id": format!("test:{case}")
+            })
+            .to_string();
+
+            let outcome = tool
+                .call_with_execution_context(&arguments, None, exec_ctx)
+                .await
+                .expect("denial is a normal tool outcome");
+            approval_seen.await.expect("approval responder completes");
+            server.abort();
+            let _ = server.await;
+
+            assert_eq!(outcome.output, "Request denied by user", "case={case}");
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "denied {case} write must not reach the network"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ungranted_mandate_write_cannot_reuse_ordinary_session_approval() {
+        let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(2);
+        let approval_responder = tokio::spawn(async move {
+            for response in [ApprovalResponse::AllowSession, ApprovalResponse::Deny] {
+                let request = tokio::time::timeout(Duration::from_secs(2), approval_rx.recv())
+                    .await
+                    .expect("each authority path must reach its own approval boundary")
+                    .expect("approval channel remains open");
+                request
+                    .response_tx
+                    .send(response)
+                    .expect("answer approval request");
+            }
+        });
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "POST",
+            "url": url,
+            "_session_id": "test:authority-boundaries"
+        })
+        .to_string();
+
+        let ordinary = tool
+            .call_with_execution_context(&arguments, None, ToolExecutionContext::default())
+            .await
+            .expect("ordinary session-approved write executes");
+        assert_eq!(ordinary.metadata.http_status, Some(204));
+
+        let mandate = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("mandate denial is a normal tool outcome");
+        approval_responder
+            .await
+            .expect("approval responder completes");
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(mandate.output, "Request denied by user");
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the ordinary write executes once; the mandate call must not inherit its approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_post_redirects_are_negative_receipts() {
+        for (status_line, expected_status) in
+            [("302 Found", 302_u16), ("307 Temporary Redirect", 307_u16)]
+        {
+            let (url, request_count, server) = spawn_counting_status_server(status_line).await;
+            let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+            let tool = HttpRequestTool::new(
+                Arc::new(RwLock::new(HashMap::new())),
+                ApprovalBroker::new(approval_tx),
+            );
+            let arguments = json!({"method": "POST", "url": url}).to_string();
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                tool.call_with_execution_context(
+                    &arguments,
+                    None,
+                    ToolExecutionContext {
+                        mandate_preapproved: true,
+                        mandate_execution: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("an exact mandate grant skips redundant approval")
+            .expect("redirect response is returned normally");
+
+            server.abort();
+            let _ = server.await;
+            assert_eq!(outcome.metadata.http_status, Some(expected_status));
+            assert_eq!(
+                outcome.metadata.outcome_status,
+                Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                "mandate HTTP {expected_status} must not prove ACT success"
+            );
+            assert_eq!(
+                request_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "redirect response must not be followed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mandate_202_accepted_is_not_completion_evidence() {
+        assert_eq!(
+            HttpRequestTool::outcome_status_for_http(202, false),
+            ToolOutcomeStatus::Succeeded,
+            "ordinary HTTP behavior remains backward-compatible"
+        );
+        let (url, request_count, server) = spawn_counting_status_server("202 Accepted").await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let outcome = tool
+            .call_with_execution_context(
+                &json!({"method": "POST", "url": url}).to_string(),
+                None,
+                ToolExecutionContext {
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("202 response is returned as non-success evidence");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(outcome.metadata.http_status, Some(202));
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+            "accepted-for-processing does not prove the mutation completed"
+        );
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mandate_rejects_query_params_that_change_the_authorized_url() {
+        let (base_url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let authorized_url = format!("{base_url}?account=1");
+        let arguments = json!({
+            "method": "GET",
+            "url": authorized_url,
+            "query_params": {"account": "2"}
+        })
+        .to_string();
+
+        let semantics = tool.call_semantics(&arguments);
+        assert_eq!(semantics.target_hints.len(), 1);
+        assert!(semantics.target_hints[0].value.ends_with("?account=1"));
+        let outcome = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query target drift is rejected deterministically");
+
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome.output.contains("cannot append `query_params`"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no drifted URL may reach the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_rejects_embedded_tool_parameter_recovery() {
+        let (base_url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "GET",
+            "url": format!("{base_url}?auth_profile=local_oauth")
+        })
+        .to_string();
+
+        let outcome = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("embedded control arguments are rejected deterministically");
+
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome
+            .output
+            .contains("cannot recover tool parameters embedded in the URL"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a recovered target must never reach the network under a mandate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_rejects_get_method_override_and_semantics_mark_it_mutating() {
+        let (url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "GET",
+            "url": url,
+            "headers": {"X-HTTP-Method-Override": "DELETE"}
+        })
+        .to_string();
+
+        assert!(
+            tool.call_semantics(&arguments).mutates_state(),
+            "method override must never be classified as an observation"
+        );
+        let outcome = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("method override is rejected deterministically");
+
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome
+            .output
+            .contains("method-override headers are not allowed"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an overridden method must never reach the network under a mandate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_rejects_authority_override_and_semantics_mark_it_mutating() {
+        let (url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "GET",
+            "url": url,
+            "headers": {"Host": "different-tenant.example"}
+        })
+        .to_string();
+
+        assert!(
+            tool.call_semantics(&arguments).mutates_state(),
+            "an authority override must never be classified as a scoped observation"
+        );
+        assert_eq!(
+            HttpRequestTool::authority_override_headers(
+                json!({":authority": "different-tenant.example"}).as_object()
+            ),
+            vec![":authority".to_string()]
+        );
+        let outcome = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("authority override is rejected deterministically");
+
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome.output.contains("authority override headers"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an overridden HTTP authority must never reach the network under a mandate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_rejects_get_body_and_semantics_mark_it_mutating() {
+        let (url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(HashMap::new())),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "GET",
+            "url": url,
+            "body": "action=delete"
+        })
+        .to_string();
+
+        assert!(
+            tool.call_semantics(&arguments).mutates_state(),
+            "an observation method with a body must not be classified as read-only"
+        );
+        let outcome = tool
+            .call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    mandate_preapproved: false,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("GET body is rejected deterministically");
+
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.metadata.http_status.is_none());
+        assert!(outcome.output.contains("non-empty body on GET"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a GET action body must never reach the network under a mandate"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_get_401_does_not_refresh_or_replay_oauth_request() {
+        let (url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(1);
+        let mut profiles = HashMap::new();
+        profiles.insert("local_oauth".to_string(), make_local_bearer_profile());
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(profiles)),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "GET",
+            "url": url,
+            "auth_profile": "local_oauth",
+            "account_id": "12345",
+            "_session_id": "mandate:test-get"
+        })
+        .to_string();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    // The dispatcher issued an exact grant for this
+                    // authenticated observation, including its stable account.
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("an exact mandate grant skips redundant approval")
+        .expect("mandate GET returns the upstream 401");
+
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(
+                approval_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "an exact mandate grant must not request redundant approval"
+        );
+        assert_eq!(
+            outcome.metadata.http_status,
+            Some(401),
+            "unexpected tool output: {}",
+            outcome.output
+        );
+        assert!(outcome
+            .output
+            .contains("Automatic OAuth refresh and request replay are disabled"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the GET must not be replayed"
+        );
+        assert_eq!(
+            tool.oauth_refresh_attempt_count(),
+            0,
+            "mandate execution must not invoke OAuth refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_post_401_does_not_refresh_or_replay_oauth_request() {
+        let (url, request_count, server) = spawn_counting_unauthorized_server().await;
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let mut profiles = HashMap::new();
+        profiles.insert("local_oauth".to_string(), make_local_bearer_profile());
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(profiles)),
+            ApprovalBroker::new(approval_tx),
+        );
+        let arguments = json!({
+            "method": "POST",
+            "url": url,
+            "auth_profile": "local_oauth",
+            "account_id": "12345",
+            "_session_id": "mandate:test-post"
+        })
+        .to_string();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            tool.call_with_execution_context(
+                &arguments,
+                None,
+                ToolExecutionContext {
+                    correction_preapproved: false,
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("an exact mandate grant skips redundant approval")
+        .expect("mandate POST returns the upstream 401");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            outcome.metadata.http_status,
+            Some(401),
+            "unexpected tool output: {}",
+            outcome.output
+        );
+        assert!(outcome
+            .output
+            .contains("Automatic OAuth refresh and request replay are disabled"));
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the mutating POST must not be replayed"
+        );
+        assert_eq!(
+            tool.oauth_refresh_attempt_count(),
+            0,
+            "mandate execution must not invoke OAuth refresh"
         );
     }
 

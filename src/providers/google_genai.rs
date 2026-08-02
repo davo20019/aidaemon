@@ -173,6 +173,18 @@ fn is_missing_thought_signature_error(body: &str) -> bool {
         || lower.contains("missing thoughtsignature")
 }
 
+fn should_retry_missing_thought_signature(
+    status_code: u16,
+    body: &str,
+    dropped_calls: usize,
+    options: &ChatOptions,
+) -> bool {
+    !options.single_attempt_fail_closed
+        && status_code == 400
+        && dropped_calls > 0
+        && is_missing_thought_signature_error(body)
+}
+
 pub struct GoogleGenAiProvider {
     client: Client,
     base_url: String,
@@ -757,7 +769,12 @@ impl ModelProvider for GoogleGenAiProvider {
             if status.as_u16() == 400 && is_missing_thought_signature_error(&text) {
                 let (sanitized_contents, dropped_calls, dropped_responses) =
                     strip_unsigned_function_call_history(&original_contents);
-                if dropped_calls > 0 {
+                if should_retry_missing_thought_signature(
+                    status.as_u16(),
+                    &text,
+                    dropped_calls,
+                    options,
+                ) {
                     let mut retry_body = body.clone();
                     retry_body["contents"] = json!(sanitized_contents);
                     warn!(
@@ -894,6 +911,27 @@ mod tests {
             api_key: "fake-key".to_string(),
             extra_headers: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn mandate_single_attempt_disables_thought_signature_recovery_retry() {
+        let error = "Function call is missing a thought_signature";
+        assert!(should_retry_missing_thought_signature(
+            400,
+            error,
+            1,
+            &ChatOptions::default(),
+        ));
+        let mandate_options = ChatOptions {
+            single_attempt_fail_closed: true,
+            ..ChatOptions::default()
+        };
+        assert!(!should_retry_missing_thought_signature(
+            400,
+            error,
+            1,
+            &mandate_options,
+        ));
     }
 
     /// Helper: build an OpenAI-format tool definition from a parameters object.

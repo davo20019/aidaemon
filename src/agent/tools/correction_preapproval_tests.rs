@@ -137,6 +137,8 @@ async fn test_model_supplied_correction_preapproval_json_key_does_not_preapprove
                 // correction_preapproved is FALSE at the dispatcher level
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -191,6 +193,8 @@ async fn test_dispatcher_correction_preapproval_context_reaches_tool_once() {
                 // Dispatcher sets correction_preapproved=true
                 correction_preapproved: true,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -235,6 +239,8 @@ async fn test_no_correction_preapproval_key_is_injected_into_args() {
                 workspace_grant: None,
                 correction_preapproved: true,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -288,6 +294,8 @@ async fn test_channel_context_trusted_does_not_bypass_correction_gate() {
                 correction_preapproved: true,
                 // ...suppress_trusted_session must prevent _trusted_session injection.
                 suppress_trusted_session: true,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -350,6 +358,8 @@ async fn test_scheduled_trust_does_not_bypass_correction_gate() {
                 workspace_grant: None,
                 correction_preapproved: false,
                 suppress_trusted_session: true,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -490,6 +500,8 @@ async fn test_error_after_allowed_call_no_residue() {
                 workspace_grant: None,
                 correction_preapproved: true,
                 suppress_trusted_session: true,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;
@@ -521,6 +533,8 @@ async fn test_error_after_allowed_call_no_residue() {
                 workspace_grant: None,
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;
@@ -589,6 +603,8 @@ async fn test_panic_no_residue() {
                 workspace_grant: None,
                 correction_preapproved: true,
                 suppress_trusted_session: true,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;
@@ -620,6 +636,8 @@ async fn test_panic_no_residue() {
                 workspace_grant: None,
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await;
@@ -666,6 +684,8 @@ async fn test_later_correction_call_reclassified_after_block() {
                 workspace_grant: None,
                 correction_preapproved: true,
                 suppress_trusted_session: true,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await
@@ -699,6 +719,8 @@ async fn test_later_correction_call_reclassified_after_block() {
                 // This call was NOT granted preapproval by the correction gate.
                 correction_preapproved: false,
                 suppress_trusted_session: false,
+                mandate_authority: None,
+                mandate_tool_call_id: None,
             },
         )
         .await

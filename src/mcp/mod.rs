@@ -119,6 +119,14 @@ fn is_recoverable_transport_error(err: &anyhow::Error) -> bool {
         || msg.contains("io error")
 }
 
+/// Retrying after a transport failure is safe only when the adapter contract
+/// guarantees that the call is both read-only and idempotent. A mutating call
+/// may have committed before its response was lost; replaying it would turn one
+/// dispatcher grant and one reserved attempt into two external effects.
+fn should_retry_transport_failure(capabilities: ToolCapabilities, error: &anyhow::Error) -> bool {
+    capabilities.read_only && capabilities.idempotent && is_recoverable_transport_error(error)
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &str {
@@ -174,7 +182,7 @@ impl Tool for McpTool {
         let should_attempt_recovery = result
             .as_ref()
             .err()
-            .is_some_and(is_recoverable_transport_error);
+            .is_some_and(|error| should_retry_transport_failure(self.capabilities, error));
 
         if should_attempt_recovery {
             if let (Some(registry), Some(server_name)) = (&self.registry, &self.server_name) {
@@ -417,7 +425,18 @@ fn detect_suspicious_output(tool_name: &str, output: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_recoverable_transport_error;
+    use super::{is_recoverable_transport_error, should_retry_transport_failure};
+    use crate::traits::ToolCapabilities;
+
+    fn capabilities(read_only: bool, idempotent: bool) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only,
+            idempotent,
+            external_side_effect: true,
+            needs_approval: !read_only,
+            high_impact_write: !read_only,
+        }
+    }
 
     #[test]
     fn transport_error_classifier_ignores_tool_level_is_error() {
@@ -429,5 +448,27 @@ mod tests {
     fn transport_error_classifier_flags_dead_process_signals() {
         let err = anyhow::anyhow!("MCP server closed stdout (empty response)");
         assert!(is_recoverable_transport_error(&err));
+    }
+
+    #[test]
+    fn transport_recovery_retries_only_read_only_idempotent_calls() {
+        let err = anyhow::anyhow!("MCP server closed stdout (empty response)");
+
+        assert!(should_retry_transport_failure(
+            capabilities(true, true),
+            &err
+        ));
+        assert!(!should_retry_transport_failure(
+            capabilities(true, false),
+            &err
+        ));
+        assert!(!should_retry_transport_failure(
+            capabilities(false, true),
+            &err
+        ));
+        assert!(!should_retry_transport_failure(
+            capabilities(false, false),
+            &err
+        ));
     }
 }

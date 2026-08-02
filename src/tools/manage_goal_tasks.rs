@@ -40,6 +40,7 @@ impl ManageGoalTasksTool {
         description.starts_with("execute scheduled goal:")
             || description.starts_with("scheduled check:")
             || description.starts_with("manual scheduled run:")
+            || description.starts_with("mandate review:")
     }
 
     async fn scoped_tasks(&self) -> anyhow::Result<Vec<Task>> {
@@ -291,6 +292,14 @@ struct ManageGoalTasksArgs {
     remaining_risk: Option<String>,
     #[serde(default)]
     next_step: Option<String>,
+    #[serde(default)]
+    _mandate_id: Option<String>,
+    #[serde(default)]
+    _mandate_version: Option<i64>,
+    #[serde(default)]
+    _goal_run_id: Option<String>,
+    #[serde(default)]
+    _task_attempt_id: Option<String>,
 }
 
 #[async_trait]
@@ -411,6 +420,24 @@ impl Tool for ManageGoalTasksTool {
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageGoalTasksArgs = serde_json::from_str(arguments)?;
+
+        let mandate_context = args._mandate_id.is_some()
+            || self
+                .state
+                .get_mandate_for_goal(&self.goal_id)
+                .await?
+                .is_some();
+        if mandate_context
+            && !matches!(
+                args.action.as_str(),
+                "create_task" | "claim_task" | "list_tasks"
+            )
+        {
+            return Ok(format!(
+                "Mandate task control rejects '{}': only exact-run create_task/claim_task and read-only list_tasks are supported; executor outcomes are finalized through their own leases.",
+                args.action
+            ));
+        }
 
         match args.action.as_str() {
             "create_task" => self.create_task(&args).await,
@@ -561,6 +588,48 @@ fn validate_no_cycles(
 
 impl ManageGoalTasksTool {
     async fn create_task(&self, args: &ManageGoalTasksArgs) -> anyhow::Result<String> {
+        let persisted_mandate = self.state.get_mandate_for_goal(&self.goal_id).await?;
+        let mandate_context = args._mandate_id.is_some() || persisted_mandate.is_some();
+        let mandate_fence = if mandate_context {
+            let mandate_id = args._mandate_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mandate task creation is missing its dispatcher-owned mandate id")
+            })?;
+            let mandate_version = args._mandate_version.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mandate task creation is missing its dispatcher-owned policy version"
+                )
+            })?;
+            let goal_run_id = args._goal_run_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mandate task creation is missing its dispatcher-owned goal run")
+            })?;
+            let task_attempt_id = args._task_attempt_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mandate task creation is missing its dispatcher-owned task attempt"
+                )
+            })?;
+            anyhow::ensure!(
+                self.goal_run_id.as_deref() == Some(goal_run_id),
+                "mandate task creation run does not match the task-lead binding"
+            );
+            if let Some(mandate) = persisted_mandate.as_ref() {
+                anyhow::ensure!(
+                    mandate.id == mandate_id && mandate.version == mandate_version,
+                    "mandate task creation policy binding is stale"
+                );
+            }
+            anyhow::ensure!(
+                args.workspace_policy.is_none(),
+                "workspace_policy is unavailable for mandate tasks"
+            );
+            anyhow::ensure!(
+                args.worker_profile.is_none(),
+                "worker_profile assignment is unavailable for mandate tasks"
+            );
+            Some((mandate_id, mandate_version, goal_run_id, task_attempt_id))
+        } else {
+            None
+        };
+
         let description = args
             .description
             .as_deref()
@@ -612,31 +681,58 @@ impl ManageGoalTasksTool {
             result: None,
             error: None,
             blocker: None,
-            idempotent: args.idempotent.unwrap_or(false),
+            idempotent: if mandate_fence.is_some() {
+                false
+            } else {
+                args.idempotent.unwrap_or(false)
+            },
             retry_count: 0,
-            max_retries: 3,
+            max_retries: if mandate_fence.is_some() { 0 } else { 3 },
             created_at: now,
             started_at: None,
             completed_at: None,
         };
 
-        self.state.create_task(&task).await?;
-        if let Some(profile_id) = args.worker_profile.as_deref() {
+        if let Some((mandate_id, mandate_version, goal_run_id, task_attempt_id)) = mandate_fence {
+            const MAX_MANDATE_ACTION_TASKS_PER_RUN: i64 = 16;
             if !self
                 .state
-                .assign_task_worker_profile(&task.id, profile_id, "task-lead", None)
+                .create_mandate_task_from_attempt(
+                    &task,
+                    mandate_id,
+                    mandate_version,
+                    goal_run_id,
+                    task_attempt_id,
+                    MAX_MANDATE_ACTION_TASKS_PER_RUN,
+                )
                 .await?
             {
-                anyhow::bail!("worker profile '{}' is unavailable", profile_id);
+                return Ok(
+                    "Cannot create mandate task: authority/run/attempt changed or the per-run task cap was reached. Reconsider in a fresh cycle."
+                        .to_string(),
+                );
             }
+        } else {
+            self.state.create_task(&task).await?;
         }
-        if let Some(policy) = args.workspace_policy.as_deref() {
-            if !self
-                .state
-                .set_task_workspace_policy(&task.id, policy)
-                .await?
-            {
-                anyhow::bail!("workspace policy could not be applied to the new task");
+        if mandate_fence.is_none() {
+            if let Some(profile_id) = args.worker_profile.as_deref() {
+                if !self
+                    .state
+                    .assign_task_worker_profile(&task.id, profile_id, "task-lead", None)
+                    .await?
+                {
+                    anyhow::bail!("worker profile '{}' is unavailable", profile_id);
+                }
+            }
+            if let Some(policy) = args.workspace_policy.as_deref() {
+                if !self
+                    .state
+                    .set_task_workspace_policy(&task.id, policy)
+                    .await?
+                {
+                    anyhow::bail!("workspace policy could not be applied to the new task");
+                }
             }
         }
         info!(goal_id = %self.goal_id, task_id = %task.id, "Created task");
@@ -913,6 +1009,56 @@ impl ManageGoalTasksTool {
         }
 
         let agent_id = args.agent_id.as_deref().unwrap_or("executor");
+        if args._mandate_id.is_some()
+            || self
+                .state
+                .get_mandate_for_goal(&self.goal_id)
+                .await?
+                .is_some()
+        {
+            let mandate_id = args._mandate_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mandate task claim is missing its dispatcher-owned mandate id")
+            })?;
+            let mandate_version = args._mandate_version.ok_or_else(|| {
+                anyhow::anyhow!("mandate task claim is missing its dispatcher-owned policy version")
+            })?;
+            let goal_run_id = args._goal_run_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mandate task claim is missing its dispatcher-owned goal run")
+            })?;
+            let root_attempt_id = args._task_attempt_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("mandate task claim is missing its dispatcher-owned root attempt")
+            })?;
+            anyhow::ensure!(
+                self.goal_run_id.as_deref() == Some(goal_run_id),
+                "mandate task claim run does not match the task-lead binding"
+            );
+            anyhow::ensure!(
+                args.worker_profile.is_none(),
+                "worker_profile assignment is unavailable for mandate tasks"
+            );
+            return match self
+                .state
+                .claim_mandate_task_from_attempt(
+                    task_id,
+                    agent_id,
+                    mandate_id,
+                    mandate_version,
+                    goal_run_id,
+                    root_attempt_id,
+                    180,
+                )
+                .await?
+            {
+                Some(attempt) => Ok(format!(
+                    "Claimed mandate task {} for agent {} with attempt {} (no worker-profile or workspace binding)",
+                    task_id, agent_id, attempt.id
+                )),
+                None => Ok(format!(
+                    "Failed to claim mandate task {} — authority/run/attempt changed, dependencies are unmet, or another worker owns it",
+                    task_id
+                )),
+            };
+        }
         match self
             .state
             .claim_task_with_lease(
