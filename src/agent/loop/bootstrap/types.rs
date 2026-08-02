@@ -45,14 +45,23 @@ pub(in crate::agent) struct BootstrapData {
     pub llm_router: Option<Router>,
     pub model: String,
     pub route_failsafe_active: bool,
+    /// Canonical per-turn scope/follow-up/contract snapshot. Bootstrap resolves
+    /// it before prompt construction so scoped project instructions and the
+    /// execution loop use the exact same project decision.
+    pub turn_context: TurnContext,
+    /// Authorized, task-local instruction hierarchy state. `None` for turns
+    /// without a single trusted project scope; otherwise used to discover
+    /// deeper instruction files before the first tool action in that subtree.
+    pub project_instruction_tracker: Option<crate::project_instructions::ProjectInstructionTracker>,
     /// Pillar A: message-zero bytes (the session-static CORE prompt). Cacheable
     /// prefix; rendered once per task by `render_core_prompt`.
     pub core_prompt_bytes: String,
     /// Pillar A: the per-task volatile context tail (timestamp, session context,
     /// memories, matched skill bodies, resume checkpoint, …). Compiled once per
-    /// task and reused byte-identically across the within-task loop. Inserted
-    /// immediately before the structurally preserved preceding exchange (or
-    /// before the current user when no preceding exchange exists).
+    /// task and reused across the within-task loop. Just-in-time project
+    /// instructions may be appended once when a tool first enters a deeper
+    /// subtree. Inserted immediately before the structurally preserved
+    /// preceding exchange (or before the current user when none exists).
     pub task_context_tail: String,
     pub session_summary: Option<ConversationSummary>,
     pub harness_eval: HarnessEvalAccumulator,

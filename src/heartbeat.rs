@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -164,6 +164,11 @@ fn task_is_blocked_by_terminal_dependency(task: &crate::traits::Task) -> bool {
         && task.blocker.as_deref().is_some_and(|blocker| {
             blocker.starts_with("Dependency ") && blocker.contains(" ended with status ")
         })
+}
+
+fn task_blocks_schedule_fire(task: &crate::traits::Task) -> bool {
+    matches!(task.status.as_str(), "pending" | "claimed" | "running")
+        || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
 }
 
 /// Runtime snapshot of a heartbeat background job.
@@ -1011,15 +1016,53 @@ impl HeartbeatCoordinator {
                     .iter()
                     .any(|task| is_scheduled_task_description(&task.description))
             };
-            // Most recent fire time across this goal's schedules, used below as
-            // the "current cycle" boundary for the idempotency check.
-            let current_cycle_since = schedules_for_goal.as_ref().and_then(|schedules| {
-                schedules
-                    .iter()
-                    .filter_map(|s| s.last_run_at.as_deref())
-                    .max()
-                    .map(|s| s.to_string())
-            });
+            // A goal run is the durable isolation boundary for one scheduled or
+            // explicit manual firing.  In particular, `trigger_now` starts a new
+            // goal run without advancing the cron schedule's `last_run_at`, so
+            // using only the schedule timestamp here would let a mutation from
+            // the previous run suppress the newly requested run.
+            let current_goal_run = if is_scheduled_goal {
+                self.state
+                    .get_current_goal_run(goal_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    // Legacy/repair-created open runs can contain old child
+                    // rows without an execution root. They are not a valid
+                    // current scheduled cycle and must keep using the stale
+                    // child retirement fallback below.
+                    .filter(|run| run.root_task_id.is_some())
+            } else {
+                None
+            };
+            let current_goal_run_task_ids = if let Some(run) = current_goal_run.as_ref() {
+                self.state
+                    .get_tasks_for_goal_run(&run.id)
+                    .await
+                    .ok()
+                    .map(|tasks| {
+                        tasks
+                            .into_iter()
+                            .map(|task| task.id)
+                            .collect::<HashSet<_>>()
+                    })
+            } else {
+                None
+            };
+            // Retain the schedule timestamp only as a legacy eligibility
+            // fallback when a pending row predates durable goal-run tracking.
+            let current_cycle_since = current_goal_run
+                .as_ref()
+                .map(|run| run.started_at.clone())
+                .or_else(|| {
+                    schedules_for_goal.as_ref().and_then(|schedules| {
+                        schedules
+                            .iter()
+                            .filter_map(|s| s.last_run_at.as_deref())
+                            .max()
+                            .map(|s| s.to_string())
+                    })
+                });
             let active_scheduled_run = if is_scheduled_goal {
                 self.state
                     .get_scheduled_run_state(goal_id)
@@ -1033,6 +1076,11 @@ impl HeartbeatCoordinator {
             for task in tasks.iter().copied() {
                 let eligible = if !is_scheduled_goal {
                     true
+                } else if let Some(run_task_ids) = current_goal_run_task_ids.as_ref() {
+                    // Durable run membership is authoritative and avoids
+                    // timestamp races between task construction and the run
+                    // row created milliseconds later.
+                    run_task_ids.contains(&task.id)
                 } else if let Some(run) = active_scheduled_run.as_ref() {
                     timestamp_is_at_or_after(&task.created_at, &run.created_at)
                 } else {
@@ -1111,6 +1159,8 @@ impl HeartbeatCoordinator {
             let has_active_nonstale = all_tasks.iter().any(|t| {
                 let belongs_to_current_run = if !is_scheduled_goal {
                     true
+                } else if let Some(run_task_ids) = current_goal_run_task_ids.as_ref() {
+                    run_task_ids.contains(&t.id)
                 } else if let Some(run) = active_scheduled_run.as_ref() {
                     timestamp_is_at_or_after(&t.created_at, &run.created_at)
                 } else {
@@ -1163,24 +1213,47 @@ impl HeartbeatCoordinator {
             // task tracking) hiccups, the run ends up interrupted, and a fresh
             // task lead gets dispatched here for what looks like unfinished
             // work but whose real-world action already succeeded. Before
-            // reclaiming, check whether this goal's current cycle already has
-            // a successful mutating (non-GET) http_request logged; if so, the
-            // goal's job for this cycle is done — close out the leftover
-            // pending tasks instead of spawning another attempt.
+            // reclaiming, check whether this exact goal run already has a
+            // successful mutating (non-GET) http_request logged; if so, the
+            // run's job is done — close out the leftover pending tasks instead
+            // of spawning another attempt. Never use a prior run's receipt:
+            // an explicit manual run is a new authorized execution even when
+            // the recurring schedule's `last_run_at` has not advanced.
             // See docs/2026-06-30-telegram-edge-case-findings.md (2026-07-04
             // escalation: 5 duplicate tweets from repeated goal dispatch).
             if is_scheduled_goal {
-                if let Some(ref since_ts) = current_cycle_since {
-                    if self
-                        .goal_has_recent_mutating_success(goal_id, since_ts)
-                        .await
-                    {
+                if let Some(current_run) = current_goal_run.as_ref() {
+                    let mutating_success_task_ids =
+                        self.goal_run_mutating_success_tasks(&current_run.id).await;
+                    if !mutating_success_task_ids.is_empty() {
                         info!(
                             goal_id = %goal_id,
+                            run_id = %current_run.id,
                             pending_count = eligible_tasks.len(),
-                            "Goal already has a successful mutating action this cycle; \
+                            "Goal run already has a successful mutating action; \
                              closing out orphaned pending tasks instead of re-dispatching"
                         );
+                        // The receipt is authoritative evidence that the task's
+                        // external mutation succeeded, even if a downstream
+                        // verification/tracking hiccup left its task status as
+                        // interrupted or failed.
+                        for task_id in &mutating_success_task_ids {
+                            let Ok(Some(mut done)) = self.state.get_task(task_id).await else {
+                                continue;
+                            };
+                            if !done.satisfies_run_completion() {
+                                done.status = "completed".to_string();
+                                done.error = None;
+                                done.blocker = None;
+                                done.result = Some(
+                                    "Auto-reconciled: this task has a successful mutating \
+                                     tool receipt in the current goal run."
+                                        .to_string(),
+                                );
+                                done.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                let _ = self.state.update_task(&done).await;
+                            }
+                        }
                         for task in &eligible_tasks {
                             let mut done = (*task).clone();
                             done.status = "completed".to_string();
@@ -1192,6 +1265,27 @@ impl HeartbeatCoordinator {
                             );
                             done.completed_at = Some(chrono::Utc::now().to_rfc3339());
                             let _ = self.state.update_task(&done).await;
+                        }
+                        if self
+                            .state
+                            .get_tasks_for_goal_run(&current_run.id)
+                            .await
+                            .is_ok_and(|run_tasks| {
+                                !run_tasks.is_empty()
+                                    && run_tasks.iter().all(|task| task.satisfies_run_completion())
+                            })
+                        {
+                            let _ = self
+                                .state
+                                .finish_goal_run(
+                                    &current_run.id,
+                                    "completed",
+                                    Some(
+                                        "Auto-reconciled from a successful mutating receipt in \
+                                         this goal run; duplicate dispatch was suppressed.",
+                                    ),
+                                )
+                                .await;
                         }
                         continue;
                     }
@@ -1307,9 +1401,9 @@ impl HeartbeatCoordinator {
         }
     }
 
-    /// Idempotency backstop for scheduled goals: returns true if any task
-    /// belonging to `goal_id` has a logged, successful, mutating (non-GET)
-    /// `http_request` activity created at or after `since_ts`.
+    /// Idempotency backstop for scheduled goals: returns the tasks in one
+    /// durable goal run that have a logged, successful, mutating (non-GET)
+    /// `http_request` activity.
     ///
     /// This is a defense-in-depth check, not the primary fix — it exists so
     /// that *whatever* caused a scheduled goal's task to look unfinished
@@ -1318,18 +1412,17 @@ impl HeartbeatCoordinator {
     /// task_activity rows that are already logged for every tool call
     /// (`src/agent/loop/tool_execution/run.rs`), so it needs no schema change.
     /// Fails closed toward "don't block" on any parse/lookup miss — a false
-    /// negative here just falls back to prior behavior, never a false
-    /// positive that would wrongly skip real unfinished work.
-    async fn goal_has_recent_mutating_success(&self, goal_id: &str, since_ts: &str) -> bool {
-        let Some(since) = parse_datetime_flexible(since_ts) else {
-            return false;
-        };
-
-        let tasks = match self.state.get_tasks_for_goal(goal_id).await {
+    /// negative here just falls back to prior behavior, never a false positive
+    /// that would wrongly skip real unfinished work. Scoping by `goal_run_id`
+    /// is what prevents a successful prior run from suppressing a new manual
+    /// trigger.
+    async fn goal_run_mutating_success_tasks(&self, run_id: &str) -> Vec<String> {
+        let tasks = match self.state.get_tasks_for_goal_run(run_id).await {
             Ok(t) => t,
-            Err(_) => return false,
+            Err(_) => return Vec::new(),
         };
 
+        let mut successful_task_ids = Vec::new();
         for task in &tasks {
             let activities = match self.state.get_task_activities(&task.id).await {
                 Ok(a) => a,
@@ -1342,22 +1435,17 @@ impl HeartbeatCoordinator {
                 if activity.success != Some(true) {
                     continue;
                 }
-                let Some(created) = parse_datetime_flexible(&activity.created_at) else {
-                    continue;
-                };
-                if created < since {
-                    continue;
-                }
                 if activity
                     .tool_args
                     .as_deref()
                     .is_some_and(is_mutating_http_method)
                 {
-                    return true;
+                    successful_task_ids.push(task.id.clone());
+                    break;
                 }
             }
         }
-        false
+        successful_task_ids
     }
 
     /// Phase 5a: Scan goals that completed/failed and enqueue notifications.
@@ -1706,18 +1794,28 @@ impl HeartbeatCoordinator {
             }
         }
 
-        let tasks = self
+        // Only work belonging to an open goal run can apply backpressure to a
+        // new scheduled firing. Historical blocked tasks are intentionally
+        // retained as audit records after their run is closed; counting all
+        // tasks for the goal would make those records suppress every future
+        // coalesced firing forever.
+        let open_runs = self
             .state
-            .get_tasks_for_goal(&goal.id)
-            .await
-            .unwrap_or_default();
-        let open_count = tasks
-            .iter()
-            .filter(|task| {
-                matches!(task.status.as_str(), "pending" | "claimed" | "running")
-                    || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
-            })
-            .count();
+            .get_goal_runs(&goal.id)
+            .await?
+            .into_iter()
+            .filter(|run| matches!(run.status.as_str(), "pending" | "running" | "blocked"))
+            .collect::<Vec<_>>();
+        let mut open_count = 0;
+        for run in &open_runs {
+            open_count += self
+                .state
+                .get_tasks_for_goal_run(&run.id)
+                .await?
+                .iter()
+                .filter(|task| task_blocks_schedule_fire(task))
+                .count();
+        }
 
         let fire_policy = schedule.fire_policy.as_str();
         let coalesce = fire_policy != "always_fire";
@@ -1733,6 +1831,14 @@ impl HeartbeatCoordinator {
             }
             schedule.updated_at = now_ts.clone();
             let _ = self.state.update_goal_schedule(&schedule).await;
+            info!(
+                goal_id = %goal.id,
+                schedule_id = %schedule.id,
+                fire_policy,
+                open_run_count = open_runs.len(),
+                open_task_count = open_count,
+                "Deferred schedule fire because open goal-run work is still active"
+            );
             return Ok(());
         }
 
@@ -1860,11 +1966,7 @@ impl HeartbeatCoordinator {
             if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
                 let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
                 if !run_tasks.is_empty() {
-                    let active_or_human_blocked = run_tasks.iter().any(|task| {
-                        matches!(task.status.as_str(), "pending" | "claimed" | "running")
-                            || (task.status == "blocked"
-                                && !task_is_blocked_by_terminal_dependency(task))
-                    });
+                    let active_or_human_blocked = run_tasks.iter().any(task_blocks_schedule_fire);
                     if active_or_human_blocked {
                         warn!(
                             goal_id = %goal.id,
@@ -2862,6 +2964,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_closed_run_blocker_does_not_block_next_schedule_fire() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Daily blog", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let historical_run = state
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let historical_blocker = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Old deployment attempt".to_string(),
+            status: "blocked".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: Some("Deployment credentials were unavailable".to_string()),
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&historical_blocker).await.unwrap();
+        state
+            .finish_goal_run(
+                &historical_run.id,
+                "failed",
+                Some("Archived failed deployment run"),
+            )
+            .await
+            .unwrap();
+
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: (now - chrono::Duration::minutes(2)).to_rfc3339(),
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|task| task.id == historical_blocker.id));
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.description.starts_with("Scheduled check:")),
+            "a blocker retained in a closed run must not suppress future scheduled work"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_run_blocker_coalesces_next_schedule_fire() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Daily tweet", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let open_run = state
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let active_blocker = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Await editorial approval".to_string(),
+            status: "blocked".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: Some("Waiting for a user decision".to_string()),
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&active_blocker).await.unwrap();
+
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: (now - chrono::Duration::minutes(2)).to_rfc3339(),
+            created_at: now_ts.clone(),
+            updated_at: now_ts,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, active_blocker.id);
+        assert_eq!(
+            state
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .expect("blocked run should remain open")
+                .id,
+            open_run.id
+        );
+
+        let updated_schedule = state
+            .get_goal_schedule(&schedule.id)
+            .await
+            .unwrap()
+            .expect("recurring schedule should remain active");
+        assert!(updated_schedule.last_run_at.is_none());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&updated_schedule.next_run_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                > now
+        );
+    }
+
+    #[tokio::test]
     async fn test_pending_task_with_interrupted_dependency_does_not_block_next_schedule_fire() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let embedding_service = Arc::new(EmbeddingService::new().unwrap());
@@ -3502,11 +3762,28 @@ mod tests {
         coordinator.dispatch_pending_tasks().await;
 
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        let posted_after = tasks.iter().find(|t| t.id == posted_task.id).unwrap();
+        assert_eq!(
+            posted_after.status, "completed",
+            "a successful mutation receipt should reconcile its interrupted task"
+        );
         let orphaned_after = tasks.iter().find(|t| t.id == orphaned.id).unwrap();
         assert_eq!(
             orphaned_after.status, "completed",
             "orphaned task should be closed out, not redispatched, once a \
              mutating success is already logged for this cycle"
+        );
+        assert!(
+            state
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a fully reconciled run must not remain open after orphan closeout"
+        );
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0].status,
+            "completed"
         );
 
         let notifications = state.get_pending_notifications(10).await.unwrap();
@@ -3516,6 +3793,160 @@ mod tests {
                 .all(|n| n.notification_type != "stalled"),
             "should not fall through to the stalled-notification path once the \
              idempotency gate has closed out the orphaned task"
+        );
+    }
+
+    /// A successful mutation in an earlier run is not a receipt for a new
+    /// explicit manual run. This reproduces task 30e0c819 (2026-08-01):
+    /// `trigger_now` created a new run without changing the cron schedule's
+    /// `last_run_at`, and goal-wide timestamp matching auto-closed the new task
+    /// from the previous run's tweet receipt.
+    #[tokio::test]
+    async fn test_manual_run_is_not_suppressed_by_prior_run_mutating_success() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                embedding_service,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let goal = Goal::new_continuous("Post one useful tweet", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let prior_cycle = now - chrono::Duration::minutes(15);
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: None,
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: Some(prior_cycle.to_rfc3339()),
+            next_run_at: (now + chrono::Duration::hours(20)).to_rfc3339(),
+            created_at: prior_cycle.to_rfc3339(),
+            updated_at: prior_cycle.to_rfc3339(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let first_run = state
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        let first_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Scheduled check: Post one useful tweet".to_string(),
+            status: "completed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: Some("Posted and verified.".to_string()),
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: prior_cycle.to_rfc3339(),
+            started_at: Some(prior_cycle.to_rfc3339()),
+            completed_at: Some((prior_cycle + chrono::Duration::minutes(1)).to_rfc3339()),
+        };
+        state.create_task(&first_task).await.unwrap();
+        state
+            .log_task_activity(&TaskActivity {
+                id: 0,
+                task_id: first_task.id.clone(),
+                activity_type: "tool_call".to_string(),
+                tool_name: Some("http_request".to_string()),
+                tool_args: Some(
+                    r#"{"method":"POST","url":"https://api.x.com/2/tweets"}"#.to_string(),
+                ),
+                result: Some("HTTP 201 Created".to_string()),
+                success: Some(true),
+                tokens_used: None,
+                created_at: (prior_cycle + chrono::Duration::minutes(1)).to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        state
+            .finish_goal_run(&first_run.id, "completed", Some("First tweet posted."))
+            .await
+            .unwrap();
+
+        let second_run = state
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        let pending = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Manual scheduled run: Post one useful tweet".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: (now - chrono::Duration::minutes(2)).to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&pending).await.unwrap();
+        state
+            .upsert_scheduled_run_state(&crate::traits::ScheduledRunState {
+                goal_id: goal.id.clone(),
+                root_task_id: pending.id.clone(),
+                effective_budget_per_check: 5000,
+                tokens_used: 0,
+                budget_extensions_count: 0,
+                health: Default::default(),
+                created_at: (now - chrono::Duration::minutes(3)).to_rfc3339(),
+                updated_at: (now - chrono::Duration::minutes(3)).to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.dispatch_pending_tasks().await;
+
+        let pending_after = state.get_task(&pending.id).await.unwrap().unwrap();
+        assert_ne!(
+            pending_after.status, "completed",
+            "the previous run's mutation receipt must not auto-close a new manual run"
+        );
+        assert!(!pending_after
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains("mutating action")));
+        assert_eq!(
+            state
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            second_run.id,
+            "the new manual run must remain eligible for dispatch"
         );
     }
 

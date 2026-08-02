@@ -12,6 +12,10 @@ pub(in crate::agent) enum ToolResultNotice {
         tool_name: String,
         reason: String,
     },
+    ProjectInstructionsDiscovered {
+        tool_name: String,
+        sources: String,
+    },
     RunCommandPolicyAutoRoutedToTerminal,
     CliAgentInlineBoundary {
         task_hint: String,
@@ -163,6 +167,13 @@ impl ToolResultNotice {
                 "[SYSTEM] Blocked `{}` by deterministic argument contract: {}. \
 Continue with tools that directly match the user request.",
                 tool_name, reason
+            ),
+            Self::ProjectInstructionsDiscovered { tool_name, sources } => format!(
+                "[SYSTEM] `{}` was deliberately NOT executed because newly applicable project \
+                 instructions were discovered at {}. Review the new system-level Project \
+                 Instructions, adjust the action if needed, then retry it. This deferral made \
+                 no filesystem or external change.",
+                tool_name, sources
             ),
             Self::RunCommandPolicyAutoRoutedToTerminal => {
                 "[SYSTEM] run_command was blocked by policy; auto-routed to `terminal`."
@@ -591,6 +602,19 @@ mod tests {
         assert!(overlap.contains("1-9, 21-30"));
         assert!(overlap.contains("search_files"));
         assert!(overlap.contains("non-overlapping"));
+    }
+
+    #[test]
+    fn project_instruction_discovery_notice_is_an_explicit_noop() {
+        let rendered = ToolResultNotice::ProjectInstructionsDiscovered {
+            tool_name: "write_file".to_string(),
+            sources: "crates/widget/AGENTS.md".to_string(),
+        }
+        .render();
+
+        assert!(rendered.contains("deliberately NOT executed"));
+        assert!(rendered.contains("crates/widget/AGENTS.md"));
+        assert!(rendered.contains("no filesystem or external change"));
     }
 }
 

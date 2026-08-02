@@ -30,6 +30,165 @@ const MAX_MESSAGE_LEN: usize = 39_000;
 const DEFAULT_WORKSPACE_GRANT_HOURS: i64 = 24;
 const MAX_WORKSPACE_GRANT_HOURS: i64 = 168;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlackInboundEventKind {
+    Message,
+    FileShared,
+    Ignore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackFileShareLocation {
+    message_ts: String,
+    thread_ts: Option<String>,
+    is_private: bool,
+}
+
+fn classify_slack_inbound_event(event: &Value) -> SlackInboundEventKind {
+    match event.get("type").and_then(Value::as_str).unwrap_or("") {
+        "message" | "app_mention" => match event.get("subtype").and_then(Value::as_str) {
+            None | Some("file_share") => SlackInboundEventKind::Message,
+            Some(_) => SlackInboundEventKind::Ignore,
+        },
+        "file_shared" => SlackInboundEventKind::FileShared,
+        _ => SlackInboundEventKind::Ignore,
+    }
+}
+
+fn slack_file_share_location(
+    file: &Value,
+    channel_id: &str,
+    event_ts: Option<&str>,
+) -> Option<SlackFileShareLocation> {
+    let mut locations = Vec::new();
+    for (visibility, is_private) in [("private", true), ("public", false)] {
+        let Some(shares) = file
+            .get("shares")
+            .and_then(|value| value.get(visibility))
+            .and_then(|value| value.get(channel_id))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+
+        locations.extend(shares.iter().filter_map(|share| {
+            let message_ts = share.get("ts").and_then(Value::as_str)?.to_string();
+            let thread_ts = share
+                .get("thread_ts")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(SlackFileShareLocation {
+                message_ts,
+                thread_ts,
+                is_private,
+            })
+        }));
+    }
+
+    if locations.is_empty() {
+        return None;
+    }
+
+    if let Some(event_ts) = event_ts {
+        if let Some(exact) = locations
+            .iter()
+            .find(|location| location.message_ts == event_ts)
+        {
+            return Some(exact.clone());
+        }
+
+        if let Ok(event_number) = event_ts.parse::<f64>() {
+            locations.sort_by(|left, right| {
+                let left_distance = left
+                    .message_ts
+                    .parse::<f64>()
+                    .map(|value| (value - event_number).abs())
+                    .unwrap_or(f64::INFINITY);
+                let right_distance = right
+                    .message_ts
+                    .parse::<f64>()
+                    .map(|value| (value - event_number).abs())
+                    .unwrap_or(f64::INFINITY);
+                left_distance
+                    .total_cmp(&right_distance)
+                    .then_with(|| right.message_ts.cmp(&left.message_ts))
+            });
+            return locations.into_iter().next();
+        }
+    }
+
+    locations.into_iter().max_by(|left, right| {
+        match (
+            left.message_ts.parse::<f64>(),
+            right.message_ts.parse::<f64>(),
+        ) {
+            (Ok(left), Ok(right)) => left.total_cmp(&right),
+            _ => left.message_ts.cmp(&right.message_ts),
+        }
+    })
+}
+
+fn slack_channel_type(channel: &Value) -> &'static str {
+    if channel.get("is_im").and_then(Value::as_bool) == Some(true) {
+        "im"
+    } else if channel.get("is_mpim").and_then(Value::as_bool) == Some(true) {
+        "mpim"
+    } else if channel.get("is_private").and_then(Value::as_bool) == Some(true) {
+        "group"
+    } else {
+        "channel"
+    }
+}
+
+fn fallback_slack_channel_type(channel_id: &str, is_private: bool) -> &'static str {
+    if channel_id.starts_with('D') {
+        "im"
+    } else if is_private {
+        "group"
+    } else {
+        "channel"
+    }
+}
+
+fn normalize_file_shared_message(
+    mut message: Value,
+    file_event: &Value,
+    file: &Value,
+    channel_id: &str,
+    channel_type: &str,
+) -> anyhow::Result<Value> {
+    let message_object = message
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Slack file share message was not an object"))?;
+    message_object.insert("type".to_string(), Value::String("message".to_string()));
+    message_object.insert("channel".to_string(), Value::String(channel_id.to_string()));
+    message_object.insert(
+        "channel_type".to_string(),
+        Value::String(channel_type.to_string()),
+    );
+
+    if !message_object.contains_key("user") {
+        if let Some(user_id) = file_event
+            .get("user_id")
+            .or_else(|| file_event.get("user"))
+            .and_then(Value::as_str)
+            .or_else(|| file.get("user").and_then(Value::as_str))
+        {
+            message_object.insert("user".to_string(), Value::String(user_id.to_string()));
+        }
+    }
+
+    let has_files = message_object
+        .get("files")
+        .and_then(Value::as_array)
+        .is_some_and(|files| !files.is_empty());
+    if !has_files {
+        message_object.insert("files".to_string(), Value::Array(vec![file.clone()]));
+    }
+
+    Ok(message)
+}
+
 /// Serialize config mutations across every Slack bot in this process. Without
 /// one shared lock, simultaneous grants/auto-claims could overwrite each other.
 static SLACK_CONFIG_WRITE_LOCK: once_cell::sync::Lazy<Mutex<()>> =
@@ -1144,6 +1303,208 @@ impl SlackChannel {
         Ok(body)
     }
 
+    /// Make a Slack Web API call with query parameters and one bounded 429 retry.
+    async fn slack_api_query(
+        &self,
+        method: &str,
+        params: &[(&str, String)],
+    ) -> anyhow::Result<Value> {
+        let url = format!("https://slack.com/api/{}", method);
+        let mut resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .query(params)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Some(delay) = crate::channels::rate_limit::retry_after_from_headers(
+                resp.headers(),
+                crate::channels::rate_limit::default_retry_after_cap(),
+            ) {
+                crate::channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
+                resp = self
+                    .http
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", self.bot_token))
+                    .query(params)
+                    .send()
+                    .await?;
+            }
+        }
+
+        let status = resp.status();
+        let response_text = resp.text().await?;
+        let result: Value = serde_json::from_str(&response_text).map_err(|error| {
+            anyhow::anyhow!(
+                "Slack API {} returned invalid JSON (HTTP {}): {}",
+                method,
+                status,
+                error
+            )
+        })?;
+        if !status.is_success() || result.get("ok").and_then(Value::as_bool) != Some(true) {
+            let error = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!(
+                "Slack API {} failed: {} (HTTP {}, response: {})",
+                method,
+                error,
+                status,
+                result
+            );
+        }
+        Ok(result)
+    }
+
+    async fn fetch_slack_file_info(&self, file_id: &str) -> anyhow::Result<Value> {
+        let params = [("file", file_id.to_string())];
+        let response = self.slack_api_query("files.info", &params).await?;
+        response
+            .get("file")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Slack files.info omitted file {}", file_id))
+    }
+
+    async fn resolve_slack_file_metadata(&self, file: &Value) -> anyhow::Result<Value> {
+        let has_download_url = file
+            .get("url_private_download")
+            .or_else(|| file.get("url_private"))
+            .and_then(Value::as_str)
+            .is_some();
+        let metadata_complete = file.get("name").and_then(Value::as_str).is_some()
+            && file.get("mimetype").and_then(Value::as_str).is_some()
+            && file.get("size").and_then(Value::as_u64).is_some();
+        if has_download_url && metadata_complete {
+            return Ok(file.clone());
+        }
+
+        let file_id = file
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Slack file metadata omitted both a URL and file ID"))?;
+        self.fetch_slack_file_info(file_id).await
+    }
+
+    async fn hydrate_file_shared_event(&self, event: &Value) -> anyhow::Result<Value> {
+        const RETRY_DELAYS_MS: [u64; 3] = [200, 500, 1_000];
+
+        let mut last_error = None;
+        for attempt in 0..=RETRY_DELAYS_MS.len() {
+            match self.try_hydrate_file_shared_event(event).await {
+                Ok(message) => return Ok(message),
+                Err(error) => {
+                    debug!(
+                        attempt = attempt + 1,
+                        error = %error,
+                        "Slack file_shared event was not ready"
+                    );
+                    last_error = Some(error);
+                }
+            }
+
+            if let Some(delay_ms) = RETRY_DELAYS_MS.get(attempt) {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Slack file share hydration failed")))
+    }
+
+    async fn try_hydrate_file_shared_event(&self, event: &Value) -> anyhow::Result<Value> {
+        let channel_id = event
+            .get("channel_id")
+            .or_else(|| event.get("channel"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Slack file_shared event omitted channel_id"))?;
+        let file_id = event
+            .get("file_id")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/file/id").and_then(Value::as_str))
+            .ok_or_else(|| anyhow::anyhow!("Slack file_shared event omitted file_id"))?;
+        let event_ts = event.get("event_ts").and_then(Value::as_str);
+
+        let file = self.fetch_slack_file_info(file_id).await?;
+        let location = slack_file_share_location(&file, channel_id, event_ts).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Slack files.info did not expose a share for file {} in channel {}",
+                file_id,
+                channel_id
+            )
+        })?;
+
+        let (method, mut params) = if let Some(thread_ts) = location
+            .thread_ts
+            .as_deref()
+            .filter(|thread_ts| *thread_ts != location.message_ts)
+        {
+            (
+                "conversations.replies",
+                vec![
+                    ("channel", channel_id.to_string()),
+                    ("ts", thread_ts.to_string()),
+                ],
+            )
+        } else {
+            (
+                "conversations.history",
+                vec![("channel", channel_id.to_string())],
+            )
+        };
+        params.extend([
+            ("oldest", location.message_ts.clone()),
+            ("latest", location.message_ts.clone()),
+            ("inclusive", "true".to_string()),
+            ("limit", "15".to_string()),
+        ]);
+        let history = self.slack_api_query(method, &params).await?;
+        let message = history
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages.iter().find(|message| {
+                    message.get("ts").and_then(Value::as_str) == Some(location.message_ts.as_str())
+                })
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Slack {} did not return file share message {}",
+                    method,
+                    location.message_ts
+                )
+            })?;
+
+        let channel_type = if let Some(channel_type) = event
+            .get("channel_type")
+            .and_then(Value::as_str)
+            .filter(|channel_type| matches!(*channel_type, "im" | "mpim" | "group" | "channel"))
+        {
+            channel_type.to_string()
+        } else {
+            let params = [("channel", channel_id.to_string())];
+            match self.slack_api_query("conversations.info", &params).await {
+                Ok(response) => response
+                    .get("channel")
+                    .map(slack_channel_type)
+                    .unwrap_or_else(|| fallback_slack_channel_type(channel_id, location.is_private))
+                    .to_string(),
+                Err(error) => {
+                    warn!(
+                        channel_id,
+                        error = %error,
+                        "Could not resolve Slack channel type for file_shared event"
+                    );
+                    fallback_slack_channel_type(channel_id, location.is_private).to_string()
+                }
+            }
+        };
+
+        normalize_file_shared_message(message, event, &file, channel_id, &channel_type)
+    }
+
     /// Make a POST Slack API call with a JSON body.
     async fn slack_api_post(&self, method: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("https://slack.com/api/{}", method);
@@ -1222,19 +1583,34 @@ impl SlackChannel {
 
     /// Handle an Events API payload (message events, etc.).
     async fn handle_events_api(&self, payload: &Value) {
-        let event = match payload.get("event") {
-            Some(e) => e,
+        let mut event = match payload.get("event").cloned() {
+            Some(event) => event,
             None => return,
         };
 
-        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if event_type != "message" && event_type != "app_mention" {
-            return;
-        }
-
-        // Ignore message subtypes (edits, joins, bot messages, etc.)
-        if event.get("subtype").is_some() {
-            return;
+        match classify_slack_inbound_event(&event) {
+            SlackInboundEventKind::Message => {}
+            SlackInboundEventKind::FileShared => {
+                event = match self.hydrate_file_shared_event(&event).await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(
+                            file_id = event
+                                .get("file_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown"),
+                            channel_id = event
+                                .get("channel_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown"),
+                            error = %error,
+                            "Failed to hydrate Slack file_shared event"
+                        );
+                        return;
+                    }
+                };
+            }
+            SlackInboundEventKind::Ignore => return,
         }
 
         let user = match event.get("user").and_then(|v| v.as_str()) {
@@ -2548,7 +2924,8 @@ impl SlackChannel {
     ) -> anyhow::Result<Vec<crate::traits::MessageAttachment>> {
         let mut attachments = Vec::new();
 
-        for file in files {
+        for sparse_file in files {
+            let file = self.resolve_slack_file_metadata(sparse_file).await?;
             let filename = file.get("name").and_then(|v| v.as_str()).unwrap_or("file");
             let file_size = file.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
             let mime_type = file
@@ -2565,16 +2942,16 @@ impl SlackChannel {
                 );
             }
 
-            let download_url = match file.get("url_private_download").and_then(|v| v.as_str()) {
-                Some(u) => u,
-                None => {
-                    tracing::warn!(
-                        filename,
-                        "Slack file missing url_private_download; skipping"
-                    );
-                    continue;
-                }
-            };
+            let download_url = file
+                .get("url_private_download")
+                .or_else(|| file.get("url_private"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Slack file {} has no private download URL after files.info",
+                        filename
+                    )
+                })?;
 
             let resp = self
                 .http
@@ -2586,7 +2963,23 @@ impl SlackChannel {
             if !resp.status().is_success() {
                 anyhow::bail!("Failed to download Slack file: HTTP {}", resp.status());
             }
+            if let Some(content_length) = resp.content_length() {
+                if content_length > max_bytes {
+                    anyhow::bail!(
+                        "File too large ({:.1} MB). Maximum is {} MB.",
+                        content_length as f64 / 1_048_576.0,
+                        self.max_file_size_mb
+                    );
+                }
+            }
             let bytes = resp.bytes().await?;
+            if bytes.len() as u64 > max_bytes {
+                anyhow::bail!(
+                    "File too large ({:.1} MB). Maximum is {} MB.",
+                    bytes.len() as f64 / 1_048_576.0,
+                    self.max_file_size_mb
+                );
+            }
 
             let sanitized = sanitize_filename(filename);
             let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -3052,6 +3445,197 @@ pub fn spawn_slack_channel(channel: Arc<SlackChannel>) {
     tokio::spawn(async move {
         channel.start_with_retry().await;
     });
+}
+
+#[cfg(test)]
+mod file_event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_file_share_messages_without_accepting_unrelated_subtypes() {
+        assert_eq!(
+            classify_slack_inbound_event(&json!({"type": "message"})),
+            SlackInboundEventKind::Message
+        );
+        assert_eq!(
+            classify_slack_inbound_event(&json!({
+                "type": "message",
+                "subtype": "file_share",
+                "files": [{"id": "F_IMAGE_1"}]
+            })),
+            SlackInboundEventKind::Message
+        );
+        assert_eq!(
+            classify_slack_inbound_event(&json!({
+                "type": "app_mention",
+                "subtype": "file_share"
+            })),
+            SlackInboundEventKind::Message
+        );
+        assert_eq!(
+            classify_slack_inbound_event(&json!({
+                "type": "message",
+                "subtype": "message_changed"
+            })),
+            SlackInboundEventKind::Ignore
+        );
+        assert_eq!(
+            classify_slack_inbound_event(&json!({
+                "type": "message",
+                "subtype": "bot_message"
+            })),
+            SlackInboundEventKind::Ignore
+        );
+    }
+
+    #[test]
+    fn routes_standalone_file_shared_events_for_hydration() {
+        assert_eq!(
+            classify_slack_inbound_event(&json!({
+                "type": "file_shared",
+                "file_id": "F_IMAGE_1",
+                "channel_id": "C_PROJECT"
+            })),
+            SlackInboundEventKind::FileShared
+        );
+        assert_eq!(
+            classify_slack_inbound_event(&json!({"type": "reaction_added"})),
+            SlackInboundEventKind::Ignore
+        );
+    }
+
+    #[test]
+    fn locates_the_share_closest_to_the_file_event() {
+        let file = json!({
+            "shares": {
+                "private": {
+                    "C_PROJECT": [
+                        {"ts": "100.000001"},
+                        {"ts": "300.000001", "thread_ts": "250.000001"}
+                    ]
+                },
+                "public": {
+                    "C_OTHER": [{"ts": "400.000001"}]
+                }
+            }
+        });
+
+        assert_eq!(
+            slack_file_share_location(&file, "C_PROJECT", Some("300.000002")),
+            Some(SlackFileShareLocation {
+                message_ts: "300.000001".to_string(),
+                thread_ts: Some("250.000001".to_string()),
+                is_private: true,
+            })
+        );
+        assert_eq!(
+            slack_file_share_location(&file, "C_PROJECT", None),
+            Some(SlackFileShareLocation {
+                message_ts: "300.000001".to_string(),
+                thread_ts: Some("250.000001".to_string()),
+                is_private: true,
+            })
+        );
+        assert!(slack_file_share_location(&file, "C_MISSING", None).is_none());
+    }
+
+    #[test]
+    fn recovered_file_message_keeps_text_and_every_reference_image() {
+        let history_message = json!({
+            "type": "message",
+            "subtype": "file_share",
+            "user": "U_OWNER",
+            "text": "<@U_BOT> use both images as references",
+            "ts": "300.000001",
+            "files": [
+                {"id": "F_IMAGE_1", "name": "reference-1.jpg"},
+                {"id": "F_IMAGE_2", "name": "reference-2.jpg"}
+            ]
+        });
+        let file_event = json!({
+            "type": "file_shared",
+            "file_id": "F_IMAGE_1",
+            "user_id": "U_OWNER",
+            "channel_id": "C_PROJECT"
+        });
+        let file = json!({"id": "F_IMAGE_1", "user": "U_OWNER"});
+
+        let normalized = normalize_file_shared_message(
+            history_message,
+            &file_event,
+            &file,
+            "C_PROJECT",
+            "group",
+        )
+        .unwrap();
+
+        assert_eq!(normalized["type"], "message");
+        assert_eq!(normalized["channel"], "C_PROJECT");
+        assert_eq!(normalized["channel_type"], "group");
+        assert_eq!(normalized["user"], "U_OWNER");
+        assert_eq!(normalized["text"], "<@U_BOT> use both images as references");
+        assert_eq!(normalized["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repeated_per_file_callbacks_recover_one_stable_message_identity() {
+        let history_message = json!({
+            "text": "<@U_BOT> compare these",
+            "ts": "500.000001",
+            "files": [
+                {"id": "F_IMAGE_1"},
+                {"id": "F_IMAGE_2"}
+            ]
+        });
+
+        let first = normalize_file_shared_message(
+            history_message.clone(),
+            &json!({"file_id": "F_IMAGE_1", "user_id": "U_OWNER"}),
+            &json!({"id": "F_IMAGE_1"}),
+            "C_PROJECT",
+            "channel",
+        )
+        .unwrap();
+        let second = normalize_file_shared_message(
+            history_message,
+            &json!({"file_id": "F_IMAGE_2", "user_id": "U_OWNER"}),
+            &json!({"id": "F_IMAGE_2"}),
+            "C_PROJECT",
+            "channel",
+        )
+        .unwrap();
+
+        assert_eq!(first["ts"], second["ts"]);
+        assert_eq!(first["files"], second["files"]);
+        assert_eq!(first["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sparse_history_message_uses_file_event_fallbacks() {
+        let normalized = normalize_file_shared_message(
+            json!({"text": "", "ts": "600.000001"}),
+            &json!({"user_id": "U_OWNER"}),
+            &json!({"id": "F_IMAGE_1", "user": "U_FILE_OWNER"}),
+            "D_OWNER",
+            "im",
+        )
+        .unwrap();
+
+        assert_eq!(normalized["user"], "U_OWNER");
+        assert_eq!(normalized["files"][0]["id"], "F_IMAGE_1");
+    }
+
+    #[test]
+    fn resolves_channel_types_without_weakening_private_fallbacks() {
+        assert_eq!(slack_channel_type(&json!({"is_im": true})), "im");
+        assert_eq!(slack_channel_type(&json!({"is_mpim": true})), "mpim");
+        assert_eq!(slack_channel_type(&json!({"is_private": true})), "group");
+        assert_eq!(slack_channel_type(&json!({"is_channel": true})), "channel");
+        assert_eq!(fallback_slack_channel_type("D_OWNER", true), "im");
+        assert_eq!(fallback_slack_channel_type("C_PRIVATE", true), "group");
+        assert_eq!(fallback_slack_channel_type("C_PUBLIC", false), "channel");
+    }
 }
 
 #[cfg(test)]

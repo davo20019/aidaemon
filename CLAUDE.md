@@ -129,6 +129,33 @@ Prefer reading the current module files over trusting stale architecture notes.
 This codebase changes quickly; keep this guide focused on durable invariants and
 navigation pointers.
 
+## Project Instruction Loading
+
+For a repo-scoped task, the direct AIDaemon agent loads project guidance through
+`src/project_instructions.rs` into the volatile task-context tail. Discovery is
+broad-to-specific from the nearest project root to the selected working
+directory. At each directory, prefer a non-empty `AGENTS.override.md`, then
+`AGENTS.md`, and use `CLAUDE.md` or `GEMINI.md` only as compatibility fallbacks;
+`README.md` is never authoritative instruction content.
+
+Bootstrap loads only the hierarchy applicable to the selected working
+directory. Before a high-intent file read/write, project inspection, Git action,
+or shell command enters a deeper subtree, the central tool prelude resolves any
+newly applicable nested instructions, appends them to the system-level task
+context, and deliberately defers the whole tool batch without executing it. The
+model must review the new guidance and retry. Already-delivered source paths are
+task-local deduplicated, broad file searches do not trigger eager instruction
+loads, and the execution phase repeats the check after working-directory
+injection as a defense-in-depth fallback.
+
+Project instructions apply only inside their directory scope. They cannot
+expand channel/workspace authority, grant secret access, authorize destructive
+or external actions, or override system/security rules or the user's explicit
+current request. Symlinks are accepted only when their canonical target remains
+inside the project root. Instruction files and each delivered hierarchy remain
+size-bounded. Keep direct-agent and CLI-agent instruction discovery on this
+shared resolver so their behavior does not drift.
+
 ## Core Traits
 
 The core interfaces are re-exported from `src/traits.rs`:

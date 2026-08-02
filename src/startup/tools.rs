@@ -560,7 +560,8 @@ pub async fn register_optional_tools(
                 std::fs::create_dir_all(&inbox_dir)?;
                 tools.push(Arc::new(
                     GenerateImageTool::chatgpt_subscription(PathBuf::from(&inbox_dir))
-                        .map_err(anyhow::Error::msg)?,
+                        .map_err(anyhow::Error::msg)?
+                        .with_event_store(event_store.clone()),
                 ));
             }
             OptionalToolId::CliAgents => {

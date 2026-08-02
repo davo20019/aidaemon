@@ -408,6 +408,16 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         }
     }
     let requests_external_verification = user_requests_external_verification(user_text);
+    // Bootstrap tool exposure happens before per-task routing. Use the runtime
+    // snapshot's primary model as the trust-tier signal so keyword-derived
+    // memory intent can narrow tools only for Guided models. The same snapshot
+    // is reused below for provider/router selection.
+    let llm_runtime_snapshot = agent.llm_runtime.snapshot();
+    let llm_provider = llm_runtime_snapshot.provider();
+    let llm_router = llm_runtime_snapshot.router();
+    let guided_bootstrap_supervision = agent
+        .trust_tier_for_model(&llm_runtime_snapshot.primary_model())
+        == crate::agent::trust_tier::ModelTrustTier::Guided;
     let skills_snapshot = agent.skill_cache.get();
     let active_untrusted_external_reference_skills =
         matched_untrusted_external_reference_skill_names(
@@ -421,15 +431,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         && !user_explicitly_requests_local_file_inspection(user_text);
     // For personal-memory recall turns, keep tool search narrow unless the
     // user explicitly asks for broader verification.
-    let restrict_to_personal_memory_tools =
-        is_personal_memory_recall_turn && !requests_external_verification;
+    let restrict_to_personal_memory_tools = guided_bootstrap_supervision
+        && is_personal_memory_recall_turn
+        && !requests_external_verification;
     // "Are you sure?" should allow only one targeted re-check before reaffirming.
-    let personal_memory_tool_call_cap =
-        if is_reaffirmation_challenge_turn && is_personal_memory_recall_turn {
-            1
-        } else {
-            4
-        };
+    let personal_memory_tool_call_cap = if guided_bootstrap_supervision
+        && is_reaffirmation_challenge_turn
+        && is_personal_memory_recall_turn
+    {
+        1
+    } else {
+        4
+    };
 
     // Tools are owner-only by default. A Guest can receive a tiny file-tool
     // subset only through an explicit, active, channel-bound workspace grant.
@@ -707,13 +720,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         )
         .await;
 
-    // Keep provider + router consistent for this task, even if runtime reloads.
-    let llm_runtime_snapshot = agent.llm_runtime.snapshot();
-    let llm_provider = llm_runtime_snapshot.provider();
-    // All depths get the router so cascade fallback works on rate limits.
-    // Other depth-0-only features (identity detection, memory loading) have
-    // their own separate depth checks.
-    let llm_router = llm_runtime_snapshot.router();
+    // Provider + router came from the same runtime snapshot above, keeping
+    // this task internally consistent even if runtime configuration reloads.
 
     // Model selection: route to the appropriate model.
     // Iteration 1 runs deterministic orchestration routing before entering
@@ -896,6 +904,25 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         None
     };
 
+    // Resolve turn/project context before prompt construction. The main loop
+    // reuses this exact snapshot so instruction scope cannot drift between the
+    // prompt AIDaemon saw and the filesystem scope its tools enforce.
+    let turn_context = agent
+        .build_turn_context_from_recent_history(session_id, user_text)
+        .await;
+    let project_instruction_scope = if turn_context.allow_multi_project_scope {
+        // A single instruction hierarchy must not silently govern an explicit
+        // multi-repository request. Each delegated working directory can still
+        // apply its own native/scoped instructions.
+        None
+    } else if user_role == UserRole::Owner {
+        turn_context.primary_project_scope.as_deref()
+    } else {
+        // Collaborators may receive project guidance only from the exact root
+        // already authorized by their active workspace grant.
+        workspace_grant.map(|grant| grant.project_root.as_str())
+    };
+
     // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
     // Returns the session-static CORE bytes (message zero) and the per-task
     // volatile TAIL separately so the assembler can place them at message 0 and
@@ -908,20 +935,22 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // MISS a `Core prompt invalidated component=...` line is logged there. Option
     // (b) in the plan — chosen for the smaller diff since assemble + render already
     // co-locate at that call site.
-    let (core_prompt_bytes, task_context_tail, active_skill_names) = agent
-        .build_system_prompt_for_message(
-            &emitter,
-            &task_id,
-            session_id,
-            user_text,
-            user_role,
-            &channel_ctx,
-            tool_defs.len(),
-            resume_checkpoint.as_ref(),
-            owner_dm_fact_cache.as_deref(),
-            session_summary.as_ref(),
-        )
-        .await?;
+    let (core_prompt_bytes, task_context_tail, active_skill_names, project_instruction_tracker) =
+        agent
+            .build_system_prompt_for_message(
+                &emitter,
+                &task_id,
+                session_id,
+                user_text,
+                user_role,
+                &channel_ctx,
+                tool_defs.len(),
+                resume_checkpoint.as_ref(),
+                owner_dm_fact_cache.as_deref(),
+                session_summary.as_ref(),
+                project_instruction_scope,
+            )
+            .await?;
 
     // Pillar B (Task 7): historical conversation retention is now owned
     // entirely by the turn-anchored fetch in `message_build_phase`
@@ -972,6 +1001,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         llm_router,
         model,
         route_failsafe_active,
+        turn_context,
+        project_instruction_tracker,
         core_prompt_bytes,
         task_context_tail,
         session_summary,

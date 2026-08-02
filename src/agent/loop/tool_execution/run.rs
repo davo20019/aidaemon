@@ -4,7 +4,7 @@ use super::guards::LoopPatternGuardOutcome;
 use super::project_dir::{
     extract_project_dir_hint_with_aliases, is_file_recheck_tool,
     maybe_inject_project_dir_into_tool_args, project_dir_from_tool_args,
-    tool_call_includes_project_path,
+    project_instruction_targets_for_tool_call, tool_call_includes_project_path,
 };
 use super::result_learning::{ResultLearningEnv, ResultLearningState};
 use super::run_helpers::*;
@@ -201,6 +201,40 @@ fn format_line_intervals(intervals: &[LineInterval]) -> String {
         .join(", ")
 }
 
+async fn defer_tool_calls_for_new_project_instructions(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_calls: &[ToolCall],
+    source_paths: &[String],
+) -> anyhow::Result<()> {
+    let sources = source_paths.join(", ");
+    for tool_call in tool_calls {
+        let result_text = ToolResultNotice::ProjectInstructionsDiscovered {
+            tool_name: tool_call.name.clone(),
+            sources: sources.clone(),
+        }
+        .render();
+        let tool_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "tool".to_string(),
+            content: Some(result_text),
+            tool_call_id: Some(tool_call.id.clone()),
+            tool_name: Some(tool_call.name.clone()),
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.2,
+            ..Message::runtime_defaults()
+        };
+        agent
+            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .await?;
+    }
+    Ok(())
+}
+
 pub(in crate::agent) async fn run_tool_execution_phase(
     services: &crate::agent::services::AgentServices<'_>,
     ctx: &mut ToolExecutionCtx<'_>,
@@ -232,9 +266,12 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let heartbeat = ctx.heartbeat;
     let turn_context = ctx.turn_context;
     let resolved_goal_id = ctx.resolved_goal_id;
+    let is_scheduled_goal = ctx.is_scheduled_goal;
     let evidence_state = &mut *ctx.evidence_state;
     let validation_state = &mut *ctx.validation_state;
     let read_file_tracker = &mut *ctx.read_file_tracker;
+    let project_instruction_tracker = &mut *ctx.project_instruction_tracker;
+    let task_context_tail = &mut *ctx.task_context_tail;
 
     let mut tool_defs = std::mem::take(ctx.tool_defs);
     let mut total_tool_calls_attempted = *ctx.total_tool_calls_attempted;
@@ -349,6 +386,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     .and_then(|request| request.semantic_scope)
             }),
         _user_text,
+        is_scheduled_goal,
     );
     info!(
         session_id,
@@ -367,7 +405,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     // result only when its computed effective arguments match exactly.
     // Prefetch is disabled in correction mode: the correction gate must run
     // the full sandbox classifier on each call before I/O begins.
-    let mut prefetched_io = if !restrict_untrusted_external_reference_tools
+    let mut prefetched_io = if project_instruction_tracker.is_none()
+        && !restrict_untrusted_external_reference_tools
         && ctx.correction.is_none()
         && super::parallel_prefetch::batch_is_prefetch_eligible(
             &resp.tool_calls,
@@ -415,7 +454,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     // deliverable for the task lead, so the loop ends after this batch instead
     // of running reconciliation/verification iterations against it.
     let mut executor_blocker_summary: Option<String> = None;
-    for tc in &resp.tool_calls {
+    for (tool_call_index, tc) in resp.tool_calls.iter().enumerate() {
         if let Some(limit) = execution_state.exhausted_limit(task_tokens_used, task_start.elapsed())
         {
             force_text_response = true;
@@ -629,7 +668,22 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     .map(|affordances| affordances.scope)
             })
             .or_else(|| fallback_tool_semantic_scope(&tc.name));
-        if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope) {
+        if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope)
+            && agent
+                .supervision_gate_enforced_with_context(
+                    "dialogue_semantic_scope_gate",
+                    model,
+                    emitter,
+                    task_id,
+                    iteration,
+                    json!({
+                        "tool": tc.name,
+                        "active_scope": active_dialogue_scope.map(|scope| format!("{scope:?}")),
+                        "tool_scope": tool_semantic_scope.map(|scope| format!("{scope:?}")),
+                    }),
+                )
+                .await
+        {
             *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
             let active_scope = active_dialogue_scope
                 .map(|scope| format!("{scope:?}"))
@@ -739,6 +793,82 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .get(&tc.name)
             .copied()
             .unwrap_or_default();
+
+        if let Some(tracker) = project_instruction_tracker.as_mut() {
+            let instruction_targets = project_instruction_targets_for_tool_call(
+                &tc.name,
+                &effective_arguments,
+                &call_semantics,
+            );
+            if !instruction_targets.is_empty() {
+                match tracker
+                    .discover_for_targets(
+                        crate::execution::active_execution_backend(),
+                        &instruction_targets,
+                    )
+                    .await
+                {
+                    Ok(Some(instructions)) => {
+                        let source_paths = instructions.source_paths();
+                        if !task_context_tail.is_empty() {
+                            task_context_tail.push_str("\n\n");
+                        }
+                        task_context_tail.push_str(
+                            "[Just-in-time Project Instructions — loaded before subtree work]\n",
+                        );
+                        task_context_tail.push_str(&instructions.render_for_prompt());
+                        info!(
+                            session_id,
+                            iteration,
+                            tool = %tc.name,
+                            instruction_targets = ?instruction_targets,
+                            instruction_sources = ?source_paths,
+                            "Deferred tool call to load nested project instructions"
+                        );
+                        agent
+                            .emit_decision_point(
+                                emitter,
+                                task_id,
+                                iteration,
+                                DecisionType::InstructionsSnapshot,
+                                format!("Loaded nested project instructions before {}", tc.name),
+                                json!({
+                                    "condition": "jit_project_instructions_discovered",
+                                    "tool": tc.name,
+                                    "targets": &instruction_targets,
+                                    "sources": &source_paths,
+                                    "action_executed": false,
+                                }),
+                            )
+                            .await;
+                        defer_tool_calls_for_new_project_instructions(
+                            agent,
+                            emitter,
+                            session_id,
+                            task_id,
+                            &resp.tool_calls[tool_call_index..],
+                            &source_paths,
+                        )
+                        .await?;
+                        total_tool_calls_attempted = total_tool_calls_attempted.saturating_sub(1);
+                        commit_state!();
+                        return Ok(ToolExecutionOutcome::NextIteration);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            session_id,
+                            iteration,
+                            tool = %tc.name,
+                            instruction_targets = ?instruction_targets,
+                            %error,
+                            "Could not perform just-in-time project instruction discovery"
+                        );
+                    }
+                }
+            }
+        }
+
         let step_plan = compile_step_execution_plan(
             &execution_state.execution_id,
             execution_state.current_plan_version.unwrap_or(1),
@@ -1095,6 +1225,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             task_start,
             task_tokens_used,
             learning_ctx,
+            model,
             &mut recent_tool_calls,
             &mut recent_tool_names,
             &mut consecutive_same_tool,

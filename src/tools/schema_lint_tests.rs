@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_SCHEMA_SEGMENT_CHARS: usize = 6_500;
-const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 100_000;
+// Reference-image editing adds one bounded input to `generate_image`; retain a
+// hard aggregate ceiling while accounting for that user-visible capability.
+const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 101_000;
 
 fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")

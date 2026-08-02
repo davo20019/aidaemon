@@ -365,7 +365,10 @@ pub(crate) async fn generate_task_plan(
            named operations. Example: build locally but do not deploy => scoped, \
            expects_mutation=true, forbidden_actions=[\"deploy\"].\n\
          - Valid forbidden_actions values are create, delete, deploy, publish, post, and send. \
-           Include only operations actually forbidden by the current request.\n\
+           Include only operations actually forbidden by the current request. A content, retry, \
+           or precondition guard is not an operation-wide ban: for example, \"do not post \
+           secrets\", \"do not post filler\", and \"do not post if identity verification fails\" \
+           must not produce forbidden_actions=[\"post\"].\n\
          - mutation_scope=allowed when there is no negative mutation constraint; then \
            forbidden_actions and constraint_evidence must be empty.\n\
          - For read_only or scoped, constraint_evidence must contain the exact verbatim \

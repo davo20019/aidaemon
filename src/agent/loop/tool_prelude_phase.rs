@@ -30,6 +30,9 @@ pub(super) struct ToolPreludeCtx<'a> {
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
     pub force_text_response: &'a mut bool,
     pub turn_context: &'a TurnContext,
+    pub project_instruction_tracker:
+        &'a mut Option<crate::project_instructions::ProjectInstructionTracker>,
+    pub task_context_tail: &'a mut String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -876,6 +879,41 @@ async fn inject_prelude_retry_messages(
     Ok(())
 }
 
+async fn defer_prelude_for_new_project_instructions(
+    agent: &Agent,
+    emitter: &crate::events::EventEmitter,
+    session_id: &str,
+    task_id: &str,
+    tool_calls: &[ToolCall],
+    source_paths: &[String],
+) -> anyhow::Result<()> {
+    let sources = source_paths.join(", ");
+    for tool_call in tool_calls {
+        let tool_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: "tool".to_string(),
+            content: Some(
+                ToolResultNotice::ProjectInstructionsDiscovered {
+                    tool_name: tool_call.name.clone(),
+                    sources: sources.clone(),
+                }
+                .render(),
+            ),
+            tool_call_id: Some(tool_call.id.clone()),
+            tool_name: Some(tool_call.name.clone()),
+            tool_calls_json: None,
+            created_at: Utc::now(),
+            importance: 0.2,
+            ..Message::runtime_defaults()
+        };
+        agent
+            .append_tool_message_with_result_event(emitter, &tool_msg, true, 0, None, Some(task_id))
+            .await?;
+    }
+    Ok(())
+}
+
 async fn request_pre_execution_plan(
     llm_provider: Arc<dyn ModelProvider>,
     model: &str,
@@ -1019,6 +1057,8 @@ pub(super) async fn run_tool_prelude_phase(
     let pending_system_messages = &mut *ctx.pending_system_messages;
     let force_text_response = &mut *ctx.force_text_response;
     let turn_context = ctx.turn_context;
+    let project_instruction_tracker = &mut *ctx.project_instruction_tracker;
+    let task_context_tail = &mut *ctx.task_context_tail;
     // Persist assistant message with tool calls
     let assistant_msg = Message {
         id: Uuid::new_v4().to_string(),
@@ -1042,17 +1082,42 @@ pub(super) async fn run_tool_prelude_phase(
         )
         .await?;
 
-    // Hard negative contract: an executor instructed to inspect/report only
-    // must never drift into a write. This is enforced before execution rather
-    // than merely scored after the damage is done.
-    if let Some((blocked, restriction)) = resp.tool_calls.iter().find_map(|tc| {
+    // Explicit operation-wide read-only instructions remain an authorization
+    // boundary. Scoped action matches, however, are language heuristics: they
+    // are useful coaching for Guided models but must not intercept an
+    // Autonomous model's valid tool call. Deterministic tool/auth/role policy
+    // remains enforced in the execution phase for every model.
+    let negative_contract_match = resp.tool_calls.iter().find_map(|tc| {
         negative_contract_block_reason(
             &turn_context.completion_contract,
             tc,
             tool_call_is_side_effecting(agent, tc, available_capabilities),
         )
         .map(|restriction| (tc, restriction))
-    }) {
+    });
+    let enforce_negative_contract =
+        if let Some((blocked, restriction)) = negative_contract_match.as_ref() {
+            turn_context.completion_contract.forbids_mutation
+                || agent
+                    .supervision_gate_enforced_with_context(
+                        "scoped_negative_contract",
+                        model,
+                        emitter,
+                        task_id,
+                        iteration,
+                        json!({
+                            "tool": blocked.name,
+                            "forbidden_action": restriction,
+                        }),
+                    )
+                    .await
+        } else {
+            false
+        };
+    if enforce_negative_contract {
+        let (blocked, restriction) = negative_contract_match
+            .as_ref()
+            .expect("negative contract match exists when enforcement is requested");
         agent
             .with_harness_eval(|eval| eval.record_forbidden_mutation_attempt())
             .await;
@@ -1328,6 +1393,90 @@ pub(super) async fn run_tool_prelude_phase(
                 )
                 .await;
             return Ok(ToolPreludeOutcome::Return(Ok(clarify)));
+        }
+    }
+
+    if let Some(tracker) = project_instruction_tracker.as_mut() {
+        let mut instruction_targets = Vec::new();
+        for tool_call in &resp.tool_calls {
+            let call_semantics = agent
+                .tools
+                .iter()
+                .find(|tool| tool.name() == tool_call.name && tool.is_available())
+                .map(|tool| tool.call_semantics(&tool_call.arguments))
+                .unwrap_or_default();
+            for target in super::tool_execution_phase::project_instruction_targets_for_tool_call(
+                &tool_call.name,
+                &tool_call.arguments,
+                &call_semantics,
+            ) {
+                if !instruction_targets.contains(&target) {
+                    instruction_targets.push(target);
+                }
+            }
+        }
+
+        if !instruction_targets.is_empty() {
+            match tracker
+                .discover_for_targets(
+                    crate::execution::active_execution_backend(),
+                    &instruction_targets,
+                )
+                .await
+            {
+                Ok(Some(instructions)) => {
+                    let source_paths = instructions.source_paths();
+                    if !task_context_tail.is_empty() {
+                        task_context_tail.push_str("\n\n");
+                    }
+                    task_context_tail.push_str(
+                        "[Just-in-time Project Instructions — loaded before subtree work]\n",
+                    );
+                    task_context_tail.push_str(&instructions.render_for_prompt());
+                    info!(
+                        session_id,
+                        iteration,
+                        instruction_targets = ?instruction_targets,
+                        instruction_sources = ?source_paths,
+                        "Deferred tool batch to load nested project instructions"
+                    );
+                    agent
+                        .emit_decision_point(
+                            emitter,
+                            task_id,
+                            iteration,
+                            DecisionType::InstructionsSnapshot,
+                            "Loaded nested project instructions before tool execution".to_string(),
+                            json!({
+                                "condition": "jit_project_instructions_discovered",
+                                "targets": &instruction_targets,
+                                "sources": &source_paths,
+                                "action_executed": false,
+                            }),
+                        )
+                        .await;
+                    defer_prelude_for_new_project_instructions(
+                        agent,
+                        emitter,
+                        session_id,
+                        task_id,
+                        &resp.tool_calls,
+                        &source_paths,
+                    )
+                    .await?;
+                    return Ok(ToolPreludeOutcome::ContinueLoop);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        session_id,
+                        iteration,
+                        instruction_targets = ?instruction_targets,
+                        %error,
+                        "Could not perform just-in-time project instruction discovery"
+                    );
+                }
+            }
         }
     }
 
@@ -1931,6 +2080,33 @@ mod tests {
         assert_eq!(
             negative_contract_block_reason(&contract, &delegated, false).as_deref(),
             Some("all mutation")
+        );
+    }
+
+    #[test]
+    fn scoped_and_global_negative_contract_matches_remain_distinguishable() {
+        let delegated_post = tool_call(
+            "spawn_agent",
+            r#"{"mission":"Publish one update","task":"POST exactly once, then verify"}"#,
+        );
+        let scoped = CompletionContract {
+            expects_mutation: true,
+            forbidden_mutation_actions: vec![ForbiddenMutationAction::Post],
+            ..CompletionContract::default()
+        };
+        assert_eq!(
+            negative_contract_block_reason(&scoped, &delegated_post, false).as_deref(),
+            Some("post")
+        );
+
+        let read_only = CompletionContract {
+            forbids_mutation: true,
+            ..CompletionContract::default()
+        };
+        assert_eq!(
+            negative_contract_block_reason(&read_only, &delegated_post, false).as_deref(),
+            Some("all mutation"),
+            "an explicit global read-only contract is still separately identifiable"
         );
     }
 

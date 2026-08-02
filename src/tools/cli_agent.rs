@@ -1042,20 +1042,21 @@ impl CliAgentTool {
             }
         }
 
-        // Project docs hinting
-        let mut project_docs_text = String::new();
+        // Scoped repository instructions. Native coding CLIs also perform
+        // their own discovery from cwd; this shared snapshot keeps enriched
+        // specialist prompts and non-native/custom CLI agents consistent with
+        // AIDaemon's direct-agent behavior.
+        let mut project_instructions_text = String::new();
         if let Some(dir) = working_dir {
-            let root = BackendPath::new(dir);
-            for doc_name in ["CLAUDE.md", "README.md"] {
-                let doc_path = root.join(doc_name);
-                if let Ok(bytes) = self.backend.read(&doc_path).await {
-                    let content = String::from_utf8_lossy(&bytes);
-                    let mut snippet: String = content.chars().take(3072).collect();
-                    if content.chars().count() > 3072 {
-                        snippet.push_str("\n...[truncated]");
-                    }
-                    project_docs_text = format!("From {}:\n{}", doc_name, snippet);
-                    break;
+            match crate::project_instructions::load_project_instructions(self.backend.clone(), dir)
+                .await
+            {
+                Ok(Some(instructions)) => {
+                    project_instructions_text = instructions.render_for_prompt();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(working_dir = dir, %error, "Could not load CLI project instructions");
                 }
             }
         }
@@ -1120,7 +1121,7 @@ impl CliAgentTool {
 
         // Fit within budget by truncating lower-priority sections first.
         let total = active_goal_text.len()
-            + project_docs_text.len()
+            + project_instructions_text.len()
             + facts_text.len()
             + files_text.len()
             + projects_listing_text.len()
@@ -1139,9 +1140,12 @@ impl CliAgentTool {
                 active_goal_text = active_goal_text.chars().take(goal_budget).collect();
                 active_goal_text.push_str("...[truncated]");
             }
-            if project_docs_text.len() > docs_budget {
-                project_docs_text = project_docs_text.chars().take(docs_budget).collect();
-                project_docs_text.push_str("...[truncated]");
+            if project_instructions_text.len() > docs_budget {
+                project_instructions_text = project_instructions_text
+                    .chars()
+                    .take(docs_budget)
+                    .collect();
+                project_instructions_text.push_str("...[truncated]");
             }
             if facts_text.len() > facts_budget {
                 facts_text = facts_text.chars().take(facts_budget).collect();
@@ -1167,8 +1171,11 @@ impl CliAgentTool {
         if !active_goal_text.is_empty() {
             parts.push(format!("## Active Goal\n{}", active_goal_text));
         }
-        if !project_docs_text.is_empty() {
-            parts.push(format!("## Project Documentation\n{}", project_docs_text));
+        if !project_instructions_text.is_empty() {
+            parts.push(format!(
+                "## Project Instructions\n{}",
+                project_instructions_text
+            ));
         }
         if !facts_text.is_empty() {
             parts.push(format!("## Known Facts\n{}", facts_text));
@@ -4909,6 +4916,36 @@ mod tests {
         // Empty instruction should not appear
         assert!(prompt.contains("Just do the task"));
         assert!(prompt.contains("## Task"));
+    }
+
+    #[tokio::test]
+    async fn test_enriched_prompt_uses_scoped_agents_instead_of_readme() {
+        let (tool, _db) = setup_echo_tool().await;
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".git")).unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "RUN_THE_SCOPED_AGENT_TEST",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("README.md"),
+            "README_MUST_NOT_BECOME_INSTRUCTIONS",
+        )
+        .unwrap();
+
+        let prompt = tool
+            .build_enriched_prompt(
+                "test-session",
+                "You are a code reviewer",
+                "Review this codebase",
+                project.path().to_str(),
+            )
+            .await;
+
+        assert!(prompt.contains("## Project Instructions"));
+        assert!(prompt.contains("RUN_THE_SCOPED_AGENT_TEST"));
+        assert!(!prompt.contains("README_MUST_NOT_BECOME_INSTRUCTIONS"));
     }
 
     // -----------------------------------------------------------------------

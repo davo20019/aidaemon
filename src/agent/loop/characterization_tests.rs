@@ -1,8 +1,9 @@
 use crate::agent::policy_metrics_snapshot;
 use crate::testing::{
     setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
-    setup_test_agent_root_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
-    MockProvider, MockTool,
+    setup_test_agent_root_with_extra_tools_and_llm_timeout,
+    setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
+    MockTool,
 };
 use crate::traits::store_prelude::*;
 use crate::traits::{
@@ -576,6 +577,149 @@ impl Tool for MockRemoteObservationTool {
             .with_verification_mode(ToolVerificationMode::ResultContent)
             .with_target_hint(ToolTargetHintKind::Url, url)
     }
+}
+
+struct CountingLocalWriteTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingLocalWriteTool {
+    fn name(&self) -> &str {
+        "write_file"
+    }
+
+    fn description(&self) -> &str {
+        "Write a local file for project-instruction gate characterization"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "write_file",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        let args: Value = serde_json::from_str(arguments)?;
+        let path = args["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing content"))?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::fs::write(path, content)?;
+        Ok(format!("Successfully wrote file: {path}"))
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let path = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|args| args["path"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        ToolCallSemantics::mutation_with(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE)
+            .with_target_hint(ToolTargetHintKind::Path, path)
+    }
+}
+
+#[tokio::test]
+async fn nested_project_instructions_are_injected_before_first_write_executes() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let nested = repo.join("crates/widget/src");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "ROOT_ONLY_RULE").unwrap();
+    std::fs::write(repo.join("crates/widget/AGENTS.md"), "JIT_ONLY_WIDGET_RULE").unwrap();
+    let target = nested.join("lib.rs");
+    std::fs::write(&target, "before\n").unwrap();
+
+    let write_args = json!({
+        "path": target.to_string_lossy(),
+        "content": "after\n"
+    })
+    .to_string();
+    let read_args = json!({"path": target.to_string_lossy()}).to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("write_file", &write_args),
+        MockProvider::tool_call_response("read_file", &read_args),
+        MockProvider::tool_call_response("write_file", &write_args),
+        MockProvider::tool_call_response("read_file", &read_args),
+        MockProvider::text_response("Updated and verified the widget."),
+    ]);
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![
+            Arc::new(CountingLocalWriteTool {
+                calls: write_calls.clone(),
+            }) as Arc<dyn Tool>,
+            Arc::new(crate::tools::ReadFileTool) as Arc<dyn Tool>,
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "jit_project_instruction_write_gate",
+            &format!(
+                "In project {}, update and verify the widget.",
+                repo.display()
+            ),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(!reply.trim().is_empty());
+    let calls = harness.provider.call_log.lock().await;
+    let call_trace = calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| format!("call {index}: {}", Value::Array(call.messages.clone())))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        write_calls.load(Ordering::SeqCst),
+        1,
+        "reply={reply:?}; provider calls:\n{call_trace}"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+
+    assert!(!calls[0]
+        .messages
+        .iter()
+        .any(|message| message.to_string().contains("JIT_ONLY_WIDGET_RULE")));
+    assert!(calls.iter().skip(1).any(|call| {
+        let payload = Value::Array(call.messages.clone()).to_string();
+        payload.contains("JIT_ONLY_WIDGET_RULE") && payload.contains("deliberately NOT executed")
+    }));
 }
 
 #[tokio::test]
@@ -1320,8 +1464,13 @@ async fn autonomous_model_never_forces_required_after_concrete_no_tool_deferral(
         .await
         .unwrap();
 
-    assert_eq!(reply, "Command inspection completed.");
+    assert_eq!(reply, "I'll run the command now.");
     let call_log = harness.provider.call_log.lock().await.clone();
+    assert_eq!(
+        call_log.len(),
+        1,
+        "autonomous models must not be bounced by language-only deferral heuristics"
+    );
     assert!(
         call_log
             .iter()

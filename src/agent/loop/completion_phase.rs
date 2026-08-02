@@ -656,7 +656,21 @@ pub(super) async fn run_completion_phase(
 
         let false_capability_denial = looks_like_false_capability_denial_after_tool_success(&reply);
 
-        if false_capability_denial {
+        if false_capability_denial
+            && agent
+                .supervision_gate_enforced_with_context(
+                    "false_capability_denial_rewrite",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                    json!({
+                        "successful_tool_calls": total_successful_tool_calls,
+                        "reply_preview": reply.chars().take(180).collect::<String>(),
+                    }),
+                )
+                .await
+        {
             if !force_text_response && !tool_defs.is_empty() && stall_count == 0 {
                 stall_count = stall_count.saturating_add(1);
                 consecutive_clean_iterations = 0;
@@ -1548,11 +1562,9 @@ pub(super) async fn run_completion_phase(
         // False in-progress status: the reply asserts work is happening RIGHT
         // NOW ("I'm searching the API now...") while the task made zero tool
         // calls — nothing is running, nothing was spawned, and the task is
-        // about to end (live repro: task ab7b318d, 2026-07-03 — the user was
-        // left waiting on a search that did not exist). Unlike future-intent
-        // deferrals ("I'll ..."), this is a fabricated status report, so it
-        // is enforced on every tier and feeds the same no-tool recovery
-        // ladder (bounce -> hard nudge -> force-text) instead of shipping.
+        // about to end. This remains a useful Guided-tier recovery signal, but
+        // the phrase detector itself is not exact enough to override an
+        // Autonomous model's completion.
         // Present-progressive false status at COMPLETION is dishonest
         // regardless of tool history: the task is ending, so "I am currently
         // refining the query..." is false even after earlier attempts (3rd
@@ -1565,14 +1577,9 @@ pub(super) async fn run_completion_phase(
                 && !crate::agent::is_friendly_background_handoff(&reply);
         // Terminal unbacked plan: the FINAL reply promises future work ("I'll
         // try a web search instead") while the task produced zero successful
-        // tool calls and schedules nothing — the promise is broken by
-        // construction, on every tier. Mid-task deferrals remain tier-trusted
-        // (Autonomous doesn't micromanage approach); a task-END promise is
-        // not an approach choice, it is a claim the daemon will not honor
-        // (live repro 2026-07-03, twice in one day: "I'm searching now..."
-        // then "I'll try a different approach by searching the web instead",
-        // both shipped as final answers, nothing ever ran). Harness-composed
-        // background handoffs are exempt: their promise has real pending work.
+        // tool calls and schedules nothing. Harness-composed background
+        // handoffs are exempt; otherwise the text classifier remains Guided
+        // supervision while exact tool/receipt state is retained as telemetry.
         // 4th live incident (2026-07-03, task ending 18:30): a 750-char
         // progress narration ending in "I will present the trials shortly"
         // shipped as the final answer of an ended task — evading BOTH the
@@ -1598,23 +1605,26 @@ pub(super) async fn run_completion_phase(
                 || claims_unfulfilled_delegation
                 || claims_false_in_progress
                 || terminal_unbacked_plan)
-            // Anti-fabrication triggers (claimed mutation/delegation/current
-            // activity with zero tool calls) and structural protocol markers
-            // ([INTENT_GATE], [tool_use:]) are correctness guards — enforced
-            // on every tier. Pure deferred-*style* policing is supervision
-            // and is telemetry-only on the Autonomous tier.
-            && (claims_unfulfilled_mutation
-                || claims_unfulfilled_delegation
-                || claims_false_in_progress
-                || terminal_unbacked_plan
-                || has_structural_markers
+            // Structural protocol markers are deterministic malformed output.
+            // All natural-language claim/deferral detectors remain behavioral
+            // supervision, even when compared with the tool ledger: the ledger
+            // is exact, but the claim classifier is not.
+            && (has_structural_markers
                 || agent
-                    .supervision_gate_enforced(
+                    .supervision_gate_enforced_with_context(
                         "deferred_action_guard",
                         &model,
                         emitter,
                         task_id,
                         iteration,
+                        json!({
+                            "claims_unfulfilled_mutation": claims_unfulfilled_mutation,
+                            "claims_unfulfilled_delegation": claims_unfulfilled_delegation,
+                            "claims_false_in_progress": claims_false_in_progress,
+                            "terminal_unbacked_plan": terminal_unbacked_plan,
+                            "incomplete_live_work_summary": incomplete_live_work_summary,
+                            "incomplete_retry_plan": incomplete_retry_plan,
+                        }),
                     )
                     .await)
         {
@@ -2186,6 +2196,15 @@ pub(super) async fn run_completion_phase(
             && completion_progress.file_access_retry_count == 0
             && crate::agent::response_analysis::reply_defers_file_access(&reply)
             && crate::agent::response_analysis::user_text_references_file(user_text)
+            && agent
+                .supervision_gate_enforced(
+                    "file_access_deferral_retry",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                )
+                .await
         {
             // Increment the LOCAL copy — commit_state! writes the local back
             // over ctx, so a direct ctx increment would be clobbered and the
@@ -2222,6 +2241,20 @@ pub(super) async fn run_completion_phase(
         let is_plain_text_tool_call = response_looks_like_plain_text_tool_call(&reply);
         if (is_canned_with_work || is_low_quality_multipart || is_plain_text_tool_call)
             && completion_progress.quality_nudge_count == 0
+            && agent
+                .supervision_gate_enforced_with_context(
+                    "response_quality_nudge",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                    json!({
+                        "canned_with_work": is_canned_with_work,
+                        "low_quality_multipart": is_low_quality_multipart,
+                        "plain_text_tool_call": is_plain_text_tool_call,
+                    }),
+                )
+                .await
         {
             // Local copy, not ctx — see file_access_retry_count above.
             completion_progress.quality_nudge_count += 1;
@@ -2256,7 +2289,18 @@ pub(super) async fn run_completion_phase(
                 &reply,
                 &[execution_state.tool_output_evidence.as_str(), user_text],
             );
-            if !ungrounded.is_empty() {
+            if !ungrounded.is_empty()
+                && agent
+                    .supervision_gate_enforced_with_context(
+                        "ungrounded_list_rewrite",
+                        &model,
+                        emitter,
+                        task_id,
+                        iteration,
+                        json!({ "ungrounded_count": ungrounded.len() }),
+                    )
+                    .await
+            {
                 completion_progress.grounding_nudge_count += 1;
                 warn!(
                     session_id,
@@ -2319,7 +2363,18 @@ pub(super) async fn run_completion_phase(
                         &intent.entities,
                         &[execution_state.tool_output_evidence.as_str()],
                     );
-                    if !unsearched.is_empty() {
+                    if !unsearched.is_empty()
+                        && agent
+                            .supervision_gate_enforced_with_context(
+                                "unsearched_personal_fact_retry",
+                                &model,
+                                emitter,
+                                task_id,
+                                iteration,
+                                json!({ "entity_count": unsearched.len() }),
+                            )
+                            .await
+                    {
                         completion_progress.denial_gate_count += 1;
                         warn!(
                             target: "memory_recall",
@@ -2369,6 +2424,18 @@ pub(super) async fn run_completion_phase(
             && execution_state.web_source_domains.len() < 2
             && super::answer_grounding::count_list_name_entities(&reply)
                 >= super::answer_grounding::MIN_LIST_ENTITIES
+            && agent
+                .supervision_gate_enforced_with_context(
+                    "single_source_enumeration_retry",
+                    &model,
+                    emitter,
+                    task_id,
+                    iteration,
+                    json!({
+                        "sources_read": execution_state.web_source_domains.len(),
+                    }),
+                )
+                .await
         {
             completion_progress.corroboration_nudge_count += 1;
             warn!(

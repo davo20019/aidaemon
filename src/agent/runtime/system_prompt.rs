@@ -172,7 +172,13 @@ impl Agent {
         resume_checkpoint: Option<&ResumeCheckpoint>,
         owner_dm_fact_cache: Option<&[crate::traits::Fact]>,
         session_summary: Option<&crate::traits::ConversationSummary>,
-    ) -> anyhow::Result<(String, String, Vec<String>)> {
+        project_instruction_scope: Option<&str>,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        Vec<String>,
+        Option<crate::project_instructions::ProjectInstructionTracker>,
+    )> {
         // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
         let skills_snapshot = self.skill_cache.get();
         let skill_matches = skills::match_skills(
@@ -794,8 +800,56 @@ impl Agent {
             .then_some(session_summary)
             .flatten();
 
+        // Repository instructions are per-task and per-scope, so they belong
+        // in the volatile tail rather than the session-static core. Only an
+        // owner-selected scope or an already-validated collaborator workspace
+        // grant reaches this point; public/external contexts never receive
+        // local repository content.
+        let mut project_instruction_tracker = None;
+        let project_instructions_block = if channel_ctx.visibility
+            != ChannelVisibility::PublicExternal
+            && (user_role == UserRole::Owner
+                || channel_ctx.active_workspace_grant(user_role).is_some())
+        {
+            if let Some(scope) = project_instruction_scope {
+                match crate::project_instructions::initialize_project_instructions(
+                    crate::execution::active_execution_backend(),
+                    scope,
+                )
+                .await
+                {
+                    Ok((instructions, tracker)) => {
+                        project_instruction_tracker = Some(tracker);
+                        instructions.map(|instructions| {
+                            info!(
+                                session_id,
+                                project_scope = scope,
+                                instruction_sources = ?instructions.source_paths(),
+                                "Loaded scoped project instructions"
+                            );
+                            instructions.render_for_prompt()
+                        })
+                    }
+                    Err(error) => {
+                        warn!(
+                            session_id,
+                            project_scope = scope,
+                            %error,
+                            "Could not load scoped project instructions"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let tail = Self::build_context_tail(
             critical_facts_block.as_deref(),
+            project_instructions_block.as_deref(),
             memory_section,
             channel_ctx.sender_name.as_deref(),
             session_summary,
@@ -883,7 +937,12 @@ impl Agent {
             "Memory context loaded"
         );
 
-        Ok((core_prompt_bytes, tail, active_skill_names))
+        Ok((
+            core_prompt_bytes,
+            tail,
+            active_skill_names,
+            project_instruction_tracker,
+        ))
     }
 
     /// Universal behavioral rules that apply regardless of channel, role, or
@@ -1268,13 +1327,14 @@ impl Agent {
     ///
     /// The first line is `TASK_CONTEXT_TAIL_MARKER` so the provider-call
     /// fingerprint can locate and hash the tail. Sections, in order: critical
-    /// facts, query-ranked memory recall + people/current-speaker context +
-    /// matched skill CONTENT, current speaker name, session summary, session
-    /// context, current date/time, resume checkpoint. Empty sections are
-    /// dropped.
+    /// facts, scoped project instructions, query-ranked memory recall +
+    /// people/current-speaker context + matched skill CONTENT, current speaker
+    /// name, session summary, session context, current date/time, resume
+    /// checkpoint. Empty sections are dropped.
     #[allow(clippy::too_many_arguments)]
     fn build_context_tail(
         critical_facts_block: Option<&str>,
+        project_instructions_block: Option<&str>,
         memory_section: &str,
         sender_name: Option<&str>,
         session_summary: Option<&crate::traits::ConversationSummary>,
@@ -1285,6 +1345,11 @@ impl Agent {
         let mut tail = String::from(crate::agent::prefix_fingerprint::TASK_CONTEXT_TAIL_MARKER);
 
         if let Some(block) = critical_facts_block {
+            tail.push_str("\n\n");
+            tail.push_str(block);
+        }
+
+        if let Some(block) = project_instructions_block {
             tail.push_str("\n\n");
             tail.push_str(block);
         }
@@ -1484,6 +1549,7 @@ mod tests {
     fn context_tail_carries_all_volatile_sections_and_marker() {
         let tail = Agent::build_context_tail(
             None,
+            None,
             "",
             None,
             None,
@@ -1505,6 +1571,7 @@ mod tests {
         let checkpoint_section =
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
         let tail = Agent::build_context_tail(
+            None,
             None,
             "",
             None,
@@ -1588,6 +1655,7 @@ mod tests {
         };
         let tail = Agent::build_context_tail(
             None,
+            None,
             "",
             None,
             Some(&summary),
@@ -1600,5 +1668,24 @@ mod tests {
         assert!(tail.contains("[Compacted Conversation State]"));
         assert!(tail.contains("turn 3 / message x"));
         assert!(tail.contains("black coffee"));
+    }
+
+    #[test]
+    fn context_tail_includes_scoped_project_instructions() {
+        let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
+        let tail = Agent::build_context_tail(
+            None,
+            Some(instructions),
+            "",
+            None,
+            None,
+            "",
+            "Monday, June 1, 2026 12:00 UTC",
+            None,
+        );
+
+        assert!(tail.starts_with(TASK_CONTEXT_TAIL_MARKER));
+        assert!(tail.contains(instructions));
+        assert!(tail.find(instructions).unwrap() < tail.find("[Current Date & Time]").unwrap());
     }
 }

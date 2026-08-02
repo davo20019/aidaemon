@@ -159,15 +159,23 @@ async fn checklist_completion_gate(
         .iter()
         .map(|s| s.description.clone())
         .collect();
-    let guided =
-        agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided;
-    if guided
-        && !unchecked.is_empty()
+    let first_unchecked_completion = !unchecked.is_empty()
         && agent
             .checklist_turn_flags
             .write()
             .await
-            .insert(format!("{task_id}:nudged"))
+            .insert(format!("{task_id}:nudged"));
+    if first_unchecked_completion
+        && agent
+            .supervision_gate_enforced_with_context(
+                "checklist_completion_nudge",
+                model,
+                emitter,
+                task_id,
+                iteration,
+                serde_json::json!({ "unchecked_count": unchecked.len() }),
+            )
+            .await
     {
         // Telemetry: the soft-verification nudge fired (model tried to finish
         // with items still unchecked). Joinable to TaskEnd by task_id.

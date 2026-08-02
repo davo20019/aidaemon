@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Best-in-class scoped project instructions for direct and delegated work.** AIDaemon now resolves repository guidance broad-to-specific from the selected project root, gives `AGENTS.override.md` precedence over `AGENTS.md`, supports `CLAUDE.md` and `GEMINI.md` as compatibility fallbacks, and injects guidance without making the daemon's process directory globally authoritative. Before a high-intent tool enters a deeper subtree, newly applicable instructions are loaded into the system task context and the entire tool batch is explicitly deferred without execution; task-local source deduplication, post-injection defense-in-depth checks, workspace confinement, symlink containment, authority boundaries, and prompt-size limits keep the behavior safe and bounded.
+
 ## [0.11.33] - 2026-08-01
 
 ### Added

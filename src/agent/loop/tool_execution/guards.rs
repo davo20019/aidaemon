@@ -18,6 +18,7 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
     task_start: Instant,
     task_tokens_used: u64,
     learning_ctx: &LearningContext,
+    model: &str,
     recent_tool_calls: &mut VecDeque<u64>,
     recent_tool_names: &mut VecDeque<String>,
     consecutive_same_tool: &mut (String, usize),
@@ -57,7 +58,22 @@ pub(super) async fn maybe_handle_loop_pattern_guards(
     // Soft redirect: skip execution and coach the LLM to adapt.
     // This fires BEFORE the hard stall, giving the agent a chance
     // to change approach instead of just giving up.
-    if (repetitive_redirect_threshold..MAX_REPETITIVE_CALLS).contains(&repetitive_count) {
+    if (repetitive_redirect_threshold..MAX_REPETITIVE_CALLS).contains(&repetitive_count)
+        && agent
+            .supervision_gate_enforced_with_context(
+                "repetitive_call_soft_redirect",
+                model,
+                emitter,
+                task_id,
+                iteration,
+                json!({
+                    "tool": tc.name,
+                    "repetitive_count": repetitive_count,
+                    "hard_stop_at": MAX_REPETITIVE_CALLS,
+                }),
+            )
+            .await
+    {
         warn!(
             session_id,
             tool = %tc.name,

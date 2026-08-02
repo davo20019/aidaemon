@@ -494,9 +494,13 @@ pub fn derive_executor_step_result(
         };
     }
 
-    let blocker = task
-        .and_then(|task| task.blocker.clone())
-        .or_else(|| task_response.clone().filter(|text| mentions_blocker(text)));
+    // A blocker is a durable protocol outcome, not a keyword found in otherwise
+    // successful executor prose.  Executors can legitimately describe work on
+    // "blocked tasks" or say that a fix "unblocked" a queue.  Inferring state
+    // from those words turned verified success into a blocked task and could
+    // schedule a duplicate retry after an external side effect.  Explicit
+    // `report_blocker` state (or the `error` branch above) remains authoritative.
+    let blocker = task.and_then(|task| task.blocker.clone());
     let summary = task_response
         .clone()
         .or_else(|| blocker.clone())
@@ -618,13 +622,6 @@ pub fn derive_executor_step_result(
         approval_request: None,
         partial_result: None,
     }
-}
-
-fn mentions_blocker(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    super::contains_keyword_as_words(&lower, "blocked")
-        || super::contains_keyword_as_words(&lower, "blocker")
-        || super::contains_keyword_as_words(&lower, "cannot proceed")
 }
 
 fn mentions_approval(text: &str) -> bool {
@@ -961,6 +958,61 @@ mod tests {
         history::CompletionTaskKind, CompletionContract, VerificationTarget, VerificationTargetKind,
     };
     use chrono::Utc;
+
+    fn executor_task(blocker: Option<&str>) -> Task {
+        Task {
+            id: "executor-task".to_string(),
+            goal_id: "goal".to_string(),
+            description: "Complete one bounded step".to_string(),
+            status: "running".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: blocker.map(ToOwned::to_owned),
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: Utc::now().to_rfc3339(),
+            started_at: Some(Utc::now().to_rfc3339()),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn successful_executor_prose_about_blocked_tasks_is_not_a_blocker() {
+        let task = executor_task(None);
+        let response = "I fixed the scheduler: old blocked tasks no longer prevent new runs. The deployment and read-back verification both succeeded.";
+
+        let result = derive_executor_step_result(&task.id, Some(&task), Some(response), None);
+
+        assert_eq!(result.step_outcome, StepValidationOutcome::StepDone);
+        assert_eq!(result.task_outcome, TaskValidationOutcome::TaskDone);
+        assert!(result.blocker.is_none());
+    }
+
+    #[test]
+    fn explicit_persisted_executor_blocker_remains_authoritative() {
+        let task = executor_task(Some("Production approval is required."));
+
+        let result = derive_executor_step_result(
+            &task.id,
+            Some(&task),
+            Some("I completed the safe preflight work."),
+            None,
+        );
+
+        assert_eq!(result.step_outcome, StepValidationOutcome::NeedsApproval);
+        assert_eq!(result.task_outcome, TaskValidationOutcome::NeedsApproval);
+        assert_eq!(
+            result.blocker.as_deref(),
+            Some("Production approval is required.")
+        );
+    }
 
     #[test]
     fn partial_done_blocked_request_is_specific() {

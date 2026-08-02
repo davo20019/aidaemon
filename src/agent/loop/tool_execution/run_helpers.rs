@@ -161,8 +161,14 @@ pub(super) fn is_scheduled_goal_execution_text(text: &str) -> bool {
 pub(super) fn effective_dialogue_scope_for_tool_execution(
     active_scope: Option<ToolSemanticScope>,
     user_text: &str,
+    is_scheduled_goal: bool,
 ) -> Option<ToolSemanticScope> {
-    if is_scheduled_goal_execution_text(user_text) {
+    // Scheduled automation is already authorized and scoped by durable goal,
+    // run, task, role, and per-tool policy state. Do not let a keyword-derived
+    // dialogue label override that provenance. This matters for executor child
+    // tasks, whose model-written step descriptions do not retain the root
+    // task's scheduled-execution marker.
+    if is_scheduled_goal || is_scheduled_goal_execution_text(user_text) {
         None
     } else {
         active_scope
@@ -962,6 +968,7 @@ mod tests {
         let scope = effective_dialogue_scope_for_tool_execution(
             Some(ToolSemanticScope::GoalState),
             "Scheduled check: Post daily update [SYSTEM: already scheduled and firing now; do not reschedule.]",
+            false,
         );
         assert_eq!(scope, None);
     }
@@ -971,6 +978,7 @@ mod tests {
         let scope = effective_dialogue_scope_for_tool_execution(
             Some(ToolSemanticScope::GoalState),
             "Execute scheduled goal: Publish queued API update [SYSTEM: already scheduled and firing now; do not reschedule.]",
+            false,
         );
         assert_eq!(scope, None);
     }
@@ -980,8 +988,19 @@ mod tests {
         let scope = effective_dialogue_scope_for_tool_execution(
             Some(ToolSemanticScope::GoalState),
             "What times does the scheduled tweet goal run?",
+            false,
         );
         assert_eq!(scope, Some(ToolSemanticScope::GoalState));
+    }
+
+    #[test]
+    fn scheduled_executor_provenance_clears_keyword_derived_goal_state_scope() {
+        let scope = effective_dialogue_scope_for_tool_execution(
+            Some(ToolSemanticScope::GoalState),
+            "Use the scheduler-admission fix as the topic, then POST once to /2/tweets.",
+            true,
+        );
+        assert_eq!(scope, None);
     }
 
     #[test]

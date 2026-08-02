@@ -183,8 +183,10 @@ impl Agent {
             llm_router,
             mut model,
             route_failsafe_active,
+            mut turn_context,
+            mut project_instruction_tracker,
             core_prompt_bytes,
-            task_context_tail,
+            mut task_context_tail,
             session_summary,
             mut harness_eval,
         } = match bootstrap_outcome {
@@ -195,9 +197,6 @@ impl Agent {
         // From this point onward, use exactly what was persisted so matching,
         // rendering, routing, and dialogue projection share one source of truth.
         let user_text = canonical_user_text.as_str();
-        let mut turn_context = self
-            .build_turn_context_from_recent_history(session_id, user_text)
-            .await;
         let followup_mode = turn_context
             .followup_mode
             .map(|mode| mode.as_str())
@@ -702,6 +701,15 @@ impl Agent {
         if looks_like_evidence_grounding_challenge(user_text)
             && (turn_context.followup_mode != Some(FollowupMode::NewTask)
                 || has_recent_tool_context)
+            && self
+                .supervision_gate_enforced(
+                    "evidence_challenge_directive",
+                    &model,
+                    &emitter,
+                    &task_id,
+                    0,
+                )
+                .await
         {
             turn_state
                 .directives
@@ -723,6 +731,15 @@ impl Agent {
         // actual request.
         if is_reaffirmation_challenge_turn
             && crate::agent::recall_guardrails::is_vague_reaffirmation_challenge(user_text)
+            && self
+                .supervision_gate_enforced(
+                    "reaffirmation_anchor_directive",
+                    &model,
+                    &emitter,
+                    &task_id,
+                    0,
+                )
+                .await
         {
             if let Ok(history) = self.state.get_history(session_id, 12).await {
                 if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
@@ -742,7 +759,17 @@ impl Agent {
         // binding the pronoun to the salient pinned-profile person instead of
         // the actual subject of the prior exchange. Anchor it to that exchange
         // and force a memory lookup before answering.
-        else if crate::agent::recall_guardrails::looks_like_pronoun_referent_followup(user_text) {
+        else if crate::agent::recall_guardrails::looks_like_pronoun_referent_followup(user_text)
+            && self
+                .supervision_gate_enforced(
+                    "coreference_grounding_directive",
+                    &model,
+                    &emitter,
+                    &task_id,
+                    0,
+                )
+                .await
+        {
             if let Ok(history) = self.state.get_history(session_id, 12).await {
                 if let Some(anchor) = crate::agent::recall_guardrails::resolve_reaffirmation_anchor(
                     &history, user_text,
@@ -1543,6 +1570,8 @@ impl Agent {
                     pending_system_messages: tool_prelude_directives.pending_system_messages,
                     force_text_response: tool_prelude_recovery.force_text_response,
                     turn_context: &turn_context,
+                    project_instruction_tracker: &mut project_instruction_tracker,
+                    task_context_tail: &mut task_context_tail,
                 },
             )
             .await?;
@@ -1641,7 +1670,10 @@ impl Agent {
                         .require_file_recheck_before_answer,
                     completion_progress: &mut completion_progress,
                     turn_context: &turn_context,
+                    project_instruction_tracker: &mut project_instruction_tracker,
+                    task_context_tail: &mut task_context_tail,
                     resolved_goal_id: resolved_goal_id.as_deref(),
+                    is_scheduled_goal,
                     tool_result_cache: tool_execution_counters.tool_result_cache,
                     execution_state: &mut execution_state,
                     validation_state: tool_execution_evidence.validation_state,

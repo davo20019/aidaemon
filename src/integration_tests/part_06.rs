@@ -369,18 +369,11 @@ async fn test_deferred_action_text_accepted_on_autonomous_tier() {
         .await
         .unwrap();
 
-    // CONTRACT CHANGE 2026-07-03: a TERMINAL plan with zero successful tool
-    // calls bounces on every tier — two live incidents in one day shipped
-    // "I'll do X" as the final answer with nothing ever running. The
-    // Autonomous tier still trusts mid-task deferrals; a task-END promise is
-    // not an approach choice, it is a claim the daemon will not honor.
-    assert!(
-        response.contains("Found it and sent it"),
-        "the retry's real outcome must ship, not the unbacked promise; got: {response:?}"
-    );
-    assert!(
-        harness.provider.call_count().await >= 2,
-        "terminal unbacked plan must get a retry on the autonomous tier"
+    assert_eq!(response, deferred_text);
+    assert_eq!(
+        harness.provider.call_count().await,
+        1,
+        "language-only completion heuristics must stay shadow-only on the autonomous tier"
     );
 }
 

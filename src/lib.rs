@@ -29,6 +29,7 @@ mod memory;
 mod oauth;
 #[allow(dead_code)]
 mod plans;
+mod project_instructions;
 mod providers;
 mod queue_policy;
 mod queue_telemetry;

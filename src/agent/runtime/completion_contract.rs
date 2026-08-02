@@ -467,8 +467,120 @@ const SCOPED_NEGATIVE_MUTATION_PHRASES: &[(ForbiddenMutationAction, &[&str])] = 
 fn scoped_forbidden_mutation_actions(lower: &str) -> Vec<ForbiddenMutationAction> {
     SCOPED_NEGATIVE_MUTATION_PHRASES
         .iter()
-        .filter_map(|(action, phrases)| text_contains_any_phrase(lower, phrases).then_some(*action))
+        .filter_map(|(action, phrases)| {
+            phrases
+                .iter()
+                .any(|phrase| negative_phrase_is_operation_wide(lower, phrase))
+                .then_some(*action)
+        })
         .collect()
+}
+
+/// Return true only when a negative action phrase is unambiguously a ban on
+/// the operation itself. Content and precondition guards such as "don't post
+/// filler" or "do not post if identity verification fails" must remain task
+/// instructions; promoting them to a blanket hard gate makes the requested
+/// operation impossible.
+///
+/// This intentionally prefers false negatives for ambiguous noun phrases. The
+/// completion contract is an execution backstop, not a natural-language policy
+/// engine, so it should hard-block only high-confidence operation-wide bans.
+fn negative_phrase_is_operation_wide(lower: &str, phrase: &str) -> bool {
+    lower.match_indices(phrase).any(|(index, _)| {
+        let before = lower[..index].chars().next_back();
+        let after_index = index + phrase.len();
+        let after = lower[after_index..].chars().next();
+        if before.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            || after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            return false;
+        }
+
+        if negative_phrase_has_conditional_context(lower, index, phrase) {
+            return false;
+        }
+
+        let tail = lower[after_index..].trim_start();
+        if tail.is_empty()
+            || tail.starts_with(|ch: char| {
+                matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '\n' | '\r' | '—')
+            })
+        {
+            return true;
+        }
+
+        // These complements still prohibit the operation as a whole. Other
+        // noun/conditional complements are deliberately left to the executor
+        // because they commonly constrain content, retries, or prerequisites.
+        [
+            "anything",
+            "anything else",
+            "it",
+            "this",
+            "that",
+            "them",
+            "again",
+            "yet",
+            "now",
+            "at all",
+            "anywhere",
+            "publicly",
+            "externally",
+            "automatically",
+            "directly",
+            "live",
+            "online",
+            "to ",
+            "on ",
+            "via ",
+            "into ",
+        ]
+        .iter()
+        .any(|complement| {
+            tail == *complement
+                || (tail.starts_with(complement)
+                    && complement
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+                || tail
+                    .strip_prefix(complement)
+                    .is_some_and(|rest| rest.starts_with(|ch: char| !ch.is_alphanumeric()))
+        })
+    })
+}
+
+fn negative_phrase_has_conditional_context(lower: &str, index: usize, phrase: &str) -> bool {
+    let before = &lower[..index];
+    let sentence_start = before
+        .rfind(['.', '!', '?', '\n'])
+        .map_or(0, |position| position + 1);
+    let sentence_prefix = before[sentence_start..].trim_start();
+    if ["if ", "unless ", "when ", "whenever ", "only if "]
+        .iter()
+        .any(|marker| sentence_prefix.starts_with(marker))
+    {
+        return true;
+    }
+
+    // Scheduled publishing goals commonly express their skip gate as two
+    // sentences: establish the condition, then say to finish without posting.
+    // Keep that conditional outcome out of the operation-wide hard gate.
+    if !phrase.starts_with("without ") {
+        return false;
+    }
+    let paragraph_start = before.rfind("\n\n").map_or(0, |position| position + 2);
+    let paragraph_prefix = before[paragraph_start..].trim_start();
+    let immediate_prefix = sentence_prefix
+        .rsplit_once(';')
+        .map_or(sentence_prefix, |(_, tail)| tail)
+        .trim();
+    ["finish", "skip", "stop"]
+        .iter()
+        .any(|verb| immediate_prefix.ends_with(verb))
+        && (paragraph_prefix.contains("skip gate")
+            || paragraph_prefix.contains("skip if")
+            || paragraph_prefix.contains("if nothing"))
 }
 
 fn remove_scoped_negative_mutation_phrases(lower: &str) -> String {
@@ -2318,6 +2430,38 @@ mod tests {
             contract.forbidden_mutation_actions,
             vec![ForbiddenMutationAction::Deploy]
         );
+    }
+
+    #[test]
+    fn tweet_content_and_precondition_guards_do_not_become_a_blanket_post_ban() {
+        let request = "Post one short tweet from the authenticated account. \
+            Skip if nothing genuinely noteworthy happened; don't post filler. \
+            A quiet day is fine; finish without posting. Never post personal data or \
+            security-sensitive internals. Resolve the account \
+            through GET /2/users/me and do not post if the identity check fails. \
+            Compose and POST exactly one tweet, then verify it once.";
+        let contract = infer_completion_contract(request, &[]);
+
+        assert!(!contract
+            .forbidden_mutation_actions
+            .contains(&ForbiddenMutationAction::Post));
+    }
+
+    #[test]
+    fn unqualified_post_bans_remain_hard_constraints() {
+        for request in [
+            "Draft the tweet, but do not post.",
+            "Prepare the message without posting.",
+            "Write the announcement, but don't post it.",
+        ] {
+            let contract = infer_completion_contract(request, &[]);
+            assert!(
+                contract
+                    .forbidden_mutation_actions
+                    .contains(&ForbiddenMutationAction::Post),
+                "operation-wide prohibition must remain enforced: {request}"
+            );
+        }
     }
 
     #[test]

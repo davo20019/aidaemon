@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::events::TaskOutcome;
 use crate::traits::AgentRole;
@@ -356,6 +356,36 @@ fn dispatch_trigger_succeeded(
     work_tasks
         .iter()
         .all(|task| task.satisfies_run_completion())
+}
+
+async fn patch_task_attempt_with_transient_retry(
+    state: &Arc<dyn crate::traits::StateStore>,
+    attempt: &crate::traits::TaskAttempt,
+    patch: &crate::traits::TaskAttemptPatch,
+) -> anyhow::Result<bool> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut delay_ms = 25u64;
+    for try_number in 1..=MAX_ATTEMPTS {
+        match state
+            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, patch)
+            .await
+        {
+            Ok(applied) => return Ok(applied),
+            Err(error) if try_number < MAX_ATTEMPTS => {
+                warn!(
+                    task_id = %attempt.task_id,
+                    attempt_id = %attempt.id,
+                    try_number,
+                    %error,
+                    "Transient task-attempt finalization error; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded retry loop always returns")
 }
 
 fn clear_partial_success_context(goal: &mut crate::traits::Goal) {
@@ -1272,16 +1302,35 @@ pub fn spawn_background_task_lead(
                                 handoff: Some(handoff),
                                 ..Default::default()
                             };
-                            if !state
-                                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                            match patch_task_attempt_with_transient_retry(&state, attempt, &patch)
                                 .await
-                                .unwrap_or(false)
                             {
-                                warn!(
-                                    task_id = %trigger_task_id,
-                                    goal_id = %goal_id,
-                                    "Ignored stale task-lead finalization"
-                                );
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let persisted_status = state
+                                        .get_task(trigger_task_id)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .map(|task| task.status)
+                                        .unwrap_or_else(|| "missing".to_string());
+                                    warn!(
+                                        task_id = %trigger_task_id,
+                                        goal_id = %goal_id,
+                                        attempt_id = %attempt.id,
+                                        persisted_status,
+                                        "Ignored stale task-lead finalization"
+                                    );
+                                }
+                                Err(error) => {
+                                    error!(
+                                        task_id = %trigger_task_id,
+                                        goal_id = %goal_id,
+                                        attempt_id = %attempt.id,
+                                        %error,
+                                        "Failed to finalize task-lead attempt after retries"
+                                    );
+                                }
                             }
                         } else {
                             let mut updated = trigger_task;

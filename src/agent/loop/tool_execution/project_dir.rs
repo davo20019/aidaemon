@@ -1,4 +1,6 @@
 use crate::agent::*;
+use crate::execution::BackendPath;
+use crate::traits::{ToolCallSemantics, ToolTargetHintKind};
 
 const PATH_ARGUMENT_KEYS: &[&str] = &[
     "path",
@@ -236,6 +238,127 @@ pub(super) fn extract_project_dirs_from_tool_args(tool_name: &str, args_json: &s
 
     collect_project_dirs_from_value(&parsed, None, &mut dirs);
     dirs
+}
+
+fn shell_path_candidate(token: &str, previous: Option<&str>) -> Option<String> {
+    let mut candidate = token
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '(' | ')' | ',' | ';'));
+    if let Some((_, redirected)) = candidate.rsplit_once('>') {
+        candidate = redirected.trim();
+    }
+    if candidate.is_empty()
+        || candidate.starts_with('-')
+        || candidate.contains("://")
+        || candidate.contains(['$', '`', '*', '?', '[', ']', '{', '}'])
+        || matches!(candidate, "&&" | "||" | "|" | ">" | ">>")
+    {
+        return None;
+    }
+
+    let previous_declares_path = previous.is_some_and(|value| {
+        matches!(
+            value,
+            "cd" | "-C" | "--directory" | "--manifest-path" | "--path" | "--file" | "-f"
+        )
+    });
+    let looks_like_path = previous_declares_path
+        || candidate.starts_with('/')
+        || candidate.starts_with("~/")
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.contains('/');
+    looks_like_path.then(|| candidate.to_string())
+}
+
+fn terminal_command_path_targets(command: &str, base_directory: Option<&str>) -> Vec<String> {
+    let tokens = shell_words::split(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let mut targets = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(candidate) = shell_path_candidate(
+            token,
+            index
+                .checked_sub(1)
+                .and_then(|i| tokens.get(i))
+                .map(String::as_str),
+        ) else {
+            continue;
+        };
+        let target =
+            if candidate.starts_with('/') || candidate == "~" || candidate.starts_with("~/") {
+                candidate
+            } else if let Some(base_directory) = base_directory {
+                BackendPath::new(base_directory)
+                    .join(&candidate)
+                    .to_string()
+            } else {
+                candidate
+            };
+        if !targets.iter().any(|existing| existing == &target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+/// Return filesystem locations whose first access should trigger nested
+/// project-instruction discovery. Broad grep/glob searches are intentionally
+/// excluded; high-intent reads, writes, project entry, and command working
+/// directories mirror the just-in-time behavior of established coding agents.
+pub(in crate::agent) fn project_instruction_targets_for_tool_call(
+    tool_name: &str,
+    args_json: &str,
+    semantics: &ToolCallSemantics,
+) -> Vec<String> {
+    if !matches!(
+        tool_name,
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "project_inspect"
+            | "git_info"
+            | "git_commit"
+            | "terminal"
+            | "run_command"
+    ) {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    for hint in &semantics.target_hints {
+        if matches!(
+            hint.kind,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ProjectScope
+        ) && !targets.iter().any(|existing| existing == &hint.value)
+        {
+            targets.push(hint.value.clone());
+        }
+    }
+    for directory in extract_project_dirs_from_tool_args(tool_name, args_json) {
+        if !targets.iter().any(|existing| existing == &directory) {
+            targets.push(directory);
+        }
+    }
+
+    if matches!(tool_name, "terminal" | "run_command") {
+        if let Ok(args) = serde_json::from_str::<Value>(args_json) {
+            if let Some(command) = args.get("command").and_then(Value::as_str) {
+                let base = targets.first().map(String::as_str);
+                for target in terminal_command_path_targets(command, base) {
+                    if !targets.iter().any(|existing| existing == &target) {
+                        targets.push(target);
+                    }
+                }
+            }
+        }
+    }
+
+    targets
 }
 
 fn project_dir_arg_key_for_tool(tool_name: &str) -> Option<&'static str> {
@@ -641,6 +764,42 @@ mod tests {
         let args = r#"{"command":"cd ~/projects/demo && npm run build"}"#;
         let dirs = extract_project_dirs_from_tool_args("terminal", args);
         assert!(dirs.iter().any(|d| d.contains("projects/demo")));
+    }
+
+    #[test]
+    fn jit_targets_include_high_intent_file_paths_but_not_broad_searches() {
+        let read_semantics = ToolCallSemantics::observation()
+            .with_target_hint(ToolTargetHintKind::Path, "crates/widget/src/lib.rs");
+        let targets = project_instruction_targets_for_tool_call(
+            "read_file",
+            r#"{"path":"crates/widget/src/lib.rs"}"#,
+            &read_semantics,
+        );
+        assert!(targets
+            .iter()
+            .any(|target| target == "crates/widget/src/lib.rs"));
+        assert!(project_instruction_targets_for_tool_call(
+            "search_files",
+            r#"{"path":"crates/widget","glob":"*.rs"}"#,
+            &read_semantics,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn jit_targets_extract_terminal_cwd_and_nested_command_paths() {
+        let args =
+            r#"{"command":"sed -i '' crates/widget/src/lib.rs && cargo test","cwd":"/tmp/repo"}"#;
+        let targets = project_instruction_targets_for_tool_call(
+            "terminal",
+            args,
+            &ToolCallSemantics::mutation(),
+        );
+
+        assert!(targets.iter().any(|target| target == "/tmp/repo"));
+        assert!(targets
+            .iter()
+            .any(|target| target.ends_with("/tmp/repo/crates/widget/src/lib.rs")));
     }
 
     #[test]

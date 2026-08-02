@@ -18,6 +18,63 @@ impl ScheduledGoalRunsTool {
         Self { state }
     }
 
+    const RUN_INSTRUCTIONS_MARKER: &'static str = "\n\nLATEST RUN INSTRUCTIONS:\n";
+
+    fn description_with_run_instructions(description: &str, instructions: &str) -> String {
+        let base = description
+            .split_once(Self::RUN_INSTRUCTIONS_MARKER)
+            .map_or(description, |(base, _)| base)
+            .trim_end();
+        format!("{base}{}{instructions}", Self::RUN_INSTRUCTIONS_MARKER)
+    }
+
+    async fn update_instructions(
+        &self,
+        goal_id_input: &str,
+        instructions: &str,
+    ) -> anyhow::Result<String> {
+        let instructions = instructions.trim();
+        if instructions.is_empty() {
+            return Ok("Provide non-empty instructions.".to_string());
+        }
+        if instructions.chars().count() > 6000 {
+            return Ok("Instructions are too long (maximum 6000 characters).".to_string());
+        }
+
+        let resolved_goal_id = match self.resolve_goal_id(goal_id_input).await {
+            Ok(id) => id,
+            Err(error) => return Ok(error.to_string()),
+        };
+        let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
+            return Ok(format!("Scheduled goal not found: {resolved_goal_id}"));
+        };
+        if self
+            .state
+            .get_schedules_for_goal(&resolved_goal_id)
+            .await?
+            .is_empty()
+        {
+            return Ok("Only scheduled goals can have run instructions updated.".to_string());
+        }
+
+        goal.description = Self::description_with_run_instructions(&goal.description, instructions);
+        let mut context = goal
+            .context
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        context["run_instructions"] = Value::String(instructions.to_string());
+        goal.context = Some(context.to_string());
+        goal.updated_at = chrono::Utc::now().to_rfc3339();
+        self.state.update_goal(&goal).await?;
+
+        Ok(format!(
+            "Updated run instructions for scheduled goal {}. No run was triggered.",
+            goal.id
+        ))
+    }
+
     async fn set_budget(
         &self,
         goal_id_input: &str,
@@ -251,7 +308,7 @@ impl ScheduledGoalRunsTool {
         hints
     }
 
-    async fn run_now(
+    pub(crate) async fn run_now(
         &self,
         goal_id_input: &str,
         schedule_id: Option<&str>,
@@ -672,6 +729,8 @@ struct ScheduledGoalRunsArgs {
     #[serde(default)]
     budget_daily: Option<i64>,
     #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
     _user_role: Option<String>,
 }
 
@@ -684,27 +743,26 @@ fn scheduled_goal_runs_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget"]
+                    "enum": ["run_now", "run_history", "last_failure", "unblock_hints", "set_budget", "update_instructions"]
                 },
                 "goal_id": {
-                    "type": "string",
-                    "description": "Goal ID (full or prefix)"
+                    "type": "string"
                 },
                 "schedule_id": {
-                    "type": "string",
-                    "description": "Schedule ID; run_now consumes one-shot schedules"
+                    "type": "string"
                 },
                 "limit": {
-                    "type": "integer",
-                    "description": "Max runs (run_history; default 10, max 50)"
+                    "type": "integer"
                 },
                 "budget_per_check": {
-                    "type": "integer",
-                    "description": "Per-check token budget (set_budget)"
+                    "type": "integer"
                 },
                 "budget_daily": {
-                    "type": "integer",
-                    "description": "Daily token budget (set_budget)"
+                    "type": "integer"
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "Persistent run instructions (update_instructions)"
                 }
             },
             "required": ["action", "goal_id"],
@@ -720,7 +778,7 @@ impl Tool for ScheduledGoalRunsTool {
     }
 
     fn description(&self) -> &str {
-        "Run scheduled goals now and inspect run history/failures without terminal/sqlite access (not for storing facts)"
+        "Run, update, and inspect scheduled goals without terminal/sqlite access"
     }
 
     fn schema(&self) -> Value {
@@ -792,8 +850,25 @@ impl Tool for ScheduledGoalRunsTool {
 	                self.set_budget(goal_id, args.budget_per_check, args.budget_daily)
 	                    .await
 	            }
+	            "update_instructions" => {
+	                let is_owner = args
+	                    ._user_role
+	                    .as_deref()
+	                    .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
+	                if !is_owner {
+	                    return Ok("Only owners can update scheduled goal instructions.".to_string());
+	                }
+	                let goal_id = args
+	                    .goal_id
+	                    .as_deref()
+	                    .ok_or_else(|| anyhow::anyhow!("'goal_id' is required for update_instructions"))?;
+	                let instructions = args.instructions.as_deref().ok_or_else(|| {
+	                    anyhow::anyhow!("'instructions' is required for update_instructions")
+	                })?;
+	                self.update_instructions(goal_id, instructions).await
+	            }
 	            other => Ok(format!(
-	                "Unknown action: '{}'. Use run_now, run_history, last_failure, unblock_hints, or set_budget.",
+	                "Unknown action: '{}'. Use run_now, run_history, last_failure, unblock_hints, set_budget, or update_instructions.",
 	                other
 	            )),
 	        }
@@ -840,11 +915,17 @@ mod tests {
         let state = setup_state().await;
         let tool = ScheduledGoalRunsTool::new(state.clone());
 
-        let goal = Goal::new_continuous(
+        let mut goal = Goal::new_continuous(
             "Run diagnostics job",
             "user-session",
             Some(1000),
             Some(5000),
+        );
+        goal.context = Some(
+            serde_json::json!({
+                "instructions": "Search a current authoritative source before drafting."
+            })
+            .to_string(),
         );
         let goal_id = goal.id.clone();
         state.create_goal(&goal).await.unwrap();
@@ -887,6 +968,103 @@ mod tests {
         assert!(!tasks[0].idempotent);
         assert_eq!(tasks[0].max_retries, 0);
         assert!(tasks[0].description.starts_with("Manual scheduled run:"));
+        assert_eq!(tasks[0].context, goal.context);
+
+        let run = state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .expect("manual trigger creates an open goal run");
+        assert_eq!(run.trigger_type, "manual");
+        assert_eq!(run.root_task_id.as_deref(), Some(tasks[0].id.as_str()));
+        assert_eq!(
+            state.get_tasks_for_goal_run(&run.id).await.unwrap()[0].id,
+            tasks[0].id
+        );
+    }
+
+    #[tokio::test]
+    async fn update_instructions_persists_without_triggering_and_replaces_prior_update() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let mut goal = Goal::new_continuous(
+            "Publish one daily insight",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        goal.context = Some(json!({"existing": "preserved"}).to_string());
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily at 9am".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: crate::cron_utils::compute_next_run("0 9 * * *")
+                .unwrap()
+                .to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        for instructions in [
+            "Search a current authoritative source before drafting.",
+            "Use one current primary source and write a human-useful insight.",
+        ] {
+            let result = tool
+                .call(
+                    &json!({
+                        "action": "update_instructions",
+                        "goal_id": goal.id,
+                        "instructions": instructions,
+                        "_user_role": "Owner"
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            assert!(result.contains("No run was triggered"));
+        }
+
+        let updated = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert!(updated
+            .description
+            .contains("Use one current primary source and write a human-useful insight."));
+        assert!(!updated
+            .description
+            .contains("Search a current authoritative source before drafting."));
+        assert_eq!(
+            updated
+                .description
+                .matches(ScheduledGoalRunsTool::RUN_INSTRUCTIONS_MARKER)
+                .count(),
+            1
+        );
+        let context: Value = serde_json::from_str(updated.context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["existing"], "preserved");
+        assert_eq!(
+            context["run_instructions"],
+            "Use one current primary source and write a human-useful insight."
+        );
+        assert!(state.get_tasks_for_goal(&goal.id).await.unwrap().is_empty());
+        assert!(state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state.get_schedules_for_goal(&goal.id).await.unwrap()[0].id,
+            schedule.id
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,14 @@
 //! data for: which heuristics fire, on which models, and how often —
 //! so false-positive-prone gates can be found and pruned from evidence
 //! instead of anecdote.
+//!
+//! Audit invariant: any decision sourced from keyword/regex matching, prose
+//! shape, or an auxiliary intent classifier must enter through
+//! `supervision_gate_enforced[_with_context]` before it can block, redirect,
+//! retry, rewrite, or narrow tools. Hard enforcement is reserved for durable
+//! authorization and structured runtime evidence (role/capability policy,
+//! explicit global read-only scope, target identity, approvals, idempotency,
+//! budgets, typed tool receipts, and exact protocol validity).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};

@@ -87,7 +87,16 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
     pub require_file_recheck_before_answer: &'a mut bool,
     pub completion_progress: &'a mut CompletionProgress,
     pub turn_context: &'a TurnContext,
+    /// Authorized project-instruction state for pre-action nested discovery.
+    pub project_instruction_tracker:
+        &'a mut Option<crate::project_instructions::ProjectInstructionTracker>,
+    /// Persistent system-role task tail. Newly discovered nested guidance is
+    /// appended here before the triggering tool call is allowed to retry.
+    pub task_context_tail: &'a mut String,
     pub resolved_goal_id: Option<&'a str>,
+    /// Durable scheduled-goal provenance, resolved from goal/task state rather
+    /// than inferred from the current prompt text.
+    pub is_scheduled_goal: bool,
     pub execution_state: &'a mut ExecutionState,
     pub validation_state: &'a mut ValidationState,
     pub read_file_tracker: &'a mut ReadFileObservationTracker,
