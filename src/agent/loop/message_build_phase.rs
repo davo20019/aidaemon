@@ -1139,7 +1139,9 @@ pub(super) async fn run_message_build_phase(
                 iteration, model_budget, policy_budget, "Context budget shadow comparison"
             );
         }
-        let effective_budget = if agent.policy_config.policy_enforce {
+        let effective_budget = if agent.policy_config.policy_enforce
+            && agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided
+        {
             // Never exceed the model's budget; policy config can be mis-set.
             policy_budget.min(model_budget)
         } else {

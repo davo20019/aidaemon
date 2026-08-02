@@ -30,7 +30,7 @@ use crate::skills::{self, MemoryContext};
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::VerificationTracker;
 use crate::traits::{
-    AgentRole, ChatOptions, Goal, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
+    AgentRole, ChatOptions, Message, ModelProvider, StateStore, TaskActivity, Tool, ToolCall,
     ToolCapabilities, ToolChoiceMode, ToolRole,
 };
 use crate::types::{ApprovalResponse, ChannelContext, ChannelVisibility, UserRole};
@@ -122,11 +122,6 @@ const MAX_CLARIFYING_ASSISTANT_CONTENT_CHARS: usize = 2000;
 /// Window size for detecting alternating tool patterns (A-B-A-B cycles).
 const ALTERNATING_PATTERN_WINDOW: usize = 10;
 const PROGRESS_SUMMARY_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
-/// Legacy fallback schedule text heuristics used as a guardrail when the model
-/// omits schedule fields. These heuristics explicitly ignore "tell me about this
-/// scheduled goal" meta-queries to avoid accidental schedule creation.
-const ENABLE_SCHEDULE_HEURISTICS: bool = true;
-
 pub mod activity_gate;
 #[path = "response_analysis.rs"]
 mod response_analysis;
@@ -149,15 +144,11 @@ mod intent_routing;
 pub mod llm_classifier;
 #[path = "intent/relational_prefilter.rs"]
 pub mod relational_prefilter;
-use intent_routing::{
-    classify_intent_complexity, contains_keyword_as_words, infer_intent_gate,
-    is_internal_maintenance_intent, recognized_artifact_creation_request,
-    refine_intent_complexity_with_task_shape, IntentComplexity, IntentTaskShape,
-};
+use intent_routing::contains_keyword_as_words;
+#[cfg(test)]
+use intent_routing::infer_intent_gate;
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
-#[cfg(test)]
-use intent_routing::{detect_schedule_heuristic, looks_like_recurring_intent_without_timing};
 #[path = "policy/policy_signals.rs"]
 mod policy_signals;
 #[cfg(test)]
@@ -249,10 +240,6 @@ mod completion_phase;
 mod core_prompt;
 #[path = "runtime/dialogue_state.rs"]
 mod dialogue_state;
-#[path = "loop/direct_return.rs"]
-mod direct_return;
-#[path = "loop/fallthrough.rs"]
-mod fallthrough;
 #[path = "runtime/followup.rs"]
 mod followup;
 #[path = "runtime/graceful.rs"]
@@ -261,14 +248,10 @@ mod graceful;
 mod history;
 #[path = "runtime/notes.rs"]
 mod notes;
-#[path = "loop/orchestration_phase.rs"]
-mod orchestration_phase;
 #[path = "runtime/parent_delivery.rs"]
 mod parent_delivery;
 #[path = "runtime/project_scope.rs"]
 mod project_scope;
-#[path = "runtime/schedule_confirmation.rs"]
-mod schedule_confirmation;
 pub(crate) mod specialists;
 #[path = "runtime/turn_context.rs"]
 mod turn_context;
@@ -386,6 +369,8 @@ pub(in crate::agent) use policy_metrics::{observe_route_reason_for_drift, RouteD
 // filtering, intent-gate merge). Implementation lives in `agent_helpers.rs`.
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
+#[cfg(test)]
+pub(in crate::agent) use agent_helpers::IntentGateDecision;
 pub(in crate::agent) use agent_helpers::{
     build_empty_response_fallback, filter_tool_defs_for_untrusted_external_reference,
     is_resume_request, is_untrusted_external_reference_blocked_tool,
@@ -393,7 +378,7 @@ pub(in crate::agent) use agent_helpers::{
     should_allow_contextual_project_nickname_scope, summarize_tool_args,
     text_has_explicit_project_scope_cues, truncate_for_resume,
     user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
-    IntentGateDecision, ResumeCheckpoint, ResumeExecutionSnapshot,
+    ResumeCheckpoint, ResumeExecutionSnapshot,
 };
 pub use agent_helpers::{send_status, touch_heartbeat};
 
@@ -489,10 +474,6 @@ pub struct Agent {
     /// Session IDs that have granted schedule confirmation for this process lifetime.
     /// Allows schedule creation to auto-confirm after an explicit AllowSession/AllowAlways.
     schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
-    /// Unconfirmed schedule proposals. Kept per agent runtime so request-text
-    /// classification cannot create durable state before explicit confirmation.
-    pending_schedule_proposals:
-        Arc<tokio::sync::RwLock<HashMap<String, schedule_confirmation::PendingScheduleProposal>>>,
     /// Models that recently returned 402 billing errors. Maps model name → failure time.
     /// Shared across parent/child agents. Entries expire after BILLING_FAIL_CACHE_TTL.
     billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,

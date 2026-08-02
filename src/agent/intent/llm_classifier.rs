@@ -2,24 +2,14 @@
 //!
 //! This module exposes a fast-model classification call that returns a
 //! coarse-grained intent class for a user message. It is *not* wired into
-//! the agent's decision path. Its purpose is to run alongside the existing
-//! keyword-based heuristics so we can compare outputs and gather evidence
-//! before deciding whether (and where) to replace regex-based intent
-//! detection with an LLM call.
+//! the agent's decision path. Its purpose is telemetry and evaluation only;
+//! task interpretation and capability selection remain with the main model.
 //!
 //! ## Why this exists
 //!
-//! Intent detection in this codebase is keyword-based: a series of helpers
-//! like `detect_schedule_heuristic`, `is_memory_storage_intent`, and
-//! `looks_like_personal_memory_recall_question` walk shared keyword lists
-//! and combine them with simple logic. The lists are now centralized (see
-//! `intent_keywords.rs`), but adding edge cases still requires patching
-//! regex/keyword logic in code.
-//!
-//! An LLM classifier could in principle handle the long tail of phrasings
-//! that regex misses, at the cost of latency, money, and a new failure mode.
-//! Whether that trade is worth it is an empirical question. This module
-//! provides the measurement instrument.
+//! A separate classifier can measure coarse task classes without acquiring
+//! authority to route, schedule, mutate state, or hide capabilities. This
+//! module provides that measurement instrument.
 //!
 //! ## Shape
 //!

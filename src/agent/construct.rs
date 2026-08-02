@@ -136,7 +136,6 @@ impl Agent {
             plan_store: RwLock::new(None),
             checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
-            pending_schedule_proposals: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             billing_failed_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             // Seed the in-memory ignore-set from config so a fresh start never
             // forces `tool_choice=required` on a known-bad model. Persisted
@@ -289,16 +288,6 @@ impl Agent {
         });
     }
 
-    #[cfg(test)]
-    pub async fn set_test_schedule_approval_for_session(&self, session_id: &str, approved: bool) {
-        let mut sessions = self.schedule_approved_sessions.write().await;
-        if approved {
-            sessions.insert(session_id.to_string());
-        } else {
-            sessions.remove(session_id);
-        }
-    }
-
     /// Create an Agent with explicit depth/max_depth (used internally for sub-agents).
     /// Sub-agents don't auto-route — they use whatever model was selected by the parent.
     #[allow(clippy::too_many_arguments)]
@@ -332,11 +321,6 @@ impl Agent {
         goal_token_registry: Option<GoalTokenRegistry>,
         hub: Option<Weak<ChannelHub>>,
         schedule_approved_sessions: Arc<tokio::sync::RwLock<HashSet<String>>>,
-        pending_schedule_proposals: Arc<
-            tokio::sync::RwLock<
-                HashMap<String, super::schedule_confirmation::PendingScheduleProposal>,
-            >,
-        >,
         billing_failed_models: Arc<tokio::sync::RwLock<HashMap<String, Instant>>>,
         required_tool_choice_ignored_models: Arc<tokio::sync::RwLock<HashSet<String>>>,
         record_decision_points: bool,
@@ -395,7 +379,6 @@ impl Agent {
             plan_store: RwLock::new(None),
             checklist_turn_flags: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
             schedule_approved_sessions,
-            pending_schedule_proposals,
             billing_failed_models,
             required_tool_choice_ignored_models,
             self_ref: RwLock::new(None),

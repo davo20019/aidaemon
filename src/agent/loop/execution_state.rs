@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{contains_keyword_as_words, FollowupMode, TurnContext};
+use crate::agent::TurnContext;
 use crate::traits::{
     AgentRole, ToolCallEffect, ToolCallSemantics, ToolCapabilities, ToolTargetHint,
     ToolTargetHintKind,
@@ -991,227 +991,21 @@ pub fn default_execution_budget(tier: BudgetTier) -> ExecutionBudget {
 }
 
 pub fn select_initial_execution_budget(
-    user_text: &str,
-    turn_context: &TurnContext,
+    _user_text: &str,
+    _turn_context: &TurnContext,
     depth: usize,
     role: AgentRole,
 ) -> (BudgetTier, &'static str, ExecutionBudget) {
-    fn promote_contextual_followup_budget(
-        tier: BudgetTier,
-        route_kind: &'static str,
-        turn_context: &TurnContext,
-    ) -> (BudgetTier, &'static str, ExecutionBudget) {
-        let carries_followup_context = matches!(
-            turn_context.followup_mode,
-            Some(FollowupMode::Followup | FollowupMode::ClarificationAnswer)
-        ) && !turn_context.recent_messages.is_empty();
-
-        if carries_followup_context && matches!(tier, BudgetTier::None | BudgetTier::Small) {
-            let promoted = BudgetTier::Standard;
-            return (
-                promoted,
-                "contextual_followup",
-                default_execution_budget(promoted),
-            );
-        }
-
-        (tier, route_kind, default_execution_budget(tier))
-    }
-
-    let lower = user_text.trim().to_ascii_lowercase();
-    let authoring_only_content = turn_context
-        .completion_contract
-        .connected_content_mode
-        .is_authoring_only();
-    let auth_or_integration_management =
-        crate::agent::intent_routing::user_text_requests_auth_or_integration_management(user_text);
     if depth > 0 || matches!(role, AgentRole::Executor | AgentRole::TaskLead) {
         let tier = BudgetTier::Extended;
         return (tier, "delegated_multi_step", default_execution_budget(tier));
     }
 
-    let has_scoped_target = turn_context.primary_project_scope.is_some()
-        || turn_context
-            .completion_contract
-            .primary_target_hint()
-            .is_some()
-        || lower.contains('/')
-        || lower.contains(".rs")
-        || lower.contains(".md")
-        || lower.contains(".toml");
-
-    let has_scheduled_action = [
-        "schedule",
-        "scheduled",
-        "cron",
-        "every day",
-        "every week",
-        "every month",
-        "tomorrow",
-        "next week",
-        "daily",
-        "weekly",
-        "monthly",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower, kw));
-
-    let has_deployment_or_external_write = auth_or_integration_management
-        || (!authoring_only_content
-            && [
-                "deploy", "publish", "release", "restart", "schedule", "webhook", "post", "put",
-                "patch", "delete", "send",
-            ]
-            .iter()
-            .any(|kw| contains_keyword_as_words(&lower, kw)));
-
-    let has_mutation_request = auth_or_integration_management
-        || (!authoring_only_content
-            && [
-                "edit",
-                "write",
-                "update",
-                "change",
-                "fix",
-                "fixing",
-                "implement",
-                "refactor",
-                "create",
-                "add",
-                "remove",
-                "delete",
-                "rename",
-                "remember",
-                "commit",
-                "deploy",
-                "restart",
-                "send",
-                "schedule",
-                "retry",
-                "redo",
-                "rerun",
-                "try again",
-                "do it again",
-            ]
-            .iter()
-            .any(|kw| contains_keyword_as_words(&lower, kw)));
-
-    let has_read_only_api_lookup = contains_keyword_as_words(&lower, "api")
-        && !has_mutation_request
-        && !has_deployment_or_external_write
-        && !has_scheduled_action;
-
-    let has_read_only_investigation = turn_context.completion_contract.requires_observation
-        || has_read_only_api_lookup
-        || [
-            "inspect",
-            "check",
-            "verify",
-            "read",
-            "search",
-            "find",
-            "list",
-            "show",
-            "look up",
-            "investigate",
-            "diagnose",
-            "status",
-            "logs",
-        ]
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw))
-            && !has_mutation_request
-            && !has_deployment_or_external_write;
-
-    if has_scheduled_action {
-        let tier = BudgetTier::Standard;
-        return promote_contextual_followup_budget(tier, "scheduled_action", turn_context);
-    }
-
-    if has_deployment_or_external_write {
-        let tier = BudgetTier::Standard;
-        return promote_contextual_followup_budget(
-            tier,
-            "deployment_or_external_write",
-            turn_context,
-        );
-    }
-
-    if has_mutation_request {
-        // Multi-step tasks that include both creation AND verification/testing
-        // need more budget than simple scoped edits.
-        let has_verification_step = [
-            "test",
-            "run",
-            "verify",
-            "execute",
-            "demonstrate",
-            "show me",
-            "show the results",
-            "check",
-        ]
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw));
-
-        // Tasks that involve research or multi-phase work (web search, reading
-        // existing files for context, sequential "then" steps) need Standard
-        // budget even when the final target is a scoped file path.
-        let has_research_or_multi_phase = [
-            "search the web",
-            "web search",
-            "search online",
-            "look up online",
-            "then create",
-            "then write",
-            "then make",
-            "and create",
-            "and write",
-            "and make",
-        ]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-            || (contains_keyword_as_words(&lower, "search")
-                && contains_keyword_as_words(&lower, "create"));
-
-        let needs_standard = has_verification_step || has_research_or_multi_phase;
-
-        let tier = if has_scoped_target && !needs_standard {
-            BudgetTier::Small
-        } else {
-            BudgetTier::Standard
-        };
-        let route_kind = if has_scoped_target && !needs_standard {
-            "scoped_modification"
-        } else if has_scoped_target {
-            "scoped_modification_with_verification"
-        } else {
-            "unscoped_modification"
-        };
-        return promote_contextual_followup_budget(tier, route_kind, turn_context);
-    }
-
-    if has_read_only_api_lookup {
-        let tier = BudgetTier::Standard;
-        return promote_contextual_followup_budget(tier, "api_lookup", turn_context);
-    }
-
-    if has_read_only_investigation {
-        // Previously BudgetTier::None — but this stripped tools for queries
-        // that legitimately need them (e.g., "what time is it in tokyo?"
-        // needs web_search). Use Standard as the minimum so tools are always
-        // available. The model self-decides whether to use them.
-        let tier = BudgetTier::Standard;
-        return promote_contextual_followup_budget(tier, "read_only_investigation", turn_context);
-    }
-
-    // Previously BudgetTier::None — same rationale as above.
+    // Top-level turns receive the same useful execution headroom regardless of
+    // wording. The model chooses whether and how to use tools; lexical cues such
+    // as "schedule", file suffixes, or API names must not change orchestration.
     let tier = BudgetTier::Standard;
-    let route_kind = if turn_context.completion_contract.requires_observation {
-        "read_only_investigation"
-    } else {
-        "knowledge"
-    };
-    promote_contextual_followup_budget(tier, route_kind, turn_context)
+    (tier, "model_directed", default_execution_budget(tier))
 }
 
 #[allow(clippy::too_many_arguments)]

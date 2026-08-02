@@ -553,15 +553,12 @@ async fn setup_test_agent_internal(
     })
 }
 
-/// Build a test agent with non-uniform model tiers (enables smart routing and
-/// first-pass orchestration).
+/// Build a test agent with non-uniform model tiers.
 ///
 /// The `primary_model` name is used as the agent's default model and for the
 /// Primary router tier.  `smart_model` is used for the Smart tier (and Fast
 /// tier).  Because `MockProvider` ignores model names (pops from its response
-/// queue), the different names only affect routing logic and the
-/// first-pass orchestration activation check
-/// (`first_turn_model != execution_model`).
+/// queue), the different names only affect model-routing behavior.
 #[allow(dead_code)]
 pub async fn setup_test_agent_with_models(
     provider: MockProvider,
@@ -673,8 +670,7 @@ pub async fn setup_test_agent_with_models_and_policy(
 
 /// Build a test agent in orchestrator mode with non-uniform model tiers.
 ///
-/// This enables smart routing plus first-pass orchestration so integration
-/// tests can exercise orchestration routing and the full execution loop.
+/// This enables model routing while retaining the full execution loop.
 #[allow(dead_code)]
 pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Result<TestHarness> {
     let db_file = tempfile::NamedTempFile::new()?;

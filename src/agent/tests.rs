@@ -15,9 +15,6 @@ mod goal_failure_tests;
 #[path = "response_analysis_tests.rs"]
 mod response_analysis_tests;
 
-#[path = "intent/intent_tests.rs"]
-mod intent_tests;
-
 #[path = "policy/tool_scoping_tests.rs"]
 mod tool_scoping_tests;
 

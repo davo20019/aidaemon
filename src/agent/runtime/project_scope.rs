@@ -291,6 +291,7 @@ pub(super) fn extract_project_hints_from_text(
     }
 }
 
+#[cfg(test)]
 pub(super) fn extract_project_hints_from_history(
     history: &[Message],
     current_user_text: &str,

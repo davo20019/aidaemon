@@ -1142,7 +1142,10 @@ pub(super) async fn run_completion_phase(
                             false
                         }
                     };
-                    if !is_override {
+                    if !is_override
+                        && agent.trust_tier_for_model(&model)
+                            == crate::agent::trust_tier::ModelTrustTier::Guided
+                    {
                         let reason = format!("empty_response(iter={},model={})", iteration, model);
                         if policy_bundle.policy.escalate(reason.clone()) {
                             POLICY_METRICS
@@ -2074,15 +2077,7 @@ pub(super) async fn run_completion_phase(
                                 policy_bundle.risk_score,
                                 true,
                             );
-                            let widened = agent.restrict_connected_api_setup_tools_for_request(
-                                user_text, &widened,
-                            );
-                            let widened = agent.ensure_connected_api_tools_exposed(
-                                user_text,
-                                &widened,
-                                base_tool_defs,
-                            );
-                            if !widened.is_empty() {
+                            if widened.len() > previous_count {
                                 POLICY_METRICS
                                     .fallback_expansion_total
                                     .fetch_add(1, Ordering::Relaxed);

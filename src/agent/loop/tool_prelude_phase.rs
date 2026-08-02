@@ -1178,54 +1178,6 @@ pub(super) async fn run_tool_prelude_phase(
         return Ok(ToolPreludeOutcome::ContinueLoop);
     }
 
-    // Intent gate: on first iteration, require narration before tool calls.
-    // Forces the agent to "show its work" so the user can catch misunderstandings.
-    if iteration == 1
-        && agent.depth == 0
-        && !resp.tool_calls.is_empty()
-        && resp.content.as_ref().is_none_or(|c| c.trim().len() < 20)
-        && agent
-            .supervision_gate_enforced("intent_narration_gate", model, emitter, task_id, iteration)
-            .await
-    {
-        info!(
-            session_id,
-            "Intent gate: requiring narration before tool execution"
-        );
-        agent
-            .with_harness_eval(|eval| eval.record_intent_gate_fire())
-            .await;
-        for tc in &resp.tool_calls {
-            let result_text = "[SYSTEM] Before executing tools, briefly state what you \
-                    understand the user is asking and what you plan to do. \
-                    Then re-issue the tool calls."
-                .to_string();
-            let tool_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                session_id: session_id.to_string(),
-                role: "tool".to_string(),
-                content: Some(result_text),
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls_json: None,
-                created_at: Utc::now(),
-                importance: 0.3,
-                ..Message::runtime_defaults()
-            };
-            agent
-                .append_tool_message_with_result_event(
-                    emitter,
-                    &tool_msg,
-                    true,
-                    0,
-                    None,
-                    Some(task_id),
-                )
-                .await?;
-        }
-        return Ok(ToolPreludeOutcome::ContinueLoop);
-    }
-
     if let Some(side_effecting_tool_call) =
         first_plain_text_blocked_tool_call(agent, resp, available_capabilities)
     {

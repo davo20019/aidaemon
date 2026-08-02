@@ -4,12 +4,12 @@
 //! `execution_state` so `use super::*;` continues to resolve against it.
 
 use super::*;
-use crate::agent::{CompletionContract, CompletionTaskKind, TurnContext};
+use crate::agent::{CompletionContract, CompletionTaskKind, FollowupMode, TurnContext};
 use crate::traits::{ToolCallSemantics, ToolTargetHintKind};
 use serde_json::json;
 
 #[test]
-fn scoped_edit_requests_start_with_small_budget() {
+fn top_level_requests_use_model_directed_standard_budget() {
     let turn_context = TurnContext {
         primary_project_scope: Some("/tmp/demo".to_string()),
         ..TurnContext::default()
@@ -20,8 +20,8 @@ fn scoped_edit_requests_start_with_small_budget() {
         0,
         AgentRole::Orchestrator,
     );
-    assert_eq!(tier, BudgetTier::Small);
-    assert_eq!(route_kind, "scoped_modification");
+    assert_eq!(tier, BudgetTier::Standard);
+    assert_eq!(route_kind, "model_directed");
     assert_eq!(budget.max_validation_rounds, 3);
 }
 
@@ -41,7 +41,7 @@ fn research_plus_create_gets_standard_not_small() {
         BudgetTier::Standard,
         "research+create should get Standard budget"
     );
-    assert_eq!(route_kind, "scoped_modification_with_verification");
+    assert_eq!(route_kind, "model_directed");
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn knowledge_turns_use_standard_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "knowledge");
+    assert_eq!(route_kind, "model_directed");
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn scheduled_turns_use_standard_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "scheduled_action");
+    assert_eq!(route_kind, "model_directed");
     assert!(budget.max_validation_rounds >= 3);
 }
 
@@ -230,7 +230,7 @@ fn read_only_investigation_uses_standard_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "read_only_investigation");
+    assert_eq!(route_kind, "model_directed");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn api_read_requests_use_standard_budget_for_multi_step_lookups() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "api_lookup");
+    assert_eq!(route_kind, "model_directed");
     assert!(budget.max_llm_calls >= 18);
     assert_eq!(budget.max_tokens, 0);
 }
@@ -261,7 +261,7 @@ fn connected_content_authoring_requests_stay_in_knowledge_lane() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "deployment_or_external_write");
+    assert_eq!(route_kind, "model_directed");
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn account_scoped_connected_content_delivery_uses_external_write_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "deployment_or_external_write");
+    assert_eq!(route_kind, "model_directed");
     assert!(budget.max_llm_calls >= 18);
 }
 
@@ -286,7 +286,7 @@ fn auth_management_requests_use_standard_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "deployment_or_external_write");
+    assert_eq!(route_kind, "model_directed");
 }
 
 #[test]
@@ -329,7 +329,7 @@ fn clarification_followups_promote_scoped_edits_to_standard_budget() {
         AgentRole::Orchestrator,
     );
     assert_eq!(tier, BudgetTier::Standard);
-    assert_eq!(route_kind, "contextual_followup");
+    assert_eq!(route_kind, "model_directed");
     assert!(budget.max_validation_rounds >= 3);
 }
 

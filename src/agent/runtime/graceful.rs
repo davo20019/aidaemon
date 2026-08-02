@@ -989,7 +989,7 @@ impl Agent {
             .await
     }
 
-    /// Emit TaskEnd after recording a deterministic orchestration direct-return.
+    /// Emit TaskEnd after recording an exact bootstrap protocol direct-return.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn emit_direct_return_task_end(
         &self,

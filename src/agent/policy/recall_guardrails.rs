@@ -1,3 +1,4 @@
+#[cfg(test)]
 use serde_json::Value;
 
 use super::intent_routing::contains_keyword_as_words;
@@ -150,6 +151,7 @@ pub(super) fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSumma
     summary
 }
 
+#[cfg(test)]
 pub(super) fn deterministic_reply_for_critical_query(
     query: CriticalFactQuery,
     summary: &CriticalFactSummary,
@@ -228,6 +230,7 @@ pub(super) fn text_relates_to_critical_identity(text: &str) -> bool {
         || (lower.contains("remembered:") && lower.contains("name"))
 }
 
+#[cfg(test)]
 pub(super) fn filter_tool_defs_for_personal_memory(defs: &[Value]) -> Vec<Value> {
     defs.iter()
         .filter_map(|def| {
@@ -250,6 +253,7 @@ pub(super) fn is_delegation_blocked_tool(name: &str) -> bool {
     matches!(name, "terminal" | "browser" | "run_command")
 }
 
+#[cfg(test)]
 pub(super) fn filter_tool_defs_for_delegation(defs: &[Value]) -> Vec<Value> {
     defs.iter()
         .filter_map(|def| {

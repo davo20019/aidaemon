@@ -512,11 +512,6 @@ pub(super) fn looks_like_self_contained_mutation_request(current: &str, lower_te
         return false;
     }
 
-    if let Some((schedule_raw, _)) = crate::cron_utils::extract_schedule_from_text(trimmed) {
-        let cleaned = crate::cron_utils::clean_task_description(trimmed, &schedule_raw);
-        return payload_has_self_contained_detail(&cleaned);
-    }
-
     let has_mutation_cue = [
         "set up", "setup", "create", "build", "write", "edit", "update", "delete", "remove",
         "deploy", "publish", "post", "send", "email", "message", "upload", "install", "connect",
@@ -1142,12 +1137,12 @@ mod tests {
         assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
     }
     #[test]
-    fn detailed_schedule_request_breaks_followup_carryover() {
+    fn detailed_request_after_schedule_question_keeps_semantic_context() {
         let current = "Can you set up a daily scheduled task at 6:00 am to publish the blog with honest reflections about recent errors and fixes.";
         let (mode, reasons) =
             classify_followup_mode(current, Some("Would you like me to schedule that?"));
-        assert_eq!(mode, FollowupMode::NewTask);
-        assert!(reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
+        assert_ne!(mode, FollowupMode::NewTask);
+        assert!(!reasons.contains(&TurnContextReason::FollowupOverrideStandalone));
     }
     #[test]
     fn deictic_schedule_followup_stays_contextual() {

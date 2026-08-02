@@ -6,7 +6,7 @@ orchestrator: true
 mock_responses:
   - text: I inspected Cargo.toml without modifying anything.
 expect:
-  tools_required_predicted: true
+  tools_required_predicted: false
   tools_not_used:
     - write_file
     - terminal

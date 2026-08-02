@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
     let properties = parameters
@@ -152,6 +152,7 @@ impl Agent {
             .0
     }
 
+    #[cfg(test)]
     pub(super) fn has_available_tool(&self, tool_name: &str) -> bool {
         self.tools
             .iter()
@@ -162,6 +163,7 @@ impl Agent {
         self.tools.iter().any(|tool| tool.name() == tool_name)
     }
 
+    #[cfg(test)]
     pub(super) fn has_cli_agents_available(&self) -> bool {
         self.has_available_tool("cli_agent")
     }
@@ -256,96 +258,6 @@ impl Agent {
             .collect();
         keyed.sort_by(|(an, as_, _), (bn, bs, _)| an.cmp(bn).then_with(|| as_.cmp(bs)));
         defs.extend(keyed.into_iter().map(|(_, _, d)| d));
-    }
-
-    fn request_requires_connected_api_setup_tools(user_message: &str) -> bool {
-        crate::agent::intent_routing::user_text_requests_auth_or_integration_management(
-            user_message,
-        ) || crate::agent::intent_routing::classify_connected_api_intent(user_message).is_some()
-    }
-
-    pub(super) fn restrict_connected_api_setup_tools_for_request(
-        &self,
-        user_message: &str,
-        defs: &[Value],
-    ) -> Vec<Value> {
-        if Self::request_requires_connected_api_setup_tools(user_message) {
-            return defs.to_vec();
-        }
-
-        defs.iter()
-            .filter(|def| {
-                !matches!(
-                    Self::tool_name_from_definition(def),
-                    Some("manage_api" | "manage_http_auth" | "manage_oauth")
-                )
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn connected_api_tools_to_pin(user_message: &str) -> Option<&'static [&'static str]> {
-        if crate::agent::intent_routing::user_text_requests_auth_or_integration_management(
-            user_message,
-        ) {
-            return Some(&[
-                "manage_api",
-                "manage_oauth",
-                "manage_http_auth",
-                "http_request",
-            ]);
-        }
-
-        match crate::agent::intent_routing::classify_connected_api_intent(user_message) {
-            Some(crate::agent::intent_routing::ConnectedApiIntent::RuntimeCapabilityValidation)
-            | Some(crate::agent::intent_routing::ConnectedApiIntent::ReadAction)
-            | Some(crate::agent::intent_routing::ConnectedApiIntent::WriteAction) => Some(&[
-                "manage_api",
-                "manage_oauth",
-                "manage_http_auth",
-                "http_request",
-            ]),
-            None => None,
-        }
-    }
-
-    pub(super) fn ensure_connected_api_tools_exposed(
-        &self,
-        user_message: &str,
-        filtered_defs: &[Value],
-        base_defs: &[Value],
-    ) -> Vec<Value> {
-        let Some(pinned_names) = Self::connected_api_tools_to_pin(user_message) else {
-            return filtered_defs.to_vec();
-        };
-        let base_by_name: HashMap<String, Value> = base_defs
-            .iter()
-            .filter_map(|def| {
-                let name = Self::tool_name_from_definition(def)?.to_string();
-                Some((name, def.clone()))
-            })
-            .collect();
-
-        let mut exposed: Vec<Value> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for name in pinned_names {
-            if let Some(def) = base_by_name.get(*name) {
-                seen.insert((*name).to_string());
-                exposed.push(def.clone());
-            }
-        }
-
-        for def in filtered_defs {
-            let Some(name) = Self::tool_name_from_definition(def) else {
-                continue;
-            };
-            if seen.insert(name.to_string()) {
-                exposed.push(def.clone());
-            }
-        }
-
-        exposed
     }
 
     pub(super) fn filter_tool_definitions_for_policy(
@@ -476,60 +388,6 @@ impl Agent {
     /// internal/system sessions, never in group or public conversations.
     const DESKTOP_CONTROL_TOOLS: &'static [&'static str] = &["computer_use"];
 
-    fn request_has_explicit_desktop_control_cue(user_message: &str) -> bool {
-        const DESKTOP_CUES: &[&str] = &[
-            "computer use",
-            "computer_use",
-            "desktop",
-            "gui",
-            "screen",
-            "screenshot",
-            "window",
-            "click",
-            "tap",
-            "mouse",
-            "keyboard",
-            "button",
-            "menu",
-            "scroll",
-            "drag",
-            "application",
-            "app",
-            "finder",
-            "calculator",
-            "textedit",
-            "preview",
-            "safari",
-            "chrome",
-            "xcode",
-            "system settings",
-        ];
-        DESKTOP_CUES
-            .iter()
-            .any(|cue| contains_keyword_as_words(user_message, cue))
-    }
-
-    /// A concrete local path does not imply a GUI task. Keep desktop automation
-    /// out of the model's fallback set for filesystem-only requests, while
-    /// preserving it when the user explicitly names a GUI/app interaction.
-    pub(crate) fn restrict_desktop_control_for_request(
-        defs: &mut Vec<Value>,
-        caps: &mut HashMap<String, ToolCapabilities>,
-        user_message: &str,
-    ) {
-        if !user_text_references_filesystem_path(user_message)
-            || Self::request_has_explicit_desktop_control_cue(user_message)
-        {
-            return;
-        }
-        defs.retain(|d| {
-            Self::tool_name_from_definition(d)
-                .map(|name| !Self::DESKTOP_CONTROL_TOOLS.contains(&name))
-                .unwrap_or(true)
-        });
-        caps.retain(|name, _| !Self::DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
-    }
-
     /// Whether desktop-control tools may be exposed in a conversation of this
     /// visibility. Only direct messages (`Private`) and internal/system sessions
     /// (`Internal`, e.g. the scheduler or spawned sub-agents) qualify. Group and
@@ -560,6 +418,7 @@ impl Agent {
         caps.retain(|name, _| !Self::DESKTOP_CONTROL_TOOLS.contains(&name.as_str()));
     }
 
+    #[cfg(test)]
     pub(super) async fn load_policy_tool_set(
         &self,
         user_message: &str,
@@ -581,14 +440,9 @@ impl Agent {
         // Desktop control is owner-machine-only: never expose it outside DMs and
         // internal sessions, so a shared-channel message can't trigger it.
         Self::restrict_desktop_control_for_visibility(&mut defs, &mut caps, channel_visibility);
-        Self::restrict_desktop_control_for_request(&mut defs, &mut caps, user_message);
-
         let base_defs = defs.clone();
-        defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
         if enforce_filter {
             defs = self.filter_tool_definitions_for_policy(&defs, &caps, policy, risk_score, false);
-            defs = self.restrict_connected_api_setup_tools_for_request(user_message, &defs);
-            defs = self.ensure_connected_api_tools_exposed(user_message, &defs, &base_defs);
         }
 
         (defs, base_defs, caps)
@@ -734,50 +588,6 @@ mod tests {
             );
             assert!(caps.contains_key("computer_use"));
         }
-    }
-
-    #[test]
-    fn filesystem_only_request_strips_computer_use_but_keeps_terminal() {
-        let mut defs = vec![named_tool_def("computer_use"), named_tool_def("terminal")];
-        let mut caps = HashMap::from([
-            ("computer_use".to_string(), ToolCapabilities::default()),
-            ("terminal".to_string(), ToolCapabilities::default()),
-        ]);
-
-        Agent::restrict_desktop_control_for_request(
-            &mut defs,
-            &mut caps,
-            "How many projects do I have at ~/projects?",
-        );
-
-        let names: Vec<&str> = defs
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .collect();
-        assert!(!names.contains(&"computer_use"));
-        assert!(names.contains(&"terminal"));
-        assert!(!caps.contains_key("computer_use"));
-        assert!(caps.contains_key("terminal"));
-    }
-
-    #[test]
-    fn explicit_finder_request_keeps_computer_use_for_local_path() {
-        let mut defs = vec![named_tool_def("computer_use")];
-        let mut caps = HashMap::from([("computer_use".to_string(), ToolCapabilities::default())]);
-
-        Agent::restrict_desktop_control_for_request(
-            &mut defs,
-            &mut caps,
-            "Open ~/projects in Finder",
-        );
-
-        assert_eq!(
-            defs.iter()
-                .filter_map(Agent::tool_name_from_definition)
-                .collect::<Vec<_>>(),
-            vec!["computer_use"]
-        );
-        assert!(caps.contains_key("computer_use"));
     }
 
     proptest! {
@@ -968,264 +778,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_validation_queries_pin_connected_api_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
+    async fn private_owner_roster_keeps_safe_capabilities_without_keyword_routing() {
+        let extra_tools = [
+            "manage_mandates",
+            "manage_memories",
+            "http_request",
+            "manage_api",
+        ]
+        .into_iter()
+        .map(|name| Arc::new(MockTool::new(name, "test capability", "ok")) as Arc<dyn Tool>)
+        .collect();
+        let harness =
+            setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), extra_tools)
+                .await
+                .unwrap();
+        let policy = ExecutionPolicy::for_profile(ModelProfile::Strong);
 
-        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
-        let base = vec![
-            named_tool_def("search_files"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_skills"),
-            named_tool_def("manage_oauth"),
-            named_tool_def("terminal"),
-        ];
-
-        let exposed = harness.agent.ensure_connected_api_tools_exposed(
-            "Can you verify whether you can post to Twitter/X right now before answering?",
-            &filtered,
-            &base,
-        );
-        let names: Vec<String> = exposed
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        assert!(names.contains(&"manage_api".to_string()));
-        assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
-        assert_eq!(names.first().map(String::as_str), Some("manage_api"));
-    }
-
-    #[tokio::test]
-    async fn connected_api_write_queries_pin_connected_api_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
-
-        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
-        let base = vec![
-            named_tool_def("search_files"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_skills"),
-            named_tool_def("manage_oauth"),
-            named_tool_def("terminal"),
-        ];
-
-        let exposed = harness.agent.ensure_connected_api_tools_exposed(
-            "Create a GitHub issue for this regression.",
-            &filtered,
-            &base,
-        );
-        let names: Vec<String> = exposed
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        assert!(names.contains(&"manage_api".to_string()));
-        assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
-    }
-
-    #[tokio::test]
-    async fn connected_api_read_queries_pin_connected_api_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
-
-        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
-        let base = vec![
-            named_tool_def("search_files"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_skills"),
-            named_tool_def("manage_oauth"),
-            named_tool_def("terminal"),
-        ];
-
-        let exposed = harness.agent.ensure_connected_api_tools_exposed(
-            "List my open GitHub issues.",
-            &filtered,
-            &base,
-        );
-
-        let names: Vec<String> = exposed
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        assert!(names.contains(&"manage_api".to_string()));
-        assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
-    }
-
-    #[tokio::test]
-    async fn non_connected_api_queries_do_not_pin_connected_api_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
-
-        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
-        let base = vec![
-            named_tool_def("search_files"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_skills"),
-            named_tool_def("manage_oauth"),
-            named_tool_def("terminal"),
-        ];
-
-        let exposed = harness.agent.ensure_connected_api_tools_exposed(
-            "What's your twitter account?",
-            &filtered,
-            &base,
-        );
-        let names: Vec<String> = exposed
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        assert_eq!(
-            names,
-            vec!["search_files".to_string(), "terminal".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn auth_management_queries_pin_connected_api_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
-
-        let filtered = vec![named_tool_def("search_files"), named_tool_def("terminal")];
-        let base = vec![
-            named_tool_def("search_files"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_oauth"),
-            named_tool_def("terminal"),
-        ];
-
-        let exposed = harness.agent.ensure_connected_api_tools_exposed(
-            "Reconnect my GitHub OAuth integration.",
-            &filtered,
-            &base,
-        );
-        let names: Vec<String> = exposed
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        assert!(names.contains(&"manage_api".to_string()));
-        assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
-    }
-
-    #[tokio::test]
-    async fn drafting_queries_strip_connected_api_setup_tools() {
-        let harness = setup_full_stack_test_agent_with_extra_tools(MockProvider::new(), vec![])
-            .await
-            .unwrap();
-
-        let defs = vec![
-            named_tool_def("search_files"),
-            named_tool_def("read_file"),
-            named_tool_def("manage_api"),
-            named_tool_def("http_request"),
-            named_tool_def("manage_http_auth"),
-            named_tool_def("manage_oauth"),
-        ];
-        let capabilities: HashMap<String, ToolCapabilities> = HashMap::from([
-            ("search_files".to_string(), ToolCapabilities::default()),
-            ("read_file".to_string(), ToolCapabilities::default()),
-            (
-                "manage_api".to_string(),
-                ToolCapabilities {
-                    read_only: false,
-                    external_side_effect: true,
-                    needs_approval: true,
-                    idempotent: false,
-                    high_impact_write: true,
-                },
-            ),
-            (
-                "http_request".to_string(),
-                ToolCapabilities {
-                    read_only: false,
-                    external_side_effect: true,
-                    needs_approval: true,
-                    idempotent: false,
-                    high_impact_write: false,
-                },
-            ),
-            (
-                "manage_http_auth".to_string(),
-                ToolCapabilities {
-                    read_only: false,
-                    external_side_effect: true,
-                    needs_approval: true,
-                    idempotent: false,
-                    high_impact_write: true,
-                },
-            ),
-            (
-                "manage_oauth".to_string(),
-                ToolCapabilities {
-                    read_only: false,
-                    external_side_effect: true,
-                    needs_approval: true,
-                    idempotent: false,
-                    high_impact_write: true,
-                },
-            ),
-        ]);
-
-        let filtered = harness.agent.filter_tool_definitions_for_policy(
-            &defs,
-            &capabilities,
-            &ExecutionPolicy::for_profile(ModelProfile::Cheap),
-            0.2,
-            false,
-        );
-        let filtered = harness
-            .agent
-            .restrict_connected_api_setup_tools_for_request(
-                "Can you post a tweet about your new stuff and make it engaging?",
-                &filtered,
-            );
-        let names: Vec<String> = filtered
-            .iter()
-            .filter_map(Agent::tool_name_from_definition)
-            .map(ToString::to_string)
-            .collect();
-
-        // "post a tweet ... make it engaging" now classifies as WriteAction
-        // (DraftThenDeliver), so restrict_connected_api_setup_tools_for_request
-        // keeps all defs. However, the upstream policy filter (Cheap, risk=0.2)
-        // already removed manage_oauth via the low-risk truncation. The
-        // restrict step can only preserve what survived the policy filter.
-        assert!(names.contains(&"manage_api".to_string()));
-        assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        // manage_oauth was removed by Cheap low-risk policy truncation
-        assert!(!names.contains(&"manage_oauth".to_string()));
+        for request in [
+            "Prepare a mandate draft. Do not schedule or activate it.",
+            "Review every 15 minutes and schedule the work.",
+            "Help me decide what to do next.",
+        ] {
+            let (defs, _, _) = harness
+                .agent
+                .load_policy_tool_set(request, ChannelVisibility::Private, &policy, 0.2, false)
+                .await;
+            let names = defs
+                .iter()
+                .filter_map(Agent::tool_name_from_definition)
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"manage_mandates"));
+            assert!(names.contains(&"manage_memories"));
+            assert!(names.contains(&"http_request"));
+            assert!(names.contains(&"manage_api"));
+        }
     }
 
     #[tokio::test]

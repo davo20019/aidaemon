@@ -723,6 +723,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         }
         let policy_tool_budget = policy_bundle.policy.tool_budget;
         if agent.policy_config.policy_enforce
+            && agent.trust_tier_for_model(model)
+                == crate::agent::trust_tier::ModelTrustTier::Guided
             && is_hard_policy_tool_budget_reached(total_tool_calls_attempted, policy_tool_budget)
         {
             force_text_response = true;
@@ -2706,6 +2708,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             completed_tool_calls: &learning_ctx.tool_calls,
             recent_tool_names: &recent_tool_names,
             user_text: _user_text,
+            model,
         },
         super::post_loop::PostToolIterationState {
             total_successful_tool_calls: &mut total_successful_tool_calls,

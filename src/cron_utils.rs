@@ -13,9 +13,11 @@ use std::sync::LazyLock;
 
 static RE_SPACE_COLLAPSE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s+").expect("space collapse regex"));
+#[cfg(test)]
 static RE_SPLIT_NUMBERED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[.;]\s*)\s*\d+[\)\.]\s+").expect("numbered split regex")
 });
+#[cfg(test)]
 static RE_SPLIT_DELIMITER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:[.!?]\s+(?:also|and)\s+|;\s*(?:also|and)\s+|;\s+)")
         .expect("delimiter split regex")
@@ -148,11 +150,13 @@ static RE_FILLER_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("filler-prefix regex")
 });
+#[cfg(test)]
 static RE_LEADING_CONNECTOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(?:also|and|then)\b[:,]?\s*").expect("leading-connector regex")
 });
 
 /// A schedule/task pair extracted from one message segment.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSegment {
     /// Clean task text with schedule/filler language stripped.
@@ -171,28 +175,17 @@ struct ScheduleMatch {
     end: usize,
 }
 
-/// Check whether a schedule string is a bare month-day pattern (e.g. "March 3rd",
-/// "on October 15th at 3pm").  Bare month-day patterns are ambiguous — they could
-/// be references to past events, facts, or recall rather than scheduling requests.
-/// Callers should require additional scheduling context (a verb like "remind" or
-/// "schedule") before treating these as scheduling intent.
-pub fn is_bare_month_day_pattern(schedule_raw: &str) -> bool {
-    let trimmed = schedule_raw.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    RE_SCHEDULE_MONTH_DAY.is_match(trimmed)
-}
-
 /// Extract the first schedule phrase from arbitrary user text.
 ///
 /// Returns `(schedule_raw, is_one_shot)` when a schedule is detected.
+#[cfg(test)]
 pub fn extract_schedule_from_text(text: &str) -> Option<(String, bool)> {
     let schedule_match = extract_schedule_match(text)?;
     Some((schedule_match.schedule_raw, schedule_match.is_one_shot))
 }
 
 /// Extract all schedule/task segments from a potentially multi-request message.
+#[cfg(test)]
 pub fn extract_schedule_segments(text: &str) -> Vec<ScheduleSegment> {
     let mut out = Vec::new();
     for candidate in split_schedule_candidates(text) {
@@ -226,6 +219,7 @@ pub fn clean_task_description(text: &str, schedule_match: &str) -> String {
     clean_task_description_with_match(text, schedule_match, schedule_range)
 }
 
+#[cfg(test)]
 fn split_schedule_candidates(text: &str) -> Vec<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -456,6 +450,7 @@ fn clean_task_description_with_match(
     capitalize_first_ascii(&cleaned)
 }
 
+#[cfg(test)]
 fn append_non_schedule_fragment(previous: &mut ScheduleSegment, fragment: &str) {
     let mut cleaned_fragment = fragment.trim().to_string();
     cleaned_fragment = RE_LEADING_CONNECTOR

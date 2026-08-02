@@ -301,22 +301,14 @@ pub(in crate::agent) fn summarize_tool_args(name: &str, arguments: &str) -> Stri
     }
 }
 
-/// Per-turn intent decision, populated only by deterministic heuristics
-/// (`infer_intent_gate` keyword rules, deterministic cancel detection in
-/// `main_loop.rs`). The model-populated `[INTENT_GATE]` protocol that once
-/// filled additional fields was removed with the consultant system in
-/// v0.9.21.
+/// Legacy intent-gate test fixture. Production routing is model-directed.
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(in crate::agent) struct IntentGateDecision {
     /// Heuristics armed the tool requirement: the request references the
     /// filesystem, local execution, auth/integration management, or a
     /// connected API and cannot be satisfied by a text-only reply.
     pub(in crate::agent) needs_tools: Option<bool>,
-    /// True when the user explicitly asks to cancel active work.
-    pub(in crate::agent) cancel_intent: Option<bool>,
-    /// Cancel scope: "generic" (broad cancel) or "targeted" (specific
-    /// goal/task).
-    pub(in crate::agent) cancel_scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]

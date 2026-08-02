@@ -1,4 +1,5 @@
 use super::*;
+use crate::traits::Goal;
 use serde_json::json;
 
 fn sample_task(status: &str, description: &str, result: Option<&str>, error: Option<&str>) -> Task {

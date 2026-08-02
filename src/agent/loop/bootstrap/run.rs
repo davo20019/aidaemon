@@ -1,7 +1,5 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use crate::agent::recall_guardrails::{
-    detect_critical_fact_query, deterministic_reply_for_critical_query,
-    extract_critical_fact_summary, filter_tool_defs_for_personal_memory, is_personal_memory_tool,
     looks_like_personal_memory_recall_question, user_is_reaffirmation_challenge,
     user_requests_external_verification,
 };
@@ -433,59 +431,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         return Ok(BootstrapOutcome::Return(Ok(reply)));
     }
 
-    // Explicit mid-task pivots ("wait stop... actually ... instead") should
-    // cancel stale in-flight work but continue handling the new instruction.
-    super::shortcuts::maybe_cancel_work_for_mid_task_pivot(
-        agent,
-        session_id,
-        user_text,
-        user_role,
-        &channel_ctx,
-        status_tx.clone(),
-        &task_id,
-    )
-    .await;
-
-    if let Some(reply) = super::shortcuts::maybe_handle_non_resolving_confirmation_shortcut(
-        agent, session_id, user_text, &task_id, &emitter,
-    )
-    .await?
-    {
-        return Ok(BootstrapOutcome::Return(Ok(reply)));
-    }
-
-    if let Some(reply) = super::shortcuts::maybe_handle_trivial_ack_shortcut(
-        agent, session_id, user_text, &task_id, &emitter,
-    )
-    .await?
-    {
-        return Ok(BootstrapOutcome::Return(Ok(reply)));
-    }
-
-    if let Some(reply) = super::shortcuts::maybe_handle_time_query_shortcut(
-        agent, session_id, user_text, &task_id, &emitter,
-    )
-    .await?
-    {
-        return Ok(BootstrapOutcome::Return(Ok(reply)));
-    }
-
-    let straightforward_artifact_task = recognized_artifact_creation_request(user_text)
-        && matches!(
-            classify_intent_complexity(user_text),
-            IntentComplexity::Simple
-        );
-
-    // Deterministic critical-fact resolver for high-trust identity/profile recall.
-    // This avoids model drift when context is compressed or the fast model is selected.
-    let critical_fact_query = detect_critical_fact_query(user_text);
     // Only fetch identity/profile categories — NOT get_facts(None) which returned
     // every fact in the DB, causing unrelated facts (Ecuador travel, WiFi router
     // tips, etc.) to bleed into prompts for unrelated queries.
     let owner_dm_fact_cache = if agent.depth == 0
         && user_role == UserRole::Owner
         && channel_ctx.should_inject_personal_memory()
-        && !straightforward_artifact_task
     {
         let mut identity_facts = Vec::new();
         for cat in &[
@@ -507,33 +458,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     } else {
         None
     };
-    if agent.depth == 0
-        && user_role == UserRole::Owner
-        && channel_ctx.should_inject_personal_memory()
-        && !straightforward_artifact_task
-    {
-        if let Some(query) = critical_fact_query {
-            let facts = owner_dm_fact_cache.as_deref().unwrap_or(&[]);
-            let mut summary = extract_critical_fact_summary(facts);
-            if let Some(configured_name) =
-                crate::agent::system_prompt::infer_assistant_name_from_prompt(&agent.system_prompt)
-            {
-                summary.assistant_name = Some(configured_name);
-            }
-            let reply = deterministic_reply_for_critical_query(query, &summary);
-            let reply = super::shortcuts::emit_bootstrap_direct_reply(
-                agent,
-                &emitter,
-                &task_id,
-                session_id,
-                Instant::now(),
-                &reply,
-            )
-            .await?;
-            return Ok(BootstrapOutcome::Return(Ok(reply)));
-        }
-    }
-
     // Initialize learning context for post-task learning
     let mut learning_ctx = LearningContext {
         user_text: user_text.to_string(),
@@ -595,16 +519,14 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         }
     }
     let requests_external_verification = user_requests_external_verification(user_text);
-    // Bootstrap tool exposure happens before per-task routing. Use the runtime
-    // snapshot's primary model as the trust-tier signal so keyword-derived
-    // memory intent can narrow tools only for Guided models. The same snapshot
-    // is reused below for provider/router selection.
+    // Bootstrap tool exposure happens before per-task model selection. Use the
+    // runtime primary model's trust tier to decide whether policy filtering is
+    // merely observed or may narrow the roster.
     let llm_runtime_snapshot = agent.llm_runtime.snapshot();
     let llm_provider = llm_runtime_snapshot.provider();
     let llm_router = llm_runtime_snapshot.router();
-    let guided_bootstrap_supervision = agent
-        .trust_tier_for_model(&llm_runtime_snapshot.primary_model())
-        == crate::agent::trust_tier::ModelTrustTier::Guided;
+    let autonomous_bootstrap = agent.trust_tier_for_model(&llm_runtime_snapshot.primary_model())
+        == crate::agent::trust_tier::ModelTrustTier::Autonomous;
     let skills_snapshot = agent.skill_cache.get();
     let active_untrusted_external_reference_skills =
         matched_untrusted_external_reference_skill_names(
@@ -616,26 +538,12 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     let restrict_untrusted_external_reference_tools = !active_untrusted_external_reference_skills
         .is_empty()
         && !user_explicitly_requests_local_file_inspection(user_text);
-    // For personal-memory recall turns, keep tool search narrow unless the
-    // user explicitly asks for broader verification.
-    let restrict_to_personal_memory_tools = guided_bootstrap_supervision
-        && is_personal_memory_recall_turn
-        && !requests_external_verification;
-    // "Are you sure?" should allow only one targeted re-check before reaffirming.
-    let personal_memory_tool_call_cap = if guided_bootstrap_supervision
-        && is_reaffirmation_challenge_turn
-        && is_personal_memory_recall_turn
-    {
-        1
-    } else {
-        4
-    };
+    let restrict_to_personal_memory_tools = false;
+    let personal_memory_tool_call_cap = 4;
 
     // Tools are owner-only by default. A Guest can receive a tiny file-tool
     // subset only through an explicit, active, channel-bound workspace grant.
-    // Orchestrator (depth 0) now keeps tools available from iteration 1.
-    // Deterministic control-plane routing still handles cancel/schedule/goal fast-paths
-    // before the first LLM call.
+    // Orchestrator (depth 0) keeps its authorized tools available from iteration 1.
     // Sub-agents (depth > 0) get tools based on their role (set in spawn_child).
     let workspace_grant = channel_ctx.active_workspace_grant(user_role);
     let tools_allowed_for_user = user_role == UserRole::Owner || workspace_grant.is_some();
@@ -719,19 +627,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             }
         }
 
-        {
-            let before = defs.len();
-            Agent::restrict_desktop_control_for_request(&mut defs, &mut caps, user_text);
-            if before != defs.len() {
-                tool_filter_stages.push(GateFilterStage::new(
-                    "desktop_control_request_scope",
-                    before,
-                    defs.len(),
-                    "filtered",
-                ));
-            }
-        }
-
         if restrict_untrusted_external_reference_tools {
             let before = defs.len();
             defs = filter_tool_defs_for_untrusted_external_reference(&defs);
@@ -746,41 +641,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                     "filtered"
                 },
             ));
-        }
-
-        if restrict_to_personal_memory_tools {
-            let before = defs.len();
-            defs = filter_tool_defs_for_personal_memory(&defs);
-            caps.retain(|name, _| is_personal_memory_tool(name));
-            tool_filter_stages.push(GateFilterStage::new(
-                "personal_memory_allowlist",
-                before,
-                defs.len(),
-                if before == defs.len() {
-                    "passed"
-                } else {
-                    "filtered"
-                },
-            ));
-        }
-
-        if matches!(
-            classify_intent_complexity(user_text),
-            IntentComplexity::Simple
-        ) {
-            let before = defs.len();
-            defs.retain(|definition| {
-                Agent::tool_name_from_definition(definition) != Some("track_requirements")
-            });
-            caps.remove("track_requirements");
-            if before != defs.len() {
-                tool_filter_stages.push(GateFilterStage::new(
-                    "simple_turn_no_checklist",
-                    before,
-                    defs.len(),
-                    "filtered",
-                ));
-            }
         }
 
         available_capabilities = caps;
@@ -799,7 +659,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     Agent::sort_tool_definitions_by_name(&mut tool_defs);
 
     let mut policy_bundle = build_policy_bundle(user_text, &available_capabilities, false);
-    if (critical_fact_query.is_some() || is_personal_memory_recall_turn)
+    if is_personal_memory_recall_turn
         && matches!(policy_bundle.policy.model_profile, ModelProfile::Cheap)
         && policy_bundle
             .policy
@@ -820,10 +680,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
             policy_bundle.risk_score,
             false,
         );
-        let shadow_filtered =
-            agent.restrict_connected_api_setup_tools_for_request(user_text, &shadow_filtered);
-        let shadow_filtered =
-            agent.ensure_connected_api_tools_exposed(user_text, &shadow_filtered, &tool_defs);
         POLICY_METRICS
             .tool_exposure_samples
             .fetch_add(1, Ordering::Relaxed);
@@ -844,7 +700,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 "Policy tool filter shadow comparison"
             );
         }
-        if agent.policy_config.tool_filter_enforce {
+        if agent.policy_config.tool_filter_enforce && !autonomous_bootstrap {
             tool_filter_stages.push(GateFilterStage::new(
                 "policy_filter",
                 tool_defs.len(),
@@ -910,9 +766,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     // Provider + router came from the same runtime snapshot above, keeping
     // this task internally consistent even if runtime configuration reloads.
 
-    // Model selection: route to the appropriate model.
-    // Iteration 1 runs deterministic orchestration routing before entering
-    // the normal tool-enabled loop.
+    // Model selection: autonomous primary models interpret the request directly.
+    // Lexical policy scoring remains available for guided/local-model support,
+    // but must not silently swap a capable primary model based on user wording.
     let selected_model = {
         let is_override =
             match tokio::time::timeout(Duration::from_secs(2), agent.model_override.read()).await {
@@ -926,7 +782,9 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 }
             };
         if !is_override {
-            if let Some(ref router) = llm_router {
+            if autonomous_bootstrap {
+                llm_runtime_snapshot.primary_model()
+            } else if let Some(ref router) = llm_router {
                 let new_model = router
                     .select_for_profile(policy_bundle.policy.model_profile)
                     .to_string();
@@ -986,9 +844,8 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     };
     let mut model = selected_model.clone();
     let route_failsafe_active = route_failsafe_active_for_session(session_id);
-    if route_failsafe_active {
-        // Fail-safe mode: bypass deterministic direct-return routing and
-        // force strong profile/model selection for this turn.
+    if route_failsafe_active && !autonomous_bootstrap {
+        // Guided models may still use the drift fail-safe to recover capacity.
         if !matches!(policy_bundle.policy.model_profile, ModelProfile::Strong) {
             policy_bundle.policy = ExecutionPolicy::for_profile(ModelProfile::Strong);
             policy_bundle
@@ -999,7 +856,7 @@ pub(in crate::agent) async fn run_bootstrap_phase(
         if let Some(ref router) = llm_router {
             model = router.select_for_profile(ModelProfile::Strong).to_string();
         }
-        if !tool_defs.is_empty() {
+        if !tool_defs.is_empty() && !autonomous_bootstrap {
             tool_defs = agent.filter_tool_definitions_for_policy(
                 &base_tool_defs,
                 &available_capabilities,
@@ -1007,15 +864,18 @@ pub(in crate::agent) async fn run_bootstrap_phase(
                 policy_bundle.risk_score,
                 false,
             );
-            tool_defs = agent.restrict_connected_api_setup_tools_for_request(user_text, &tool_defs);
-            tool_defs =
-                agent.ensure_connected_api_tools_exposed(user_text, &tool_defs, &base_tool_defs);
         }
         warn!(
             session_id,
             model = %model,
             profile = ?policy_bundle.policy.model_profile,
             "Route drift fail-safe active: forcing strong routing policy"
+        );
+    } else if route_failsafe_active {
+        info!(
+            session_id,
+            model = %model,
+            "Route drift fail-safe observed without overriding autonomous model selection"
         );
     }
 
@@ -1036,7 +896,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
     if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
         && user_role.can_persist_owner_memory()
-        && !straightforward_artifact_task
         && !non_owner_shared_context
     {
         let compaction_model = llm_router
@@ -1076,7 +935,6 @@ pub(in crate::agent) async fn run_bootstrap_phase(
 
     let session_summary = if agent.context_window_config.enabled
         && agent.mandate_execution.is_none()
-        && !straightforward_artifact_task
         && !non_owner_shared_context
     {
         agent
@@ -1284,7 +1142,6 @@ mod mandate_bootstrap_isolation_tests {
         assert!(data.llm_router.is_none());
         assert!(!data.route_failsafe_active);
         assert!(data.turn_context.recent_messages.is_empty());
-        assert!(data.turn_context.project_hints.is_empty());
         assert!(data.turn_context.primary_project_scope.is_none());
         assert_eq!(
             data.turn_context.goal_user_text,
@@ -1332,7 +1189,7 @@ mod mandate_bootstrap_isolation_tests {
         harness.agent.skills_dir = skill_dir.path().to_path_buf();
         harness.agent.skill_cache = crate::skills::SkillCache::new(skill_dir.path().to_path_buf());
 
-        let goal = Goal::new_continuous(
+        let goal = crate::traits::Goal::new_continuous(
             "Mandate bootstrap controller",
             "owner-mandate-bootstrap",
             Some(10_000),

@@ -1,12 +1,11 @@
-name: scheduled_missing_timing_fallthrough
-description: Recurring schedule without timing falls through to LLM loop
+name: scheduled_missing_timing_model_directed
+description: The model decides whether missing schedule details require clarification
 session_id: eval_missing_timing_01
 user_text: monitor my account and post 3 times per day
 orchestrator: true
 mock_responses:
   - text: What time should I run the first post each day?
 expect:
-  orchestration_route: clarification_required
-  response_fallthrough: true
+  orchestration_route: default_continue
   direct_return: false
   llm_calls_min: 1

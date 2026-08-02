@@ -7,7 +7,6 @@
 pub(super) enum TurnRestartReason {
     StoppingPhaseControl,
     ApproachPivot { failure_record: String },
-    OrchestrationFallthrough,
     LlmPhaseRecovery,
     ResponsePhaseRecovery,
     ToolPreludeRecovery,

@@ -16,9 +16,8 @@ use super::followup::{
 };
 use super::project_scope::{
     choose_primary_project_scope, extract_explicit_path_scopes_from_text,
-    extract_project_hints_from_history, extract_project_scopes_from_history,
-    extract_project_scopes_from_text, resolve_primary_project_scope,
-    turn_allows_inherited_project_scope, unify_current_turn_scopes,
+    extract_project_scopes_from_history, extract_project_scopes_from_text,
+    resolve_primary_project_scope, turn_allows_inherited_project_scope, unify_current_turn_scopes,
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
@@ -27,7 +26,6 @@ use crate::llm_markers::INTENT_GATE_MARKER;
 pub(super) struct TurnContext {
     pub goal_user_text: String,
     pub recent_messages: Vec<Value>,
-    pub project_hints: Vec<String>,
     pub primary_project_scope: Option<String>,
     pub allow_multi_project_scope: bool,
     pub followup_mode: Option<FollowupMode>,
@@ -37,7 +35,6 @@ pub(super) struct TurnContext {
 
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
 const GOAL_CONTEXT_HINT_HISTORY_LIMIT: usize = 30;
-const GOAL_CONTEXT_MAX_PROJECT_HINTS: usize = 8;
 const GOAL_CONTEXT_MAX_PROJECT_SCOPES: usize = 6;
 
 fn normalize_message_resources(msg: &Message) -> Message {
@@ -350,12 +347,6 @@ impl Agent {
             }
         }
 
-        let project_hints = extract_project_hints_from_history(
-            &history,
-            &authored_current,
-            GOAL_CONTEXT_MAX_PROJECT_HINTS,
-            true,
-        );
         // For the current user message, only extract explicit filesystem paths
         // (~/foo, /foo, ./foo) — NOT contextual nickname matches.  This prevents
         // common English words like "modern" (in "modern website") from resolving
@@ -423,7 +414,6 @@ impl Agent {
                 &history,
                 GOAL_CONTEXT_RECENT_MESSAGES_LIMIT,
             ),
-            project_hints,
             primary_project_scope,
             allow_multi_project_scope,
             followup_mode: Some(followup_mode),

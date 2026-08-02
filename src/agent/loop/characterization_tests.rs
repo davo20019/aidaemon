@@ -5,7 +5,6 @@ use crate::testing::{
     setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models, MockProvider,
     MockTool,
 };
-use crate::traits::store_prelude::*;
 use crate::traits::{
     ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata,
     ToolCallOutcome, ToolCallSemantics, ToolChoiceMode, ToolTargetHintKind, ToolVerificationMode,
@@ -16,133 +15,6 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-#[tokio::test]
-async fn response_metrics_capture_direct_return_and_fallthrough_paths() {
-    let before = policy_metrics_snapshot();
-
-    // Direct-return case (deterministic schedule routing before first LLM call).
-    let direct_provider = MockProvider::with_responses(vec![]);
-    let direct_harness =
-        setup_test_agent_with_models(direct_provider, "primary-model", "smart-model")
-            .await
-            .unwrap();
-    let direct_reply = direct_harness
-        .agent
-        .handle_message(
-            "metrics_direct",
-            "Check deployment tomorrow at 9am",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(
-        direct_reply.contains("Reply **confirm** to proceed"),
-        "expected schedule confirmation direct-return, got: {direct_reply}"
-    );
-    assert_eq!(
-        direct_harness.provider.call_count().await,
-        0,
-        "expected deterministic pre-routing to avoid first LLM call"
-    );
-
-    // Fallthrough case (deterministic simple route continues into full tool loop).
-    let fallthrough_provider = MockProvider::with_responses(vec![
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response("System inspected."),
-    ]);
-    let fallthrough_harness =
-        setup_test_agent_with_models(fallthrough_provider, "primary-model", "smart-model")
-            .await
-            .unwrap();
-    let fallthrough_reply = fallthrough_harness
-        .agent
-        .handle_message(
-            "metrics_fallthrough",
-            "Check my system status",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(fallthrough_reply, "System inspected.");
-
-    let after = policy_metrics_snapshot();
-    let direct_delta = after
-        .response_direct_return_total
-        .saturating_sub(before.response_direct_return_total);
-    let fallthrough_delta = after
-        .response_fallthrough_total
-        .saturating_sub(before.response_fallthrough_total);
-
-    assert!(
-        direct_delta >= 1,
-        "expected response_direct_return_total to increase by at least 1; before={} after={}",
-        before.response_direct_return_total,
-        after.response_direct_return_total
-    );
-    assert!(
-        fallthrough_delta >= 1,
-        "expected response_fallthrough_total to increase by at least 1; before={} after={}",
-        before.response_fallthrough_total,
-        after.response_fallthrough_total
-    );
-}
-
-#[tokio::test]
-async fn schedule_is_not_persisted_until_exact_next_turn_confirmation() {
-    let provider = MockProvider::with_responses(vec![]);
-    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
-        .await
-        .unwrap();
-    let session_id = "ephemeral_schedule_confirmation";
-
-    let proposal = harness
-        .agent
-        .handle_message(
-            session_id,
-            "Check deployment tomorrow at 9am",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(
-        proposal.contains("Reply **confirm** to proceed"),
-        "unexpected proposal response: {proposal}"
-    );
-    assert!(harness
-        .state
-        .get_pending_confirmation_goals(session_id)
-        .await
-        .unwrap()
-        .is_empty());
-
-    let confirmation = harness
-        .agent
-        .handle_message(
-            session_id,
-            "confirm",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(confirmation.contains("✅ Scheduled"));
-    let scheduled = harness.state.get_scheduled_goals().await.unwrap();
-    assert!(scheduled
-        .iter()
-        .any(|goal| goal.session_id == session_id && goal.status == "active"));
-}
 
 #[tokio::test]
 #[ignore = "tokens_failed_tasks_total / no_progress_iterations_total not yet wired to agent loop"]
@@ -1597,65 +1469,6 @@ async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation()
         calls.load(Ordering::SeqCst),
         1,
         "an invented restriction without a verbatim span must not suppress mutation"
-    );
-}
-
-#[tokio::test]
-async fn autonomous_semantic_assessment_routes_without_installing_a_step_plan() {
-    let mut provider = MockProvider::with_responses(vec![
-        MockProvider::text_response(
-            r#"{
-                "goal": "Explain a cohesive comparison",
-                "steps": [
-                    {"description": "This must be discarded", "tool_hint": "system_info"}
-                ],
-                "success_criteria": ["This must also be discarded"],
-                "contract": {
-                    "task_kind": "answer",
-                    "expects_mutation": false,
-                    "requires_observation": false,
-                    "mutation_scope": "allowed",
-                    "forbidden_actions": []
-                },
-                "task_shape": {
-                    "execution_mode": "inline",
-                    "confidence": "high",
-                    "independent_workstreams": 1,
-                    "requires_background_continuation": false
-                }
-            }"#,
-        ),
-        MockProvider::text_response(
-            "This is one cohesive comparison, so it was completed inline without a background goal.",
-        ),
-    ]);
-    provider.skip_planning_calls = false;
-
-    let harness = setup_test_agent_with_models(provider, "gpt-5.6-terra", "gpt-5.6-terra")
-        .await
-        .unwrap();
-
-    let reply = harness
-        .agent
-        .handle_message(
-            "autonomous_semantic_inline_route",
-            "Compare the package files across all my projects, identify shared dependencies, \
-             calculate the totals, and summarize the version conflicts.",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(reply.contains("completed inline"), "reply: {reply}");
-    let calls = harness.provider.call_log.lock().await.clone();
-    assert_eq!(calls.len(), 2, "assessment + primary model call");
-    let primary_context = serde_json::to_string(&calls[1].messages).unwrap();
-    assert!(
-        !primary_context.contains("This must be discarded"),
-        "autonomous assessment steps must never enter the primary model context"
     );
 }
 

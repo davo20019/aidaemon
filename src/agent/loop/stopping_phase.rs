@@ -2058,7 +2058,10 @@ pub(super) async fn run_stopping_phase(
     }
 
     // 8. Mid-loop adaptation: refresh + bounded escalation/de-escalation
-    if agent.policy_config.context_refresh_enforce {
+    if agent.policy_config.context_refresh_enforce
+        && agent.trust_tier_for_model(&model)
+            == crate::agent::trust_tier::ModelTrustTier::Guided
+    {
         let max_same_tool_failures = tool_failure_count.values().copied().max().unwrap_or(0);
         let should_refresh = iteration >= 5 && (stall_count >= 1 || max_same_tool_failures >= 2);
 

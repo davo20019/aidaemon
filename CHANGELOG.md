@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.38] - 2026-08-02
+
+### Changed
+
+- **Autonomous turns are model-directed from the start.** Removed the deterministic orchestration router, lexical complexity lanes, keyword-selected schedules/goals, and canned natural-language shortcuts. Cadence text inside a draft or mandate is now ordinary request context unless the model explicitly selects a scheduling tool.
+- **Authorized capabilities stay visible.** Private owner turns expose their full safe tool roster regardless of phrases such as “schedule,” “API,” or a filename. Autonomous primary models are no longer silently replaced, context-trimmed, tool-capped, or mid-loop de-escalated by lexical policy scoring; guided-model scaffolding remains available for small and local models.
+- **The runtime boundary is narrower and typed.** Deterministic code continues to enforce identity, channel/workspace authority, approvals, mandate scopes and quotas, tool schemas, replay/idempotency, execution budgets, and receipt-backed completion, while the model owns semantic interpretation, intention, and tool choice.
+
+### Fixed
+
+- **Draft-only cadence language cannot create a recurring goal.** Added a full agent-loop regression reproducing the two-hour mandate draft with a 15-minute review cadence and proving that no mandate or scheduled goal is persisted before explicit model-selected creation and owner authorization.
+- **First tool calls execute without a narration retry.** Removed the gate that discarded a valid tool call when the assistant had not first emitted a prose plan, eliminating a redundant model round trip and preserving the model's chosen action.
+
 ## [0.11.37] - 2026-08-02
 
 ### Added

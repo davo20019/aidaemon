@@ -270,16 +270,11 @@ async fn record_auxiliary_model_call(
     .await;
 }
 
-/// Assess the user's request before orchestration routing.
-///
-/// Guided models receive a concrete step plan. Autonomous models receive only
-/// semantic contract and task-shape classification, avoiding step-by-step
-/// supervision while still giving the control plane a language-independent
-/// routing signal.
+/// Assess the user's request for a Guided model before its main loop.
+/// Autonomous models do not invoke this auxiliary classifier or step planner.
 ///
 /// Returns None if the assessment call fails, times out, or returns
-/// unparseable JSON. Failure is silent and callers use the conservative
-/// deterministic fallback.
+/// unparseable JSON. Failure is silent and callers continue without a plan.
 #[allow(dead_code)]
 pub(crate) async fn generate_task_plan(
     provider: Arc<dyn ModelProvider>,
@@ -541,11 +536,9 @@ fn looks_like_compound_task(user_text: &str) -> bool {
     categories >= 2
 }
 
-/// Determine whether the task-start assessment call should be skipped.
-///
-/// Simple turns can still use tools in the normal loop; they do not need a
-/// separate model call. Longer requests are assessed even when English action
-/// markers are absent so routing does not become English-only word matching.
+/// Determine whether a turn bypasses the optional task-start assessment.
+/// Semantic task interpretation belongs to the model. Only protocol-level
+/// acknowledgments and exact emergency control commands bypass assessment.
 #[cfg(test)]
 fn should_skip_planning(
     _task_kind: &crate::agent::CompletionTaskKind,
@@ -563,19 +556,7 @@ pub(crate) fn planning_skip_reason(
         return Some("acknowledgment");
     }
 
-    if crate::agent::is_internal_maintenance_intent(user_text) {
-        return Some("orchestration_direct_return");
-    }
-
-    if matches!(
-        crate::agent::classify_intent_complexity(user_text),
-        crate::agent::IntentComplexity::Scheduled { .. }
-            | crate::agent::IntentComplexity::ScheduledMissingTiming
-    ) {
-        return Some("orchestration_direct_return");
-    }
-
-    // Control commands — not tasks that need a plan.
+    // Exact control commands are handled by the typed bootstrap protocol.
     let lower = user_text.trim().to_lowercase();
     let control_commands = [
         "cancel",
@@ -589,54 +570,6 @@ pub(crate) fn planning_skip_reason(
     ];
     if control_commands.iter().any(|cmd| lower == *cmd) {
         return Some("control_command");
-    }
-
-    if crate::agent::recognized_artifact_creation_request(user_text)
-        && !looks_like_compound_task(user_text)
-        && matches!(
-            crate::agent::classify_intent_complexity(user_text),
-            crate::agent::IntentComplexity::Simple
-        )
-    {
-        return Some("straightforward_artifact_creation");
-    }
-
-    let planning_worthy_markers = [
-        "analyze",
-        "audit",
-        "build",
-        "change",
-        "create",
-        "debug",
-        "deploy",
-        "diagnose",
-        "figure out",
-        "fix",
-        "implement",
-        "inspect",
-        "install",
-        "investigate",
-        "repair",
-        "run",
-        "send",
-        "test",
-        "update",
-        "write",
-    ];
-    let planning_worthy = planning_worthy_markers
-        .iter()
-        .any(|marker| crate::agent::contains_keyword_as_words(&lower, marker));
-
-    let compact_turn = user_text.chars().count() <= 80;
-    if compact_turn
-        && !planning_worthy
-        && !looks_like_compound_task(user_text)
-        && matches!(
-            crate::agent::classify_intent_complexity(user_text),
-            crate::agent::IntentComplexity::Simple
-        )
-    {
-        return Some("simple_turn");
     }
 
     None
@@ -754,9 +687,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_skips_simple_conversational_turn() {
+    fn conversational_turn_gets_semantic_assessment() {
         use crate::agent::CompletionTaskKind;
-        assert!(should_skip_planning(
+        assert!(!should_skip_planning(
             &CompletionTaskKind::Conversational,
             "hello there how are you doing today",
             false
@@ -764,19 +697,20 @@ mod tests {
     }
 
     #[test]
-    fn test_should_skip_simple_short_text() {
+    fn short_turn_gets_semantic_assessment() {
         use crate::agent::CompletionTaskKind;
-        assert!(should_skip_planning(&CompletionTaskKind::Find, "hi", false));
+        assert!(!should_skip_planning(
+            &CompletionTaskKind::Find,
+            "hi",
+            false
+        ));
     }
 
     #[test]
-    fn test_should_skip_direct_recall_question() {
+    fn direct_recall_question_gets_semantic_assessment() {
         use crate::agent::CompletionTaskKind;
-        assert_eq!(
-            planning_skip_reason("What's my dad's name?", false),
-            Some("simple_turn")
-        );
-        assert!(should_skip_planning(
+        assert_eq!(planning_skip_reason("What's my dad's name?", false), None);
+        assert!(!should_skip_planning(
             &CompletionTaskKind::Answer,
             "What's the source of that?",
             false
@@ -784,13 +718,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_school_presentation_request_skips_llm_planning() {
+    fn artifact_request_gets_semantic_assessment() {
         let request = "Can you create a pptx about Ecuador. Make it beautiful as I will present in my daughter's school.";
 
-        assert_eq!(
-            planning_skip_reason(request, false),
-            Some("straightforward_artifact_creation")
-        );
+        assert_eq!(planning_skip_reason(request, false), None);
     }
 
     #[test]
@@ -824,27 +755,23 @@ mod tests {
     }
 
     #[test]
-    fn test_should_skip_internal_maintenance() {
+    fn timed_request_gets_semantic_assessment() {
         use crate::agent::CompletionTaskKind;
-        assert!(should_skip_planning(
+        assert_eq!(
+            planning_skip_reason("Check deployment tomorrow at 9am", false),
+            None
+        );
+        assert!(!should_skip_planning(
             &CompletionTaskKind::Change,
-            "Analyze the knowledge base and identify stale entries, then process embeddings, consolidate memories, find outdated data, and report on decay old facts",
+            "Check deployment tomorrow at 9am",
             false
         ));
     }
 
     #[test]
-    fn test_should_skip_scheduled_direct_return() {
-        use crate::agent::CompletionTaskKind;
-        assert_eq!(
-            planning_skip_reason("Check deployment tomorrow at 9am", false),
-            Some("orchestration_direct_return")
-        );
-        assert!(should_skip_planning(
-            &CompletionTaskKind::Change,
-            "Check deployment tomorrow at 9am",
-            false
-        ));
+    fn cadence_inside_draft_only_request_is_not_a_schedule_route() {
+        let request = "Prepare a mandate draft that reviews every 15 minutes. Do not schedule, create, or activate anything.";
+        assert_eq!(planning_skip_reason(request, false), None);
     }
 
     #[test]

@@ -726,16 +726,6 @@ pub(super) async fn run_llm_phase(
     }
     if force_text_response {
         llm_options.tool_choice = ToolChoiceMode::None;
-    } else if should_require_initial_execution_call(
-        execution_requirement,
-        total_successful_tool_calls,
-        effective_tools,
-    ) {
-        llm_options.tool_choice = ToolChoiceMode::Required;
-        info!(
-            session_id,
-            iteration, "Artifact execution: requiring an initial tool call"
-        );
     } else if services.agent.trust_tier_for_model(model)
         == crate::agent::trust_tier::ModelTrustTier::Guided
         && execution_requirement.requires_execution()
@@ -1903,16 +1893,6 @@ fn effective_tools_for_call(force_text_response: bool, tool_defs: &[Value]) -> &
     tool_defs
 }
 
-fn should_require_initial_execution_call(
-    requirement: &ExecutionRequirement,
-    total_successful_tool_calls: usize,
-    effective_tools: &[Value],
-) -> bool {
-    requirement.requires_initial_tool_call()
-        && total_successful_tool_calls == 0
-        && !effective_tools.is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,31 +1950,6 @@ mod tests {
         let tools = vec![serde_json::json!({"name": "t1"})];
         assert_eq!(effective_tools_for_call(true, &tools), tools.as_slice());
         assert_eq!(effective_tools_for_call(false, &tools), tools.as_slice());
-    }
-
-    #[test]
-    fn exact_school_presentation_request_requires_initial_execution_tool_call() {
-        let request = "Can you create a pptx about Ecuador. Make it beautiful as I will present in my daughter's school.";
-        let contract = crate::agent::history::infer_completion_contract(request, &[]);
-        let lexical_need = crate::agent::infer_intent_gate(request, "").needs_tools;
-        let requirement = ExecutionRequirement::from_finalized_contract(
-            &contract,
-            lexical_need,
-            false,
-            crate::agent::recognized_artifact_creation_request(request),
-        );
-        let tools = vec![serde_json::json!({"name": "write_file"})];
-
-        assert!(should_require_initial_execution_call(
-            &requirement,
-            0,
-            &tools
-        ));
-        assert!(!should_require_initial_execution_call(
-            &requirement,
-            1,
-            &tools
-        ));
     }
 
     #[test]

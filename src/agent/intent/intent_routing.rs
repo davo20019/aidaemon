@@ -1,23 +1,7 @@
-use regex::Regex;
+#[cfg(test)]
+use super::IntentGateDecision;
 
-use super::{IntentGateDecision, ENABLE_SCHEDULE_HEURISTICS};
-
-/// Complexity classification for orchestration routing.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum IntentComplexity {
-    /// Simple task — falls through to full agent loop.
-    Simple,
-    /// Multi-step complex task, create a goal and fall through to current agent loop.
-    Complex,
-    /// User asks for recurring/ongoing behavior but did not provide timing.
-    ScheduledMissingTiming,
-    /// Scheduled task intent requiring deferred/recurring goal creation.
-    Scheduled {
-        schedule_raw: String,
-        is_one_shot: bool,
-    },
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConnectedApiIntent {
     RuntimeCapabilityValidation,
@@ -73,297 +57,16 @@ pub(crate) fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
         .any(|window| window == kw_words.as_slice())
 }
 
-/// Detect "about this scheduled goal" meta-queries so they aren't misread as
-/// fresh scheduling requests when quoted text contains timing words.
-fn is_schedule_reference_query(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let mentions_schedule_subject = contains_keyword_as_words(&lower, "scheduled goal")
-        || contains_keyword_as_words(&lower, "recurring goal")
-        || contains_keyword_as_words(&lower, "schedule");
-
-    if !mentions_schedule_subject {
-        return false;
-    }
-
-    contains_keyword_as_words(&lower, "details about")
-        || contains_keyword_as_words(&lower, "tell me about")
-        || contains_keyword_as_words(&lower, "show me")
-        || contains_keyword_as_words(&lower, "list")
-        || contains_keyword_as_words(&lower, "what is")
-        || contains_keyword_as_words(&lower, "what's")
-        || contains_keyword_as_words(&lower, "explain")
-        || contains_keyword_as_words(&lower, "describe")
-        || lower.contains("scheduled goal:")
-}
-
-/// Detect obvious scheduling phrases in user text as a fallback when the model
-/// omits schedule fields in [INTENT_GATE].
-///
-/// Returns (schedule_raw, is_one_shot).
-///
-/// This heuristic is intentionally conservative: it only overrides the LLM's
-/// classification when there is strong evidence of scheduling intent.  Bare
-/// month-day dates (e.g. "March 3rd") are ambiguous — they could be recall,
-/// facts, or past references — so we require a scheduling verb alongside them.
-/// More specific patterns like "in 2h" or "tomorrow at 3pm" are inherently
-/// forward-looking and don't need the extra verb check.
-pub(super) fn detect_schedule_heuristic(user_text: &str) -> Option<(String, bool)> {
-    let text = user_text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    // Synthetic follow-up messages from background command completions contain
-    // command output that often includes dates (e.g., `find -mmin` timestamps).
-    // These are never scheduling requests.
-    if text.starts_with("[Background command completed]")
-        || text.starts_with("[Background command still running]")
-    {
-        return None;
-    }
-    if is_schedule_reference_query(text) {
-        return None;
-    }
-    if is_memory_storage_intent(text) {
-        return None;
-    }
-    if is_file_operation_with_dates(text) {
-        return None;
-    }
-
-    let result = crate::cron_utils::extract_schedule_from_text(text)?;
-
-    // Bare month-day patterns ("March 3rd", "on October 15th") are ambiguous —
-    // they appear in recall queries, fact storage, past-tense references, etc.
-    // Only treat them as scheduling when the text also contains an explicit
-    // scheduling verb (remind, schedule, alert, notify, etc.).  This trusts the
-    // LLM's classification for bare-date messages and only overrides when there
-    // is unambiguous scheduling intent.
-    if crate::cron_utils::is_bare_month_day_pattern(&result.0) && !has_scheduling_action_verb(text)
-    {
-        return None;
-    }
-
-    Some(result)
-}
-
-/// Detect memory/fact-storage intent so that date mentions like "my birthday is
-/// October 15" are not hijacked by the schedule extractor.
-///
-/// Returns true when the message is clearly asking the agent to remember or
-/// store information (which may incidentally contain a date).
-fn is_memory_storage_intent(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    // Memory-storage verb phrases — user wants to store a fact, not schedule.
-    // Uses the strict (multi-word) precision level: this classifier gates the
-    // schedule heuristic, so a false positive would silently swallow a real
-    // reminder request.
-    let has_memory_verb = crate::agent::intent_keywords::MEMORY_STORE_STRICT_PHRASES
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw));
-
-    // Fact-storage context phrases catch messages without a leading verb
-    // (e.g., "here are some facts about me").
-    let has_fact_context = crate::agent::intent_keywords::MEMORY_STORE_FACT_CONTEXTS
-        .iter()
-        .any(|kw| lower.contains(kw));
-
-    if !has_memory_verb && !has_fact_context {
-        return false;
-    }
-
-    // If the message also contains explicit scheduling verbs, let the
-    // scheduler win — the date is meant as a trigger, not a fact.
-    let has_scheduling_verb = crate::agent::intent_keywords::SCHEDULING_VERB_PHRASES
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw));
-
-    !has_scheduling_verb
-}
-
-/// Check whether the user text contains an explicit scheduling action verb.
-///
-/// Used to gate bare month-day pattern matches (e.g. "March 3rd") — these are
-/// too ambiguous on their own (could be recall, facts, past references) and
-/// should only trigger scheduling when paired with a clear scheduling verb.
-fn has_scheduling_action_verb(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    let verbs = [
-        "remind",
-        "reminder",
-        "remind me",
-        "schedule",
-        "set a reminder",
-        "alert me",
-        "notify me",
-        "ping me",
-        "follow up",
-    ];
-    verbs.iter().any(|kw| contains_keyword_as_words(&lower, kw))
-}
-
-/// Detect file-editing/coding intent so that date mentions in messages like
-/// "finish the plan covering March 18 through March 31" or "append to file.md
-/// starting from where it was truncated" are not hijacked by the schedule extractor.
-///
-/// Returns true when the message contains both file-operation verbs AND file path
-/// references, indicating the dates are part of file content, not a scheduling request.
-fn is_file_operation_with_dates(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    // File-operation verb phrases — user wants to create/edit/read/fix files.
-    let file_verbs = [
-        "read the",
-        "read my",
-        "read file",
-        "read_file",
-        "write_file",
-        "write file",
-        "write to",
-        "edit_file",
-        "edit file",
-        "edit the",
-        "edit my",
-        "append",
-        "finish it",
-        "finish the",
-        "complete the",
-        "fix the file",
-        "fix my file",
-        "fix the script",
-        "fix my script",
-        "update the file",
-        "update my file",
-        "create a file",
-        "create a script",
-        "got cut off",
-        "was truncated",
-        "got truncated",
-    ];
-    let has_file_verb = file_verbs.iter().any(|kw| lower.contains(kw));
-
-    if !has_file_verb {
-        return false;
-    }
-
-    // Must also contain a file-path-like reference to confirm the dates are
-    // about file content, not scheduling. Matches:
-    //   ~/projects/..., ./foo.md, /path/to/file, file.md, file.json, etc.
-    static FILE_PATH_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"(?:~/|[.~/]\S*\.\w{1,10}|\S+\.\w{2,5}(?:\s|$))").expect("file path regex")
-    });
-    let has_file_ref = FILE_PATH_RE.is_match(&lower);
-
-    if !has_file_ref {
-        return false;
-    }
-
-    // If the message also contains explicit scheduling verbs, let the scheduler win.
-    let scheduling_verbs = [
-        "schedule",
-        "remind me",
-        "set a reminder",
-        "alert me",
-        "notify me",
-    ];
-    let has_scheduling_verb = scheduling_verbs
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw));
-
-    !has_scheduling_verb
-}
-
-/// Detect recurring-intent language when the user did not provide concrete timing.
-/// Used to prevent accidental fallback into non-recurring "complex" goals.
-pub(super) fn looks_like_recurring_intent_without_timing(user_text: &str) -> bool {
-    if detect_schedule_heuristic(user_text).is_some() {
-        return false;
-    }
-
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let re_times_per = match Regex::new(r"(?i)\b\d+\s+times?\s+per\s+(day|week|month)\b") {
-        Ok(re) => re,
-        Err(_) => return false,
-    };
-    if re_times_per.is_match(user_text) {
-        return true;
-    }
-
-    for kw in [
-        "monitor",
-        "recurring",
-        "ongoing",
-        "long-term",
-        "long term",
-        "regularly",
-        "consistently",
-        "every day",
-        "each day",
-        "per day",
-        "per week",
-        "per month",
-    ] {
-        if contains_keyword_as_words(&lower, kw) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Detect legacy internal-maintenance intents that should run via native
-/// heartbeat/memory jobs rather than goal orchestration.
-pub(super) fn is_internal_maintenance_intent(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    if lower == "maintain knowledge base: process embeddings, consolidate memories, decay old facts"
-        || lower
-            == "maintain memory health: prune old events, clean up retention, remove stale data"
-    {
-        return true;
-    }
-
-    let knowledge_maintenance = contains_keyword_as_words(&lower, "process embeddings")
-        && contains_keyword_as_words(&lower, "consolidate memories")
-        && (contains_keyword_as_words(&lower, "decay old facts")
-            || contains_keyword_as_words(&lower, "memory decay"));
-
-    let memory_health = contains_keyword_as_words(&lower, "prune old events")
-        && (contains_keyword_as_words(&lower, "clean up retention")
-            || contains_keyword_as_words(&lower, "retention cleanup"))
-        && contains_keyword_as_words(&lower, "stale data");
-
-    knowledge_maintenance || memory_health
-}
-
 /// Returns `true` when this turn is a background-output delivery injected by
 /// the terminal tool's re-engagement path (see `tools/terminal.rs`).
 /// These turns already contain the command output and must not be forced
 /// through the tool loop — the model only needs to interpret and reply.
+#[cfg(test)]
 fn is_observation_delivery_turn(user_text: &str) -> bool {
     user_text.contains("[Background command completed]")
 }
 
+#[cfg(test)]
 pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateDecision {
     // Short-circuit: background-output delivery turns never need tools.
     // The terminal re-engagement injects a synthetic message starting with
@@ -407,6 +110,7 @@ pub(super) fn infer_intent_gate(user_text: &str, _analysis: &str) -> IntentGateD
 /// creation. It deliberately requires both an authoring action and an explicit
 /// artifact type so ordinary questions about writing or presentations do not
 /// get routed into execution.
+#[cfg(test)]
 pub(crate) fn recognized_artifact_creation_request(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -448,6 +152,7 @@ pub(crate) fn recognized_artifact_creation_request(user_text: &str) -> bool {
     .any(|keyword| contains_keyword_as_words(&lower, keyword))
 }
 
+#[cfg(test)]
 fn user_text_requires_local_tool_execution(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -507,6 +212,7 @@ fn contains_any_as_words(text: &str, keywords: &[&str]) -> bool {
         .any(|kw| contains_keyword_as_words(text, kw))
 }
 
+#[cfg(test)]
 pub(super) fn user_text_requests_runtime_capability_validation(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -620,6 +326,7 @@ fn mentions_connected_api_target(user_text: &str) -> bool {
     contains_any_as_words(&lower, TARGET_MARKERS)
 }
 
+#[cfg(test)]
 fn mentions_connected_api_resource(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -1048,6 +755,7 @@ pub(crate) fn content_authoring_request_is_text_only(user_text: &str) -> bool {
     classify_connected_content_mode(user_text).is_authoring_only()
 }
 
+#[cfg(test)]
 pub(crate) fn user_text_requests_auth_or_integration_management(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -1106,6 +814,7 @@ pub(crate) fn user_text_requests_auth_or_integration_management(user_text: &str)
     )
 }
 
+#[cfg(test)]
 pub(super) fn user_text_requests_connected_api_write_action(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -1147,6 +856,7 @@ pub(super) fn user_text_requests_connected_api_write_action(user_text: &str) -> 
     has_strong_write_verb || has_scoped_write_verb
 }
 
+#[cfg(test)]
 pub(super) fn user_text_requests_connected_api_read_action(user_text: &str) -> bool {
     let lower = user_text.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -1171,6 +881,7 @@ pub(super) fn user_text_requests_connected_api_read_action(user_text: &str) -> b
         && (mentions_connected_api_account_scope(&lower) || mentions_connected_api_resource(&lower))
 }
 
+#[cfg(test)]
 pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<ConnectedApiIntent> {
     if user_text_requests_runtime_capability_validation(user_text) {
         Some(ConnectedApiIntent::RuntimeCapabilityValidation)
@@ -1181,134 +892,6 @@ pub(super) fn classify_connected_api_intent(user_text: &str) -> Option<Connected
     } else {
         None
     }
-}
-
-/// Classify user intent complexity for orchestration routing.
-///
-/// This is the deterministic first pass: schedule extraction plus a
-/// conservative durable-work fallback. When a semantic task assessment is
-/// available, [`refine_intent_complexity_with_task_shape`] finalizes the
-/// inline-vs-durable decision. Keeping this pass means routing still works
-/// when the assessment provider is unavailable.
-pub(super) fn classify_intent_complexity(user_text: &str) -> IntentComplexity {
-    // Heuristic schedule extraction: if the user message contains a concrete
-    // schedule phrase, treat it as scheduled rather than falling into the
-    // tool loop (which can spiral).
-    if ENABLE_SCHEDULE_HEURISTICS {
-        if let Some((schedule_raw, is_one_shot)) = detect_schedule_heuristic(user_text) {
-            return IntentComplexity::Scheduled {
-                schedule_raw,
-                is_one_shot,
-            };
-        }
-
-        // If user clearly wants recurring behavior but no timing could be
-        // extracted, ask for schedule details instead of silently creating a
-        // non-recurring goal.
-        if looks_like_recurring_intent_without_timing(user_text) {
-            return IntentComplexity::ScheduledMissingTiming;
-        }
-    }
-
-    // Promote obviously cross-project / multi-question, multi-step requests
-    // to Complex.
-    if looks_like_complex_request_fallback(user_text) {
-        return IntentComplexity::Complex;
-    }
-
-    IntentComplexity::Simple
-}
-
-/// Refine the deterministic complexity fallback with a semantic task-shape
-/// classification. Scheduling remains deterministic because its parsed timing
-/// payload must be preserved. Low-confidence or internally inconsistent model
-/// output is ignored.
-///
-/// The boolean reports whether the structured assessment was accepted, even
-/// when it agreed with the fallback.
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct IntentTaskShape<'a> {
-    pub execution_mode: Option<&'a str>,
-    pub confidence: Option<&'a str>,
-    pub independent_workstreams: Option<u8>,
-    pub requires_background_continuation: Option<bool>,
-}
-
-pub(super) fn refine_intent_complexity_with_task_shape(
-    fallback: IntentComplexity,
-    shape: IntentTaskShape<'_>,
-) -> (IntentComplexity, bool) {
-    if matches!(
-        fallback,
-        IntentComplexity::Scheduled { .. } | IntentComplexity::ScheduledMissingTiming
-    ) {
-        return (fallback, false);
-    }
-
-    let confident = matches!(
-        shape
-            .confidence
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "medium" | "high")
-    );
-    if !confident {
-        return (fallback, false);
-    }
-
-    let mode = shape
-        .execution_mode
-        .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let shape_demands_durable = shape.requires_background_continuation == Some(true)
-        || shape
-            .independent_workstreams
-            .is_some_and(|count| count >= 2);
-
-    match mode.as_str() {
-        "durable" if shape_demands_durable => (IntentComplexity::Complex, true),
-        "inline" if !shape_demands_durable => (IntentComplexity::Simple, true),
-        // A routing label without supporting shape facts, or an inline label
-        // paired with durable facts, is inconsistent. Retain the deterministic
-        // fallback rather than trusting the label alone.
-        _ => (fallback, false),
-    }
-}
-
-fn looks_like_complex_request_fallback(user_text: &str) -> bool {
-    let lower = user_text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    let cross_project_scope = contains_keyword_as_words(&lower, "all my projects")
-        || contains_keyword_as_words(&lower, "across all projects")
-        || contains_keyword_as_words(&lower, "across my projects")
-        || (contains_keyword_as_words(&lower, "all projects")
-            && contains_keyword_as_words(&lower, "compare"));
-
-    let action_markers = [
-        "compare",
-        "analyze",
-        "analyse",
-        "identify",
-        "find",
-        "count",
-        "calculate",
-        "summarize",
-        "report",
-        "list",
-    ];
-    let action_hits = action_markers
-        .iter()
-        .filter(|marker| contains_keyword_as_words(&lower, marker))
-        .count();
-    let multi_question = user_text.matches('?').count() >= 2;
-    let compound_request =
-        lower.contains(" and ") || lower.contains(" then ") || lower.contains(" also ");
-
-    cross_project_scope
-        || (action_hits >= 3 && (multi_question || compound_request))
-        || (action_hits >= 2 && user_text.chars().count() >= 140)
 }
 
 #[cfg(test)]

@@ -118,81 +118,20 @@ impl CompletionContract {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExecutionRequirement {
     requires_execution: bool,
-    deterministic_intent: bool,
-    recognized_artifact_request: bool,
-    mutation_contract: bool,
-    observation_contract: bool,
-    complex_route: bool,
-    supplied_observation: bool,
 }
 
 impl ExecutionRequirement {
-    pub(super) fn from_finalized_contract(
-        contract: &CompletionContract,
-        deterministic_tool_need: Option<bool>,
-        complex_route: bool,
-        recognized_artifact_request: bool,
-    ) -> Self {
+    pub(super) fn from_finalized_contract(contract: &CompletionContract) -> Self {
         let mutation_contract =
             contract.expects_mutation && !contract.connected_content_mode.is_authoring_only();
         let observation_contract = contract.requires_observation;
-        let supplied_observation = deterministic_tool_need == Some(false);
-        let deterministic_intent = deterministic_tool_need == Some(true);
-        let requires_execution = !supplied_observation
-            && (deterministic_intent
-                || recognized_artifact_request
-                || mutation_contract
-                || observation_contract
-                || complex_route);
+        let requires_execution = mutation_contract || observation_contract;
 
-        Self {
-            requires_execution,
-            deterministic_intent,
-            recognized_artifact_request,
-            mutation_contract,
-            observation_contract,
-            complex_route,
-            // `Some(false)` is reserved for synthetic turns that already carry
-            // the requested observation (for example background-command output).
-            supplied_observation,
-        }
+        Self { requires_execution }
     }
 
     pub(super) fn requires_execution(&self) -> bool {
         self.requires_execution
-    }
-
-    /// Recognized artifact creation is the narrow case where the first model
-    /// turn must be an execution call rather than an explanatory text response.
-    pub(super) fn requires_initial_tool_call(&self) -> bool {
-        self.requires_execution && self.recognized_artifact_request
-    }
-
-    pub(super) fn reason_codes(&self) -> Vec<&'static str> {
-        if self.supplied_observation {
-            return vec!["supplied_observation"];
-        }
-
-        let mut reasons = Vec::new();
-        if self.deterministic_intent {
-            reasons.push("deterministic_intent");
-        }
-        if self.recognized_artifact_request {
-            reasons.push("recognized_artifact_request");
-        }
-        if self.mutation_contract {
-            reasons.push("mutation_contract");
-        }
-        if self.observation_contract {
-            reasons.push("observation_contract");
-        }
-        if self.complex_route {
-            reasons.push("complex_route");
-        }
-        if reasons.is_empty() {
-            reasons.push("none");
-        }
-        reasons
     }
 }
 
@@ -1034,7 +973,7 @@ fn infer_completion_signals(
             "recurring task",
             "recurring goal",
         ],
-    ) || crate::cron_utils::extract_schedule_from_text(lower_text).is_some();
+    );
     let asks_monitor =
         text_contains_any_phrase(lower_text, &["monitor", "watch", "keep an eye on"]);
     let asks_check = text_contains_any_phrase(
@@ -2087,11 +2026,9 @@ mod tests {
     #[test]
     fn finalized_execution_requirement_keeps_draft_only_text_optional() {
         let contract = infer_completion_contract("Help me write a tweet about our launch.", &[]);
-        let requirement =
-            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+        let requirement = ExecutionRequirement::from_finalized_contract(&contract);
 
         assert!(!requirement.requires_execution());
-        assert_eq!(requirement.reason_codes(), vec!["none"]);
     }
 
     #[test]
@@ -2103,11 +2040,9 @@ mod tests {
             Some(true),
             Some(CompletionTaskKind::Check),
         );
-        let requirement =
-            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+        let requirement = ExecutionRequirement::from_finalized_contract(&contract);
 
         assert!(requirement.requires_execution());
-        assert!(requirement.reason_codes().contains(&"observation_contract"));
     }
 
     #[test]
@@ -2121,41 +2056,9 @@ mod tests {
             }],
             ..CompletionContract::default()
         };
-        let requirement =
-            ExecutionRequirement::from_finalized_contract(&contract, None, false, false);
+        let requirement = ExecutionRequirement::from_finalized_contract(&contract);
 
         assert!(requirement.requires_execution());
-    }
-
-    #[test]
-    fn supplied_observation_disarms_tool_recovery() {
-        let contract = CompletionContract {
-            requires_observation: true,
-            ..CompletionContract::default()
-        };
-        let requirement =
-            ExecutionRequirement::from_finalized_contract(&contract, Some(false), true, true);
-
-        assert!(!requirement.requires_execution());
-        assert!(!requirement.requires_initial_tool_call());
-        assert_eq!(requirement.reason_codes(), vec!["supplied_observation"]);
-    }
-
-    #[test]
-    fn recognized_artifact_requires_initial_execution_call() {
-        let contract = CompletionContract {
-            task_kind: CompletionTaskKind::Change,
-            expects_mutation: true,
-            ..CompletionContract::default()
-        };
-        let requirement =
-            ExecutionRequirement::from_finalized_contract(&contract, Some(true), false, true);
-
-        assert!(requirement.requires_execution());
-        assert!(requirement.requires_initial_tool_call());
-        assert!(requirement
-            .reason_codes()
-            .contains(&"recognized_artifact_request"));
     }
 
     #[test]

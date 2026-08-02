@@ -11,10 +11,6 @@ pub(super) enum ResponsePhaseOutcome {
 }
 
 impl ResponsePhaseOutcome {
-    pub(super) fn into_orchestration_transition(self) -> TurnTransition<()> {
-        self.into_turn_transition(TurnRestartReason::OrchestrationFallthrough)
-    }
-
     pub(super) fn into_response_transition(self) -> TurnTransition<()> {
         self.into_turn_transition(TurnRestartReason::ResponsePhaseRecovery)
     }

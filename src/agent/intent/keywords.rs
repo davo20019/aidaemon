@@ -11,10 +11,8 @@
 //!
 //! ## Precision levels
 //!
-//! Some classifiers run at points where false positives are expensive (e.g.,
-//! the schedule heuristic — a false positive there silently swallows a real
-//! reminder request). Others run where false positives are cheap (e.g., the
-//! recall guardrail — a false positive just keeps the tool palette wider).
+//! These vocabularies support advisory context and tests. They do not route an
+//! autonomous turn or remove authorized tools from its roster.
 //!
 //! We expose two precision levels for memory-store intent:
 //!
@@ -27,8 +25,7 @@
 //! Callers pick the level that matches the cost of being wrong.
 
 /// Strong multi-word phrases that clearly indicate the user is asking the
-/// agent to store information. Used by classifiers where a false positive
-/// would hijack another intent (e.g., the schedule heuristic).
+/// agent to store information.
 ///
 /// Each entry is intentionally a multi-token phrase to minimize false
 /// positives from word stems and unrelated uses (e.g., "remembers", "saved
@@ -71,6 +68,7 @@ pub(crate) const MEMORY_STORE_LENIENT_VERBS: &[&str] = &["remember", "memorize",
 /// Fact-storage context phrases. Even without an imperative verb, the presence
 /// of one of these phrases strongly suggests the user is sharing facts to be
 /// remembered (e.g., "here are some facts about me: ...").
+#[cfg(test)]
 pub(crate) const MEMORY_STORE_FACT_CONTEXTS: &[&str] = &[
     "facts about me",
     "things about me",
@@ -82,6 +80,7 @@ pub(crate) const MEMORY_STORE_FACT_CONTEXTS: &[&str] = &[
 /// Scheduling verb phrases. When present, the user wants the agent to trigger
 /// an action at a future time. Classifiers that handle ambiguous date mentions
 /// use this to break ties in favor of the scheduler.
+#[cfg(test)]
 pub(crate) const SCHEDULING_VERB_PHRASES: &[&str] = &[
     "schedule",
     "remind me",

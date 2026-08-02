@@ -7,7 +7,7 @@
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
     setup_test_agent_with_mandates,
-    setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads, setup_test_agent_root,
+    setup_test_agent_orchestrator, setup_test_agent_root,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
     setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
     setup_test_agent_with_models_and_policy, setup_test_agent_with_policy, MockProvider, MockTool,
@@ -481,6 +481,72 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
 }
 
 #[tokio::test]
+async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_scheduled() {
+    let draft_args = json!({
+        "action": "draft",
+        "objective": "Assess current public AIdaemon work and draft at most one grounded X post",
+        "operation_scopes": [{
+            "tool": "http_request",
+            "operation": "POST",
+            "kind": "mutation",
+            "target_prefixes": ["https://api.x.com/2/tweets"],
+            "mutation_effects": ["remote_mutation", "external_delivery"]
+        }],
+        "max_mutating_actions_per_cycle": 1,
+        "max_mutating_actions_per_rolling_24h": 1,
+        "min_seconds_between_mutations": 900,
+        "constraints": ["Draft only; do not create, activate, or schedule this mandate"],
+        "stop_conditions": ["Authentication or factual grounding is uncertain"]
+    })
+    .to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("manage_mandates", &draft_args),
+        MockProvider::text_response("Draft prepared only; nothing was created or scheduled."),
+    ]);
+    let harness = setup_test_agent_with_mandates(provider).await.unwrap();
+    let session_id = "draft-only-cadence";
+
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "Prepare only—do not create, activate, or schedule—an ongoing mandate lasting two hours. It may review every 15 minutes once activated. Draft only and wait for confirmation.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        "Draft prepared only; nothing was created or scheduled."
+    );
+    assert!(harness
+        .state
+        .list_mandates(Some(session_id), true)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .state
+        .get_goals_for_session(session_id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let calls = harness.provider.call_log.lock().await;
+    let first_call = calls.first().expect("model received the request directly");
+    let tool_names = first_call
+        .tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"manage_mandates"));
+}
+
+#[tokio::test]
 async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical_reads() {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     use std::io::Write;
@@ -546,7 +612,13 @@ async fn test_semantic_file_read_cache_avoids_duplicate_and_overlapping_physical
 async fn test_llm_call_event_emitted_with_telemetry() {
     // A simple conversational turn skips the separate planner call. The mock
     // response reports 10 input / 5 output tokens.
-    let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+    let harness = setup_test_agent_with_models(
+        MockProvider::new(),
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+    )
+    .await
+    .unwrap();
 
     harness
         .agent

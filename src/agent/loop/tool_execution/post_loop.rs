@@ -19,6 +19,7 @@ pub(super) struct PostToolIterationInputs<'a> {
     pub completed_tool_calls: &'a [String],
     pub recent_tool_names: &'a VecDeque<String>,
     pub user_text: &'a str,
+    pub model: &'a str,
 }
 
 pub(super) struct PostToolIterationState<'a> {
@@ -192,6 +193,7 @@ pub(super) fn apply_post_tool_iteration_controls(
         completed_tool_calls,
         recent_tool_names,
         user_text,
+        model,
     } = inputs;
     let PostToolIterationState {
         total_successful_tool_calls,
@@ -330,11 +332,8 @@ pub(super) fn apply_post_tool_iteration_controls(
             policy_bundle.risk_score,
             true,
         );
-        widened = agent.restrict_connected_api_setup_tools_for_request(inputs.user_text, &widened);
-        widened =
-            agent.ensure_connected_api_tools_exposed(inputs.user_text, &widened, base_tool_defs);
         widened.truncate(20);
-        if !widened.is_empty() {
+        if widened.len() > previous_count {
             POLICY_METRICS
                 .fallback_expansion_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -349,22 +348,24 @@ pub(super) fn apply_post_tool_iteration_controls(
         }
     }
 
-    apply_read_saturation_controls(
-        session_id,
-        pending_system_messages,
-        tool_defs,
-        base_tool_defs,
-        recent_tool_names,
-    );
+    if agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided {
+        apply_read_saturation_controls(
+            session_id,
+            pending_system_messages,
+            tool_defs,
+            base_tool_defs,
+            recent_tool_names,
+        );
 
-    apply_terminal_after_edit_nudge(session_id, pending_system_messages, recent_tool_names);
+        apply_terminal_after_edit_nudge(session_id, pending_system_messages, recent_tool_names);
 
-    apply_edit_stall_write_hint(
-        session_id,
-        pending_system_messages,
-        recent_tool_names,
-        iteration_had_tool_failures,
-    );
+        apply_edit_stall_write_hint(
+            session_id,
+            pending_system_messages,
+            recent_tool_names,
+            iteration_had_tool_failures,
+        );
+    }
 
     apply_memory_search_saturation_controls(
         session_id,

@@ -360,31 +360,6 @@ impl ChannelHub {
             .await
     }
 
-    /// Request goal confirmation through a channel that supports inline buttons.
-    ///
-    /// Shows Confirm ✅ / Cancel ❌ buttons instead of the standard
-    /// Allow Once / Allow Session / Deny buttons.
-    pub async fn request_inline_goal_confirmation(
-        &self,
-        session_id: &str,
-        goal_description: &str,
-        details: &[String],
-    ) -> anyhow::Result<bool> {
-        let (channel, routed_session) = self
-            .routed_channel(session_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
-        if !channel.capabilities().inline_buttons {
-            anyhow::bail!(
-                "Channel {} does not support inline goal confirmation buttons",
-                channel.name()
-            );
-        }
-        channel
-            .request_goal_confirmation(&routed_session, goal_description, details)
-            .await
-    }
-
     /// Route approval requests from tools to the appropriate channel.
     ///
     /// Each approval is handled in its own task so the listener doesn't

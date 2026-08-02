@@ -1846,91 +1846,6 @@ async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
     );
 }
 
-#[tokio::test]
-async fn test_explicit_tool_turn_still_forces_required_tool_choice_after_no_tool_deferral() {
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("I'll check the system info now."),
-        MockProvider::tool_call_response("system_info", "{}"),
-        MockProvider::text_response("I checked the system info for you."),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let response = harness
-        .agent
-        .handle_message(
-            "tool_required_deferral_recovery",
-            "check the system info on this machine",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "I checked the system info for you.");
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(call_log.len(), 3);
-    assert_eq!(
-        call_log[1].options.tool_choice,
-        crate::traits::ToolChoiceMode::Required,
-        "genuinely tool-required turns should still escalate to required tool choice on retry"
-    );
-}
-
-/// A serving stack that ignores `tool_choice=required` (observed with
-/// llama.cpp + Gemma: the forced retry returned text and degenerated into a
-/// repetition loop until the token limit) must only get the forced retry
-/// once. After a forced call comes back with text and zero tool calls, the
-/// model is flagged and later turns skip the forcing — the substantive-text
-/// acceptance path converges without the wasted call.
-#[tokio::test]
-async fn test_required_tool_choice_not_reforced_after_model_ignores_it() {
-    let substantive = "The machine reports healthy disks, normal memory pressure, \
-        and no failed services.\nNothing actionable needs fixing right now.";
-    let provider = MockProvider::with_responses(vec![
-        // Turn 1, iter 2: deferral text — blocked, streak=1.
-        MockProvider::text_response("I'll check the system info now."),
-        // Turn 1, iter 3: tool_choice=required forced, but the "model"
-        // ignores it and returns substantive text — accepted at streak=2.
-        MockProvider::text_response(substantive),
-        // Turn 2, iter 2: deferral text — blocked, streak=1.
-        MockProvider::text_response("I'll check the system info now."),
-        // Turn 2, iter 3: the retry must NOT force required anymore.
-        MockProvider::text_response(substantive),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    for _ in 0..2 {
-        harness
-            .agent
-            .handle_message(
-                "required_tool_choice_ignored",
-                "check the system info on this machine",
-                None,
-                UserRole::Owner,
-                ChannelContext::private("test"),
-                None,
-            )
-            .await
-            .unwrap();
-    }
-
-    let call_log = harness.provider.call_log.lock().await.clone();
-    assert_eq!(call_log.len(), 4);
-    assert_eq!(
-        call_log[1].options.tool_choice,
-        crate::traits::ToolChoiceMode::Required,
-        "first deferral retry should still escalate to required tool choice"
-    );
-    assert_eq!(
-        call_log[3].options.tool_choice,
-        crate::traits::ToolChoiceMode::Auto,
-        "after the model ignored required once, later turns must not force it again"
-    );
-}
-
 /// Persistence round-trip: a model flagged as ignoring `tool_choice=required`
 /// is persisted to the settings KV and survives a reload (clear in-memory set,
 /// then `load_required_tool_choice_ignored()` re-populates it from the DB).
@@ -1988,7 +1903,6 @@ async fn test_required_tool_choice_ignored_persists_across_reload() {
 #[tokio::test]
 async fn test_stall_detection_unknown_tool() {
     let provider = MockProvider::with_responses(vec![
-        // Intent gate: first call has narration to pass the gate
         {
             let mut resp = MockProvider::tool_call_response("nonexistent_tool", "{}");
             resp.content = Some("I'll try calling this tool to help you.".to_string());
@@ -2474,43 +2388,6 @@ async fn test_memory_fact_persists_across_turns() {
          System prompt tail: ...{}",
         &system_content[system_content.len().saturating_sub(500)..]
     );
-}
-
-/// Intent gate test: on the first iteration, if the LLM returns a tool call
-/// without narration (content < 20 chars), the agent should force narration
-/// and re-issue. This ensures the user sees what the agent plans to do.
-#[tokio::test]
-async fn test_intent_gate_forces_narration() {
-    let provider = MockProvider::with_responses(vec![
-        // Iter 1: tool call with NO narration → intent gate triggers
-        MockProvider::tool_call_response("system_info", "{}"),
-        // Iter 2: same tool call but now with narration (agent learned)
-        {
-            let mut resp = MockProvider::tool_call_response("system_info", "{}");
-            resp.content = Some("I'll check your system information now.".to_string());
-            resp
-        },
-        // Iter 3: final answer
-        MockProvider::text_response("Your system is running fine."),
-    ]);
-
-    let harness = setup_test_agent(provider).await.unwrap();
-    let response = harness
-        .agent
-        .handle_message(
-            "intent_session",
-            "check my system",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response, "Your system is running fine.");
-    // 3 LLM calls: intent-gated (no exec) + narrated tool call + final
-    assert_eq!(harness.provider.call_count().await, 3);
 }
 
 /// Trust tier baseline: on the default (Guided) tier, the pre-execution

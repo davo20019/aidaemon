@@ -205,21 +205,12 @@ impl HarnessEvalAccumulator {
         self.route_drift_failsafe = route_failsafe_active;
     }
 
-    pub fn record_orchestration_route(&mut self, route: impl Into<String>, tools_required: bool) {
-        self.orchestration_route = route.into();
-        self.tools_required_predicted = tools_required;
-    }
-
     pub fn record_direct_return(&mut self, attempted: bool, succeeded: bool) {
         self.direct_return_attempted = attempted;
         self.direct_return_succeeded = succeeded;
         if succeeded {
             self.stop_reason = StopReason::DirectReturn;
         }
-    }
-
-    pub fn record_response_fallthrough(&mut self) {
-        self.response_fallthrough = true;
     }
 
     pub fn record_message_build(
@@ -231,10 +222,6 @@ impl HarnessEvalAccumulator {
         self.progress.tool_defs_count = tool_defs_count;
         self.progress.est_input_tokens = est_input_tokens;
         self.progress.context_drops = context_drops;
-    }
-
-    pub fn record_intent_gate_fire(&mut self) {
-        self.intent_gate_fires = self.intent_gate_fires.saturating_add(1);
     }
 
     pub fn record_evidence_gate_block(&mut self) {

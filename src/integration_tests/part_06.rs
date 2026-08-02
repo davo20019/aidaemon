@@ -60,8 +60,11 @@ async fn test_initial_routing_call_classifies_then_executor_answers_questions() 
 }
 
 #[tokio::test]
-async fn test_critical_owner_name_query_is_deterministic() {
-    let harness = setup_test_agent_with_models(MockProvider::new(), "primary-model", "smart-model")
+async fn test_critical_owner_name_query_is_model_directed_with_pinned_context() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "Your name is Test Owner.",
+    )]);
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
         .await
         .unwrap();
 
@@ -92,18 +95,12 @@ async fn test_critical_owner_name_query_is_deterministic() {
         .unwrap();
 
     assert_eq!(response, "Your name is Test Owner.");
-    assert_eq!(
-        harness.provider.call_count().await,
-        0,
-        "Critical identity query should resolve without an LLM call"
-    );
+    assert_eq!(harness.provider.call_count().await, 1);
 }
 
 #[tokio::test]
 async fn test_personal_recall_turn_routes_at_least_primary_model() {
-    // With deterministic routing (no first-pass orchestration LLM call), the
-    // execution loop
-    // handles the request directly with a single LLM call.
+    // The execution loop handles the request directly with a single model call.
     let provider = MockProvider::with_responses(vec![
         // Execution loop — direct answer (no text-only pre-pass response needed)
         MockProvider::text_response("I don't have pet information saved."),
@@ -139,9 +136,37 @@ async fn test_personal_recall_turn_routes_at_least_primary_model() {
 }
 
 #[tokio::test]
+async fn test_autonomous_primary_model_is_not_replaced_by_lexical_policy_routing() {
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I prepared the draft only and did not schedule or activate anything.",
+    )]);
+    let harness = setup_test_agent_with_models(provider, "gpt-5.4", "small-local-model")
+        .await
+        .unwrap();
+
+    let response = harness
+        .agent
+        .handle_message(
+            "autonomous-model-routing",
+            "Prepare a draft mandate that mentions a 15-minute review cadence. Do not create, activate, or schedule it.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("draft only"));
+    let calls = harness.provider.call_log.lock().await;
+    let first = calls.first().expect("main model call");
+    assert_eq!(first.model, "gpt-5.4");
+}
+
+#[tokio::test]
 async fn test_empty_answerable_routing_output_falls_through_to_tool_path() {
-    // With deterministic orchestration (no first-pass LLM call), an empty/low-signal
-    // first response should cause the agent to retry and eventually use tools.
+    // An empty/low-signal first response should cause the agent to retry and
+    // eventually use tools.
     let provider = MockProvider::with_responses(vec![
         // 1) First LLM call produces an empty response
         MockProvider::text_response(""),

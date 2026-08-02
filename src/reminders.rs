@@ -134,6 +134,7 @@ fn flip_pronouns(text: &str) -> String {
 /// ("Check logs" → "Remind me to check logs"). Used when upstream description
 /// cleaning stripped the user's leading "remind me to", so the stored goal
 /// stays recognizable as a reminder at fire time.
+#[cfg(test)]
 pub fn canonical_description(body: &str) -> String {
     let body = body.trim().trim_end_matches(['?', '.', '!']).trim();
     let first_word = body.split_whitespace().next().unwrap_or("");

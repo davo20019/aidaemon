@@ -1,7 +1,6 @@
 use super::bootstrap_phase::{BootstrapCtx, BootstrapData, BootstrapOutcome};
 use super::llm_phase::LlmPhaseCtx;
 use super::message_build_phase::{MessageBuildCtx, MessageBuildData};
-use super::orchestration_phase::OrchestrationCtx;
 use super::response_phase::ResponsePhaseCtx;
 use super::stopping_phase::StoppingPhaseCtx;
 use super::tool_execution_phase::ToolExecutionCtx;
@@ -9,38 +8,6 @@ use super::tool_prelude_phase::ToolPreludeCtx;
 use super::turn_transition::{TurnRestartReason, TurnTransition};
 use super::*;
 use crate::events::TaskOutcome;
-
-/// Check if a cancel keyword appears in text without a preceding negation.
-/// Returns false for phrases like "do not stop", "don't cancel", "never stop".
-fn cancel_keyword_not_negated(text: &str, keyword: &str) -> bool {
-    if !contains_keyword_as_words(text, keyword) {
-        return false;
-    }
-    // Find the keyword position and check the 1-3 words before it for negation.
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let kw_lower = keyword.to_ascii_lowercase();
-    for (i, w) in words.iter().enumerate() {
-        let normalized = w
-            .trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_ascii_lowercase();
-        if normalized == kw_lower {
-            // Check up to 3 words before for negation markers.
-            let start = i.saturating_sub(3);
-            for word in &words[start..i] {
-                let prev = word
-                    .trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-                    .to_ascii_lowercase();
-                if matches!(
-                    prev.as_str(),
-                    "not" | "don't" | "dont" | "no" | "never" | "shouldn't" | "without"
-                ) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
 
 /// Build a user-facing message when the force-text safety net fires and there
 /// is no salvageable tool output to return.
@@ -75,56 +42,6 @@ fn build_stuck_no_output_fallback(user_text: &str) -> String {
     "I wasn't able to complete that. Could you rephrase with a bit more detail about what \
      you'd like me to do?"
         .to_string()
-}
-
-fn infer_deterministic_orchestration_intent(user_text: &str) -> IntentGateDecision {
-    let mut intent_gate = infer_intent_gate(user_text, "");
-    let lower = user_text.trim().to_ascii_lowercase();
-    let explicit_cancel_command = lower == "/cancel" || lower.starts_with("/cancel ");
-
-    // Single-word cancel keywords ("cancel", "stop", "abort") are only treated
-    // as cancel intent in SHORT messages (< 80 chars). In long task descriptions
-    // they are almost always part of instructions, not commands.
-    // Multi-word phrases ("never mind", "forget it", "scratch that") are
-    // unambiguous regardless of message length.
-    let short_msg = lower.len() < 80;
-    let has_cancel_phrase = if short_msg {
-        [
-            "cancel",
-            "stop",
-            "abort",
-            "never mind",
-            "nevermind",
-            "forget it",
-            "scratch that",
-        ]
-        .iter()
-        .any(|kw| cancel_keyword_not_negated(&lower, kw))
-    } else {
-        ["never mind", "nevermind", "forget it", "scratch that"]
-            .iter()
-            .any(|kw| cancel_keyword_not_negated(&lower, kw))
-    };
-    if explicit_cancel_command || has_cancel_phrase {
-        let targeted_cancel = [
-            "goal",
-            "task",
-            "job",
-            "this goal",
-            "that goal",
-            "specific",
-            "id",
-        ]
-        .iter()
-        .any(|kw| contains_keyword_as_words(&lower, kw));
-        intent_gate.cancel_intent = Some(true);
-        intent_gate.cancel_scope = Some(if targeted_cancel {
-            "targeted".to_string()
-        } else {
-            "generic".to_string()
-        });
-    }
-    intent_gate
 }
 
 /// Enter one agent-loop iteration and update the state that is common to every
@@ -372,9 +289,9 @@ impl Agent {
             harness_eval: None,
             eval: None,
         };
-        // Task-start semantic assessment. Every model gets contract/task-shape
-        // classification when the turn warrants it; only Guided models get a
-        // step plan. Autonomous models retain control of their own approach.
+        // Optional task-start semantic assessment for Guided models. Autonomous
+        // models retain control of their own approach without an auxiliary
+        // classifier or step planner.
         // In tests, MockProvider silently intercepts assessment calls.
         let task_plan = {
             use super::bootstrap_phase::task_planning::{
@@ -400,12 +317,8 @@ impl Agent {
             };
             let planner_skip_reason = if self.mandate_execution.is_some() {
                 Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
-            } else if matches!(
-                assessment_mode,
-                TaskAssessmentMode::AutonomousRouting
-            ) && (self.depth > 0 || self.role != AgentRole::Orchestrator)
-            {
-                Some("autonomous_worker_self_directed")
+            } else if matches!(assessment_mode, TaskAssessmentMode::AutonomousRouting) {
+                Some("autonomous_model_directed")
             } else {
                 planning_skip_reason(user_text, false)
             };
@@ -624,26 +537,6 @@ impl Agent {
             }
         };
 
-        let fallback_intent_complexity = classify_intent_complexity(user_text);
-        let (intent_complexity, structured_complexity_used) = task_plan
-            .as_ref()
-            .and_then(|plan| plan.task_shape.as_ref())
-            .map(|shape| {
-                refine_intent_complexity_with_task_shape(
-                    fallback_intent_complexity.clone(),
-                    IntentTaskShape {
-                        execution_mode: shape.execution_mode.as_deref(),
-                        confidence: shape.confidence.as_deref(),
-                        independent_workstreams: shape.independent_workstreams,
-                        requires_background_continuation: shape
-                            .requires_background_continuation,
-                    },
-                )
-            })
-            .unwrap_or((fallback_intent_complexity, false));
-
-        // The assessment has now had its one opportunity to refine the contract
-        // and route. Derive contract-dependent state exactly once.
         // Derive all contract-dependent state exactly once from that finalized
         // value so loop control, progress tracking, budgets, and telemetry agree.
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
@@ -666,18 +559,8 @@ impl Agent {
             turn_state.attach_harness_eval(handle);
         }
 
-        let intent_gate = infer_deterministic_orchestration_intent(user_text);
-        let deterministic_tool_need = intent_gate.needs_tools;
-        let recognized_artifact_request = recognized_artifact_creation_request(user_text);
-        let route_requires_tools = self.depth == 0
-            && self.role == AgentRole::Orchestrator
-            && matches!(&intent_complexity, IntentComplexity::Complex);
-        let execution_requirement = ExecutionRequirement::from_finalized_contract(
-            &turn_context.completion_contract,
-            deterministic_tool_need,
-            route_requires_tools,
-            recognized_artifact_request,
-        );
+        let execution_requirement =
+            ExecutionRequirement::from_finalized_contract(&turn_context.completion_contract);
 
         let (execution_budget_tier, execution_budget_route, execution_budget) =
             select_initial_execution_budget(user_text, &turn_context, self.depth, self.role);
@@ -1323,67 +1206,6 @@ impl Agent {
                 TurnTransition::Advance(()) => {}
             }
 
-            // Deterministic control-plane routing on iteration 1:
-            // handle cancel/schedule/complex intents before the first LLM call.
-            if iteration == 1
-                && self.depth == 0
-                && self.role == AgentRole::Orchestrator
-                && !route_failsafe_active
-            {
-                if let Some(outcome) = super::orchestration_phase::run_orchestration_phase(
-                    &services,
-                    &mut OrchestrationCtx {
-                        emitter: &emitter,
-                        task_id: &task_id,
-                        session_id,
-                        user_text,
-                        iteration,
-                        task_start,
-                        task_tokens_used: turn_state.budget.task_tokens_used(),
-                        pending_system_messages: turn_state
-                            .directives
-                            .for_message_build_phase()
-                            .pending_system_messages,
-                        tool_defs: &mut tool_defs,
-                        base_tool_defs: &mut base_tool_defs,
-                        available_capabilities: &mut available_capabilities,
-                        policy_bundle: &mut policy_bundle,
-                        tools_allowed_for_user,
-                        llm_provider: llm_provider.clone(),
-                        llm_router: llm_router.clone(),
-                        model: &model,
-                        user_role,
-                        channel_ctx: channel_ctx.clone(),
-                        status_tx: status_tx.clone(),
-                        intent_gate: &intent_gate,
-                        intent_complexity: &intent_complexity,
-                        structured_complexity_used,
-                        turn_context: &turn_context,
-                        execution_requirement: &execution_requirement,
-                    },
-                )
-                .await?
-                {
-                    match outcome.into_orchestration_transition() {
-                        TurnTransition::Restart(reason) => {
-                            turn_state
-                                .with_harness_eval(|eval| eval.record_response_fallthrough())
-                                .await;
-                            prepare_turn_restart(
-                                self,
-                                reason,
-                                &mut turn_state,
-                                &mut approach_pivots_used,
-                                &model,
-                            );
-                            continue;
-                        }
-                        TurnTransition::Finish(result) => return result,
-                        TurnTransition::Advance(()) => {}
-                    }
-                }
-            }
-
             // Inject task plan context with progress markers into the model's context.
             if let Some(ref plan) = execution_state.active_linear_intent_plan {
                 if !plan.steps.is_empty() {
@@ -1890,71 +1712,6 @@ impl Agent {
 #[cfg(test)]
 #[path = "characterization_tests.rs"]
 mod characterization_tests;
-
-#[cfg(test)]
-mod cancel_intent_tests {
-    use super::*;
-
-    #[test]
-    fn negated_stop_not_detected() {
-        // "Do not stop until every test passes" should NOT trigger cancel
-        assert!(!cancel_keyword_not_negated(
-            "do not stop until every test passes",
-            "stop"
-        ));
-    }
-
-    #[test]
-    fn negated_cancel_not_detected() {
-        assert!(!cancel_keyword_not_negated(
-            "don't cancel anything",
-            "cancel"
-        ));
-    }
-
-    #[test]
-    fn bare_stop_detected() {
-        assert!(cancel_keyword_not_negated("stop", "stop"));
-    }
-
-    #[test]
-    fn bare_cancel_detected() {
-        assert!(cancel_keyword_not_negated("cancel everything", "cancel"));
-    }
-
-    #[test]
-    fn never_stop_not_detected() {
-        assert!(!cancel_keyword_not_negated("never stop working", "stop"));
-    }
-
-    #[test]
-    fn long_message_with_stop_no_cancel() {
-        let msg = "write a script that does X and Y. do not stop until every test passes.";
-        let intent = infer_deterministic_orchestration_intent(msg);
-        assert!(!intent.cancel_intent.unwrap_or(false));
-    }
-
-    #[test]
-    fn short_stop_message_triggers_cancel() {
-        let intent = infer_deterministic_orchestration_intent("stop");
-        assert!(intent.cancel_intent.unwrap_or(false));
-    }
-
-    #[test]
-    fn short_cancel_message_triggers_cancel() {
-        let intent = infer_deterministic_orchestration_intent("cancel all");
-        assert!(intent.cancel_intent.unwrap_or(false));
-    }
-
-    #[test]
-    fn never_mind_in_long_message() {
-        // Multi-word phrases are always unambiguous
-        let intent = infer_deterministic_orchestration_intent(
-            "actually never mind about that whole thing I asked earlier, let me think about it",
-        );
-        assert!(intent.cancel_intent.unwrap_or(false));
-    }
-}
 
 #[cfg(test)]
 mod stuck_fallback_tests {

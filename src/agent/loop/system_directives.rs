@@ -134,9 +134,6 @@ pub(in crate::agent) enum SystemDirective {
     /// steps (e.g., "start server in background, then test it with curl").
     /// The agent should continue working on the remaining steps.
     BackgroundProcessContinue,
-    SchedulingOwnerOnly,
-    DelegationModeActive,
-    GoalCreationOwnerOnly,
     ReflectionDiagnosis {
         tool_name: String,
         root_cause: String,
@@ -225,9 +222,6 @@ pub(in crate::agent) enum SystemDirective {
     },
     /// Injected when plan detection heuristics identify a multi-step task
     /// that benefits from structured execution with verification.
-    PlanSuggestion {
-        hint: String,
-    },
     /// User challenged the immediately previous answer ("Are you sure?").
     /// Anchor the model to that exchange only.
     ReaffirmationChallengeAnchor {
@@ -522,9 +516,6 @@ impl SystemDirective {
                 }
             }
             Self::BackgroundProcessContinue => "[SYSTEM] A background process was launched successfully and is now running. Continue with the remaining steps of the user's request (e.g., testing endpoints, verifying output). The background process is already running — proceed directly with the next action.".to_string(),
-            Self::SchedulingOwnerOnly => "[SYSTEM] Scheduling goals is owner-only. Handle this request directly without creating a goal.".to_string(),
-            Self::DelegationModeActive => "[SYSTEM] Delegation mode active. Use `cli_agent` for execution tasks. `terminal`, `browser`, and `run_command` are hidden in this turn.".to_string(),
-            Self::GoalCreationOwnerOnly => "[SYSTEM] Creating goals is owner-only. Handle this request directly without creating a goal.".to_string(),
             Self::ReflectionDiagnosis {
                 tool_name,
                 root_cause,
@@ -642,7 +633,6 @@ impl SystemDirective {
                  User request: \"{}\"",
                 user_text_hint
             ),
-            Self::PlanSuggestion { hint } => hint.clone(),
             Self::ReaffirmationChallengeAnchor {
                 prior_user_request,
                 prior_assistant_reply,

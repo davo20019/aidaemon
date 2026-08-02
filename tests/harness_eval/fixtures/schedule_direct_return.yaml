@@ -1,13 +1,12 @@
-name: schedule_direct_return
-description: Scheduled intent should direct-return before first LLM call
+name: schedule_model_directed
+description: Schedule language reaches the model instead of a deterministic direct-return router
 session_id: eval_schedule_01
 user_text: Check deployment tomorrow at 9am
 orchestrator: true
+mock_responses:
+  - text: I will assess the requested future check and use the available goal tools if scheduling is appropriate.
 expect:
-  llm_calls_max: 0
+  llm_calls_min: 1
   tool_calls_max: 0
-  outcome: succeeded
-  direct_return: true
-  orchestration_route: direct_reply
-  response_contains:
-    - confirm
+  direct_return: false
+  orchestration_route: default_continue
