@@ -15,7 +15,7 @@ use super::backend::{MockBackend, MockCall};
 use super::BrowserTool;
 use crate::tools::ApprovalBroker;
 use crate::traits::{AttachmentProvenance, Tool};
-use crate::types::{ApprovalResponse, MediaKind, MediaMessage};
+use crate::types::{ApprovalKind, ApprovalResponse, MediaKind, MediaMessage};
 
 fn mock_tool() -> (
     BrowserTool,
@@ -304,12 +304,13 @@ async fn dispatch_mutation_click_routes_through_backend() {
 
     // Exact sequence: ensure_ready -> create_page -> click(selector) -> a
     // navigation-readiness probe (Task 13 nav-race; the non-navigating default
-    // returns fast via the short settle while still recording the probe).
+    // returns fast via the short settle while still recording the probe), then
+    // read the live URL to refresh the origin used by later approval prompts.
     // Asserts the click is recorded and that we did NOT route through
     // goto/find_element.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 4, "expected 4 recorded calls: {calls:?}");
+    assert_eq!(calls.len(), 5, "expected 5 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -324,6 +325,11 @@ async fn dispatch_mutation_click_routes_through_backend() {
         calls[3],
         MockCall::WaitForNavigation,
         "click must run the nav-race probe (no fixed sleep): {calls:?}"
+    );
+    assert_eq!(
+        calls[4],
+        MockCall::Url,
+        "click must refresh the current URL for later approval prompts: {calls:?}"
     );
 }
 
@@ -1657,6 +1663,7 @@ async fn single_page_actions_use_active_tab() {
 #[derive(Clone)]
 struct ApprovalRecorder {
     commands: Arc<Mutex<Vec<String>>>,
+    kinds: Arc<Mutex<Vec<ApprovalKind>>>,
 }
 
 impl ApprovalRecorder {
@@ -1666,6 +1673,10 @@ impl ApprovalRecorder {
 
     async fn count(&self) -> usize {
         self.commands.lock().await.len()
+    }
+
+    async fn kinds(&self) -> Vec<ApprovalKind> {
+        self.kinds.lock().await.clone()
     }
 }
 
@@ -1677,11 +1688,14 @@ fn spawn_responder(reply: ApprovalResponse) -> (ApprovalBroker, ApprovalRecorder
     let broker = ApprovalBroker::new(tx);
     let recorder = ApprovalRecorder {
         commands: Arc::new(Mutex::new(Vec::new())),
+        kinds: Arc::new(Mutex::new(Vec::new())),
     };
     let commands = recorder.commands.clone();
+    let kinds = recorder.kinds.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             commands.lock().await.push(req.command.clone());
+            kinds.lock().await.push(req.kind);
             let _ = req.response_tx.send(reply.clone());
         }
     });
@@ -1695,11 +1709,14 @@ fn spawn_silent_responder() -> (ApprovalBroker, ApprovalRecorder) {
     let broker = ApprovalBroker::new(tx);
     let recorder = ApprovalRecorder {
         commands: Arc::new(Mutex::new(Vec::new())),
+        kinds: Arc::new(Mutex::new(Vec::new())),
     };
     let commands = recorder.commands.clone();
+    let kinds = recorder.kinds.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             commands.lock().await.push(req.command.clone());
+            kinds.lock().await.push(req.kind);
             // Drop req (and its response_tx) without replying → the gate times out.
             drop(req);
         }
@@ -1950,7 +1967,7 @@ async fn missing_channel_denies_mutation_but_allows_observation() {
 async fn observations_never_prompt() {
     let (tool, backend, recorder) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
 
-    for action in &["get_text", "screenshot", "list_tabs"] {
+    for action in &["get_text", "inspect_page", "screenshot", "list_tabs"] {
         let out = tool
             .call(&json!({ "action": action, "_session_id": "sess-obs" }).to_string())
             .await
@@ -1966,6 +1983,14 @@ async fn observations_never_prompt() {
         0,
         "observations must never send an approval request: {:?}",
         recorder.commands().await
+    );
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Evaluate(super::INSPECT_PAGE_SCRIPT.to_string())
+        )
+        .await,
+        "inspect_page must use only the fixed internal inspection script"
     );
     // And they reached the backend (proof they actually ran).
     assert!(
@@ -2036,6 +2061,14 @@ async fn execute_js_prompts_every_call_and_hides_script() {
         "each execute_js must prompt, even after AllowSession: {:?}",
         recorder.commands().await
     );
+    assert!(
+        recorder
+            .kinds()
+            .await
+            .iter()
+            .all(|kind| matches!(kind, ApprovalKind::CommandOnce)),
+        "execute_js approvals must be explicitly one-time"
+    );
 
     // The prompt must NOT leak the script body / sentinel.
     for cmd in recorder.commands().await {
@@ -2050,6 +2083,42 @@ async fn execute_js_prompts_every_call_and_hides_script() {
         calls_contains(&backend, &MockCall::Evaluate(script.clone())).await,
         "approved execute_js must reach the backend"
     );
+}
+
+#[tokio::test]
+async fn execute_js_prompt_uses_origin_cached_after_navigation() {
+    let (tool, _backend, recorder) = approving_tool(
+        MockBackend::new().with_url("https://example.com/reservations?token=SECRET"),
+        ApprovalResponse::AllowSession,
+    );
+
+    tool.call(
+        &json!({
+            "action": "navigate",
+            "url": "https://example.com/reservations?token=SECRET",
+            "_session_id": "sess-origin"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tool.call(
+        &json!({
+            "action": "execute_js",
+            "script": "1 + 1",
+            "_session_id": "sess-origin"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let commands = recorder.commands().await;
+    let js_prompt = commands.last().expect("execute_js approval prompt");
+    assert!(js_prompt.contains("https://example.com"), "{js_prompt}");
+    assert!(!js_prompt.contains("current page"), "{js_prompt}");
+    assert!(!js_prompt.contains("reservations"), "{js_prompt}");
+    assert!(!js_prompt.contains("SECRET"), "{js_prompt}");
 }
 
 /// POINT-OF-ACTION: a consequential click prompts even after a prior ordinary
@@ -2401,9 +2470,9 @@ async fn navigate_blocked_redirect_resets_page_to_about_blank() {
 
 /// PART 2 — OBSERVATION REFUSED: when the page's LIVE committed URL is a blocked
 /// host (e.g. reached via a post-load JS-redirect / meta-refresh), get_text,
-/// screenshot, and execute_js must each REFUSE before reading/capturing/
-/// evaluating. The error names ONLY the host class (no IP/path/query), and the
-/// underlying read/capture/evaluate call must NOT have been recorded.
+/// inspect_page, screenshot, and execute_js must each REFUSE before reading,
+/// capturing, or evaluating. The error names ONLY the host class (no
+/// IP/path/query), and the underlying operation must NOT have been recorded.
 #[tokio::test]
 async fn observation_actions_refuse_on_blocked_current_url() {
     // The page is currently sitting on a link-local metadata endpoint with a
@@ -2464,6 +2533,34 @@ async fn observation_actions_refuse_on_blocked_current_url() {
         assert!(
             !calls.iter().any(|c| matches!(c, MockCall::Screenshot(..))),
             "screenshot must refuse BEFORE capturing: {calls:?}"
+        );
+    }
+
+    // inspect_page refuses before evaluating its fixed inspection script.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(blocked),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(&json!({ "action": "inspect_page", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.to_lowercase().contains("block") && out.to_lowercase().contains("link-local"),
+            "inspect_page on a blocked URL must refuse with the host class: {out}"
+        );
+        assert!(
+            !out.contains("169.254.169.254")
+                && !out.contains("security-credentials")
+                && !out.contains("meta-data"),
+            "inspect_page refusal must not leak the URL/path: {out}"
+        );
+        let calls = backend.calls();
+        let calls = calls.lock().await;
+        assert!(
+            !calls.iter().any(|c| matches!(c, MockCall::Evaluate(_))),
+            "inspect_page must refuse BEFORE evaluating: {calls:?}"
         );
     }
 
@@ -2533,8 +2630,9 @@ async fn observation_actions_refuse_on_private_current_url() {
     );
 }
 
-/// REGRESSION: with the live URL on a PUBLIC host, get_text / screenshot /
-/// execute_js still proceed normally (the gate only blocks blocked hosts).
+/// REGRESSION: with the live URL on a PUBLIC host, get_text / inspect_page /
+/// screenshot / execute_js still proceed normally (the gate only blocks
+/// blocked hosts).
 #[tokio::test]
 async fn observation_actions_allowed_on_public_current_url() {
     let public = "https://app.example/dashboard";
@@ -2597,6 +2695,27 @@ async fn observation_actions_allowed_on_public_current_url() {
         assert!(
             calls_contains(&backend, &MockCall::Evaluate("1 + 1".to_string())).await,
             "public execute_js must reach evaluate"
+        );
+    }
+
+    // inspect_page proceeds using only the fixed internal script.
+    {
+        let (tool, backend, _rec) = approving_tool(
+            MockBackend::new().with_url(public),
+            ApprovalResponse::AllowSession,
+        );
+        let out = tool
+            .call(&json!({ "action": "inspect_page", "_session_id": "sess-a" }).to_string())
+            .await
+            .unwrap();
+        assert!(!out.to_lowercase().contains("block"), "{out}");
+        assert!(
+            calls_contains(
+                &backend,
+                &MockCall::Evaluate(super::INSPECT_PAGE_SCRIPT.to_string())
+            )
+            .await,
+            "public inspect_page must evaluate only the fixed internal script"
         );
     }
 }

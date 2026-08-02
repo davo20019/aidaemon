@@ -1300,6 +1300,7 @@ impl Channel for DiscordChannel {
         risk_level: RiskLevel,
         warnings: &[String],
         permission_mode: PermissionMode,
+        one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
         let http = self.get_http().await?;
         let channel_id = self.resolve_channel_id(session_id).await?;
@@ -1324,7 +1325,16 @@ impl Channel for DiscordChannel {
         let use_session_button =
             approval_render::approval_use_session_button(permission_mode, risk_level);
 
-        let buttons = if use_session_button {
+        let buttons = if one_time_only {
+            CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("approve:once:{}", approval_id))
+                    .label("Allow Once")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new(format!("approve:deny:{}", approval_id))
+                    .label("Deny")
+                    .style(ButtonStyle::Danger),
+            ])
+        } else if use_session_button {
             CreateActionRow::Buttons(vec![
                 CreateButton::new(format!("approve:once:{}", approval_id))
                     .label("Allow Once")
@@ -1355,6 +1365,7 @@ impl Channel for DiscordChannel {
             risk_level,
             warnings,
             use_session_button,
+            one_time_only,
         );
 
         let msg = CreateMessage::new()

@@ -1,16 +1,19 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateStatus, StateStore, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolRole,
+    MandateLearningNote, MandateReconciliationResolution, MandateStatus, MandateStrategySnapshot,
+    MandateSuspensionKind, MandateTerminationKind, StateStore, Tool, ToolCallSemantics,
+    ToolCapabilities, ToolMutationEffects, ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
@@ -31,7 +34,9 @@ const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
 const MAX_GUIDANCE_ENTRIES: usize = 10;
 const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
-const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only in v1; update rejects this field.";
+const MAX_LEARNING_NOTE_TEXT: usize = 1024;
+const MAX_EVIDENCE_RECEIPTS: usize = 16;
+const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only; update rejects.";
 
 /// Owner-facing mandate administration and the internal deliberation commit point.
 ///
@@ -41,11 +46,21 @@ const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only in v1; update rejects t
 pub struct ManageMandatesTool {
     state: Arc<dyn StateStore>,
     approval_tx: ApprovalBroker,
+    skills_dir: Option<PathBuf>,
 }
 
 impl ManageMandatesTool {
     pub fn new(state: Arc<dyn StateStore>, approval_tx: ApprovalBroker) -> Self {
-        Self { state, approval_tx }
+        Self {
+            state,
+            approval_tx,
+            skills_dir: None,
+        }
+    }
+
+    pub fn with_skills_dir(mut self, skills_dir: Option<PathBuf>) -> Self {
+        self.skills_dir = skills_dir;
+        self
     }
 
     fn is_owner(args: &ManageMandatesArgs) -> bool {
@@ -94,6 +109,165 @@ impl ManageMandatesTool {
                 .unwrap_or(0),
             min_seconds_between_mutations: args.min_seconds_between_mutations.unwrap_or(0),
         }
+    }
+
+    fn strategy_snapshot(
+        &self,
+        skill_name: Option<&str>,
+    ) -> anyhow::Result<Option<MandateStrategySnapshot>> {
+        let Some(skill_name) = skill_name.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let skills_dir = self.skills_dir.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("strategy_skill requires the filesystem skills system")
+        })?;
+        let skills = crate::skills::load_skills(skills_dir);
+        let skill = crate::skills::find_skill_by_name(&skills, skill_name)
+            .ok_or_else(|| anyhow::anyhow!("strategy skill `{skill_name}` was not found"))?;
+        let canonical = skill.to_markdown();
+        let body = crate::tools::sanitize::sanitize_external_content(&skill.body)
+            .trim()
+            .to_string();
+        anyhow::ensure!(
+            !body.is_empty(),
+            "strategy skill body is empty after sanitization"
+        );
+        let snapshot = MandateStrategySnapshot {
+            skill_name: skill.name.clone(),
+            snapshot_version: MandateStrategySnapshot::SCHEMA_VERSION,
+            content_sha256: format!("{:x}", Sha256::digest(canonical.as_bytes())),
+            description: skill.description.trim().to_string(),
+            body,
+            source: skill.source.clone(),
+        };
+        snapshot.validate().map_err(anyhow::Error::msg)?;
+        Ok(Some(snapshot))
+    }
+
+    fn confirmation_warnings(
+        mandate: &Mandate,
+        budget_per_cycle: i64,
+        budget_daily: i64,
+    ) -> Vec<String> {
+        vec![
+            format!("Objective: {}", mandate.objective),
+            format!("Constraints: {}", display_policy(&mandate.constraints)),
+            format!(
+                "Success criteria: {}",
+                display_policy(&mandate.success_criteria)
+            ),
+            format!("Stop conditions: {}", display_policy(&mandate.stop_conditions)),
+            format!(
+                "Pinned strategy: {}",
+                mandate.strategy.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |strategy| format!(
+                        "{} (sha256:{})",
+                        strategy.skill_name,
+                        &strategy.content_sha256[..12]
+                    )
+                )
+            ),
+            format!(
+                "Observations allowed: {}; exact observation/action tools: {}",
+                mandate.authority.allow_observations,
+                display_allowlist(&mandate.authority.allowed_tools)
+            ),
+            format!(
+                "Allowed mutation effects: {}",
+                display_allowlist(&mandate.authority.allowed_mutation_effects)
+            ),
+            format!(
+                "Allowed targets: {}",
+                display_target_scope(&mandate.authority.allowed_target_prefixes)
+            ),
+            format!(
+                "Mutation limits: {} per decision cycle; {} per rolling 24 hours; minimum spacing {} seconds",
+                mandate.authority.max_mutating_actions_per_cycle,
+                mandate.authority.max_mutating_actions_per_rolling_24h,
+                mandate.authority.min_seconds_between_mutations
+            ),
+            format!(
+                "Review interval: {}–{} minutes (default {})",
+                mandate.min_review_secs / 60,
+                mandate.max_review_secs / 60,
+                mandate.default_review_secs / 60
+            ),
+            format!(
+                "Expiration: {}",
+                mandate.expires_at.as_deref().unwrap_or("none")
+            ),
+            format!(
+                "Resolved token budgets: {budget_per_cycle} tokens per decision cycle; {budget_daily} tokens per UTC day"
+            ),
+        ]
+    }
+
+    async fn draft(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandate drafts can only be prepared for the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let objective =
+            required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
+        let authority = Self::authority_from_args(args);
+        let constraints = clean_strings(args.constraints.as_deref());
+        let success_criteria = clean_strings(args.success_criteria.as_deref());
+        let stop_conditions = clean_strings(args.stop_conditions.as_deref());
+        validate_policy_text(&constraints, &success_criteria, &stop_conditions)?;
+        let strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        let mut missing = Vec::new();
+        if authority.max_mutating_actions_per_cycle > 0 {
+            if authority.allowed_tools.is_empty() {
+                missing.push("allowed_tools");
+            }
+            if authority.allowed_mutation_effects.is_empty() {
+                missing.push("allowed_mutation_effects");
+            }
+            if authority.allowed_target_prefixes.is_empty() {
+                missing.push("allowed_target_prefixes");
+            }
+            if authority.max_mutating_actions_per_rolling_24h == 0 {
+                missing.push("max_mutating_actions_per_rolling_24h");
+            }
+            if authority.min_seconds_between_mutations < 900 {
+                missing.push("min_seconds_between_mutations_at_least_900");
+            }
+        }
+        let validation_error = authority.validate().err();
+        let ready_to_confirm = missing.is_empty() && validation_error.is_none();
+        Ok(serde_json::to_string_pretty(&json!({
+            "execution_mode": "ongoing_mandate",
+            "writes_performed": false,
+            "ready_to_confirm": ready_to_confirm,
+            "required_inputs": missing,
+            "validation_status": validation_error.as_deref().unwrap_or("ready"),
+            "proposal": {
+                "objective": objective,
+                "constraints": constraints,
+                "success_criteria": success_criteria,
+                "stop_conditions": stop_conditions,
+                "strategy": strategy.as_ref().map(|value| json!({
+                    "skill_name": value.skill_name,
+                    "content_sha256": value.content_sha256,
+                })),
+                "authority": authority,
+                "review_minutes": {
+                    "minimum": args.min_review_minutes.unwrap_or(DEFAULT_MIN_REVIEW_SECS / 60),
+                    "default": args.default_review_minutes.unwrap_or(DEFAULT_REVIEW_SECS / 60),
+                    "maximum": args.max_review_minutes.unwrap_or(DEFAULT_MAX_REVIEW_SECS / 60),
+                },
+                "expires_at": args.expires_at,
+                "priority": args.priority.as_deref().unwrap_or("high"),
+            },
+            "next_step": if ready_to_confirm {
+                "Call create with this proposal to show the complete owner confirmation."
+            } else {
+                "Supply every required input, then draft again before create."
+            }
+        }))?)
     }
 
     fn reject_create_only_update_fields(args: &ManageMandatesArgs) -> anyhow::Result<()> {
@@ -236,6 +410,7 @@ impl ManageMandatesTool {
         mandate.constraints = clean_strings(args.constraints.as_deref());
         mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
         mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
+        mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
         validate_policy_text(
             &mandate.constraints,
             &mandate.success_criteria,
@@ -265,38 +440,7 @@ impl ManageMandatesTool {
             .await?;
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let warnings = vec![
-            format!(
-                "Resolved token budgets: {budget_per_cycle} tokens per decision cycle; {budget_daily} tokens per UTC day"
-            ),
-            format!(
-                "Allowed observation/action tools: {}",
-                display_allowlist(&mandate.authority.allowed_tools)
-            ),
-            format!(
-                "Allowed effects: {}",
-                display_allowlist(&mandate.authority.allowed_mutation_effects)
-            ),
-            format!(
-                "Allowed targets: {}",
-                display_target_scope(&mandate.authority.allowed_target_prefixes)
-            ),
-            format!(
-                "Mutation limit: {} per decision cycle",
-                mandate.authority.max_mutating_actions_per_cycle
-            ),
-            format!(
-                "Rolling mutation limit: {} per 24 hours; minimum spacing: {} seconds",
-                mandate.authority.max_mutating_actions_per_rolling_24h,
-                mandate.authority.min_seconds_between_mutations
-            ),
-            format!(
-                "Review interval: {}–{} minutes (default {})",
-                mandate.min_review_secs / 60,
-                mandate.max_review_secs / 60,
-                mandate.default_review_secs / 60
-            ),
-        ];
+        let warnings = Self::confirmation_warnings(&mandate, budget_per_cycle, budget_daily);
         let request = ApprovalRequest {
             command: format!("Delegate mandate: {objective}"),
             session_id: session_id.to_string(),
@@ -394,10 +538,24 @@ impl ManageMandatesTool {
         let mandate = self.resolve_owned_mandate(id, owner).await?;
         let decisions = self.state.list_mandate_decisions(&mandate.id, 5).await?;
         let recent = self.state.list_intentions(&mandate.id, 5).await?;
+        let learning = self
+            .state
+            .list_mandate_learning_notes(&mandate.id, 10)
+            .await?;
+        let mut mutation_receipts = Vec::new();
+        for decision in &decisions {
+            mutation_receipts.extend(
+                self.state
+                    .list_mandate_mutation_attempts_for_run(&decision.goal_run_id)
+                    .await?,
+            );
+        }
         Ok(serde_json::to_string_pretty(&json!({
             "mandate": mandate,
             "recent_decisions": decisions,
             "recent_intentions": recent,
+            "recent_learning_notes": learning,
+            "recent_mutation_receipts": mutation_receipts,
         }))?)
     }
 
@@ -415,51 +573,123 @@ impl ManageMandatesTool {
             !mandate.status.is_terminal(),
             "terminal mandates cannot be changed"
         );
-        if action != "resume" {
+        if !matches!(
+            action,
+            "resume" | "answer_question" | "resolve_reconciliation"
+        ) {
             anyhow::ensure!(
                 args.guidance.is_none(),
-                "guidance is valid only with resume"
+                "guidance is valid only with resume, answer_question, or resolve_reconciliation"
             );
         }
-        let resume_controller_context = if action == "resume" {
+        if matches!(
+            action,
+            "resume" | "answer_question" | "resolve_reconciliation"
+        ) {
             anyhow::ensure!(
                 mandate.confirmed_at.is_some(),
                 "an unconfirmed mandate cannot be resumed; cancel it and create a fresh confirmed mandate"
             );
-            let controller = self
-                .state
-                .get_goal(&mandate.goal_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
-            let guidance = args
-                .guidance
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if mandate.status == MandateStatus::AwaitingInput {
-                anyhow::ensure!(
-                    guidance.is_some(),
-                    "guidance is required when resuming a mandate that asked the owner"
-                );
-            }
-            if let Some(guidance) = guidance {
-                validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
-                Some(append_owner_guidance(
-                    controller.context.as_deref(),
-                    guidance,
-                )?)
-            } else {
-                None
-            }
+        }
+        let controller = if matches!(
+            action,
+            "resume" | "answer_question" | "resolve_reconciliation"
+        ) {
+            Some(
+                self.state
+                    .get_goal(&mandate.goal_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?,
+            )
         } else {
             None
         };
+        let guidance = args
+            .guidance
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(guidance) = guidance {
+            validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
+        }
+        let resumed_context = guidance
+            .map(|guidance| {
+                append_owner_guidance(
+                    controller.as_ref().and_then(|goal| goal.context.as_deref()),
+                    guidance,
+                )
+            })
+            .transpose()?;
+
+        if action == "answer_question" || action == "resolve_reconciliation" {
+            anyhow::ensure!(
+                mandate.status == MandateStatus::AwaitingInput,
+                "{action} requires an awaiting-input mandate"
+            );
+            let suspension = mandate
+                .suspension
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("awaiting-input mandate has no typed suspension"))?;
+            let expected_kind = suspension.kind;
+            let resolution = if action == "answer_question" {
+                anyhow::ensure!(
+                    expected_kind == MandateSuspensionKind::AwaitingAnswer,
+                    "this mandate is awaiting safety reconciliation, not a question answer"
+                );
+                anyhow::ensure!(
+                    guidance.is_some(),
+                    "guidance is required for answer_question"
+                );
+                None
+            } else {
+                anyhow::ensure!(
+                    expected_kind != MandateSuspensionKind::AwaitingAnswer,
+                    "this mandate is awaiting an answer; use answer_question"
+                );
+                let raw = required_trimmed(
+                    args.reconciliation_resolution.as_deref(),
+                    "reconciliation_resolution",
+                )?;
+                Some(MandateReconciliationResolution::parse(raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "reconciliation_resolution must be confirmed_effect_occurred, confirmed_no_effect, or abandon_attempt"
+                    )
+                })?)
+            };
+            let guidance =
+                guidance.ok_or_else(|| anyhow::anyhow!("guidance is required for {action}"))?;
+            anyhow::ensure!(
+                self.state
+                    .resolve_mandate_suspension(
+                        &mandate.id,
+                        mandate.version,
+                        expected_kind,
+                        resumed_context.as_deref(),
+                        resolution,
+                        guidance,
+                        owner,
+                    )
+                    .await?,
+                "mandate suspension changed before it could be resolved"
+            );
+            return Ok(format!(
+                "Mandate {} is active after typed {}.",
+                mandate.id, action
+            ));
+        }
+
         let (from, to) = match action {
             "pause" => (MandateStatus::Active, MandateStatus::Paused),
-            "resume" if mandate.status == MandateStatus::AwaitingInput => {
-                (MandateStatus::AwaitingInput, MandateStatus::Active)
+            "resume" => {
+                anyhow::ensure!(
+                    mandate.status == MandateStatus::Paused
+                        && mandate.suspension.as_ref().is_some_and(|value| {
+                            value.kind == MandateSuspensionKind::OwnerPaused
+                        }),
+                    "resume is only for owner-paused mandates; use answer_question or resolve_reconciliation for awaiting-input states"
+                );
+                (MandateStatus::Paused, MandateStatus::Active)
             }
-            "resume" => (MandateStatus::Paused, MandateStatus::Active),
             "cancel" => (mandate.status, MandateStatus::Cancelled),
             _ => unreachable!(),
         };
@@ -469,7 +699,7 @@ impl ManageMandatesTool {
                     &mandate.id,
                     from,
                     mandate.version,
-                    resume_controller_context.as_deref(),
+                    resumed_context.as_deref(),
                 )
                 .await?
         } else {
@@ -482,7 +712,12 @@ impl ManageMandatesTool {
             "mandate is {}, so it cannot be changed with {action}",
             mandate.status
         );
-        Ok(format!("Mandate {} is now {to}.", mandate.id))
+        let current = self
+            .state
+            .get_mandate(&mandate.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mandate disappeared after transition"))?;
+        Ok(format!("Mandate {} is now {}.", mandate.id, current.status))
     }
 
     async fn update(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
@@ -510,7 +745,9 @@ impl ManageMandatesTool {
             || args.min_review_minutes.is_some()
             || args.max_review_minutes.is_some()
             || args.default_review_minutes.is_some()
-            || args.expires_at.is_some();
+            || args.expires_at.is_some()
+            || args.strategy_skill.is_some()
+            || args.clear_strategy.unwrap_or(false);
         anyhow::ensure!(has_change, "update requires at least one changed field");
         anyhow::ensure!(
             !mandate.status.is_terminal(),
@@ -565,6 +802,15 @@ impl ManageMandatesTool {
         if let Some(values) = args.stop_conditions.as_deref() {
             mandate.stop_conditions = clean_strings(Some(values));
         }
+        anyhow::ensure!(
+            !(args.strategy_skill.is_some() && args.clear_strategy.unwrap_or(false)),
+            "strategy_skill and clear_strategy are mutually exclusive"
+        );
+        if args.clear_strategy.unwrap_or(false) {
+            mandate.strategy = None;
+        } else if args.strategy_skill.is_some() {
+            mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        }
         validate_policy_text(
             &mandate.constraints,
             &mandate.success_criteria,
@@ -601,35 +847,23 @@ impl ManageMandatesTool {
         }
         mandate.authority.validate().map_err(anyhow::Error::msg)?;
 
+        let controller = self
+            .state
+            .get_goal(&mandate.goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
+        let warnings = Self::confirmation_warnings(
+            &mandate,
+            controller.budget_per_check.unwrap_or_default(),
+            controller.budget_daily.unwrap_or_default(),
+        );
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
                 command: format!("Update delegated mandate: {}", mandate.objective),
                 session_id: owner.to_string(),
                 risk_level: RiskLevel::High,
-                warnings: vec![
-                    format!(
-                        "New observation/action tools: {}",
-                        display_allowlist(&mandate.authority.allowed_tools)
-                    ),
-                    format!(
-                        "New effects: {}",
-                        display_allowlist(&mandate.authority.allowed_mutation_effects)
-                    ),
-                    format!(
-                        "New targets: {}",
-                        display_target_scope(&mandate.authority.allowed_target_prefixes)
-                    ),
-                    format!(
-                        "New mutation limit: {} per cycle",
-                        mandate.authority.max_mutating_actions_per_cycle
-                    ),
-                    format!(
-                        "New rolling mutation limit: {} per 24 hours; minimum spacing: {} seconds",
-                        mandate.authority.max_mutating_actions_per_rolling_24h,
-                        mandate.authority.min_seconds_between_mutations
-                    ),
-                ],
+                warnings,
                 permission_mode: PermissionMode::Cautious,
                 response_tx,
                 kind: ApprovalKind::GoalConfirmation,
@@ -744,6 +978,14 @@ impl ManageMandatesTool {
         if !observations.is_empty() {
             decision.belief_snapshot = Some(serde_json::to_string(&observations)?);
         }
+        decision.evidence_receipt_ids = clean_strings(args.evidence_receipt_ids.as_deref());
+        validate_bounded_strings(
+            &decision.evidence_receipt_ids,
+            "evidence_receipt_ids",
+            MAX_EVIDENCE_RECEIPTS,
+            256,
+            4 * 1024,
+        )?;
         decision.question = args
             .question
             .as_deref()
@@ -757,6 +999,35 @@ impl ManageMandatesTool {
             anyhow::ensure!(
                 decision.question.is_some(),
                 "question is required when outcome is ask"
+            );
+        }
+        decision.termination_kind = args
+            .termination_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                MandateTerminationKind::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "termination_kind must be success_criteria_satisfied, stop_condition_met, or safety_termination"
+                    )
+                })
+            })
+            .transpose()?;
+        decision.termination_match = bounded_optional_text(
+            args.termination_match.as_deref(),
+            "termination_match",
+            MAX_POLICY_ENTRY_TEXT,
+        )?;
+        if outcome == MandateDecisionOutcome::Stop {
+            anyhow::ensure!(
+                decision.termination_kind.is_some(),
+                "STOP requires termination_kind"
+            );
+        } else {
+            anyhow::ensure!(
+                decision.termination_kind.is_none() && decision.termination_match.is_none(),
+                "termination fields are valid only with STOP"
             );
         }
         let review_secs = mandate.clamp_review_secs(
@@ -814,6 +1085,37 @@ impl ManageMandatesTool {
         self.state
             .record_mandate_decision(&decision, intention.as_ref(), Some(pinned_attempt_id))
             .await?;
+        if let Some(summary) = bounded_optional_text(
+            args.learning_note.as_deref(),
+            "learning_note",
+            MAX_LEARNING_NOTE_TEXT,
+        )? {
+            let evidence = clean_strings(args.learning_evidence_receipt_ids.as_deref());
+            validate_bounded_strings(
+                &evidence,
+                "learning_evidence_receipt_ids",
+                MAX_EVIDENCE_RECEIPTS,
+                256,
+                4 * 1024,
+            )?;
+            anyhow::ensure!(
+                !evidence.is_empty(),
+                "learning_note requires learning_evidence_receipt_ids"
+            );
+            let note = MandateLearningNote::new(
+                &mandate.id,
+                mandate.version,
+                &decision.id,
+                &summary,
+                evidence,
+            );
+            self.state.record_mandate_learning_note(&note).await?;
+        } else {
+            anyhow::ensure!(
+                args.learning_evidence_receipt_ids.is_none(),
+                "learning_evidence_receipt_ids require learning_note"
+            );
+        }
         Ok(match outcome {
             MandateDecisionOutcome::Act => {
                 format!(
@@ -873,6 +1175,8 @@ struct ManageMandatesArgs {
     constraints: Option<Vec<String>>,
     success_criteria: Option<Vec<String>>,
     stop_conditions: Option<Vec<String>>,
+    strategy_skill: Option<String>,
+    clear_strategy: Option<bool>,
     min_review_minutes: Option<i64>,
     max_review_minutes: Option<i64>,
     default_review_minutes: Option<i64>,
@@ -885,13 +1189,19 @@ struct ManageMandatesArgs {
     outcome: Option<String>,
     rationale: Option<String>,
     observations: Option<Vec<String>>,
+    evidence_receipt_ids: Option<Vec<String>>,
     question: Option<String>,
+    termination_kind: Option<String>,
+    termination_match: Option<String>,
     reconsider_minutes: Option<i64>,
     intention: Option<String>,
     expected_benefit: Option<String>,
     risk: Option<String>,
     invalidation_criteria: Option<String>,
+    learning_note: Option<String>,
+    learning_evidence_receipt_ids: Option<Vec<String>>,
     guidance: Option<String>,
+    reconciliation_resolution: Option<String>,
     #[serde(default)]
     _session_id: Option<String>,
     #[serde(default)]
@@ -913,7 +1223,7 @@ impl Tool for ManageMandatesTool {
     }
 
     fn description(&self) -> &str {
-        "Create/administer owner-confirmed bounded mandates or record internal ACT/WAIT/ASK/STOP. v1 delegates exact http_request/web_fetch only: no wildcards, MCP, local/private-state, or configuration tools. Every observation or mutation needs a typed target; authenticated HTTP needs exact URL, auth_profile:<name>, and account:<stable-id> scopes. Mutations require positive cycle/rolling caps (rolling >= cycle) and at least 900s cooldown. source_goal_id, priority, and token budgets are create-only; defaults are high, 400000/cycle, and 1000000/day, with daily >= cycle. expires_at is RFC3339. ASK guidance cannot widen authority."
+        "Manage ongoing mandates. Stewardship: draft, then create for owner confirmation. strategy_skill is advisory, never authority. v1 delegates exact http_request/web_fetch scopes with quotas and >=900s cooldown. answer_question handles ASK; resolve_reconciliation handles uncertain effects. STOP/learning evidence uses receipt IDs."
     }
 
     fn schema(&self) -> Value {
@@ -923,7 +1233,7 @@ impl Tool for ManageMandatesTool {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["create", "list", "get", "update", "pause", "resume", "cancel", "record_decision", "list_intentions"] },
+                    "action": { "type": "string", "enum": ["draft", "create", "list", "get", "update", "pause", "resume", "answer_question", "resolve_reconciliation", "cancel", "record_decision", "list_intentions"] },
                     "mandate_id": { "type": "string", "maxLength": 256 },
                     "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT },
                     "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
@@ -937,6 +1247,8 @@ impl Tool for ManageMandatesTool {
                     "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
                     "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
                     "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "strategy_skill": { "type": "string", "maxLength": 256 },
+                    "clear_strategy": { "type": "boolean" },
                     "min_review_minutes": { "type": "integer", "minimum": 1 },
                     "max_review_minutes": { "type": "integer", "minimum": 1 },
                     "default_review_minutes": { "type": "integer", "minimum": 1 },
@@ -949,13 +1261,19 @@ impl Tool for ManageMandatesTool {
                     "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] },
                     "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
                     "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } },
+                    "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } },
                     "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
+                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"] },
+                    "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT },
                     "reconsider_minutes": { "type": "integer", "minimum": 1 },
                     "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT },
                     "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
                     "risk": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
                     "invalidation_criteria": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
-                    "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT }
+                    "learning_note": { "type": "string", "maxLength": MAX_LEARNING_NOTE_TEXT },
+                    "learning_evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } },
+                    "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT },
+                    "reconciliation_resolution": { "type": "string", "enum": ["confirmed_effect_occurred", "confirmed_no_effect", "abandon_attempt"] }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -966,11 +1284,14 @@ impl Tool for ManageMandatesTool {
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ManageMandatesArgs = serde_json::from_str(arguments)?;
         match args.action.as_str() {
+            "draft" => self.draft(&args).await,
             "create" => self.create(&args).await,
             "list" => self.list(&args).await,
             "get" => self.get(&args).await,
             "update" => self.update(&args).await,
-            "pause" | "resume" | "cancel" => self.transition(&args, &args.action).await,
+            "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
+                self.transition(&args, &args.action).await
+            }
             "record_decision" => self.record_decision(&args).await,
             "list_intentions" => self.list_intentions(&args).await,
             other => anyhow::bail!("unknown manage_mandates action `{other}`"),
@@ -991,7 +1312,7 @@ impl Tool for ManageMandatesTool {
                     .map(str::to_string)
             });
         match action.as_deref() {
-            Some("list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
+            Some("draft" | "list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
             Some("record_decision") => ToolCallSemantics::administrative(),
             _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
         }
@@ -1190,6 +1511,19 @@ fn display_target_scope(values: &[String]) -> String {
     }
 }
 
+fn display_policy(values: &[String]) -> String {
+    if values.is_empty() {
+        "none specified".to_string()
+    } else {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| format!("{}. {}", index + 1, value))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1646,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_strategy_is_content_addressed_and_confirmation_is_complete() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        let original_skill = crate::skills::Skill {
+            name: "x-stewardship".to_string(),
+            description: "Thoughtful account strategy".to_string(),
+            triggers: vec![],
+            body: "Prefer useful replies and verify outcomes.".to_string(),
+            origin: Some("custom".to_string()),
+            source: Some("filesystem".to_string()),
+            source_url: None,
+            dir_path: None,
+            resources: vec![],
+        };
+        crate::skills::write_skill_to_file(skills_dir.path(), &original_skill).unwrap();
+
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx))
+            .with_skills_dir(Some(skills_dir.path().to_path_buf()));
+        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let call = tokio::spawn(async move {
+            tool.call(&format!(
+                r#"{{
+                    "action":"create",
+                    "objective":"Steward @aidaemon_ai thoughtfully",
+                    "allow_observations":false,
+                    "constraints":["No fabrication"],
+                    "success_criteria":["Owner ends stewardship"],
+                    "stop_conditions":["Credentials are revoked"],
+                    "strategy_skill":"x-stewardship",
+                    "expires_at":"{expires_at}",
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }}"#,
+            ))
+            .await
+        });
+
+        let request = approval_rx.recv().await.expect("complete confirmation");
+        for expected in [
+            "Objective:",
+            "Constraints:",
+            "Success criteria:",
+            "Stop conditions:",
+            "Pinned strategy:",
+            "Observations allowed: false",
+            "Allowed mutation effects:",
+            "Allowed targets:",
+            "Mutation limits:",
+            "Review interval:",
+            "Expiration:",
+            "Resolved token budgets:",
+        ] {
+            assert!(
+                request
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(expected)),
+                "missing confirmation field {expected}"
+            );
+        }
+
+        let changed_skill = crate::skills::Skill {
+            body: "A later filesystem edit must not alter the pending snapshot.".to_string(),
+            ..original_skill
+        };
+        crate::skills::write_skill_to_file(skills_dir.path(), &changed_skill).unwrap();
+        request
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .unwrap();
+        call.await.unwrap().unwrap();
+
+        let mandate = state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let strategy = mandate.strategy.expect("pinned strategy");
+        assert_eq!(strategy.skill_name, "x-stewardship");
+        assert!(strategy.body.contains("Prefer useful replies"));
+        assert!(!strategy.body.contains("later filesystem edit"));
+        assert_eq!(strategy.content_sha256.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn draft_reports_missing_authority_without_writing() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Manage the account as an ongoing presence",
+                    "max_mutating_actions_per_cycle":1,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["execution_mode"], "ongoing_mandate");
+        assert_eq!(value["writes_performed"], false);
+        assert_eq!(value["ready_to_confirm"], false);
+        assert!(value["required_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "allowed_target_prefixes"));
+        assert!(state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn update_rejects_and_documents_create_only_fields() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
@@ -1327,7 +1785,7 @@ mod tests {
             let description = schema["parameters"]["properties"][field]["description"]
                 .as_str()
                 .expect("create-only field description");
-            assert!(description.contains("Create only in v1"), "{field}");
+            assert!(description.contains("Create only"), "{field}");
             let description = description.to_ascii_lowercase();
             assert!(description.contains("update"), "{field}");
             assert!(description.contains("reject"), "{field}");
@@ -1555,7 +2013,7 @@ mod tests {
         let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
         let missing = tool
             .call(&format!(
-                r#"{{"action":"resume","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                r#"{{"action":"answer_question","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
                 mandate.id
             ))
             .await;
@@ -1566,12 +2024,12 @@ mod tests {
 
         let resumed = tool
             .call(&format!(
-                r#"{{"action":"resume","mandate_id":"{}","guidance":"Prefer thoughtful replies over original posts.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                r#"{{"action":"answer_question","mandate_id":"{}","guidance":"Prefer thoughtful replies over original posts.","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
                 mandate.id
             ))
             .await
             .unwrap();
-        assert!(resumed.contains("now active"));
+        assert!(resumed.contains("is active"));
         let resumed_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(resumed_mandate.status, MandateStatus::Active);
         let resumed_review_at =

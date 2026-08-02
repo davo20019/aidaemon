@@ -2174,6 +2174,7 @@ impl TelegramChannel {
                         RiskLevel::High,
                         &login_warnings,
                         PermissionMode::Cautious,
+                        false,
                     )
                     .await
                 {
@@ -2326,6 +2327,7 @@ impl TelegramChannel {
                             RiskLevel::High,
                             &install_warnings,
                             PermissionMode::Cautious,
+                            false,
                         )
                         .await
                     {
@@ -2395,6 +2397,7 @@ impl TelegramChannel {
                             RiskLevel::High,
                             &login_warnings,
                             PermissionMode::Cautious,
+                            false,
                         )
                         .await
                     {
@@ -2477,6 +2480,7 @@ impl TelegramChannel {
                                 RiskLevel::High,
                                 &warnings,
                                 PermissionMode::Cautious,
+                                false,
                             )
                             .await
                         {
@@ -2587,6 +2591,7 @@ impl TelegramChannel {
                             RiskLevel::High,
                             &login_warnings,
                             PermissionMode::Cautious,
+                            false,
                         )
                         .await
                     {
@@ -2683,6 +2688,7 @@ impl TelegramChannel {
                         RiskLevel::High,
                         &warnings,
                         PermissionMode::Cautious,
+                        false,
                     )
                     .await
                 {
@@ -5178,6 +5184,7 @@ impl Channel for TelegramChannel {
         risk_level: RiskLevel,
         warnings: &[String],
         permission_mode: PermissionMode,
+        one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
         let chat_id: i64 = crate::session::telegram_chat_id_from_session(session_id)
             .unwrap_or_else(|| {
@@ -5210,13 +5217,18 @@ impl Channel for TelegramChannel {
         let use_session_button =
             approval_render::approval_use_session_button(permission_mode, risk_level);
 
-        let keyboard = approval_render::build_approval_keyboard(&approval_id, use_session_button);
+        let keyboard = approval_render::build_approval_keyboard(
+            &approval_id,
+            use_session_button,
+            one_time_only,
+        );
 
         let text = approval_render::build_approval_message_text(
             command,
             risk_level,
             warnings,
             use_session_button,
+            one_time_only,
         );
 
         match self

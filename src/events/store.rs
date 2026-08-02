@@ -54,6 +54,86 @@ pub struct ToolStats {
     pub common_errors: Vec<(String, u64)>,
 }
 
+struct AtomicMandateReceiptProjection {
+    mandate_id: String,
+    mandate_version: i64,
+    decision_cycle_id: String,
+    reserved_action_attempt: i64,
+    action_digest: String,
+    tool_call_id: String,
+    status: &'static str,
+    outcome_evidence: Option<&'static str>,
+    http_status: Option<i64>,
+    exit_code: Option<i32>,
+    completed_at: String,
+}
+
+fn mandate_projection_from_tool_result(
+    result: &ToolResultData,
+    completed_at: &str,
+) -> anyhow::Result<Option<AtomicMandateReceiptProjection>> {
+    let Some(receipt) = result.receipt.as_ref() else {
+        return Ok(None);
+    };
+    let Some(grant) = receipt.mandate_authority.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        grant.counts_toward_cycle_budget
+            && grant.reserved_action_attempt > 0
+            && grant.tool_call_id.as_deref() == Some(result.tool_call_id.as_str()),
+        "mandate receipt carries an invalid action-bound grant"
+    );
+    let evidence = match receipt.outcome_evidence {
+        crate::events::ToolOutcomeEvidenceSource::ToolReported => Some("tool_reported"),
+        crate::events::ToolOutcomeEvidenceSource::StructuredMetadata => Some("structured_metadata"),
+        crate::events::ToolOutcomeEvidenceSource::DurableReplay
+        | crate::events::ToolOutcomeEvidenceSource::LegacyText => None,
+    };
+    let clean_transport = receipt.transport_error.is_none()
+        && !receipt.timed_out
+        && !receipt.background_started
+        && !receipt.detached
+        && !receipt.completion_notifications_enabled;
+    let exit_success = receipt.exit_code.is_none_or(|code| code == 0);
+    let http_success = result.name != "http_request"
+        || receipt
+            .http_status
+            .is_some_and(|status| (200..300).contains(&status) && status != 202);
+    let strict_success = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+        && receipt.outcome_status == crate::traits::ToolOutcomeStatus::Succeeded
+        && evidence.is_some()
+        && clean_transport
+        && exit_success
+        && http_success
+        && receipt.semantics.mutates_state();
+    let explicit_failure = receipt.schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
+        && receipt.outcome_status.is_failure()
+        && evidence.is_some()
+        && clean_transport
+        && receipt.semantics.mutates_state();
+    let status = if strict_success {
+        "succeeded"
+    } else if explicit_failure {
+        "failed"
+    } else {
+        "ambiguous"
+    };
+    Ok(Some(AtomicMandateReceiptProjection {
+        mandate_id: grant.mandate_id.clone(),
+        mandate_version: grant.mandate_version,
+        decision_cycle_id: grant.decision_cycle_id.clone(),
+        reserved_action_attempt: grant.reserved_action_attempt,
+        action_digest: grant.action_digest.clone(),
+        tool_call_id: result.tool_call_id.clone(),
+        status,
+        outcome_evidence: evidence,
+        http_status: receipt.http_status.map(i64::from),
+        exit_code: receipt.exit_code,
+        completed_at: completed_at.to_string(),
+    }))
+}
+
 /// Aggregated latency + token telemetry over recent `LlmCall` events.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LlmStats {
@@ -301,6 +381,17 @@ impl EventStore {
         let event_type_str = event.event_type.as_str();
         let created_at_str = event.created_at.to_rfc3339();
 
+        let mandate_projection = if event.event_type == EventType::ToolResult {
+            match serde_json::from_value::<ToolResultData>(event.data.clone()) {
+                Ok(result) => mandate_projection_from_tool_result(&result, &created_at_str)?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let mut tx = self.pool.begin().await?;
+
         let result = sqlx::query(
             r#"
             INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name, turn_id)
@@ -314,10 +405,39 @@ impl EventStore {
         .bind(&event.task_id)
         .bind(&event.tool_name)
         .bind(&event.turn_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         let event_id = result.last_insert_rowid();
+        if let Some(projection) = mandate_projection {
+            let updated = sqlx::query(
+                "UPDATE mandate_mutation_attempts
+                 SET status = ?, outcome_evidence = ?, http_status = ?, exit_code = ?,
+                     completed_at = ?
+                 WHERE mandate_id = ? AND mandate_version = ?
+                   AND decision_cycle_id = ? AND reserved_action_attempt = ?
+                   AND action_digest = ? AND tool_call_id = ?
+                   AND status = 'reserved' AND dispatch_claimed_at IS NOT NULL",
+            )
+            .bind(projection.status)
+            .bind(projection.outcome_evidence)
+            .bind(projection.http_status)
+            .bind(projection.exit_code)
+            .bind(&projection.completed_at)
+            .bind(&projection.mandate_id)
+            .bind(projection.mandate_version)
+            .bind(&projection.decision_cycle_id)
+            .bind(projection.reserved_action_attempt)
+            .bind(&projection.action_digest)
+            .bind(&projection.tool_call_id)
+            .execute(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "mandate mutation receipt did not match its claimed reservation"
+            );
+        }
+        tx.commit().await?;
         if event_type_str == "user_message" {
             if let Err(error) =
                 crate::state::sqlite::memory::project_event_span(&self.pool, event_id).await

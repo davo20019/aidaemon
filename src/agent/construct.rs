@@ -257,6 +257,12 @@ impl Agent {
     }
 
     #[cfg(test)]
+    pub(crate) fn push_test_tool(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_test_mandate_execution(
         &mut self,
         mandate_id: &str,

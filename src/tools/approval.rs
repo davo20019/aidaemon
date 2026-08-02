@@ -173,6 +173,7 @@ impl ApprovalBroker {
 fn interaction_kind(kind: &ApprovalKind) -> &'static str {
     match kind {
         ApprovalKind::Command => "command_approval",
+        ApprovalKind::CommandOnce => "command_approval_once",
         ApprovalKind::GoalConfirmation => "goal_confirmation",
     }
 }

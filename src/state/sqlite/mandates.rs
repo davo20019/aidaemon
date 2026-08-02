@@ -2,26 +2,33 @@ use super::*;
 use crate::traits::{
     GoalRun, Intention, IntentionStatus, Mandate, MandateAuthority, MandateDecisionCycle,
     MandateDecisionOutcome, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
-    MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
-    MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateReconciliationReason,
-    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
-    MandateStatus, MandateStore, Task,
+    MandateLearningNote, MandateMutationAttempt, MandateMutationAttemptStatus,
+    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationOutcomeProjection,
+    MandateMutationQuotaBlockReason, MandateMutationQuotaState, MandateMutationReservation,
+    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
+    MandateRunFinalizationResult, MandateRunProofCounts, MandateStatus, MandateStore,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, Task,
 };
 
 const MANDATE_COLUMNS: &str =
-    "id, goal_id, source_goal_id, objective, status, authority_json, constraints_json, \
+    "id, goal_id, source_goal_id, objective, status, authority_json, strategy_json, \
+     suspension_json, constraints_json, \
      success_criteria_json, stop_conditions_json, min_review_secs, max_review_secs, \
      default_review_secs, next_review_at, review_lease_token, review_lease_expires_at, \
      expires_at, confirmed_at, version, created_by_session, created_at, updated_at";
 
 const DECISION_COLUMNS: &str =
-    "id, mandate_id, goal_run_id, mandate_version, outcome, rationale, belief_snapshot, question, \
-     reconsider_at, action_attempts, created_at, updated_at";
+    "id, mandate_id, goal_run_id, mandate_version, outcome, rationale, belief_snapshot, \
+     evidence_receipt_ids_json, question, termination_kind, termination_match, reconsider_at, \
+     action_attempts, created_at, updated_at";
 
 const INTENTION_COLUMNS: &str =
     "id, mandate_id, decision_cycle_id, goal_run_id, description, rationale, \
      expected_benefit, risk, invalidation_criteria, status, created_at, updated_at, completed_at";
+
+const LEARNING_NOTE_COLUMNS: &str =
+    "id, mandate_id, mandate_version, learned_in_decision_cycle_id, summary, \
+     evidence_receipt_ids_json, created_at";
 
 const MUTATION_ATTEMPT_COLUMNS: &str =
     "id, mandate_id, mandate_version, decision_cycle_id, goal_run_id, intention_id, \
@@ -51,6 +58,14 @@ fn mandate_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Mandate> {
         authority: serde_json::from_str::<MandateAuthority>(
             &row.get::<String, _>("authority_json"),
         )?,
+        strategy: row
+            .get::<Option<String>, _>("strategy_json")
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        suspension: row
+            .get::<Option<String>, _>("suspension_json")
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
         constraints: serde_json::from_str(&row.get::<String, _>("constraints_json"))?,
         success_criteria: serde_json::from_str(&row.get::<String, _>("success_criteria_json"))?,
         stop_conditions: serde_json::from_str(&row.get::<String, _>("stop_conditions_json"))?,
@@ -81,7 +96,18 @@ fn decision_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateDec
         outcome,
         rationale: row.get("rationale"),
         belief_snapshot: row.get("belief_snapshot"),
+        evidence_receipt_ids: serde_json::from_str(
+            &row.get::<String, _>("evidence_receipt_ids_json"),
+        )?,
         question: row.get("question"),
+        termination_kind: row
+            .get::<Option<String>, _>("termination_kind")
+            .map(|value| {
+                MandateTerminationKind::parse(&value)
+                    .ok_or_else(|| anyhow::anyhow!("invalid mandate termination kind `{value}`"))
+            })
+            .transpose()?,
+        termination_match: row.get("termination_match"),
         reconsider_at: row.get("reconsider_at"),
         action_attempts: row.get("action_attempts"),
         created_at: row.get("created_at"),
@@ -107,6 +133,20 @@ fn intention_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Intention
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),
+    })
+}
+
+fn learning_note_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateLearningNote> {
+    Ok(MandateLearningNote {
+        id: row.get("id"),
+        mandate_id: row.get("mandate_id"),
+        mandate_version: row.get("mandate_version"),
+        learned_in_decision_cycle_id: row.get("learned_in_decision_cycle_id"),
+        summary: row.get("summary"),
+        evidence_receipt_ids: serde_json::from_str(
+            &row.get::<String, _>("evidence_receipt_ids_json"),
+        )?,
+        created_at: row.get("created_at"),
     })
 }
 
@@ -192,6 +232,20 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
         mandate.status != MandateStatus::Active || mandate.confirmed_at.is_some(),
         "an active mandate requires durable owner confirmation"
     );
+    anyhow::ensure!(
+        match mandate.status {
+            MandateStatus::Active | MandateStatus::Completed | MandateStatus::Cancelled => {
+                mandate.suspension.is_none()
+            }
+            MandateStatus::Paused if mandate.confirmed_at.is_none() => mandate.suspension.is_none(),
+            MandateStatus::Paused => mandate
+                .suspension
+                .as_ref()
+                .is_some_and(|value| value.kind == MandateSuspensionKind::OwnerPaused),
+            MandateStatus::AwaitingInput => mandate.suspension.is_some(),
+        },
+        "mandate lifecycle status and typed suspension disagree"
+    );
     match (
         mandate.review_lease_token.as_deref(),
         mandate.review_lease_expires_at.as_deref(),
@@ -260,6 +314,42 @@ fn clamped_next_review_at(
             requested_secs.clamp(mandate.min_review_secs, mandate.max_review_secs),
         ))
     .to_rfc3339())
+}
+
+async fn validate_current_run_receipt_refs(
+    connection: &mut sqlx::SqliteConnection,
+    goal_run_id: &str,
+    refs: &[String],
+) -> anyhow::Result<()> {
+    let mut unique = std::collections::HashSet::new();
+    for receipt_id in refs {
+        anyhow::ensure!(
+            unique.insert(receipt_id),
+            "duplicate mandate evidence receipt ID"
+        );
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT 1
+             FROM events e
+             JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+             WHERE e.event_type = 'tool_result'
+               AND t.goal_run_id = ?
+               AND json_extract(e.data, '$.tool_call_id') = ?
+               AND json_extract(e.data, '$.receipt.schema_version') = 1
+               AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
+               AND json_extract(e.data, '$.receipt.outcome_evidence')
+                   IN ('tool_reported', 'structured_metadata')
+             LIMIT 1",
+        )
+        .bind(goal_run_id)
+        .bind(receipt_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        anyhow::ensure!(
+            found.is_some(),
+            "mandate evidence receipt `{receipt_id}` is not a current-run structured success"
+        );
+    }
+    Ok(())
 }
 
 fn validate_canonical_identifier(label: &str, value: &str, max_chars: usize) -> anyhow::Result<()> {
@@ -478,12 +568,13 @@ async fn insert_mandate_row(
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO mandates (
-            id, goal_id, source_goal_id, objective, status, authority_json,
+            id, goal_id, source_goal_id, objective, status, authority_json, strategy_json,
+            suspension_json,
             constraints_json, success_criteria_json, stop_conditions_json,
             min_review_secs, max_review_secs, default_review_secs, next_review_at,
             review_lease_token, review_lease_expires_at, expires_at, confirmed_at,
             version, created_by_session, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&mandate.id)
     .bind(&mandate.goal_id)
@@ -491,6 +582,20 @@ async fn insert_mandate_row(
     .bind(&mandate.objective)
     .bind(mandate.status.as_str())
     .bind(serde_json::to_string(&mandate.authority)?)
+    .bind(
+        mandate
+            .strategy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        mandate
+            .suspension
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
     .bind(serde_json::to_string(&mandate.constraints)?)
     .bind(serde_json::to_string(&mandate.success_criteria)?)
     .bind(serde_json::to_string(&mandate.stop_conditions)?)
@@ -790,12 +895,19 @@ async fn reconcile_orphaned_mandate_runs(
         let version: i64 = row.get("version");
         let session_id: String = row.get("session_id");
         let goal_run_id: String = row.get("goal_run_id");
+        let mut suspension = MandateSuspension::new(
+            MandateSuspensionKind::ExecutionLeaseLost,
+            Some("orphaned_mandate_run".to_string()),
+        );
+        suspension.goal_run_id = Some(goal_run_id.clone());
         let transitioned = sqlx::query(
             "UPDATE mandates
              SET status = 'awaiting_input', review_lease_token = NULL,
-                 review_lease_expires_at = NULL, version = version + 1, updated_at = ?
+                 review_lease_expires_at = NULL, suspension_json = ?,
+                 version = version + 1, updated_at = ?
              WHERE id = ? AND goal_id = ? AND status = 'active' AND version = ?",
         )
+        .bind(serde_json::to_string(&suspension)?)
         .bind(now)
         .bind(&mandate_id)
         .bind(&goal_id)
@@ -997,7 +1109,7 @@ impl MandateStore for SqliteStateStore {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE mandates
-             SET objective = ?, authority_json = ?, constraints_json = ?,
+             SET objective = ?, authority_json = ?, strategy_json = ?, constraints_json = ?,
                  success_criteria_json = ?, stop_conditions_json = ?, min_review_secs = ?,
                  max_review_secs = ?, default_review_secs = ?, next_review_at = ?, expires_at = ?,
                  version = ?, review_lease_token = NULL, review_lease_expires_at = NULL,
@@ -1006,6 +1118,13 @@ impl MandateStore for SqliteStateStore {
         )
         .bind(&mandate.objective)
         .bind(serde_json::to_string(&mandate.authority)?)
+        .bind(
+            mandate
+                .strategy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .bind(serde_json::to_string(&mandate.constraints)?)
         .bind(serde_json::to_string(&mandate.success_criteria)?)
         .bind(serde_json::to_string(&mandate.stop_conditions)?)
@@ -1036,12 +1155,17 @@ impl MandateStore for SqliteStateStore {
             // safe. Land the new policy, but pause its controller until the
             // owner reconciles the prior target; otherwise the updated active
             // mandate could immediately begin a duplicate cycle.
+            let suspension = MandateSuspension::new(
+                MandateSuspensionKind::AuthorityRevokedWithUnresolvedMutation,
+                Some("policy_update_invalidated_dispatched_mutation".to_string()),
+            );
             let paused = sqlx::query(
                 "UPDATE mandates
                  SET status = 'awaiting_input', review_lease_token = NULL,
-                     review_lease_expires_at = NULL, updated_at = ?
+                     review_lease_expires_at = NULL, suspension_json = ?, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'active'",
             )
+            .bind(serde_json::to_string(&suspension)?)
             .bind(&now)
             .bind(&mandate.id)
             .bind(mandate.version)
@@ -1070,7 +1194,7 @@ impl MandateStore for SqliteStateStore {
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', confirmed_at = ?, next_review_at = ?,
-                 review_lease_token = NULL, review_lease_expires_at = NULL,
+                 review_lease_token = NULL, review_lease_expires_at = NULL, suspension_json = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND status = 'paused' AND confirmed_at IS NULL
                AND EXISTS (
@@ -1115,12 +1239,24 @@ impl MandateStore for SqliteStateStore {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
+        let suspension = match to_status {
+            MandateStatus::Paused => Some(MandateSuspension::new(
+                MandateSuspensionKind::OwnerPaused,
+                None,
+            )),
+            MandateStatus::AwaitingInput => Some(MandateSuspension::new(
+                MandateSuspensionKind::ReviewFailed,
+                Some("lifecycle_transition".to_string()),
+            )),
+            MandateStatus::Active | MandateStatus::Completed | MandateStatus::Cancelled => None,
+        };
         let mut tx = self.pool.begin().await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = ?,
                  next_review_at = CASE WHEN ? = 'active' THEN ? ELSE next_review_at END,
                  review_lease_token = NULL, review_lease_expires_at = NULL,
+                 suspension_json = ?,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND status = ?
                AND (? != 'active' OR confirmed_at IS NOT NULL)
@@ -1129,6 +1265,7 @@ impl MandateStore for SqliteStateStore {
         .bind(to_status.as_str())
         .bind(to_status.as_str())
         .bind(&now)
+        .bind(suspension.as_ref().map(serde_json::to_string).transpose()?)
         .bind(&now)
         .bind(mandate_id)
         .bind(from_status.as_str())
@@ -1143,8 +1280,30 @@ impl MandateStore for SqliteStateStore {
         // A lifecycle transition is an authority-epoch change. Close every
         // open mandate run and its work in the same transaction so pausing and
         // later resuming cannot resurrect a pre-pause ACT or attempt.
-        invalidate_open_mandate_runs(&mut tx, &goal_id, &now).await?;
-        update_controller_status(&mut tx, &goal_id, to_status, &now).await?;
+        let claimed_unresolved = invalidate_open_mandate_runs(&mut tx, &goal_id, &now).await?;
+        let effective_status = if to_status == MandateStatus::Paused && claimed_unresolved > 0 {
+            let suspension = MandateSuspension::new(
+                MandateSuspensionKind::ReconciliationRequired,
+                Some("lifecycle_invalidated_after_dispatch_claim".to_string()),
+            );
+            let changed = sqlx::query(
+                "UPDATE mandates SET status = 'awaiting_input', suspension_json = ?, updated_at = ?
+                 WHERE id = ? AND status = 'paused'",
+            )
+            .bind(serde_json::to_string(&suspension)?)
+            .bind(&now)
+            .bind(mandate_id)
+            .execute(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                changed.rows_affected() == 1,
+                "claimed mutation requires typed reconciliation"
+            );
+            MandateStatus::AwaitingInput
+        } else {
+            to_status
+        };
+        update_controller_status(&mut tx, &goal_id, effective_status, &now).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1157,11 +1316,9 @@ impl MandateStore for SqliteStateStore {
         controller_context: Option<&str>,
     ) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            matches!(
-                from_status,
-                MandateStatus::Paused | MandateStatus::AwaitingInput
-            ) && from_status.can_transition_to(MandateStatus::Active),
-            "only paused or awaiting-input mandates can resume"
+            from_status == MandateStatus::Paused
+                && from_status.can_transition_to(MandateStatus::Active),
+            "ordinary resume is only valid for owner-paused mandates"
         );
         anyhow::ensure!(expected_version > 0, "mandate version must be positive");
         if let Some(context) = controller_context {
@@ -1177,9 +1334,11 @@ impl MandateStore for SqliteStateStore {
             "UPDATE mandates
              SET status = 'active', next_review_at = ?,
                  review_lease_token = NULL, review_lease_expires_at = NULL,
+                 suspension_json = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND status = ? AND version = ?
                AND confirmed_at IS NOT NULL
+               AND json_extract(suspension_json, '$.kind') = 'owner_paused'
              RETURNING goal_id",
         )
         .bind(&now)
@@ -1908,6 +2067,11 @@ impl MandateStore for SqliteStateStore {
                 "ASK requires a concrete question"
             );
         }
+        anyhow::ensure!(
+            decision.outcome == MandateDecisionOutcome::Stop
+                || (decision.termination_kind.is_none() && decision.termination_match.is_none()),
+            "termination fields are valid only for STOP"
+        );
 
         let now = chrono::Utc::now();
         let now_string = now.to_rfc3339();
@@ -1978,6 +2142,46 @@ impl MandateStore for SqliteStateStore {
             decision.mandate_version == mandate.version,
             "mandate version changed before the decision was committed"
         );
+        validate_current_run_receipt_refs(
+            &mut tx,
+            &decision.goal_run_id,
+            &decision.evidence_receipt_ids,
+        )
+        .await?;
+        if decision.outcome == MandateDecisionOutcome::Stop {
+            let termination_kind = decision
+                .termination_kind
+                .ok_or_else(|| anyhow::anyhow!("STOP requires a typed termination_kind"))?;
+            match termination_kind {
+                MandateTerminationKind::SuccessCriteriaSatisfied => {
+                    let matched = decision.termination_match.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("success termination requires termination_match")
+                    })?;
+                    anyhow::ensure!(
+                        mandate
+                            .success_criteria
+                            .iter()
+                            .any(|entry| entry == matched),
+                        "termination_match is not an owner-authored success criterion"
+                    );
+                }
+                MandateTerminationKind::StopConditionMet => {
+                    let matched = decision.termination_match.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("stop-condition termination requires termination_match")
+                    })?;
+                    anyhow::ensure!(
+                        mandate.stop_conditions.iter().any(|entry| entry == matched),
+                        "termination_match is not an owner-authored stop condition"
+                    );
+                }
+                MandateTerminationKind::SafetyTermination => {}
+            }
+            anyhow::ensure!(
+                !termination_kind.requires_receipt_evidence()
+                    || !decision.evidence_receipt_ids.is_empty(),
+                "evidence-dependent STOP requires at least one current-run receipt"
+            );
+        }
 
         let next_review_at =
             clamped_next_review_at(&mandate, decision.reconsider_at.as_deref(), now)?;
@@ -1989,8 +2193,9 @@ impl MandateStore for SqliteStateStore {
         sqlx::query(
             "INSERT INTO mandate_decision_cycles (
                 id, mandate_id, goal_run_id, mandate_version, outcome, rationale,
-                belief_snapshot, question, reconsider_at, action_attempts, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                belief_snapshot, evidence_receipt_ids_json, question, termination_kind,
+                termination_match, reconsider_at, action_attempts, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&decision.id)
         .bind(&decision.mandate_id)
@@ -1999,7 +2204,14 @@ impl MandateStore for SqliteStateStore {
         .bind(decision.outcome.as_str())
         .bind(&decision.rationale)
         .bind(&decision.belief_snapshot)
+        .bind(serde_json::to_string(&decision.evidence_receipt_ids)?)
         .bind(&decision.question)
+        .bind(
+            decision
+                .termination_kind
+                .map(MandateTerminationKind::as_str),
+        )
+        .bind(&decision.termination_match)
         .bind(persisted_reconsider_at)
         .bind(decision.action_attempts)
         .bind(&decision.created_at)
@@ -2115,6 +2327,220 @@ impl MandateStore for SqliteStateStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(intention_from_row).collect()
+    }
+
+    async fn record_mandate_learning_note(&self, note: &MandateLearningNote) -> anyhow::Result<()> {
+        note.validate().map_err(anyhow::Error::msg)?;
+        let mut tx = self.pool.begin().await?;
+        let decision_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1
+             FROM mandate_decision_cycles dc
+             JOIN mandates m ON m.id = dc.mandate_id
+             WHERE dc.id = ? AND dc.mandate_id = ? AND dc.mandate_version = ?
+               AND m.version >= dc.mandate_version
+             LIMIT 1",
+        )
+        .bind(&note.learned_in_decision_cycle_id)
+        .bind(&note.mandate_id)
+        .bind(note.mandate_version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            decision_exists.is_some(),
+            "mandate learning note does not belong to its decision epoch"
+        );
+
+        let mut unique = std::collections::HashSet::new();
+        for receipt_id in &note.evidence_receipt_ids {
+            anyhow::ensure!(
+                unique.insert(receipt_id),
+                "duplicate learning evidence receipt ID"
+            );
+            let found = sqlx::query_scalar::<_, i64>(
+                "SELECT 1
+                 FROM events e
+                 JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+                 JOIN goal_runs gr ON gr.id = t.goal_run_id
+                 JOIN mandates m ON m.goal_id = gr.goal_id
+                 WHERE m.id = ? AND gr.trigger_type = 'mandate'
+                   AND e.event_type = 'tool_result'
+                   AND json_extract(e.data, '$.tool_call_id') = ?
+                   AND json_extract(e.data, '$.receipt.schema_version') = 1
+                   AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
+                   AND json_extract(e.data, '$.receipt.outcome_evidence')
+                       IN ('tool_reported', 'structured_metadata')
+                 LIMIT 1",
+            )
+            .bind(&note.mandate_id)
+            .bind(receipt_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                found.is_some(),
+                "learning evidence receipt `{receipt_id}` is not a same-mandate structured success"
+            );
+        }
+
+        sqlx::query(
+            "INSERT INTO mandate_learning_notes (
+                id, mandate_id, mandate_version, learned_in_decision_cycle_id,
+                summary, evidence_receipt_ids_json, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&note.id)
+        .bind(&note.mandate_id)
+        .bind(note.mandate_version)
+        .bind(&note.learned_in_decision_cycle_id)
+        .bind(&note.summary)
+        .bind(serde_json::to_string(&note.evidence_receipt_ids)?)
+        .bind(&note.created_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_mandate_learning_notes(
+        &self,
+        mandate_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<MandateLearningNote>> {
+        let query = format!(
+            "SELECT {LEARNING_NOTE_COLUMNS} FROM mandate_learning_notes
+             WHERE mandate_id = ? ORDER BY julianday(created_at) DESC, id DESC LIMIT ?"
+        );
+        let rows = sqlx::query(&query)
+            .bind(mandate_id)
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(learning_note_from_row).collect()
+    }
+
+    async fn resolve_mandate_suspension(
+        &self,
+        mandate_id: &str,
+        expected_version: i64,
+        expected_kind: MandateSuspensionKind,
+        controller_context: Option<&str>,
+        reconciliation_resolution: Option<MandateReconciliationResolution>,
+        owner_guidance: &str,
+        owner_session: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !owner_guidance.trim().is_empty() && owner_guidance.trim() == owner_guidance,
+            "owner guidance is required and must be canonical"
+        );
+        anyhow::ensure!(
+            owner_guidance.chars().count() <= 1024 && owner_guidance.len() <= 1024,
+            "owner guidance exceeds its 1 KiB bound"
+        );
+        anyhow::ensure!(
+            !owner_session.trim().is_empty(),
+            "owner session is required"
+        );
+        if let Some(context) = controller_context {
+            anyhow::ensure!(
+                context.chars().count() <= 64_000,
+                "mandate controller context is too large"
+            );
+            serde_json::from_str::<serde_json::Value>(context)?;
+        }
+        match expected_kind {
+            MandateSuspensionKind::AwaitingAnswer => anyhow::ensure!(
+                reconciliation_resolution.is_none(),
+                "question answers cannot carry a reconciliation resolution"
+            ),
+            MandateSuspensionKind::ReconciliationRequired
+            | MandateSuspensionKind::ExecutionLeaseLost
+            | MandateSuspensionKind::ReviewFailed
+            | MandateSuspensionKind::AuthorityRevokedWithUnresolvedMutation => anyhow::ensure!(
+                reconciliation_resolution.is_some(),
+                "safety suspension requires a typed reconciliation resolution"
+            ),
+            MandateSuspensionKind::OwnerPaused => {
+                anyhow::bail!("owner-paused mandates must use ordinary resume")
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query(
+            "SELECT goal_id, created_by_session, suspension_json
+             FROM mandates
+             WHERE id = ? AND version = ? AND status = 'awaiting_input'
+               AND confirmed_at IS NOT NULL",
+        )
+        .bind(mandate_id)
+        .bind(expected_version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            current.get::<String, _>("created_by_session") == owner_session,
+            "mandate does not belong to this owner session"
+        );
+        let suspension: MandateSuspension = serde_json::from_str(
+            &current
+                .get::<Option<String>, _>("suspension_json")
+                .ok_or_else(|| anyhow::anyhow!("awaiting-input mandate has no typed suspension"))?,
+        )?;
+        anyhow::ensure!(
+            suspension.kind == expected_kind,
+            "mandate suspension changed before it was resolved"
+        );
+        let goal_id: String = current.get("goal_id");
+
+        if let Some(resolution) = reconciliation_resolution {
+            sqlx::query(
+                "INSERT INTO mandate_reconciliations (
+                    id, mandate_id, suspended_version, suspension_kind, resolution,
+                    owner_guidance, resolved_by_session, resolved_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(mandate_id)
+            .bind(expected_version)
+            .bind(expected_kind.as_str())
+            .bind(resolution.as_str())
+            .bind(owner_guidance)
+            .bind(owner_session)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let updated = sqlx::query(
+            "UPDATE mandates
+             SET status = 'active', suspension_json = NULL, next_review_at = ?,
+                 review_lease_token = NULL, review_lease_expires_at = NULL,
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(mandate_id)
+        .bind(expected_version)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(context) = controller_context {
+            sqlx::query("UPDATE goals SET context = ?, updated_at = ? WHERE id = ?")
+                .bind(context)
+                .bind(&now)
+                .bind(&goal_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        update_controller_status(&mut tx, &goal_id, MandateStatus::Active, &now).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn reserve_mandate_action_attempt(
@@ -2494,7 +2920,37 @@ impl MandateStore for SqliteStateStore {
         .bind(projection.http_status.map(i64::from))
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            return Ok(true);
+        }
+        // The canonical ToolResult append projects the same receipt and ledger
+        // transition atomically. The execution loop repeats this call as a
+        // defensive compatibility check, so accept an exact terminal match.
+        let already_projected = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM mandate_mutation_attempts
+             WHERE mandate_id = ? AND mandate_version = ? AND decision_cycle_id = ?
+               AND reserved_action_attempt = ? AND action_digest = ?
+               AND goal_run_id = ? AND task_id = ? AND task_attempt_id = ?
+               AND tool_call_id = ? AND status = ?
+               AND COALESCE(http_status, -1) = COALESCE(?, -1)
+               AND COALESCE(exit_code, -2147483648) = COALESCE(?, -2147483648)
+             LIMIT 1",
+        )
+        .bind(&projection.grant.mandate_id)
+        .bind(projection.grant.mandate_version)
+        .bind(&projection.grant.decision_cycle_id)
+        .bind(projection.grant.reserved_action_attempt)
+        .bind(&projection.grant.action_digest)
+        .bind(&projection.goal_run_id)
+        .bind(&projection.task_id)
+        .bind(&projection.task_attempt_id)
+        .bind(&projection.tool_call_id)
+        .bind(projection.status.as_str())
+        .bind(projection.http_status.map(i64::from))
+        .bind(projection.exit_code)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(already_projected.is_some())
     }
 
     async fn list_mandate_mutation_attempts_for_run(
@@ -2742,12 +3198,18 @@ impl MandateStore for SqliteStateStore {
                 .bind(&request.goal_run_id)
                 .execute(&mut *tx)
                 .await?;
+                let mut suspension = MandateSuspension::new(
+                    MandateSuspensionKind::ReviewFailed,
+                    Some(reason.as_str().to_string()),
+                );
+                suspension.goal_run_id = Some(request.goal_run_id.clone());
                 let mandate_updated = sqlx::query(
                     "UPDATE mandates
                      SET status = 'awaiting_input', review_lease_token = NULL,
-                         review_lease_expires_at = NULL, updated_at = ?
+                         review_lease_expires_at = NULL, suspension_json = ?, updated_at = ?
                      WHERE id = ? AND version = ? AND status = 'active'",
                 )
+                .bind(serde_json::to_string(&suspension)?)
                 .bind(&request.finalized_at)
                 .bind(&request.mandate_id)
                 .bind(request.expected_mandate_version)
@@ -2959,12 +3421,19 @@ impl MandateStore for SqliteStateStore {
                 .bind(&request.goal_run_id)
                 .execute(&mut *tx)
                 .await?;
+                let mut suspension = MandateSuspension::new(
+                    MandateSuspensionKind::ReconciliationRequired,
+                    Some(reason.as_str().to_string()),
+                );
+                suspension.decision_cycle_id = Some(decision_cycle_id.clone());
+                suspension.goal_run_id = Some(request.goal_run_id.clone());
                 let mandate_updated = sqlx::query(
                     "UPDATE mandates
                      SET status = 'awaiting_input', review_lease_token = NULL,
-                         review_lease_expires_at = NULL, updated_at = ?
+                         review_lease_expires_at = NULL, suspension_json = ?, updated_at = ?
                      WHERE id = ? AND version = ? AND status = ?",
                 )
+                .bind(serde_json::to_string(&suspension)?)
                 .bind(&request.finalized_at)
                 .bind(&request.mandate_id)
                 .bind(request.expected_mandate_version)
@@ -3126,13 +3595,23 @@ impl MandateStore for SqliteStateStore {
                     MandateDecisionOutcome::Stop => MandateStatus::Completed,
                     MandateDecisionOutcome::Act => unreachable!(),
                 };
+                let suspension = (decision_outcome == MandateDecisionOutcome::Ask).then(|| {
+                    let mut value = MandateSuspension::new(
+                        MandateSuspensionKind::AwaitingAnswer,
+                        Some("agent_question".to_string()),
+                    );
+                    value.decision_cycle_id = Some(decision_cycle_id.clone());
+                    value.goal_run_id = Some(request.goal_run_id.clone());
+                    value
+                });
                 let mandate_updated = sqlx::query(
                     "UPDATE mandates
                      SET status = ?, review_lease_token = NULL,
-                         review_lease_expires_at = NULL, updated_at = ?
+                         review_lease_expires_at = NULL, suspension_json = ?, updated_at = ?
                      WHERE id = ? AND version = ? AND status = 'active'",
                 )
                 .bind(final_mandate_status.as_str())
+                .bind(suspension.as_ref().map(serde_json::to_string).transpose()?)
                 .bind(&request.finalized_at)
                 .bind(&request.mandate_id)
                 .bind(request.expected_mandate_version)
@@ -4080,7 +4559,7 @@ mod tests {
             store.list_intentions(&mandate.id, 1).await.unwrap()[0].status,
             IntentionStatus::Suspended
         );
-        assert!(!store
+        assert!(store
             .reserve_mandate_action_attempt(&reservation(
                 &mandate,
                 &act,
@@ -4092,7 +4571,7 @@ mod tests {
             ))
             .await
             .unwrap()
-            .is_some());
+            .is_none());
 
         assert!(store
             .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
@@ -4264,6 +4743,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notice_count, 1);
+        let suspended = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(suspended.status, MandateStatus::AwaitingInput);
+        assert_eq!(
+            suspended.suspension.as_ref().map(|value| value.kind),
+            Some(MandateSuspensionKind::ReconciliationRequired)
+        );
+        assert!(store
+            .resolve_mandate_suspension(
+                &mandate.id,
+                suspended.version,
+                MandateSuspensionKind::ReconciliationRequired,
+                None,
+                Some(MandateReconciliationResolution::ConfirmedNoEffect),
+                "I inspected the exact target and confirmed no effect occurred.",
+                "owner-session",
+            )
+            .await
+            .unwrap());
+        let resumed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, MandateStatus::Active);
+        assert!(resumed.suspension.is_none());
+        let reconciliations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mandate_reconciliations
+             WHERE mandate_id = ? AND resolution = 'confirmed_no_effect'",
+        )
+        .bind(&mandate.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(reconciliations, 1);
     }
 
     #[tokio::test]
@@ -4506,11 +5015,11 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(!store
+        assert!(store
             .reserve_mandate_action_attempt(&first)
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         assert!(store
             .reserve_mandate_action_attempt(&reservation(
                 &mandate,
@@ -4524,7 +5033,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(!store
+        assert!(store
             .reserve_mandate_action_attempt(&reservation(
                 &mandate,
                 &act,
@@ -4536,7 +5045,7 @@ mod tests {
             ))
             .await
             .unwrap()
-            .is_some());
+            .is_none());
     }
 
     #[tokio::test]
@@ -4577,7 +5086,7 @@ mod tests {
             .push("New owner constraint".to_string());
         store.update_mandate(&owner_update).await.unwrap();
 
-        assert!(!store
+        assert!(store
             .reserve_mandate_action_attempt(&reservation(
                 &mandate,
                 &act,
@@ -4589,7 +5098,7 @@ mod tests {
             ))
             .await
             .unwrap()
-            .is_some());
+            .is_none());
     }
 
     #[tokio::test]
@@ -4878,6 +5387,101 @@ mod tests {
             quota.block_reason,
             Some(MandateMutationQuotaBlockReason::Rolling24hExhausted)
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_tool_result_atomically_projects_the_mandate_ledger() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("owner-session", 1);
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "Exercise atomic receipt projection",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &decision.id,
+            &run.id,
+            "Issue one governed request",
+            "The event and ledger must commit together",
+        );
+        store
+            .record_mandate_decision(&decision, Some(&intention), None)
+            .await
+            .unwrap();
+        let fence = claim_mutation_fence(&store, &goal, &mandate, &run).await;
+        let now = chrono::Utc::now();
+        let reservation = reservation(&mandate, &decision, &run, &fence, 1, 777, now);
+        store
+            .reserve_mandate_action_attempt(&reservation)
+            .await
+            .unwrap()
+            .expect("reserved mutation");
+        assert!(store
+            .claim_mandate_mutation_dispatch(&dispatch_claim(
+                &reservation,
+                now + chrono::Duration::milliseconds(1),
+            ))
+            .await
+            .unwrap());
+
+        let semantics = crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY,
+        );
+        let mut receipt = crate::events::ToolReceiptV1::from_metadata(
+            &crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                http_status: Some(201),
+                semantics,
+                ..Default::default()
+            },
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            Some("mandate-atomic-receipt".to_string()),
+        );
+        receipt.mandate_authority = Some(reservation.grant.clone());
+        let result = crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: reservation.tool_call_id.clone(),
+            name: "http_request".to_string(),
+            result: "created".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(fence.worker_task.id.clone()),
+            annotations: vec![],
+            turn_id: None,
+            attachments: vec![],
+            receipt: Some(receipt),
+        };
+        let event_store = crate::events::EventStore::new(store.pool()).await.unwrap();
+        event_store
+            .append(crate::events::Event::new(
+                "specialist:mandate",
+                crate::events::EventType::ToolResult,
+                serde_json::to_value(result).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let attempts = store
+            .list_mandate_mutation_attempts_for_run(&run.id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, MandateMutationAttemptStatus::Succeeded);
+        assert!(store
+            .project_mandate_mutation_outcome(&outcome_projection(
+                &reservation,
+                MandateMutationAttemptStatus::Succeeded,
+                Some(201),
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -5319,6 +5923,8 @@ mod tests {
             );
             if outcome == MandateDecisionOutcome::Ask {
                 decision.question = Some("May I broaden the allowed target?".to_string());
+            } else {
+                decision.termination_kind = Some(MandateTerminationKind::SafetyTermination);
             }
             store
                 .record_mandate_decision(&decision, None, Some(&root_attempt.id))
@@ -5383,6 +5989,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_backed_stop_and_learning_are_same_mandate_only() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 0);
+        mandate.success_criteria = vec!["Account stewardship is no longer needed".to_string()];
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let root_task_id = run.root_task_id.as_deref().unwrap();
+        let root_attempt = store
+            .claim_task_with_lease(
+                root_task_id,
+                "receipt-backed-stop",
+                Some("profile-task-lead"),
+                7_200,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let receipt = crate::events::ToolReceiptV1::from_metadata(
+            &crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                semantics: crate::traits::ToolCallSemantics::observation(),
+                ..Default::default()
+            },
+            crate::traits::ToolOutcomeStatus::Succeeded,
+            crate::events::ToolOutcomeEvidenceSource::StructuredMetadata,
+            None,
+        );
+        let result = crate::events::ToolResultData {
+            message_id: None,
+            tool_call_id: "observation-receipt-1".to_string(),
+            name: "web_fetch".to_string(),
+            result: "bounded observation".to_string(),
+            success: true,
+            duration_ms: 1,
+            error: None,
+            task_id: Some(root_task_id.to_string()),
+            annotations: vec![],
+            turn_id: None,
+            attachments: vec![],
+            receipt: Some(receipt),
+        };
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'web_fetch')",
+        )
+        .bind("specialist:mandate")
+        .bind(serde_json::to_string(&result).unwrap())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(root_task_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let mut decision = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Stop,
+            "A current structured observation proves the owner criterion",
+            mandate.version,
+        );
+        decision.termination_kind = Some(MandateTerminationKind::SuccessCriteriaSatisfied);
+        decision.termination_match = mandate.success_criteria.first().cloned();
+        decision.evidence_receipt_ids = vec!["observation-receipt-1".to_string()];
+        store
+            .record_mandate_decision(&decision, None, Some(&root_attempt.id))
+            .await
+            .unwrap();
+
+        let note = MandateLearningNote::new(
+            &mandate.id,
+            mandate.version,
+            &decision.id,
+            "Explicit verification is more reliable than inferred completion",
+            vec!["observation-receipt-1".to_string()],
+        );
+        store.record_mandate_learning_note(&note).await.unwrap();
+        assert_eq!(
+            store
+                .list_mandate_learning_notes(&mandate.id, 10)
+                .await
+                .unwrap(),
+            vec![note]
+        );
+
+        assert!(store
+            .patch_task_from_attempt(
+                &root_attempt.id,
+                &root_attempt.lease_token,
+                &crate::traits::TaskAttemptPatch {
+                    status: "completed".to_string(),
+                    result: Some("receipt-backed STOP recorded".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        let finalized = store
+            .finalize_mandate_run_from_proof(&MandateRunFinalizationRequest {
+                mandate_id: mandate.id.clone(),
+                expected_mandate_version: mandate.version,
+                goal_run_id: run.id,
+                finalized_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            finalized,
+            MandateRunFinalizationResult::NonActionSatisfied {
+                outcome: MandateDecisionOutcome::Stop,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn ask_and_stop_crashes_remain_reconcilable_until_proof_finalization() {
         for outcome in [MandateDecisionOutcome::Ask, MandateDecisionOutcome::Stop] {
             let (store, _database) = test_store().await;
@@ -5407,6 +6128,8 @@ mod tests {
             );
             if outcome == MandateDecisionOutcome::Ask {
                 decision.question = Some("May I broaden the exact target?".to_string());
+            } else {
+                decision.termination_kind = Some(MandateTerminationKind::SafetyTermination);
             }
             store
                 .record_mandate_decision(&decision, None, Some(&root_attempt.id))

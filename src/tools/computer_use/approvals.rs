@@ -114,6 +114,7 @@ impl ApprovalState {
                     .to_string(),
             ],
             Some(task_id),
+            crate::types::ApprovalKind::Command,
         )
         .await?;
         match response {
@@ -146,6 +147,7 @@ impl ApprovalState {
                     .to_string(),
             ],
             Some(task_id),
+            crate::types::ApprovalKind::CommandOnce,
         )
         .await?;
         match response {
@@ -169,6 +171,7 @@ async fn request_approval(
     risk_level: RiskLevel,
     warnings: Vec<String>,
     _task_id: Option<&str>,
+    kind: crate::types::ApprovalKind,
 ) -> Result<ApprovalResponse, String> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     if let Err(send_err) = approval_tx
@@ -179,7 +182,7 @@ async fn request_approval(
             warnings,
             permission_mode: PermissionMode::Default,
             response_tx,
-            kind: Default::default(),
+            kind,
         })
         .await
     {

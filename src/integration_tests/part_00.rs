@@ -6,6 +6,7 @@
 
 use crate::testing::{
     setup_full_stack_test_agent, setup_full_stack_test_agent_with_extra_tools, setup_test_agent,
+    setup_test_agent_with_mandates,
     setup_test_agent_orchestrator, setup_test_agent_orchestrator_task_leads, setup_test_agent_root,
     setup_test_agent_root_with_extra_tools_and_llm_timeout,
     setup_test_agent_with_extra_tools_and_llm_timeout, setup_test_agent_with_models,
@@ -139,6 +140,336 @@ async fn test_tool_execution() {
     // Agent should have called the LLM twice (tool call + final response)
     assert_eq!(harness.provider.call_count().await, 2);
     assert_eq!(response, "Here is your system info.");
+}
+
+async fn retry_test_sqlite_busy<T, F, Fut>(mut operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    const MAX_ATTEMPTS: usize = 40;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < MAX_ATTEMPTS
+                    && error.chain().any(|cause| {
+                        let message = cause.to_string().to_ascii_lowercase();
+                        message.contains("database is locked")
+                            || message.contains("database table is locked")
+                            || message.contains("sqlite_busy")
+                            || message.contains("(code: 5)")
+                    }) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+#[tokio::test]
+async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedule() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let fake_x_url = format!(
+        "http://localhost:{}/2/tweets",
+        listener.local_addr().unwrap().port()
+    );
+    let fake_x_calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = fake_x_calls.clone();
+    let fake_x_server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 8192];
+        let bytes = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..bytes]);
+        assert!(request.starts_with("POST /2/tweets"));
+        assert!(request.contains("bounded stewardship update"));
+        server_calls.fetch_add(1, Ordering::SeqCst);
+        stream
+            .write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"data\":{\"id\":\"fake-1\"}}",
+            )
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let draft_args = json!({
+        "action": "draft",
+        "objective": "Steward @aidaemon_ai as an authentic proactive presence",
+        "allowed_tools": ["http_request"],
+        "allowed_mutation_effects": ["remote_mutation", "external_delivery"],
+        "allowed_target_prefixes": [fake_x_url.clone()],
+        "max_mutating_actions_per_cycle": 1,
+        "max_mutating_actions_per_rolling_24h": 4,
+        "min_seconds_between_mutations": 900,
+        "constraints": ["No fabrication, spam, or engagement bait"],
+        "stop_conditions": ["Authentication is revoked"]
+    })
+    .to_string();
+    let create_args = json!({
+        "action": "create",
+        "objective": "Steward @aidaemon_ai as an authentic proactive presence",
+        "allowed_tools": ["http_request"],
+        "allowed_mutation_effects": ["remote_mutation", "external_delivery"],
+        "allowed_target_prefixes": [fake_x_url.clone()],
+        "max_mutating_actions_per_cycle": 1,
+        "max_mutating_actions_per_rolling_24h": 4,
+        "min_seconds_between_mutations": 900,
+        "constraints": ["No fabrication, spam, or engagement bait"],
+        "stop_conditions": ["Authentication is revoked"]
+    })
+    .to_string();
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("manage_mandates", &draft_args),
+        MockProvider::tool_call_response("manage_mandates", &create_args),
+        MockProvider::text_response("The ongoing stewardship mandate is active."),
+        MockProvider::tool_call_response(
+            "http_request",
+            &json!({
+                "method": "POST",
+                "url": fake_x_url,
+                "body": "{\"text\":\"bounded stewardship update\"}"
+            })
+            .to_string(),
+        ),
+        MockProvider::text_response("The fake X API accepted the bounded update."),
+    ]);
+    let mut harness = setup_test_agent_with_mandates(provider).await.unwrap();
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.agent.handle_message(
+            "owner-chat",
+            "Manage my X account as an ongoing authentic presence. Decide when to post, reply, or wait based on what is happening; do not turn this into a fixed posting schedule.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        ),
+    )
+    .await
+    .expect("owner chat should not hang")
+    .unwrap();
+    assert_eq!(response, "The ongoing stewardship mandate is active.");
+    let mandates = harness
+        .state
+        .list_mandates(Some("owner-chat"), false)
+        .await
+        .unwrap();
+    assert_eq!(mandates.len(), 1);
+    assert_eq!(mandates[0].status, crate::traits::MandateStatus::Active);
+    assert!(harness
+        .state
+        .get_schedules_for_goal(&mandates[0].goal_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let calls = harness.provider.call_log.lock().await;
+    let mandate_schema = calls
+        .iter()
+        .flat_map(|call| call.tools.iter())
+        .find(|schema| schema["function"]["name"] == "manage_mandates")
+        .expect("manage_mandates is visible on the chat path");
+    assert!(mandate_schema["function"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("draft"));
+    assert!(mandate_schema["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "draft"));
+    drop(calls);
+
+    let claimed = retry_test_sqlite_busy(|| {
+        harness
+            .state
+            .claim_due_mandates(1, "e2e-heartbeat", 300)
+    })
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let mandate = claimed.into_iter().next().unwrap();
+    let root_task_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let root_task = crate::traits::Task {
+        id: root_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Review the chat-created stewardship mandate".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 0,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now.clone(),
+        started_at: None,
+        completed_at: None,
+    };
+    let goal_run_id = uuid::Uuid::new_v4().to_string();
+    let run = retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_review_run(
+            &mandate.id,
+            mandate.review_lease_token.as_deref().unwrap(),
+            &goal_run_id,
+            &root_task,
+        )
+    })
+        .await
+        .unwrap();
+    let root_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_task_with_lease(
+            &root_task_id,
+            "e2e-task-lead",
+            Some("profile-task-lead"),
+            7_200,
+        )
+    })
+        .await
+        .unwrap()
+        .unwrap();
+    let decision = crate::traits::MandateDecisionCycle::new(
+        &mandate.id,
+        &run.id,
+        crate::traits::MandateDecisionOutcome::Act,
+        "A useful bounded update is warranted",
+        mandate.version,
+    );
+    let intention = crate::traits::Intention::new(
+        &mandate.id,
+        &decision.id,
+        &run.id,
+        "Post one bounded stewardship update",
+        "It is within the confirmed target and quota",
+    );
+    retry_test_sqlite_busy(|| {
+        harness.state.record_mandate_decision(
+            &decision,
+            Some(&intention),
+            Some(&root_attempt.id),
+        )
+    })
+        .await
+        .unwrap();
+    let worker_task_id = uuid::Uuid::new_v4().to_string();
+    let worker_task = crate::traits::Task {
+        id: worker_task_id.clone(),
+        goal_id: mandate.goal_id.clone(),
+        description: "Send the exact fake-X update".to_string(),
+        status: "pending".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: None,
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 0,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+    assert!(retry_test_sqlite_busy(|| {
+        harness.state.create_mandate_task_from_attempt(
+            &worker_task,
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            8,
+        )
+    })
+        .await
+        .unwrap());
+    let worker_attempt = retry_test_sqlite_busy(|| {
+        harness.state.claim_mandate_task_from_attempt(
+            &worker_task_id,
+            "e2e-executor",
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            &root_attempt.id,
+            7_200,
+        )
+    })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (http_approval_tx, _http_approval_rx) = tokio::sync::mpsc::channel(1);
+    harness.agent.push_test_tool(Arc::new(crate::tools::HttpRequestTool::new(
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        crate::tools::ApprovalBroker::new(http_approval_tx),
+    )));
+    harness.agent.set_test_mandate_execution(
+        &mandate.id,
+        mandate.version,
+        mandate.authority.clone(),
+        &mandate.goal_id,
+        &root_task_id,
+        &root_attempt.id,
+        &worker_attempt,
+    );
+    let executor_response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.agent.handle_message(
+            "specialist:mandate-e2e",
+            "Execute the current committed intention.",
+            None,
+            UserRole::Owner,
+            ChannelContext::internal(),
+            None,
+        ),
+    )
+    .await
+    .expect("mandate executor should not hang")
+    .unwrap();
+    assert_eq!(
+        executor_response,
+        "The fake X API accepted the bounded update."
+    );
+    let receipt_task_id = sqlx::query_scalar::<_, String>(
+        "SELECT json_extract(data, '$.task_id') FROM events
+         WHERE event_type = 'tool_result'
+           AND json_extract(data, '$.name') = 'http_request'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&harness.state.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_task_id, worker_task_id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), fake_x_server)
+        .await
+        .expect("fake X API should receive one request")
+        .unwrap();
+    assert_eq!(fake_x_calls.load(Ordering::SeqCst), 1);
+    let attempts = harness
+        .state
+        .list_mandate_mutation_attempts_for_run(&run.id)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].status,
+        crate::traits::MandateMutationAttemptStatus::Succeeded
+    );
 }
 
 #[tokio::test]

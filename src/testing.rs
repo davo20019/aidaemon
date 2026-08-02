@@ -304,6 +304,7 @@ impl Channel for TestChannel {
         _risk_level: RiskLevel,
         _warnings: &[String],
         _permission_mode: PermissionMode,
+        _one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
         Ok(self.default_approval.lock().await.clone())
     }
@@ -330,7 +331,13 @@ pub struct TestHarness {
 ///
 /// Each call creates an isolated database, so tests can run in parallel.
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, vec![], None, true, true, None).await
+    setup_test_agent_internal(provider, vec![], None, true, true, false, None).await
+}
+
+/// Build a chat-path harness with the real mandate management tool and a
+/// deterministic one-time owner confirmation responder.
+pub async fn setup_test_agent_with_mandates(provider: MockProvider) -> anyhow::Result<TestHarness> {
+    setup_test_agent_internal(provider, vec![], None, true, true, true, None).await
 }
 
 /// Build a test agent with a custom policy config (e.g. trust_tier overrides)
@@ -341,13 +348,22 @@ pub async fn setup_test_agent_with_policy(
     policy_config: crate::config::PolicyConfig,
     extra_tools: Vec<Arc<dyn Tool>>,
 ) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, extra_tools, None, true, true, Some(policy_config)).await
+    setup_test_agent_internal(
+        provider,
+        extra_tools,
+        None,
+        true,
+        true,
+        false,
+        Some(policy_config),
+    )
+    .await
 }
 
 /// Build a root-mode test agent without forcing executor-mode loop behavior.
 #[allow(dead_code)]
 pub async fn setup_test_agent_root(provider: MockProvider) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, vec![], None, false, true, None).await
+    setup_test_agent_internal(provider, vec![], None, false, true, false, None).await
 }
 
 /// Build a root-mode test agent with extra tools and an optional per-LLM timeout.
@@ -363,6 +379,7 @@ pub async fn setup_test_agent_root_with_extra_tools_and_llm_timeout(
         llm_call_timeout_secs,
         false,
         true,
+        false,
         None,
     )
     .await
@@ -376,7 +393,16 @@ pub async fn setup_test_agent_root_with_only_tools_and_llm_timeout(
     tools: Vec<Arc<dyn Tool>>,
     llm_call_timeout_secs: Option<u64>,
 ) -> anyhow::Result<TestHarness> {
-    setup_test_agent_internal(provider, tools, llm_call_timeout_secs, false, false, None).await
+    setup_test_agent_internal(
+        provider,
+        tools,
+        llm_call_timeout_secs,
+        false,
+        false,
+        false,
+        None,
+    )
+    .await
 }
 
 /// Build a test agent with extra tools and an optional per-LLM-call timeout.
@@ -391,6 +417,7 @@ pub async fn setup_test_agent_with_extra_tools_and_llm_timeout(
         llm_call_timeout_secs,
         true,
         true,
+        false,
         None,
     )
     .await
@@ -402,6 +429,7 @@ async fn setup_test_agent_internal(
     llm_call_timeout_secs: Option<u64>,
     use_test_executor_mode: bool,
     include_default_tools: bool,
+    include_manage_mandates: bool,
     policy_config: Option<crate::config::PolicyConfig>,
 ) -> anyhow::Result<TestHarness> {
     // Temp file for SQLite (pool needs a real file, not :memory:)
@@ -434,6 +462,21 @@ async fn setup_test_agent_internal(
     } else {
         Vec::new()
     };
+    if include_manage_mandates {
+        let (approval_tx, mut approval_rx) = mpsc::channel(8);
+        tools.push(Arc::new(
+            crate::tools::ManageMandatesTool::new(
+                state.clone() as Arc<dyn crate::traits::StateStore>,
+                crate::tools::ApprovalBroker::new(approval_tx),
+            )
+            .with_skills_dir(Some(skills_dir.path().to_path_buf())),
+        ));
+        tokio::spawn(async move {
+            while let Some(request) = approval_rx.recv().await {
+                let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
+            }
+        });
+    }
     tools.extend(extra_tools);
 
     // Models config (all tiers point to "mock-model")

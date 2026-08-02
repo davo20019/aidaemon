@@ -171,8 +171,8 @@ fn is_consequential(text: &str) -> bool {
 pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> BrowserActionRisk {
     match action {
         // ── Observation ───────────────────────────────────────────────────────
-        "get_text" | "screenshot" | "scroll" | "wait" | "list_tabs" | "get_console_logs"
-        | "get_network_errors" => BrowserActionRisk {
+        "get_text" | "inspect_page" | "screenshot" | "scroll" | "wait" | "list_tabs"
+        | "get_console_logs" | "get_network_errors" => BrowserActionRisk {
             class: BrowserRiskClass::Observation,
             sensitive: false,
             consequential: false,
@@ -235,6 +235,7 @@ mod tests {
     fn observation_actions_map_correctly() {
         for action in &[
             "get_text",
+            "inspect_page",
             "screenshot",
             "scroll",
             "wait",
@@ -522,9 +523,13 @@ mod tests {
             "click",
             "fill",
             "get_text",
+            "inspect_page",
+            "scroll",
             "execute_js",
             "wait",
             "list_tabs",
+            "get_console_logs",
+            "get_network_errors",
             "new_tab",
             "switch_tab",
             "close_tab",
@@ -539,9 +544,13 @@ mod tests {
             BrowserRiskClass::Mutation,       // click
             BrowserRiskClass::Mutation,       // fill
             BrowserRiskClass::Observation,    // get_text
+            BrowserRiskClass::Observation,    // inspect_page
+            BrowserRiskClass::Observation,    // scroll
             BrowserRiskClass::Mutation,       // execute_js
             BrowserRiskClass::Observation,    // wait
             BrowserRiskClass::Observation,    // list_tabs
+            BrowserRiskClass::Observation,    // get_console_logs
+            BrowserRiskClass::Observation,    // get_network_errors
             BrowserRiskClass::Navigation,     // new_tab
             BrowserRiskClass::Navigation,     // switch_tab
             BrowserRiskClass::Administrative, // close_tab

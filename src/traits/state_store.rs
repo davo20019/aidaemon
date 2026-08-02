@@ -1111,6 +1111,39 @@ pub trait MandateStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Persist one bounded, advisory learning note only after all cited
+    /// receipts are proven to belong to this mandate.
+    async fn record_mandate_learning_note(
+        &self,
+        _note: &super::MandateLearningNote,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("mandate learning is not supported by this store")
+    }
+
+    async fn list_mandate_learning_notes(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::MandateLearningNote>> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve an awaiting-input state with a typed owner action. Question
+    /// answers and external-effect reconciliation are intentionally distinct.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_mandate_suspension(
+        &self,
+        _mandate_id: &str,
+        _expected_version: i64,
+        _expected_kind: super::MandateSuspensionKind,
+        _controller_context: Option<&str>,
+        _reconciliation_resolution: Option<super::MandateReconciliationResolution>,
+        _owner_guidance: &str,
+        _owner_session: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Atomically reserve the exact next mutation attempt under the current
     /// cycle, rolling-24h, cooldown, mandate, run, intention, task, and lease
     /// fences. Implementations must insert the durable ledger row and advance

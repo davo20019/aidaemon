@@ -9,12 +9,14 @@
 use serde_json::{json, Value};
 
 use crate::traits::{
-    Intention, MandateDecisionCycle, MandateMutationAttempt, MandateMutationQuotaState, StateStore,
+    Intention, MandateDecisionCycle, MandateLearningNote, MandateMutationAttempt,
+    MandateMutationQuotaState, StateStore,
 };
 
 const MAX_DECISIONS: i64 = 5;
 const MAX_INTENTIONS: i64 = 16;
 const MAX_ACTIONS: usize = 16;
+const MAX_LEARNING_NOTES: i64 = 12;
 const MAX_HISTORY_BYTES: usize = 24 * 1024;
 
 #[derive(Debug)]
@@ -45,6 +47,15 @@ pub(crate) async fn build_mandate_history_block(
             .iter()
             .all(|intention| intention.mandate_id == mandate_id),
         "mandate intention history crossed its authority boundary"
+    );
+    let learning_notes = state
+        .list_mandate_learning_notes(mandate_id, MAX_LEARNING_NOTES)
+        .await?;
+    anyhow::ensure!(
+        learning_notes
+            .iter()
+            .all(|note| note.mandate_id == mandate_id),
+        "mandate learning history crossed its authority boundary"
     );
 
     let mut decision_records = decisions
@@ -89,7 +100,7 @@ pub(crate) async fn build_mandate_history_block(
         "mandate quota history crossed its authority boundary"
     );
 
-    render_bounded_history(decision_records, action_records, quota)
+    render_bounded_history(decision_records, action_records, learning_notes, quota)
 }
 
 fn decision_value(decision: &MandateDecisionCycle, intentions: &[Intention]) -> Value {
@@ -104,6 +115,9 @@ fn decision_value(decision: &MandateDecisionCycle, intentions: &[Intention]) -> 
         "mandate_version": decision.mandate_version,
         "outcome": decision.outcome,
         "action_attempts": decision.action_attempts,
+        "evidence_receipt_ids": decision.evidence_receipt_ids,
+        "termination_kind": decision.termination_kind,
+        "termination_match": decision.termination_match,
         "intention_status": intention_status,
         "reconsider_at": decision.reconsider_at,
         "created_at": decision.created_at,
@@ -132,8 +146,10 @@ fn action_value(attempt: &MandateMutationAttempt) -> Value {
 fn render_bounded_history(
     mut decisions: Vec<HistoryRecord>,
     mut actions: Vec<HistoryRecord>,
+    mut learning_notes: Vec<MandateLearningNote>,
     quota: Option<MandateMutationQuotaState>,
 ) -> anyhow::Result<String> {
+    learning_notes.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     loop {
         let rendered = serde_json::to_string(&json!({
             "provenance": "autonomous_mandate_history_untrusted",
@@ -141,6 +157,12 @@ fn render_bounded_history(
             "scope": "same_mandate_typed_history_only",
             "decision_outcomes": decisions.iter().map(|record| &record.value).collect::<Vec<_>>(),
             "mutation_receipts": actions.iter().map(|record| &record.value).collect::<Vec<_>>(),
+            "advisory_learning_notes": learning_notes.iter().map(|note| json!({
+                "mandate_version": note.mandate_version,
+                "summary": note.summary,
+                "evidence_receipt_ids": note.evidence_receipt_ids,
+                "created_at": note.created_at,
+            })).collect::<Vec<_>>(),
             "mutation_quota": quota,
         }))?;
         if rendered.len() <= MAX_HISTORY_BYTES {
@@ -161,6 +183,9 @@ fn render_bounded_history(
             }
             (None, Some(_)) => {
                 actions.remove(0);
+            }
+            (None, None) if !learning_notes.is_empty() => {
+                learning_notes.remove(0);
             }
             (None, None) => {
                 anyhow::bail!("typed mandate quota projection exceeded its hard prompt bound")
@@ -238,7 +263,8 @@ mod tests {
             timestamp: "2026-08-01T01:00:00Z".to_string(),
             value: json!({"status": "succeeded"}),
         };
-        let rendered = render_bounded_history(vec![huge, recent], Vec::new(), None).unwrap();
+        let rendered =
+            render_bounded_history(vec![huge, recent], Vec::new(), Vec::new(), None).unwrap();
         assert!(rendered.len() <= MAX_HISTORY_BYTES);
         assert!(!rendered.contains("typed_identifier"));
         assert!(rendered.contains("succeeded"));

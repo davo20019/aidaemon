@@ -147,6 +147,27 @@ impl BrowserSessionRegistry {
             .insert(session_id.to_string(), true);
     }
 
+    /// Update the cached URL for this session's active tab after an action has
+    /// observed the live committed page URL. Approval prompts and `list_tabs`
+    /// use this cache so they can show a secret-safe origin without touching the
+    /// browser before the user approves the next action.
+    pub async fn update_active_tab_url(&self, session_id: &str, url: String) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        let Some(state) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        let active_target_id = state.active_target_id.clone();
+        let Some(tab) = state
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.target_id == active_target_id)
+        else {
+            return false;
+        };
+        tab.last_url = Some(url);
+        true
+    }
+
     /// Resolve the ACTIVE tab's page + the session action lock, creating a fresh
     /// first tab on the backend the first time a session is seen.
     ///

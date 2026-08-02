@@ -233,8 +233,10 @@ mod gate_telemetry_tests {
         let mut force_text_response = false;
         let mut validation_state = ValidationState::default();
 
-        let mut updated_progress = CompletionProgress::default();
-        updated_progress.quality_nudge_count = 4;
+        let updated_progress = CompletionProgress {
+            quality_nudge_count: 4,
+            ..CompletionProgress::default()
+        };
         let mut updated_validation = ValidationState::default();
         updated_validation.note_retry(LoopRepetitionReason::RetryStep);
 

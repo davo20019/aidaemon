@@ -3291,6 +3291,7 @@ impl Channel for SlackChannel {
         risk_level: RiskLevel,
         warnings: &[String],
         permission_mode: PermissionMode,
+        one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
         let (channel_id, thread_ts) = self.parse_session_id(session_id);
 
@@ -3319,10 +3320,26 @@ impl Channel for SlackChannel {
             risk_level,
             warnings,
             use_session_button,
+            one_time_only,
         );
 
         // Build Block Kit message with approval buttons
-        let action_buttons = if use_session_button {
+        let action_buttons = if one_time_only {
+            serde_json::json!([
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Allow Once" },
+                    "action_id": format!("approve:once:{}", approval_id),
+                    "style": "primary"
+                },
+                {
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "Deny" },
+                    "action_id": format!("approve:deny:{}", approval_id),
+                    "style": "danger"
+                }
+            ])
+        } else if use_session_button {
             serde_json::json!([
                 {
                     "type": "button",

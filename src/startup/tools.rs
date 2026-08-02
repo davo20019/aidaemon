@@ -918,7 +918,14 @@ async fn build_base_tool(
             terminal_tool: None,
         },
         BaseToolId::ManageMandates => BuiltBaseTool {
-            tool: Arc::new(ManageMandatesTool::new(state, approval_tx)),
+            tool: Arc::new(ManageMandatesTool::new(state, approval_tx).with_skills_dir(
+                config.skills.enabled.then(|| {
+                    config_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(&config.skills.dir)
+                }),
+            )),
             terminal_tool: None,
         },
         BaseToolId::SearchHistory => BuiltBaseTool {

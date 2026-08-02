@@ -85,6 +85,7 @@ impl Channel for MediaCaptureChannel {
         _risk_level: crate::tools::command_risk::RiskLevel,
         _warnings: &[String],
         _permission_mode: PermissionMode,
+        _one_time_only: bool,
     ) -> anyhow::Result<crate::types::ApprovalResponse> {
         Ok(crate::types::ApprovalResponse::AllowOnce)
     }

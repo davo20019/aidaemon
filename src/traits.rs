@@ -41,12 +41,13 @@ pub use goals::{
 pub use mandates::{
     Intention, IntentionStatus, Mandate, MandateAuthority, MandateAuthorityGrant,
     MandateDecisionCycle, MandateDecisionOutcome, MandateFinalizationRejectReason,
-    MandateFinalizationStaleReason, MandateMutationAttempt, MandateMutationAttemptStatus,
-    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationOutcomeProjection,
-    MandateMutationQuotaBlockReason, MandateMutationQuotaState, MandateMutationReservation,
-    MandateMutationTarget, MandateReconciliationReason, MandateRunFinalizationRequest,
-    MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
-    MandateRunProofCounts, MandateStatus,
+    MandateFinalizationStaleReason, MandateLearningNote, MandateMutationAttempt,
+    MandateMutationAttemptStatus, MandateMutationDispatchClaim, MandateMutationEvidence,
+    MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
+    MandateMutationReservation, MandateMutationTarget, MandateReconciliationReason,
+    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
+    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
+    MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
 };
 #[allow(unused_imports)]
 pub use memory::{

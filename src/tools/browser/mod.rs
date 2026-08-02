@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -43,6 +44,45 @@ const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// legitimate automation (64 KiB covers virtually any real workflow) while
 /// bounding potential abuse via enormous payloads.
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+
+/// Fixed, caller-unmodifiable DOM inspection used by `inspect_page`. It exposes
+/// the common research fields that previously pushed the model toward arbitrary
+/// `execute_js`, while omitting form values, cookies, storage, and URL queries or
+/// fragments. Because callers cannot inject code into this script, the action is
+/// a normal read-only observation and does not need point-of-action approval.
+const INSPECT_PAGE_SCRIPT: &str = r#"(() => {
+  const cleanUrl = (value) => {
+    try {
+      const url = new URL(value, document.baseURI);
+      return `${url.origin}${url.pathname}`;
+    } catch (_) {
+      return "";
+    }
+  };
+  const text = (value) => String(value || "").trim();
+  return {
+    title: document.title,
+    url: cleanUrl(location.href),
+    links: [...document.querySelectorAll("a[href]")].map((a) => ({
+      text: text(a.innerText || a.getAttribute("aria-label")),
+      href: cleanUrl(a.href)
+    })).filter((item) => item.text || item.href).slice(0, 120),
+    forms: [...document.forms].map((form) => ({
+      action: cleanUrl(form.action || location.href),
+      method: String(form.method || "get").toUpperCase(),
+      inputs: [...form.elements].map((element) => ({
+        name: text(element.name),
+        type: text(element.type),
+        placeholder: text(element.placeholder),
+        ariaLabel: text(element.getAttribute && element.getAttribute("aria-label")),
+        required: Boolean(element.required)
+      })).slice(0, 80)
+    })).slice(0, 40),
+    iframes: [...document.querySelectorAll("iframe[src]")]
+      .map((frame) => cleanUrl(frame.src)).filter(Boolean).slice(0, 40),
+    text: text(document.body && document.body.innerText).slice(0, 12000)
+  };
+})()"#;
 
 /// Patterns whose presence in a script argument means the script is attempting
 /// to use a privileged browser-management API that bypasses the session/tab
@@ -237,7 +277,7 @@ fn format_browser_approval_prompt(
     origin: &str,
     selector: Option<&str>,
     tab_id: Option<&str>,
-    script_len: Option<usize>,
+    script: Option<&str>,
     _risk: &policy::BrowserActionRisk,
 ) -> String {
     match action {
@@ -252,8 +292,15 @@ fn format_browser_approval_prompt(
             format!("Switch to browser tab {}", tab_id.unwrap_or("?"))
         }
         "execute_js" => {
-            let bytes = script_len.unwrap_or(0);
-            format!("Run JavaScript on {origin} ({bytes} bytes)")
+            let script = script.unwrap_or_default();
+            let bytes = script.len();
+            // A short digest distinguishes different same-sized scripts without
+            // exposing their potentially sensitive contents in chat or logs.
+            let digest = format!("{:x}", Sha256::digest(script.as_bytes()));
+            format!(
+                "Run JavaScript on {origin} ({bytes} bytes, id {})",
+                &digest[..12]
+            )
         }
         "click" => {
             if let Some(sel) = selector {
@@ -573,9 +620,9 @@ impl BrowserTool {
 
     /// Build the secret-safe approval prompt string for an action.
     ///
-    /// NEVER include: the `fill` value, the full `execute_js` script (only
-    /// "JavaScript execution" + byte length), or full URLs with path/query/
-    /// fragment (origins are redacted via [`redact_origin`]).
+    /// NEVER include: the `fill` value, the full `execute_js` script (only its
+    /// byte length and a short digest), or full URLs with path/query/fragment
+    /// (origins are redacted via [`redact_origin`]).
     async fn build_prompt(
         &self,
         args: &ActionArgs<'_>,
@@ -603,7 +650,7 @@ impl BrowserTool {
             &origin,
             args.selector,
             args.tab_id,
-            args.script.map(|s| s.len()),
+            args.script,
             risk,
         )
     }
@@ -618,6 +665,7 @@ impl BrowserTool {
         risk_level: RiskLevel,
         warnings: Vec<String>,
         session_id: &str,
+        one_time_only: bool,
     ) -> Option<ApprovalResponse> {
         let broker = self.approval_tx.as_ref()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -629,7 +677,11 @@ impl BrowserTool {
                 warnings,
                 permission_mode: PermissionMode::Default,
                 response_tx,
-                kind: Default::default(),
+                kind: if one_time_only {
+                    crate::types::ApprovalKind::CommandOnce
+                } else {
+                    crate::types::ApprovalKind::Command
+                },
             })
             .await
             .is_err()
@@ -655,7 +707,7 @@ impl BrowserTool {
     /// only when the action is permitted.
     ///
     /// Per-class rules:
-    /// - `Observation` (get_text/screenshot/wait/list_tabs): never prompt.
+    /// - `Observation` (get_text/inspect_page/screenshot/wait/list_tabs): never prompt.
     /// - `Administrative` (close/close_tab/set_mode): never prompt — local
     ///   lifecycle / mode switch, not a consequential web side effect.
     /// - `sensitive || consequential` (every `execute_js`, plus consequential
@@ -718,7 +770,7 @@ impl BrowserTool {
         let command = self.build_prompt(args, &risk).await;
 
         let resp = self
-            .request_approval(command, risk_level, warnings, session_id)
+            .request_approval(command, risk_level, warnings, session_id, point_of_action)
             .await;
 
         match resp {
@@ -843,8 +895,9 @@ impl BrowserTool {
         // note). If the committed URL is blocked, treat the navigation as
         // blocked and surface ONLY the host class — never the committed URL,
         // which may carry a path/query/token.
-        if let Some(final_url) = page.url().await {
-            if let Err(blocked) = policy::validate_network_url(&final_url) {
+        let final_url = page.url().await;
+        if let Some(final_url) = final_url.as_deref() {
+            if let Err(blocked) = policy::validate_network_url(final_url) {
                 warn!(
                     class = blocked.class.label(),
                     "navigation landed on a blocked host after redirect; blocking"
@@ -861,6 +914,12 @@ impl BrowserTool {
                     blocked.class.label()
                 ));
             }
+        }
+
+        if let Some(final_url) = final_url {
+            self.sessions
+                .update_active_tab_url(session_id, final_url)
+                .await;
         }
 
         Ok(format!("Navigated to {}", url))
@@ -1228,6 +1287,16 @@ impl BrowserTool {
             .detect_and_register_popup(session_id, &known_before, clicker_target_id.as_deref())
             .await;
 
+        // A same-tab click may have navigated. Refresh the last-known URL so a
+        // later point-of-action prompt names the actual site origin.
+        if let Some(current_url) = page.url().await {
+            if policy::validate_network_url(&current_url).is_ok() {
+                self.sessions
+                    .update_active_tab_url(session_id, current_url)
+                    .await;
+            }
+        }
+
         match new_tab_id {
             Some(tab_id) => Ok(format!(
                 "Clicked element '{}' (opened new tab: {})",
@@ -1344,6 +1413,25 @@ impl BrowserTool {
         Ok(text)
     }
 
+    /// Return a bounded, structured snapshot of the current page without
+    /// accepting caller-supplied JavaScript. This covers the common research
+    /// need for title, text, links, forms, and iframes while keeping arbitrary
+    /// script execution behind point-of-action approval.
+    async fn action_inspect_page(&self, session_id: &str) -> Result<String, String> {
+        let (page, _guard) = self.page_for(session_id).await?;
+        self.ensure_current_url_allowed(&page).await?;
+
+        let result = page.evaluate(INSPECT_PAGE_SCRIPT).await?;
+        let value_str = match result {
+            Some(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{:?}", value))
+            }
+            None => "{}".to_string(),
+        };
+        let value_str = crate::utils::truncate_with_note(&value_str, 4000);
+        Ok(crate::tools::sanitize::redact_secrets(&value_str))
+    }
+
     async fn action_scroll(&self, args: &Value, session_id: &str) -> Result<String, String> {
         let direction = args
             .get("direction")
@@ -1384,6 +1472,16 @@ impl BrowserTool {
         self.ensure_current_url_allowed(&page).await?;
 
         let result = page.evaluate(script).await?;
+
+        // Arbitrary JavaScript can change `location`. Preserve the last observed
+        // public URL so the next approval prompt names the resulting origin.
+        if let Some(current_url) = page.url().await {
+            if policy::validate_network_url(&current_url).is_ok() {
+                self.sessions
+                    .update_active_tab_url(session_id, current_url)
+                    .await;
+            }
+        }
 
         let value_str = match result {
             Some(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| format!("{:?}", v)),
@@ -1570,6 +1668,10 @@ impl BrowserTool {
                 .action_get_text(args, session_id)
                 .await
                 .map(DispatchResult::text_only),
+            "inspect_page" => self
+                .action_inspect_page(session_id)
+                .await
+                .map(DispatchResult::text_only),
             "scroll" => self
                 .action_scroll(args, session_id)
                 .await
@@ -1612,7 +1714,7 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "close" => self.action_close().await.map(DispatchResult::text_only),
             _ => Err(format!(
-                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, render_pdf, click, fill, get_text, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
+                "Unknown browser action: '{}'. Valid actions: navigate, screenshot, render_pdf, click, fill, get_text, inspect_page, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
         }
@@ -1976,19 +2078,19 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a browser to navigate pages, click elements, fill forms, scroll, take screenshots, render local HTML to PDF, extract text, and execute JavaScript. Supports headless and visible modes."
+        "Control a persistent browser for navigation, forms, screenshots, PDF rendering, page inspection, tabs, logs, and headless/visible modes. Prefer inspect_page for research. execute_js runs arbitrary JavaScript and always requires one-time approval. Use only opaque tab IDs returned by the tool."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "browser",
-            "description": "Control a browser for web interactions and deterministic document rendering. Actions: navigate (go to URL), screenshot (capture page as photo), render_pdf (render a local HTML file with Chromium, preserving print backgrounds and CSS page size; returns a local path for send_file), click (click element — reports a new tab id if the click opened one), fill (type into input), get_text (extract text), scroll (move the active page up or down), execute_js (run JavaScript), wait (wait for an element condition: present/visible/enabled/hidden/text_contains), list_tabs (list this session's open tabs with their ids), get_console_logs (read captured console output for a tab), get_network_errors (read captured network load failures for a tab), new_tab (open and switch to a new tab, optionally at a url), switch_tab (make a tab active by its id), close_tab (close a tab by its id), set_mode (switch between 'visible' and 'headless' — use visible for sites that block headless browsers), close (end session). The browser persists across calls for multi-step workflows. Tab ids are opaque tokens returned by list_tabs/new_tab; do not guess them.",
+            "description": self.description(),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["navigate", "screenshot", "render_pdf", "click", "fill", "get_text", "scroll", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
+                        "enum": ["navigate", "screenshot", "render_pdf", "click", "fill", "get_text", "inspect_page", "scroll", "execute_js", "wait", "list_tabs", "get_console_logs", "get_network_errors", "new_tab", "switch_tab", "close_tab", "set_mode", "close"],
                         "description": "The browser action to perform"
                     },
                     "source_path": {
@@ -2127,7 +2229,7 @@ fn browser_call_semantics(
         Some("navigate") => {
             ToolCallSemantics::observation().with_target_hint(ToolTargetHintKind::Url, url)
         }
-        Some("get_text") => ToolCallSemantics::observation()
+        Some("get_text" | "inspect_page") => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
         Some("scroll") => ToolCallSemantics::observation(),
         Some("wait") => ToolCallSemantics::observation()
@@ -2265,9 +2367,34 @@ mod prompt_tests {
             "https://example.com",
             None,
             None,
-            Some(512),
+            Some("SECRET_SCRIPT_BODY"),
             &sample_risk(),
         );
-        assert_eq!(prompt, "Run JavaScript on https://example.com (512 bytes)");
+        assert!(prompt.starts_with("Run JavaScript on https://example.com (18 bytes, id "));
+        assert!(prompt.ends_with(')'));
+        assert!(!prompt.contains("SECRET_SCRIPT_BODY"));
+    }
+
+    #[test]
+    fn execute_js_prompt_distinguishes_same_sized_scripts() {
+        let first = format_browser_approval_prompt(
+            "execute_js",
+            "https://example.com",
+            None,
+            None,
+            Some("1 + 1"),
+            &sample_risk(),
+        );
+        let second = format_browser_approval_prompt(
+            "execute_js",
+            "https://example.com",
+            None,
+            None,
+            Some("2 + 2"),
+            &sample_risk(),
+        );
+        assert_ne!(first, second);
+        assert!(first.contains("5 bytes"));
+        assert!(second.contains("5 bytes"));
     }
 }

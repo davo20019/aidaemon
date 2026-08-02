@@ -154,7 +154,7 @@ pub fn compact_embedded_json(text: &str) -> Option<String> {
 }
 
 /// Whether a line is harness-injected scaffolding (truncation notices,
-/// [SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
+/// \[SYSTEM] coaching, diagnostics, untrusted-data envelopes) rather than real
 /// tool output. Such lines are addressed to the model and must never be
 /// mistaken for error content or shipped to the user.
 pub fn is_internal_scaffolding_line(line: &str) -> bool {

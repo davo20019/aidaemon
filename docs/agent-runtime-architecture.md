@@ -210,6 +210,7 @@ prompt and not a standing trusted session:
 ```text
 owner Mandate vN
   objective | constraints | success/stop conditions | authority envelope
+  owner-pinned strategy snapshot
              |
              v
 leased review -> observations/beliefs -> ACT | WAIT | ASK | STOP
@@ -234,6 +235,11 @@ This combines established patterns without giving the model protocol authority:
   mutation-effect, target, and action-count envelope, checked by the
   deterministic dispatcher rather than the prompt.
 
+A mandate may also pin one installed skill as an immutable, content-addressed
+strategy snapshot. The snapshot informs how the worker reasons, but never adds
+tools, targets, effects, quota, or any other authority. Later edits to the
+installed skill do not silently change an already-confirmed delegation.
+
 The model may decide that an action is worthwhile, but the kernel grants no
 mutation until that run has committed ACT against the current mandate version.
 The grant is bound to the mandate, decision cycle, canonical tool arguments, and
@@ -254,10 +260,15 @@ boundary. Revocation cannot undo an external request that was already issued,
 so unresolved reserved actions enter reconciliation instead of being replayed.
 
 WAIT is a first-class successful outcome: it advances the adaptive review clock
-without manufacturing work or notifying the owner. ASK pauses the controller
-and emits one concrete question. STOP completes the mandate. A failed cycle is
-retried within its owner-approved timing bounds, while ambiguous external
-effects remain subject to the ordinary idempotency/reconciliation rules.
+without manufacturing work or notifying the owner. ASK creates a typed
+`awaiting_answer` suspension and emits one concrete question; answering that
+question cannot accidentally resolve an ambiguous side effect. Lease loss,
+review failure, and unresolved mutations use distinct typed suspensions and
+require their matching recovery action. STOP completes the mandate only when it
+names the exact owner-authored success or stop condition (or a typed safety
+termination); success/stop completion must cite successful, same-run typed
+receipts. A failed cycle is retried within its owner-approved timing bounds,
+while ambiguous external effects require an explicit, audited reconciliation.
 
 V1 deliberately exposes a narrow autonomous execution surface:
 
@@ -282,17 +293,18 @@ V1 deliberately exposes a narrow autonomous execution surface:
   exact profile name and stable account ID, but not an immutable credential
   generation, so this operational pause/reconfirmation is a required boundary;
 - mandate workers use a fixed isolated prompt. They do not inherit a private
-  session persona, user memory, custom skills, project instructions,
+  session persona, user memory, unpinned skills, project instructions,
   checkpoints, result spill, or global learning/reflection channels;
 - canonical mandate turns carry durable execution provenance. Completion-time
   fact extraction and summaries, periodic memory/episode/activity jobs, and
   delayed event consolidation all reject that provenance before global writes,
   embeddings, or auxiliary model calls;
 - continuity is limited to a byte-bounded, typed view of the same mandate's
-  recent outcomes, receipts, and quota state. Generated rationale, questions,
-  task prose, tool bodies, errors, and cross-mandate history are excluded and
-  cannot become authority. Adaptive durable `LearningNote` synthesis remains
-  future work rather than silently reusing the daemon's global learning path;
+  recent outcomes, receipts, quota state, and evidence-linked learning notes.
+  Every learning note must cite successful structured receipts from that same
+  mandate and remains advisory: it cannot broaden the authority envelope.
+  Generated rationale, questions, task prose, tool bodies, errors, and
+  cross-mandate history are excluded and cannot become authority;
 - success means satisfying the owner-authored criteria with typed evidence. It
   does not promise engagement, follower counts, availability of a third-party
   API, or any other external outcome.

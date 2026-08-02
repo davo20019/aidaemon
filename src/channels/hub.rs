@@ -355,6 +355,7 @@ impl ChannelHub {
                 risk_level,
                 warnings,
                 permission_mode,
+                false,
             )
             .await
     }
@@ -469,7 +470,8 @@ impl ChannelHub {
                                 }
                             }
                         }
-                        ApprovalKind::Command => {
+                        ApprovalKind::Command | ApprovalKind::CommandOnce => {
+                            let one_time_only = matches!(request.kind, ApprovalKind::CommandOnce);
                             match ch
                                 .request_approval(
                                     &routed_session,
@@ -477,10 +479,24 @@ impl ChannelHub {
                                     request.risk_level,
                                     &request.warnings,
                                     request.permission_mode,
+                                    one_time_only,
                                 )
                                 .await
                             {
-                                Ok(resp) => Some(resp),
+                                Ok(resp) => Some(if one_time_only {
+                                    // Enforce the one-shot boundary even if an
+                                    // older or forged channel callback returns a
+                                    // broader choice that is no longer offered.
+                                    match resp {
+                                        ApprovalResponse::AllowSession
+                                        | ApprovalResponse::AllowAlways => {
+                                            ApprovalResponse::AllowOnce
+                                        }
+                                        other => other,
+                                    }
+                                } else {
+                                    resp
+                                }),
                                 Err(e) => {
                                     warn!("Approval request failed on {}: {}", ch.name(), e);
                                     had_error = true;
@@ -902,6 +918,7 @@ mod tests {
             _risk_level: RiskLevel,
             _warnings: &[String],
             _permission_mode: PermissionMode,
+            _one_time_only: bool,
         ) -> anyhow::Result<ApprovalResponse> {
             self.approvals.lock().await.push(session_id.to_string());
             Ok(ApprovalResponse::AllowOnce)
@@ -955,6 +972,7 @@ mod tests {
             _risk_level: RiskLevel,
             _warnings: &[String],
             _permission_mode: PermissionMode,
+            _one_time_only: bool,
         ) -> anyhow::Result<ApprovalResponse> {
             Ok(ApprovalResponse::AllowOnce)
         }
@@ -1000,6 +1018,7 @@ mod tests {
             _risk_level: RiskLevel,
             _warnings: &[String],
             _permission_mode: PermissionMode,
+            _one_time_only: bool,
         ) -> anyhow::Result<ApprovalResponse> {
             Ok(ApprovalResponse::AllowOnce)
         }

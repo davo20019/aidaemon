@@ -272,7 +272,7 @@ mod tests {
         let (store, _database) = test_store().await;
         let mut tx = store.pool.begin().await.unwrap();
         assert!(enqueue_mandate_run_notification_on_connection(
-            &mut *tx,
+            &mut tx,
             &notice(MandateRunNotificationKind::ActSatisfied),
         )
         .await
@@ -294,7 +294,7 @@ mod tests {
         let act_notice = notice(MandateRunNotificationKind::ActSatisfied);
         let mut tx = store.pool.begin().await.unwrap();
         assert!(
-            enqueue_mandate_run_notification_on_connection(&mut *tx, &act_notice)
+            enqueue_mandate_run_notification_on_connection(&mut tx, &act_notice)
                 .await
                 .unwrap()
         );
@@ -302,7 +302,7 @@ mod tests {
 
         let mut retry = store.pool.begin().await.unwrap();
         assert!(
-            !enqueue_mandate_run_notification_on_connection(&mut *retry, &act_notice)
+            !enqueue_mandate_run_notification_on_connection(&mut retry, &act_notice)
                 .await
                 .unwrap()
         );
@@ -320,7 +320,7 @@ mod tests {
 
         let mut conflicting_retry = store.pool.begin().await.unwrap();
         let conflict = enqueue_mandate_run_notification_on_connection(
-            &mut *conflicting_retry,
+            &mut conflicting_retry,
             &notice(MandateRunNotificationKind::Ask),
         )
         .await;
@@ -333,7 +333,7 @@ mod tests {
         let (store, _database) = test_store().await;
         let notice = notice(MandateRunNotificationKind::Ask);
         let mut tx = store.pool.begin().await.unwrap();
-        enqueue_mandate_run_notification_on_connection(&mut *tx, &notice)
+        enqueue_mandate_run_notification_on_connection(&mut tx, &notice)
             .await
             .unwrap();
         tx.commit().await.unwrap();

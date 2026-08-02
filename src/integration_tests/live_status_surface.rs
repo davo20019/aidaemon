@@ -78,6 +78,7 @@ mod live_status_surface_tests {
             _risk_level: RiskLevel,
             _warnings: &[String],
             _permission_mode: PermissionMode,
+            _one_time_only: bool,
         ) -> anyhow::Result<ApprovalResponse> {
             Ok(ApprovalResponse::AllowOnce)
         }

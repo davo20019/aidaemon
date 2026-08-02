@@ -53,7 +53,6 @@ enum MandateGateDecision {
 async fn mandate_gate_for_tool_call(
     agent: &Agent,
     goal_id: &str,
-    task_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     effective_arguments: &str,
@@ -95,7 +94,7 @@ async fn mandate_gate_for_tool_call(
             reason: "mandate_role_fence_missing".to_string(),
         });
     };
-    if task_id != fence.worker_task_id {
+    if agent.task_id.as_deref() != Some(fence.worker_task_id.as_str()) {
         return Ok(MandateGateDecision::Deny {
             reason: "mandate_worker_identity_mismatch".to_string(),
         });
@@ -199,7 +198,6 @@ async fn mandate_gate_for_tool_call(
 
 fn mandate_mutation_outcome_projection(
     fence: &MandateExecutionFence,
-    task_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     call_semantics: &ToolCallSemantics,
@@ -251,7 +249,7 @@ fn mandate_mutation_outcome_projection(
     crate::traits::MandateMutationOutcomeProjection {
         grant: grant.clone(),
         goal_run_id: fence.goal_run_id.clone(),
-        task_id: task_id.to_string(),
+        task_id: fence.worker_task_id.clone(),
         task_attempt_id: fence.attempt_id.clone(),
         tool_call_id: tool_call_id.to_string(),
         status,
@@ -1665,7 +1663,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             match mandate_gate_for_tool_call(
                 agent,
                 goal_id,
-                task_id,
                 &tc.id,
                 &tc.name,
                 &effective_arguments,
@@ -2491,7 +2488,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             .map(|(grant, fence)| {
                 mandate_mutation_outcome_projection(
                     fence,
-                    task_id,
                     &tc.id,
                     &tc.name,
                     &call_semantics,
@@ -2499,6 +2495,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     &receipt,
                 )
             });
+        let receipt_task_id = agent
+            .mandate_execution
+            .as_ref()
+            .map_or(task_id, |fence| fence.worker_task_id.as_str());
         agent
             .append_tool_message_with_receipt_event_policy(
                 emitter,
@@ -2510,7 +2510,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 } else {
                     None
                 },
-                Some(task_id),
+                Some(receipt_task_id),
                 result_metadata.persistent_output.as_deref(),
                 Some(receipt),
             )

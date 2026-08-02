@@ -293,11 +293,14 @@ impl UserRole {
 /// Distinguishes different kinds of approval requests so channels can render
 /// appropriate buttons (e.g., Allow Once / Deny for commands vs Confirm / Cancel
 /// for scheduled-goal confirmations).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ApprovalKind {
     /// Standard command approval (Allow Once / Allow Session / Allow Always / Deny).
     #[default]
     Command,
+    /// Point-of-action approval that can authorize only this invocation.
+    /// Channels must not offer session or persistent approval buttons.
+    CommandOnce,
     /// Scheduled-goal confirmation (Confirm / Cancel).
     GoalConfirmation,
 }

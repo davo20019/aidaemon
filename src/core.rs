@@ -1753,6 +1753,9 @@ treating an error as active — stale log lines may only describe a past failure
 | Get system specs, current time/date | system_info, terminal | — |
 | Store user info | remember_fact | — |
 | User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
+| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
+| Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
+| Fixed-time or fixed-cadence work where the cadence itself is the instruction | scheduled goal | manage_memories |
 | List/cancel/pause/resume/retry/diagnose scheduled goals (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
 | Trigger scheduled goals now + inspect run failures | scheduled_goal_runs | terminal (sqlite), browser |
 | Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |
@@ -1784,7 +1787,13 @@ For other errors, tell the user what went wrong and suggest a fix.
 When a user explicitly asks for something to be done at a specific time, regularly, \
 or on a recurring basis, help them set up a scheduled task. \
 Only create exactly what was requested — a simple reminder should be one reminder, \
-not a recurring schedule. Never add extra schedules the user didn't ask for.
+not a recurring schedule. Never add extra schedules the user didn't ask for. \
+Before scheduling, choose the execution mode semantically from the user's desired control model: \
+use a one-shot task for one finite outcome, a schedule when the time/cadence is itself fixed, and an \
+owner-confirmed mandate when the user delegates an ongoing objective and expects the agent to choose \
+when to observe, act, wait, ask, and adapt. Do not use keyword filters. For a mandate, call \
+manage_mandates(action=\"draft\") first, resolve missing integration identity/target fields, show the \
+complete proposal through create confirmation, and never infer authority from the objective.
 
 ## Behavior
 - **Ask first, search second — BUT act when told to.** When unsure what the user means, ask them to clarify. \
@@ -2205,6 +2214,11 @@ primary = "gpt-4o"
         assert!(prompt.contains(
             "| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |"
         ));
+        assert!(prompt.contains(
+            "| Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates"
+        ));
+        assert!(prompt.contains("Do not use keyword filters"));
+        assert!(prompt.contains("manage_mandates(action=\"draft\")"));
     }
 
     #[test]

@@ -56,8 +56,10 @@ pub(super) fn risk_header(risk_level: RiskLevel) -> (&'static str, &'static str,
 }
 
 /// Hint text explaining what the persistent-approval button does.
-pub(super) fn allow_button_hint(use_session_button: bool) -> &'static str {
-    if use_session_button {
+pub(super) fn allow_button_hint(use_session_button: bool, one_time_only: bool) -> &'static str {
+    if one_time_only {
+        "This approval applies only to this action; you will be asked again for another sensitive action."
+    } else if use_session_button {
         "\"Allow Session\" means you won't be asked again until the daemon restarts."
     } else {
         "\"Allow Always\" means you won't be asked again for this type of action."
@@ -95,6 +97,10 @@ fn strip_approval_footer(text: &str) -> String {
         "\n\n*\"Allow Always\"",
         "\n\n_\"Allow Session\"",
         "\n\n_\"Allow Always\"",
+        "\n\nThis approval applies only",
+        "\n\n<i>This approval applies only",
+        "\n\n*This approval applies only",
+        "\n\n_This approval applies only",
     ] {
         if let Some(idx) = body.find(marker) {
             body.truncate(idx);
@@ -132,8 +138,14 @@ fn truncate_command(command: &str) -> String {
 pub(super) fn build_approval_keyboard(
     approval_id: &str,
     use_session_button: bool,
+    one_time_only: bool,
 ) -> InlineKeyboardMarkup {
-    if use_session_button {
+    if one_time_only {
+        InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("Allow Once", format!("approve:once:{}", approval_id)),
+            InlineKeyboardButton::callback("Deny", format!("approve:deny:{}", approval_id)),
+        ]])
+    } else if use_session_button {
         InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback("Allow Once", format!("approve:once:{}", approval_id)),
             InlineKeyboardButton::callback(
@@ -160,6 +172,7 @@ pub(super) fn build_approval_message_text(
     risk_level: RiskLevel,
     warnings: &[String],
     use_session_button: bool,
+    one_time_only: bool,
 ) -> String {
     let display_cmd = truncate_command(command);
     let escaped_cmd = html_escape(&display_cmd);
@@ -179,7 +192,7 @@ pub(super) fn build_approval_message_text(
 
     text.push_str(&format!(
         "\n\n<i>{}</i>",
-        html_escape(allow_button_hint(use_session_button))
+        html_escape(allow_button_hint(use_session_button, one_time_only))
     ));
 
     text
@@ -191,6 +204,7 @@ pub(super) fn build_approval_message_discord(
     risk_level: RiskLevel,
     warnings: &[String],
     use_session_button: bool,
+    one_time_only: bool,
 ) -> String {
     let display_cmd = truncate_command(command);
     let (risk_icon, risk_label, risk_subtitle) = risk_header(risk_level);
@@ -207,7 +221,10 @@ pub(super) fn build_approval_message_discord(
         }
     }
 
-    text.push_str(&format!("\n\n*{}*", allow_button_hint(use_session_button)));
+    text.push_str(&format!(
+        "\n\n*{}*",
+        allow_button_hint(use_session_button, one_time_only)
+    ));
 
     text
 }
@@ -218,6 +235,7 @@ pub(super) fn build_approval_message_slack(
     risk_level: RiskLevel,
     warnings: &[String],
     use_session_button: bool,
+    one_time_only: bool,
 ) -> String {
     let display_cmd = truncate_command(command);
     let (risk_icon, risk_label, risk_subtitle) = risk_header(risk_level);
@@ -234,7 +252,10 @@ pub(super) fn build_approval_message_slack(
         }
     }
 
-    text.push_str(&format!("\n\n_{}_", allow_button_hint(use_session_button)));
+    text.push_str(&format!(
+        "\n\n_{}_",
+        allow_button_hint(use_session_button, one_time_only)
+    ));
 
     text
 }
@@ -279,6 +300,7 @@ mod tests {
             RiskLevel::Medium,
             &[],
             false,
+            false,
         );
         let final_msg = finalize_approval_message(&prompt, &ApprovalResponse::AllowAlways);
         assert!(!final_msg.contains("Allow Always\" means"));
@@ -289,8 +311,28 @@ mod tests {
 
     #[test]
     fn finalize_denied_shows_denied_status() {
-        let prompt = build_approval_message_text("rm -rf /", RiskLevel::Critical, &[], true);
+        let prompt = build_approval_message_text("rm -rf /", RiskLevel::Critical, &[], true, false);
         let final_msg = finalize_approval_message(&prompt, &ApprovalResponse::Deny);
         assert!(final_msg.contains("❌ Denied"));
+    }
+
+    #[test]
+    fn one_time_only_prompt_has_no_persistent_choice() {
+        let keyboard = build_approval_keyboard("approval-1", false, true);
+        let serialized = serde_json::to_string(&keyboard).unwrap();
+        assert!(serialized.contains("Allow Once"));
+        assert!(serialized.contains("Deny"));
+        assert!(!serialized.contains("Allow Always"));
+        assert!(!serialized.contains("Allow Session"));
+
+        let prompt = build_approval_message_text(
+            "Run JavaScript on https://example.com (10 bytes)",
+            RiskLevel::High,
+            &[],
+            false,
+            true,
+        );
+        assert!(prompt.contains("applies only to this action"));
+        assert!(!prompt.contains("Allow Always"));
     }
 }

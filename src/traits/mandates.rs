@@ -12,6 +12,9 @@ const MAX_DECISION_OBSERVATIONS_JSON: usize = 6 * 1024;
 const MAX_DECISION_QUESTION_TEXT: usize = 500;
 const MAX_INTENTION_DESCRIPTION_TEXT: usize = 1024;
 const MAX_INTENTION_METADATA_TEXT: usize = 4 * 1024;
+const MAX_MANDATE_STRATEGY_BODY_TEXT: usize = 16 * 1024;
+const MAX_MANDATE_LEARNING_NOTE_TEXT: usize = 1024;
+const MAX_MANDATE_EVIDENCE_REFS: usize = 16;
 
 fn text_within(value: &str, max: usize) -> bool {
     value.chars().count() <= max && value.len() <= max
@@ -116,6 +119,13 @@ pub struct Mandate {
     pub objective: String,
     pub status: MandateStatus,
     pub authority: MandateAuthority,
+    /// Owner-confirmed, immutable strategy material. This may guide how the
+    /// objective is pursued, but it never contributes authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<MandateStrategySnapshot>,
+    /// Typed reason for a non-active, non-terminal lifecycle state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension: Option<MandateSuspension>,
     pub constraints: Vec<String>,
     pub success_criteria: Vec<String>,
     pub stop_conditions: Vec<String>,
@@ -163,6 +173,8 @@ impl Mandate {
             objective: objective.trim().to_string(),
             status: MandateStatus::Active,
             authority,
+            strategy: None,
+            suspension: None,
             constraints: Vec::new(),
             success_criteria: Vec::new(),
             stop_conditions: Vec::new(),
@@ -209,6 +221,12 @@ impl Mandate {
                     .to_string(),
             );
         }
+        if let Some(strategy) = self.strategy.as_ref() {
+            strategy.validate()?;
+        }
+        if let Some(suspension) = self.suspension.as_ref() {
+            suspension.validate()?;
+        }
 
         let mut total_chars = 0usize;
         let mut total_bytes = 0usize;
@@ -236,6 +254,128 @@ impl Mandate {
                     .to_string(),
             );
         }
+        Ok(())
+    }
+}
+
+/// A content-addressed copy of one owner-approved skill. The snapshot body is
+/// persisted so a later filesystem edit cannot silently change a live mandate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateStrategySnapshot {
+    pub skill_name: String,
+    pub snapshot_version: u16,
+    pub content_sha256: String,
+    pub description: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl MandateStrategySnapshot {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.snapshot_version != Self::SCHEMA_VERSION {
+            return Err("unsupported mandate strategy snapshot version".to_string());
+        }
+        if !canonical_text_within(&self.skill_name, 256) {
+            return Err(
+                "strategy skill_name must be canonical text of at most 256 bytes".to_string(),
+            );
+        }
+        if self.content_sha256.len() != 64
+            || !self
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("strategy content_sha256 must be a 64-character hex digest".to_string());
+        }
+        if !text_within(&self.description, 1024)
+            || !canonical_text_within(&self.body, MAX_MANDATE_STRATEGY_BODY_TEXT)
+        {
+            return Err(
+                "strategy description/body exceed their bounded canonical form".to_string(),
+            );
+        }
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|source| !canonical_text_within(source, 512))
+        {
+            return Err("strategy source exceeds its canonical 512-byte bound".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateSuspensionKind {
+    OwnerPaused,
+    AwaitingAnswer,
+    ReconciliationRequired,
+    ExecutionLeaseLost,
+    ReviewFailed,
+    AuthorityRevokedWithUnresolvedMutation,
+}
+
+impl MandateSuspensionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerPaused => "owner_paused",
+            Self::AwaitingAnswer => "awaiting_answer",
+            Self::ReconciliationRequired => "reconciliation_required",
+            Self::ExecutionLeaseLost => "execution_lease_lost",
+            Self::ReviewFailed => "review_failed",
+            Self::AuthorityRevokedWithUnresolvedMutation => {
+                "authority_revoked_with_unresolved_mutation"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateSuspension {
+    pub kind: MandateSuspensionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_cycle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_run_id: Option<String>,
+    pub created_at: String,
+}
+
+impl MandateSuspension {
+    pub fn new(kind: MandateSuspensionKind, reason_code: Option<String>) -> Self {
+        Self {
+            kind,
+            reason_code,
+            decision_cycle_id: None,
+            goal_run_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .reason_code
+            .as_deref()
+            .is_some_and(|value| !canonical_text_within(value, 256))
+            || self
+                .decision_cycle_id
+                .as_deref()
+                .is_some_and(|value| !canonical_text_within(value, 256))
+            || self
+                .goal_run_id
+                .as_deref()
+                .is_some_and(|value| !canonical_text_within(value, 256))
+        {
+            return Err("mandate suspension identifiers exceed their canonical bounds".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "mandate suspension created_at must be RFC3339".to_string())?;
         Ok(())
     }
 }
@@ -547,6 +687,42 @@ pub enum MandateDecisionOutcome {
     Stop,
 }
 
+/// Why a STOP decision may close a mandate. Evidence-dependent reasons must
+/// cite one or more current-run structured tool receipts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateTerminationKind {
+    SuccessCriteriaSatisfied,
+    StopConditionMet,
+    SafetyTermination,
+}
+
+impl MandateTerminationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SuccessCriteriaSatisfied => "success_criteria_satisfied",
+            Self::StopConditionMet => "stop_condition_met",
+            Self::SafetyTermination => "safety_termination",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "success_criteria_satisfied" => Some(Self::SuccessCriteriaSatisfied),
+            "stop_condition_met" => Some(Self::StopConditionMet),
+            "safety_termination" => Some(Self::SafetyTermination),
+            _ => None,
+        }
+    }
+
+    pub const fn requires_receipt_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::SuccessCriteriaSatisfied | Self::StopConditionMet
+        )
+    }
+}
+
 impl MandateDecisionOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -580,7 +756,17 @@ pub struct MandateDecisionCycle {
     pub rationale: String,
     /// Sourced observations used by the deliberator, serialized as JSON.
     pub belief_snapshot: Option<String>,
+    /// Exact current-run tool-call receipts that support the belief or STOP
+    /// decision. These identifiers are verified against durable events before
+    /// the decision is committed.
+    #[serde(default)]
+    pub evidence_receipt_ids: Vec<String>,
     pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_kind: Option<MandateTerminationKind>,
+    /// Exact owner-authored success/stop entry matched by a STOP decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_match: Option<String>,
     pub reconsider_at: Option<String>,
     /// Number of mutation attempts authorized during this cycle.
     pub action_attempts: i64,
@@ -605,7 +791,10 @@ impl MandateDecisionCycle {
             outcome,
             rationale: rationale.trim().to_string(),
             belief_snapshot: None,
+            evidence_receipt_ids: Vec::new(),
             question: None,
+            termination_kind: None,
+            termination_match: None,
             reconsider_at: None,
             action_attempts: 0,
             created_at: now.clone(),
@@ -650,7 +839,103 @@ impl MandateDecisionCycle {
                 );
             }
         }
+        if self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self.evidence_receipt_ids.iter().any(|value| {
+                !canonical_text_within(value, 256)
+                    || !value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.')
+                    })
+            })
+        {
+            return Err("decision evidence receipt IDs exceed their canonical bounds".to_string());
+        }
+        if let Some(matched) = self.termination_match.as_deref() {
+            if !canonical_text_within(matched, MAX_MANDATE_POLICY_ENTRY_TEXT) {
+                return Err("decision termination match exceeds its canonical bound".to_string());
+            }
+        }
         Ok(())
+    }
+}
+
+/// Bounded, mandate-local strategy learning. Notes are advisory continuity,
+/// never authority, and every note must cite durable evidence from this same
+/// mandate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateLearningNote {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub learned_in_decision_cycle_id: String,
+    pub summary: String,
+    pub evidence_receipt_ids: Vec<String>,
+    pub created_at: String,
+}
+
+impl MandateLearningNote {
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        decision_cycle_id: &str,
+        summary: &str,
+        evidence_receipt_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            learned_in_decision_cycle_id: decision_cycle_id.to_string(),
+            summary: summary.trim().to_string(),
+            evidence_receipt_ids,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.id, 256)
+            || !canonical_text_within(&self.mandate_id, 256)
+            || self.mandate_version <= 0
+            || !canonical_text_within(&self.learned_in_decision_cycle_id, 256)
+            || !canonical_text_within(&self.summary, MAX_MANDATE_LEARNING_NOTE_TEXT)
+            || self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self
+                .evidence_receipt_ids
+                .iter()
+                .any(|value| !canonical_text_within(value, 256))
+        {
+            return Err("invalid bounded mandate learning note".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|_| "mandate learning note created_at must be RFC3339".to_string())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateReconciliationResolution {
+    ConfirmedEffectOccurred,
+    ConfirmedNoEffect,
+    AbandonAttempt,
+}
+
+impl MandateReconciliationResolution {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfirmedEffectOccurred => "confirmed_effect_occurred",
+            Self::ConfirmedNoEffect => "confirmed_no_effect",
+            Self::AbandonAttempt => "abandon_attempt",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "confirmed_effect_occurred" => Some(Self::ConfirmedEffectOccurred),
+            "confirmed_no_effect" => Some(Self::ConfirmedNoEffect),
+            "abandon_attempt" => Some(Self::AbandonAttempt),
+            _ => None,
+        }
     }
 }
 

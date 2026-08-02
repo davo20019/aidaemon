@@ -2883,7 +2883,6 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             )
             .await
@@ -2922,7 +2921,6 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             )
             .await
@@ -2968,7 +2966,6 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             )
             .await
@@ -3062,7 +3059,6 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             )
             .await
@@ -3109,7 +3105,6 @@ mod tests {
                     // authenticated observation, including its stable account.
                     mandate_preapproved: true,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             ),
         )
@@ -3175,7 +3170,6 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: true,
                     mandate_execution: true,
-                    ..Default::default()
                 },
             ),
         )

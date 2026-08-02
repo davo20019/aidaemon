@@ -1679,6 +1679,8 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             status TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'paused', 'awaiting_input', 'completed', 'cancelled')),
             authority_json TEXT NOT NULL,
+            strategy_json TEXT,
+            suspension_json TEXT,
             constraints_json TEXT NOT NULL DEFAULT '[]',
             success_criteria_json TEXT NOT NULL DEFAULT '[]',
             stop_conditions_json TEXT NOT NULL DEFAULT '[]',
@@ -1747,7 +1749,14 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             outcome TEXT NOT NULL CHECK (outcome IN ('act', 'wait', 'ask', 'stop')),
             rationale TEXT NOT NULL,
             belief_snapshot TEXT,
+            evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'
+                CHECK (json_valid(evidence_receipt_ids_json)),
             question TEXT,
+            termination_kind TEXT
+                CHECK (termination_kind IS NULL OR termination_kind IN (
+                    'success_criteria_satisfied', 'stop_condition_met', 'safety_termination'
+                )),
+            termination_match TEXT,
             reconsider_at TEXT,
             action_attempts INTEGER NOT NULL DEFAULT 0 CHECK (action_attempts >= 0),
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1770,6 +1779,24 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN confirmed_at TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN strategy_json TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN suspension_json TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(
+        "ALTER TABLE mandate_decision_cycles
+         ADD COLUMN evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN termination_kind TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN termination_match TEXT")
         .execute(pool)
         .await;
     sqlx::query(
@@ -1796,6 +1823,19 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
                    )
                )
            )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE mandates
+         SET suspension_json = json_object(
+             'kind', CASE WHEN status = 'paused' THEN 'owner_paused' ELSE 'review_failed' END,
+             'reason_code', 'legacy_state_backfill',
+             'created_at', COALESCE(updated_at, created_at, datetime('now'))
+         )
+         WHERE suspension_json IS NULL
+           AND confirmed_at IS NOT NULL
+           AND status IN ('paused', 'awaiting_input')",
     )
     .execute(pool)
     .await?;
@@ -1834,6 +1874,45 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             completed_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_learning_notes (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            learned_in_decision_cycle_id TEXT NOT NULL
+                REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            summary TEXT NOT NULL,
+            evidence_receipt_ids_json TEXT NOT NULL CHECK (json_valid(evidence_receipt_ids_json)),
+            created_at TEXT NOT NULL,
+            UNIQUE(mandate_id, learned_in_decision_cycle_id, summary)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_learning_notes_recent
+         ON mandate_learning_notes(mandate_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_reconciliations (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            suspended_version INTEGER NOT NULL CHECK (suspended_version > 0),
+            suspension_kind TEXT NOT NULL,
+            resolution TEXT NOT NULL CHECK (resolution IN (
+                'confirmed_effect_occurred', 'confirmed_no_effect', 'abandon_attempt'
+            )),
+            owner_guidance TEXT NOT NULL,
+            resolved_by_session TEXT NOT NULL,
+            resolved_at TEXT NOT NULL
         )",
     )
     .execute(pool)

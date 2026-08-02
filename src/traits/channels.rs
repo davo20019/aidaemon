@@ -71,6 +71,8 @@ pub trait Channel: Send + Sync {
     ///
     /// The `risk_level`, `warnings`, and `permission_mode` parameters provide
     /// context about why approval is being requested and which buttons to show.
+    /// `one_time_only` suppresses session/persistent choices for point-of-action
+    /// approvals whose grant is deliberately not reusable.
     async fn request_approval(
         &self,
         session_id: &str,
@@ -78,6 +80,7 @@ pub trait Channel: Send + Sync {
         risk_level: RiskLevel,
         warnings: &[String],
         permission_mode: PermissionMode,
+        one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse>;
 
     /// Request user confirmation for a scheduled goal. Blocks until the user

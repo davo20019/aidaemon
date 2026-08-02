@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.36] - 2026-08-02
+
+### Added
+
+- **Natural-language delegation now reaches the durable autonomy path.** The tool-selection guide semantically distinguishes one-shot work, fixed schedules, and ongoing stewardship without phrase-list routing. Ongoing requests are drafted before confirmation, and confirmation renders the complete objective, constraints, success/stop conditions, observation/action scope, effects, targets, quotas, cooldown, timing, expiry, and budgets.
+- **Owner-pinned mandate strategy and local learning.** A confirmed mandate may embed an immutable, content-addressed snapshot of one installed skill as advisory strategy without granting authority. Evidence-linked learning notes are restricted to successful structured receipts from the same mandate and are supplied only to that mandate's later reviews.
+- **Safe structured browser inspection.** `inspect_page` returns a bounded title/text/link/form/iframe snapshot without caller-supplied JavaScript, URL queries, form values, cookies, or storage, reducing the need for arbitrary page scripts during research.
+
+### Changed
+
+- **Mandate suspension and termination are typed.** Owner pause, owner question, reconciliation, lease loss, review failure, and authority revocation have distinct recovery paths. STOP must identify a typed termination reason and exact owner-authored condition; successful/condition-based termination requires same-run receipt evidence.
+- **Arbitrary browser JavaScript is always one-shot approved.** Telegram, Discord, and Slack approval surfaces omit persistent choices for `execute_js`; the hub also coerces stale or forged persistent responses back to `AllowOnce`. Approval prompts identify scripts by byte count and a short digest without exposing script contents.
+
+### Fixed
+
+- **Mutation completion projection is crash-safe.** Appending the canonical successful tool receipt and projecting its matching mandate mutation reservation now commit in one database transaction, closing the event-to-ledger crash window.
+
 ## [0.11.35] - 2026-08-02
 
 ### Changed
