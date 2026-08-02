@@ -43,7 +43,7 @@ impl ManageMcpTool {
                 warnings: vec!["This will spawn an external MCP server process".to_string()],
                 permission_mode: PermissionMode::Default,
                 response_tx,
-                kind: Default::default(),
+                kind: crate::types::ApprovalKind::CommandOnce,
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;

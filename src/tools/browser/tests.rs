@@ -1664,6 +1664,7 @@ async fn single_page_actions_use_active_tab() {
 struct ApprovalRecorder {
     commands: Arc<Mutex<Vec<String>>>,
     kinds: Arc<Mutex<Vec<ApprovalKind>>>,
+    permission_modes: Arc<Mutex<Vec<crate::tools::command_risk::PermissionMode>>>,
 }
 
 impl ApprovalRecorder {
@@ -1678,6 +1679,10 @@ impl ApprovalRecorder {
     async fn kinds(&self) -> Vec<ApprovalKind> {
         self.kinds.lock().await.clone()
     }
+
+    async fn permission_modes(&self) -> Vec<crate::tools::command_risk::PermissionMode> {
+        self.permission_modes.lock().await.clone()
+    }
 }
 
 /// Spawn a responder that replies to every approval request with `reply`,
@@ -1689,13 +1694,16 @@ fn spawn_responder(reply: ApprovalResponse) -> (ApprovalBroker, ApprovalRecorder
     let recorder = ApprovalRecorder {
         commands: Arc::new(Mutex::new(Vec::new())),
         kinds: Arc::new(Mutex::new(Vec::new())),
+        permission_modes: Arc::new(Mutex::new(Vec::new())),
     };
     let commands = recorder.commands.clone();
     let kinds = recorder.kinds.clone();
+    let permission_modes = recorder.permission_modes.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             commands.lock().await.push(req.command.clone());
             kinds.lock().await.push(req.kind);
+            permission_modes.lock().await.push(req.permission_mode);
             let _ = req.response_tx.send(reply.clone());
         }
     });
@@ -1710,13 +1718,16 @@ fn spawn_silent_responder() -> (ApprovalBroker, ApprovalRecorder) {
     let recorder = ApprovalRecorder {
         commands: Arc::new(Mutex::new(Vec::new())),
         kinds: Arc::new(Mutex::new(Vec::new())),
+        permission_modes: Arc::new(Mutex::new(Vec::new())),
     };
     let commands = recorder.commands.clone();
     let kinds = recorder.kinds.clone();
+    let permission_modes = recorder.permission_modes.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             commands.lock().await.push(req.command.clone());
             kinds.lock().await.push(req.kind);
+            permission_modes.lock().await.push(req.permission_mode);
             // Drop req (and its response_tx) without replying → the gate times out.
             drop(req);
         }
@@ -2033,6 +2044,124 @@ async fn session_approval_suppresses_second_navigation_prompt() {
             && calls_contains(&backend, &MockCall::Goto("https://b.example/".to_string())).await,
         "both navigations must reach the backend"
     );
+}
+
+/// PERSISTENT REUSE: an origin granted with AllowAlways is shared across
+/// internal agent sessions, which is required when a specialist tests a site
+/// and the parent agent later opens the same deployment URL.
+#[tokio::test]
+async fn persistent_navigation_origin_crosses_agent_sessions() {
+    let (tool, backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
+
+    tool.call(
+        &json!({
+            "action": "navigate",
+            "url": "https://site.example/first?secret=one",
+            "_session_id": "specialist:code:first"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tool.call(
+        &json!({
+            "action": "navigate",
+            "url": "https://site.example/second?secret=two",
+            "_session_id": "parent-session"
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recorder.count().await,
+        1,
+        "the same approved origin must not prompt again across agent sessions"
+    );
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("https://site.example/second?secret=two".to_string())
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn persistent_navigation_origin_survives_tool_restart() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    let (mut first, _backend, first_recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
+    first.approval_pool = Some(pool.clone());
+    first.initialize_persistent_approvals().await.unwrap();
+    first
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://persistent.example/first",
+                "_session_id": "first-agent"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_recorder.count().await, 1);
+
+    let (mut restarted, backend, restarted_recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+    restarted.approval_pool = Some(pool);
+    restarted.initialize_persistent_approvals().await.unwrap();
+    let out = restarted
+        .call(
+            &json!({
+                "action": "navigate",
+                "url": "https://persistent.example/after-restart",
+                "_session_id": "different-agent"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    assert!(!out.to_lowercase().contains("denied"), "{out}");
+    assert_eq!(restarted_recorder.count().await, 0);
+    assert!(
+        calls_contains(
+            &backend,
+            &MockCall::Goto("https://persistent.example/after-restart".to_string())
+        )
+        .await
+    );
+}
+
+/// Ordinary mutations do not have a safe durable scope, so their UI must offer
+/// session approval rather than claiming that "Allow Always" will persist.
+#[tokio::test]
+async fn ordinary_mutation_approval_is_session_only() {
+    let (tool, _backend, recorder) =
+        approving_tool(MockBackend::new(), ApprovalResponse::AllowAlways);
+
+    for session in ["specialist:one", "parent-session"] {
+        tool.call(
+            &json!({ "action": "click", "selector": "#menu", "_session_id": session }).to_string(),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(recorder.count().await, 2);
+    assert!(recorder
+        .permission_modes()
+        .await
+        .iter()
+        .all(|mode| *mode == crate::tools::command_risk::PermissionMode::Cautious));
 }
 
 /// POINT-OF-ACTION: every `execute_js` call prompts even after AllowSession —

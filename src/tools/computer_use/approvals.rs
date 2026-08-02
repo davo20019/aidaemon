@@ -78,7 +78,7 @@ impl ApprovalState {
     /// Ensure the user has approved aidaemon to operate `app` in this session.
     ///
     /// One combined prompt per app grants both inspection (screenshots) and
-    /// control (click/type). Persists for the session on Allow Always. This does
+    /// control (click/type). Persists for the session on Allow Session. This does
     /// NOT authorize consequential actions (send/delete/purchase/publish) — those
     /// are gated separately at point of action.
     pub async fn ensure_app(
@@ -118,9 +118,8 @@ impl ApprovalState {
         )
         .await?;
         match response {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {
+            ApprovalResponse::AllowOnce => Ok(()),
+            ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways => {
                 self.app_approved.lock().await.insert(key);
                 Ok(())
             }
@@ -180,7 +179,11 @@ async fn request_approval(
             session_id: session_id.to_string(),
             risk_level,
             warnings,
-            permission_mode: PermissionMode::Default,
+            permission_mode: if matches!(kind, crate::types::ApprovalKind::CommandOnce) {
+                PermissionMode::Default
+            } else {
+                PermissionMode::Cautious
+            },
             response_tx,
             kind,
         })
@@ -209,5 +212,68 @@ async fn request_approval(
                 "computer_use approval timed out after {timeout_secs}s"
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn approval_broker(response: ApprovalResponse) -> (ApprovalBroker, Arc<AtomicUsize>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApprovalRequest>(4);
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = request.response_tx.send(response.clone());
+            }
+        });
+        (ApprovalBroker::new(tx), count)
+    }
+
+    #[tokio::test]
+    async fn app_allow_once_does_not_become_session_approval() {
+        let state = ApprovalState::new();
+        let (broker, count) = approval_broker(ApprovalResponse::AllowOnce);
+        let config = ComputerUseConfig::default();
+
+        for task in ["task-1", "task-2"] {
+            state
+                .ensure_app(
+                    &broker,
+                    &config,
+                    "session",
+                    task,
+                    "com.example.App",
+                    "Example",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn app_allow_session_is_reused() {
+        let state = ApprovalState::new();
+        let (broker, count) = approval_broker(ApprovalResponse::AllowSession);
+        let config = ComputerUseConfig::default();
+
+        for task in ["task-1", "task-2"] {
+            state
+                .ensure_app(
+                    &broker,
+                    &config,
+                    "session",
+                    task,
+                    "com.example.App",
+                    "Example",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

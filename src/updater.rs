@@ -195,7 +195,7 @@ impl Updater {
                 ],
                 permission_mode: PermissionMode::Default,
                 response_tx,
-                kind: Default::default(),
+                kind: crate::types::ApprovalKind::CommandOnce,
             })
             .await;
 

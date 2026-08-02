@@ -6,14 +6,16 @@
 //! cycle, call [`authorize_mandate_action`], then atomically reserve a mutation
 //! attempt before carrying an allowed grant into the execution boundary.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::traits::{
     Mandate, MandateAuthorityGrant, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateMutationTarget, MandateStatus, ToolCallEffect, ToolCallSemantics, ToolMutationEffects,
-    ToolTargetHintKind,
+    MandateMutationTarget, MandateOperationKind, MandateOperationScope, MandateStatus,
+    ToolCallEffect, ToolCallSemantics, ToolMutationEffects, ToolTargetHintKind,
 };
 
 const ACTION_DIGEST_DOMAIN: &[u8] = b"aidaemon.mandate.action.v1\0";
@@ -59,6 +61,7 @@ pub(crate) enum MandateAuthorityDenial {
     UnsupportedCallSemantics,
     ObservationNotAllowed,
     ToolNotAllowed,
+    OperationNotAllowed,
     UnknownMutationEffect,
     MutationEffectNotAllowed,
     TargetRequired,
@@ -84,6 +87,7 @@ impl MandateAuthorityDenial {
             Self::UnsupportedCallSemantics => "unsupported_call_semantics",
             Self::ObservationNotAllowed => "observation_not_allowed",
             Self::ToolNotAllowed => "tool_not_allowed",
+            Self::OperationNotAllowed => "operation_not_allowed",
             Self::UnknownMutationEffect => "unknown_mutation_effect",
             Self::MutationEffectNotAllowed => "mutation_effect_not_allowed",
             Self::TargetRequired => "target_required",
@@ -187,25 +191,41 @@ pub(crate) fn authorize_mandate_action(
     if targets.is_empty() {
         return deny(MandateAuthorityDenial::TargetRequired);
     }
-    if !mandate.authority.allowed_target_prefixes.is_empty()
-        && targets.iter().any(|target| {
-            !mandate
-                .authority
-                .allowed_target_prefixes
+    if mandate.authority.uses_operation_scopes() {
+        if !mandate.authority.operation_scopes.iter().any(|scope| {
+            operation_scope_matches(
+                scope,
+                tool_name,
+                semantics,
+                call_mutates,
+                &effect_names,
+                &targets,
+            )
+        }) {
+            return deny(MandateAuthorityDenial::OperationNotAllowed);
+        }
+    } else {
+        if !mandate.authority.allowed_target_prefixes.is_empty()
+            && targets.iter().any(|target| {
+                !mandate
+                    .authority
+                    .allowed_target_prefixes
+                    .iter()
+                    .any(|prefix| target_is_within_scope(target, prefix))
+            })
+        {
+            return deny(MandateAuthorityDenial::TargetNotAllowed);
+        }
+        if call_mutates
+            && effect_names
                 .iter()
-                .any(|prefix| target_is_within_scope(target, prefix))
-        })
-    {
-        return deny(MandateAuthorityDenial::TargetNotAllowed);
-    }
-
-    if call_mutates {
-        if effect_names
-            .iter()
-            .any(|effect| !mandate.authority.allows_effect(effect))
+                .any(|effect| !mandate.authority.allows_effect(effect))
         {
             return deny(MandateAuthorityDenial::MutationEffectNotAllowed);
         }
+    }
+
+    if call_mutates {
         if decision_cycle.action_attempts
             >= i64::from(mandate.authority.max_mutating_actions_per_cycle)
         {
@@ -291,7 +311,16 @@ pub(crate) fn authorize_mandate_observation(
     if mandate.authority.allowed_target_prefixes.is_empty() {
         return Err(MandateAuthorityDenial::TargetRequired);
     }
-    if targets.iter().any(|target| {
+    if mandate.authority.uses_operation_scopes() {
+        if !mandate
+            .authority
+            .operation_scopes
+            .iter()
+            .any(|scope| operation_scope_matches(scope, tool_name, semantics, false, &[], &targets))
+        {
+            return Err(MandateAuthorityDenial::OperationNotAllowed);
+        }
+    } else if targets.iter().any(|target| {
         !mandate
             .authority
             .allowed_target_prefixes
@@ -534,6 +563,60 @@ fn canonical_targets(semantics: &ToolCallSemantics) -> Vec<CanonicalTarget> {
     targets.sort();
     targets.dedup();
     targets
+}
+
+fn operation_scope_matches(
+    scope: &MandateOperationScope,
+    tool_name: &str,
+    semantics: &ToolCallSemantics,
+    call_mutates: bool,
+    effect_names: &[&str],
+    targets: &[CanonicalTarget],
+) -> bool {
+    if scope.tool != tool_name
+        || semantics.operation != Some(scope.operation)
+        || scope.kind
+            != if call_mutates {
+                MandateOperationKind::Mutation
+            } else {
+                MandateOperationKind::Observation
+            }
+    {
+        return false;
+    }
+
+    let actual_effects = effect_names.iter().copied().collect::<BTreeSet<_>>();
+    let allowed_effects = scope
+        .mutation_effects
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_effects != allowed_effects {
+        return false;
+    }
+    if targets.is_empty()
+        || targets.iter().any(|target| {
+            !scope
+                .target_prefixes
+                .iter()
+                .any(|prefix| target_is_within_scope(target, prefix))
+        })
+    {
+        return false;
+    }
+
+    // Resource identities in a scope are requirements, not alternatives. A
+    // call cannot omit the owner-pinned auth profile or account and still
+    // match merely because its URL was allowed by the same tuple.
+    scope
+        .target_prefixes
+        .iter()
+        .filter(|prefix| !prefix.contains("://"))
+        .all(|required| {
+            targets
+                .iter()
+                .any(|target| target.kind == "resource_id" && target.value == *required)
+        })
 }
 
 /// Derive the content-safe audit fields persisted with a mutation reservation.
@@ -803,7 +886,10 @@ fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{MandateAuthority, ToolTargetHint};
+    use crate::traits::{
+        MandateAuthority, MandateOperationKind, MandateOperationScope, ToolCallOperation,
+        ToolTargetHint,
+    };
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
@@ -820,6 +906,7 @@ mod tests {
                 "external_delivery".to_string(),
             ],
             allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
+            operation_scopes: Vec::new(),
             max_mutating_actions_per_cycle: 2,
             max_mutating_actions_per_rolling_24h: 8,
             min_seconds_between_mutations: 900,
@@ -2066,6 +2153,97 @@ mod tests {
     }
 
     #[test]
+    fn operation_scopes_do_not_form_a_cross_product_and_require_bound_identity() {
+        let scopes = vec![
+            MandateOperationScope {
+                tool: "web_fetch".to_string(),
+                operation: ToolCallOperation::Get,
+                kind: MandateOperationKind::Observation,
+                target_prefixes: vec!["https://blog.aidaemon.ai/posts/".to_string()],
+                mutation_effects: Vec::new(),
+            },
+            MandateOperationScope {
+                tool: "http_request".to_string(),
+                operation: ToolCallOperation::Post,
+                kind: MandateOperationKind::Mutation,
+                target_prefixes: vec![
+                    "https://api.x.com/2/tweets".to_string(),
+                    "auth_profile:twitter".to_string(),
+                    "account:12345".to_string(),
+                ],
+                mutation_effects: vec![
+                    "remote_mutation".to_string(),
+                    "external_delivery".to_string(),
+                ],
+            },
+        ];
+        let mut mandate = mandate();
+        mandate.authority = MandateAuthority::from_operation_scopes(true, scopes, 1, 1, 900);
+        assert!(mandate.authority.validate().is_ok());
+        let cycle = cycle(&mandate);
+
+        let blog_read = ToolCallSemantics::observation()
+            .with_operation(ToolCallOperation::Get)
+            .with_target_hint(ToolTargetHintKind::Url, "https://blog.aidaemon.ai/posts/");
+        assert_eq!(
+            authorize_mandate_observation(
+                &mandate,
+                "web_fetch",
+                r#"{"url":"https://blog.aidaemon.ai/posts/"}"#,
+                &blog_read,
+                &now(),
+            ),
+            Ok(())
+        );
+
+        let blog_post = ToolCallSemantics::mutation_with(
+            ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::EXTERNAL_DELIVERY),
+        )
+        .with_operation(ToolCallOperation::Post)
+        .with_target_hint(ToolTargetHintKind::Url, "https://blog.aidaemon.ai/posts/");
+        assert_eq!(
+            decide(
+                &mandate,
+                &cycle,
+                "http_request",
+                r#"{"method":"POST","url":"https://blog.aidaemon.ai/posts/","body":"x"}"#,
+                &blog_post,
+            ),
+            MandateAuthorityDecision::Deny(MandateAuthorityDenial::OperationNotAllowed)
+        );
+
+        let unauthenticated_x_post = ToolCallSemantics::mutation_with(
+            ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::EXTERNAL_DELIVERY),
+        )
+        .with_operation(ToolCallOperation::Post)
+        .with_target_hint(ToolTargetHintKind::Url, "https://api.x.com/2/tweets");
+        assert_eq!(
+            decide(
+                &mandate,
+                &cycle,
+                "http_request",
+                r#"{"method":"POST","url":"https://api.x.com/2/tweets","body":"x"}"#,
+                &unauthenticated_x_post,
+            ),
+            MandateAuthorityDecision::Deny(MandateAuthorityDenial::OperationNotAllowed)
+        );
+
+        let authenticated_x_post = unauthenticated_x_post
+            .with_target_hint(ToolTargetHintKind::ResourceId, "auth_profile:twitter")
+            .with_target_hint(ToolTargetHintKind::ResourceId, "account:12345");
+        assert!(matches!(
+            decide(
+                &mandate,
+                &cycle,
+                "http_request",
+                r#"{"method":"POST","url":"https://api.x.com/2/tweets","auth_profile":"twitter","account_id":"12345","body":"x"}"#,
+                &authenticated_x_post,
+            ),
+            MandateAuthorityDecision::Allow(_)
+        ));
+    }
+
+    #[test]
     fn denial_codes_are_stable_machine_values() {
         assert_eq!(
             MandateAuthorityDenial::CycleBudgetExhausted.as_str(),
@@ -2078,6 +2256,10 @@ mod tests {
         assert_eq!(
             MandateAuthorityDenial::GrantMismatch.as_str(),
             "grant_mismatch"
+        );
+        assert_eq!(
+            MandateAuthorityDenial::OperationNotAllowed.as_str(),
+            "operation_not_allowed"
         );
     }
 }

@@ -316,7 +316,7 @@ impl ConfigManagerTool {
                 warnings: vec!["Modifying security-sensitive configuration".to_string()],
                 permission_mode: PermissionMode::Default,
                 response_tx,
-                kind: Default::default(),
+                kind: crate::types::ApprovalKind::CommandOnce,
             })
             .await
             .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -270,6 +272,23 @@ fn redact_url_for_display(url: &str) -> String {
     url[..cut].to_string()
 }
 
+/// Return the canonical public HTTP(S) origin eligible for a durable browser
+/// navigation grant. Grants never cover paths, queries, local files, or private
+/// network targets.
+fn durable_navigation_origin(action: &str, url: Option<&str>) -> Option<String> {
+    if !matches!(action, "navigate" | "new_tab") {
+        return None;
+    }
+    let url = url?;
+    policy::validate_network_url(url).ok()?;
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let origin = parsed.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
 /// User-facing description of a browser action for approval prompts.
 /// Never includes fill values or script bodies.
 fn format_browser_approval_prompt(
@@ -454,6 +473,10 @@ pub struct BrowserTool {
     action_timeout: Duration,
     /// Console logs and network load failures, scoped per session/tab.
     diagnostics: BrowserDiagnosticsStore,
+    /// Durable, origin-scoped navigation grants selected with "Allow Always".
+    /// Per-session mutation approval deliberately remains separate.
+    approval_pool: Option<SqlitePool>,
+    allowed_navigation_origins: tokio::sync::RwLock<HashSet<String>>,
 }
 
 /// Upper bound on the element-poll timeout, mirroring `BrowserConfig`'s
@@ -509,6 +532,7 @@ impl BrowserTool {
         media_tx: mpsc::Sender<MediaMessage>,
         approval_tx: ApprovalBroker,
         inbox_dir: impl Into<PathBuf>,
+        approval_pool: Option<SqlitePool>,
     ) -> Result<Self, String> {
         // Resolve + clamp the bounded timeouts BEFORE `config` is moved into the
         // backend.
@@ -537,7 +561,38 @@ impl BrowserTool {
             element_timeout,
             action_timeout,
             diagnostics: BrowserDiagnosticsStore::new(),
+            approval_pool,
+            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         })
+    }
+
+    /// Create and hydrate the durable navigation-approval store before the
+    /// browser becomes available to agents.
+    pub async fn initialize_persistent_approvals(&self) -> Result<(), String> {
+        let Some(pool) = &self.approval_pool else {
+            return Ok(());
+        };
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS browser_allowed_navigation_origins (
+                origin TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to initialize browser approvals: {error}"))?;
+
+        let persisted = sqlx::query_scalar::<_, String>(
+            "SELECT origin FROM browser_allowed_navigation_origins",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|error| format!("failed to load browser approvals: {error}"))?;
+        self.allowed_navigation_origins
+            .write()
+            .await
+            .extend(persisted);
+        Ok(())
     }
 
     /// Test-only constructor that injects an arbitrary backend (e.g. the mock)
@@ -559,6 +614,8 @@ impl BrowserTool {
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
             diagnostics: BrowserDiagnosticsStore::new(),
+            approval_pool: None,
+            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -583,6 +640,8 @@ impl BrowserTool {
             element_timeout: Duration::from_secs(10),
             action_timeout: Duration::from_secs(30),
             diagnostics: BrowserDiagnosticsStore::new(),
+            approval_pool: None,
+            allowed_navigation_origins: tokio::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -666,6 +725,7 @@ impl BrowserTool {
         warnings: Vec<String>,
         session_id: &str,
         one_time_only: bool,
+        permission_mode: PermissionMode,
     ) -> Option<ApprovalResponse> {
         let broker = self.approval_tx.as_ref()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -675,7 +735,7 @@ impl BrowserTool {
                 session_id: session_id.to_string(),
                 risk_level,
                 warnings,
-                permission_mode: PermissionMode::Default,
+                permission_mode,
                 response_tx,
                 kind: if one_time_only {
                     crate::types::ApprovalKind::CommandOnce
@@ -702,6 +762,34 @@ impl BrowserTool {
         }
     }
 
+    async fn navigation_origin_is_allowed(&self, origin: Option<&str>) -> bool {
+        let Some(origin) = origin else {
+            return false;
+        };
+        self.allowed_navigation_origins
+            .read()
+            .await
+            .contains(origin)
+    }
+
+    async fn remember_navigation_origin(&self, origin: &str) {
+        if let Some(pool) = &self.approval_pool {
+            if let Err(error) = sqlx::query(
+                "INSERT OR IGNORE INTO browser_allowed_navigation_origins (origin) VALUES (?)",
+            )
+            .bind(origin)
+            .execute(pool)
+            .await
+            {
+                warn!(%error, "Failed to persist browser navigation approval");
+            }
+        }
+        self.allowed_navigation_origins
+            .write()
+            .await
+            .insert(origin.to_string());
+    }
+
     /// The approval gate. Runs BEFORE any backend/page method is touched, so a
     /// denied action can never reach the browser. Returns [`GateDecision::Allow`]
     /// only when the action is permitted.
@@ -714,10 +802,11 @@ impl BrowserTool {
     ///   click/fill): point-of-action — ALWAYS prompt, every call, regardless of
     ///   any prior session approval. A non-Deny response allows ONLY this single
     ///   action and NEVER records persistent/session approval.
-    /// - `Navigation` / ordinary `Mutation`: session-level. Allowed without a
-    ///   prompt once the session is approved; otherwise prompt. `AllowOnce`
-    ///   allows just this action; `AllowSession`/`AllowAlways` also mark the
-    ///   session approved so subsequent ordinary actions don't re-prompt.
+    /// - Public HTTP(S) `navigate`/`new_tab`: may be approved persistently for
+    ///   that exact origin. The grant crosses agent/session boundaries and is
+    ///   restored after restart.
+    /// - Other navigation / ordinary mutation: session-level only. Allowed
+    ///   without a prompt once the session is approved; otherwise prompt.
     /// - Missing approval channel + an action that needs approval → fail safe to
     ///   Deny (observations/administrative still run).
     async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
@@ -734,6 +823,17 @@ impl BrowserTool {
         }
 
         let point_of_action = risk.sensitive || risk.consequential;
+        let durable_origin = durable_navigation_origin(action, args.url);
+
+        // "Allow Always" navigation grants are origin-scoped, not tied to the
+        // internal agent session that happened to request them.
+        if !point_of_action
+            && self
+                .navigation_origin_is_allowed(durable_origin.as_deref())
+                .await
+        {
+            return GateDecision::Allow;
+        }
 
         // Session-level fast path: an already-approved session skips the prompt
         // for ordinary navigation/mutation — but NEVER for point-of-action.
@@ -770,7 +870,20 @@ impl BrowserTool {
         let command = self.build_prompt(args, &risk).await;
 
         let resp = self
-            .request_approval(command, risk_level, warnings, session_id, point_of_action)
+            .request_approval(
+                command,
+                risk_level,
+                warnings,
+                session_id,
+                point_of_action,
+                // Only origin-scoped navigation has real durable semantics.
+                // All other reusable browser approval is honestly session-only.
+                if durable_origin.is_some() {
+                    PermissionMode::Default
+                } else {
+                    PermissionMode::Cautious
+                },
+            )
             .await;
 
         match resp {
@@ -781,11 +894,20 @@ impl BrowserTool {
             ),
             Some(ApprovalResponse::Deny) => GateDecision::Deny("Denied by user.".to_string()),
             Some(ApprovalResponse::AllowOnce) => GateDecision::Allow,
-            Some(ApprovalResponse::AllowSession) | Some(ApprovalResponse::AllowAlways) => {
+            Some(ApprovalResponse::AllowSession) => {
                 // Point-of-action approvals NEVER persist: each consequential
                 // action / execute_js must be approved on its own. Only ordinary
                 // navigation/mutation marks the session approved.
                 if !point_of_action {
+                    self.sessions.mark_session_approved(session_id).await;
+                }
+                GateDecision::Allow
+            }
+            Some(ApprovalResponse::AllowAlways) => {
+                if !point_of_action {
+                    if let Some(origin) = durable_origin {
+                        self.remember_navigation_origin(&origin).await;
+                    }
                     self.sessions.mark_session_approved(session_id).await;
                 }
                 GateDecision::Allow

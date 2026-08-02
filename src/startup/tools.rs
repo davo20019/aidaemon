@@ -529,8 +529,13 @@ pub async fn register_optional_tools(
                     media_tx.clone(),
                     approval_tx.clone(),
                     inbox_dir.clone(),
+                    Some(state.pool()),
                 )
                 .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
+                browser_tool
+                    .initialize_persistent_approvals()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Browser approval initialization failed: {e}"))?;
                 tools.push(Arc::new(browser_tool));
             }
             #[cfg(feature = "computer_use")]

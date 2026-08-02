@@ -11,15 +11,16 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateLearningNote, MandateReconciliationResolution, MandateStatus, MandateStrategySnapshot,
-    MandateSuspensionKind, MandateTerminationKind, StateStore, Tool, ToolCallSemantics,
-    ToolCapabilities, ToolMutationEffects, ToolRole,
+    MandateLearningNote, MandateOperationScope, MandateReconciliationResolution, MandateStatus,
+    MandateStrategySnapshot, MandateSuspensionKind, MandateTerminationKind, StateStore, Tool,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_REVIEW_SECS: i64 = 4 * 60 * 60;
+const MIN_MANDATE_TOKEN_BUDGET: i64 = 10_000;
 const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_POLICY_ENTRIES: usize = 16;
 const MAX_POLICY_ENTRY_TEXT: usize = 500;
@@ -97,18 +98,62 @@ impl ManageMandatesTool {
         Ok(session)
     }
 
-    fn authority_from_args(args: &ManageMandatesArgs) -> MandateAuthority {
-        MandateAuthority {
+    fn authority_from_args(args: &ManageMandatesArgs) -> anyhow::Result<MandateAuthority> {
+        if let Some(operation_scopes) = args.operation_scopes.clone() {
+            anyhow::ensure!(
+                !operation_scopes.is_empty(),
+                "operation_scopes must contain at least one exact operation"
+            );
+            anyhow::ensure!(
+                args.allowed_tools.is_none()
+                    && args.allowed_mutation_effects.is_none()
+                    && args.allowed_target_prefixes.is_none(),
+                "operation_scopes replace the legacy independent allowed_tools, allowed_mutation_effects, and allowed_target_prefixes fields; do not send both"
+            );
+            return Ok(MandateAuthority::from_operation_scopes(
+                args.allow_observations.unwrap_or(true),
+                operation_scopes,
+                args.max_mutating_actions_per_cycle.unwrap_or(0),
+                args.max_mutating_actions_per_rolling_24h.unwrap_or(0),
+                args.min_seconds_between_mutations.unwrap_or(0),
+            ));
+        }
+        Ok(MandateAuthority {
             allow_observations: args.allow_observations.unwrap_or(true),
             allowed_tools: args.allowed_tools.clone().unwrap_or_default(),
             allowed_mutation_effects: args.allowed_mutation_effects.clone().unwrap_or_default(),
             allowed_target_prefixes: args.allowed_target_prefixes.clone().unwrap_or_default(),
+            operation_scopes: Vec::new(),
             max_mutating_actions_per_cycle: args.max_mutating_actions_per_cycle.unwrap_or(0),
             max_mutating_actions_per_rolling_24h: args
                 .max_mutating_actions_per_rolling_24h
                 .unwrap_or(0),
             min_seconds_between_mutations: args.min_seconds_between_mutations.unwrap_or(0),
-        }
+        })
+    }
+
+    fn resolved_token_budgets(args: &ManageMandatesArgs) -> anyhow::Result<(i64, i64)> {
+        let goal = crate::traits::Goal::new_continuous_pending(
+            "Mandate draft budget resolution",
+            "mandate-draft",
+            args.budget_per_cycle,
+            args.budget_daily,
+        );
+        let per_cycle = goal.budget_per_check.unwrap_or_default();
+        let daily = goal.budget_daily.unwrap_or_default();
+        anyhow::ensure!(
+            per_cycle >= MIN_MANDATE_TOKEN_BUDGET,
+            "budget_per_cycle is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
+        );
+        anyhow::ensure!(
+            daily >= MIN_MANDATE_TOKEN_BUDGET,
+            "budget_daily is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
+        );
+        anyhow::ensure!(
+            daily >= per_cycle,
+            "budget_daily must be at least budget_per_cycle"
+        );
+        Ok((per_cycle, daily))
     }
 
     fn strategy_snapshot(
@@ -182,6 +227,11 @@ impl ManageMandatesTool {
                 display_target_scope(&mandate.authority.allowed_target_prefixes)
             ),
             format!(
+                "Exact operation scopes: {}",
+                serde_json::to_string(&mandate.authority.operation_scopes)
+                    .unwrap_or_else(|_| "unavailable".to_string())
+            ),
+            format!(
                 "Mutation limits: {} per decision cycle; {} per rolling 24 hours; minimum spacing {} seconds",
                 mandate.authority.max_mutating_actions_per_cycle,
                 mandate.authority.max_mutating_actions_per_rolling_24h,
@@ -212,13 +262,22 @@ impl ManageMandatesTool {
         }
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
-        let authority = Self::authority_from_args(args);
+        let authority = Self::authority_from_args(args)?;
+        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(args)?;
         let constraints = clean_strings(args.constraints.as_deref());
         let success_criteria = clean_strings(args.success_criteria.as_deref());
         let stop_conditions = clean_strings(args.stop_conditions.as_deref());
         validate_policy_text(&constraints, &success_criteria, &stop_conditions)?;
         let strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
         let mut missing = Vec::new();
+        if authority.operation_scopes.is_empty()
+            && (authority.max_mutating_actions_per_cycle > 0
+                || !authority.allowed_tools.is_empty()
+                || !authority.allowed_mutation_effects.is_empty()
+                || !authority.allowed_target_prefixes.is_empty())
+        {
+            missing.push("operation_scopes");
+        }
         if authority.max_mutating_actions_per_cycle > 0 {
             if authority.allowed_tools.is_empty() {
                 missing.push("allowed_tools");
@@ -254,6 +313,11 @@ impl ManageMandatesTool {
                     "content_sha256": value.content_sha256,
                 })),
                 "authority": authority,
+                "token_budgets": {
+                    "units": "tokens",
+                    "per_decision_cycle": budget_per_cycle,
+                    "per_utc_day": budget_daily,
+                },
                 "review_minutes": {
                     "minimum": args.min_review_minutes.unwrap_or(DEFAULT_MIN_REVIEW_SECS / 60),
                     "default": args.default_review_minutes.unwrap_or(DEFAULT_REVIEW_SECS / 60),
@@ -344,7 +408,15 @@ impl ManageMandatesTool {
         let session_id = Self::owner_session(args)?;
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
-        let authority = Self::authority_from_args(args);
+        let authority = Self::authority_from_args(args)?;
+        anyhow::ensure!(
+            authority.uses_operation_scopes()
+                || (authority.allowed_tools.is_empty()
+                    && authority.allowed_mutation_effects.is_empty()
+                    && authority.allowed_target_prefixes.is_empty()
+                    && authority.max_mutating_actions_per_cycle == 0),
+            "delegated operations require operation_scopes from a validated draft; legacy independent authority lists cannot create new mandates"
+        );
         authority.validate().map_err(anyhow::Error::msg)?;
 
         let min_review_secs = minutes_to_secs(
@@ -373,16 +445,7 @@ impl ManageMandatesTool {
             args.budget_per_cycle,
             args.budget_daily,
         );
-        let budget_per_cycle = goal.budget_per_check.unwrap_or_default();
-        let budget_daily = goal.budget_daily.unwrap_or_default();
-        anyhow::ensure!(
-            budget_per_cycle > 0 && budget_daily > 0,
-            "mandate token budgets must be greater than zero"
-        );
-        anyhow::ensure!(
-            budget_daily >= budget_per_cycle,
-            "budget_daily must be at least budget_per_cycle"
-        );
+        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(args)?;
         goal.priority = args.priority.clone().unwrap_or_else(|| "high".to_string());
         anyhow::ensure!(
             matches!(
@@ -733,6 +796,7 @@ impl ManageMandatesTool {
         let mut mandate = self.resolve_owned_mandate(id, owner).await?;
         let has_change = args.objective.is_some()
             || args.allow_observations.is_some()
+            || args.operation_scopes.is_some()
             || args.allowed_tools.is_some()
             || args.allowed_mutation_effects.is_some()
             || args.allowed_target_prefixes.is_some()
@@ -759,6 +823,7 @@ impl ManageMandatesTool {
                     .to_string();
         }
         if args.allow_observations.is_some()
+            || args.operation_scopes.is_some()
             || args.allowed_tools.is_some()
             || args.allowed_mutation_effects.is_some()
             || args.allowed_target_prefixes.is_some()
@@ -766,32 +831,57 @@ impl ManageMandatesTool {
             || args.max_mutating_actions_per_rolling_24h.is_some()
             || args.min_seconds_between_mutations.is_some()
         {
-            mandate.authority = MandateAuthority {
-                allow_observations: args
-                    .allow_observations
-                    .unwrap_or(mandate.authority.allow_observations),
-                allowed_tools: args
-                    .allowed_tools
-                    .clone()
-                    .unwrap_or(mandate.authority.allowed_tools),
-                allowed_mutation_effects: args
-                    .allowed_mutation_effects
-                    .clone()
-                    .unwrap_or(mandate.authority.allowed_mutation_effects),
-                allowed_target_prefixes: args
-                    .allowed_target_prefixes
-                    .clone()
-                    .unwrap_or(mandate.authority.allowed_target_prefixes),
-                max_mutating_actions_per_cycle: args
-                    .max_mutating_actions_per_cycle
-                    .unwrap_or(mandate.authority.max_mutating_actions_per_cycle),
-                max_mutating_actions_per_rolling_24h: args
-                    .max_mutating_actions_per_rolling_24h
-                    .unwrap_or(mandate.authority.max_mutating_actions_per_rolling_24h),
-                min_seconds_between_mutations: args
-                    .min_seconds_between_mutations
-                    .unwrap_or(mandate.authority.min_seconds_between_mutations),
-            };
+            let scopes = args
+                .operation_scopes
+                .clone()
+                .unwrap_or_else(|| mandate.authority.operation_scopes.clone());
+            if !scopes.is_empty() {
+                anyhow::ensure!(
+                    args.allowed_tools.is_none()
+                        && args.allowed_mutation_effects.is_none()
+                        && args.allowed_target_prefixes.is_none(),
+                    "operation-scoped mandates cannot be updated through legacy independent authority lists"
+                );
+                mandate.authority = MandateAuthority::from_operation_scopes(
+                    args.allow_observations
+                        .unwrap_or(mandate.authority.allow_observations),
+                    scopes,
+                    args.max_mutating_actions_per_cycle
+                        .unwrap_or(mandate.authority.max_mutating_actions_per_cycle),
+                    args.max_mutating_actions_per_rolling_24h
+                        .unwrap_or(mandate.authority.max_mutating_actions_per_rolling_24h),
+                    args.min_seconds_between_mutations
+                        .unwrap_or(mandate.authority.min_seconds_between_mutations),
+                );
+            } else {
+                mandate.authority = MandateAuthority {
+                    allow_observations: args
+                        .allow_observations
+                        .unwrap_or(mandate.authority.allow_observations),
+                    allowed_tools: args
+                        .allowed_tools
+                        .clone()
+                        .unwrap_or(mandate.authority.allowed_tools),
+                    allowed_mutation_effects: args
+                        .allowed_mutation_effects
+                        .clone()
+                        .unwrap_or(mandate.authority.allowed_mutation_effects),
+                    allowed_target_prefixes: args
+                        .allowed_target_prefixes
+                        .clone()
+                        .unwrap_or(mandate.authority.allowed_target_prefixes),
+                    operation_scopes: Vec::new(),
+                    max_mutating_actions_per_cycle: args
+                        .max_mutating_actions_per_cycle
+                        .unwrap_or(mandate.authority.max_mutating_actions_per_cycle),
+                    max_mutating_actions_per_rolling_24h: args
+                        .max_mutating_actions_per_rolling_24h
+                        .unwrap_or(mandate.authority.max_mutating_actions_per_rolling_24h),
+                    min_seconds_between_mutations: args
+                        .min_seconds_between_mutations
+                        .unwrap_or(mandate.authority.min_seconds_between_mutations),
+                };
+            }
         }
         if let Some(values) = args.constraints.as_deref() {
             mandate.constraints = clean_strings(Some(values));
@@ -1166,6 +1256,7 @@ struct ManageMandatesArgs {
     objective: Option<String>,
     source_goal_id: Option<String>,
     allow_observations: Option<bool>,
+    operation_scopes: Option<Vec<MandateOperationScope>>,
     allowed_tools: Option<Vec<String>>,
     allowed_mutation_effects: Option<Vec<String>>,
     allowed_target_prefixes: Option<Vec<String>>,
@@ -1223,7 +1314,7 @@ impl Tool for ManageMandatesTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ongoing mandates. Stewardship: draft, then create for owner confirmation. strategy_skill is advisory, never authority. v1 delegates exact http_request/web_fetch scopes with quotas and >=900s cooldown. answer_question handles ASK; resolve_reconciliation handles uncertain effects. STOP/learning evidence uses receipt IDs."
+        "Manage ongoing mandates. Draft before create. Delegated calls require exact non-combinable operation scopes. Budgets are tokens; ASK, reconciliation, STOP, and learning use typed evidence."
     }
 
     fn schema(&self) -> Value {
@@ -1238,9 +1329,24 @@ impl Tool for ManageMandatesTool {
                     "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT },
                     "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
                     "allow_observations": { "type": "boolean" },
-                    "allowed_tools": { "type": "array", "maxItems": 64, "items": { "type": "string", "enum": ["http_request", "web_fetch"] } },
-                    "allowed_mutation_effects": { "type": "array", "maxItems": MandateAuthority::EFFECT_NAMES.len(), "items": { "type": "string", "enum": MandateAuthority::EFFECT_NAMES } },
-                    "allowed_target_prefixes": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2048 } },
+                    "operation_scopes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "description": "Exact tool + operation + kind + targets + effects tuples; authenticated scopes pair auth_profile and account targets.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": { "type": "string", "enum": ["http_request", "web_fetch"] },
+                                "operation": { "type": "string", "enum": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] },
+                                "kind": { "type": "string", "enum": ["observation", "mutation"] },
+                                "target_prefixes": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 2048 } },
+                                "mutation_effects": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["remote_mutation", "external_delivery"] } }
+                            },
+                            "required": ["tool", "operation", "kind", "target_prefixes", "mutation_effects"],
+                            "additionalProperties": false
+                        }
+                    },
                     "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 },
                     "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 },
                     "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
@@ -1254,8 +1360,8 @@ impl Tool for ManageMandatesTool {
                     "default_review_minutes": { "type": "integer", "minimum": 1 },
                     "expires_at": { "type": "string" },
                     "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
-                    "budget_per_cycle": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION },
-                    "budget_daily": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Cycle token limit; default 400000." },
+                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. UTC-day token limit; default 1000000." },
                     "include_terminal": { "type": "boolean" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] },
@@ -1593,9 +1699,13 @@ mod tests {
                 r#"{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
-                    "allowed_tools":["http_request"],
-                    "allowed_mutation_effects":["remote_mutation","external_delivery"],
-                    "allowed_target_prefixes":["https://api.x.com/2/","auth_profile:twitter","account:12345"],
+                    "operation_scopes":[{
+                        "tool":"http_request",
+                        "operation":"POST",
+                        "kind":"mutation",
+                        "target_prefixes":["https://api.x.com/2/tweets","auth_profile:twitter","account:12345"],
+                        "mutation_effects":["remote_mutation","external_delivery"]
+                    }],
                     "max_mutating_actions_per_cycle":1,
                     "max_mutating_actions_per_rolling_24h":8,
                     "min_seconds_between_mutations":900,
@@ -1761,12 +1871,81 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|field| field == "allowed_target_prefixes"));
+            .any(|field| field == "operation_scopes"));
         assert!(state
             .list_mandates(Some("owner-session"), true)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_labels_resolved_token_budgets_and_rejects_action_count_values() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Maintain a bounded internal posture",
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["proposal"]["token_budgets"]["units"], "tokens");
+        assert_eq!(
+            value["proposal"]["token_budgets"]["per_decision_cycle"],
+            400_000
+        );
+        assert_eq!(value["proposal"]["token_budgets"]["per_utc_day"], 1_000_000);
+
+        let error = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Do not confuse actions with tokens",
+                    "budget_per_cycle":1,
+                    "budget_daily":1,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("token budget"));
+        assert!(error.to_string().contains("at least 10000"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_legacy_cross_product_authority() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+        let error = tool
+            .call(
+                r#"{
+                    "action":"create",
+                    "objective":"Do not combine unrelated reads and writes",
+                    "allowed_tools":["http_request","web_fetch"],
+                    "allowed_mutation_effects":["remote_mutation","external_delivery"],
+                    "allowed_target_prefixes":["https://blog.aidaemon.ai/posts/","https://api.x.com/2/tweets"],
+                    "max_mutating_actions_per_cycle":1,
+                    "max_mutating_actions_per_rolling_24h":1,
+                    "min_seconds_between_mutations":900,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("operation_scopes"));
     }
 
     #[tokio::test]
@@ -1831,8 +2010,6 @@ mod tests {
                 r#"{
                     "action":"create",
                     "objective":"Never activate without confirmation",
-                    "allowed_tools":[],
-                    "allowed_mutation_effects":[],
                     "max_mutating_actions_per_cycle":0,
                     "_session_id":"owner-session",
                     "_user_role":"owner",

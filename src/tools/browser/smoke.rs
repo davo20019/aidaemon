@@ -72,6 +72,7 @@ async fn browser_smoke_real_chrome() {
         media_tx,
         auto_approve_broker(),
         profile.path().join("inbox"),
+        None,
     )
     .expect("construct browser tool");
 
@@ -207,6 +208,7 @@ html, body { margin: 0; background: #08352d; color: white }
         media_tx,
         auto_approve_broker(),
         fixture.path().join("inbox"),
+        None,
     )
     .expect("construct browser tool");
 

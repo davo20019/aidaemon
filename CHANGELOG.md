@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.37] - 2026-08-02
+
+### Added
+
+- **Mandate authority is operation-scoped.** New delegations bind each exact adapter tool, adapter-emitted operation, observation/mutation kind, mutation effects, URL scope, authentication profile, and stable account identity in one non-combinable tuple. A permitted blog GET can no longer combine with a separately permitted X POST to authorize an unintended blog mutation.
+
+### Changed
+
+- **Drafts validate executable adapter shapes and resolve token budgets.** Body-bearing HTTP POST/PUT/PATCH scopes require both `remote_mutation` and `external_delivery`; authenticated scopes require paired `auth_profile` and `account` identities. Draft output labels resolved token budgets explicitly, defaults to 400,000 tokens per cycle and 1,000,000 per UTC day, and rejects values below 10,000 that commonly result from confusing action quotas with tokens.
+- **Mandate preparation preserves exact authority facts.** The agent is instructed to render operation-scope identifiers and token units verbatim and cannot treat an anonymous 401 as evidence about a configured authentication profile.
+
 ## [0.11.36] - 2026-08-02
 
 ### Added

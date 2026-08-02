@@ -585,6 +585,7 @@ impl Tool for WebFetchTool {
             .unwrap_or_default();
 
         ToolCallSemantics::observation()
+            .with_operation(crate::traits::ToolCallOperation::Get)
             .with_verification_mode(ToolVerificationMode::ResultContent)
             .with_target_hint(ToolTargetHintKind::Url, url)
     }

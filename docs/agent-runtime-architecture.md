@@ -278,7 +278,14 @@ V1 deliberately exposes a narrow autonomous execution surface:
 - only directly governed, deterministic adapters can be delegated. MCP,
   terminal/shell, filesystem/project, browser/computer-use, scheduler/health,
   and other opaque nested-action tools are denied;
-- scoped HTTP authority binds the exact canonical URL scope, exact
+- each delegated call must match one complete, non-combinable operation scope:
+  exact adapter tool, adapter-emitted operation, observation/mutation kind,
+  mutation effects, URL scope, and required identity targets. Independent
+  aggregate lists remain a legacy read format only; new mandates cannot use
+  their Cartesian product as authority. Thus a `web_fetch + GET + blog` scope
+  cannot authorize `http_request + POST + blog` merely because another scope
+  permits an X POST;
+- scoped authenticated HTTP authority binds the exact canonical URL scope, exact
   authentication-profile resource identifier, and (for every authenticated
   request) exact stable remote account ID. The adapter verifies the
   model-supplied `account_id` against the profile's configured `user_id` before
@@ -291,7 +298,13 @@ V1 deliberately exposes a narrow autonomous execution surface:
   mandate that references that profile, make the change, and explicitly
   reconfirm its profile and account scopes before resuming. V1 persists the
   exact profile name and stable account ID, but not an immutable credential
-  generation, so this operational pause/reconfirmation is a required boundary;
+  generation, so this operational pause/reconfirmation is a required boundary.
+  Authentication readiness probes must actually name the configured profile;
+  an anonymous 401 is only evidence about the anonymous request;
+- draft validation resolves and labels token budgets in tokens, rejects
+  unusably tiny mandate budgets, and validates adapter-specific operation
+  shapes before owner confirmation. Body-bearing HTTP POST/PUT/PATCH scopes
+  require both `remote_mutation` and `external_delivery` effects;
 - mandate workers use a fixed isolated prompt. They do not inherit a private
   session persona, user memory, unpinned skills, project instructions,
   checkpoints, result spill, or global learning/reflection channels;

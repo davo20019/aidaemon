@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 const MAX_SCHEMA_SEGMENT_CHARS: usize = 6_500;
 // Reference-image editing and the owner-facing bounded-mandate contract add
-// explicit inputs; retain a hard aggregate ceiling while accounting for those
-// user-visible capabilities.
-const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 106_000;
+// explicit inputs, including non-combinable operation scopes. Retain a hard
+// aggregate ceiling while accounting for those user-visible capabilities.
+const MAX_TOTAL_SCHEMA_SEGMENT_CHARS: usize = 107_000;
 
 fn tools_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")

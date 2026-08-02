@@ -14,16 +14,14 @@ async fn test_orchestration_task_lead_flag_off_uses_agent_loop() {
     ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
-    let response = harness
-        .agent
-        .handle_message(
+    let response = Box::pin(harness.agent.handle_message(
             "test_session",
             "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
             None,
-        )
+        ))
         .await
         .unwrap();
 
@@ -53,16 +51,14 @@ async fn test_orchestration_task_lead_spawns_for_complex() {
         .await
         .unwrap();
 
-    let response = harness
-        .agent
-        .handle_message(
+    let response = Box::pin(harness.agent.handle_message(
             "test_session",
             "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
             None,
-        )
+        ))
         .await
         .unwrap();
 
@@ -108,16 +104,14 @@ async fn test_orchestration_task_lead_creates_tasks_via_tool() {
         .await
         .unwrap();
 
-    let response = harness
-        .agent
-        .handle_message(
+    let response = Box::pin(harness.agent.handle_message(
             "test_session",
             "Analyze the requirements, compare authentication approaches, identify security gaps, find the best database solutions, and summarize a deployment plan for a full-stack website with CI/CD",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
             None,
-        )
+        ))
         .await
         .unwrap();
 
@@ -170,16 +164,17 @@ async fn test_orchestration_task_lead_claims_before_dispatch() {
     // report = 5 action markers + "and"/"then" compound keywords.
     // Includes "build" and "deploy" so the completion contract has expects_mutation=true,
     // which prevents the text-only prelude from blocking side-effecting tool calls.
-    let response = harness
-        .agent
-        .handle_message(
+    // Keep the unusually large end-to-end agent future off the test thread's
+    // fixed-size stack. Production agent turns are spawned tasks; pinning here
+    // gives this stress test the same heap-backed execution shape.
+    let response = Box::pin(harness.agent.handle_message(
             "test_session",
             "Analyze the quantum computing landscape, compare visualization frameworks, identify performance bottlenecks, find optimal algorithms, build a prototype, and deploy production monitoring with documentation",
             None,
             UserRole::Owner,
             ChannelContext::private("test"),
             None,
-        )
+        ))
         .await
         .unwrap();
 

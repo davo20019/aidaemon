@@ -1,4 +1,8 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
+
+use super::tools::ToolCallOperation;
 
 const MAX_MANDATE_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_MANDATE_POLICY_ENTRIES: usize = 16;
@@ -347,6 +351,162 @@ pub struct MandateSuspension {
     pub created_at: String,
 }
 
+/// Whether one exact delegated adapter operation observes or mutates state.
+/// This is owner-approved policy data, not an inference from prose.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateOperationKind {
+    Observation,
+    Mutation,
+}
+
+/// One non-combinable authority tuple.
+///
+/// Keeping tool, adapter operation, effects, and targets in the same record
+/// prevents the unsafe Cartesian product created by independent allowlists
+/// (for example, GET on one URL accidentally authorizing POST to that URL).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct MandateOperationScope {
+    pub tool: String,
+    pub operation: ToolCallOperation,
+    pub kind: MandateOperationKind,
+    #[serde(default)]
+    pub target_prefixes: Vec<String>,
+    #[serde(default)]
+    pub mutation_effects: Vec<String>,
+}
+
+impl MandateOperationScope {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tool.trim() != self.tool
+            || !text_within(&self.tool, 256)
+            || !MandateAuthority::DELEGABLE_DATA_TOOLS.contains(&self.tool.as_str())
+        {
+            return Err(format!(
+                "operation scope tool must be an exact delegable adapter name: {}",
+                MandateAuthority::DELEGABLE_DATA_TOOLS.join(", ")
+            ));
+        }
+        if self.target_prefixes.is_empty() || self.target_prefixes.len() > 16 {
+            return Err("operation scopes require 1–16 exact target prefixes".to_string());
+        }
+        for (index, prefix) in self.target_prefixes.iter().enumerate() {
+            validate_mandate_target_prefix(prefix)?;
+            if self.target_prefixes[..index]
+                .iter()
+                .any(|seen| seen == prefix)
+            {
+                return Err("operation scope target prefixes must be unique".to_string());
+            }
+        }
+        let url_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.contains("://"))
+            .count();
+        if url_targets == 0 {
+            return Err("delegated operation scopes require a URL target".to_string());
+        }
+        let auth_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.starts_with("auth_profile:"))
+            .count();
+        let account_targets = self
+            .target_prefixes
+            .iter()
+            .filter(|target| target.starts_with("account:"))
+            .count();
+        if auth_targets > 1 || account_targets > 1 || (auth_targets == 1) != (account_targets == 1)
+        {
+            return Err(
+                "authenticated operation scopes require exactly one auth_profile target paired with exactly one account target"
+                    .to_string(),
+            );
+        }
+        if self.mutation_effects.len() > MandateAuthority::EFFECT_NAMES.len() {
+            return Err("operation scope mutation effects exceed their bounded size".to_string());
+        }
+        for (index, effect) in self.mutation_effects.iter().enumerate() {
+            if effect.trim() != effect
+                || !MandateAuthority::EFFECT_NAMES.contains(&effect.as_str())
+                || self.mutation_effects[..index]
+                    .iter()
+                    .any(|seen| seen == effect)
+            {
+                return Err(
+                    "operation scope mutation effects must be unique canonical effect names"
+                        .to_string(),
+                );
+            }
+        }
+
+        match (self.tool.as_str(), self.operation, self.kind) {
+            ("web_fetch", ToolCallOperation::Get, MandateOperationKind::Observation) => {
+                if auth_targets != 0 || account_targets != 0 {
+                    return Err(
+                        "web_fetch operation scopes cannot carry authentication identity"
+                            .to_string(),
+                    );
+                }
+                if !self.mutation_effects.is_empty() {
+                    return Err(
+                        "observation operation scopes cannot declare mutation effects".to_string(),
+                    );
+                }
+            }
+            (
+                "http_request",
+                ToolCallOperation::Get | ToolCallOperation::Head | ToolCallOperation::Options,
+                MandateOperationKind::Observation,
+            ) => {
+                if !self.mutation_effects.is_empty() {
+                    return Err(
+                        "observation operation scopes cannot declare mutation effects".to_string(),
+                    );
+                }
+            }
+            (
+                "http_request",
+                ToolCallOperation::Post | ToolCallOperation::Put | ToolCallOperation::Patch,
+                MandateOperationKind::Mutation,
+            ) => {
+                let expected = BTreeSet::from([
+                    "external_delivery".to_string(),
+                    "remote_mutation".to_string(),
+                ]);
+                if self
+                    .mutation_effects
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != expected
+                {
+                    return Err(
+                        "body-bearing HTTP mutation scopes require exactly remote_mutation and external_delivery effects"
+                            .to_string(),
+                    );
+                }
+            }
+            ("http_request", ToolCallOperation::Delete, MandateOperationKind::Mutation) => {
+                if self.mutation_effects.as_slice() != ["remote_mutation"] {
+                    return Err(
+                        "HTTP DELETE mutation scopes require exactly the remote_mutation effect"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "operation scope kind/operation is not supported by the selected delegable adapter"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl MandateSuspension {
     pub fn new(kind: MandateSuspensionKind, reason_code: Option<String>) -> Self {
         Self {
@@ -399,6 +559,11 @@ pub struct MandateAuthority {
     pub allowed_mutation_effects: Vec<String>,
     #[serde(default)]
     pub allowed_target_prefixes: Vec<String>,
+    /// V2 non-combinable operation tuples. When present, the runtime matches a
+    /// call against one complete tuple and never authorizes from the aggregate
+    /// compatibility lists above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_scopes: Vec<MandateOperationScope>,
     #[serde(default)]
     pub max_mutating_actions_per_cycle: u32,
     /// Cross-cycle dispatch ceiling. Every claimed mutation attempt, including
@@ -423,6 +588,7 @@ impl Default for MandateAuthority {
             allowed_tools: Vec::new(),
             allowed_mutation_effects: Vec::new(),
             allowed_target_prefixes: Vec::new(),
+            operation_scopes: Vec::new(),
             max_mutating_actions_per_cycle: 0,
             max_mutating_actions_per_rolling_24h: 0,
             min_seconds_between_mutations: 0,
@@ -471,7 +637,110 @@ impl MandateAuthority {
         "unspecified",
     ];
 
+    pub fn from_operation_scopes(
+        allow_observations: bool,
+        operation_scopes: Vec<MandateOperationScope>,
+        max_mutating_actions_per_cycle: u32,
+        max_mutating_actions_per_rolling_24h: u32,
+        min_seconds_between_mutations: u32,
+    ) -> Self {
+        let allowed_tools = operation_scopes
+            .iter()
+            .map(|scope| scope.tool.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let allowed_mutation_effects = operation_scopes
+            .iter()
+            .flat_map(|scope| scope.mutation_effects.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let allowed_target_prefixes = operation_scopes
+            .iter()
+            .flat_map(|scope| scope.target_prefixes.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self {
+            allow_observations,
+            allowed_tools,
+            allowed_mutation_effects,
+            allowed_target_prefixes,
+            operation_scopes,
+            max_mutating_actions_per_cycle,
+            max_mutating_actions_per_rolling_24h,
+            min_seconds_between_mutations,
+        }
+    }
+
+    pub fn uses_operation_scopes(&self) -> bool {
+        !self.operation_scopes.is_empty()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if self.operation_scopes.len() > 64 {
+            return Err("mandate operation scopes exceed their bounded size".to_string());
+        }
+        for (index, scope) in self.operation_scopes.iter().enumerate() {
+            scope.validate()?;
+            if self.operation_scopes[..index]
+                .iter()
+                .any(|seen| seen == scope)
+            {
+                return Err("mandate operation scopes must be unique".to_string());
+            }
+        }
+        if self.uses_operation_scopes() {
+            let derived = Self::from_operation_scopes(
+                self.allow_observations,
+                self.operation_scopes.clone(),
+                self.max_mutating_actions_per_cycle,
+                self.max_mutating_actions_per_rolling_24h,
+                self.min_seconds_between_mutations,
+            );
+            if self.allowed_tools.iter().collect::<BTreeSet<_>>()
+                != derived.allowed_tools.iter().collect::<BTreeSet<_>>()
+                || self
+                    .allowed_mutation_effects
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    != derived
+                        .allowed_mutation_effects
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                || self.allowed_target_prefixes.iter().collect::<BTreeSet<_>>()
+                    != derived
+                        .allowed_target_prefixes
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+            {
+                return Err(
+                    "mandate aggregate authority lists must exactly match the operation scope projection"
+                        .to_string(),
+                );
+            }
+            if !self.allow_observations
+                && self
+                    .operation_scopes
+                    .iter()
+                    .any(|scope| scope.kind == MandateOperationKind::Observation)
+            {
+                return Err(
+                    "observation operation scopes require allow_observations=true".to_string(),
+                );
+            }
+            let has_mutation = self
+                .operation_scopes
+                .iter()
+                .any(|scope| scope.kind == MandateOperationKind::Mutation);
+            if has_mutation != (self.max_mutating_actions_per_cycle > 0) {
+                return Err(
+                    "operation scopes and per-cycle mutation budget must agree on whether mutations are delegated"
+                        .to_string(),
+                );
+            }
+        }
         let authority_text = self
             .allowed_tools
             .iter()
@@ -637,32 +906,7 @@ impl MandateAuthority {
                         .to_string(),
                 );
             }
-            if prefix.contains("://") {
-                let url = reqwest::Url::parse(prefix)
-                    .map_err(|_| "URL target prefixes must be canonical URLs".to_string())?;
-                if !matches!(url.scheme(), "http" | "https")
-                    || url.host_str().is_none()
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                    || url.fragment().is_some()
-                    || matches!(url.path(), "" | "/")
-                {
-                    return Err(
-                        "URL target prefixes require an http(s) origin plus a non-root path and cannot contain userinfo or fragments"
-                            .to_string(),
-                    );
-                }
-            } else {
-                let suffix = prefix
-                    .strip_prefix("auth_profile:")
-                    .or_else(|| prefix.strip_prefix("account:"));
-                if !suffix.is_some_and(canonical_scoped_resource_suffix) {
-                    return Err(
-                        "v1 resource targets must be exact auth_profile: or account: identifiers with a non-empty canonical suffix"
-                            .to_string(),
-                    );
-                }
-            }
+            validate_mandate_target_prefix(prefix)?;
         }
         Ok(())
     }
@@ -676,6 +920,36 @@ impl MandateAuthority {
             .iter()
             .any(|allowed| allowed.trim() == effect)
     }
+}
+
+fn validate_mandate_target_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.contains("://") {
+        let url = reqwest::Url::parse(prefix)
+            .map_err(|_| "URL target prefixes must be canonical URLs".to_string())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || matches!(url.path(), "" | "/")
+        {
+            return Err(
+                "URL target prefixes require an http(s) origin plus a non-root path and cannot contain userinfo or fragments"
+                    .to_string(),
+            );
+        }
+    } else {
+        let suffix = prefix
+            .strip_prefix("auth_profile:")
+            .or_else(|| prefix.strip_prefix("account:"));
+        if !suffix.is_some_and(canonical_scoped_resource_suffix) {
+            return Err(
+                "v1 resource targets must be exact auth_profile: or account: identifiers with a non-empty canonical suffix"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1774,6 +2048,51 @@ mod tests {
         authority.max_mutating_actions_per_rolling_24h = 1;
         authority.max_mutating_actions_per_cycle = 2;
         assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn operation_scopes_project_exact_authority_and_validate_executable_http_shapes() {
+        let read = MandateOperationScope {
+            tool: "web_fetch".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://blog.aidaemon.ai/posts/".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        let post = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Post,
+            kind: MandateOperationKind::Mutation,
+            target_prefixes: vec![
+                "https://api.x.com/2/tweets".to_string(),
+                "auth_profile:twitter".to_string(),
+                "account:12345".to_string(),
+            ],
+            mutation_effects: vec![
+                "remote_mutation".to_string(),
+                "external_delivery".to_string(),
+            ],
+        };
+        let authority =
+            MandateAuthority::from_operation_scopes(true, vec![read, post.clone()], 1, 1, 900);
+        assert!(authority.validate().is_ok());
+        assert_eq!(
+            authority.allowed_tools,
+            vec!["http_request".to_string(), "web_fetch".to_string()]
+        );
+        assert!(authority
+            .allowed_target_prefixes
+            .contains(&"account:12345".to_string()));
+
+        let mut missing_delivery = post.clone();
+        missing_delivery.mutation_effects = vec!["remote_mutation".to_string()];
+        assert!(missing_delivery.validate().is_err());
+
+        let mut missing_account = post;
+        missing_account
+            .target_prefixes
+            .retain(|target| !target.starts_with("account:"));
+        assert!(missing_account.validate().is_err());
     }
 
     #[test]

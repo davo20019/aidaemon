@@ -1801,6 +1801,7 @@ mod tests {
                 "external_delivery".to_string(),
             ],
             allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
+            operation_scopes: Vec::new(),
             max_mutating_actions_per_cycle: 1,
             max_mutating_actions_per_rolling_24h: 8,
             min_seconds_between_mutations: 1_800,

@@ -1982,6 +1982,9 @@ impl Tool for HttpRequestTool {
                         .with_target_hint(ToolTargetHintKind::Url, url),
                 }
             };
+        if let Some(operation) = crate::traits::ToolCallOperation::from_http_method(&method) {
+            semantics = semantics.with_operation(operation);
+        }
         if let Some(resource_id) = auth_profile_resource {
             semantics = semantics.with_target_hint(ToolTargetHintKind::ResourceId, resource_id);
         }

@@ -44,10 +44,11 @@ pub use mandates::{
     MandateFinalizationStaleReason, MandateLearningNote, MandateMutationAttempt,
     MandateMutationAttemptStatus, MandateMutationDispatchClaim, MandateMutationEvidence,
     MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason, MandateMutationQuotaState,
-    MandateMutationReservation, MandateMutationTarget, MandateReconciliationReason,
-    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
-    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
-    MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
+    MandateMutationReservation, MandateMutationTarget, MandateOperationKind, MandateOperationScope,
+    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
+    MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
+    MandateRunProofCounts, MandateStatus, MandateStrategySnapshot, MandateSuspension,
+    MandateSuspensionKind, MandateTerminationKind,
 };
 #[allow(unused_imports)]
 pub use memory::{
@@ -66,10 +67,10 @@ pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
     semantics_for_exact_read_actions, AgentRole, ReadFileResultMetadata, ReadFileSelectionMetadata,
-    SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
-    ToolCapabilities, ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
-    ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolExecutionContext, ToolMutationEffects,
+    ToolOutcomeStatus, ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 

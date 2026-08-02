@@ -277,6 +277,36 @@ impl ToolSemanticAffordances {
     }
 }
 
+/// Canonical adapter operation used by deterministic operation-scoped policy.
+/// Unknown/new HTTP verbs deliberately remain untyped and therefore cannot
+/// match a delegated mandate scope.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ToolCallOperation {
+    Get,
+    Head,
+    Options,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl ToolCallOperation {
+    pub const fn from_http_method(method: &str) -> Option<Self> {
+        match method.as_bytes() {
+            b"GET" => Some(Self::Get),
+            b"HEAD" => Some(Self::Head),
+            b"OPTIONS" => Some(Self::Options),
+            b"POST" => Some(Self::Post),
+            b"PUT" => Some(Self::Put),
+            b"PATCH" => Some(Self::Patch),
+            b"DELETE" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
 /// Structured completion semantics for a specific tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolCallSemantics {
@@ -290,6 +320,11 @@ pub struct ToolCallSemantics {
     pub mutation_effects: ToolMutationEffects,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_hints: Vec<ToolTargetHint>,
+    /// Adapter-defined canonical operation for policy matching. This is an
+    /// exact, typed identifier (for example `GET` or `POST`), not a natural-
+    /// language action inferred by the policy layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<ToolCallOperation>,
 }
 
 impl ToolCallSemantics {
@@ -359,6 +394,11 @@ impl ToolCallSemantics {
         self
     }
 
+    pub fn with_operation(mut self, operation: ToolCallOperation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
     pub fn observes_state(&self) -> bool {
         self.effect.observes_state()
     }
@@ -376,6 +416,7 @@ impl ToolCallSemantics {
             && self.verification_mode == ToolVerificationMode::None
             && self.mutation_effects.is_empty()
             && self.target_hints.is_empty()
+            && self.operation.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: Self) {
@@ -390,6 +431,9 @@ impl ToolCallSemantics {
         }
         if self.target_hints.is_empty() {
             self.target_hints = fallback.target_hints;
+        }
+        if self.operation.is_none() {
+            self.operation = fallback.operation;
         }
     }
 }

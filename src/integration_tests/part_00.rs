@@ -201,9 +201,13 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     let draft_args = json!({
         "action": "draft",
         "objective": "Steward @aidaemon_ai as an authentic proactive presence",
-        "allowed_tools": ["http_request"],
-        "allowed_mutation_effects": ["remote_mutation", "external_delivery"],
-        "allowed_target_prefixes": [fake_x_url.clone()],
+        "operation_scopes": [{
+            "tool": "http_request",
+            "operation": "POST",
+            "kind": "mutation",
+            "target_prefixes": [fake_x_url.clone()],
+            "mutation_effects": ["remote_mutation", "external_delivery"]
+        }],
         "max_mutating_actions_per_cycle": 1,
         "max_mutating_actions_per_rolling_24h": 4,
         "min_seconds_between_mutations": 900,
@@ -214,9 +218,13 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
     let create_args = json!({
         "action": "create",
         "objective": "Steward @aidaemon_ai as an authentic proactive presence",
-        "allowed_tools": ["http_request"],
-        "allowed_mutation_effects": ["remote_mutation", "external_delivery"],
-        "allowed_target_prefixes": [fake_x_url.clone()],
+        "operation_scopes": [{
+            "tool": "http_request",
+            "operation": "POST",
+            "kind": "mutation",
+            "target_prefixes": [fake_x_url.clone()],
+            "mutation_effects": ["remote_mutation", "external_delivery"]
+        }],
         "max_mutating_actions_per_cycle": 1,
         "max_mutating_actions_per_rolling_24h": 4,
         "min_seconds_between_mutations": 900,

@@ -158,6 +158,7 @@ async fn install_active_test_mandate(
         allowed_tools: vec!["mandate_mutation_spy".to_string()],
         allowed_mutation_effects: vec!["remote_mutation".to_string()],
         allowed_target_prefixes: vec!["https://api.x.com/2/".to_string()],
+        operation_scopes: Vec::new(),
         max_mutating_actions_per_cycle: 1,
         max_mutating_actions_per_rolling_24h: 8,
         min_seconds_between_mutations: 900,
