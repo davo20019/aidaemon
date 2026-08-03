@@ -362,6 +362,14 @@ fn dispatch_trigger_succeeded(
         .all(|task| task.satisfies_run_completion())
 }
 
+fn task_lead_semantically_succeeded(
+    task_lead_outcome: Option<TaskOutcome>,
+    is_mandate_run: bool,
+    mandate_decision_ready: bool,
+) -> bool {
+    task_lead_outcome == Some(TaskOutcome::Succeeded) || (is_mandate_run && mandate_decision_ready)
+}
+
 async fn patch_task_attempt_with_transient_retry(
     state: &Arc<dyn crate::traits::StateStore>,
     attempt: &crate::traits::TaskAttempt,
@@ -480,14 +488,13 @@ async fn persist_safe_wait_if_decision_missing(
     goal_id: &str,
     goal_run_id: &str,
 ) -> bool {
-    match state.get_mandate_decision_for_run(goal_run_id).await {
-        Ok(Some(_)) => return true,
-        Ok(None) => {}
+    let existing = match state.get_mandate_decision_for_run(goal_run_id).await {
+        Ok(existing) => existing,
         Err(error) => {
             warn!(goal_id, run_id = goal_run_id, %error, "Could not inspect mandate decision");
             return false;
         }
-    }
+    };
     let mandate = match state.get_mandate_for_goal(goal_id).await {
         Ok(Some(mandate)) if mandate.is_active() => mandate,
         Ok(_) => return false,
@@ -496,6 +503,9 @@ async fn persist_safe_wait_if_decision_missing(
             return false;
         }
     };
+    if let Some(decision) = existing {
+        return decision.mandate_id == mandate.id && decision.mandate_version == mandate.version;
+    }
     let mut decision = crate::traits::MandateDecisionCycle::new(
         &mandate.id,
         goal_run_id,
@@ -514,7 +524,9 @@ async fn persist_safe_wait_if_decision_missing(
             .await
             .ok()
             .flatten()
-            .is_some();
+            .is_some_and(|decision| {
+                decision.mandate_id == mandate.id && decision.mandate_version == mandate.version
+            });
         if !committed {
             warn!(goal_id, run_id = goal_run_id, %error, "Could not persist safe mandate WAIT");
         }
@@ -1238,6 +1250,16 @@ pub fn spawn_background_task_lead(
                     return;
                 }
             }
+            if is_mandate_run {
+                if let Err(error) = &task_lead_run {
+                    warn!(
+                        goal_id = %goal_id,
+                        run_id = goal_run_id.as_deref().unwrap_or("missing"),
+                        %error,
+                        "Mandate deliberator exited before returning a semantic outcome"
+                    );
+                }
+            }
             let task_lead_outcome = task_lead_run.as_ref().ok().map(|run| run.outcome);
             let result = task_lead_run.map(|run| run.response);
 
@@ -1503,17 +1525,20 @@ pub fn spawn_background_task_lead(
                 .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id.as_deref())
                 .cloned()
                 .collect::<Vec<_>>();
-            let safe_wait_committed =
-                if is_mandate_run && task_lead_outcome == Some(TaskOutcome::Succeeded) {
-                    match goal_run_id.as_deref() {
-                        Some(run_id) => {
-                            persist_safe_wait_if_decision_missing(&state, &goal_id, run_id).await
-                        }
-                        None => false,
+            // No durable decision means no ACT authority exists, regardless of
+            // how the deliberator process itself exited. Close that semantic
+            // state as WAIT even after a provider/setup/orchestration error;
+            // this can never manufacture mutation permission.
+            let safe_wait_committed = if is_mandate_run {
+                match goal_run_id.as_deref() {
+                    Some(run_id) => {
+                        persist_safe_wait_if_decision_missing(&state, &goal_id, run_id).await
                     }
-                } else {
-                    false
-                };
+                    None => false,
+                }
+            } else {
+                false
+            };
             let mandate_decision_ready = if !is_mandate_run || safe_wait_committed {
                 true
             } else {
@@ -1538,8 +1563,13 @@ pub fn spawn_background_task_lead(
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
                 if let Ok(Some(trigger_task)) = state.get_task(trigger_task_id).await {
                     if trigger_task.status == "running" || trigger_task.status == "claimed" {
+                        let semantic_task_lead_success = task_lead_semantically_succeeded(
+                            task_lead_outcome,
+                            is_mandate_run,
+                            mandate_decision_ready,
+                        );
                         let success = dispatch_trigger_succeeded(
-                            task_lead_outcome == Some(TaskOutcome::Succeeded),
+                            semantic_task_lead_success,
                             &trigger_work_tasks,
                         ) && mandate_decision_ready;
                         let status = if success {
@@ -3039,6 +3069,26 @@ mod tests {
         assert!(dispatch_trigger_succeeded(true, &[]));
         assert!(!dispatch_trigger_succeeded(false, &[]));
         assert!(failed_run_summary(&[failed], None).contains("109976 / 100000"));
+    }
+
+    #[test]
+    fn durable_mandate_decision_is_semantic_success_after_child_error() {
+        assert!(task_lead_semantically_succeeded(
+            Some(TaskOutcome::Failed),
+            true,
+            true,
+        ));
+        assert!(task_lead_semantically_succeeded(None, true, true));
+        assert!(!task_lead_semantically_succeeded(
+            Some(TaskOutcome::Failed),
+            true,
+            false,
+        ));
+        assert!(!task_lead_semantically_succeeded(
+            Some(TaskOutcome::Failed),
+            false,
+            true,
+        ));
     }
 
     #[test]

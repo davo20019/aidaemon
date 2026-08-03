@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.43] - 2026-08-02
+
+### Fixed
+
+- **Mandate reviews fail closed to WAIT even when deliberator setup fails.** A current review with no durable decision now records a typed WAIT and its bounded reconsideration after provider, setup, or orchestration errors—not only after successful child completion. Existing decisions must match the active mandate version, and external mutation authority still requires a separately committed ACT.
+
 ## [0.11.42] - 2026-08-02
 
 ### Changed
