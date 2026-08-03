@@ -273,7 +273,7 @@ impl ManageMandatesTool {
         let stop_conditions = clean_strings(args.stop_conditions.as_deref());
         validate_policy_text(&constraints, &success_criteria, &stop_conditions)?;
         let strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
-        let activation_duration_secs = activation_duration_secs(args)?;
+        let timing = activation_timing(args)?;
         let mut missing = Vec::new();
         if authority.operation_scopes.is_empty()
             && (authority.max_mutating_actions_per_cycle > 0
@@ -328,8 +328,11 @@ impl ManageMandatesTool {
                     "default": args.default_review_minutes.unwrap_or(DEFAULT_REVIEW_SECS / 60),
                     "maximum": args.max_review_minutes.unwrap_or(DEFAULT_MAX_REVIEW_SECS / 60),
                 },
-                "expires_at": args.expires_at,
-                "duration_minutes": activation_duration_secs.map(|value| value / 60),
+                "expires_at": timing.expires_at,
+                "duration_minutes": timing.duration_secs.map(|value| value / 60),
+                "timing_normalization": timing.normalized_redundant_expiry.then_some(
+                    "duration_minutes is authoritative; the redundant expires_at value was ignored"
+                ),
                 "priority": args.priority.as_deref().unwrap_or("high"),
             },
             "next_step": if ready_to_confirm {
@@ -488,8 +491,8 @@ impl ManageMandatesTool {
             &mandate.success_criteria,
             &mandate.stop_conditions,
         )?;
-        let activation_duration_secs = activation_duration_secs(args)?;
-        mandate.expires_at = args.expires_at.clone();
+        let timing = activation_timing(args)?;
+        mandate.expires_at = timing.expires_at.clone();
         if let Some(expires_at) = mandate.expires_at.as_deref() {
             let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
                 .map_err(|_| anyhow::anyhow!("expires_at must be an RFC3339 timestamp"))?;
@@ -513,12 +516,18 @@ impl ManageMandatesTool {
             .await?;
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let warnings = Self::confirmation_warnings(
+        let mut warnings = Self::confirmation_warnings(
             &mandate,
             budget_per_cycle,
             budget_daily,
-            activation_duration_secs,
+            timing.duration_secs,
         );
+        if timing.normalized_redundant_expiry {
+            warnings.push(
+                "Timing normalized: duration_minutes is authoritative; the redundant expires_at value was ignored before persistence."
+                    .to_string(),
+            );
+        }
         let request = ApprovalRequest {
             command: format!("Delegate mandate: {objective}"),
             session_id: session_id.to_string(),
@@ -547,7 +556,7 @@ impl ManageMandatesTool {
             ) => {
                 anyhow::ensure!(
                     self.state
-                        .confirm_mandate(&mandate.id, activation_duration_secs)
+                        .confirm_mandate(&mandate.id, timing.duration_secs)
                         .await?,
                     "mandate could not be activated"
                 );
@@ -1508,8 +1517,8 @@ impl Tool for ManageMandatesTool {
                     "min_review_minutes": { "type": "integer", "minimum": 1 },
                     "max_review_minutes": { "type": "integer", "minimum": 1 },
                     "default_review_minutes": { "type": "integer", "minimum": 1 },
-                    "duration_minutes": { "type": "integer", "minimum": 1, "description": "Create only; update rejects. Minutes after activation." },
-                    "expires_at": { "type": "string", "description": "Fixed RFC3339 deadline; excludes duration_minutes." },
+                    "duration_minutes": { "type": "integer", "minimum": 1, "description": "Create only; update rejects. Relative minutes; wins over expires_at." },
+                    "expires_at": { "type": "string", "description": "Fixed RFC3339 deadline if no duration." },
                     "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
                     "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Cycle tokens." },
                     "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Daily tokens." },
@@ -1699,14 +1708,28 @@ fn minutes_to_secs(value: Option<i64>, default_secs: i64, field: &str) -> anyhow
         .ok_or_else(|| anyhow::anyhow!("{field} is too large"))
 }
 
-fn activation_duration_secs(args: &ManageMandatesArgs) -> anyhow::Result<Option<i64>> {
-    anyhow::ensure!(
-        args.duration_minutes.is_none() || args.expires_at.is_none(),
-        "duration_minutes and expires_at are mutually exclusive"
-    );
-    args.duration_minutes
+#[derive(Debug, PartialEq, Eq)]
+struct ActivationTiming {
+    duration_secs: Option<i64>,
+    expires_at: Option<String>,
+    normalized_redundant_expiry: bool,
+}
+
+fn activation_timing(args: &ManageMandatesArgs) -> anyhow::Result<ActivationTiming> {
+    let duration_secs = args
+        .duration_minutes
         .map(|minutes| minutes_to_secs(Some(minutes), 0, "duration_minutes"))
-        .transpose()
+        .transpose()?;
+    let normalized_redundant_expiry = duration_secs.is_some() && args.expires_at.is_some();
+    Ok(ActivationTiming {
+        duration_secs,
+        expires_at: if duration_secs.is_some() {
+            None
+        } else {
+            args.expires_at.clone()
+        },
+        normalized_redundant_expiry,
+    })
 }
 
 fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Result<String> {
@@ -1862,6 +1885,7 @@ mod tests {
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
                     "duration_minutes":60,
+                    "expires_at":"2099-01-01T00:00:00Z",
                     "operation_scopes":[{
                         "tool":"http_request",
                         "operation":"POST",
@@ -1896,6 +1920,10 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning == "Expiration: 3600 seconds after actual activation"));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Timing normalized")
+                && warning.contains("expires_at value was ignored")
+        }));
         request
             .response_tx
             .send(ApprovalResponse::AllowOnce)
@@ -1926,6 +1954,10 @@ mod tests {
         assert_eq!(
             expires_at.signed_duration_since(confirmed_at).num_seconds(),
             3_600
+        );
+        assert_ne!(
+            mandates[0].expires_at.as_deref(),
+            Some("2099-01-01T00:00:00Z")
         );
         let controller = state.get_goal(&mandates[0].goal_id).await.unwrap().unwrap();
         assert_eq!(controller.status, "active");
@@ -2057,6 +2089,40 @@ mod tests {
             .unwrap()
             .iter()
             .any(|field| field == "operation_scopes"));
+        assert!(state
+            .list_mandates(Some("owner-session"), true)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_normalizes_redundant_fixed_expiry_to_relative_duration() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Steward the account for exactly 24 hours after activation",
+                    "duration_minutes":1440,
+                    "expires_at":"2099-01-01T00:00:00Z",
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["proposal"]["duration_minutes"], 1_440);
+        assert!(value["proposal"]["expires_at"].is_null());
+        assert!(value["proposal"]["timing_normalization"]
+            .as_str()
+            .unwrap()
+            .contains("redundant expires_at value was ignored"));
         assert!(state
             .list_mandates(Some("owner-session"), true)
             .await

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.45] - 2026-08-03
+
+### Fixed
+
+- **Redundant mandate timing now self-normalizes.** When model output includes both an activation-relative `duration_minutes` and a generated fixed `expires_at`, the duration is authoritative, the redundant timestamp is discarded before persistence, and the normalization is disclosed in the owner confirmation instead of blocking activation. Fixed wall-clock deadlines remain unchanged when no duration is supplied.
+
 ## [0.11.44] - 2026-08-02
 
 ### Added
