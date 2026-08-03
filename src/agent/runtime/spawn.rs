@@ -56,13 +56,36 @@ fn enforce_child_terminal_outcome(
     result
 }
 
+fn sqlite_busy_code(value: &str) -> bool {
+    value
+        .parse::<i32>()
+        .ok()
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+fn message_has_sqlite_busy_code(message: &str) -> bool {
+    message.split("code:").skip(1).any(|suffix| {
+        let code = suffix
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        sqlite_busy_code(&code)
+    })
+}
+
 fn is_sqlite_busy(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
+            if database.code().is_some_and(|code| sqlite_busy_code(&code)) {
+                return true;
+            }
+        }
         let message = cause.to_string().to_ascii_lowercase();
         message.contains("database is locked")
             || message.contains("database table is locked")
             || message.contains("sqlite_busy")
-            || message.contains("(code: 5)")
+            || message_has_sqlite_busy_code(&message)
     })
 }
 
@@ -117,6 +140,44 @@ pub(in crate::agent) fn task_lead_execution_mode(is_scheduled: bool) -> &'static
 
 // impl-Agent justification: sub-agent spawning over specialists/limits/depth/role.
 impl Agent {
+    async fn bind_task_attempt_worker_with_retry(
+        &self,
+        attempt_id: &str,
+        lease_token: &str,
+        worker_instance_id: &str,
+        worker_profile_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        const MAX_BUSY_RETRIES: usize = 4;
+        let mut busy_retries = 0_usize;
+        loop {
+            match self
+                .state
+                .bind_task_attempt_worker(
+                    attempt_id,
+                    lease_token,
+                    worker_instance_id,
+                    worker_profile_id,
+                )
+                .await
+            {
+                Ok(bound) => return Ok(bound),
+                Err(error) if busy_retries < MAX_BUSY_RETRIES && is_sqlite_busy(&error) => {
+                    let delay_ms = 25_u64 << busy_retries;
+                    busy_retries += 1;
+                    warn!(
+                        attempt_id,
+                        busy_retries,
+                        delay_ms,
+                        error = %error,
+                        "Retrying task worker binding after SQLite contention"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) fn select_specialist_kind(
         role: AgentRole,
         mission: &str,
@@ -2099,8 +2160,7 @@ impl Agent {
                 None => worker_profile_id(specialist_kind),
             };
             let bound = self
-                .state
-                .bind_task_attempt_worker(
+                .bind_task_attempt_worker_with_retry(
                     &attempt.id,
                     &attempt.lease_token,
                     &child_session,
@@ -2787,6 +2847,14 @@ mod tests {
             "error returned from database: (code: 5) database is locked"
         )));
         assert!(is_sqlite_busy(&anyhow::anyhow!("SQLITE_BUSY")));
+        for code in [261, 517, 773] {
+            assert!(is_sqlite_busy(&anyhow::anyhow!(
+                "error returned from database: (code: {code}) database is locked"
+            )));
+        }
+        assert!(!is_sqlite_busy(&anyhow::anyhow!(
+            "error returned from database: (code: 516) unrelated failure"
+        )));
         assert!(!is_sqlite_busy(&anyhow::anyhow!("executor lease was lost")));
     }
 

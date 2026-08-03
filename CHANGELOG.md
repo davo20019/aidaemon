@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.46] - 2026-08-03
+
+### Fixed
+
+- **Scheduled task startup survives SQLite WAL contention.** Worker rebinding now reserves the write transaction before reading, preventing `SQLITE_BUSY_SNAPSHOT` during concurrent internal writes. Typed busy classification covers SQLite's base and extended busy codes, and worker binding retries bounded transient contention instead of failing the entire scheduled run.
+
 ## [0.11.45] - 2026-08-03
 
 ### Fixed

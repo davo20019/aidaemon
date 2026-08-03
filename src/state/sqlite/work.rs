@@ -602,7 +602,12 @@ impl WorkCoordinationStore for SqliteStateStore {
         worker_instance_id: &str,
         worker_profile_id: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        // This operation reads the current lease/profile and then writes the
+        // bound worker. A deferred transaction can acquire its read snapshot,
+        // lose a race to another WAL writer, and fail on promotion with
+        // SQLITE_BUSY_SNAPSHOT (extended code 517). Reserve the writer slot
+        // before reading so the snapshot can always be committed.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT a.worker_profile_id, g.project_id
              FROM task_attempts a
@@ -1980,6 +1985,65 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn worker_binding_waits_for_a_wal_writer_instead_of_losing_its_snapshot() {
+        let (store, _database) = test_store().await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        let goal = Goal::new_finite("bind after contention", "session-a");
+        store.create_goal(&goal).await.unwrap();
+        let work = task(&goal.id, "scheduled root", None);
+        store.create_task(&work).await.unwrap();
+        let attempt = store
+            .claim_task_with_lease(&work.id, "heartbeat-dispatch", None, 180)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut competing_writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE goals SET updated_at = datetime('now') WHERE id = ?")
+            .bind(&goal.id)
+            .execute(&mut *competing_writer)
+            .await
+            .unwrap();
+
+        let store = Arc::new(store);
+        let binding_store = store.clone();
+        let attempt_id = attempt.id.clone();
+        let lease_token = attempt.lease_token.clone();
+        let binding = tokio::spawn(async move {
+            binding_store
+                .bind_task_attempt_worker(
+                    &attempt_id,
+                    &lease_token,
+                    "specialist:task-lead:test",
+                    None,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        competing_writer.commit().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), binding)
+                .await
+                .expect("binding should resume after the competing writer commits")
+                .unwrap()
+                .unwrap()
+        );
+
+        let rebound = store
+            .get_current_task_attempt(&work.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.worker_instance_id, "specialist:task-lead:test");
     }
 
     #[tokio::test]
