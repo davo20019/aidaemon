@@ -300,20 +300,23 @@ fn clamped_next_review_at(
     requested: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<String> {
-    let requested_secs = match requested {
-        Some(value) => {
-            let parsed = chrono::DateTime::parse_from_rfc3339(value)
-                .map_err(|error| anyhow::anyhow!("invalid reconsider_at: {error}"))?
-                .with_timezone(&chrono::Utc);
-            parsed.signed_duration_since(now).num_seconds()
-        }
-        None => mandate.default_review_secs,
+    let candidate = match requested {
+        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|error| anyhow::anyhow!("invalid reconsider_at: {error}"))?
+            .with_timezone(&chrono::Utc),
+        None => now + chrono::Duration::seconds(mandate.default_review_secs),
     };
-    Ok((now
-        + chrono::Duration::seconds(
-            requested_secs.clamp(mandate.min_review_secs, mandate.max_review_secs),
-        ))
-    .to_rfc3339())
+    let earliest = now + chrono::Duration::seconds(mandate.min_review_secs);
+    let latest = now + chrono::Duration::seconds(mandate.max_review_secs);
+    let candidate = candidate.clamp(earliest, latest);
+    Ok(mandate
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|expires| expires.with_timezone(&chrono::Utc))
+        .filter(|expires| *expires < candidate)
+        .unwrap_or(candidate)
+        .to_rfc3339())
 }
 
 async fn validate_current_run_receipt_refs(
@@ -1187,13 +1190,33 @@ impl MandateStore for SqliteStateStore {
         Ok(())
     }
 
-    async fn confirm_mandate(&self, mandate_id: &str) -> anyhow::Result<bool> {
+    async fn confirm_mandate(
+        &self,
+        mandate_id: &str,
+        activation_duration_secs: Option<i64>,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(!mandate_id.trim().is_empty(), "mandate id is required");
-        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(duration_secs) = activation_duration_secs {
+            anyhow::ensure!(
+                duration_secs > 0,
+                "mandate activation duration must be greater than zero"
+            );
+        }
+        let activated_at = chrono::Utc::now();
+        let expires_at = activation_duration_secs
+            .map(|duration_secs| {
+                activated_at
+                    .checked_add_signed(chrono::Duration::seconds(duration_secs))
+                    .ok_or_else(|| anyhow::anyhow!("mandate activation duration is too large"))
+                    .map(|value| value.to_rfc3339())
+            })
+            .transpose()?;
+        let now = activated_at.to_rfc3339();
         let mut tx = self.pool.begin().await?;
         let goal_id = sqlx::query_scalar::<_, String>(
             "UPDATE mandates
              SET status = 'active', confirmed_at = ?, next_review_at = ?,
+                 expires_at = COALESCE(?, expires_at),
                  review_lease_token = NULL, review_lease_expires_at = NULL, suspension_json = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND status = 'paused' AND confirmed_at IS NULL
@@ -1208,6 +1231,7 @@ impl MandateStore for SqliteStateStore {
         )
         .bind(&now)
         .bind(&now)
+        .bind(expires_at.as_deref())
         .bind(&now)
         .bind(mandate_id)
         .fetch_optional(&mut *tx)
@@ -4190,8 +4214,8 @@ mod tests {
             .transition_mandate_status(&mandate.id, MandateStatus::Paused, MandateStatus::Active,)
             .await
             .unwrap());
-        assert!(store.confirm_mandate(&mandate.id).await.unwrap());
-        assert!(!store.confirm_mandate(&mandate.id).await.unwrap());
+        assert!(store.confirm_mandate(&mandate.id, None).await.unwrap());
+        assert!(!store.confirm_mandate(&mandate.id, None).await.unwrap());
 
         let confirmed = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(confirmed.status, MandateStatus::Active);
@@ -4246,7 +4270,7 @@ mod tests {
             store.get_goal(&goal.id).await.unwrap().unwrap().status,
             "cancelled"
         );
-        assert!(!store.confirm_mandate(&mandate.id).await.unwrap());
+        assert!(!store.confirm_mandate(&mandate.id, None).await.unwrap());
         assert!(
             !store
                 .transition_mandate_status(

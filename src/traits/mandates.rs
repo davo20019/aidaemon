@@ -216,6 +216,23 @@ impl Mandate {
             .clamp(self.min_review_secs, self.max_review_secs)
     }
 
+    /// Choose the next durable review time without ever scheduling work past
+    /// the owner-approved expiry boundary.
+    pub fn bounded_next_review_at(
+        &self,
+        requested_secs: Option<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let candidate = now + chrono::Duration::seconds(self.clamp_review_secs(requested_secs));
+        self.expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|expires| expires.with_timezone(&chrono::Utc))
+            .filter(|expires| *expires < candidate)
+            .unwrap_or(candidate)
+            .to_rfc3339()
+    }
+
     /// Content bounds shared by every mandate ingestion path. Persistence
     /// calls this again so callers cannot bypass the owner-facing tool schema.
     pub fn validate_content_bounds(&self) -> Result<(), String> {
@@ -2109,6 +2126,30 @@ mod tests {
         );
         mandate.expires_at = Some("not-a-timestamp".to_string());
         assert!(!mandate.is_active());
+    }
+
+    #[test]
+    fn next_review_is_capped_at_exact_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut mandate = Mandate::new(
+            "goal-id",
+            None,
+            "Test expiry cap",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            600,
+        );
+        let expiry = now + chrono::Duration::seconds(120);
+        mandate.expires_at = Some(expiry.to_rfc3339());
+
+        assert_eq!(
+            mandate.bounded_next_review_at(None, now),
+            expiry.to_rfc3339()
+        );
     }
 
     #[test]

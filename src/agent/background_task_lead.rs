@@ -513,9 +513,7 @@ async fn persist_safe_wait_if_decision_missing(
         "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.",
         mandate.version,
     );
-    let review_secs = mandate.clamp_review_secs(None);
-    decision.reconsider_at =
-        Some((chrono::Utc::now() + chrono::Duration::seconds(review_secs)).to_rfc3339());
+    decision.reconsider_at = Some(mandate.bounded_next_review_at(None, chrono::Utc::now()));
     if let Err(error) = state.record_mandate_decision(&decision, None, None).await {
         // A concurrent exact decision wins. Reload once before reporting that
         // the safe fallback failed.
@@ -2782,7 +2780,9 @@ mod tests {
     #[tokio::test]
     async fn completed_review_without_explicit_decision_safely_defaults_to_wait() {
         let (state, _database) = mandate_test_state().await;
-        let (goal, mandate) = due_mandate_controller("owner-session");
+        let (goal, mut mandate) = due_mandate_controller("owner-session");
+        let expiry = chrono::Utc::now() + chrono::Duration::minutes(2);
+        mandate.expires_at = Some(expiry.to_rfc3339());
         let run = claimed_mandate_run(&state, &goal, &mandate).await;
 
         assert!(persist_safe_wait_if_decision_missing(&state, &goal.id, &run.id).await);
@@ -2792,7 +2792,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decision.outcome, MandateDecisionOutcome::Wait);
-        assert!(decision.reconsider_at.is_some());
+        let reconsider_at = chrono::DateTime::parse_from_rfc3339(
+            decision
+                .reconsider_at
+                .as_deref()
+                .expect("safe WAIT reconsideration"),
+        )
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+        assert_eq!(reconsider_at, expiry);
 
         let notification =
             finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)

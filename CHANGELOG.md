@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.44] - 2026-08-02
+
+### Added
+
+- **Relative mandate windows now begin at actual activation.** Natural-language durations such as “for one hour” map to a typed `duration_minutes` field. Owner confirmation atomically records one activation timestamp and derives expiry from that same instant, while fixed wall-clock deadlines remain available through `expires_at`.
+
+### Changed
+
+- **Mandate status is compact and directly inspectable.** The default status view returns lifecycle state, the controller goal, latest run, decision, intention, learning note, and mutation receipts without embedding the potentially large pinned-strategy body. Exact policy and bounded history are available as separate status sections.
+- **Mandate IDs work in execution traces.** Goal tracing resolves a mandate ID or unique prefix to its durable controller goal, avoiding misleading “Goal not found” results.
+
+### Fixed
+
+- **Reconsideration never extends past mandate expiry.** Model-selected and safe-WAIT review times are clamped to the exact owner-approved expiry boundary.
+
 ## [0.11.43] - 2026-08-02
 
 ### Fixed

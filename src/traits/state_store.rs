@@ -979,7 +979,11 @@ pub trait MandateStore: Send + Sync {
     /// Atomically consume an explicit owner confirmation and activate both the
     /// mandate and its continuous controller. This is the only path that may
     /// turn an unconfirmed mandate into active authority.
-    async fn confirm_mandate(&self, _mandate_id: &str) -> anyhow::Result<bool> {
+    async fn confirm_mandate(
+        &self,
+        _mandate_id: &str,
+        _activation_duration_secs: Option<i64>,
+    ) -> anyhow::Result<bool> {
         Ok(false)
     }
 

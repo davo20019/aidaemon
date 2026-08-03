@@ -193,6 +193,7 @@ impl ManageMandatesTool {
         mandate: &Mandate,
         budget_per_cycle: i64,
         budget_daily: i64,
+        activation_duration_secs: Option<i64>,
     ) -> Vec<String> {
         vec![
             format!("Objective: {}", mandate.objective),
@@ -245,7 +246,10 @@ impl ManageMandatesTool {
             ),
             format!(
                 "Expiration: {}",
-                mandate.expires_at.as_deref().unwrap_or("none")
+                activation_duration_secs.map_or_else(
+                    || mandate.expires_at.as_deref().unwrap_or("none").to_string(),
+                    |duration_secs| format!("{duration_secs} seconds after actual activation")
+                )
             ),
             format!(
                 "Resolved token budgets: {budget_per_cycle} tokens per decision cycle; {budget_daily} tokens per UTC day"
@@ -269,6 +273,7 @@ impl ManageMandatesTool {
         let stop_conditions = clean_strings(args.stop_conditions.as_deref());
         validate_policy_text(&constraints, &success_criteria, &stop_conditions)?;
         let strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        let activation_duration_secs = activation_duration_secs(args)?;
         let mut missing = Vec::new();
         if authority.operation_scopes.is_empty()
             && (authority.max_mutating_actions_per_cycle > 0
@@ -324,6 +329,7 @@ impl ManageMandatesTool {
                     "maximum": args.max_review_minutes.unwrap_or(DEFAULT_MAX_REVIEW_SECS / 60),
                 },
                 "expires_at": args.expires_at,
+                "duration_minutes": activation_duration_secs.map(|value| value / 60),
                 "priority": args.priority.as_deref().unwrap_or("high"),
             },
             "next_step": if ready_to_confirm {
@@ -347,6 +353,9 @@ impl ManageMandatesTool {
         }
         if args.budget_daily.is_some() {
             fields.push("budget_daily");
+        }
+        if args.duration_minutes.is_some() {
+            fields.push("duration_minutes");
         }
         anyhow::ensure!(
             fields.is_empty(),
@@ -479,6 +488,7 @@ impl ManageMandatesTool {
             &mandate.success_criteria,
             &mandate.stop_conditions,
         )?;
+        let activation_duration_secs = activation_duration_secs(args)?;
         mandate.expires_at = args.expires_at.clone();
         if let Some(expires_at) = mandate.expires_at.as_deref() {
             let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
@@ -503,7 +513,12 @@ impl ManageMandatesTool {
             .await?;
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let warnings = Self::confirmation_warnings(&mandate, budget_per_cycle, budget_daily);
+        let warnings = Self::confirmation_warnings(
+            &mandate,
+            budget_per_cycle,
+            budget_daily,
+            activation_duration_secs,
+        );
         let request = ApprovalRequest {
             command: format!("Delegate mandate: {objective}"),
             session_id: session_id.to_string(),
@@ -531,14 +546,22 @@ impl ManageMandatesTool {
                 | ApprovalResponse::AllowAlways,
             ) => {
                 anyhow::ensure!(
-                    self.state.confirm_mandate(&mandate.id).await?,
+                    self.state
+                        .confirm_mandate(&mandate.id, activation_duration_secs)
+                        .await?,
                     "mandate could not be activated"
                 );
+                let activated =
+                    self.state.get_mandate(&mandate.id).await?.ok_or_else(|| {
+                        anyhow::anyhow!("activated mandate could not be reloaded")
+                    })?;
                 Ok(format!(
-                    "Activated mandate {}. Its first review is due now; future reviews are chosen within {}–{} minutes.",
-                    mandate.id,
-                    mandate.min_review_secs / 60,
-                    mandate.max_review_secs / 60
+                    "Activated mandate {} at {}; it expires at {}. Its first review is due now; future reviews are chosen within {}–{} minutes and capped at expiry.",
+                    activated.id,
+                    activated.confirmed_at.as_deref().unwrap_or("unavailable"),
+                    activated.expires_at.as_deref().unwrap_or("none"),
+                    activated.min_review_secs / 60,
+                    activated.max_review_secs / 60
                 ))
             }
             Ok(ApprovalResponse::Deny) => {
@@ -599,27 +622,151 @@ impl ManageMandatesTool {
         let owner = Self::owner_session(args)?;
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
         let mandate = self.resolve_owned_mandate(id, owner).await?;
-        let decisions = self.state.list_mandate_decisions(&mandate.id, 5).await?;
-        let recent = self.state.list_intentions(&mandate.id, 5).await?;
-        let learning = self
-            .state
-            .list_mandate_learning_notes(&mandate.id, 10)
-            .await?;
-        let mut mutation_receipts = Vec::new();
-        for decision in &decisions {
-            mutation_receipts.extend(
-                self.state
-                    .list_mandate_mutation_attempts_for_run(&decision.goal_run_id)
-                    .await?,
-            );
-        }
-        Ok(serde_json::to_string_pretty(&json!({
-            "mandate": mandate,
-            "recent_decisions": decisions,
-            "recent_intentions": recent,
-            "recent_learning_notes": learning,
-            "recent_mutation_receipts": mutation_receipts,
-        }))?)
+        let strategy = mandate.strategy.as_ref().map(|value| {
+            json!({
+                "skill_name": value.skill_name,
+                "snapshot_version": value.snapshot_version,
+                "content_sha256": value.content_sha256,
+                "description": value.description,
+                "source": value.source,
+                "body_persisted": true,
+                "body_included": false,
+            })
+        });
+        let section = args.section.as_deref().unwrap_or("summary");
+        let output = match section {
+            "summary" => {
+                let latest_decision = self
+                    .state
+                    .list_mandate_decisions(&mandate.id, 1)
+                    .await?
+                    .into_iter()
+                    .next();
+                let latest_intention = self
+                    .state
+                    .list_intentions(&mandate.id, 1)
+                    .await?
+                    .into_iter()
+                    .next();
+                let latest_learning_note = self
+                    .state
+                    .list_mandate_learning_notes(&mandate.id, 1)
+                    .await?
+                    .into_iter()
+                    .next();
+                let latest_goal_run = self
+                    .state
+                    .get_goal_runs(&mandate.goal_id)
+                    .await?
+                    .into_iter()
+                    .next();
+                let latest_mutation_receipts = if let Some(decision) = latest_decision.as_ref() {
+                    self.state
+                        .list_mandate_mutation_attempts_for_run(&decision.goal_run_id)
+                        .await?
+                } else {
+                    Vec::new()
+                };
+                json!({
+                    "schema_version": 2,
+                    "section": "summary",
+                    "mandate": {
+                        "id": mandate.id,
+                        "controller_goal_id": mandate.goal_id,
+                        "source_goal_id": mandate.source_goal_id,
+                        "objective": mandate.objective,
+                        "status": mandate.status,
+                        "version": mandate.version,
+                        "confirmed_at": mandate.confirmed_at,
+                        "expires_at": mandate.expires_at,
+                        "next_review_at": mandate.next_review_at,
+                        "review_lease_active": mandate.review_lease_token.is_some(),
+                        "review_lease_expires_at": mandate.review_lease_expires_at,
+                        "suspension": mandate.suspension,
+                        "created_at": mandate.created_at,
+                        "updated_at": mandate.updated_at,
+                    },
+                    "review_policy": {
+                        "minimum_seconds": mandate.min_review_secs,
+                        "default_seconds": mandate.default_review_secs,
+                        "maximum_seconds": mandate.max_review_secs,
+                    },
+                    "authority_summary": {
+                        "observations_allowed": mandate.authority.allow_observations,
+                        "operation_scope_count": mandate.authority.operation_scopes.len(),
+                        "tools": mandate.authority.allowed_tools,
+                        "mutation_effects": mandate.authority.allowed_mutation_effects,
+                        "max_mutations_per_cycle": mandate.authority.max_mutating_actions_per_cycle,
+                        "max_mutations_per_rolling_24h": mandate.authority.max_mutating_actions_per_rolling_24h,
+                        "minimum_seconds_between_mutations": mandate.authority.min_seconds_between_mutations,
+                    },
+                    "strategy": strategy,
+                    "latest_goal_run": latest_goal_run,
+                    "latest_decision": latest_decision,
+                    "latest_intention": latest_intention,
+                    "latest_learning_note": latest_learning_note,
+                    "latest_mutation_receipts": latest_mutation_receipts,
+                    "more": {
+                        "policy": "Call get again with section=policy for exact scopes and owner policy.",
+                        "history": "Call get again with section=history and limit=1..10 for recent durable history."
+                    }
+                })
+            }
+            "policy" => json!({
+                "schema_version": 2,
+                "section": "policy",
+                "mandate_id": mandate.id,
+                "controller_goal_id": mandate.goal_id,
+                "version": mandate.version,
+                "objective": mandate.objective,
+                "authority": mandate.authority,
+                "constraints": mandate.constraints,
+                "success_criteria": mandate.success_criteria,
+                "stop_conditions": mandate.stop_conditions,
+                "strategy": strategy,
+            }),
+            "history" => {
+                let limit = args.limit.unwrap_or(3).clamp(1, 10);
+                let decisions = self
+                    .state
+                    .list_mandate_decisions(&mandate.id, limit)
+                    .await?;
+                let intentions = self.state.list_intentions(&mandate.id, limit).await?;
+                let learning = self
+                    .state
+                    .list_mandate_learning_notes(&mandate.id, limit)
+                    .await?;
+                let goal_runs = self
+                    .state
+                    .get_goal_runs(&mandate.goal_id)
+                    .await?
+                    .into_iter()
+                    .take(limit as usize)
+                    .collect::<Vec<_>>();
+                let mut mutation_receipts = Vec::new();
+                for decision in &decisions {
+                    mutation_receipts.extend(
+                        self.state
+                            .list_mandate_mutation_attempts_for_run(&decision.goal_run_id)
+                            .await?,
+                    );
+                }
+                json!({
+                    "schema_version": 2,
+                    "section": "history",
+                    "mandate_id": mandate.id,
+                    "controller_goal_id": mandate.goal_id,
+                    "limit": limit,
+                    "recent_goal_runs": goal_runs,
+                    "recent_decisions": decisions,
+                    "recent_intentions": intentions,
+                    "recent_learning_notes": learning,
+                    "recent_mutation_receipts": mutation_receipts,
+                })
+            }
+            _ => anyhow::bail!("section must be summary, policy, or history"),
+        };
+        Ok(serde_json::to_string(&output)?)
     }
 
     async fn transition(&self, args: &ManageMandatesArgs, action: &str) -> anyhow::Result<String> {
@@ -946,6 +1093,7 @@ impl ManageMandatesTool {
             &mandate,
             controller.budget_per_check.unwrap_or_default(),
             controller.budget_daily.unwrap_or_default(),
+            None,
         );
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
@@ -1126,7 +1274,7 @@ impl ManageMandatesTool {
         );
         if outcome != MandateDecisionOutcome::Stop {
             decision.reconsider_at =
-                Some((chrono::Utc::now() + chrono::Duration::seconds(review_secs)).to_rfc3339());
+                Some(mandate.bounded_next_review_at(Some(review_secs), chrono::Utc::now()));
         }
         let intention = if outcome == MandateDecisionOutcome::Act {
             let description = required_bounded_trimmed(
@@ -1271,11 +1419,13 @@ struct ManageMandatesArgs {
     min_review_minutes: Option<i64>,
     max_review_minutes: Option<i64>,
     default_review_minutes: Option<i64>,
+    duration_minutes: Option<i64>,
     expires_at: Option<String>,
     priority: Option<String>,
     budget_per_cycle: Option<i64>,
     budget_daily: Option<i64>,
     include_terminal: Option<bool>,
+    section: Option<String>,
     limit: Option<i64>,
     outcome: Option<String>,
     rationale: Option<String>,
@@ -1314,7 +1464,7 @@ impl Tool for ManageMandatesTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ongoing mandates. Draft before create. Delegated calls require exact non-combinable operation scopes. Budgets are tokens; ASK, reconciliation, STOP, and learning use typed evidence."
+        "Draft, create, inspect, and govern owner-confirmed ongoing mandates."
     }
 
     fn schema(&self) -> Value {
@@ -1333,7 +1483,7 @@ impl Tool for ManageMandatesTool {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 64,
-                        "description": "Exact tool + operation + kind + targets + effects tuples; authenticated scopes pair auth_profile and account targets.",
+                        "description": "Exact non-combinable authority tuples.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1358,12 +1508,14 @@ impl Tool for ManageMandatesTool {
                     "min_review_minutes": { "type": "integer", "minimum": 1 },
                     "max_review_minutes": { "type": "integer", "minimum": 1 },
                     "default_review_minutes": { "type": "integer", "minimum": 1 },
-                    "expires_at": { "type": "string" },
+                    "duration_minutes": { "type": "integer", "minimum": 1, "description": "Create only; update rejects. Minutes after activation." },
+                    "expires_at": { "type": "string", "description": "Fixed RFC3339 deadline; excludes duration_minutes." },
                     "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
-                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Cycle token limit; default 400000." },
-                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. UTC-day token limit; default 1000000." },
+                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Cycle tokens." },
+                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Daily tokens." },
                     "include_terminal": { "type": "boolean" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "section": { "type": "string", "enum": ["summary", "policy", "history"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] },
                     "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
                     "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } },
@@ -1547,6 +1699,16 @@ fn minutes_to_secs(value: Option<i64>, default_secs: i64, field: &str) -> anyhow
         .ok_or_else(|| anyhow::anyhow!("{field} is too large"))
 }
 
+fn activation_duration_secs(args: &ManageMandatesArgs) -> anyhow::Result<Option<i64>> {
+    anyhow::ensure!(
+        args.duration_minutes.is_none() || args.expires_at.is_none(),
+        "duration_minutes and expires_at are mutually exclusive"
+    );
+    args.duration_minutes
+        .map(|minutes| minutes_to_secs(Some(minutes), 0, "duration_minutes"))
+        .transpose()
+}
+
 fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Result<String> {
     validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
     let mut context = existing
@@ -1699,6 +1861,7 @@ mod tests {
                 r#"{
                     "action":"create",
                     "objective":"Steward @aidaemon_ai thoughtfully",
+                    "duration_minutes":60,
                     "operation_scopes":[{
                         "tool":"http_request",
                         "operation":"POST",
@@ -1729,6 +1892,10 @@ mod tests {
             warning
                 == "Resolved token budgets: 400000 tokens per decision cycle; 1000000 tokens per UTC day"
         }));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning == "Expiration: 3600 seconds after actual activation"));
         request
             .response_tx
             .send(ApprovalResponse::AllowOnce)
@@ -1742,6 +1909,24 @@ mod tests {
             .unwrap();
         assert_eq!(mandates.len(), 1);
         assert_eq!(mandates[0].status, MandateStatus::Active);
+        let confirmed_at = chrono::DateTime::parse_from_rfc3339(
+            mandates[0]
+                .confirmed_at
+                .as_deref()
+                .expect("confirmation time"),
+        )
+        .unwrap();
+        let expires_at = chrono::DateTime::parse_from_rfc3339(
+            mandates[0]
+                .expires_at
+                .as_deref()
+                .expect("activation-relative expiry"),
+        )
+        .unwrap();
+        assert_eq!(
+            expires_at.signed_duration_since(confirmed_at).num_seconds(),
+            3_600
+        );
         let controller = state.get_goal(&mandates[0].goal_id).await.unwrap().unwrap();
         assert_eq!(controller.status, "active");
         assert_eq!(controller.domain, "orchestration");
@@ -1960,6 +2145,7 @@ mod tests {
             "priority",
             "budget_per_cycle",
             "budget_daily",
+            "duration_minutes",
         ] {
             let description = schema["parameters"]["properties"][field]["description"]
                 .as_str()
@@ -1979,6 +2165,7 @@ mod tests {
                     "priority":"critical",
                     "budget_per_cycle":12345,
                     "budget_daily":67890,
+                    "duration_minutes":60,
                     "_session_id":"owner-session",
                     "_user_role":"owner",
                     "_channel_visibility":"private"
@@ -1993,6 +2180,7 @@ mod tests {
             "priority",
             "budget_per_cycle",
             "budget_daily",
+            "duration_minutes",
         ] {
             assert!(message.contains(field), "{field}");
         }
@@ -2034,6 +2222,59 @@ mod tests {
                 .status,
             "cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn get_defaults_to_compact_runtime_summary_without_strategy_body() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Compact mandate status",
+            "owner-session",
+            None,
+            None,
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Expose durable runtime state without spilling",
+            "owner-session",
+            MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        let body_marker = "STRATEGY_BODY_MUST_NOT_APPEAR";
+        mandate.strategy = Some(MandateStrategySnapshot {
+            skill_name: "large-strategy".to_string(),
+            snapshot_version: MandateStrategySnapshot::SCHEMA_VERSION,
+            content_sha256: "a".repeat(64),
+            description: "A deliberately large persisted strategy".to_string(),
+            body: body_marker.repeat(500),
+            source: Some("test".to_string()),
+        });
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let result = tool
+            .call(&format!(
+                r#"{{"action":"get","mandate_id":"{}","_session_id":"owner-session","_user_role":"owner","_channel_visibility":"private"}}"#,
+                mandate.id
+            ))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["section"], "summary");
+        assert_eq!(value["mandate"]["controller_goal_id"], goal.id);
+        assert!(value.get("latest_decision").is_some());
+        assert!(value.get("latest_mutation_receipts").is_some());
+        assert!(!result.contains(body_marker));
+        assert!(result.len() < 8_000, "summary was {} bytes", result.len());
     }
 
     #[tokio::test]

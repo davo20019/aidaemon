@@ -25,6 +25,35 @@ impl GoalTraceTool {
             return Ok(trimmed.to_string());
         }
 
+        if let Some(mandate) = self.state.get_mandate(trimmed).await? {
+            return Ok(mandate.goal_id);
+        }
+        let mandate_matches = self
+            .state
+            .list_mandates(None, true)
+            .await?
+            .into_iter()
+            .filter(|mandate| mandate.id.starts_with(trimmed))
+            .collect::<Vec<_>>();
+        match mandate_matches.as_slice() {
+            [mandate] => return Ok(mandate.goal_id.clone()),
+            [] => {}
+            _ => {
+                let preview = mandate_matches
+                    .iter()
+                    .take(5)
+                    .map(|mandate| format!("{} ({})", Self::short_id(&mandate.id), mandate.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Mandate ID prefix '{}' is ambiguous ({} matches): {}. Use the full mandate_id.",
+                    trimmed,
+                    mandate_matches.len(),
+                    preview
+                );
+            }
+        }
+
         let mut candidates = self.state.get_active_goals().await?;
         for g in self.state.get_scheduled_goals().await? {
             if !candidates.iter().any(|x| x.id == g.id) {
@@ -373,7 +402,7 @@ fn goal_trace_schema() -> Value {
                 },
                 "goal_id": {
                     "type": "string",
-                    "description": "Goal ID. Required for goal_trace; optional for tool_trace with task_id"
+                    "description": "Goal or mandate ID. Required for goal_trace; optional for tool_trace with task_id"
                 },
                 "task_id": {
                     "type": "string",
@@ -659,6 +688,41 @@ mod tests {
         assert!(result.contains("Goal Trace (Recent Goals)"));
         assert!(result.contains("Investigate scheduler failures"));
         assert!(result.contains("Tip: call `goal_trace` again with `goal_id`"));
+    }
+
+    #[tokio::test]
+    async fn goal_trace_resolves_a_mandate_id_to_its_controller_goal() {
+        let state = setup_state().await;
+        let tool = GoalTraceTool::new(state.clone());
+        let goal = Goal::new_continuous("Mandate controller", "owner-session", None, None);
+        let mandate = crate::traits::Mandate::new(
+            &goal.id,
+            None,
+            "Observe a bounded domain",
+            "owner-session",
+            crate::traits::MandateAuthority::default(),
+            60,
+            3_600,
+            300,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "goal_trace",
+                    "goal_id": mandate.id
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Goal Trace"));
+        assert!(result.contains(&format!("Goal ID: {}", goal.id)));
     }
 
     #[tokio::test]
