@@ -1189,6 +1189,29 @@ impl HttpRequestTool {
     /// Mandate execution disables redirects and automatic OAuth replay so
     /// execution cannot leave or repeat the exact action covered by the
     /// action-bound mandate grant.
+    fn append_query_params(parsed_url: &mut reqwest::Url, args: &Value) {
+        if let Some(query_params) = args["query_params"].as_object() {
+            for (key, value) in query_params {
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                parsed_url.query_pairs_mut().append_pair(key, &value);
+            }
+        }
+    }
+
+    /// Resolve the exact remote URL represented by the tool arguments.
+    /// Authorization, audit semantics, and adapter execution all call this
+    /// same canonicalization path so structured query parameters cannot create
+    /// target drift.
+    fn canonical_url_from_args(args: &Value) -> Option<reqwest::Url> {
+        let url = args["url"].as_str()?;
+        let mut parsed_url = reqwest::Url::parse(url).ok()?;
+        Self::append_query_params(&mut parsed_url, args);
+        Some(parsed_url)
+    }
+
     async fn execute(
         &self,
         arguments: &str,
@@ -1222,27 +1245,7 @@ impl HttpRequestTool {
                 None,
             ));
         }
-        if mandate_execution
-            && args["query_params"]
-                .as_object()
-                .is_some_and(|params| !params.is_empty())
-        {
-            return Ok((
-                "Request blocked: mandate execution cannot append `query_params`; include the exact query string in `url` so the authorized and executed targets are identical."
-                    .to_string(),
-                None,
-                None,
-            ));
-        }
-        if let Some(qp) = args["query_params"].as_object() {
-            for (k, v) in qp {
-                let val_owned = v
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| v.to_string());
-                parsed_url.query_pairs_mut().append_pair(k, &val_owned);
-            }
-        }
+        Self::append_query_params(&mut parsed_url, &args);
         let url = parsed_url.to_string();
         let auth_profile_name = args["auth_profile"].as_str();
         let account_id = args["account_id"].as_str();
@@ -1922,11 +1925,16 @@ impl Tool for HttpRequestTool {
             .and_then(|value| value.as_str())
             .map(|value| value.trim().to_ascii_uppercase())
             .unwrap_or_default();
-        let url = args
+        let raw_url = args
             .as_ref()
             .and_then(|value| value.get("url"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let url = args
+            .as_ref()
+            .and_then(Self::canonical_url_from_args)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| raw_url.to_string());
         let auth_profile_name = args
             .as_ref()
             .and_then(|value| value.get("auth_profile"))
@@ -1968,18 +1976,18 @@ impl Tool for HttpRequestTool {
         let mut semantics =
             if has_method_override || has_authority_override || observation_method_with_body {
                 ToolCallSemantics::mutation_with(mutation_effects)
-                    .with_target_hint(ToolTargetHintKind::Url, url)
+                    .with_target_hint(ToolTargetHintKind::Url, url.clone())
             } else {
                 match method.as_str() {
                     "GET" | "HEAD" | "OPTIONS" => ToolCallSemantics::observation()
                         .with_verification_mode(ToolVerificationMode::ResultContent)
-                        .with_target_hint(ToolTargetHintKind::Url, url),
+                        .with_target_hint(ToolTargetHintKind::Url, url.clone()),
                     "POST" | "PUT" | "PATCH" | "DELETE" => {
                         ToolCallSemantics::mutation_with(mutation_effects)
-                            .with_target_hint(ToolTargetHintKind::Url, url)
+                            .with_target_hint(ToolTargetHintKind::Url, url.clone())
                     }
                     _ => ToolCallSemantics::mutation_with(mutation_effects)
-                        .with_target_hint(ToolTargetHintKind::Url, url),
+                        .with_target_hint(ToolTargetHintKind::Url, url.clone()),
                 }
             };
         if let Some(operation) = crate::traits::ToolCallOperation::from_http_method(&method) {
@@ -2860,7 +2868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mandate_rejects_query_params_that_change_the_authorized_url() {
+    async fn mandate_canonicalizes_query_params_into_audited_url() {
         let (base_url, request_count, server) = spawn_counting_unauthorized_server().await;
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = HttpRequestTool::new(
@@ -2877,28 +2885,29 @@ mod tests {
 
         let semantics = tool.call_semantics(&arguments);
         assert_eq!(semantics.target_hints.len(), 1);
-        assert!(semantics.target_hints[0].value.ends_with("?account=1"));
+        assert!(semantics.target_hints[0]
+            .value
+            .ends_with("?account=1&account=2"));
         let outcome = tool
             .call_with_execution_context(
                 &arguments,
                 None,
                 ToolExecutionContext {
                     correction_preapproved: false,
-                    mandate_preapproved: false,
+                    mandate_preapproved: true,
                     mandate_execution: true,
                 },
             )
             .await
-            .expect("query target drift is rejected deterministically");
+            .expect("canonical query reaches the adapter");
 
         server.abort();
         let _ = server.await;
-        assert!(outcome.metadata.http_status.is_none());
-        assert!(outcome.output.contains("cannot append `query_params`"));
+        assert_eq!(outcome.metadata.http_status, Some(401));
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no drifted URL may reach the network"
+            1,
+            "the canonical URL should execute exactly once"
         );
     }
 

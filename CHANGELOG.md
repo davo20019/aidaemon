@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.42] - 2026-08-02
+
+### Changed
+
+- **Mandate HTTP queries use the normal typed adapter contract.** Structured `query_params` are now canonicalized into the exact URL shared by authorization semantics, audit receipts, and network execution instead of being rejected by a mandate-only special case.
+- **Missing deliberator bookkeeping defaults safely to WAIT.** When a mandate review returns successfully without explicitly committing ACT/WAIT/ASK/STOP, the runtime records a typed WAIT and the next bounded reconsideration time. It never infers intent from prose or grants mutation authority, and it avoids escalating one transient model protocol miss as a critical owner incident.
+
 ## [0.11.41] - 2026-08-02
 
 ### Fixed

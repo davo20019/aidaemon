@@ -470,6 +470,64 @@ async fn keep_mandate_controller_open(
     }
 }
 
+/// A completed deliberator turn without `record_decision` has granted no
+/// authority and created no intention. Persist the least-privilege semantic
+/// result (WAIT) rather than treating missing orchestration bookkeeping as an
+/// owner-facing incident. This never parses model prose and can never authorize
+/// a mutation; a later bounded cycle remains free to decide ACT explicitly.
+async fn persist_safe_wait_if_decision_missing(
+    state: &Arc<dyn StateStore>,
+    goal_id: &str,
+    goal_run_id: &str,
+) -> bool {
+    match state.get_mandate_decision_for_run(goal_run_id).await {
+        Ok(Some(_)) => return true,
+        Ok(None) => {}
+        Err(error) => {
+            warn!(goal_id, run_id = goal_run_id, %error, "Could not inspect mandate decision");
+            return false;
+        }
+    }
+    let mandate = match state.get_mandate_for_goal(goal_id).await {
+        Ok(Some(mandate)) if mandate.is_active() => mandate,
+        Ok(_) => return false,
+        Err(error) => {
+            warn!(goal_id, run_id = goal_run_id, %error, "Could not load mandate for safe WAIT");
+            return false;
+        }
+    };
+    let mut decision = crate::traits::MandateDecisionCycle::new(
+        &mandate.id,
+        goal_run_id,
+        MandateDecisionOutcome::Wait,
+        "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.",
+        mandate.version,
+    );
+    let review_secs = mandate.clamp_review_secs(None);
+    decision.reconsider_at =
+        Some((chrono::Utc::now() + chrono::Duration::seconds(review_secs)).to_rfc3339());
+    if let Err(error) = state.record_mandate_decision(&decision, None, None).await {
+        // A concurrent exact decision wins. Reload once before reporting that
+        // the safe fallback failed.
+        let committed = state
+            .get_mandate_decision_for_run(goal_run_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !committed {
+            warn!(goal_id, run_id = goal_run_id, %error, "Could not persist safe mandate WAIT");
+        }
+        return committed;
+    }
+    warn!(
+        goal_id,
+        run_id = goal_run_id,
+        "Mandate deliberator omitted its decision; persisted safe WAIT"
+    );
+    true
+}
+
 /// Finalize one mandate deliberation independently from scheduled-run state.
 ///
 /// Any returned notice was already committed by the state store in the same
@@ -1445,7 +1503,18 @@ pub fn spawn_background_task_lead(
                 .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id.as_deref())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mandate_decision_ready = if !is_mandate_run {
+            let safe_wait_committed =
+                if is_mandate_run && task_lead_outcome == Some(TaskOutcome::Succeeded) {
+                    match goal_run_id.as_deref() {
+                        Some(run_id) => {
+                            persist_safe_wait_if_decision_missing(&state, &goal_id, run_id).await
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+            let mandate_decision_ready = if !is_mandate_run || safe_wait_committed {
                 true
             } else {
                 match goal_run_id.as_deref() {
@@ -2678,6 +2747,36 @@ mod tests {
             state.get_goal_runs(&goal.id).await.unwrap()[0].status,
             "completed"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_review_without_explicit_decision_safely_defaults_to_wait() {
+        let (state, _database) = mandate_test_state().await;
+        let (goal, mandate) = due_mandate_controller("owner-session");
+        let run = claimed_mandate_run(&state, &goal, &mandate).await;
+
+        assert!(persist_safe_wait_if_decision_missing(&state, &goal.id, &run.id).await);
+        let decision = state
+            .get_mandate_decision_for_run(&run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.outcome, MandateDecisionOutcome::Wait);
+        assert!(decision.reconsider_at.is_some());
+
+        let notification =
+            finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)
+                .await;
+        assert!(notification.is_none());
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0].status,
+            "completed"
+        );
+        assert!(state
+            .get_pending_notifications(10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
