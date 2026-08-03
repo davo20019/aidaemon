@@ -18,12 +18,15 @@ use crate::types::{ApprovalResponse, StatusUpdate};
 
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
+use crate::tools::{ApprovalBroker, HttpRequestTool};
 
 #[derive(Deserialize, Default)]
 struct ManageOAuthArgs {
     action: String,
     service: Option<String>,
+    account_id: Option<String>,
+    identity_url: Option<String>,
+    account_id_pointer: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
     display_name: Option<String>,
@@ -104,6 +107,62 @@ impl ManageOAuthTool {
             "{} must be an https:// URL.",
             label
         );
+        Ok(parsed.to_string())
+    }
+
+    fn validate_account_id(raw: &str) -> anyhow::Result<String> {
+        let value = raw.trim();
+        anyhow::ensure!(
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
+            "account_id must be a non-empty stable identifier of at most 256 characters"
+        );
+        Ok(value.to_string())
+    }
+
+    fn validate_account_id_pointer(raw: &str) -> anyhow::Result<String> {
+        let value = raw.trim();
+        anyhow::ensure!(
+            value.starts_with('/') && value.len() <= 256 && !value.chars().any(char::is_control),
+            "account_id_pointer must be an RFC 6901 JSON Pointer beginning with '/'"
+        );
+        Ok(value.to_string())
+    }
+
+    fn validate_identity_url(
+        raw: &str,
+        provider: &crate::oauth::OAuthProvider,
+    ) -> anyhow::Result<String> {
+        let parsed = reqwest::Url::parse(raw.trim())
+            .map_err(|error| anyhow::anyhow!("Invalid identity_url: {}", error))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("identity_url must contain a host"))?;
+        let test_localhost = cfg!(test)
+            && matches!(host, "localhost" | "127.0.0.1" | "::1")
+            && parsed.scheme() == "http";
+        anyhow::ensure!(
+            parsed.scheme() == "https" || test_localhost,
+            "identity_url must use https"
+        );
+        anyhow::ensure!(
+            parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.fragment().is_none(),
+            "identity_url cannot contain credentials or a fragment"
+        );
+        anyhow::ensure!(
+            provider
+                .allowed_domains
+                .iter()
+                .any(|domain| HttpRequestTool::domain_matches(host, domain)),
+            "identity_url host '{}' is not allowed for OAuth provider '{}'",
+            host,
+            provider.name
+        );
+        if !test_localhost {
+            crate::tools::web_fetch::validate_url_for_ssrf(parsed.as_str())
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(parsed.to_string())
     }
 
@@ -443,12 +502,166 @@ impl ManageOAuthTool {
                 .as_deref()
                 .map(|e| format!(" [expires: {}]", e))
                 .unwrap_or_default();
+            let account = conn
+                .account_id
+                .as_deref()
+                .map(|id| format!(" [account_id: {}]", id))
+                .unwrap_or_else(|| " [account_id: unbound]".to_string());
             result.push_str(&format!(
-                "  - {}{} [{}]{}\n",
-                conn.service, username, conn.auth_type, expires
+                "  - {}{} [{}]{}{}\n",
+                conn.service, username, conn.auth_type, account, expires
             ));
         }
         Ok(result)
+    }
+
+    async fn identity_response(
+        &self,
+        service: &str,
+        identity_url: &str,
+    ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>, bool)> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let token_key = format!("oauth_{}_access_token", service);
+        let mut refreshed = false;
+        loop {
+            let token = match crate::config::resolve_from_keychain(&token_key) {
+                Ok(token) => token,
+                Err(error) if !refreshed => {
+                    self.gateway.refresh_token(service).await.map_err(|refresh_error| {
+                        anyhow::anyhow!(
+                            "OAuth access token is unavailable ({error}); refresh also failed: {refresh_error}"
+                        )
+                    })?;
+                    refreshed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let response = client
+                .get(identity_url)
+                .bearer_auth(token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Identity verification request failed: {}", error)
+                })?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                self.gateway.refresh_token(service).await?;
+                refreshed = true;
+                continue;
+            }
+            let status = response.status();
+            let (body, truncated) =
+                crate::tools::web_fetch::read_body_capped(response, 64 * 1024).await?;
+            return Ok((status, body, truncated));
+        }
+    }
+
+    async fn handle_bind_account(
+        &self,
+        service: &str,
+        expected_account_id: &str,
+        identity_url: &str,
+        account_id_pointer: &str,
+        session_id: &str,
+    ) -> anyhow::Result<String> {
+        let connection = self
+            .state_store
+            .get_oauth_connection(service)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No OAuth connection found for '{}'", service))?;
+        let provider = self
+            .gateway
+            .get_provider(service)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Unknown OAuth provider: {}", service))?;
+        let identity_url = Self::validate_identity_url(identity_url, &provider)?;
+        let expected_account_id = Self::validate_account_id(expected_account_id)?;
+        let account_id_pointer = Self::validate_account_id_pointer(account_id_pointer)?;
+        let prior_binding = connection.account_id.as_deref().unwrap_or("unbound");
+        let approval_description = format!(
+            "Verify and bind OAuth service '{}' from account '{}' to '{}'",
+            service, prior_binding, expected_account_id
+        );
+        match self
+            .request_approval(
+                session_id,
+                &approval_description,
+                vec![
+                    format!(
+                        "Performs one authenticated read-only GET to {}",
+                        identity_url
+                    ),
+                    "Persists the proven remote account ID for future mandate authorization"
+                        .to_string(),
+                    "A later OAuth reconnect clears this binding and requires verification again"
+                        .to_string(),
+                ],
+            )
+            .await?
+        {
+            ApprovalResponse::AllowOnce
+            | ApprovalResponse::AllowSession
+            | ApprovalResponse::AllowAlways => {}
+            ApprovalResponse::Deny => {
+                return Ok(
+                    "OAuth account binding denied by user; no changes were made.".to_string(),
+                );
+            }
+        }
+
+        let (status, body, truncated) = self.identity_response(service, &identity_url).await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "Identity verification returned HTTP {}; account binding was not changed",
+            status.as_u16()
+        );
+        anyhow::ensure!(
+            !truncated,
+            "Identity verification response exceeded 65536 bytes; account binding was not changed"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| anyhow::anyhow!("Identity response was not valid JSON: {}", error))?;
+        let observed_account_id = payload
+            .pointer(&account_id_pointer)
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Identity response did not contain a string or number at JSON Pointer '{}'",
+                    account_id_pointer
+                )
+            })?;
+        anyhow::ensure!(
+            observed_account_id == expected_account_id,
+            "Authenticated identity mismatch: expected account '{}', received '{}'; account binding was not changed",
+            expected_account_id,
+            observed_account_id
+        );
+        self.gateway
+            .bind_account_id(service, &observed_account_id)
+            .await?;
+        let receipt = json!({
+            "account_id": observed_account_id,
+            "account_id_pointer": account_id_pointer,
+            "bound": true,
+            "http_status": status.as_u16(),
+            "identity_url": identity_url,
+            "method": "GET",
+            "service": service,
+            "verified_at": chrono::Utc::now().to_rfc3339(),
+        });
+        Ok(format!(
+            "OAuth account identity verified and bound.\n{}",
+            serde_json::to_string_pretty(&receipt)?
+        ))
     }
 
     async fn handle_connect(
@@ -853,15 +1066,18 @@ impl ManageOAuthTool {
 fn manage_oauth_schema() -> Value {
     json!({
         "name": "manage_oauth",
-        "description": "Browser OAuth connections. Never ask user to paste credentials — give keychain command. Check providers/list before reconnecting; use connect to reauthorize, not remove. API-key/bearer/header/basic/OAuth1a → manage_http_auth.",
+        "description": "OAuth. Never paste secrets; inspect first; connect reauthorizes; bind_account proves identity. Manual auth → manage_http_auth.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["connect", "list", "remove", "set_credentials", "refresh", "providers", "describe_provider", "register_provider", "remove_provider"]
+                    "enum": ["connect", "list", "bind_account", "remove", "set_credentials", "refresh", "providers", "describe_provider", "register_provider", "remove_provider"]
                 },
                 "service": { "type": "string" },
+                "account_id": { "type": "string", "maxLength": 256 },
+                "identity_url": { "type": "string" },
+                "account_id_pointer": { "type": "string" },
                 "client_id": { "type": "string" },
                 "client_secret": { "type": "string" },
                 "display_name": { "type": "string" },
@@ -937,6 +1153,32 @@ impl Tool for ManageOAuthTool {
                 self.handle_describe_provider(&service).await
             }
             "list" => self.handle_list().await,
+            "bind_account" => {
+                let service = Self::validate_service_name(
+                    args.service
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
+                )?;
+                let session_id = if args._session_id.is_empty() {
+                    "unknown"
+                } else {
+                    args._session_id.as_str()
+                };
+                self.handle_bind_account(
+                    &service,
+                    args.account_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'account_id'"))?,
+                    args.identity_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'identity_url'"))?,
+                    args.account_id_pointer.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("'bind_account' requires 'account_id_pointer'")
+                    })?,
+                    session_id,
+                )
+                .await
+            }
             "connect" => {
                 let service = Self::validate_service_name(
                     args.service
@@ -1014,7 +1256,7 @@ impl Tool for ManageOAuthTool {
                 self.handle_refresh(&service).await
             }
             other => Ok(format!(
-                "Unknown action '{}'. Use: connect, list, remove, set_credentials, refresh, providers, describe_provider, register_provider, remove_provider.",
+                "Unknown action '{}'. Use: connect, list, bind_account, remove, set_credentials, refresh, providers, describe_provider, register_provider, remove_provider.",
                 other
             )),
         }
@@ -1050,7 +1292,12 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    use axum::{extract::Form, routing::post, Json, Router};
+    use axum::{
+        extract::Form,
+        http::HeaderMap,
+        routing::{get, post},
+        Json, Router,
+    };
     use once_cell::sync::Lazy;
     use tempfile::NamedTempFile;
     use tokio::net::TcpListener;
@@ -1422,6 +1669,132 @@ allowed_domains = ["api.linear.app"]
     }
 
     #[tokio::test]
+    async fn bind_account_proves_remote_identity_before_persisting_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn identity_handler(headers: HeaderMap) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer synthetic-access-token")
+            );
+            Json(serde_json::json!({
+                "data": {
+                    "id": "2018008573557551105",
+                    "username": "synthetic_agent"
+                }
+            }))
+        }
+
+        let app = Router::new().route("/2/users/me", get(identity_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config_file = NamedTempFile::new().unwrap();
+        let env_file = NamedTempFile::new().unwrap();
+        write_minimal_config(config_file.path());
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_TWITTER_ACCESS_TOKEN=synthetic-access-token\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        let (tool, gateway, _db) = test_tool(config_file.path().to_path_buf()).await.unwrap();
+        gateway
+            .register_provider(crate::oauth::OAuthProvider {
+                name: "twitter".to_string(),
+                display_name: "Synthetic X".to_string(),
+                auth_type: OAuthType::OAuth2Pkce,
+                authorize_url: "https://example.test/oauth/authorize".to_string(),
+                token_url: "https://example.test/oauth/token".to_string(),
+                scopes: vec!["users.read".to_string()],
+                allowed_domains: vec!["127.0.0.1".to_string()],
+            })
+            .await;
+        tool.state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                account_id: None,
+                scopes: r#"["users.read"]"#.to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        gateway.restore_connections().await;
+
+        let identity_url = format!("http://{addr}/2/users/me");
+        let result = tool
+            .call(
+                &json!({
+                    "action": "bind_account",
+                    "service": "twitter",
+                    "account_id": "2018008573557551105",
+                    "identity_url": identity_url,
+                    "account_id_pointer": "/data/id",
+                    "_session_id": "test",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("OAuth account identity verified and bound"));
+        assert!(result.contains("\"http_status\": 200"));
+        let bound = tool
+            .state_store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.account_id.as_deref(), Some("2018008573557551105"));
+        let listed = tool.call(r#"{"action":"list"}"#).await.unwrap();
+        assert!(listed.contains("account_id: 2018008573557551105"));
+
+        let mismatch = tool
+            .call(
+                &json!({
+                    "action": "bind_account",
+                    "service": "twitter",
+                    "account_id": "different-account",
+                    "identity_url": identity_url,
+                    "account_id_pointer": "/data/id",
+                    "_session_id": "test",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("Authenticated identity mismatch"));
+        let unchanged = tool
+            .state_store
+            .get_oauth_connection("twitter")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.account_id.as_deref(), Some("2018008573557551105"));
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+    }
+
+    #[tokio::test]
     async fn remove_requires_explicit_confirmation() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config_file = NamedTempFile::new().unwrap();
@@ -1442,6 +1815,7 @@ allowed_domains = ["api.linear.app"]
                 service: "twitter".to_string(),
                 auth_type: "oauth2_pkce".to_string(),
                 username: None,
+                account_id: None,
                 scopes: r#"["tweet.read","tweet.write","users.read","offline.access"]"#.to_string(),
                 token_expires_at: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -1488,6 +1862,7 @@ allowed_domains = ["api.linear.app"]
                 service: "twitter".to_string(),
                 auth_type: "oauth2_pkce".to_string(),
                 username: None,
+                account_id: None,
                 scopes: r#"["tweet.read","tweet.write","users.read","offline.access"]"#.to_string(),
                 token_expires_at: None,
                 created_at: chrono::Utc::now().to_rfc3339(),

@@ -2536,6 +2536,7 @@ async fn test_oauth_connection_crud() {
         service: "twitter".to_string(),
         auth_type: "oauth2_pkce".to_string(),
         username: Some("@testuser".to_string()),
+        account_id: None,
         scopes: r#"["tweet.read","tweet.write"]"#.to_string(),
         token_expires_at: Some("2025-12-31T00:00:00Z".to_string()),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -2553,6 +2554,23 @@ async fn test_oauth_connection_crud() {
     assert_eq!(fetched.service, "twitter");
     assert_eq!(fetched.auth_type, "oauth2_pkce");
     assert_eq!(fetched.username, Some("@testuser".to_string()));
+    assert_eq!(fetched.account_id, None);
+
+    // Bind a stable remote identity independently from token expiry.
+    assert!(store
+        .update_oauth_account_id("twitter", Some("2018008573557551105"))
+        .await
+        .unwrap());
+    let bound = store
+        .get_oauth_connection("twitter")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.account_id.as_deref(), Some("2018008573557551105"));
+    assert!(!store
+        .update_oauth_account_id("missing", Some("synthetic-account"))
+        .await
+        .unwrap());
 
     // List all
     let all = store.list_oauth_connections().await.unwrap();
@@ -2579,6 +2597,7 @@ async fn test_oauth_connection_crud() {
         service: "twitter".to_string(),
         auth_type: "oauth2_pkce".to_string(),
         username: Some("@newuser".to_string()),
+        account_id: None,
         scopes: r#"["tweet.read"]"#.to_string(),
         token_expires_at: None,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -2591,6 +2610,10 @@ async fn test_oauth_connection_crud() {
         .unwrap()
         .unwrap();
     assert_eq!(upserted.username, Some("@newuser".to_string()));
+    assert_eq!(
+        upserted.account_id, None,
+        "a fresh connection upsert must clear an earlier identity binding"
+    );
     // Still just 1 connection (upserted, not duplicated)
     assert_eq!(store.list_oauth_connections().await.unwrap().len(), 1);
 

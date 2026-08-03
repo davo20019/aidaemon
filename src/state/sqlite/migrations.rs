@@ -699,6 +699,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             service TEXT NOT NULL UNIQUE,
             auth_type TEXT NOT NULL,
             username TEXT,
+            account_id TEXT,
             scopes TEXT NOT NULL DEFAULT '[]',
             token_expires_at TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -707,6 +708,13 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+
+    // Stable remote identity bound after an authenticated read-only proof.
+    // Existing OAuth connections remain intentionally unbound until the owner
+    // verifies them; never infer identity from the service or username.
+    let _ = sqlx::query("ALTER TABLE oauth_connections ADD COLUMN account_id TEXT")
+        .execute(pool)
+        .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pending_oauth_flows (
@@ -3165,6 +3173,67 @@ pub(crate) async fn rebuild_memory_fts_projections(pool: &SqlitePool) -> anyhow:
         .execute(pool)
         .await?;
     create_memory_fts(pool).await
+}
+
+#[cfg(test)]
+mod oauth_identity_upgrade_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn adds_account_binding_without_inventing_identity_for_existing_connections() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE oauth_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL UNIQUE,
+                auth_type TEXT NOT NULL,
+                username TEXT,
+                scopes TEXT NOT NULL DEFAULT '[]',
+                token_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_connections
+                (service, auth_type, username, scopes, created_at, updated_at)
+             VALUES ('synthetic', 'oauth2_pkce', 'mutable-alias', '[]',
+                     '2026-08-02T00:00:00Z', '2026-08-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_state(&pool).await.unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(oauth_connections)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "account_id"));
+        let row = sqlx::query(
+            "SELECT username, account_id FROM oauth_connections WHERE service = 'synthetic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("username"), "mutable-alias");
+        assert!(row.get::<Option<String>, _>("account_id").is_none());
+    }
 }
 
 #[cfg(test)]

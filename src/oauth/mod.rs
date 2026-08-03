@@ -427,6 +427,7 @@ impl OAuthGateway {
         access_token: &str,
         refresh_token: Option<&str>,
         expires_in: Option<u64>,
+        preserve_account_binding: bool,
     ) -> anyhow::Result<String> {
         let at_key = format!("oauth_{}_access_token", service);
         crate::config::store_in_keychain(&at_key, access_token)?;
@@ -439,11 +440,20 @@ impl OAuthGateway {
         let expires_at = expires_in
             .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
 
+        let account_id = if preserve_account_binding {
+            self.state_store
+                .get_oauth_connection(service)
+                .await?
+                .and_then(|connection| connection.account_id)
+        } else {
+            None
+        };
         let conn = crate::traits::OAuthConnection {
             id: 0,
             service: service.to_string(),
             auth_type: Self::oauth_type_label(&provider.auth_type).to_string(),
             username: None,
+            account_id: account_id.clone(),
             scopes: serde_json::to_string(&provider.scopes).unwrap_or_default(),
             token_expires_at: expires_at,
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -458,7 +468,7 @@ impl OAuthGateway {
             api_secret: None,
             access_token: None,
             access_token_secret: None,
-            user_id: None,
+            user_id: account_id,
             token: Some(access_token.to_string()),
             header_name: None,
             header_value: None,
@@ -546,6 +556,7 @@ impl OAuthGateway {
             &access_token,
             refresh_token.as_deref(),
             expires_in,
+            false,
         )
         .await
     }
@@ -630,6 +641,7 @@ impl OAuthGateway {
                 access_token,
                 refresh_token,
                 expires_in,
+                false,
             )
             .await
         }
@@ -733,7 +745,7 @@ impl OAuthGateway {
                                 api_secret: None,
                                 access_token: None,
                                 access_token_secret: None,
-                                user_id: None,
+                                user_id: conn.account_id.clone(),
                                 token: Some(token),
                                 header_name: None,
                                 header_value: None,
@@ -796,6 +808,7 @@ impl OAuthGateway {
                 &access_token,
                 refresh_token.as_deref(),
                 expires_in,
+                true,
             )
             .await?;
             info!(service = %service, "OAuth client-credentials token refreshed");
@@ -850,7 +863,14 @@ impl OAuthGateway {
             .update_oauth_token_expiry(service, expires_at.as_deref())
             .await?;
 
-        // Update in-memory profile
+        let account_id = self
+            .state_store
+            .get_oauth_connection(service)
+            .await?
+            .and_then(|connection| connection.account_id);
+
+        // Update in-memory profile while preserving the independently verified
+        // remote identity. Token refresh must never discard mandate binding.
         {
             let mut profiles = self.http_profiles.write().await;
             let had_profile = profiles.contains_key(service);
@@ -863,7 +883,7 @@ impl OAuthGateway {
                     api_secret: None,
                     access_token: None,
                     access_token_secret: None,
-                    user_id: None,
+                    user_id: account_id,
                     token: Some(new_access_token.to_string()),
                     header_name: None,
                     header_value: None,
@@ -881,6 +901,42 @@ impl OAuthGateway {
 
         info!(service = %service, "OAuth token refreshed");
         Ok(format!("Token refreshed for {}", service))
+    }
+
+    /// Persist a verified remote identity and apply it to the live HTTP auth
+    /// profile. Callers must prove the identity through the provider before
+    /// invoking this commit point.
+    pub async fn bind_account_id(&self, service: &str, account_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state_store
+                .get_oauth_connection(service)
+                .await?
+                .is_some(),
+            "No OAuth connection found for '{}'",
+            service
+        );
+        {
+            let profiles = self.http_profiles.read().await;
+            anyhow::ensure!(
+                profiles.contains_key(service),
+                "OAuth profile '{}' is not loaded; reconnect or refresh it before binding identity",
+                service
+            );
+        }
+        anyhow::ensure!(
+            self.state_store
+                .update_oauth_account_id(service, Some(account_id))
+                .await?,
+            "OAuth connection '{}' disappeared before identity binding",
+            service
+        );
+        let mut profiles = self.http_profiles.write().await;
+        let profile = profiles
+            .get_mut(service)
+            .ok_or_else(|| anyhow::anyhow!("OAuth profile '{}' disappeared", service))?;
+        profile.user_id = Some(account_id.to_string());
+        info!(service = %service, account_id = %account_id, "Bound verified OAuth account identity");
+        Ok(())
     }
 
     /// Remove an OAuth connection: delete from DB, keychain, and profiles.
@@ -1009,6 +1065,63 @@ mod tests {
         assert_ne!(s1, s2);
         // Should be a valid UUID
         assert!(uuid::Uuid::parse_str(&s1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn bind_account_id_updates_persistence_and_live_profile() {
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "synthetic".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                account_id: None,
+                scopes: "[]".to_string(),
+                token_expires_at: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        gateway.http_profiles.write().await.insert(
+            "synthetic".to_string(),
+            HttpAuthProfile {
+                auth_type: HttpAuthType::Bearer,
+                allowed_domains: vec!["api.example.test".to_string()],
+                api_key: None,
+                api_secret: None,
+                access_token: None,
+                access_token_secret: None,
+                user_id: None,
+                token: Some("synthetic-token".to_string()),
+                header_name: None,
+                header_value: None,
+                username: None,
+                password: None,
+            },
+        );
+
+        gateway
+            .bind_account_id("synthetic", "stable-remote-account")
+            .await
+            .unwrap();
+
+        let stored = gateway
+            .state_store
+            .get_oauth_connection("synthetic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.account_id.as_deref(), Some("stable-remote-account"));
+        let profiles = gateway.http_profiles.read().await;
+        assert_eq!(
+            profiles
+                .get("synthetic")
+                .and_then(|profile| profile.user_id.as_deref()),
+            Some("stable-remote-account")
+        );
     }
 
     #[test]
@@ -1372,6 +1485,7 @@ mod tests {
                 service: "twitter".to_string(),
                 auth_type: "oauth2_pkce".to_string(),
                 username: None,
+                account_id: Some("stable-account-123".to_string()),
                 scopes: r#"["tweet.read"]"#.to_string(),
                 token_expires_at: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -1389,6 +1503,7 @@ mod tests {
         let profiles = gateway.http_profiles.read().await;
         let profile = profiles.get("twitter").expect("twitter profile rebuilt");
         assert_eq!(profile.token.as_deref(), Some("refreshed-access"));
+        assert_eq!(profile.user_id.as_deref(), Some("stable-account-123"));
         assert!(profile
             .allowed_domains
             .iter()
@@ -1455,6 +1570,7 @@ mod tests {
                 service: "twitter".to_string(),
                 auth_type: "oauth2_pkce".to_string(),
                 username: None,
+                account_id: Some("stable-account-456".to_string()),
                 scopes: r#"["tweet.read"]"#.to_string(),
                 token_expires_at: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -1475,5 +1591,6 @@ mod tests {
             .get("twitter")
             .expect("twitter profile should be restored via refresh");
         assert_eq!(profile.token.as_deref(), Some("restored-via-refresh"));
+        assert_eq!(profile.user_id.as_deref(), Some("stable-account-456"));
     }
 }

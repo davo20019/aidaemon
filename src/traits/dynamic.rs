@@ -7,6 +7,10 @@ pub struct OAuthConnection {
     pub service: String,
     pub auth_type: String,
     pub username: Option<String>,
+    /// Stable remote account identifier proven through an authenticated
+    /// identity endpoint. Mandate execution binds to this value rather than a
+    /// mutable provider alias or display name.
+    pub account_id: Option<String>,
     pub scopes: String,
     pub token_expires_at: Option<String>,
     pub created_at: String,

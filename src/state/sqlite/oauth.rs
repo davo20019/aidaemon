@@ -8,15 +8,16 @@ impl crate::traits::OAuthStore for SqliteStateStore {
     ) -> anyhow::Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
-            "INSERT INTO oauth_connections (service, auth_type, username, scopes, token_expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+            "INSERT INTO oauth_connections (service, auth_type, username, account_id, scopes, token_expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(service) DO UPDATE SET \
-             auth_type = excluded.auth_type, username = excluded.username, scopes = excluded.scopes, \
+             auth_type = excluded.auth_type, username = excluded.username, account_id = excluded.account_id, scopes = excluded.scopes, \
              token_expires_at = excluded.token_expires_at, updated_at = excluded.updated_at",
         )
         .bind(&conn.service)
         .bind(&conn.auth_type)
         .bind(&conn.username)
+        .bind(&conn.account_id)
         .bind(&conn.scopes)
         .bind(&conn.token_expires_at)
         .bind(&now)
@@ -52,7 +53,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
         service: &str,
     ) -> anyhow::Result<Option<crate::traits::OAuthConnection>> {
         let row = sqlx::query(
-            "SELECT id, service, auth_type, username, scopes, token_expires_at, created_at, updated_at \
+            "SELECT id, service, auth_type, username, account_id, scopes, token_expires_at, created_at, updated_at \
              FROM oauth_connections WHERE service = ?",
         )
         .bind(service)
@@ -64,6 +65,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
             service: r.get("service"),
             auth_type: r.get("auth_type"),
             username: r.try_get("username").unwrap_or(None),
+            account_id: r.try_get("account_id").unwrap_or(None),
             scopes: r.get("scopes"),
             token_expires_at: r.try_get("token_expires_at").unwrap_or(None),
             created_at: r.get("created_at"),
@@ -94,7 +96,7 @@ impl crate::traits::OAuthStore for SqliteStateStore {
 
     async fn list_oauth_connections(&self) -> anyhow::Result<Vec<crate::traits::OAuthConnection>> {
         let rows = sqlx::query(
-            "SELECT id, service, auth_type, username, scopes, token_expires_at, created_at, updated_at \
+            "SELECT id, service, auth_type, username, account_id, scopes, token_expires_at, created_at, updated_at \
              FROM oauth_connections ORDER BY service ASC",
         )
         .fetch_all(&self.pool)
@@ -107,12 +109,30 @@ impl crate::traits::OAuthStore for SqliteStateStore {
                 service: r.get("service"),
                 auth_type: r.get("auth_type"),
                 username: r.try_get("username").unwrap_or(None),
+                account_id: r.try_get("account_id").unwrap_or(None),
                 scopes: r.get("scopes"),
                 token_expires_at: r.try_get("token_expires_at").unwrap_or(None),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    async fn update_oauth_account_id(
+        &self,
+        service: &str,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE oauth_connections SET account_id = ?, updated_at = ? WHERE service = ?",
+        )
+        .bind(account_id)
+        .bind(&now)
+        .bind(service)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn list_pending_oauth_flows(

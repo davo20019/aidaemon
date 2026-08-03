@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.39] - 2026-08-02
+
+### Added
+
+- **OAuth connections can prove and bind a stable remote identity.** The owner-approved `bind_account` flow performs an authenticated read-only identity request, extracts the account through an explicit JSON Pointer, rejects mismatches without changing state, and returns a structured verification receipt. The verified account ID is persisted separately from mutable usernames and restored into the live HTTP authentication profile after restart.
+
+### Changed
+
+- **Mandate identity survives token refresh but not account replacement.** Refreshing an OAuth token preserves its verified account binding, while a completed reconnect clears the old binding so a newly authorized account cannot silently inherit existing mandate authority. OAuth connection listings now show whether each profile is bound and to which stable account ID.
+
+### Fixed
+
+- **OAuth 2 profiles can participate in authenticated mandate scopes.** Previously, OAuth-managed HTTP profiles always had an empty `user_id`, so the mandate gate rejected every authenticated call even after a successful `/users/me` check. Verified bindings now populate the exact account identity required by the runtime authorization boundary.
+
 ## [0.11.38] - 2026-08-02
 
 ### Changed

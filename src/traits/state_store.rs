@@ -834,6 +834,15 @@ pub trait OAuthStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Persist or clear the verified remote account bound to an OAuth service.
+    async fn update_oauth_account_id(
+        &self,
+        _service: &str,
+        _account_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Get a pending OAuth flow by state parameter.
     async fn get_pending_oauth_flow(
         &self,
