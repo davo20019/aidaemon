@@ -909,6 +909,16 @@ impl Tool for ManageMemoriesTool {
                 Ok(output)
             }
             "create_personal_goal" => {
+                let session_id = args
+                    ._session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Internal error: create_personal_goal requires _session_id."
+                        )
+                    })?;
                 let desc = args
                     .goal
                     .as_deref()
@@ -916,7 +926,11 @@ impl Tool for ManageMemoriesTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("'goal' is required for create_personal_goal action"))?;
 
-                let mut goal = crate::traits::Goal::new_personal(desc, "_global");
+                // Personal goals may be visible across the owner's private contexts, but the
+                // session that actually created them is an authorization boundary. Mandates use
+                // this binding to prevent a goal from another conversation from delegating
+                // external authority.
+                let mut goal = crate::traits::Goal::new_personal(desc, session_id);
                 if let Some(p) = args.priority.as_deref() {
                     let p = p.trim().to_ascii_lowercase();
                     if matches!(p.as_str(), "low" | "medium" | "high" | "critical") {
@@ -3181,7 +3195,8 @@ mod tests {
             .call(
                 &json!({
                     "action": "create_personal_goal",
-                    "goal": "Learn conversational Spanish"
+                    "goal": "Learn conversational Spanish",
+                    "_session_id": "owner-session"
                 })
                 .to_string(),
             )
@@ -3197,6 +3212,7 @@ mod tests {
         assert_eq!(goals[0].domain, "personal");
         assert_eq!(goals[0].priority, "medium");
         assert_eq!(goals[0].status, "active");
+        assert_eq!(goals[0].session_id, "owner-session");
     }
 
     #[tokio::test]
@@ -3209,7 +3225,8 @@ mod tests {
                 &json!({
                     "action": "create_personal_goal",
                     "goal": "Exercise daily",
-                    "priority": "high"
+                    "priority": "high",
+                    "_session_id": "owner-session"
                 })
                 .to_string(),
             )
@@ -3231,7 +3248,8 @@ mod tests {
                 &json!({
                     "action": "create_personal_goal",
                     "goal": "Some goal",
-                    "priority": "ultra"
+                    "priority": "ultra",
+                    "_session_id": "owner-session"
                 })
                 .to_string(),
             )
@@ -3252,13 +3270,41 @@ mod tests {
             .call(
                 &json!({
                     "action": "create_personal_goal",
-                    "goal": "   "
+                    "goal": "   ",
+                    "_session_id": "owner-session"
                 })
                 .to_string(),
             )
             .await;
 
         assert!(result.is_err() || result.unwrap().contains("required"));
+    }
+
+    #[tokio::test]
+    async fn create_personal_goal_rejects_missing_internal_session() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "Cannot become unowned"
+                })
+                .to_string(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("create_personal_goal requires _session_id"));
+        assert!(state
+            .get_active_personal_goals(50)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // ==================== create_scheduled_goal tests ====================

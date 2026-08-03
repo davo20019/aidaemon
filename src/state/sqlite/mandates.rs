@@ -4047,6 +4047,16 @@ mod tests {
             .is_err());
         assert!(store.get_goal(&bad_goal.id).await.unwrap().is_none());
 
+        let same_owner_source = Goal::new_personal("Grow an audience", "owner-session");
+        store.create_goal(&same_owner_source).await.unwrap();
+        let (linked_goal, mut linked_mandate) = controller("owner-session", 2);
+        linked_mandate.source_goal_id = Some(same_owner_source.id);
+        store
+            .create_mandate_controller(&linked_goal, &linked_mandate)
+            .await
+            .unwrap();
+        assert!(store.get_goal(&linked_goal.id).await.unwrap().is_some());
+
         let foreign_source = Goal::new_personal("Grow an audience", "different-owner-session");
         store.create_goal(&foreign_source).await.unwrap();
         let (foreign_goal, mut foreign_mandate) = controller("owner-session", 2);

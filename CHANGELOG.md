@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.40] - 2026-08-02
+
+### Fixed
+
+- **Personal goals now retain their creating owner session.** Explicit personal-goal creation previously hard-coded `_global` as the session, making every newly created goal fail the mandate source-ownership check. New personal goals persist the runtime-injected session identity, same-session goals can authorize a mandate, missing session context fails closed, and cross-session goals remain rejected.
+
 ## [0.11.39] - 2026-08-02
 
 ### Added
