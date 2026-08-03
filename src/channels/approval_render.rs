@@ -6,6 +6,7 @@
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 use super::formatting::html_escape;
+use super::formatting::split_message;
 use crate::tools::command_risk::{PermissionMode, RiskLevel};
 use crate::types::ApprovalResponse;
 
@@ -268,19 +269,43 @@ pub(super) fn build_goal_confirmation_keyboard(approval_id: &str) -> InlineKeybo
     ]])
 }
 
-/// Build the HTML body for a scheduled-goal-confirmation prompt.
-pub(super) fn build_goal_confirmation_text(goal_description: &str, details: &[String]) -> String {
-    let escaped_desc = html_escape(goal_description);
-    let mut text = format!(
-        "📅 <b>Confirm scheduled goal</b>\n\n<code>{}</code>",
-        escaped_desc
-    );
+/// Build lossless plain-text pages for a goal-confirmation prompt.
+///
+/// Mandate confirmations can contain complete authority scopes and policy text,
+/// which routinely exceed Telegram's 4096-character message limit. Keep enough
+/// headroom for page labels and the final confirmation instruction, and put the
+/// inline keyboard on the final page only. Plain text avoids splitting inside
+/// generated HTML entities while preserving every disclosed detail.
+pub(super) fn build_goal_confirmation_pages(
+    goal_description: &str,
+    details: &[String],
+) -> Vec<String> {
+    const PAGE_BODY_BYTES: usize = 3_400;
 
+    let mut body = format!("Requested goal\n{goal_description}");
     for detail in details {
-        text.push_str(&format!("\n• {}", html_escape(detail)));
+        body.push_str(&format!("\n• {detail}"));
     }
 
-    text
+    let chunks = split_message(&body, PAGE_BODY_BYTES);
+    let page_count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut page = if page_count == 1 {
+                format!("📋 Confirm goal\n\n{chunk}")
+            } else {
+                format!("📋 Confirm goal ({}/{page_count})\n\n{chunk}", index + 1)
+            };
+            if index + 1 == page_count {
+                page.push_str(
+                    "\n\nReview the complete proposal above, then confirm or cancel this exact goal.",
+                );
+            }
+            page
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -334,5 +359,25 @@ mod tests {
         );
         assert!(prompt.contains("applies only to this action"));
         assert!(!prompt.contains("Allow Always"));
+    }
+
+    #[test]
+    fn goal_confirmation_pages_preserve_large_proposal_within_telegram_limit() {
+        let final_marker = "FINAL_AUTHORITY_DETAIL";
+        let details = vec![format!(
+            "{}{}",
+            "scope <unescaped> ".repeat(500),
+            final_marker
+        )];
+        let pages = build_goal_confirmation_pages("Delegate an ongoing mandate", &details);
+
+        assert!(pages.len() > 1);
+        assert!(pages.iter().all(|page| page.len() <= 4_096));
+        assert!(pages.last().unwrap().contains(final_marker));
+        assert!(pages
+            .last()
+            .unwrap()
+            .contains("confirm or cancel this exact goal"));
+        assert!(pages.iter().any(|page| page.contains("<unescaped>")));
     }
 }

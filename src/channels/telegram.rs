@@ -5297,28 +5297,31 @@ impl Channel for TelegramChannel {
         }
 
         let keyboard = approval_render::build_goal_confirmation_keyboard(&approval_id);
+        let pages = approval_render::build_goal_confirmation_pages(goal_description, details);
+        let page_count = pages.len();
 
-        let text = approval_render::build_goal_confirmation_text(goal_description, details);
-
-        match self
-            .bot
-            .send_message(ChatId(chat_id), &text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard)
-            .await
-        {
-            Ok(_) => {
-                info!(approval_id = %short_id, "Goal confirmation message sent");
-            }
-            Err(e) => {
-                warn!("Failed to send goal confirmation: {}", e);
+        for (index, text) in pages.iter().enumerate() {
+            let request = self.bot.send_message(ChatId(chat_id), text);
+            let result = if index + 1 == page_count {
+                request.reply_markup(keyboard.clone()).await
+            } else {
+                request.await
+            };
+            if let Err(error) = result {
+                warn!(
+                    page = index + 1,
+                    page_count, "Failed to send goal confirmation: {}", error
+                );
                 let mut pending = self.pending_approvals.lock().await;
                 pending.remove(&approval_id);
                 return Err(anyhow::anyhow!(
-                    "Telegram goal confirmation could not be delivered: {e}"
+                    "Telegram goal confirmation page {}/{} could not be delivered: {error}",
+                    index + 1,
+                    page_count
                 ));
             }
         }
+        info!(approval_id = %short_id, page_count, "Goal confirmation message sent");
 
         // Wait with 30-minute timeout (generous window to avoid race conditions
         // when users confirm near the timeout boundary).

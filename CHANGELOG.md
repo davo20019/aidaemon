@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.41] - 2026-08-02
+
+### Fixed
+
+- **Large mandate confirmations now reach Telegram intact.** Goal confirmation previously rendered the complete authority and policy payload as one unbounded message, so Telegram rejected proposals over 4,096 characters and the mandate failed closed as “confirmation response unavailable.” Confirmations are now split into lossless numbered plain-text pages within Telegram's limit, with approval controls attached only to the final page.
+
 ## [0.11.40] - 2026-08-02
 
 ### Fixed
