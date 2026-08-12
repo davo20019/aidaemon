@@ -327,6 +327,13 @@ pub(super) async fn execute_tool_call_io(
         }
         Err(e) => {
             result_metadata.transport_error = Some(e.to_string());
+            // A legacy tool returning `Err` has made an explicit typed Rust
+            // failure. Classify it once at this adapter boundary instead of
+            // teaching the orchestration loop phrases from its display text.
+            // Retryable conditions (notably watchdog timeouts) return a typed
+            // outcome directly before reaching this branch.
+            result_metadata.outcome_status =
+                Some(crate::traits::ToolOutcomeStatus::FailedPermanent);
             format!("Error: {}", e)
         }
     };

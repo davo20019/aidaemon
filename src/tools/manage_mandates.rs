@@ -20,7 +20,13 @@ use crate::types::{ApprovalKind, ApprovalResponse};
 const DEFAULT_MIN_REVIEW_SECS: i64 = 15 * 60;
 const DEFAULT_MAX_REVIEW_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_REVIEW_SECS: i64 = 4 * 60 * 60;
-const MIN_MANDATE_TOKEN_BUDGET: i64 = 10_000;
+// One review needs at least two model turns: observe, then commit a typed
+// ACT/WAIT/ASK/STOP decision, plus enough room for one bounded correction when
+// the typed commit is rejected. Live policy prompts can conservatively reserve
+// 7–8k per turn, so a 20k envelope can still strand the correction turn.
+const MIN_MANDATE_TOKEN_BUDGET: i64 = 30_000;
+const DEFAULT_MANDATE_TOKEN_BUDGET_PER_CYCLE: i64 = 100_000;
+const DEFAULT_MANDATE_TOKEN_BUDGET_DAILY: i64 = 1_000_000;
 const MAX_OBJECTIVE_TEXT: usize = 2 * 1024;
 const MAX_POLICY_ENTRIES: usize = 16;
 const MAX_POLICY_ENTRY_TEXT: usize = 500;
@@ -132,19 +138,28 @@ impl ManageMandatesTool {
         })
     }
 
-    fn resolved_token_budgets(args: &ManageMandatesArgs) -> anyhow::Result<(i64, i64)> {
-        let goal = crate::traits::Goal::new_continuous_pending(
-            "Mandate draft budget resolution",
-            "mandate-draft",
-            args.budget_per_cycle,
-            args.budget_daily,
-        );
-        let per_cycle = goal.budget_per_check.unwrap_or_default();
-        let daily = goal.budget_daily.unwrap_or_default();
+    fn resolved_token_budgets(
+        args: &ManageMandatesArgs,
+        default_review_secs: i64,
+        timing: &ActivationTiming,
+    ) -> anyhow::Result<(i64, i64)> {
+        let per_cycle = args
+            .budget_per_cycle
+            .unwrap_or(DEFAULT_MANDATE_TOKEN_BUDGET_PER_CYCLE);
         anyhow::ensure!(
             per_cycle >= MIN_MANDATE_TOKEN_BUDGET,
             "budget_per_cycle is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
         );
+        let review_cycles = expected_default_review_cycles(default_review_secs, timing)?;
+        let cadence_floor = per_cycle
+            .checked_mul(review_cycles)
+            .ok_or_else(|| anyhow::anyhow!("review cadence token budget is too large"))?;
+        // An omitted daily budget must always be usable with the other defaults.
+        // In particular, a 30-minute cadence has 48 reviews in a full day and
+        // therefore needs more than the static one-million-token floor.
+        let daily = args
+            .budget_daily
+            .unwrap_or(DEFAULT_MANDATE_TOKEN_BUDGET_DAILY.max(cadence_floor));
         anyhow::ensure!(
             daily >= MIN_MANDATE_TOKEN_BUDGET,
             "budget_daily is a token budget and must be at least {MIN_MANDATE_TOKEN_BUDGET}; omit it to use the default"
@@ -152,6 +167,10 @@ impl ManageMandatesTool {
         anyhow::ensure!(
             daily >= per_cycle,
             "budget_daily must be at least budget_per_cycle"
+        );
+        anyhow::ensure!(
+            daily >= cadence_floor,
+            "budget_daily must be at least {cadence_floor} tokens to fund {review_cycles} default review cycle(s) in the mandate's busiest UTC day; increase budget_daily or lengthen default_review_minutes"
         );
         Ok((per_cycle, daily))
     }
@@ -267,13 +286,33 @@ impl ManageMandatesTool {
         let objective =
             required_bounded_trimmed(args.objective.as_deref(), "objective", MAX_OBJECTIVE_TEXT)?;
         let authority = Self::authority_from_args(args)?;
-        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(args)?;
+        let min_review_secs = minutes_to_secs(
+            args.min_review_minutes,
+            DEFAULT_MIN_REVIEW_SECS,
+            "min_review_minutes",
+        )?;
+        let max_review_secs = minutes_to_secs(
+            args.max_review_minutes,
+            DEFAULT_MAX_REVIEW_SECS,
+            "max_review_minutes",
+        )?;
+        let default_review_secs = minutes_to_secs(
+            args.default_review_minutes,
+            DEFAULT_REVIEW_SECS,
+            "default_review_minutes",
+        )?;
+        anyhow::ensure!(
+            min_review_secs <= default_review_secs && default_review_secs <= max_review_secs,
+            "review bounds must satisfy min <= default <= max"
+        );
+        let timing = activation_timing(args)?;
+        let (budget_per_cycle, budget_daily) =
+            Self::resolved_token_budgets(args, default_review_secs, &timing)?;
         let constraints = clean_strings(args.constraints.as_deref());
         let success_criteria = clean_strings(args.success_criteria.as_deref());
         let stop_conditions = clean_strings(args.stop_conditions.as_deref());
         validate_policy_text(&constraints, &success_criteria, &stop_conditions)?;
         let strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
-        let timing = activation_timing(args)?;
         let mut missing = Vec::new();
         if authority.operation_scopes.is_empty()
             && (authority.max_mutating_actions_per_cycle > 0
@@ -324,9 +363,9 @@ impl ManageMandatesTool {
                     "per_utc_day": budget_daily,
                 },
                 "review_minutes": {
-                    "minimum": args.min_review_minutes.unwrap_or(DEFAULT_MIN_REVIEW_SECS / 60),
-                    "default": args.default_review_minutes.unwrap_or(DEFAULT_REVIEW_SECS / 60),
-                    "maximum": args.max_review_minutes.unwrap_or(DEFAULT_MAX_REVIEW_SECS / 60),
+                    "minimum": min_review_secs / 60,
+                    "default": default_review_secs / 60,
+                    "maximum": max_review_secs / 60,
                 },
                 "expires_at": timing.expires_at,
                 "duration_minutes": timing.duration_secs.map(|value| value / 60),
@@ -351,18 +390,12 @@ impl ManageMandatesTool {
         if args.priority.is_some() {
             fields.push("priority");
         }
-        if args.budget_per_cycle.is_some() {
-            fields.push("budget_per_cycle");
-        }
-        if args.budget_daily.is_some() {
-            fields.push("budget_daily");
-        }
         if args.duration_minutes.is_some() {
             fields.push("duration_minutes");
         }
         anyhow::ensure!(
             fields.is_empty(),
-            "update does not support create-only fields in v1: {}; create a new mandate to change them",
+            "update does not support these create-only fields: {}; create a new mandate to change them",
             fields.join(", ")
         );
         Ok(())
@@ -451,13 +484,15 @@ impl ManageMandatesTool {
             "review bounds must satisfy min <= default <= max"
         );
 
+        let timing = activation_timing(args)?;
+        let (budget_per_cycle, budget_daily) =
+            Self::resolved_token_budgets(args, default_review_secs, &timing)?;
         let mut goal = crate::traits::Goal::new_continuous_pending(
             &format!("Mandate: {objective}"),
             session_id,
-            args.budget_per_cycle,
-            args.budget_daily,
+            Some(budget_per_cycle),
+            Some(budget_daily),
         );
-        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(args)?;
         goal.priority = args.priority.clone().unwrap_or_else(|| "high".to_string());
         anyhow::ensure!(
             matches!(
@@ -491,7 +526,6 @@ impl ManageMandatesTool {
             &mandate.success_criteria,
             &mandate.stop_conditions,
         )?;
-        let timing = activation_timing(args)?;
         mandate.expires_at = timing.expires_at.clone();
         if let Some(expires_at) = mandate.expires_at.as_deref() {
             let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
@@ -607,13 +641,18 @@ impl ManageMandatesTool {
         }
         let mut output = format!("Mandates ({}):\n", mandates.len());
         for mandate in mandates {
+            let admission = match self.state.get_goal(&mandate.goal_id).await? {
+                Some(goal) => controller_budget_admission_label(&goal),
+                None => "controller-missing".to_string(),
+            };
             output.push_str(&format!(
-                "- {} [{} v{}] {} — next review {}; {}/cycle, {}/rolling-24h mutations\n",
+                "- {} [{} v{}] {} — next review {}; review admission {}; {}/cycle, {}/rolling-24h mutations\n",
                 mandate.id,
                 mandate.status,
                 mandate.version,
                 mandate.objective,
                 mandate.next_review_at,
+                admission,
                 mandate.authority.max_mutating_actions_per_cycle,
                 mandate.authority.max_mutating_actions_per_rolling_24h
             ));
@@ -645,6 +684,11 @@ impl ManageMandatesTool {
         let section = args.section.as_deref().unwrap_or("summary");
         let output = match section {
             "summary" => {
+                let controller = self
+                    .state
+                    .get_goal(&mandate.goal_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
                 let latest_decision = self
                     .state
                     .list_mandate_decisions(&mandate.id, 1)
@@ -700,6 +744,7 @@ impl ManageMandatesTool {
                         "default_seconds": mandate.default_review_secs,
                         "maximum_seconds": mandate.max_review_secs,
                     },
+                    "controller_budget": controller_budget_snapshot(&controller),
                     "authority_summary": {
                         "observations_allowed": mandate.authority.allow_observations,
                         "operation_scope_count": mandate.authority.operation_scopes.len(),
@@ -966,6 +1011,8 @@ impl ManageMandatesTool {
             || args.max_review_minutes.is_some()
             || args.default_review_minutes.is_some()
             || args.expires_at.is_some()
+            || args.budget_per_cycle.is_some()
+            || args.budget_daily.is_some()
             || args.strategy_skill.is_some()
             || args.clear_strategy.unwrap_or(false);
         anyhow::ensure!(has_change, "update requires at least one changed field");
@@ -1098,12 +1145,31 @@ impl ManageMandatesTool {
             .get_goal(&mandate.goal_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
-        let warnings = Self::confirmation_warnings(
-            &mandate,
-            controller.budget_per_check.unwrap_or_default(),
-            controller.budget_daily.unwrap_or_default(),
-            None,
-        );
+        let proposed_budget_args =
+            ManageMandatesArgs {
+                budget_per_cycle: Some(
+                    args.budget_per_cycle
+                        .or(controller.budget_per_check)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("mandate controller per-cycle budget is missing")
+                        })?,
+                ),
+                budget_daily: Some(args.budget_daily.or(controller.budget_daily).ok_or_else(
+                    || anyhow::anyhow!("mandate controller daily budget is missing"),
+                )?),
+                ..Default::default()
+            };
+        let timing = ActivationTiming {
+            duration_secs: None,
+            expires_at: mandate.expires_at.clone(),
+            normalized_redundant_expiry: false,
+        };
+        let (budget_per_cycle, budget_daily) = Self::resolved_token_budgets(
+            &proposed_budget_args,
+            mandate.default_review_secs,
+            &timing,
+        )?;
+        let warnings = Self::confirmation_warnings(&mandate, budget_per_cycle, budget_daily, None);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.approval_tx
             .send(ApprovalRequest {
@@ -1131,11 +1197,16 @@ impl ManageMandatesTool {
             Err(_) => anyhow::bail!("mandate update confirmation became unavailable"),
         }
         mandate.version += 1;
-        mandate.updated_at = chrono::Utc::now().to_rfc3339();
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        mandate.next_review_at = updated_at.clone();
+        mandate.updated_at = updated_at;
         self.state.update_mandate(&mandate).await?;
+        self.state
+            .set_goal_budgets(&mandate.goal_id, Some(budget_per_cycle), Some(budget_daily))
+            .await?;
         Ok(format!(
-            "Updated mandate {} to policy version {}. In-flight decisions on older versions are revoked.",
-            mandate.id, mandate.version
+            "Updated mandate {} to policy version {} with {budget_per_cycle} tokens per cycle and {budget_daily} per UTC day. In-flight decisions on older versions are revoked; the next review is due now.",
+            mandate.id, mandate.version,
         ))
     }
 
@@ -1248,35 +1319,11 @@ impl ManageMandatesTool {
                 "question is required when outcome is ask"
             );
         }
-        decision.termination_kind = args
-            .termination_kind
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                MandateTerminationKind::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "termination_kind must be success_criteria_satisfied, stop_condition_met, or safety_termination"
-                    )
-                })
-            })
-            .transpose()?;
-        decision.termination_match = bounded_optional_text(
+        (decision.termination_kind, decision.termination_match) = normalized_termination_fields(
+            outcome,
+            args.termination_kind.as_deref(),
             args.termination_match.as_deref(),
-            "termination_match",
-            MAX_POLICY_ENTRY_TEXT,
         )?;
-        if outcome == MandateDecisionOutcome::Stop {
-            anyhow::ensure!(
-                decision.termination_kind.is_some(),
-                "STOP requires termination_kind"
-            );
-        } else {
-            anyhow::ensure!(
-                decision.termination_kind.is_none() && decision.termination_match.is_none(),
-                "termination fields are valid only with STOP"
-            );
-        }
         let review_secs = mandate.clamp_review_secs(
             args.reconsider_minutes
                 .map(|minutes| minutes.saturating_mul(60)),
@@ -1329,26 +1376,14 @@ impl ManageMandatesTool {
         } else {
             None
         };
+        let learning = normalized_learning_note(
+            args.learning_note.as_deref(),
+            args.learning_evidence_receipt_ids.as_deref(),
+        )?;
         self.state
             .record_mandate_decision(&decision, intention.as_ref(), Some(pinned_attempt_id))
             .await?;
-        if let Some(summary) = bounded_optional_text(
-            args.learning_note.as_deref(),
-            "learning_note",
-            MAX_LEARNING_NOTE_TEXT,
-        )? {
-            let evidence = clean_strings(args.learning_evidence_receipt_ids.as_deref());
-            validate_bounded_strings(
-                &evidence,
-                "learning_evidence_receipt_ids",
-                MAX_EVIDENCE_RECEIPTS,
-                256,
-                4 * 1024,
-            )?;
-            anyhow::ensure!(
-                !evidence.is_empty(),
-                "learning_note requires learning_evidence_receipt_ids"
-            );
+        if let Some((summary, evidence)) = learning {
             let note = MandateLearningNote::new(
                 &mandate.id,
                 mandate.version,
@@ -1357,11 +1392,6 @@ impl ManageMandatesTool {
                 evidence,
             );
             self.state.record_mandate_learning_note(&note).await?;
-        } else {
-            anyhow::ensure!(
-                args.learning_evidence_receipt_ids.is_none(),
-                "learning_evidence_receipt_ids require learning_note"
-            );
         }
         Ok(match outcome {
             MandateDecisionOutcome::Act => {
@@ -1406,7 +1436,7 @@ impl ManageMandatesTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ManageMandatesArgs {
     action: String,
     mandate_id: Option<String>,
@@ -1492,7 +1522,7 @@ impl Tool for ManageMandatesTool {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 64,
-                        "description": "Exact non-combinable authority tuples.",
+                        "description": "Exact authority tuples. Authenticated calls repeat URL, auth_profile:<name>, and account:<id>; X requires both identity targets. URL query strings are exact policy data: a queryless URL authorizes only a queryless call, so include each approved query-bearing URL used via query_params.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1520,8 +1550,8 @@ impl Tool for ManageMandatesTool {
                     "duration_minutes": { "type": "integer", "minimum": 1, "description": "Create only; update rejects. Relative minutes; wins over expires_at." },
                     "expires_at": { "type": "string", "description": "Fixed RFC3339 deadline if no duration." },
                     "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION },
-                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Cycle tokens." },
-                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Create only; update rejects. Daily tokens." },
+                    "budget_per_cycle": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "Tokens per review; create/update." },
+                    "budget_daily": { "type": "integer", "minimum": MIN_MANDATE_TOKEN_BUDGET, "description": "UTC-day tokens; must fund the busiest day's reviews." },
                     "include_terminal": { "type": "boolean" },
                     "section": { "type": "string", "enum": ["summary", "policy", "history"] },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
@@ -1530,8 +1560,8 @@ impl Tool for ManageMandatesTool {
                     "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } },
                     "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } },
                     "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
-                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"] },
-                    "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT },
+                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"], "description": "STOP only; omit for ACT, WAIT, and ASK." },
+                    "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": "STOP only; omit for ACT, WAIT, and ASK." },
                     "reconsider_minutes": { "type": "integer", "minimum": 1 },
                     "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT },
                     "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT },
@@ -1633,6 +1663,65 @@ fn bounded_optional_text(
     Ok(Some(value.to_string()))
 }
 
+fn normalized_termination_fields(
+    outcome: MandateDecisionOutcome,
+    termination_kind: Option<&str>,
+    termination_match: Option<&str>,
+) -> anyhow::Result<(Option<MandateTerminationKind>, Option<String>)> {
+    // Some structured-tool providers populate every optional schema field with
+    // a default. The explicit typed outcome is authoritative, so STOP-only
+    // metadata on ACT/WAIT/ASK must not turn a safe non-action into a failed
+    // review. It is ignored rather than reinterpreted as a termination.
+    if outcome != MandateDecisionOutcome::Stop {
+        return Ok((None, None));
+    }
+    let kind = termination_kind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            MandateTerminationKind::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "termination_kind must be success_criteria_satisfied, stop_condition_met, or safety_termination"
+                )
+            })
+        })
+        .transpose()?;
+    anyhow::ensure!(kind.is_some(), "STOP requires termination_kind");
+    let matched = bounded_optional_text(
+        termination_match,
+        "termination_match",
+        MAX_POLICY_ENTRY_TEXT,
+    )?;
+    Ok((kind, matched))
+}
+
+fn normalized_learning_note(
+    learning_note: Option<&str>,
+    learning_evidence_receipt_ids: Option<&[String]>,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let Some(summary) =
+        bounded_optional_text(learning_note, "learning_note", MAX_LEARNING_NOTE_TEXT)?
+    else {
+        // Structured-tool providers may populate this optional companion field
+        // even when learning_note is empty. With no note there is nothing to
+        // persist, so ignore the orphan defaults before the decision commit.
+        return Ok(None);
+    };
+    let evidence = clean_strings(learning_evidence_receipt_ids);
+    validate_bounded_strings(
+        &evidence,
+        "learning_evidence_receipt_ids",
+        MAX_EVIDENCE_RECEIPTS,
+        256,
+        4 * 1024,
+    )?;
+    anyhow::ensure!(
+        !evidence.is_empty(),
+        "learning_note requires learning_evidence_receipt_ids"
+    );
+    Ok(Some((summary, evidence)))
+}
+
 fn clean_strings(values: Option<&[String]>) -> Vec<String> {
     values
         .unwrap_or_default()
@@ -1730,6 +1819,82 @@ fn activation_timing(args: &ManageMandatesArgs) -> anyhow::Result<ActivationTimi
         },
         normalized_redundant_expiry,
     })
+}
+
+fn expected_default_review_cycles(
+    default_review_secs: i64,
+    timing: &ActivationTiming,
+) -> anyhow::Result<i64> {
+    anyhow::ensure!(
+        default_review_secs > 0,
+        "default review interval must be positive"
+    );
+    let horizon_secs = if let Some(duration_secs) = timing.duration_secs {
+        duration_secs
+    } else if let Some(expires_at) = timing.expires_at.as_deref() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| anyhow::anyhow!("expires_at must be an RFC3339 timestamp"))?
+            .with_timezone(&chrono::Utc);
+        (expires_at - chrono::Utc::now()).num_seconds().max(1)
+    } else {
+        24 * 60 * 60
+    }
+    .clamp(1, 24 * 60 * 60);
+
+    // The first review is immediate, then subsequent reviews occur at the
+    // default interval. Exclude a cycle exactly at expiration.
+    Ok(((horizon_secs - 1) / default_review_secs) + 1)
+}
+
+fn controller_budget_snapshot(goal: &crate::traits::Goal) -> Value {
+    let now = chrono::Utc::now();
+    let today = now.date_naive().to_string();
+    let used_today = if goal.tokens_used_day == today {
+        goal.tokens_used_today.max(0)
+    } else {
+        0
+    };
+    let remaining = goal
+        .budget_daily
+        .map(|daily| daily.saturating_sub(used_today).max(0));
+    let can_fund_full_cycle = match (remaining, goal.budget_per_check) {
+        (Some(remaining), Some(per_cycle)) => remaining >= per_cycle.max(0),
+        _ => true,
+    };
+    let blocked_until_utc = (!can_fund_full_cycle).then(|| {
+        let midnight = now
+            .date_naive()
+            .succ_opt()
+            .expect("the next UTC date is representable")
+            .and_hms_opt(0, 0, 0)
+            .expect("UTC midnight is representable");
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc)
+            .to_rfc3339()
+    });
+    json!({
+        "units": "tokens",
+        "per_cycle": goal.budget_per_check,
+        "per_utc_day": goal.budget_daily,
+        "usage_utc_day": today,
+        "used_today": used_today,
+        "remaining_today": remaining,
+        "can_fund_full_cycle": can_fund_full_cycle,
+        "blocked_until_utc": blocked_until_utc,
+    })
+}
+
+fn controller_budget_admission_label(goal: &crate::traits::Goal) -> String {
+    let snapshot = controller_budget_snapshot(goal);
+    if snapshot["can_fund_full_cycle"] == Value::Bool(true) {
+        "ready".to_string()
+    } else {
+        format!(
+            "budget-blocked-until {}",
+            snapshot["blocked_until_utc"]
+                .as_str()
+                .unwrap_or("next UTC reset")
+        )
+    }
 }
 
 fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Result<String> {
@@ -1834,6 +1999,29 @@ mod tests {
     }
 
     #[test]
+    fn non_stop_outcomes_ignore_generator_supplied_stop_metadata() {
+        let (kind, matched) = normalized_termination_fields(
+            MandateDecisionOutcome::Wait,
+            Some("success_criteria_satisfied"),
+            Some("provider-filled default"),
+        )
+        .unwrap();
+        assert!(kind.is_none());
+        assert!(matched.is_none());
+
+        assert!(normalized_termination_fields(MandateDecisionOutcome::Stop, None, None).is_err());
+    }
+
+    #[test]
+    fn empty_learning_note_ignores_generator_supplied_receipt_defaults_before_commit() {
+        let receipts = vec!["provider-filled-default".to_string()];
+        assert!(normalized_learning_note(Some(""), Some(&receipts))
+            .unwrap()
+            .is_none());
+        assert!(normalized_learning_note(Some("real learning"), None).is_err());
+    }
+
+    #[test]
     fn owner_guidance_is_bounded_durable_context() {
         let context =
             append_owner_guidance(Some(r#"{"mandate_id":"m-1"}"#), "Prefer replies").unwrap();
@@ -1914,7 +2102,7 @@ mod tests {
             .any(|warning| warning.contains("http_request")));
         assert!(request.warnings.iter().any(|warning| {
             warning
-                == "Resolved token budgets: 400000 tokens per decision cycle; 1000000 tokens per UTC day"
+                == "Resolved token budgets: 100000 tokens per decision cycle; 1000000 tokens per UTC day"
         }));
         assert!(request
             .warnings
@@ -1963,7 +2151,7 @@ mod tests {
         assert_eq!(controller.status, "active");
         assert_eq!(controller.domain, "orchestration");
         assert_eq!(controller.goal_type, "continuous");
-        assert_eq!(controller.budget_per_check, Some(400_000));
+        assert_eq!(controller.budget_per_check, Some(100_000));
         assert_eq!(controller.budget_daily, Some(1_000_000));
         assert!(state
             .get_schedules_for_goal(&controller.id)
@@ -2151,7 +2339,7 @@ mod tests {
         assert_eq!(value["proposal"]["token_budgets"]["units"], "tokens");
         assert_eq!(
             value["proposal"]["token_budgets"]["per_decision_cycle"],
-            400_000
+            100_000
         );
         assert_eq!(value["proposal"]["token_budgets"]["per_utc_day"], 1_000_000);
 
@@ -2170,7 +2358,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("token budget"));
-        assert!(error.to_string().contains("at least 10000"));
+        assert!(error.to_string().contains("at least 30000"));
+    }
+
+    #[tokio::test]
+    async fn draft_requires_daily_budget_to_fund_the_review_cadence() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
+
+        let error = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Review every thirty minutes for one day",
+                    "default_review_minutes":30,
+                    "duration_minutes":1440,
+                    "budget_per_cycle":30000,
+                    "budget_daily":30000,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1440000"));
+        assert!(error.to_string().contains("48 default review cycle"));
+
+        let defaulted = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Use cadence-aware defaults every thirty minutes",
+                    "default_review_minutes":30,
+                    "duration_minutes":1440,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        let defaulted: Value = serde_json::from_str(&defaulted).unwrap();
+        assert_eq!(
+            defaulted["proposal"]["token_budgets"]["per_utc_day"],
+            4_800_000
+        );
+
+        let result = tool
+            .call(
+                r#"{
+                    "action":"draft",
+                    "objective":"Review every thirty minutes for one day",
+                    "default_review_minutes":30,
+                    "duration_minutes":1440,
+                    "budget_per_cycle":30000,
+                    "budget_daily":1440000,
+                    "_session_id":"owner-session",
+                    "_user_role":"owner",
+                    "_channel_visibility":"private"
+                }"#,
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["proposal"]["token_budgets"]["per_utc_day"], 1_440_000);
     }
 
     #[tokio::test]
@@ -2206,13 +2459,7 @@ mod tests {
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
 
         let schema = tool.schema();
-        for field in [
-            "source_goal_id",
-            "priority",
-            "budget_per_cycle",
-            "budget_daily",
-            "duration_minutes",
-        ] {
+        for field in ["source_goal_id", "priority", "duration_minutes"] {
             let description = schema["parameters"]["properties"][field]["description"]
                 .as_str()
                 .expect("create-only field description");
@@ -2229,8 +2476,6 @@ mod tests {
                     "mandate_id":"not-consulted",
                     "source_goal_id":"source-goal",
                     "priority":"critical",
-                    "budget_per_cycle":12345,
-                    "budget_daily":67890,
                     "duration_minutes":60,
                     "_session_id":"owner-session",
                     "_user_role":"owner",
@@ -2240,16 +2485,75 @@ mod tests {
             .await
             .unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("create-only fields in v1"));
-        for field in [
-            "source_goal_id",
-            "priority",
-            "budget_per_cycle",
-            "budget_daily",
-            "duration_minutes",
-        ] {
+        assert!(message.contains("create-only fields"));
+        for field in ["source_goal_id", "priority", "duration_minutes"] {
             assert!(message.contains(field), "{field}");
         }
+    }
+
+    #[tokio::test]
+    async fn owner_confirmed_update_can_repair_controller_token_budgets() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Repair a mandate controller budget",
+            "owner-session",
+            Some(100_000),
+            Some(1_000_000),
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            4 * 60 * 60,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state.clone(), ApprovalBroker::new(approval_tx));
+        let mandate_id = mandate.id.clone();
+        let update = tokio::spawn(async move {
+            tool.call(
+                &json!({
+                    "action": "update",
+                    "mandate_id": mandate_id,
+                    "budget_per_cycle": 30_000,
+                    "budget_daily": 180_000,
+                    "_session_id": "owner-session",
+                    "_user_role": "owner",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+            )
+            .await
+        });
+        let request = approval_rx
+            .recv()
+            .await
+            .expect("budget update confirmation");
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("30000 tokens per decision cycle")));
+        request
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .unwrap();
+        let result = update.await.unwrap().unwrap();
+        assert!(result.contains("30000 tokens per cycle"));
+
+        let updated_goal = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(updated_goal.budget_per_check, Some(30_000));
+        assert_eq!(updated_goal.budget_daily, Some(180_000));
+        let updated_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(updated_mandate.version, mandate.version + 1);
     }
 
     #[tokio::test]

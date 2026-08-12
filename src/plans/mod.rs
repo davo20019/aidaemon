@@ -113,6 +113,35 @@ impl TaskPlan {
         self.steps.get_mut(self.current_step)
     }
 
+    /// Keep the user-facing execution pointer aligned with checklist state.
+    /// While work remains, exactly one pending step is promoted to in-progress.
+    pub(crate) fn sync_active_step(&mut self) {
+        if let Some(index) = self
+            .steps
+            .iter()
+            .position(|step| step.status == StepStatus::InProgress)
+        {
+            self.current_step = index;
+            return;
+        }
+
+        if let Some(index) = self
+            .steps
+            .iter()
+            .position(|step| step.status == StepStatus::Pending)
+        {
+            self.current_step = index;
+            if self.status == PlanStatus::InProgress {
+                let step = &mut self.steps[index];
+                step.status = StepStatus::InProgress;
+                step.started_at.get_or_insert_with(Utc::now);
+            }
+        } else if self.is_finished() {
+            self.status = PlanStatus::Completed;
+        }
+        self.updated_at = Utc::now();
+    }
+
     /// Calculate total duration in seconds.
     pub fn duration_secs(&self) -> u64 {
         (self.updated_at - self.created_at).num_seconds().max(0) as u64
@@ -195,17 +224,55 @@ impl TaskPlan {
 
     /// Compact, channel-friendly checklist for posting to the user at start.
     pub fn render_compact_checklist(&self) -> String {
-        let mut out = String::from("📋 Plan for this task:\n");
-        for step in &self.steps {
-            let mark = match step.status {
-                StepStatus::Completed => "✅",
-                StepStatus::Deferred => "⏭️",
-                StepStatus::Failed => "⚠️",
-                _ => "☐",
-            };
-            out.push_str(&format!("{} {}\n", mark, step.description));
+        let (heading, footer) = match self.status {
+            PlanStatus::Planning => (
+                "🧭 Planning your task",
+                "I’ll update this message as I work.",
+            ),
+            PlanStatus::InProgress => (
+                "⚙️ Working on your task",
+                "I’ll update this message as I work.",
+            ),
+            PlanStatus::Paused => (
+                "⏸️ Task paused",
+                "Work will continue when the task resumes.",
+            ),
+            PlanStatus::Completed => ("✅ Task complete", "All planned steps are resolved."),
+            PlanStatus::Failed => ("❌ Task stopped", "The plan could not be completed."),
+            PlanStatus::Abandoned => ("⏹️ Task cancelled", "No more work is in progress."),
+        };
+        let total = self.steps.len();
+        let position = self.current_step.saturating_add(1).min(total);
+        let mut out = format!("{heading}\n\n");
+        if self.status == PlanStatus::InProgress && total > 0 {
+            out.push_str(&format!("Step {position} of {total}\n"));
+        } else {
+            out.push_str(&format!(
+                "{} of {total} steps complete\n",
+                self.completed_steps()
+            ));
         }
-        out.trim_end().to_string()
+
+        let first_pending = self
+            .steps
+            .iter()
+            .position(|step| step.status == StepStatus::Pending);
+        for (index, step) in self.steps.iter().enumerate() {
+            let block = match step.status {
+                StepStatus::Completed => format!("✅ {}", step.description),
+                StepStatus::InProgress => format!("▶️ Working now\n{}", step.description),
+                StepStatus::Deferred => format!("⏭️ Deferred\n{}", step.description),
+                StepStatus::Failed => format!("⚠️ Needs attention\n{}", step.description),
+                StepStatus::Skipped => format!("➖ Skipped\n{}", step.description),
+                StepStatus::Pending if Some(index) == first_pending => {
+                    format!("○ Up next\n{}", step.description)
+                }
+                StepStatus::Pending => format!("○ {}", step.description),
+            };
+            out.push_str(&format!("\n{block}\n"));
+        }
+        out.push_str(&format!("\n{footer}"));
+        out
     }
 
     /// End-of-turn recap of what got done vs what remains/deferred.
@@ -444,6 +511,25 @@ mod tests {
     }
 
     #[test]
+    fn sync_active_step_promotes_the_next_pending_item() {
+        let mut plan = TaskPlan::new(
+            "session_123",
+            "test",
+            "Test task",
+            vec!["First".to_string(), "Second".to_string()],
+            "test",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        plan.steps[1].status = StepStatus::Pending;
+        plan.current_step = 0;
+
+        plan.sync_active_step();
+
+        assert_eq!(plan.current_step, 1);
+        assert_eq!(plan.steps[1].status, StepStatus::InProgress);
+    }
+
+    #[test]
     fn test_format_for_prompt() {
         let mut plan = TaskPlan::new(
             "session_123",
@@ -500,7 +586,14 @@ mod tests {
             "track_requirements",
         );
         plan.steps[0].status = StepStatus::Completed;
+        plan.steps[1].status = StepStatus::InProgress;
+        plan.current_step = 1;
         let checklist = plan.render_compact_checklist();
+        assert!(checklist.starts_with("⚙️ Working on your task"));
+        assert!(checklist.contains("Step 2 of 2\n\n"));
+        assert!(checklist.contains("✅ create script"));
+        assert!(checklist.contains("▶️ Working now\nsend the file"));
+        assert!(checklist.contains("I’ll update this message as I work."));
         assert!(checklist.contains("create script"));
         assert!(checklist.contains("send the file"));
         let recap = plan.render_recap();

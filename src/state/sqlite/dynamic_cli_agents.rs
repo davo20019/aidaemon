@@ -81,15 +81,17 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
 
     async fn log_cli_agent_start(
         &self,
+        task_id: Option<&str>,
         session_id: &str,
         agent_name: &str,
         prompt_summary: &str,
         working_dir: Option<&str>,
     ) -> anyhow::Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO cli_agent_invocations (session_id, agent_name, prompt_summary, working_dir, started_at)
-             VALUES (?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO cli_agent_invocations (task_id, session_id, agent_name, prompt_summary, working_dir, started_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now'))",
         )
+        .bind(task_id)
         .bind(session_id)
         .bind(agent_name)
         .bind(prompt_summary)
@@ -125,7 +127,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
         limit: usize,
     ) -> anyhow::Result<Vec<crate::traits::CliAgentInvocation>> {
         let rows = sqlx::query(
-            "SELECT id, session_id, agent_name, prompt_summary, working_dir, started_at, completed_at, exit_code, output_summary, success, duration_secs
+            "SELECT id, task_id, session_id, agent_name, prompt_summary, working_dir, started_at, completed_at, exit_code, output_summary, success, duration_secs
              FROM cli_agent_invocations ORDER BY started_at DESC LIMIT ?",
         )
         .bind(limit as i64)
@@ -136,6 +138,7 @@ impl crate::traits::DynamicCliAgentStore for SqliteStateStore {
         for row in rows {
             invocations.push(crate::traits::CliAgentInvocation {
                 id: row.get::<i64, _>("id"),
+                task_id: row.get::<Option<String>, _>("task_id"),
                 session_id: row.get::<String, _>("session_id"),
                 agent_name: row.get::<String, _>("agent_name"),
                 prompt_summary: row.get::<String, _>("prompt_summary"),

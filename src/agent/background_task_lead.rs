@@ -14,7 +14,7 @@ use crate::events::TaskOutcome;
 use crate::traits::{
     AgentRole, Mandate, MandateDecisionOutcome, MandateFinalizationRejectReason,
     MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunNotification,
-    MandateRunNotificationKind, MandateStatus, StateStore,
+    MandateRunNotificationKind, MandateStatus, StateStore, SAFE_FALLBACK_WAIT_RATIONALE,
 };
 use crate::types::{ChannelContext, UserRole};
 
@@ -48,6 +48,127 @@ fn count_successful_completed_work(
         .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id)
         .filter(|task| task.completed_successfully())
         .count()
+}
+
+fn task_failed_only_due_to_provider_infrastructure(task: &crate::traits::Task) -> bool {
+    task.status == "failed"
+        && task
+            .error
+            .as_deref()
+            .or(task.result.as_deref())
+            .is_some_and(crate::providers::is_provider_infra_error_text)
+}
+
+fn resolve_dispatch_project_scope(mission: &str, alias_roots: &[String]) -> Option<String> {
+    let mut scopes = Vec::new();
+    super::project_scope::extract_positive_explicit_path_scopes_from_text(
+        mission,
+        &mut scopes,
+        8,
+        alias_roots,
+    );
+    // Scheduled missions are often phrased with a repository nickname rather
+    // than an absolute path (for example, "the blog repository"). Resolve that
+    // name deterministically inside configured project roots instead of letting
+    // a delegated CLI agent escape to any directory that merely looks like a
+    // project. An explicit positive path always wins.
+    if scopes.is_empty() {
+        super::project_scope::extract_project_scopes_from_text(
+            mission,
+            &mut scopes,
+            8,
+            alias_roots,
+        );
+    }
+    super::project_scope::unify_current_turn_scopes(&scopes)
+}
+
+fn sqlite_busy_code(value: &str) -> bool {
+    value
+        .parse::<i32>()
+        .ok()
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
+            if database.code().is_some_and(|code| sqlite_busy_code(&code)) {
+                return true;
+            }
+        }
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("sqlite_busy")
+            || message.split("code:").skip(1).any(|suffix| {
+                let code = suffix
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                sqlite_busy_code(&code)
+            })
+    })
+}
+
+async fn promote_dispatch_trigger_attempt(
+    state: &Arc<dyn crate::traits::StateStore>,
+    attempt: &crate::traits::TaskAttempt,
+    worker_id: &str,
+) -> anyhow::Result<bool> {
+    const MAX_BUSY_RETRIES: usize = 5;
+    let patch = crate::traits::TaskAttemptPatch {
+        status: "running".to_string(),
+        ..Default::default()
+    };
+
+    for busy_retry in 0..=MAX_BUSY_RETRIES {
+        match state
+            .bind_task_attempt_worker(
+                &attempt.id,
+                &attempt.lease_token,
+                worker_id,
+                Some("profile-task-lead"),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(error) if busy_retry < MAX_BUSY_RETRIES && is_sqlite_busy_error(&error) => {
+                let delay_ms = 25_u64 << busy_retry;
+                warn!(
+                    attempt_id = %attempt.id,
+                    retry = busy_retry + 1,
+                    delay_ms,
+                    "SQLite busy while binding task-lead trigger; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+
+        match state
+            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) if busy_retry < MAX_BUSY_RETRIES && is_sqlite_busy_error(&error) => {
+                let delay_ms = 25_u64 << busy_retry;
+                warn!(
+                    attempt_id = %attempt.id,
+                    retry = busy_retry + 1,
+                    delay_ms,
+                    "SQLite busy while starting task-lead trigger; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("bounded task-lead trigger retry loop must return")
 }
 
 fn render_recovery_task_ledger(tasks: &[crate::traits::Task]) -> String {
@@ -112,12 +233,34 @@ async fn release_duplicate_dispatch_trigger(
             ),
             ..Default::default()
         };
-        if !state
-            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
-            .await
-            .unwrap_or(false)
-        {
-            return;
+        let mut busy_retry = 0_usize;
+        loop {
+            match state
+                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+                .await
+            {
+                Ok(true) => break,
+                Ok(false) => return,
+                Err(error) if busy_retry < 5 && is_sqlite_busy_error(&error) => {
+                    let delay_ms = 25_u64 << busy_retry;
+                    busy_retry += 1;
+                    warn!(
+                        attempt_id = %attempt.id,
+                        retry = busy_retry,
+                        delay_ms,
+                        "SQLite busy while releasing task-lead trigger; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => {
+                    warn!(
+                        attempt_id = %attempt.id,
+                        %error,
+                        "Failed to release task-lead trigger attempt"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -133,7 +276,31 @@ async fn release_duplicate_dispatch_trigger(
             task.blocker = None;
             task.started_at = None;
             task.completed_at = None;
-            let _ = state.update_task(&task).await;
+            let mut busy_retry = 0_usize;
+            loop {
+                match state.update_task(&task).await {
+                    Ok(()) => break,
+                    Err(error) if busy_retry < 5 && is_sqlite_busy_error(&error) => {
+                        let delay_ms = 25_u64 << busy_retry;
+                        busy_retry += 1;
+                        warn!(
+                            task_id = %task_id,
+                            retry = busy_retry,
+                            delay_ms,
+                            "SQLite busy while re-queueing task-lead trigger; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    Err(error) => {
+                        warn!(
+                            task_id = %task_id,
+                            %error,
+                            "Failed to re-queue task-lead trigger"
+                        );
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -480,9 +647,9 @@ async fn keep_mandate_controller_open(
 
 /// A completed deliberator turn without `record_decision` has granted no
 /// authority and created no intention. Persist the least-privilege semantic
-/// result (WAIT) rather than treating missing orchestration bookkeeping as an
-/// owner-facing incident. This never parses model prose and can never authorize
-/// a mutation; a later bounded cycle remains free to decide ACT explicitly.
+/// result (WAIT). Finalization recognizes the exact runtime-authored rationale
+/// and records a retriable review failure, so the fallback can never authorize
+/// a mutation or masquerade as a successful deliberation.
 async fn persist_safe_wait_if_decision_missing(
     state: &Arc<dyn StateStore>,
     goal_id: &str,
@@ -510,7 +677,7 @@ async fn persist_safe_wait_if_decision_missing(
         &mandate.id,
         goal_run_id,
         MandateDecisionOutcome::Wait,
-        "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.",
+        SAFE_FALLBACK_WAIT_RATIONALE,
         mandate.version,
     );
     decision.reconsider_at = Some(mandate.bounded_next_review_at(None, chrono::Utc::now()));
@@ -533,7 +700,7 @@ async fn persist_safe_wait_if_decision_missing(
     warn!(
         goal_id,
         run_id = goal_run_id,
-        "Mandate deliberator omitted its decision; persisted safe WAIT"
+        "Mandate deliberator omitted its decision; persisted retriable safe-WAIT failure marker"
     );
     true
 }
@@ -644,7 +811,8 @@ async fn finalize_mandate_review(
                 None
             }
             MandateFinalizationRejectReason::DecisionMissing
-            | MandateFinalizationRejectReason::InvalidDecisionState => Some(notice(
+            | MandateFinalizationRejectReason::InvalidDecisionState
+            | MandateFinalizationRejectReason::DeliberatorFailed => Some(notice(
                 MandateRunNotificationKind::ReviewFailed { reason },
                 Default::default(),
             )),
@@ -655,6 +823,7 @@ async fn finalize_mandate_review(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContinuousDispatchOutcome {
     Progress,
+    TransientInfrastructureFailure,
     ErrorWithoutProgress,
     Blocked,
     NoProgress,
@@ -663,10 +832,13 @@ enum ContinuousDispatchOutcome {
 fn classify_continuous_dispatch_outcome(
     dispatch_made_progress: bool,
     task_lead_errored: bool,
+    transient_infrastructure_failure: bool,
     all_remaining_blocked: bool,
 ) -> ContinuousDispatchOutcome {
     if dispatch_made_progress {
         ContinuousDispatchOutcome::Progress
+    } else if transient_infrastructure_failure {
+        ContinuousDispatchOutcome::TransientInfrastructureFailure
     } else if task_lead_errored {
         ContinuousDispatchOutcome::ErrorWithoutProgress
     } else if all_remaining_blocked {
@@ -791,16 +963,8 @@ pub fn spawn_background_task_lead(
             let fallback_channel_ctx = channel_ctx.clone();
             let dispatch_channel_ctx = channel_ctx.clone();
             let fallback_user_role = user_role;
-            let dispatch_project_scope = {
-                let mut scopes = Vec::new();
-                super::project_scope::extract_positive_explicit_path_scopes_from_text(
-                    &mission,
-                    &mut scopes,
-                    8,
-                    &agent.path_aliases.projects,
-                );
-                super::project_scope::unify_current_turn_scopes(&scopes)
-            };
+            let dispatch_project_scope =
+                resolve_dispatch_project_scope(&mission, &agent.path_aliases.projects);
 
             // Heartbeat dispatch claims a "trigger" task before spawning this background
             // lead. Keep it in "running" state (not "pending") so dispatch_pending_tasks
@@ -813,31 +977,31 @@ pub fn spawn_background_task_lead(
             if let Some(ref trigger_task_id) = dispatch_trigger_task_id {
                 if let Some(attempt) = dispatch_attempt.as_ref() {
                     let worker_id = format!("task-lead-{}", goal_id);
-                    let bound = state
-                        .bind_task_attempt_worker(
-                            &attempt.id,
-                            &attempt.lease_token,
-                            &worker_id,
-                            Some("profile-task-lead"),
-                        )
-                        .await
-                        .unwrap_or(false);
-                    let patch = crate::traits::TaskAttemptPatch {
-                        status: "running".to_string(),
-                        ..Default::default()
-                    };
-                    let running = bound
-                        && state
-                            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
-                            .await
-                            .unwrap_or(false);
-                    if !running {
-                        warn!(
-                            task_id = %trigger_task_id,
-                            attempt_id = %attempt.id,
-                            "Task-lead trigger lease was lost before execution"
-                        );
-                        return;
+                    match promote_dispatch_trigger_attempt(&state, attempt, &worker_id).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                task_id = %trigger_task_id,
+                                attempt_id = %attempt.id,
+                                "Task-lead trigger lease was lost before execution"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            warn!(
+                                task_id = %trigger_task_id,
+                                attempt_id = %attempt.id,
+                                %error,
+                                "Task-lead trigger transition failed; releasing it for retry"
+                            );
+                            release_duplicate_dispatch_trigger(
+                                &state,
+                                trigger_task_id,
+                                Some(attempt),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 } else {
                     match state.get_task(trigger_task_id).await {
@@ -1518,11 +1682,41 @@ pub fn spawn_background_task_lead(
                 dispatch_trigger_task_id.as_deref(),
             );
             let dispatch_made_progress = completed_work_after > completed_work_before;
-            let trigger_work_tasks = tasks_before_trigger_finalization
+            let mut trigger_work_tasks = tasks_before_trigger_finalization
                 .iter()
                 .filter(|task| Some(task.id.as_str()) != dispatch_trigger_task_id.as_deref())
                 .cloned()
                 .collect::<Vec<_>>();
+            // A task lead may recover a delegated provider outage by completing
+            // the mission directly. Reconcile only that narrow, evidence-backed
+            // case so the abandoned child attempt cannot veto the successful
+            // root outcome. Semantic/tool failures remain failed and continue to
+            // block the run.
+            if !is_mandate_run && task_lead_outcome == Some(TaskOutcome::Succeeded) {
+                for task in &mut trigger_work_tasks {
+                    if !task_failed_only_due_to_provider_infrastructure(task) {
+                        continue;
+                    }
+                    let mut superseded = task.clone();
+                    superseded.status = "superseded".to_string();
+                    superseded.result = Some(
+                        "The task lead completed the mission directly after this delegated provider failure."
+                            .to_string(),
+                    );
+                    superseded.error = None;
+                    superseded.blocker = None;
+                    superseded.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    match state.update_task(&superseded).await {
+                        Ok(()) => *task = superseded,
+                        Err(error) => warn!(
+                            goal_id = %goal_id,
+                            task_id = %task.id,
+                            %error,
+                            "Failed to supersede a provider-failed child after direct task-lead recovery"
+                        ),
+                    }
+                }
+            }
             // No durable decision means no ACT authority exists, regardless of
             // how the deliberator process itself exited. Close that semantic
             // state as WAIT even after a provider/setup/orchestration error;
@@ -1838,6 +2032,9 @@ pub fn spawn_background_task_lead(
                     match classify_continuous_dispatch_outcome(
                         dispatch_made_progress,
                         result.is_err(),
+                        result.as_ref().err().is_some_and(|error| {
+                            crate::providers::is_provider_infra_error_text(&error.to_string())
+                        }),
                         all_remaining_blocked && !tasks.is_empty(),
                     ) {
                         ContinuousDispatchOutcome::Progress => {
@@ -1848,6 +2045,13 @@ pub fn spawn_background_task_lead(
                                 completed_work_after,
                                 task_lead_errored = result.is_err(),
                                 "Dispatch made progress; reset dispatch_failures"
+                            );
+                        }
+                        ContinuousDispatchOutcome::TransientInfrastructureFailure => {
+                            info!(
+                                goal_id = %goal_id,
+                                dispatch_failures = updated_goal.dispatch_failures,
+                                "Transient provider failure made no progress; preserving the goal failure counter for a later retry"
                             );
                         }
                         ContinuousDispatchOutcome::ErrorWithoutProgress => {
@@ -2054,7 +2258,7 @@ pub fn spawn_background_task_lead(
                         Some((
                                 "failed",
                                 format!(
-                                    "Scheduled run failed before completion; the recurring schedule remains active.\n\n{}",
+                                    "⚠️ **Scheduled run needs attention**\n\n{}\n\n🔁 The recurring schedule remains active.",
                                     failed_run_summary(
                                         &final_run_tasks,
                                         task_lead_error.as_deref()
@@ -2070,7 +2274,7 @@ pub fn spawn_background_task_lead(
                         Some((
                                 "completed",
                                 format!(
-                                    "Scheduled run completed successfully; the recurring schedule remains active.\n\n{}",
+                                    "✅ **Scheduled run complete**\n\n{}\n\n🔁 The recurring schedule remains active.",
                                     truncate_goal_result_text(&summary, 3500)
                                 ),
                             ))
@@ -2079,6 +2283,7 @@ pub fn spawn_background_task_lead(
                 };
 
                 if let Some((notification_type, msg)) = terminal_notification {
+                    let msg = crate::channels::present_notification(notification_type, &msg);
                     let entry = crate::traits::NotificationEntry::new(
                         &goal_id,
                         &session_id,
@@ -2490,6 +2695,7 @@ pub fn spawn_background_task_lead(
                 }
             };
 
+            let msg = crate::channels::present_notification(notification_type, &msg);
             let entry = crate::traits::NotificationEntry::new(
                 &goal_id,
                 &session_id,
@@ -2732,6 +2938,80 @@ mod tests {
         run
     }
 
+    #[test]
+    fn task_lead_sqlite_busy_classifier_is_narrow() {
+        assert!(is_sqlite_busy_error(&anyhow::anyhow!(
+            "error returned from database: (code: 517) database is locked"
+        )));
+        assert!(is_sqlite_busy_error(&anyhow::anyhow!("SQLITE_BUSY")));
+        assert!(!is_sqlite_busy_error(&anyhow::anyhow!(
+            "task execution lease was lost"
+        )));
+    }
+
+    #[tokio::test]
+    async fn dispatch_trigger_promotion_moves_the_claimed_attempt_to_running() {
+        let (state, _database) = mandate_test_state().await;
+        let goal = Goal::new_finite("Coordinate synthetic work", "owner-session");
+        state.create_goal(&goal).await.unwrap();
+        state
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        let task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Run a synthetic task lead".to_string(),
+            status: "pending".to_string(),
+            priority: goal.priority.clone(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        state.create_task(&task).await.unwrap();
+        let attempt = state
+            .claim_task_with_lease(
+                &task.id,
+                "heartbeat-dispatch-synthetic",
+                Some("profile-task-lead"),
+                180,
+            )
+            .await
+            .unwrap()
+            .expect("trigger claim");
+
+        assert!(
+            promote_dispatch_trigger_attempt(&state, &attempt, "task-lead-synthetic")
+                .await
+                .unwrap()
+        );
+
+        let promoted_task = state.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(promoted_task.status, "running");
+        assert_eq!(
+            promoted_task.agent_id.as_deref(),
+            Some("task-lead-synthetic")
+        );
+        let promoted_attempt = state
+            .get_current_task_attempt(&task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted_attempt.status, "running");
+        assert_eq!(promoted_attempt.worker_instance_id, "task-lead-synthetic");
+    }
+
     #[tokio::test]
     async fn wait_finalization_keeps_controller_active_and_does_not_require_a_live_lease() {
         let (state, _database) = mandate_test_state().await;
@@ -2778,7 +3058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_review_without_explicit_decision_safely_defaults_to_wait() {
+    async fn completed_review_without_explicit_decision_is_a_retriable_failure() {
         let (state, _database) = mandate_test_state().await;
         let (goal, mut mandate) = due_mandate_controller("owner-session");
         let expiry = chrono::Utc::now() + chrono::Duration::minutes(2);
@@ -2804,17 +3084,27 @@ mod tests {
 
         let notification =
             finalize_mandate_review(&state, &goal, &run.id, Some("completed"), &[], None, false)
-                .await;
-        assert!(notification.is_none());
+                .await
+                .expect("safe fallback emits a durable review-failure notice");
+        assert!(matches!(
+            notification.kind,
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed
+            }
+        ));
         assert_eq!(
             state.get_goal_runs(&goal.id).await.unwrap()[0].status,
-            "completed"
+            "failed"
         );
-        assert!(state
-            .get_pending_notifications(10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            state.get_goal_runs(&goal.id).await.unwrap()[0]
+                .outcome_summary
+                .as_deref(),
+            Some("mandate_review_failed:deliberator_failed")
+        );
+        let pending = state.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notification_type, "mandate_review_failed");
     }
 
     #[tokio::test]
@@ -3017,13 +3307,64 @@ mod tests {
     #[test]
     fn completed_work_wins_over_task_lead_error_for_stall_accounting() {
         assert_eq!(
-            classify_continuous_dispatch_outcome(true, true, false),
+            classify_continuous_dispatch_outcome(true, true, true, false),
             ContinuousDispatchOutcome::Progress
         );
         assert_eq!(
-            classify_continuous_dispatch_outcome(false, true, false),
+            classify_continuous_dispatch_outcome(false, true, false, false),
             ContinuousDispatchOutcome::ErrorWithoutProgress
         );
+        assert_eq!(
+            classify_continuous_dispatch_outcome(false, true, true, false),
+            ContinuousDispatchOutcome::TransientInfrastructureFailure
+        );
+    }
+
+    #[test]
+    fn only_provider_infrastructure_failures_can_be_superseded_by_direct_recovery() {
+        let failed_task = |error: &str| crate::traits::Task {
+            id: "work-1".to_string(),
+            goal_id: "goal-1".to_string(),
+            description: "Publish synthetic artifact".to_string(),
+            status: "failed".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: Some(error.to_string()),
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+
+        assert!(task_failed_only_due_to_provider_infrastructure(&failed_task(
+            "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
+        )));
+        assert!(!task_failed_only_due_to_provider_infrastructure(
+            &failed_task("Verification failed: the public URL returned HTTP 404")
+        ));
+    }
+
+    #[test]
+    fn scheduled_dispatch_resolves_named_repository_inside_configured_roots() {
+        let root = tempfile::tempdir().expect("project root");
+        let blog = root.path().join("blog.aidaemon.ai");
+        std::fs::create_dir_all(&blog).expect("blog directory");
+        std::fs::write(blog.join("package.json"), r#"{"name":"synthetic-blog"}"#)
+            .expect("project marker");
+
+        let resolved = resolve_dispatch_project_scope(
+            "Inspect the blog repository, write one post, deploy it, and verify the public URL.",
+            &[root.path().to_string_lossy().to_string()],
+        );
+        assert_eq!(resolved.as_deref(), Some(blog.to_string_lossy().as_ref()));
     }
 
     #[test]

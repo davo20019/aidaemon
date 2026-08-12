@@ -649,6 +649,7 @@ impl ChannelHub {
             .routed_channel(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("No channel found for session {}", session_id))?;
+        let presented = super::prepare_chat_message(text);
 
         // Deduplicate identical spam (e.g. multiple heartbeats) within a short window.
         // This intentionally remains best-effort: it favors reducing noise over
@@ -656,7 +657,7 @@ impl ChannelHub {
         let mut delivery_claim = None;
         {
             let now = tokio::time::Instant::now();
-            let text_norm = text.trim();
+            let text_norm = presented.trim();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 self.last_sent_text.write(),
@@ -683,7 +684,7 @@ impl ChannelHub {
             }
         }
 
-        let result = channel.send_text(&routed_session, text).await;
+        let result = channel.send_text(&routed_session, &presented).await;
         if result.is_err() {
             if let Some((claimed_text, claimed_at)) = delivery_claim {
                 if let Ok(mut last) = tokio::time::timeout(
@@ -713,7 +714,8 @@ impl ChannelHub {
         text: &str,
     ) -> anyhow::Result<Option<String>> {
         if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
-            channel.send_text_tracked(&routed_session, text).await
+            let presented = super::prepare_chat_message(text);
+            channel.send_text_tracked(&routed_session, &presented).await
         } else {
             anyhow::bail!("No channel found for session {}", session_id)
         }
@@ -728,7 +730,10 @@ impl ChannelHub {
         text: &str,
     ) -> anyhow::Result<bool> {
         if let Some((channel, routed_session)) = self.routed_channel(session_id).await {
-            channel.edit_text(&routed_session, message_id, text).await
+            let presented = super::prepare_chat_message(text);
+            channel
+                .edit_text(&routed_session, message_id, &presented)
+                .await
         } else {
             Ok(false)
         }

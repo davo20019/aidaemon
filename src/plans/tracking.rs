@@ -8,7 +8,6 @@ use chrono::Utc;
 use tracing::{debug, info};
 
 use super::{PlanStatus, PlanStore, StepStatus, TaskPlan};
-use crate::utils::truncate_str;
 
 /// Tracks step progress based on tool execution.
 pub struct StepTracker {
@@ -58,8 +57,9 @@ impl StepTracker {
         Ok(Some(plan))
     }
 
-    /// Called after a tool result. May auto-advance steps based on heuristics.
-    /// Returns (updated_plan, step_completed) if changes were made.
+    /// Called after a tool result. Tool output is evidence, not proof that a
+    /// plan step's semantic completion criteria were met, so this method never
+    /// advances the plan. The model must use the typed plan action explicitly.
     pub async fn on_tool_result(
         &self,
         session_id: &str,
@@ -67,7 +67,7 @@ impl StepTracker {
         success: bool,
         result_summary: &str,
     ) -> anyhow::Result<Option<(TaskPlan, bool)>> {
-        let Some(mut plan) = self
+        let Some(plan) = self
             .plan_store
             .get_incomplete_for_session(session_id)
             .await?
@@ -81,7 +81,7 @@ impl StepTracker {
         }
 
         let current_idx = plan.current_step;
-        let step = match plan.steps.get(current_idx) {
+        match plan.steps.get(current_idx) {
             Some(s) if s.status == StepStatus::InProgress => s,
             _ => return Ok(Some((plan, false))),
         };
@@ -99,45 +99,13 @@ impl StepTracker {
             return Ok(Some((plan, false)));
         }
 
-        // Heuristic: Check if this looks like a "final" action for the step
-        // This is conservative - the LLM should explicitly complete steps in most cases
-        let step_desc_lower = step.description.to_lowercase();
-        let result_lower = result_summary.to_lowercase();
-
-        let looks_complete = if tool_name == "terminal" {
-            // Test steps
-            (step_desc_lower.contains("test")
-                && (result_lower.contains("passed") || result_lower.contains("success")))
-                // Build steps
-                || (step_desc_lower.contains("build") && result_lower.contains("success"))
-                // Deploy steps
-                || (step_desc_lower.contains("deploy")
-                    && (result_lower.contains("success") || result_lower.contains("deployed")))
-        } else {
-            false
-        };
-
-        if looks_complete {
-            info!(
-                plan_id = %plan.id,
-                step = current_idx,
-                step_description = %step.description,
-                "Auto-completing plan step based on tool result"
-            );
-
-            plan.complete_current_step(Some(truncate_str(result_summary, 200)));
-
-            // Advance to next step
-            let had_next = plan.advance_to_next_step();
-
-            if !had_next {
-                info!(plan_id = %plan.id, "Plan completed - all steps done");
-            }
-
-            self.plan_store.update(&plan).await?;
-            return Ok(Some((plan, true)));
-        }
-
+        debug!(
+            plan_id = %plan.id,
+            step = current_idx,
+            tool = tool_name,
+            result = %crate::utils::truncate_str(result_summary, 120),
+            "Recorded successful tool evidence without inferring plan completion"
+        );
         Ok(Some((plan, false)))
     }
 

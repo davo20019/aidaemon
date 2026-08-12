@@ -95,17 +95,15 @@ impl Tool for RememberFactTool {
     fn schema(&self) -> Value {
         json!({
             "name": "remember_fact",
-            "description": "Store stable long-term user/environment facts. Exclude task-scoped research, reference data, generated content, goals, and schedules. Use facts for batches. Use personal_memory for identity, aliases, people, dates, and relationships.",
+            "description": "Store stable user/environment facts, not task research, generated content, goals, or schedules. Use personal_memory for people and relationships.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
-                        "type": "string",
-                        "description": "Category for a single fact (e.g. 'user', 'preference', 'project')"
+                        "type": "string"
                     },
                     "key": {
-                        "type": "string",
-                        "description": "A unique key for a single fact within the category"
+                        "type": "string"
                     },
                     "value": {
                         "type": "string",
@@ -113,17 +111,14 @@ impl Tool for RememberFactTool {
                     },
                     "facts": {
                         "type": "array",
-                        "description": "Batch of legacy/general facts.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "category": {
-                                    "type": "string",
-                                    "description": "Category for this fact"
+                                    "type": "string"
                                 },
                                 "key": {
-                                    "type": "string",
-                                    "description": "A unique key for this fact"
+                                    "type": "string"
                                 },
                                 "value": {
                                     "type": "string",
@@ -135,7 +130,6 @@ impl Tool for RememberFactTool {
                     },
                     "personal_memory": {
                         "type": "object",
-                        "description": "Canonical entity-aware personal/profile memory.",
                         "properties": {
                             "entities": {
                                 "type": "array",

@@ -300,7 +300,7 @@ impl WorkCoordinationStore for SqliteStateStore {
                 sqlx::query(
                     "UPDATE goal_runs
                      SET trigger_type = ?, schedule_id = ?, root_task_id = COALESCE(?, root_task_id),
-                         status = 'running', updated_at = datetime('now')
+                         status = 'pending', updated_at = datetime('now')
                      WHERE id = ?",
                 )
                 .bind(trigger_type)
@@ -314,7 +314,7 @@ impl WorkCoordinationStore for SqliteStateStore {
                 if root_task_id.is_some() {
                     existing.root_task_id = root_task_id.map(str::to_string);
                 }
-                existing.status = "running".to_string();
+                existing.status = "pending".to_string();
                 existing.updated_at = chrono::Utc::now().to_rfc3339();
                 tx.commit().await?;
                 return Ok(existing);
@@ -740,7 +740,11 @@ impl WorkCoordinationStore for SqliteStateStore {
             ),
             "unsupported attempt task transition"
         );
-        let mut tx = self.pool.begin().await?;
+        // Reserve the writer slot before reading the attempt/task fence. A
+        // deferred transaction can read a valid lease, lose a race to another
+        // WAL writer, and then fail promotion with SQLITE_BUSY_SNAPSHOT. That
+        // previously stranded freshly dispatched work in `claimed` state.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT a.task_id, a.goal_run_id, a.status AS attempt_status,
                     t.goal_id, g.project_id
@@ -1778,6 +1782,45 @@ mod tests {
             next_step: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn goal_run_is_pending_until_a_worker_claims_its_task() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_finite("execute exactly once", "session-a");
+        store.create_goal(&goal).await.unwrap();
+        let run = store
+            .start_goal_run(&goal.id, "manual", None, None)
+            .await
+            .unwrap();
+        assert_eq!(run.status, "pending");
+
+        let root = task(&goal.id, "manual root", None);
+        store.create_task(&root).await.unwrap();
+        assert_eq!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        store
+            .claim_task_with_lease(&root.id, "worker-a", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("claim succeeds");
+        assert_eq!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 
     #[tokio::test]

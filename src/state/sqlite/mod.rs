@@ -226,6 +226,7 @@ impl SqliteStateStore {
         set_db_file_permissions(db_path);
 
         migrations::migrate_state(&pool).await?;
+        crate::nodes::store::migrate(&pool).await?;
 
         Ok(Self {
             pool,

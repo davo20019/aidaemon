@@ -10,6 +10,9 @@ use crate::events::EventStore;
 use crate::health::HealthProbeStore;
 use crate::llm_runtime::SharedLlmRuntime;
 use crate::mcp::McpRegistry;
+use crate::nodes::tool::{
+    ManageNodeMonitorsTool, ReadNodeHealthTool, ReadNodeSensorsTool, SendNodeAudioTool,
+};
 use crate::state::SqliteStateStore;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
@@ -189,6 +192,10 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum OptionalToolId {
     Diagnose,
+    NodeHealth,
+    NodeSensors,
+    NodeAudio,
+    NodeMonitoring,
     #[cfg(feature = "browser")]
     Browser,
     #[cfg(feature = "computer_use")]
@@ -209,6 +216,20 @@ struct OptionalToolSpec {
 
 fn optional_enabled_diagnostics(config: &AppConfig) -> bool {
     config.diagnostics.enabled
+}
+
+fn optional_enabled_node_sensors(config: &AppConfig) -> bool {
+    config.nodes.gateway.enabled
+}
+
+fn optional_enabled_node_audio(config: &AppConfig) -> bool {
+    config.nodes.gateway.enabled
+        && config.nodes.announcements.enabled
+        && config.nodes.speech.enabled
+}
+
+fn optional_enabled_node_monitoring(config: &AppConfig) -> bool {
+    config.nodes.gateway.enabled && config.nodes.monitoring.enabled
 }
 
 #[cfg(feature = "browser")]
@@ -238,6 +259,26 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::Diagnose,
         name: "diagnose",
         enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeHealth,
+        name: "read_node_health",
+        enabled_if: optional_enabled_node_sensors,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeSensors,
+        name: "read_node_sensors",
+        enabled_if: optional_enabled_node_sensors,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeAudio,
+        name: "send_node_audio",
+        enabled_if: optional_enabled_node_audio,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::NodeMonitoring,
+        name: "manage_node_monitors",
+        enabled_if: optional_enabled_node_monitoring,
     },
     #[cfg(feature = "browser")]
     OptionalToolSpec {
@@ -518,6 +559,44 @@ pub async fn register_optional_tools(
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));
+            }
+            OptionalToolId::NodeSensors => {
+                if !config.tools.is_enabled("read_node_sensors") {
+                    continue;
+                }
+                tools.push(Arc::new(ReadNodeSensorsTool::new(state.pool())));
+            }
+            OptionalToolId::NodeHealth => {
+                if !config.tools.is_enabled("read_node_health") {
+                    continue;
+                }
+                tools.push(Arc::new(ReadNodeHealthTool::new(state.pool())));
+            }
+            OptionalToolId::NodeAudio => {
+                if !config.tools.is_enabled("send_node_audio") {
+                    continue;
+                }
+                let store = Arc::new(crate::nodes::NodeStore::new(
+                    state.pool(),
+                    crate::nodes::auth::load_or_create_instance_key()?,
+                ));
+                let speech = crate::nodes::speech::configured_synthesizer(&config.nodes.speech)?;
+                let announcements = crate::nodes::announcement::NodeAnnouncementService::new(
+                    store,
+                    config.nodes.clone(),
+                    speech,
+                );
+                tools.push(Arc::new(SendNodeAudioTool::new(announcements)));
+            }
+            OptionalToolId::NodeMonitoring => {
+                if !config.tools.is_enabled("manage_node_monitors") {
+                    continue;
+                }
+                let monitoring = crate::nodes::monitoring::NodeMonitoringService::new(
+                    state.pool(),
+                    config.nodes.monitoring.clone(),
+                );
+                tools.push(Arc::new(ManageNodeMonitorsTool::new(monitoring)));
             }
             #[cfg(feature = "browser")]
             OptionalToolId::Browser => {
@@ -1182,6 +1261,43 @@ mod tests {
                 "OptionalToolId::{id:?} has no OPTIONAL_TOOL_REGISTRY entry (silently unregistered)"
             );
         }
+    }
+
+    #[test]
+    fn node_audio_tool_requires_explicit_opt_in() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test-key"
+            "#,
+        )
+        .unwrap();
+        assert!(!optional_enabled_node_audio(&config));
+
+        config.nodes.gateway.enabled = true;
+        config.nodes.speech.enabled = true;
+        assert!(!optional_enabled_node_audio(&config));
+
+        config.nodes.announcements.enabled = true;
+        assert!(optional_enabled_node_audio(&config));
+    }
+
+    #[test]
+    fn node_monitoring_tool_requires_explicit_opt_in() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [provider]
+            api_key = "test-key"
+            "#,
+        )
+        .unwrap();
+        assert!(!optional_enabled_node_monitoring(&config));
+
+        config.nodes.gateway.enabled = true;
+        assert!(!optional_enabled_node_monitoring(&config));
+
+        config.nodes.monitoring.enabled = true;
+        assert!(optional_enabled_node_monitoring(&config));
     }
 
     #[test]

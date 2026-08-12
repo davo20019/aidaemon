@@ -8,6 +8,7 @@ use crate::traits::{
     MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
     MandateRunFinalizationResult, MandateRunProofCounts, MandateStatus, MandateStore,
     MandateSuspension, MandateSuspensionKind, MandateTerminationKind, Task,
+    SAFE_FALLBACK_WAIT_RATIONALE,
 };
 
 const MANDATE_COLUMNS: &str =
@@ -3031,7 +3032,8 @@ impl MandateStore for SqliteStateStore {
                     g.session_id AS owner_session_id,
                     gr.goal_id AS goal_id, gr.root_task_id AS root_task_id,
                     dc.id AS decision_cycle_id, dc.mandate_version AS decision_version,
-                    dc.outcome AS decision_outcome, dc.action_attempts AS decision_action_attempts
+                    dc.outcome AS decision_outcome, dc.rationale AS decision_rationale,
+                    dc.action_attempts AS decision_action_attempts
              FROM goal_runs gr
              JOIN mandates m ON m.goal_id = gr.goal_id
              JOIN goals g ON g.id = gr.goal_id
@@ -3272,6 +3274,7 @@ impl MandateStore for SqliteStateStore {
         let decision_cycle_id: Option<String> = row.get("decision_cycle_id");
         let decision_version: Option<i64> = row.get("decision_version");
         let decision_outcome_raw: Option<String> = row.get("decision_outcome");
+        let decision_rationale: Option<String> = row.get("decision_rationale");
         let decision_action_attempts: Option<i64> = row.get("decision_action_attempts");
         let (Some(decision_cycle_id), Some(decision_version), Some(decision_outcome_raw)) =
             (decision_cycle_id, decision_version, decision_outcome_raw)
@@ -3287,6 +3290,11 @@ impl MandateStore for SqliteStateStore {
         let Some(decision_outcome) = MandateDecisionOutcome::parse(&decision_outcome_raw) else {
             close_invalid_decision_state!();
         };
+        if decision_outcome == MandateDecisionOutcome::Wait
+            && decision_rationale.as_deref() == Some(SAFE_FALLBACK_WAIT_RATIONALE)
+        {
+            close_review_failed_retry!(MandateFinalizationRejectReason::DeliberatorFailed);
+        }
         let Some(decision_action_attempts) = decision_action_attempts else {
             close_invalid_decision_state!();
         };
@@ -3810,6 +3818,14 @@ mod tests {
             .create_task(&review_root(goal, &run.id, &root_task_id))
             .await
             .unwrap();
+        // Goal runs now remain pending until a worker claim transitions them.
+        // These storage tests exercise post-claim mandate invariants without a
+        // task worker, so model that already-claimed state explicitly.
+        sqlx::query("UPDATE goal_runs SET status = 'running' WHERE id = ?")
+            .bind(&run.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
         run
     }
 
@@ -3831,6 +3847,11 @@ mod tests {
             .unwrap();
         store
             .create_task(&review_root(goal, &run.id, &root_task_id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE goal_runs SET status = 'running' WHERE id = ?")
+            .bind(&run.id)
+            .execute(&store.pool)
             .await
             .unwrap();
         run

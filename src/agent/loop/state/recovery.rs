@@ -12,6 +12,7 @@ pub(in crate::agent) struct RecoveryState {
 
 pub(in crate::agent) struct StoppingRecoveryState<'a> {
     pub force_text_response: &'a mut bool,
+    pub empty_response_retry_pending: bool,
 }
 
 pub(in crate::agent) struct MessageBuildRecoveryState {
@@ -47,6 +48,7 @@ impl RecoveryState {
     pub(in crate::agent) fn for_stopping_phase(&mut self) -> StoppingRecoveryState<'_> {
         StoppingRecoveryState {
             force_text_response: &mut self.force_text_response,
+            empty_response_retry_pending: self.empty_response_retry_pending,
         }
     }
 

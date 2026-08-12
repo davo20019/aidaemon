@@ -161,18 +161,42 @@ impl crate::traits::NotificationStore for SqliteStateStore {
              WHERE delivered_at IS NULL
                AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
                AND (
+                    notification_type NOT IN ('progress', 'status_update')
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM notification_queue AS terminal
+                        WHERE terminal.goal_id = notification_queue.goal_id
+                          AND terminal.session_id = notification_queue.session_id
+                          AND terminal.notification_type IN ('completed', 'failed', 'stalled')
+                          AND julianday(terminal.created_at) >= julianday(notification_queue.created_at)
+                    )
+               )
+               AND (
                     priority = 'critical'
                     OR (
                         attempts < 10
                         AND datetime(created_at) > datetime('now', '-24 hours')
                     )
-               )
+             )
              ORDER BY
-               CASE priority WHEN 'critical' THEN 0 ELSE 1 END ASC,
+               -- Normally deliver durable outcomes first. If critical work
+               -- already fills this whole page, reserve the front of the page
+               -- for fresh progress so a dead delivery route cannot starve
+               -- every live update forever.
+               CASE
+                 WHEN (
+                   SELECT COUNT(*) FROM notification_queue AS critical_backlog
+                   WHERE critical_backlog.delivered_at IS NULL
+                     AND critical_backlog.priority = 'critical'
+                 ) >= ?
+                 THEN CASE priority WHEN 'status_update' THEN 0 ELSE 1 END
+                 ELSE CASE priority WHEN 'critical' THEN 0 ELSE 1 END
+               END ASC,
                julianday(created_at) DESC,
                id DESC
              LIMIT ?",
         )
+        .bind(limit)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -357,5 +381,56 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_status_updates_are_not_starved_by_critical_backlog() {
+        let (store, _database) = test_store().await;
+        for index in 0..25 {
+            let entry = crate::traits::NotificationEntry::new(
+                "old-goal",
+                "unroutable-session",
+                "failed",
+                &format!("old critical failure {index}"),
+            );
+            store.enqueue_notification(&entry).await.unwrap();
+        }
+        let progress = crate::traits::NotificationEntry::new(
+            "live-goal",
+            "owner-session",
+            "status_update",
+            "The current run is making progress.",
+        );
+        store.enqueue_notification(&progress).await.unwrap();
+
+        let pending = store.get_pending_notifications(20).await.unwrap();
+        assert_eq!(pending[0].id, progress.id);
+        assert_eq!(pending[0].priority, "status_update");
+    }
+
+    #[tokio::test]
+    async fn terminal_outcome_supersedes_older_live_status_update() {
+        let (store, _database) = test_store().await;
+        let mut progress = crate::traits::NotificationEntry::new(
+            "goal-12345678",
+            "owner-session",
+            "status_update",
+            "Starting the recovered run now.",
+        );
+        progress.created_at = "2026-08-03T14:40:06Z".to_string();
+        store.enqueue_notification(&progress).await.unwrap();
+
+        let mut completed = crate::traits::NotificationEntry::new(
+            "goal-12345678",
+            "owner-session",
+            "completed",
+            "The recovered run completed.",
+        );
+        completed.created_at = "2026-08-03T14:42:18Z".to_string();
+        store.enqueue_notification(&completed).await.unwrap();
+
+        let pending = store.get_pending_notifications(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, completed.id);
     }
 }

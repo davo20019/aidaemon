@@ -2408,6 +2408,7 @@ impl SlackChannel {
 
                 match result {
                     Ok(reply) => {
+                        let reply = crate::channels::prepare_chat_message(&reply);
                         // NOTE: Task intentionally stays "running" during response
                         // sending to prevent a race where incoming messages skip the
                         // queue. Finalized below before queue check.

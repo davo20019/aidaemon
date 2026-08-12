@@ -76,6 +76,7 @@ pub(in crate::agent) struct ToolExecutionCtx<'a> {
         &'a mut HashMap<String, super::reflection::PendingReflectionRecovery>,
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
+    pub last_failure_class: &'a mut Option<ToolFailureClass>,
     pub in_session_learned: &'a mut HashSet<(String, String)>,
     pub unknown_tools: &'a mut HashSet<String>,
     pub recent_tool_calls: &'a mut VecDeque<u64>,

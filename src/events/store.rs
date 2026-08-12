@@ -1110,11 +1110,19 @@ impl EventStore {
                   AND e.task_id = s.task_id
                   AND e.event_type = 'task_end'
               )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM events a
+                WHERE a.session_id = s.session_id
+                  AND a.task_id = s.task_id
+                  AND a.created_at >= ?
+              )
             GROUP BY s.session_id, s.task_id
             ORDER BY MIN(s.created_at) ASC
             LIMIT ?
             "#,
         )
+        .bind(&cutoff_str)
         .bind(&cutoff_str)
         .bind(batch_size.max(1) as i64)
         .fetch_all(&self.pool)
@@ -1126,22 +1134,25 @@ impl EventStore {
             let task_id: String = row.get("task_id");
             let started_at_raw: String = row.get("started_at");
 
-            // Re-check to avoid duplicate synthetic task_end if a real one was
-            // written between candidate query and append.
-            let has_end = sqlx::query(
+            // Re-check both terminal state and activity to avoid racing a live
+            // task that emitted an event after the candidate query.
+            let is_terminal_or_active = sqlx::query(
                 r#"
                 SELECT 1
                 FROM events
-                WHERE session_id = ? AND task_id = ? AND event_type = 'task_end'
+                WHERE session_id = ?
+                  AND task_id = ?
+                  AND (event_type = 'task_end' OR created_at >= ?)
                 LIMIT 1
                 "#,
             )
             .bind(&session_id)
             .bind(&task_id)
+            .bind(&cutoff_str)
             .fetch_optional(&self.pool)
             .await?
             .is_some();
-            if has_end {
+            if is_terminal_or_active {
                 continue;
             }
 
@@ -2397,6 +2408,23 @@ mod tests {
         )
         .await;
 
+        // An old task that is still emitting events is active, not stale. This
+        // covers long-running tools and detached continuation turns.
+        append_task_start(
+            &store,
+            "s-reconcile",
+            "task-active",
+            now - Duration::minutes(10),
+        )
+        .await;
+        append_decision_point(
+            &store,
+            "s-reconcile",
+            "task-active",
+            now - Duration::minutes(1),
+        )
+        .await;
+
         let reconciled = store
             .reconcile_stale_task_starts(300, 10)
             .await
@@ -2426,6 +2454,16 @@ mod tests {
             .await
             .expect("query recent task events");
         assert_eq!(recent_events.len(), 1, "recent task should stay open");
+
+        let active_events = store
+            .query_task_events_for_session("s-reconcile", "task-active")
+            .await
+            .expect("query active task events");
+        assert_eq!(
+            active_events.len(),
+            2,
+            "recent activity should keep an old task open"
+        );
 
         // Running again should be idempotent.
         let reconciled_again = store

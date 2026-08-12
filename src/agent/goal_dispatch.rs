@@ -737,7 +737,14 @@ pub(crate) fn build_goal_task_results_summary(tasks: &[Task], fallback: &str) ->
 
     let omitted = successful.len().saturating_sub(selected.len());
     if sections.len() == 1 && omitted == 0 {
-        return sections[0].clone();
+        // A lone task description is often the entire scheduled-goal prompt.
+        // Repeating it as a large bold heading makes the useful result harder to
+        // find, especially on mobile. The surrounding notification already gives
+        // the user enough context, so lead directly with the outcome.
+        return truncate_goal_result_text(
+            selected[0].result.as_deref().unwrap_or(""),
+            MAX_CHARS_PRIMARY_RESULT,
+        );
     }
 
     let mut summary = format!(
@@ -824,5 +831,25 @@ mod summary_tests {
             summary.contains("END_OF_MODULE_LIST"),
             "the primary deliverable must not be cut at the old 800-char cap:\n{summary}"
         );
+    }
+
+    #[test]
+    fn single_task_summary_does_not_repeat_the_full_task_instruction() {
+        let mut task = completed_task(
+            "publish",
+            1,
+            "2026-06-12T13:10:00Z",
+            "Published the post and verified the live URL returned HTTP 200.",
+        );
+        task.description =
+            "Create, deploy, and verify a post using these detailed instructions".to_string();
+
+        let summary = build_goal_task_results_summary(&[task], "fallback text");
+
+        assert_eq!(
+            summary,
+            "Published the post and verified the live URL returned HTTP 200."
+        );
+        assert!(!summary.contains("Create, deploy"));
     }
 }

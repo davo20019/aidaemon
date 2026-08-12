@@ -215,11 +215,6 @@ pub(in crate::agent) enum SystemDirective {
     EmptyResultStreakVaryTerms {
         streak: usize,
     },
-    /// The user approved the assistant's own immediately-prior proposal.
-    /// Anchor the turn to that proposal so the model executes exactly it.
-    ApprovedProposalAnchor {
-        proposal: String,
-    },
     /// Injected when plan detection heuristics identify a multi-step task
     /// that benefits from structured execution with verification.
     /// User challenged the immediately previous answer ("Are you sure?").
@@ -575,13 +570,6 @@ impl SystemDirective {
                  (ls/find/glob) do NOT match file contents — use a content search (grep -r, \
                  mdfind) when the term may only appear inside the file.",
                 streak
-            ),
-            Self::ApprovedProposalAnchor { proposal } => format!(
-                "[SYSTEM] The user just approved YOUR OWN proposal quoted below. Execute exactly \
-                 that — do not re-plan, re-search, or substitute a different action. If the \
-                 proposal names a specific file, command, or target, act on that exact target now.\n\
-                 Your proposal: \"{}\"",
-                proposal
             ),
             Self::SingleSourceEnumeration { sources_read } => {
                 let basis = if *sources_read == 0 {

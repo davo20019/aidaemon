@@ -264,9 +264,47 @@ pub(super) fn build_approval_message_slack(
 /// Build the inline keyboard for a scheduled-goal-confirmation prompt.
 pub(super) fn build_goal_confirmation_keyboard(approval_id: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Confirm ✅", format!("goal:confirm:{}", approval_id)),
-        InlineKeyboardButton::callback("Cancel ❌", format!("goal:cancel:{}", approval_id)),
+        InlineKeyboardButton::callback("Approve goal ✅", format!("goal:confirm:{}", approval_id)),
+        InlineKeyboardButton::callback("Cancel", format!("goal:cancel:{}", approval_id)),
     ]])
+}
+
+fn goal_detail_section(detail: &str) -> (&'static str, &str) {
+    for (prefix, heading) in [
+        ("Objective:", "🎯 Objective"),
+        ("Constraints:", "🛡️ Guardrails"),
+        ("Success criteria:", "✅ Success means"),
+        ("Stop conditions:", "🛑 Stops when"),
+        ("Pinned strategy:", "🧭 Strategy"),
+        ("Observations allowed:", "👁️ Read access"),
+        ("Allowed mutation effects:", "✍️ External changes"),
+        ("Allowed targets:", "🎯 Allowed targets"),
+        ("Exact operation scopes:", "🔧 Operation scope"),
+        ("Mutation limits:", "📏 Action limits"),
+        ("Review interval:", "🔄 Review timing"),
+        ("Expiration:", "⏱️ Duration"),
+        ("Resolved token budgets:", "🧮 Compute budget"),
+    ] {
+        if let Some(value) = detail.strip_prefix(prefix) {
+            return (heading, value.trim());
+        }
+    }
+    ("ℹ️ Additional detail", detail.trim())
+}
+
+fn normalized_goal_text(text: &str) -> String {
+    text.trim()
+        .strip_prefix("Delegate mandate:")
+        .unwrap_or(text.trim())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', ';'])
+        .to_ascii_lowercase()
+}
+
+fn readable_policy(value: &str) -> String {
+    value.replace(" | ", "\n")
 }
 
 /// Build lossless plain-text pages for a goal-confirmation prompt.
@@ -280,11 +318,22 @@ pub(super) fn build_goal_confirmation_pages(
     goal_description: &str,
     details: &[String],
 ) -> Vec<String> {
-    const PAGE_BODY_BYTES: usize = 3_400;
+    const PAGE_BODY_BYTES: usize = 3_200;
 
-    let mut body = format!("Requested goal\n{goal_description}");
+    let summary = goal_description
+        .trim()
+        .strip_prefix("Delegate mandate:")
+        .unwrap_or(goal_description.trim())
+        .trim();
+    let summary_normalized = normalized_goal_text(summary);
+    let mut body =
+        format!("What you’re approving\n{summary}\n\nNothing starts until you approve this goal.");
     for detail in details {
-        body.push_str(&format!("\n• {detail}"));
+        let (heading, value) = goal_detail_section(detail);
+        if heading == "🎯 Objective" && normalized_goal_text(value) == summary_normalized {
+            continue;
+        }
+        body.push_str(&format!("\n\n{heading}\n{}", readable_policy(value)));
     }
 
     let chunks = split_message(&body, PAGE_BODY_BYTES);
@@ -294,14 +343,12 @@ pub(super) fn build_goal_confirmation_pages(
         .enumerate()
         .map(|(index, chunk)| {
             let mut page = if page_count == 1 {
-                format!("📋 Confirm goal\n\n{chunk}")
+                format!("🔐 Review goal before activation\n\n{chunk}")
             } else {
-                format!("📋 Confirm goal ({}/{page_count})\n\n{chunk}", index + 1)
+                format!("🔐 Review goal · {}/{page_count}\n\n{chunk}", index + 1)
             };
             if index + 1 == page_count {
-                page.push_str(
-                    "\n\nReview the complete proposal above, then confirm or cancel this exact goal.",
-                );
+                page.push_str("\n\nReady to proceed? Approve this exact goal or cancel it below.");
             }
             page
         })
@@ -377,7 +424,25 @@ mod tests {
         assert!(pages
             .last()
             .unwrap()
-            .contains("confirm or cancel this exact goal"));
+            .contains("Approve this exact goal or cancel it"));
         assert!(pages.iter().any(|page| page.contains("<unescaped>")));
+    }
+
+    #[test]
+    fn goal_confirmation_is_scannable_and_deduplicates_objective() {
+        let description = "Delegate mandate: Steward the synthetic account for 24 hours.";
+        let details = vec![
+            "Objective: Steward the synthetic account for 24 hours.".to_string(),
+            "Constraints: 1. Verify identity. | 2. Never retry an ambiguous mutation.".to_string(),
+            "Expiration: 86400 seconds after actual activation".to_string(),
+        ];
+
+        let pages = build_goal_confirmation_pages(description, &details);
+        let rendered = pages.join("\n");
+        assert!(rendered.starts_with("🔐 Review goal before activation"));
+        assert_eq!(rendered.matches("Steward the synthetic account").count(), 1);
+        assert!(rendered.contains("🛡️ Guardrails\n1. Verify identity.\n2. Never retry"));
+        assert!(rendered.contains("⏱️ Duration"));
+        assert!(rendered.contains("Nothing starts until you approve this goal."));
     }
 }

@@ -47,6 +47,7 @@ pub(super) struct ResultLearningState<'a> {
     pub pending_reflection_recoveries: &'a mut HashMap<String, PendingReflectionRecovery>,
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
+    pub last_failure_class: &'a mut Option<ToolFailureClass>,
     pub in_session_learned: &'a mut HashSet<(String, String)>,
     pub force_text_response: &'a mut bool,
     pub pending_system_messages: &'a mut Vec<SystemDirective>,
@@ -247,6 +248,7 @@ pub(super) async fn apply_result_learning(
 
         let base_error = strip_appended_diagnostics(result_text).to_string();
         let failure_class = failure_class.unwrap_or(ToolFailureClass::Semantic);
+        *state.last_failure_class = Some(failure_class);
         let mut semantic_failure = None;
         match execution_failure_kind {
             Some(ExecutionFailureKind::ToolContractFailure) => append_tool_result_notice(
@@ -582,6 +584,10 @@ pub(super) async fn apply_result_learning(
             semantic_failure,
         });
     }
+
+    // The most recent tool outcome succeeded, so an older transient class must
+    // not keep widening future stall windows.
+    *state.last_failure_class = None;
 
     if env.attempted_required_file_recheck {
         *state.require_file_recheck_before_answer = false;

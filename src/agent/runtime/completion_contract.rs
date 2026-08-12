@@ -108,6 +108,55 @@ impl CompletionContract {
     }
 }
 
+/// Preserve the typed obligations of a persisted request that has not reached
+/// a terminal outcome. The caller decides whether the requests are related
+/// from dialogue state; this function deliberately performs no text matching.
+pub(super) fn inherit_unfinished_request_contract(
+    mut current: CompletionContract,
+    unfinished: &CompletionContract,
+) -> CompletionContract {
+    let current_requires_execution = current.expects_mutation || current.requires_observation;
+    let may_carry_mutation = !current.forbids_mutation;
+
+    if may_carry_mutation && unfinished.expects_mutation {
+        current.expects_mutation = true;
+        current.required_mutation_effects = current
+            .required_mutation_effects
+            .union(unfinished.required_mutation_effects);
+        current.requires_reverification_after_mutation |=
+            unfinished.requires_reverification_after_mutation;
+    }
+
+    current.requires_observation |= unfinished.requires_observation;
+    current.explicit_verification_requested |= unfinished.explicit_verification_requested;
+
+    if !current_requires_execution
+        && (current.expects_mutation || current.requires_observation)
+        && !current.forbids_mutation
+    {
+        current.task_kind = unfinished.task_kind;
+    }
+
+    // Persist scoped safety constraints across a continuation. A current turn
+    // that explicitly requests mutation supersedes an older blanket
+    // observation-only constraint, while operation-specific exclusions remain.
+    if !current.expects_mutation {
+        current.forbids_mutation |= unfinished.forbids_mutation;
+    }
+    for action in &unfinished.forbidden_mutation_actions {
+        if !current.forbidden_mutation_actions.contains(action) {
+            current.forbidden_mutation_actions.push(*action);
+        }
+    }
+    for target in &unfinished.verification_targets {
+        if !current.verification_targets.contains(target) {
+            current.verification_targets.push(target.clone());
+        }
+    }
+
+    current
+}
+
 /// Authoritative, finalized per-turn assessment of whether completing the
 /// request requires execution.
 ///
@@ -1865,6 +1914,57 @@ mod tests {
             !contract.expects_mutation,
             "asking what was seen is observational, not a mutation"
         );
+    }
+
+    #[test]
+    fn unfinished_contract_inheritance_uses_typed_state_not_followup_words() {
+        let current = CompletionContract {
+            task_kind: CompletionTaskKind::Answer,
+            ..CompletionContract::default()
+        };
+        let unfinished = CompletionContract {
+            task_kind: CompletionTaskKind::Change,
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            requires_observation: true,
+            requires_reverification_after_mutation: true,
+            explicit_verification_requested: true,
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_unfinished_request_contract(current, &unfinished);
+
+        assert_eq!(inherited.task_kind, CompletionTaskKind::Change);
+        assert!(inherited.expects_mutation);
+        assert!(inherited
+            .required_mutation_effects
+            .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
+        assert!(inherited.requires_observation);
+        assert!(inherited.requires_reverification_after_mutation);
+        assert!(inherited.explicit_verification_requested);
+    }
+
+    #[test]
+    fn current_observation_only_constraint_blocks_inherited_mutation() {
+        let current = CompletionContract {
+            task_kind: CompletionTaskKind::Check,
+            forbids_mutation: true,
+            requires_observation: true,
+            ..CompletionContract::default()
+        };
+        let unfinished = CompletionContract {
+            task_kind: CompletionTaskKind::Change,
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::LOCAL_SOURCE_WRITE,
+            ..CompletionContract::default()
+        };
+
+        let inherited = inherit_unfinished_request_contract(current, &unfinished);
+
+        assert!(!inherited.expects_mutation);
+        assert!(inherited.forbids_mutation);
+        assert!(inherited.required_mutation_effects.is_empty());
+        assert_eq!(inherited.task_kind, CompletionTaskKind::Check);
     }
 
     #[test]

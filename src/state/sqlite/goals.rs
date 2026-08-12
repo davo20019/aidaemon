@@ -1309,7 +1309,9 @@ impl crate::traits::TaskDispatchStore for SqliteStateStore {
              t.blocker, t.idempotent, t.retry_count, t.max_retries, t.created_at,
              t.started_at, t.completed_at
              FROM tasks t
-             JOIN goals g ON t.goal_id = g.id AND g.domain = 'orchestration' AND g.status = 'active'
+             JOIN goals g ON t.goal_id = g.id
+                         AND g.domain = 'orchestration'
+                         AND g.status IN ('active', 'stalled')
              WHERE t.status = 'pending'
              AND NOT EXISTS (
                  SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) AS dep

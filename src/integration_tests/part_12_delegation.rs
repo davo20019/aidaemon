@@ -340,11 +340,77 @@ async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
 }
 
 #[tokio::test]
+async fn operational_blocker_without_recovery_evidence_keeps_executor_running() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "report_blocker",
+            r#"{"reason":"The build result contradicts a direct parser check","blocker_class":"recovery_exhausted","external_effect_state":"none","recovery_attempts":[{"action":"Parsed the current file","outcome":"The id is valid","evidence":"The parser returned integer 108"}],"outcome":"blocked"}"#,
+        ),
+        MockProvider::text_response(
+            "Refreshed the workspace, reran the original build, and completed the task successfully.",
+        ),
+    ]);
+    let harness = setup_full_stack_test_agent(provider).await.unwrap();
+    let agent = Arc::new(harness.agent);
+
+    let goal = Goal::new_finite("Build the current blog post", "delegation-recovery-gate");
+    harness.state.create_goal(&goal).await.unwrap();
+    let task = crate::traits::Task {
+        id: "task-recovery-gate-001".to_string(),
+        goal_id: goal.id.clone(),
+        description: "Build the current blog post".to_string(),
+        status: "claimed".to_string(),
+        priority: "high".to_string(),
+        task_order: 1,
+        parallel_group: None,
+        depends_on: None,
+        agent_id: Some("task-lead".to_string()),
+        context: None,
+        result: None,
+        error: None,
+        blocker: None,
+        idempotent: false,
+        retry_count: 0,
+        max_retries: 3,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+    };
+    harness.state.create_task(&task).await.unwrap();
+
+    let response = agent
+        .spawn_child(
+            "Build the current blog post",
+            "Build the current blog post",
+            None,
+            ChannelContext::private("test"),
+            UserRole::Owner,
+            Some(AgentRole::Executor),
+            Some(goal.id.as_str()),
+            Some(task.id.as_str()),
+            Some("/tmp/demo"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(response.contains("reran the original build"), "{response}");
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "a rejected blocker must return control to the executor"
+    );
+    let updated = harness.state.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(updated.status, "completed");
+    assert!(updated.blocker.is_none());
+}
+
+#[tokio::test]
 async fn test_report_blocker_terminates_executor_loop() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response(
             "report_blocker",
-            r#"{"reason":"Docker daemon is not reachable","outcome":"blocked","exact_need":"Start Docker so ddev can connect.","next_step":"Re-run ddev composer update once Docker is up."}"#,
+            r#"{"reason":"Docker daemon is not reachable","blocker_class":"external_dependency","external_effect_state":"none","recovery_attempts":[],"outcome":"blocked","exact_need":"Start Docker so ddev can connect.","next_step":"Re-run ddev composer update once Docker is up."}"#,
         ),
         MockProvider::text_response("SHOULD NOT BE REACHED - loop must end at report_blocker."),
     ]);
@@ -610,7 +676,7 @@ async fn test_executor_timeout_does_not_clobber_terminal_task_status() {
 async fn test_executor_spawn_persists_needs_approval_blocker_result() {
     let provider = MockProvider::with_responses(vec![MockProvider::tool_call_response(
         "report_blocker",
-        r#"{"reason":"Need approval to rotate the production credentials","outcome":"needs_approval","partial_work":"Validated the rotation script and staged the rollout notes","exact_need":"Owner approval to rotate the production credentials.","next_step":"Run the approved credential rotation and verify the service health.","target":"production credentials"}"#,
+        r#"{"reason":"Need approval to rotate the production credentials","blocker_class":"missing_authority","external_effect_state":"none","recovery_attempts":[],"outcome":"needs_approval","partial_work":"Validated the rotation script and staged the rollout notes","exact_need":"Owner approval to rotate the production credentials.","next_step":"Run the approved credential rotation and verify the service health.","target":"production credentials"}"#,
     )]);
     let harness = setup_full_stack_test_agent(provider).await.unwrap();
     let agent = Arc::new(harness.agent);

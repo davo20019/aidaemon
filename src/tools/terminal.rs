@@ -18,7 +18,8 @@ use tracing::{info, warn};
 use crate::channels::ChannelHub;
 use crate::config::SelfCorrectionConfig;
 use crate::events::{
-    ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, EventStore, EventType,
+    ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
+    DecisionType, DiagnosticSeverity, EventStore, EventType,
 };
 use crate::execution::{
     active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
@@ -47,9 +48,11 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
 const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 
 /// A disowned background process (notifier-active, non-detached) that makes no
-/// progress (no CPU time, disk I/O, or output growth) for this long is treated
-/// as stalled and auto-stopped by the heartbeat reaper. Default fallback for the
-/// stall threshold when config is absent. The observed failure: a whole-disk
+/// progress (no CPU time, disk I/O, output growth, or process-tree change) for
+/// this long is treated as a stall candidate by the heartbeat reaper. The
+/// launch-time progress contract can extend this fallback threshold, and a
+/// second conclusive sample is normally required before termination. The
+/// observed failure: a whole-disk
 /// `du -ah ~ | sort | head` that emitted zero bytes and ran for ~11 hours
 /// without exiting. Detached processes (dev servers started with `detach=true`)
 /// are exempt, and any process that is genuinely working — advancing CPU time,
@@ -57,10 +60,10 @@ const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
 /// and is never reaped on the stall path.
 pub const BACKGROUND_IDLE_REAP_SECS: u64 = 300;
 
-/// Default maximum total runtime (seconds) for a notifier-active background
-/// process, regardless of progress. Backstop for busy-loops (high CPU, no useful
-/// progress) and genuinely-too-slow commands that would otherwise run forever.
-/// 20 minutes. Used as the fallback when config is absent.
+/// Default maximum total runtime (seconds) for a generic notifier-active
+/// background process. This remains a hard leak backstop for unclassified
+/// commands; recognized filesystem, build/test, and network workloads treat it
+/// as soft while objective activity is visible. Used when config is absent.
 pub const BACKGROUND_MAX_RUNTIME_SECS: u64 = 1200;
 
 /// Why a background process was reaped — drives the user-facing wording and the
@@ -71,6 +74,79 @@ enum ReapReason {
     Stalled,
     /// Total runtime hit the max-runtime backstop (busy-loop / too-slow).
     MaxRuntime,
+}
+
+/// Deterministic launch-time context for background-process supervision.
+///
+/// This is deliberately derived from the parsed executable/arguments once, when
+/// the process starts. The heartbeat never asks an LLM to reinterpret a command
+/// and never uses substring matching to decide whether a process is healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundWorkload {
+    Generic,
+    FilesystemTraversal { broad_or_multi_target: bool },
+    BuildOrTest,
+    NetworkTransfer,
+}
+
+impl BackgroundWorkload {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::FilesystemTraversal {
+                broad_or_multi_target: true,
+            } => "filesystem_traversal_broad",
+            Self::FilesystemTraversal {
+                broad_or_multi_target: false,
+            } => "filesystem_traversal_bounded",
+            Self::BuildOrTest => "build_or_test",
+            Self::NetworkTransfer => "network_transfer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundProgressContract {
+    workload: BackgroundWorkload,
+    /// Expected long-silent work receives a larger no-progress window.
+    stall_multiplier: u32,
+    /// A threshold crossing is only a suspicion. Require another independent
+    /// heartbeat sample before terminating for a stall.
+    idle_confirmations_required: u8,
+    /// Generic commands retain the absolute runtime leak backstop. Recognized
+    /// long-running work is never killed merely because wall time elapsed while
+    /// objective activity is still visible.
+    hard_max_runtime: bool,
+}
+
+impl Default for BackgroundProgressContract {
+    fn default() -> Self {
+        Self {
+            workload: BackgroundWorkload::Generic,
+            stall_multiplier: 1,
+            idle_confirmations_required: 2,
+            hard_max_runtime: true,
+        }
+    }
+}
+
+impl BackgroundProgressContract {
+    fn effective_stall_threshold(self, base: Duration) -> Duration {
+        base.saturating_mul(self.stall_multiplier)
+    }
+}
+
+/// One OS resource snapshot for the tracked shell plus all descendants.
+/// Process-tree churn is a progress signal beyond CPU/disk/output counters.
+/// Process and runnable counts are retained as diagnostic context only: a
+/// point-in-time runnable state does not prove that work advanced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProcessResourceSample {
+    cpu_ms: u64,
+    io_bytes: u64,
+    tree_fingerprint: u64,
+    process_count: u32,
+    runnable_count: u32,
 }
 
 impl ReapReason {
@@ -89,22 +165,24 @@ impl ReapReason {
 }
 
 /// Cross-platform progress signal for one sweep. A process is "making progress"
-/// if ANY of its cumulative CPU time, cumulative disk I/O bytes, or output bytes
-/// grew since the last sweep. Pure + injectable so the policy is unit-testable
-/// without spawning real processes or sampling the OS.
+/// if any cumulative CPU time, disk I/O bytes, or output bytes grew, or if the
+/// process tree changed since the last sweep. Pure + injectable so the policy is
+/// unit-testable without spawning real processes or sampling the OS.
 ///
 /// `*_now` values that could not be sampled (process gone / OS denied the stat)
 /// MUST be passed as the previous value (no change) by the caller, so a missing
 /// signal simply contributes nothing rather than being mistaken for progress.
 fn process_made_progress(
-    cpu_ms_prev: u64,
-    cpu_ms_now: u64,
-    io_bytes_prev: u64,
-    io_bytes_now: u64,
+    previous: ProcessResourceSample,
     output_len_prev: usize,
     output_len_now: usize,
+    sample_now: ProcessResourceSample,
 ) -> bool {
-    cpu_ms_now > cpu_ms_prev || io_bytes_now > io_bytes_prev || output_len_now > output_len_prev
+    sample_now.cpu_ms > previous.cpu_ms
+        || sample_now.io_bytes > previous.io_bytes
+        || output_len_now > output_len_prev
+        || (previous.tree_fingerprint != 0
+            && sample_now.tree_fingerprint != previous.tree_fingerprint)
 }
 
 /// Pure decision: should a tracked background process be idle-reaped?
@@ -113,8 +191,8 @@ fn process_made_progress(
 /// not detached (detached = "survives, requires explicit kill"), AND either:
 ///   - it has made no progress (no CPU/IO/output advance) for at least
 ///     `stall_threshold` — truly stalled; or
-///   - its total runtime has reached `max_runtime` — busy-loop / too-slow
-///     backstop, fired even if it is technically "making progress".
+///   - its total runtime has reached `max_runtime` and its launch-time contract
+///     retains the hard wall-time backstop.
 ///
 /// Kept as a free function so the policy is unit-testable without spawning real
 /// processes.
@@ -125,11 +203,12 @@ fn should_idle_reap(
     total_runtime: Duration,
     stall_threshold: Duration,
     max_runtime: Duration,
+    hard_max_runtime: bool,
 ) -> bool {
     if !notifier_active || detached {
         return false;
     }
-    no_progress_elapsed >= stall_threshold || total_runtime >= max_runtime
+    no_progress_elapsed >= stall_threshold || (hard_max_runtime && total_runtime >= max_runtime)
 }
 
 /// Pure subtree resource aggregation: for each tracked root pid, sum the
@@ -147,7 +226,7 @@ fn should_idle_reap(
 /// then delegates here.
 ///
 /// - `children_of`: parent pid → child pids (built from each process's parent).
-/// - `per_pid`: pid → `(cpu_ms, io_bytes)` cumulative sample for that one pid.
+/// - `per_pid`: pid → `(cpu_ms, io_bytes, runnable)` sample for that one pid.
 /// - A `visited` set guards against malformed cyclic maps (a real process tree
 ///   never cycles, but this is cheap insurance against an infinite loop).
 /// - A root absent from `per_pid` (e.g. exited between snapshot and lookup)
@@ -156,8 +235,8 @@ fn should_idle_reap(
 fn sum_subtree_resources(
     roots: &[u32],
     children_of: &HashMap<u32, Vec<u32>>,
-    per_pid: &HashMap<u32, (u64, u64)>,
-) -> HashMap<u32, (u64, u64)> {
+    per_pid: &HashMap<u32, (u64, u64, bool)>,
+) -> HashMap<u32, ProcessResourceSample> {
     // Defensive cap on traversal breadth for a single root so a pathologically
     // huge / malformed tree can't blow up the 60s sweep. A real background
     // pipeline has a handful of stages, never thousands.
@@ -174,6 +253,8 @@ fn sum_subtree_resources(
         let mut stack: Vec<u32> = vec![root];
         let mut cpu_sum: u64 = 0;
         let mut io_sum: u64 = 0;
+        let mut tree_fingerprint: u64 = 0;
+        let mut runnable_count: u32 = 0;
         while let Some(pid) = stack.pop() {
             if !visited.insert(pid) {
                 continue; // cycle guard / already counted
@@ -181,9 +262,17 @@ fn sum_subtree_resources(
             if visited.len() > MAX_SUBTREE_NODES {
                 break;
             }
-            if let Some(&(cpu, io)) = per_pid.get(&pid) {
+            if let Some(&(cpu, io, runnable)) = per_pid.get(&pid) {
                 cpu_sum = cpu_sum.saturating_add(cpu);
                 io_sum = io_sum.saturating_add(io);
+                // Order-independent, cheap fingerprint. PID reuse cannot occur
+                // inside one live root without a corresponding tree transition.
+                tree_fingerprint ^= (pid as u64)
+                    .wrapping_mul(0x9E37_79B1_85EB_CA87)
+                    .rotate_left(pid % 63);
+                if runnable {
+                    runnable_count = runnable_count.saturating_add(1);
+                }
             }
             if let Some(children) = children_of.get(&pid) {
                 for &child in children {
@@ -193,7 +282,16 @@ fn sum_subtree_resources(
                 }
             }
         }
-        out.insert(root, (cpu_sum, io_sum));
+        out.insert(
+            root,
+            ProcessResourceSample {
+                cpu_ms: cpu_sum,
+                io_bytes: io_sum,
+                tree_fingerprint,
+                process_count: visited.len().min(u32::MAX as usize) as u32,
+                runnable_count,
+            },
+        );
     }
     out
 }
@@ -238,12 +336,11 @@ struct RunningProcess {
     notify_session_id: String,
     notify_goal_id: String,
     /// Idle-reap bookkeeping: total output bytes observed at the last sweep and
-    /// the instant ANY progress signal last advanced. A notifier-active,
-    /// non-detached process that makes no progress (no CPU time, disk I/O, or
-    /// output growth) for the stall threshold is treated as hung (e.g. a
-    /// whole-disk `du`/`find` scan) and stopped by the heartbeat reaper.
-    /// Genuinely-working processes keep resetting `last_progress_at` and survive
-    /// the stall path; the max-runtime backstop still catches busy-loops.
+    /// the instant any progress signal last advanced. A notifier-active,
+    /// non-detached process that makes no objective progress becomes a stall
+    /// candidate after its workload-specific threshold; termination normally
+    /// requires another conclusive sample. Genuinely working processes keep
+    /// resetting `last_progress_at` and survive the stall path.
     last_progress_len: usize,
     last_progress_at: Instant,
     /// Cumulative CPU time (ms) observed at the last sweep. Advancing CPU time is
@@ -252,6 +349,15 @@ struct RunningProcess {
     /// Cumulative disk read+written bytes observed at the last sweep. Advancing
     /// disk I/O is progress even when the process is silent.
     last_io_bytes: u64,
+    /// Stable summary of the tracked process subtree. A child starting or
+    /// finishing is observable progress even when aggregate counters fall as a
+    /// completed child leaves the tree.
+    last_tree_fingerprint: u64,
+    /// Number of consecutive, independently sampled threshold crossings. The
+    /// first crossing is only a suspected stall; termination requires the
+    /// launch-time contract's confirmation count.
+    idle_confirmations: u8,
+    progress_contract: BackgroundProgressContract,
 }
 
 /// Finalized background process output retained briefly so `action="check"`
@@ -276,7 +382,7 @@ const BACKGROUND_DELIVERY_DEDUPE_WINDOW: Duration = Duration::from_secs(600);
 /// Sliding-window limiter for background-completion agent re-engagements.
 /// Records `now` and returns `true` when the session still has budget;
 /// returns `false` (recording nothing) once the cap is reached.
-fn reengagement_allowed(
+pub(crate) fn reengagement_allowed(
     log: &mut HashMap<String, std::collections::VecDeque<Instant>>,
     session_id: &str,
     now: Instant,
@@ -604,7 +710,7 @@ pub(crate) async fn deliver_background_completion_ping(
     goal_id: &str,
     message: &str,
     pid: u32,
-) {
+) -> Option<String> {
     if let Some(hub) = hub {
         if let Some(surface_id) = hub.take_background_status_surface(session_id).await {
             match hub.edit_text(session_id, &surface_id, message).await {
@@ -614,7 +720,7 @@ pub(crate) async fn deliver_background_completion_ping(
                         session_id,
                         "Background completion ping edited into the handoff status message"
                     );
-                    return;
+                    return Some(surface_id);
                 }
                 other => {
                     info!(
@@ -628,6 +734,40 @@ pub(crate) async fn deliver_background_completion_ping(
         }
     }
     deliver_background_text(hub, state, session_id, goal_id, message, pid).await;
+    None
+}
+
+/// Resolve an edited background status surface after the promised result has
+/// actually been delivered. The completion ping is deliberately nonterminal;
+/// only this post-delivery transition gets a checkmark.
+async fn finalize_background_completion_surface(
+    hub: Option<&Arc<ChannelHub>>,
+    session_id: &str,
+    surface_id: Option<&str>,
+    outcome: BackgroundSurfaceOutcome,
+) {
+    let (Some(hub), Some(surface_id)) = (hub, surface_id) else {
+        return;
+    };
+    let text = match outcome {
+        BackgroundSurfaceOutcome::Delivered => "✅ Result delivered.",
+        BackgroundSurfaceOutcome::StillWorking => {
+            "⏳ Still working — another background step is running."
+        }
+        BackgroundSurfaceOutcome::Queued => "📨 Result queued for delivery.",
+        BackgroundSurfaceOutcome::DeliveryFailed => {
+            "⚠️ The background step finished, but I couldn't deliver the remaining result."
+        }
+    };
+    let _ = hub.edit_text(session_id, surface_id, text).await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundSurfaceOutcome {
+    Delivered,
+    StillWorking,
+    Queued,
+    DeliveryFailed,
 }
 
 async fn deliver_background_text(
@@ -832,6 +972,119 @@ fn extract_segment_binary(segment: &str) -> &str {
         return word;
     }
     ""
+}
+
+/// Return structurally parsed `(program, argv)` invocations from a shell
+/// command. Exact executable basenames are used for workload classification;
+/// this is not natural-language keyword matching.
+fn parsed_command_invocations(command: &str) -> Vec<(String, Vec<String>)> {
+    crate::tools::command_risk::split_by_operators(command)
+        .into_iter()
+        .filter_map(|(segment, _)| {
+            let tokens = shell_words::split(&segment).ok()?;
+            let program_index = tokens.iter().position(|token| {
+                !token.contains('=') && !matches!(token.as_str(), "command" | "builtin")
+            })?;
+            let program = std::path::Path::new(&tokens[program_index])
+                .file_name()
+                .and_then(|name| name.to_str())?
+                .to_ascii_lowercase();
+            Some((program, tokens[program_index + 1..].to_vec()))
+        })
+        .collect()
+}
+
+fn filesystem_invocation_is_broad_or_multi(program: &str, args: &[String]) -> bool {
+    let path_operands: Vec<&str> = match program {
+        // `find ROOT... EXPRESSION`: roots precede the first expression/option.
+        "find" => args
+            .iter()
+            .take_while(|arg| !arg.starts_with('-') && arg.as_str() != "!")
+            .map(String::as_str)
+            .collect(),
+        // `du [OPTIONS] PATH...`: every non-option token is a target. This is a
+        // conservative parse; an option value counted as a target only makes the
+        // supervisor more patient, never less safe.
+        _ => args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            .collect(),
+    };
+
+    path_operands.len() > 1
+        || path_operands.iter().any(|path| {
+            is_broad_scan_root(path)
+                || (path.contains('{') && path.contains(',') && path.contains('}'))
+        })
+}
+
+fn progress_contract_for_command(command: &str) -> BackgroundProgressContract {
+    let invocations = parsed_command_invocations(command);
+
+    for (program, args) in &invocations {
+        if matches!(program.as_str(), "du" | "find" | "tree") {
+            let broad_or_multi_target =
+                filesystem_invocation_is_broad_or_multi(program, args.as_slice());
+            return BackgroundProgressContract {
+                workload: BackgroundWorkload::FilesystemTraversal {
+                    broad_or_multi_target,
+                },
+                stall_multiplier: if broad_or_multi_target { 5 } else { 3 },
+                idle_confirmations_required: 2,
+                hard_max_runtime: false,
+            };
+        }
+    }
+
+    for (program, args) in &invocations {
+        let subcommand = args.first().map(String::as_str).unwrap_or("");
+        let is_build_or_test = matches!(
+            program.as_str(),
+            "cargo"
+                | "rustc"
+                | "make"
+                | "ninja"
+                | "cmake"
+                | "xcodebuild"
+                | "swift"
+                | "swiftc"
+                | "gradle"
+                | "gradlew"
+                | "mvn"
+                | "mvnw"
+                | "pytest"
+        ) || (program == "go"
+            && matches!(subcommand, "build" | "test" | "install"))
+            || (matches!(program.as_str(), "npm" | "pnpm" | "yarn" | "bun")
+                && matches!(subcommand, "build" | "test" | "install" | "run"));
+        if is_build_or_test {
+            return BackgroundProgressContract {
+                workload: BackgroundWorkload::BuildOrTest,
+                stall_multiplier: 2,
+                idle_confirmations_required: 2,
+                hard_max_runtime: false,
+            };
+        }
+    }
+
+    for (program, args) in &invocations {
+        let subcommand = args.first().map(String::as_str).unwrap_or("");
+        let is_network_transfer =
+            matches!(program.as_str(), "curl" | "wget" | "rsync" | "scp" | "sftp")
+                || (program == "git"
+                    && matches!(subcommand, "clone" | "fetch" | "pull" | "submodule"));
+        if is_network_transfer {
+            return BackgroundProgressContract {
+                workload: BackgroundWorkload::NetworkTransfer,
+                stall_multiplier: 2,
+                idle_confirmations_required: 2,
+                hard_max_runtime: false,
+            };
+        }
+    }
+
+    BackgroundProgressContract::default()
 }
 
 fn is_grep_command(token: &str) -> bool {
@@ -1385,21 +1638,43 @@ const SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES: usize = 4;
 /// True when a (non-empty) background result is short and self-contained
 /// enough to deliver directly rather than re-feed into the agent loop.
 /// The caller must already have excluded empty / "(no output)" results.
-/// Build the background-completion ping. When the output is non-trivial a
-/// re-engagement (or tool-less interpretation) turn follows to compose the
-/// actual answer — on a slow local model that takes minutes, so the ping must
-/// say the answer is still coming instead of reading as terminal ("Done" +
-/// silence). `answer_follows` must be false for trivial output, where no
-/// follow-up happens and the promise would be a lie.
+fn is_short_complete_output(output_trimmed: &str) -> bool {
+    output_trimmed.chars().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS
+        && output_trimmed.lines().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES
+}
+
+/// Build the background-process transition shown before any result delivery.
+/// Process exit is not task completion: the checkmark and "Done" are reserved
+/// for the point where the requested result has actually reached the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundCompletionNext {
+    Nothing,
+    PrepareResult,
+    ContinueRequirements,
+}
+
 fn background_completion_ping_message(
     exit_code: Option<i32>,
     elapsed_secs: u64,
-    answer_follows: bool,
+    next: BackgroundCompletionNext,
 ) -> String {
     if exit_code == Some(0) {
-        let mut m = format!("✅ Done — finished in {}.", humanize_elapsed(elapsed_secs));
-        if answer_follows {
-            m.push_str(" Writing up the result now…");
+        let mut m = format!(
+            "Background step finished in {}.",
+            humanize_elapsed(elapsed_secs)
+        );
+        match next {
+            BackgroundCompletionNext::Nothing => {
+                m.push_str(" It returned no output.");
+            }
+            BackgroundCompletionNext::PrepareResult => {
+                m.insert_str(0, "⏳ ");
+                m.push_str(" Preparing your result now…");
+            }
+            BackgroundCompletionNext::ContinueRequirements => {
+                m.insert_str(0, "⏳ ");
+                m.push_str(" Continuing with the remaining request now…");
+            }
         }
         m
     } else {
@@ -1411,16 +1686,17 @@ fn background_completion_ping_message(
             m.push_str(&format!(" (exit code {})", code));
         }
         m.push('.');
-        if answer_follows {
-            m.push_str(" Looking at the output now…");
+        match next {
+            BackgroundCompletionNext::Nothing => {}
+            BackgroundCompletionNext::PrepareResult => {
+                m.push_str(" Reviewing what happened now…");
+            }
+            BackgroundCompletionNext::ContinueRequirements => {
+                m.push_str(" Reviewing the error and continuing the remaining request now…");
+            }
         }
         m
     }
-}
-
-fn is_short_complete_output(output_trimmed: &str) -> bool {
-    output_trimmed.chars().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_CHARS
-        && output_trimmed.lines().count() <= SHORT_OUTPUT_DIRECT_DELIVERY_MAX_LINES
 }
 
 /// Friendly, pid-free delivery message for a short background result. Inline
@@ -1433,6 +1709,23 @@ fn format_short_background_result(output_trimmed: &str) -> String {
     }
 }
 
+fn format_background_continuation_failure(unchecked: &[String]) -> String {
+    if unchecked.is_empty() {
+        return "⚠️ The background step finished, but I couldn't prepare the final response. Please ask me to continue."
+            .to_string();
+    }
+
+    let mut message = String::from(
+        "⚠️ The background step finished, but I couldn't complete the remaining request. Still needed:\n",
+    );
+    for item in unchecked.iter().take(5) {
+        message.push_str("- ");
+        message.push_str(item);
+        message.push('\n');
+    }
+    message.trim_end().to_string()
+}
+
 /// Serializes background-notifier re-engagements of the agent loop. A
 /// completion arriving while another re-engagement turn is still running must
 /// wait, not spawn a CONCURRENT loop on the same daemon: two racing loops each
@@ -1443,7 +1736,7 @@ fn format_short_background_result(output_trimmed: &str) -> String {
 static REENGAGE_SERIALIZER: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
 
-async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
     REENGAGE_SERIALIZER.lock().await
 }
 
@@ -2465,12 +2758,12 @@ impl TerminalTool {
         .await
     }
 
-    /// Sample cumulative (CPU-ms, disk-IO-bytes) for each pid via `sysinfo`.
+    /// Sample process-tree resource/liveness metadata for each pid via `sysinfo`.
     ///
     /// Cross-platform: `sysinfo` covers macOS/Linux/Windows, so there are no
     /// per-OS `cfg` blocks. A pid that has exited (or that the OS won't stat)
     /// simply has no map entry — the caller treats a missing sample as "no
-    /// progress signal from CPU/IO" and falls back to output-based progress.
+    /// progress evidence" and falls back to output-based progress.
     ///
     /// The returned value for each tracked root pid is the SUM of cumulative CPU
     /// time + disk I/O across that pid AND all its transitive descendants.
@@ -2485,8 +2778,8 @@ impl TerminalTool {
     /// per 60s, so a single full-process refresh (cpu + disk only) per sweep is
     /// an acceptable, bounded cost. The parent→children index and subtree
     /// traversal are O(total processes), trivial at typical process counts.
-    fn sample_process_resources(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    fn sample_process_resources(pids: &[u32]) -> HashMap<u32, ProcessResourceSample> {
+        use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
         if pids.is_empty() {
             return HashMap::new();
@@ -2504,14 +2797,17 @@ impl TerminalTool {
         // Build a flat per-pid sample map and a parent→children index from the
         // full snapshot, then delegate the subtree summing to the pure helper.
         let procs = sys.processes();
-        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::with_capacity(procs.len());
+        let mut per_pid: HashMap<u32, (u64, u64, bool)> = HashMap::with_capacity(procs.len());
         let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
         for (pid, proc) in procs {
             let pid_u32 = pid.as_u32();
             let cpu_ms = proc.accumulated_cpu_time();
             let du = proc.disk_usage();
             let io_bytes = du.total_read_bytes.saturating_add(du.total_written_bytes);
-            per_pid.insert(pid_u32, (cpu_ms, io_bytes));
+            per_pid.insert(
+                pid_u32,
+                (cpu_ms, io_bytes, proc.status() == ProcessStatus::Run),
+            );
             if let Some(parent) = proc.parent() {
                 children_of
                     .entry(parent.as_u32())
@@ -2523,9 +2819,9 @@ impl TerminalTool {
         sum_subtree_resources(pids, &children_of, &per_pid)
     }
 
-    /// Stall + max-runtime variant. `stall_threshold`: reap after no
-    /// progress (CPU/IO/output) for this long. `max_runtime`: reap regardless of
-    /// progress once total runtime reaches this (busy-loop / too-slow backstop).
+    /// Stall + max-runtime variant. `stall_threshold` is the configurable base;
+    /// the launch-time contract selects the effective no-progress window and
+    /// confirmation count. `max_runtime` remains hard only for generic work.
     pub async fn reap_stale_background_processes_with(
         &self,
         stall_threshold: Duration,
@@ -2542,7 +2838,12 @@ impl TerminalTool {
             last_progress_at: Instant,
             last_cpu_ms: u64,
             last_io_bytes: u64,
+            last_tree_fingerprint: u64,
+            idle_confirmations: u8,
+            progress_contract: BackgroundProgressContract,
             started_at: Instant,
+            session_id: String,
+            owner_task_id: Option<String>,
         }
         let candidates: Vec<Candidate> = {
             let running = self.running.lock().await;
@@ -2557,7 +2858,12 @@ impl TerminalTool {
                     last_progress_at: p.last_progress_at,
                     last_cpu_ms: p.last_cpu_ms,
                     last_io_bytes: p.last_io_bytes,
+                    last_tree_fingerprint: p.last_tree_fingerprint,
+                    idle_confirmations: p.idle_confirmations,
+                    progress_contract: p.progress_contract,
                     started_at: p.started_at,
+                    session_id: p.notify_session_id.clone(),
+                    owner_task_id: p.owner_task_id.clone(),
                 })
                 .collect()
         };
@@ -2566,39 +2872,54 @@ impl TerminalTool {
         }
 
         // Phase 2: sample resources + output (no `running` lock held). A process
-        // is "making progress" if ANY of CPU time / disk I/O / output grew; that
-        // refreshes its progress clock. A process making no progress past the
-        // stall threshold — OR any process whose total runtime hit max_runtime —
-        // is reaped (max-runtime is the busy-loop / too-slow backstop).
+        // is "making progress" if CPU time, disk I/O, output, or its process
+        // tree changed; that refreshes its progress clock. Threshold crossings
+        // are confirmed on another conclusive sweep before termination. Generic
+        // commands additionally retain the absolute max-runtime leak backstop.
         let pids: Vec<u32> = candidates.iter().map(|c| c.pid).collect();
         let samples = Self::sample_process_resources(&pids);
 
-        // Updates for processes that made progress: (pid, output_len, cpu_ms, io_bytes).
-        let mut to_grow: Vec<(u32, usize, u64, u64)> = Vec::new();
+        // Bookkeeping updates carry the latest conclusive sample even when it
+        // was flat. This makes process-tree transitions comparable on the next
+        // sweep without pretending that a baseline refresh is semantic progress.
+        let mut to_update: Vec<(u32, usize, Option<ProcessResourceSample>, bool, u8)> = Vec::new();
         let mut to_reap: Vec<(u32, ReapReason)> = Vec::new();
+        let mut watchdog_events: Vec<(String, String, DecisionPointData)> = Vec::new();
         for c in candidates {
             let len = c.stdout_buf.lock().await.len() + c.stderr_buf.lock().await.len();
-            // Missing sample (process gone / OS denied) → carry previous values
-            // forward so a missing CPU/IO signal contributes nothing and we fall
-            // back to output-based progress only.
-            let (cpu_ms, io_bytes) = samples
-                .get(&c.pid)
-                .copied()
-                .unwrap_or((c.last_cpu_ms, c.last_io_bytes));
+            let sampled = samples.get(&c.pid).copied();
+            // Missing sample (process gone / OS denied) is INCONCLUSIVE, not
+            // evidence of a stall. Output growth can still prove progress, but
+            // a local process is never stall-killed solely because OS sampling
+            // disappeared.
+            let sample = sampled.unwrap_or(ProcessResourceSample {
+                cpu_ms: c.last_cpu_ms,
+                io_bytes: c.last_io_bytes,
+                tree_fingerprint: c.last_tree_fingerprint,
+                process_count: 0,
+                runnable_count: 0,
+            });
 
             // A local ssh/docker client is only a transport process; its host
             // CPU/IO says nothing about remote work. Treat a live remote
             // transport as progress for the stall policy while retaining the
             // absolute max-runtime backstop.
             let made_progress = self.backend.kind() != BackendKind::Local
-                || process_made_progress(
-                    c.last_cpu_ms,
-                    cpu_ms,
-                    c.last_io_bytes,
-                    io_bytes,
-                    c.last_progress_len,
-                    len,
-                );
+                || len > c.last_progress_len
+                || sampled.is_some_and(|sample| {
+                    process_made_progress(
+                        ProcessResourceSample {
+                            cpu_ms: c.last_cpu_ms,
+                            io_bytes: c.last_io_bytes,
+                            tree_fingerprint: c.last_tree_fingerprint,
+                            process_count: 0,
+                            runnable_count: 0,
+                        },
+                        c.last_progress_len,
+                        len,
+                        sample,
+                    )
+                });
 
             let total_runtime = c.started_at.elapsed();
             let no_progress_elapsed = if made_progress {
@@ -2606,38 +2927,133 @@ impl TerminalTool {
             } else {
                 c.last_progress_at.elapsed()
             };
+            let effective_stall = c
+                .progress_contract
+                .effective_stall_threshold(stall_threshold);
 
             if should_idle_reap(
                 true,
                 false,
                 no_progress_elapsed,
                 total_runtime,
-                stall_threshold,
+                effective_stall,
                 max_runtime,
+                c.progress_contract.hard_max_runtime,
             ) {
-                let reason =
-                    if total_runtime >= max_runtime && no_progress_elapsed < stall_threshold {
-                        ReapReason::MaxRuntime
-                    } else {
-                        ReapReason::Stalled
-                    };
-                to_reap.push((c.pid, reason));
-            } else if made_progress {
-                // Refresh bookkeeping for a genuinely-working process.
-                to_grow.push((c.pid, len, cpu_ms, io_bytes));
+                let reason = if c.progress_contract.hard_max_runtime
+                    && total_runtime >= max_runtime
+                    && no_progress_elapsed < effective_stall
+                {
+                    ReapReason::MaxRuntime
+                } else {
+                    ReapReason::Stalled
+                };
+
+                // A stall requires a real OS sample plus another independent
+                // threshold-crossing sweep. Max-runtime remains an immediate
+                // leak backstop only for the generic contract.
+                let conclusive_stall = reason != ReapReason::Stalled || sampled.is_some();
+                let confirmations = if reason == ReapReason::Stalled && conclusive_stall {
+                    c.idle_confirmations.saturating_add(1)
+                } else {
+                    0
+                };
+                let confirmed = stall_threshold.is_zero()
+                    || reason == ReapReason::MaxRuntime
+                    || (conclusive_stall
+                        && confirmations >= c.progress_contract.idle_confirmations_required);
+                if confirmed {
+                    to_reap.push((c.pid, reason));
+                }
+                to_update.push((c.pid, len, sampled, made_progress, confirmations));
+
+                if conclusive_stall {
+                    if let Some(task_id) = c.owner_task_id.as_deref() {
+                        watchdog_events.push((
+                            c.session_id.clone(),
+                            task_id.to_string(),
+                            DecisionPointData {
+                                decision_type: DecisionType::ExecutionFailureClassification,
+                                task_id: task_id.to_string(),
+                                iteration: 0,
+                                severity: DiagnosticSeverity::Warning,
+                                code: Some("background_progress_watchdog".to_string()),
+                                metadata: json!({
+                                    "pid": c.pid,
+                                    "action": if confirmed { "reap" } else { "confirm_idle" },
+                                    "reason": reason.as_str(),
+                                    "workload": c.progress_contract.workload.as_str(),
+                                    "stall_threshold_ms": effective_stall.as_millis().min(u64::MAX as u128) as u64,
+                                    "no_progress_ms": no_progress_elapsed.as_millis().min(u64::MAX as u128) as u64,
+                                    "runtime_ms": total_runtime.as_millis().min(u64::MAX as u128) as u64,
+                                    "idle_confirmation": confirmations,
+                                    "idle_confirmations_required": c.progress_contract.idle_confirmations_required,
+                                    "sample_present": sampled.is_some(),
+                                    "cpu_ms_previous": c.last_cpu_ms,
+                                    "cpu_ms_current": sample.cpu_ms,
+                                    "io_bytes_previous": c.last_io_bytes,
+                                    "io_bytes_current": sample.io_bytes,
+                                    "output_bytes_previous": c.last_progress_len,
+                                    "output_bytes_current": len,
+                                    "process_count": sample.process_count,
+                                    "runnable_count": sample.runnable_count,
+                                    "tree_changed": c.last_tree_fingerprint != 0
+                                        && sample.tree_fingerprint != c.last_tree_fingerprint,
+                                }),
+                                summary: if confirmed {
+                                    format!(
+                                        "Background {} command confirmed {} after {} idle samples",
+                                        c.progress_contract.workload.as_str(),
+                                        reason.as_str(),
+                                        confirmations
+                                    )
+                                } else {
+                                    format!(
+                                        "Background {} command suspected idle; awaiting confirmation",
+                                        c.progress_contract.workload.as_str()
+                                    )
+                                },
+                            },
+                        ));
+                    }
+                }
+            } else {
+                to_update.push((c.pid, len, sampled, made_progress, 0));
             }
         }
 
-        // Phase 3a: refresh progress bookkeeping for processes that advanced.
-        if !to_grow.is_empty() {
+        // Persist watchdog decisions before termination so a crash during kill
+        // cannot erase the evidence used to classify the process as stalled.
+        if let Some(store) = &self.event_store {
+            for (session_id, task_id, event) in watchdog_events {
+                if session_id.is_empty() {
+                    continue;
+                }
+                let emitter = crate::events::EventEmitter::new(store.clone(), session_id)
+                    .with_task_id(task_id);
+                if let Err(error) = emitter.emit(EventType::DecisionPoint, event).await {
+                    warn!(%error, "Failed to persist background watchdog sample");
+                }
+            }
+        }
+
+        // Phase 3a: refresh sample baselines, confirmation count, and—only for
+        // genuine progress—the semantic progress clock.
+        if !to_update.is_empty() {
             let now = Instant::now();
             let mut running = self.running.lock().await;
-            for (pid, len, cpu_ms, io_bytes) in to_grow {
+            for (pid, len, sample, made_progress, idle_confirmations) in to_update {
                 if let Some(proc) = running.get_mut(&pid) {
-                    proc.last_progress_len = len;
-                    proc.last_cpu_ms = cpu_ms;
-                    proc.last_io_bytes = io_bytes;
-                    proc.last_progress_at = now;
+                    if made_progress {
+                        proc.last_progress_len = len;
+                        proc.last_progress_at = now;
+                    }
+                    if let Some(sample) = sample {
+                        proc.last_cpu_ms = sample.cpu_ms;
+                        proc.last_io_bytes = sample.io_bytes;
+                        proc.last_tree_fingerprint = sample.tree_fingerprint;
+                    }
+                    proc.idle_confirmations = if made_progress { 0 } else { idle_confirmations };
                 }
             }
         }
@@ -2983,6 +3399,16 @@ impl TerminalTool {
                 let owner_task_id = task_id
                     .map(str::to_string)
                     .filter(|id| !id.trim().is_empty());
+                let progress_contract = progress_contract_for_command(command);
+
+                info!(
+                    pid,
+                    workload = progress_contract.workload.as_str(),
+                    stall_multiplier = progress_contract.stall_multiplier,
+                    idle_confirmations_required = progress_contract.idle_confirmations_required,
+                    hard_max_runtime = progress_contract.hard_max_runtime,
+                    "Attached background progress contract"
+                );
 
                 let proc = RunningProcess {
                     command: command.to_string(),
@@ -3002,6 +3428,9 @@ impl TerminalTool {
                     last_progress_at: Instant::now(),
                     last_cpu_ms: 0,
                     last_io_bytes: 0,
+                    last_tree_fingerprint: 0,
+                    idle_confirmations: 0,
+                    progress_contract,
                 };
 
                 self.running.lock().await.insert(pid, proc);
@@ -3082,6 +3511,8 @@ impl TerminalTool {
                             // Capture completion output for agent re-engagement
                             #[allow(unused_assignments)]
                             let mut completion_output_for_agent: Option<String> = None;
+                            let completion_unchecked_requirements: Vec<String>;
+                            let mut completion_status_surface_id: Option<String> = None;
                             let mut ping_interval = tokio::time::interval(Duration::from_secs(
                                 BACKGROUND_PROGRESS_INTERVAL_SECS,
                             ));
@@ -3148,6 +3579,31 @@ impl TerminalTool {
                                         let output = truncate_with_note(&with_notice, 2500);
                                         let elapsed_secs = started_at_for_notify.elapsed().as_secs();
 
+                                        // Task completion and process completion are different
+                                        // states. Load durable requirements before choosing the
+                                        // user-facing status or deciding whether empty stdout can
+                                        // end the interaction.
+                                        completion_unchecked_requirements = if let Some(ref pool) =
+                                            pool_for_notify
+                                        {
+                                            match crate::plans::PlanStore::new(pool.clone()).await {
+                                                Ok(ps) => match ps
+                                                    .get_incomplete_for_session(&session_for_notify)
+                                                    .await
+                                                {
+                                                    Ok(Some(plan)) => plan
+                                                        .unchecked_steps()
+                                                        .iter()
+                                                        .map(|step| step.description.clone())
+                                                        .collect(),
+                                                    _ => Vec::new(),
+                                                },
+                                                Err(_) => Vec::new(),
+                                            }
+                                        } else {
+                                            Vec::new()
+                                        };
+
                                         // Deliverable attribution: if the command produced exactly
                                         // one safe explicit output file, deliver THAT file directly
                                         // after the loop and suppress the generic "finished" ping +
@@ -3169,7 +3625,7 @@ impl TerminalTool {
                                             DeliverableAttribution::One(_) if exit_code == Some(0) => {
                                                 direct_deliverable_delivery = true;
                                                 // Defer to deterministic file delivery after the loop.
-                                                // Do NOT send the generic "✅ finished" ping and do NOT
+                                                // Do NOT send the generic process-finished ping and do NOT
                                                 // set completion_output_for_agent (no re-engagement).
                                                 info!(
                                                     pid,
@@ -3256,24 +3712,30 @@ impl TerminalTool {
                                             }
                                         }
 
-                                        // No deliverable — friendly status ping, then feed the
-                                        // output to agent re-engagement below. Mirror the
-                                        // post-loop triviality check so the ping only promises
-                                        // a follow-up answer when one will actually be composed.
-                                        let answer_follows = {
-                                            let t = output.trim();
-                                            !(t.is_empty() || t == "(no output)")
+                                        // No deliverable — show the process transition without
+                                        // claiming the user's request is done. Empty stdout is not
+                                        // evidence of task completion: when an agent is available,
+                                        // it still gets a continuation turn to close the request.
+                                        let output_trimmed = output.trim();
+                                        let output_has_value = !(output_trimmed.is_empty()
+                                            || output_trimmed == "(no output)");
+                                        let next = if !completion_unchecked_requirements.is_empty() {
+                                            BackgroundCompletionNext::ContinueRequirements
+                                        } else if agent_for_notify.is_some() || output_has_value {
+                                            BackgroundCompletionNext::PrepareResult
+                                        } else {
+                                            BackgroundCompletionNext::Nothing
                                         };
                                         let message = background_completion_ping_message(
                                             exit_code,
                                             elapsed_secs,
-                                            answer_follows,
+                                            next,
                                         );
 
                                         // Prefer editing the "⏳ Still on it —" handoff bubble
                                         // in place (one evolving status message); fall back to
                                         // the plain send/enqueue path inside the helper.
-                                        deliver_background_completion_ping(
+                                        completion_status_surface_id = deliver_background_completion_ping(
                                             hub_for_notify.as_ref(),
                                             state_for_notify.as_ref(),
                                             &session_for_notify,
@@ -3608,12 +4070,24 @@ impl TerminalTool {
                                 // be dropped here (length is not a proxy for value).
                                 let is_trivial =
                                     output_trimmed.is_empty() || output_trimmed == "(no output)";
-                                if is_trivial {
+                                let followup_expected = agent_for_notify.is_some()
+                                    || !is_trivial
+                                    || !completion_unchecked_requirements.is_empty();
+                                let mut result_delivered = false;
+                                let mut result_queued = false;
+                                let mut followup_still_working = false;
+                                if is_trivial
+                                    && agent_for_notify.is_none()
+                                    && completion_unchecked_requirements.is_empty()
+                                {
                                     info!(
                                         pid,
-                                        "Skipping agent re-engagement: trivial background command output"
+                                        "No agent or remaining requirement for empty background output"
                                     );
-                                } else if is_short_complete_output(output_trimmed) {
+                                } else if !is_trivial
+                                    && completion_unchecked_requirements.is_empty()
+                                    && is_short_complete_output(output_trimmed)
+                                {
                                     // SHORT, complete result (a `wc -l` count, a path, a
                                     // one-line status). Do NOT re-enter the full agent loop:
                                     // with small models it tends to RE-RUN the command,
@@ -3673,6 +4147,7 @@ impl TerminalTool {
                                         )
                                     };
                                     if !delivery_allowed {
+                                        result_delivered = true;
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
@@ -3692,6 +4167,7 @@ impl TerminalTool {
                                                 );
                                             } else {
                                                 delivered = true;
+                                                result_delivered = true;
                                             }
                                         }
                                         if !delivered {
@@ -3702,16 +4178,17 @@ impl TerminalTool {
                                                     "progress",
                                                     &message,
                                                 );
-                                                if let Err(e) =
-                                                    state.enqueue_notification(&entry).await
-                                                {
-                                                    warn!(
-                                                        pid,
-                                                        error = %e,
-                                                        session_id = %session_for_notify,
-                                                        goal_id = %goal_id_for_notify,
-                                                        "Failed to enqueue short background command output"
-                                                    );
+                                                match state.enqueue_notification(&entry).await {
+                                                    Ok(()) => result_queued = true,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            pid,
+                                                            error = %e,
+                                                            session_id = %session_for_notify,
+                                                            goal_id = %goal_id_for_notify,
+                                                            "Failed to enqueue short background command output"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -3747,33 +4224,10 @@ impl TerminalTool {
                                         // Skip the agent path entirely — fall through to the
                                         // raw-output fallback delivery below.
                                     } else if let Some(ref agent) = agent_for_notify {
-                                        // Load the durable checklist's still-unchecked items so the
-                                        // re-engagement names the exact deferred requirements (e.g.
-                                        // "send the latency file") instead of a generic hint.
-                                        let unchecked: Vec<String> = if let Some(ref pool) =
-                                            pool_for_notify
-                                        {
-                                            match crate::plans::PlanStore::new(pool.clone()).await {
-                                                Ok(ps) => match ps
-                                                    .get_incomplete_for_session(&session_for_notify)
-                                                    .await
-                                                {
-                                                    Ok(Some(plan)) => plan
-                                                        .unchecked_steps()
-                                                        .iter()
-                                                        .map(|s| s.description.clone())
-                                                        .collect(),
-                                                    _ => Vec::new(),
-                                                },
-                                                Err(_) => Vec::new(),
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        };
                                         let followup = build_background_reengagement_followup(
                                             &command_summary,
                                             &output,
-                                            &unchecked,
+                                            &completion_unchecked_requirements,
                                         );
                                         // Serialize with any other in-flight re-engagement:
                                         // completions must process one at a time, not as
@@ -3805,6 +4259,10 @@ impl TerminalTool {
                                                 // never leak scaffolding regardless of upstream changes.
                                                 let reply =
                                                     crate::tools::sanitize::sanitize_user_facing_reply(
+                                                        &reply,
+                                                    );
+                                                followup_still_working =
+                                                    crate::agent::is_friendly_background_handoff(
                                                         &reply,
                                                     );
                                                 // Send the agent's analysis to the user
@@ -3857,10 +4315,16 @@ impl TerminalTool {
                                     // send the raw output (wrapped in a code block) rather than
                                     // leaving the user with only a "completed" ping and no content.
                                     if !formatted_delivered {
-                                        let fallback = format!(
-                                            "Output from `{}`:\n\n```\n{}\n```",
-                                            command_summary, output
-                                        );
+                                        let fallback = if is_trivial {
+                                            format_background_continuation_failure(
+                                                &completion_unchecked_requirements,
+                                            )
+                                        } else {
+                                            format!(
+                                                "Output from `{}`:\n\n```\n{}\n```",
+                                                command_summary, output
+                                            )
+                                        };
                                         let delivery_allowed = {
                                             let mut log = recent_background_deliveries_for_notify
                                                 .lock()
@@ -3873,6 +4337,7 @@ impl TerminalTool {
                                             )
                                         };
                                         if !delivery_allowed {
+                                            formatted_delivered = true;
                                             info!(
                                                 pid,
                                                 session_id = %session_for_notify,
@@ -3893,6 +4358,7 @@ impl TerminalTool {
                                                     );
                                                 } else {
                                                     delivered = true;
+                                                    formatted_delivered = true;
                                                 }
                                             }
                                             if !delivered {
@@ -3904,21 +4370,42 @@ impl TerminalTool {
                                                             "progress",
                                                             &fallback,
                                                         );
-                                                    if let Err(e) =
-                                                        state.enqueue_notification(&entry).await
-                                                    {
-                                                        warn!(
-                                                            pid,
-                                                            error = %e,
-                                                            session_id = %session_for_notify,
-                                                            goal_id = %goal_id_for_notify,
-                                                            "Failed to enqueue fallback background command output"
-                                                        );
+                                                    match state.enqueue_notification(&entry).await {
+                                                        Ok(()) => result_queued = true,
+                                                        Err(e) => {
+                                                            warn!(
+                                                                pid,
+                                                                error = %e,
+                                                                session_id = %session_for_notify,
+                                                                goal_id = %goal_id_for_notify,
+                                                                "Failed to enqueue fallback background command output"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+                                    result_delivered = formatted_delivered;
+                                }
+
+                                if followup_expected {
+                                    let outcome = if followup_still_working && result_delivered {
+                                        BackgroundSurfaceOutcome::StillWorking
+                                    } else if result_delivered {
+                                        BackgroundSurfaceOutcome::Delivered
+                                    } else if result_queued {
+                                        BackgroundSurfaceOutcome::Queued
+                                    } else {
+                                        BackgroundSurfaceOutcome::DeliveryFailed
+                                    };
+                                    finalize_background_completion_surface(
+                                        hub_for_notify.as_ref(),
+                                        &session_for_notify,
+                                        completion_status_surface_id.as_deref(),
+                                        outcome,
+                                    )
+                                    .await;
                                 }
                             }
                             // Bug C fix: remove the finished process from `running`
@@ -4892,6 +5379,22 @@ mod tests {
     }
 
     #[test]
+    fn test_reengagement_followup_keeps_empty_output_requirements_alive() {
+        let followup = build_background_reengagement_followup(
+            "synthetic-background-step",
+            "(no output)",
+            &[
+                "wait for the replacement run".to_string(),
+                "report the publication receipt".to_string(),
+            ],
+        );
+        assert!(followup.contains("(no output)"));
+        assert!(followup.contains("wait for the replacement run"));
+        assert!(followup.contains("report the publication receipt"));
+        assert!(followup.contains("continue where you left off"));
+    }
+
+    #[test]
     fn test_reengagement_allowed_caps_per_session_window() {
         let mut log = HashMap::new();
         let t0 = Instant::now();
@@ -5334,29 +5837,57 @@ mod tests {
     }
 
     #[test]
-    fn completion_ping_promises_followup_only_when_answer_is_coming() {
-        // Live UX repro (2026-07-02): user got "✅ Done — finished in 1m 3s."
-        // then 2 minutes of silence while the re-engagement turn composed the
-        // real answer. The ping must say the answer is still coming — but
-        // only when re-engagement will actually follow (non-trivial output).
-        let with_followup = background_completion_ping_message(Some(0), 63, true);
-        assert!(with_followup.contains("Done — finished in 1m 3s"));
-        assert!(
-            with_followup.contains("Writing up the result now"),
-            "got: {with_followup}"
+    fn completion_ping_distinguishes_process_exit_from_task_completion() {
+        // Live UX repro: a process-exit ping said "✅ Done" while the agent was
+        // still preparing the requested result. Intermediate states must be
+        // explicitly nonterminal and say what happens next.
+        let preparing = background_completion_ping_message(
+            Some(0),
+            63,
+            BackgroundCompletionNext::PrepareResult,
+        );
+        assert!(preparing.contains("Background step finished in 1m 3s"));
+        assert!(preparing.contains("Preparing your result now"));
+        assert!(!preparing.contains("Done"));
+        assert!(!preparing.contains('✅'));
+
+        let continuing = background_completion_ping_message(
+            Some(0),
+            63,
+            BackgroundCompletionNext::ContinueRequirements,
+        );
+        assert!(continuing.contains("Continuing with the remaining request now"));
+        assert!(!continuing.contains("Done"));
+
+        // With no agent, output, or outstanding requirement, report the exact
+        // terminal condition without implying that the whole request succeeded.
+        let no_followup =
+            background_completion_ping_message(Some(0), 63, BackgroundCompletionNext::Nothing);
+        assert_eq!(
+            no_followup,
+            "Background step finished in 1m 3s. It returned no output."
         );
 
-        // Trivial output → no re-engagement → no false promise.
-        let no_followup = background_completion_ping_message(Some(0), 63, false);
-        assert!(no_followup.contains("Done — finished in 1m 3s"));
-        assert!(!no_followup.contains("Writing up the result now"));
-
-        // Error case keeps its existing shape, plus the follow-up when the
-        // output will be looked at.
-        let err = background_completion_ping_message(Some(2), 40, true);
+        let err = background_completion_ping_message(
+            Some(2),
+            40,
+            BackgroundCompletionNext::PrepareResult,
+        );
         assert!(err.contains("finished with errors in 40s"));
         assert!(err.contains("(exit code 2)"));
-        assert!(err.contains("Looking at the output now"));
+        assert!(err.contains("Reviewing what happened now"));
+    }
+
+    #[test]
+    fn empty_output_continuation_failure_names_unfinished_requirements() {
+        let message = format_background_continuation_failure(&[
+            "wait for the replacement run".to_string(),
+            "send the publication receipt".to_string(),
+        ]);
+        assert!(message.contains("couldn't complete the remaining request"));
+        assert!(message.contains("wait for the replacement run"));
+        assert!(message.contains("send the publication receipt"));
+        assert!(!message.contains("pid="));
     }
 
     #[test]
@@ -5593,7 +6124,7 @@ mod tests {
                 {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Done — finished in")
+                if entry.message.contains("Background step finished in")
                     || entry.message.contains("finished with errors in")
                 {
                     saw_completion = true;
@@ -5661,7 +6192,7 @@ mod tests {
                 if entry.message.contains("Still working on it") {
                     saw_progress_ping = true;
                 }
-                if entry.message.contains("Done — finished in")
+                if entry.message.contains("Background step finished in")
                     || entry.message.contains("finished with errors in")
                 {
                     saw_completion = true;
@@ -5697,6 +6228,7 @@ mod tests {
             Duration::from_secs(200),
             stall,
             max_runtime,
+            true,
         ));
         // Exactly at the stall threshold → reap (>=).
         assert!(should_idle_reap(
@@ -5706,6 +6238,7 @@ mod tests {
             Duration::from_secs(200),
             stall,
             max_runtime,
+            true,
         ));
         // Progress recent (no_progress below stall) AND under max runtime → keep.
         assert!(!should_idle_reap(
@@ -5715,6 +6248,7 @@ mod tests {
             Duration::from_secs(200),
             stall,
             max_runtime,
+            true,
         ));
         // Busy-loop: progress recent (no_progress=0) but total runtime hit the
         // max-runtime backstop → reap.
@@ -5725,6 +6259,7 @@ mod tests {
             Duration::from_secs(1200),
             stall,
             max_runtime,
+            true,
         ));
         assert!(should_idle_reap(
             true,
@@ -5733,6 +6268,18 @@ mod tests {
             Duration::from_secs(5000),
             stall,
             max_runtime,
+            true,
+        ));
+        // Context-recognized long work treats max runtime as a soft boundary:
+        // elapsed wall time alone is not a reason to kill an active command.
+        assert!(!should_idle_reap(
+            true,
+            false,
+            no,
+            Duration::from_secs(5000),
+            stall,
+            max_runtime,
+            false,
         ));
         // Detached (dev server) → never reaped, even when long idle / long-running.
         assert!(!should_idle_reap(
@@ -5742,6 +6289,7 @@ mod tests {
             Duration::from_secs(100_000),
             stall,
             max_runtime,
+            true,
         ));
         // Not notifier-active (task-owned, no promise to deliver) → not reaped here.
         assert!(!should_idle_reap(
@@ -5751,23 +6299,115 @@ mod tests {
             Duration::from_secs(100_000),
             stall,
             max_runtime,
+            true,
         ));
     }
 
     #[test]
+    fn test_progress_contract_is_structural_and_context_aware() {
+        let broad_scan = progress_contract_for_command(
+            "du -sh /Users/synthetic/{Library,Documents,projects} 2>/dev/null",
+        );
+        assert_eq!(
+            broad_scan.workload,
+            BackgroundWorkload::FilesystemTraversal {
+                broad_or_multi_target: true
+            }
+        );
+        assert_eq!(broad_scan.stall_multiplier, 5);
+        assert!(!broad_scan.hard_max_runtime);
+
+        let bounded_scan = progress_contract_for_command("find /tmp/synthetic -type f -size +1G");
+        assert_eq!(
+            bounded_scan.workload,
+            BackgroundWorkload::FilesystemTraversal {
+                broad_or_multi_target: false
+            }
+        );
+        assert_eq!(bounded_scan.stall_multiplier, 3);
+
+        let build = progress_contract_for_command("cargo test --all-features");
+        assert_eq!(build.workload, BackgroundWorkload::BuildOrTest);
+        assert!(!build.hard_max_runtime);
+
+        let prose_only = progress_contract_for_command("printf 'find du cargo'");
+        assert_eq!(prose_only, BackgroundProgressContract::default());
+    }
+
+    #[test]
     fn test_process_made_progress_any_signal_grows() {
+        let flat = ProcessResourceSample {
+            cpu_ms: 100,
+            io_bytes: 2_000,
+            tree_fingerprint: 7,
+            process_count: 1,
+            runnable_count: 0,
+        };
+        let previous = |cpu_ms, io_bytes, tree_fingerprint| ProcessResourceSample {
+            cpu_ms,
+            io_bytes,
+            tree_fingerprint,
+            process_count: 1,
+            runnable_count: 0,
+        };
         // CPU advanced (silent busy scan statting files) → progress.
-        assert!(process_made_progress(100, 150, 0, 0, 0, 0));
+        assert!(process_made_progress(
+            previous(100, 0, 7),
+            0,
+            0,
+            ProcessResourceSample {
+                cpu_ms: 150,
+                ..flat
+            }
+        ));
         // Disk I/O advanced (silent scan reading directory entries) → progress.
-        assert!(process_made_progress(0, 0, 1_000, 2_000, 0, 0));
+        assert!(process_made_progress(
+            previous(0, 1_000, 7),
+            0,
+            0,
+            ProcessResourceSample { cpu_ms: 0, ..flat }
+        ));
         // Output grew (streaming) → progress.
-        assert!(process_made_progress(0, 0, 0, 0, 10, 25));
+        assert!(process_made_progress(previous(0, 0, 7), 10, 25, flat));
+        // Process-tree churn is additional evidence.
+        assert!(process_made_progress(
+            previous(100, 2_000, 7),
+            25,
+            25,
+            ProcessResourceSample {
+                tree_fingerprint: 8,
+                ..flat
+            }
+        ));
+        // A point-in-time runnable state is useful telemetry, but not proof of
+        // progress: macOS can report a sleeping child this way between sweeps.
+        assert!(!process_made_progress(
+            previous(100, 2_000, 7),
+            25,
+            25,
+            ProcessResourceSample {
+                runnable_count: 1,
+                ..flat
+            }
+        ));
         // Nothing advanced (truly stalled) → no progress.
-        assert!(!process_made_progress(100, 100, 2_000, 2_000, 25, 25));
+        assert!(!process_made_progress(
+            previous(100, 2_000, 7),
+            25,
+            25,
+            flat
+        ));
         // A carried-forward (equal) signal alone is not progress; any OTHER
         // advancing signal still wins.
-        assert!(!process_made_progress(100, 100, 0, 0, 0, 0));
-        assert!(process_made_progress(100, 100, 0, 0, 0, 1));
+        let zero = ProcessResourceSample {
+            cpu_ms: 100,
+            io_bytes: 0,
+            tree_fingerprint: 7,
+            process_count: 1,
+            runnable_count: 0,
+        };
+        assert!(!process_made_progress(previous(100, 0, 7), 0, 0, zero));
+        assert!(process_made_progress(previous(100, 0, 7), 0, 1, zero));
     }
 
     #[test]
@@ -5778,24 +6418,29 @@ mod tests {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         children.insert(100, vec![101]);
         children.insert(101, vec![102]);
-        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
-        per_pid.insert(100, (0, 0));
-        per_pid.insert(101, (5_000, 2_000_000));
-        per_pid.insert(102, (10, 50));
+        let mut per_pid: HashMap<u32, (u64, u64, bool)> = HashMap::new();
+        per_pid.insert(100, (0, 0, false));
+        per_pid.insert(101, (5_000, 2_000_000, true));
+        per_pid.insert(102, (10, 50, false));
 
         let out = sum_subtree_resources(&[100], &children, &per_pid);
-        assert_eq!(out.get(&100), Some(&(5_010, 2_000_050)));
+        let sample = out.get(&100).expect("root sample");
+        assert_eq!(sample.cpu_ms, 5_010);
+        assert_eq!(sample.io_bytes, 2_000_050);
+        assert_eq!(sample.process_count, 3);
+        assert_eq!(sample.runnable_count, 1);
     }
 
     #[test]
     fn test_sum_subtree_resources_isolated_root() {
         // A root with no children sums to just its own values.
         let children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
-        per_pid.insert(42, (123, 456));
+        let mut per_pid: HashMap<u32, (u64, u64, bool)> = HashMap::new();
+        per_pid.insert(42, (123, 456, false));
 
         let out = sum_subtree_resources(&[42], &children, &per_pid);
-        assert_eq!(out.get(&42), Some(&(123, 456)));
+        let sample = out.get(&42).expect("root sample");
+        assert_eq!((sample.cpu_ms, sample.io_bytes), (123, 456));
     }
 
     #[test]
@@ -5806,12 +6451,13 @@ mod tests {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         children.insert(100, vec![101]);
         children.insert(101, vec![100]); // cycle back to root
-        let mut per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
-        per_pid.insert(100, (1, 2));
-        per_pid.insert(101, (3, 4));
+        let mut per_pid: HashMap<u32, (u64, u64, bool)> = HashMap::new();
+        per_pid.insert(100, (1, 2, false));
+        per_pid.insert(101, (3, 4, false));
 
         let out = sum_subtree_resources(&[100], &children, &per_pid);
-        assert_eq!(out.get(&100), Some(&(4, 6)));
+        let sample = out.get(&100).expect("root sample");
+        assert_eq!((sample.cpu_ms, sample.io_bytes), (4, 6));
     }
 
     #[test]
@@ -5820,7 +6466,7 @@ mod tests {
         // lookup) contributes nothing → no map entry. The caller carries
         // forward the previous sample, so an absent entry is safe.
         let children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let per_pid: HashMap<u32, (u64, u64)> = HashMap::new();
+        let per_pid: HashMap<u32, (u64, u64, bool)> = HashMap::new();
 
         let out = sum_subtree_resources(&[999], &children, &per_pid);
         assert_eq!(out.get(&999), None);

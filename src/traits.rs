@@ -48,7 +48,7 @@ pub use mandates::{
     MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
     MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
     MandateRunProofCounts, MandateStatus, MandateStrategySnapshot, MandateSuspension,
-    MandateSuspensionKind, MandateTerminationKind,
+    MandateSuspensionKind, MandateTerminationKind, SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[allow(unused_imports)]
 pub use memory::{

@@ -431,177 +431,12 @@ fn extract_target_preview(arguments: &str) -> Option<String> {
     None
 }
 
-/// Normalize a user reply for affirmation matching: trim, lowercase, and strip
-/// surrounding punctuation (preserving interior apostrophes for contractions).
-fn normalize_affirmation_text(text: &str) -> String {
-    text.trim()
-        .trim_matches(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
-        .to_ascii_lowercase()
-}
-
-/// True for short, unambiguous affirmative/approval replies (e.g. "yes",
-/// "go ahead", "try that"). A bare affirmation carries no action signal by
-/// itself — its intent lives in the proposal the assistant just made.
-fn is_short_affirmation_or_approval(text: &str) -> bool {
-    let normalized = normalize_affirmation_text(text);
-    if normalized.is_empty() {
-        return false;
-    }
-    // Questions are never approvals.
-    if normalized.contains('?') {
-        return false;
-    }
-    // Short replies only: a long sentence is doing more than approving.
-    if normalized.split_whitespace().count() > 6 {
-        return false;
-    }
-    // Explicit refusal short-circuits.
-    if contains_keyword_as_words(&normalized, "no")
-        || contains_keyword_as_words(&normalized, "don't")
-        || contains_keyword_as_words(&normalized, "stop")
-    {
-        return false;
-    }
-
-    const SINGLE_WORD_AFFIRMATIONS: &[&str] = &[
-        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "proceed", "sgtm", "please",
-    ];
-    if SINGLE_WORD_AFFIRMATIONS
-        .iter()
-        .any(|w| contains_keyword_as_words(&normalized, w))
-    {
-        return true;
-    }
-
-    const APPROVAL_PHRASES: &[&str] = &[
-        "go ahead",
-        "do it",
-        "please do",
-        "please proceed",
-        "try that",
-        "try it",
-        "let's do it",
-        "lets do it",
-        "sounds good",
-        "go for it",
-        "yes please",
-        "that works",
-    ];
-    APPROVAL_PHRASES
-        .iter()
-        .any(|phrase| contains_keyword_as_words(&normalized, phrase))
-}
-
-/// Inspect the most recent assistant-role message in `recent_messages` and
-/// return true if it proposed/offered to do something the user could approve.
-fn assistant_proposed_action(recent_messages: &[Value]) -> bool {
-    let Some(content) = recent_messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .and_then(|m| m.get("content").and_then(Value::as_str))
-    else {
-        return false;
-    };
-    let lower = content.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    const PROPOSAL_PHRASES: &[&str] = &[
-        "would you like me to",
-        "want me to",
-        "do you want me to",
-        "shall i",
-        "should i",
-        "would you like",
-        "i can run",
-        "i could run",
-        "let me know if you'd like",
-        "want me to run",
-        "like me to",
-    ];
-    if PROPOSAL_PHRASES.iter().any(|p| lower.contains(p)) {
-        return true;
-    }
-
-    // Fallback: a question that also references a concrete action.
-    if lower.ends_with('?') {
-        const ACTION_WORDS: &[&str] = &[
-            "run", "extract", "create", "generate", "build", "fetch", "script", "execute", "try",
-        ];
-        if ACTION_WORDS
-            .iter()
-            .any(|w| contains_keyword_as_words(&lower, w))
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// True when the current turn is a short approval of an action the assistant
-/// proposed in its prior turn. Requires BOTH the affirmation and a real prior
-/// proposal so genuine text-only turns are unaffected.
-fn turn_is_approval_of_prior_proposal(turn_context: &TurnContext) -> bool {
-    is_short_affirmation_or_approval(&turn_context.goal_user_text)
-        && assistant_proposed_action(&turn_context.recent_messages)
-}
-
-/// When the turn is a short approval of the assistant's own prior proposal,
-/// return that proposal text so the loop can anchor execution to it.
-/// Without the anchor, small models drift into re-planning ("Yes, read the
-/// Right one" → six fresh searches and no read).
-pub(in crate::agent) fn approved_proposal_text(turn_context: &TurnContext) -> Option<String> {
-    if !turn_is_approval_of_prior_proposal(turn_context) {
-        return None;
-    }
-    turn_context
-        .recent_messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .and_then(|m| m.get("content").and_then(Value::as_str))
-        .map(|content| crate::utils::truncate_str(content.trim(), 600))
-}
-
-/// A read-only lookup turn: the user asked a question, so a tool the model
-/// reaches for is almost certainly to *observe* state, not to mutate it.
-fn turn_is_interrogative_lookup(turn_context: &TurnContext) -> bool {
-    let t = turn_context.goal_user_text.trim().to_ascii_lowercase();
-    if t.is_empty() {
-        return false;
-    }
-    t.ends_with('?')
-        || [
-            "how many ",
-            "how much ",
-            "who ",
-            "which ",
-            "list ",
-            "what are ",
-            "are there ",
-            "is there ",
-            "do i have ",
-            "do we have ",
-            "any ",
-        ]
-        .iter()
-        .any(|prefix| t.starts_with(prefix))
-}
-
 /// Whether the plain-text redirect should spare this blocked tool. Pure-read
 /// tools never irreversibly mutate, so blocking them only forces the model to
-/// fabricate an answer instead of looking it up — always exempt. `terminal`
-/// can also mutate, so it is exempt when the turn is an interrogative lookup
-/// OR the command itself classifies as observation-only (find/ls/grep/...);
-/// destructive commands remain gated by command-risk approval downstream.
-fn plain_text_redirect_exempts_lookup(
-    tool_name: &str,
-    arguments: &str,
-    turn_context: &TurnContext,
-) -> bool {
+/// fabricate an answer instead of looking it up — always exempt. Terminal
+/// calls are exempt only when their typed command semantics are observation
+/// only; the user's wording never changes this authority decision.
+fn plain_text_redirect_exempts_lookup(tool_name: &str, arguments: &str) -> bool {
     const PURE_READ_TOOLS: &[&str] = &[
         "read_file",
         "search_files",
@@ -615,7 +450,7 @@ fn plain_text_redirect_exempts_lookup(
     if !matches!(tool_name, "terminal" | "run_command") {
         return false;
     }
-    turn_is_interrogative_lookup(turn_context) || terminal_command_is_read_only(arguments)
+    terminal_command_is_read_only(arguments)
 }
 
 /// True when a terminal call's command classifies as pure observation
@@ -632,24 +467,9 @@ fn terminal_command_is_read_only(arguments: &str) -> bool {
 }
 
 fn turn_prefers_plain_text_completion(turn_context: &TurnContext) -> bool {
-    // A bare affirmation ("yes", "try that") carries no action signal by
-    // itself — its intent is the proposal the assistant just made. When the
-    // current turn approves a prior proposal, tools must stay allowed so the
-    // model can actually carry out the approved action.
-    if turn_is_approval_of_prior_proposal(turn_context) {
-        return false;
-    }
-    if turn_context.completion_contract.forbids_mutation {
-        return true;
-    }
-    // Absence of an inferred mutation/observation is not evidence that a tool
-    // call is drift. Only an explicit response-only request may arm this
-    // redirect. Scoped prohibitions are enforced per action below and must not
-    // disable unrelated work.
-    let lower = turn_context.goal_user_text.trim().to_ascii_lowercase();
-    ["draft only", "answer only", "explain only"]
-        .iter()
-        .any(|phrase| contains_keyword_as_words(&lower, phrase))
+    // The semantic completion contract is the sole source of truth. Raw words
+    // in a user turn never directly arm or disarm tool execution.
+    turn_context.completion_contract.forbids_mutation
 }
 
 /// The text-only drift redirect protects a plain-text turn from drifting
@@ -1196,7 +1016,7 @@ pub(super) async fn run_tool_prelude_phase(
             .tool_calls
             .iter()
             .filter(|tc| tool_call_is_side_effecting(agent, tc, available_capabilities))
-            .all(|tc| plain_text_redirect_exempts_lookup(&tc.name, &tc.arguments, turn_context));
+            .all(|tc| plain_text_redirect_exempts_lookup(&tc.name, &tc.arguments));
         // Child sessions (spawned TaskLead/Executor) exist to execute actions —
         // never redirect them to plain-text mode. `sub-` is the legacy prefix
         // kept for in-flight tasks; new sessions use `specialist:`.
@@ -2126,35 +1946,6 @@ mod tests {
     }
 
     #[test]
-    fn approved_proposal_text_returns_the_proposal_on_short_approval() {
-        // "Would you like me to read X?" → "Yes, read the Right one" must
-        // anchor the turn to the proposal so the model executes it instead
-        // of drifting into re-searching.
-        let turn = turn_with(
-            "Yes, read the Right one",
-            vec![assistant_proposal_msg()],
-            false,
-            false,
-        );
-        let proposal = super::approved_proposal_text(&turn).expect("approval should anchor");
-        assert!(proposal.contains("Would you like me to"));
-    }
-
-    #[test]
-    fn approved_proposal_text_ignores_non_approval_turns() {
-        let question = turn_with(
-            "what's the weather like?",
-            vec![assistant_proposal_msg()],
-            false,
-            false,
-        );
-        assert!(super::approved_proposal_text(&question).is_none());
-
-        let no_proposal = turn_with("yes", vec![], false, false);
-        assert!(super::approved_proposal_text(&no_proposal).is_none());
-    }
-
-    #[test]
     fn inferred_text_only_request_does_not_hard_redirect_tools() {
         // A guessed answer/check classification is advisory. Only an explicit
         // user constraint such as "answer only" may hard-disable tools.
@@ -2170,49 +1961,31 @@ mod tests {
 
     #[test]
     fn read_only_terminal_command_exempt_from_plain_text_redirect() {
-        // "Can you read the file and tell me what it's about? <file>.pdf" is
-        // not interrogative by shape (doesn't end with '?'), but the model's
-        // `find` fallback is a pure lookup — blocking it forces fabrication.
-        let turn = turn_with(
-            "Can you read the file and tell me what it's about? Offer Letter (1).pdf",
-            vec![],
-            false,
-            false,
-        );
+        // The command's semantics—not the surrounding prose—make this safe.
         let arguments =
             r#"{"action": "run", "command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#;
         assert!(super::plain_text_redirect_exempts_lookup(
-            "terminal", arguments, &turn
+            "terminal", arguments
         ));
         assert!(super::plain_text_redirect_exempts_lookup(
             "run_command",
-            r#"{"command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#,
-            &turn
+            r#"{"command": "find ~ -name \"*Offer Letter*.pdf\" 2>/dev/null"}"#
         ));
     }
 
     #[test]
     fn mutating_terminal_command_still_redirected_on_text_only_turn() {
-        let turn = turn_with("write me a short poem about rust", vec![], false, false);
         let arguments = r#"{"action": "run", "command": "rm -rf ~/tmp/scratch"}"#;
         assert!(!super::plain_text_redirect_exempts_lookup(
-            "terminal", arguments, &turn
+            "terminal", arguments
         ));
     }
 
     #[test]
     fn malformed_terminal_arguments_not_exempt() {
-        let turn = turn_with("write me a short poem about rust", vec![], false, false);
         assert!(!super::plain_text_redirect_exempts_lookup(
-            "terminal", "not-json", &turn
+            "terminal", "not-json"
         ));
-    }
-
-    fn assistant_proposal_msg() -> Value {
-        json!({
-            "role": "assistant",
-            "content": "I found a PDF. Would you like me to try running a Python script to extract the text block-by-block?"
-        })
     }
 
     #[test]
@@ -2264,94 +2037,46 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_gate_allows_tools_for_approval_of_prior_proposal() {
-        // Regression case: bare affirmation in response to an assistant proposal.
-        // Even though the contract is text-only, tools must remain allowed.
-        let tc = turn_with(
-            "Yes, try that",
-            vec![
-                json!({"role": "user", "content": "Can you extract the text from this PDF?"}),
-                assistant_proposal_msg(),
-            ],
-            false,
-            false,
-        );
-        assert!(!turn_prefers_plain_text_completion(&tc));
-    }
-
-    #[test]
     fn plain_question_does_not_hard_disable_tools() {
-        let tc = turn_with(
-            "what's my name?",
-            vec![assistant_proposal_msg()],
-            false,
-            false,
-        );
+        let tc = turn_with("what's my name?", vec![], false, false);
         assert!(!turn_prefers_plain_text_completion(&tc));
     }
 
     #[test]
-    fn explicit_answer_only_constraint_hard_disables_tools() {
-        let tc = turn_with("Answer only; don't change anything.", vec![], false, false);
+    fn typed_no_mutation_contract_hard_disables_mutating_tools() {
+        let tc = TurnContext {
+            goal_user_text: "Respond without making changes.".to_string(),
+            completion_contract: CompletionContract {
+                forbids_mutation: true,
+                ..CompletionContract::default()
+            },
+            ..TurnContext::default()
+        };
         assert!(turn_prefers_plain_text_completion(&tc));
     }
 
     #[test]
-    fn lookup_exemption_spares_terminal_on_interrogative_turn() {
-        // "How many users?" reaches for terminal/drush to observe state. The
-        // plain-text redirect must spare it so the model can run the lookup
-        // instead of fabricating an answer.
-        let tc = turn_with("How many users?", vec![], false, false);
-        assert!(turn_is_interrogative_lookup(&tc));
+    fn lookup_exemption_uses_command_semantics_not_user_words() {
         assert!(plain_text_redirect_exempts_lookup(
             "terminal",
-            r#"{"action": "run", "command": "drush user:list"}"#,
-            &tc
+            r#"{"action": "run", "command": "git status --short"}"#
         ));
     }
 
     #[test]
-    fn lookup_exemption_spares_any_question_variants() {
-        for q in [
-            "Who are admin users?",
-            "Any blocked/inactive users?",
-            "Which modules are enabled?",
-            "List the active sessions",
-        ] {
-            let tc = turn_with(q, vec![], false, false);
-            assert!(
-                plain_text_redirect_exempts_lookup(
-                    "terminal",
-                    r#"{"action": "run", "command": "drush user:list"}"#,
-                    &tc
-                ),
-                "terminal lookup should be spared for: {q:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn lookup_exemption_does_not_spare_terminal_on_non_question() {
-        // A non-interrogative turn drifting into terminal is still redirected
-        // (anti-drift protection preserved). Destructive commands also remain
-        // gated by command-risk approval downstream.
-        let tc = turn_with("Write me a poem about cats.", vec![], false, false);
-        assert!(!turn_is_interrogative_lookup(&tc));
+    fn lookup_exemption_does_not_spare_mutating_terminal_command() {
         assert!(!plain_text_redirect_exempts_lookup(
             "terminal",
-            r#"{"action": "run", "command": "npm run build"}"#,
-            &tc
+            r#"{"action": "run", "command": "npm run build"}"#
         ));
     }
 
     #[test]
     fn lookup_exemption_always_spares_pure_read_tools() {
         // Pure reads never irreversibly mutate — exempt regardless of phrasing.
-        let tc = turn_with("Summarize the latest news.", vec![], false, false);
-        assert!(!turn_is_interrogative_lookup(&tc));
         for tool in ["read_file", "search_files", "web_search", "web_fetch"] {
             assert!(
-                plain_text_redirect_exempts_lookup(tool, "{}", &tc),
+                plain_text_redirect_exempts_lookup(tool, "{}"),
                 "pure-read tool should always be spared: {tool}"
             );
         }
@@ -2369,57 +2094,6 @@ mod tests {
             false,
         );
         assert!(!turn_prefers_plain_text_completion(&tc));
-    }
-
-    #[test]
-    fn is_short_affirmation_or_approval_positive() {
-        assert!(is_short_affirmation_or_approval("Yes, try that"));
-        assert!(is_short_affirmation_or_approval("go ahead"));
-        assert!(is_short_affirmation_or_approval("do it"));
-        assert!(is_short_affirmation_or_approval("sure"));
-        assert!(is_short_affirmation_or_approval("yes please"));
-        assert!(is_short_affirmation_or_approval("please proceed"));
-        assert!(is_short_affirmation_or_approval("sgtm"));
-        assert!(is_short_affirmation_or_approval("OK!"));
-    }
-
-    #[test]
-    fn is_short_affirmation_or_approval_negative() {
-        assert!(!is_short_affirmation_or_approval(""));
-        assert!(!is_short_affirmation_or_approval("what is the weather?"));
-        assert!(!is_short_affirmation_or_approval(
-            "yes can you also generate a chart and email it to my whole team tomorrow morning"
-        ));
-        assert!(!is_short_affirmation_or_approval("no don't"));
-    }
-
-    #[test]
-    fn assistant_proposed_action_positive() {
-        assert!(assistant_proposed_action(&[json!({
-            "role": "assistant",
-            "content": "Would you like me to run that for you?"
-        })]));
-        assert!(assistant_proposed_action(&[json!({
-            "role": "assistant",
-            "content": "I can run the extraction script if you want."
-        })]));
-        assert!(assistant_proposed_action(&[json!({
-            "role": "assistant",
-            "content": "Should I create the file?"
-        })]));
-    }
-
-    #[test]
-    fn assistant_proposed_action_negative() {
-        assert!(!assistant_proposed_action(&[json!({
-            "role": "assistant",
-            "content": "Cats are small domesticated mammals."
-        })]));
-        // No assistant message at all.
-        assert!(!assistant_proposed_action(&[json!({
-            "role": "user",
-            "content": "Would you like me to run that?"
-        })]));
     }
 
     fn base_plan() -> PlanState {

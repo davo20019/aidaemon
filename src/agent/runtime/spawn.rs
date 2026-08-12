@@ -781,6 +781,7 @@ impl Agent {
                  - WAIT: there is no worthwhile action now. Create no tasks; this is a successful autonomous choice.\n\
                  - ASK: owner judgment or authority is genuinely required. Include one concrete question and create no tasks.\n\
                  - STOP: a success or stop condition applies, or continuing is unsafe. Create no tasks.\n\
+                 Include termination_kind and termination_match only for STOP; omit both fields for ACT, WAIT, and ASK.\n\
                  Choose reconsider_minutes within the mandate bounds. Never use scheduled-goal trust, generic approval, or another agent to broaden this envelope.\n",
                 mandate.id,
                 mandate.version,
@@ -2640,7 +2641,8 @@ impl Agent {
              - Always check list_tasks before spawning the next executor\n\
              - If an executor reports a blocker, inspect the recorded task status/result and resolve it or adjust the plan\n\
              - Executors persist a structured handoff/result contract onto the claimed task record; do not treat vague prose alone as proof of completion\n\
-             - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\"\n\n\
+             - When finishing the goal, your final reply MUST include concrete executor results (outputs, paths, data), not just \"goal completed\"\n\
+             - Make the final reply easy to scan on a phone: lead with the outcome, use short paragraphs or bullets, and label important links, paths, verification status, and IDs. Do not repeat the goal instructions.\n\n\
              ## Pre-flight and Verification\n\
              - Keep readiness checks, the mutation, and immediate verification in the same task when \
              they concern one target and one worker can perform them safely. Put the concrete checks in \
@@ -2807,13 +2809,17 @@ impl Agent {
              - For running commands, use the execution surface actually available in your tool set.\n\
              - If `terminal` is available, keep commands simple and single-line.\n\
              - If `terminal` is available, scope commands to explicit directories and avoid scanning `target`, `node_modules`, and `.git` trees.\n\
-             - Before reporting a tool or verification blocker, exhaust safe in-scope alternatives. For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.\n\
-             - If you encounter ambiguity or a blocker you cannot resolve after those alternatives, use report_blocker immediately.\n\
-             - When using report_blocker, include outcome, reason, partial_work when applicable, exact_need, next_step, and target.\n\
+             - Treat operational failures as recovery work inside this task. After a failed command, tool, validation, or stale-state contradiction, inspect current state and choose a safe in-scope RETRY, REPAIR, SUBSTITUTE, or RECONCILE action. Then rerun the original verification. Do not ask the owner to perform recovery that your current tools and authority permit.\n\
+             - Keep recovery bounded. Before declaring recovery_exhausted, make at least two concrete recovery attempts and retain the action, outcome, and evidence for each. If newer evidence contradicts an earlier failure, treat the earlier result as stale and retry the original operation against current state.\n\
+             - Never retry a mutation whose external effect is ambiguous. Reconcile read-only when authorized; otherwise report an ambiguous_external_effect blocker for owner reconciliation.\n\
+             - For public URL reachability or text, use an HTTP-capable tool or curl when a browser is unavailable; require browser access only for visual or interactive claims.\n\
+             - Use report_blocker only for owner_input, missing_authority, external_dependency, ambiguous_external_effect, safety_boundary, or genuinely recovery_exhausted conditions.\n\
+             - When using report_blocker, include blocker_class, external_effect_state, recovery_attempts, outcome, reason, partial_work when applicable, exact_need, next_step, and target.\n\
              - Return the FULL content you produced — not a meta-description of what you did.\n\
              - NEVER return just \"I researched X\" or \"Generated a report about Y\". Return the actual content.\n\
              - Include specific outputs (file paths, data retrieved, commands run).\n\
              - If you create or write a file, include its FULL ABSOLUTE PATH in your result text.\n\
+             - Format the result for a small chat screen: lead with the outcome, use short paragraphs or bullets, and label links, paths, verification results, versions, and IDs. Do not repeat the original request or task instructions, and do not dump the execution chronology.\n\
              - Do NOT claim the overall goal is complete. You may only finish this single task.\n\
              - Do NOT spawn sub-agents."
         ));

@@ -49,9 +49,39 @@ impl ReportBlockerTool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BlockerClass {
+    OwnerInput,
+    MissingAuthority,
+    ExternalDependency,
+    AmbiguousExternalEffect,
+    SafetyBoundary,
+    RecoveryExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExternalEffectState {
+    None,
+    ConfirmedNoEffect,
+    ConfirmedEffect,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RecoveryAttempt {
+    action: String,
+    outcome: String,
+    evidence: String,
+}
+
 #[derive(Deserialize)]
 struct ReportBlockerArgs {
     reason: String,
+    blocker_class: BlockerClass,
+    external_effect_state: ExternalEffectState,
+    recovery_attempts: Vec<RecoveryAttempt>,
     #[serde(default)]
     outcome: Option<String>,
     #[serde(default)]
@@ -101,6 +131,12 @@ fn sanitize_mandate_blocker_args(args: &mut ReportBlockerArgs) {
             }
         }
     }
+    args.recovery_attempts.truncate(5);
+    for attempt in &mut args.recovery_attempts {
+        attempt.action = sanitize_mandate_text(&attempt.action, 300);
+        attempt.outcome = sanitize_mandate_text(&attempt.outcome, 300);
+        attempt.evidence = sanitize_mandate_text(&attempt.evidence, 500);
+    }
 }
 
 fn suppresses_immediate_blocker_notification(context: Option<&str>) -> bool {
@@ -110,19 +146,130 @@ fn suppresses_immediate_blocker_notification(context: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn is_self_resolvable_execution_preflight(args: &ReportBlockerArgs) -> bool {
-    let combined = format!(
-        "{} {}",
-        args.reason,
-        args.exact_need.as_deref().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
-    combined.contains("refusing an unbounded checkpoint")
-        || combined.contains("outside checkpoint scope")
-        || combined.contains("checkpoint for a command spanning multiple project roots")
-        || (combined.contains("terminal call limit")
-            && (combined.contains("workspace container")
-                || combined.contains("bounded subdirectory")))
+fn blocker_notification_excerpt(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut excerpt = compact.chars().take(max_chars).collect::<String>();
+    if let Some(last_space) = excerpt.rfind(' ') {
+        excerpt.truncate(last_space);
+    }
+    excerpt.push('…');
+    excerpt
+}
+
+fn build_blocker_notification(
+    reason: &str,
+    task_description: &str,
+    exact_need: Option<&str>,
+    task_id: &str,
+) -> String {
+    const MAX_STEP_CHARS: usize = 140;
+
+    let mut message = format!(
+        "⚠️ **Action needed**\n\n**Blocked:** {}",
+        blocker_notification_excerpt(reason, 500)
+    );
+    let compact_step = blocker_notification_excerpt(task_description, MAX_STEP_CHARS);
+    if task_description.chars().count() <= MAX_STEP_CHARS
+        && !reason
+            .to_ascii_lowercase()
+            .contains(&task_description.to_ascii_lowercase())
+    {
+        message.push_str(&format!("\n\n**Step:** {compact_step}"));
+    }
+    if let Some(need) = exact_need.map(str::trim).filter(|need| !need.is_empty()) {
+        message.push_str(&format!(
+            "\n\n**Needed:** {}",
+            blocker_notification_excerpt(need, 360)
+        ));
+    }
+    let short_id = task_id.chars().take(8).collect::<String>();
+    message.push_str(&format!(
+        "\n\n**Resume:** `/work unblock {short_id} <resolution>`"
+    ));
+    message
+}
+
+fn validate_blocker_boundary(args: &ReportBlockerArgs) -> Result<(), String> {
+    let exact_need = args
+        .exact_need
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if args.blocker_class == BlockerClass::AmbiguousExternalEffect
+        && args.external_effect_state != ExternalEffectState::Ambiguous
+    {
+        return Err(
+            "ambiguous_external_effect requires external_effect_state=ambiguous".to_string(),
+        );
+    }
+    if args.external_effect_state == ExternalEffectState::Ambiguous
+        && args.blocker_class != BlockerClass::AmbiguousExternalEffect
+    {
+        return Err(
+            "an ambiguous external effect must use blocker_class=ambiguous_external_effect"
+                .to_string(),
+        );
+    }
+
+    match args.blocker_class {
+        BlockerClass::RecoveryExhausted => {
+            if args.external_effect_state == ExternalEffectState::Ambiguous {
+                return Err(
+                    "ambiguous external effects require reconciliation, not operational retry"
+                        .to_string(),
+                );
+            }
+            if args.recovery_attempts.len() < 2 {
+                return Err(
+                    "operational recovery is not exhausted: record at least two bounded in-scope recovery attempts, then rerun the original verification"
+                        .to_string(),
+                );
+            }
+            if args.recovery_attempts.iter().any(|attempt| {
+                attempt.action.trim().is_empty()
+                    || attempt.outcome.trim().is_empty()
+                    || attempt.evidence.trim().is_empty()
+            }) {
+                return Err(
+                    "every recovery attempt must include its action, outcome, and concrete evidence"
+                        .to_string(),
+                );
+            }
+        }
+        BlockerClass::OwnerInput
+        | BlockerClass::MissingAuthority
+        | BlockerClass::ExternalDependency
+        | BlockerClass::AmbiguousExternalEffect
+        | BlockerClass::SafetyBoundary => {
+            if exact_need.is_none() {
+                return Err(
+                    "this blocker class requires exact_need to identify the unavailable external input, authority, dependency, reconciliation, or safety judgment"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if args.outcome.as_deref() == Some("needs_approval")
+        && !matches!(
+            args.blocker_class,
+            BlockerClass::OwnerInput
+                | BlockerClass::MissingAuthority
+                | BlockerClass::SafetyBoundary
+        )
+    {
+        return Err(
+            "outcome=needs_approval requires an owner_input, missing_authority, or safety_boundary blocker"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -132,58 +279,82 @@ impl Tool for ReportBlockerTool {
     }
 
     fn description(&self) -> &str {
-        "Report that you are blocked and cannot proceed. Use this instead of guessing \
-         when you encounter ambiguity, missing information, or an obstacle you cannot resolve."
+        "Report a genuine external boundary or operational failure that remains unresolved after \
+         bounded recovery. A command or tool failure alone is not a blocker: inspect current state, \
+         try safe in-scope recovery, and rerun the original verification first."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "report_blocker",
-            "description": "Report that you are blocked and cannot proceed. Use this instead of guessing when you encounter ambiguity, missing information, or an obstacle you cannot resolve.",
+            "description": "Report an external boundary or failure still unresolved after bounded recovery; never a first tool failure.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "reason": {
+                        "type": "string"
+                    },
+                    "blocker_class": {
                         "type": "string",
-                        "description": "Why you are blocked"
+                        "enum": ["owner_input", "missing_authority", "external_dependency", "ambiguous_external_effect", "safety_boundary", "recovery_exhausted"],
+                        "description": "Use recovery_exhausted only after safe attempts and renewed verification."
+                    },
+                    "external_effect_state": {
+                        "type": "string",
+                        "enum": ["none", "confirmed_no_effect", "confirmed_effect", "ambiguous"],
+                        "description": "Externally visible effect state; never retry an ambiguous effect."
+                    },
+                    "recovery_attempts": {
+                        "type": "array",
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": { "type": "string" },
+                                "outcome": { "type": "string" },
+                                "evidence": { "type": "string" }
+                            },
+                            "required": ["action", "outcome", "evidence"],
+                            "additionalProperties": false
+                        },
+                        "description": "Recovery attempts with evidence; empty only for an external boundary."
                     },
                     "outcome": {
                         "type": "string",
                         "enum": ["blocked", "partial_done_blocked", "needs_approval", "reduce_scope", "abandon"],
-                        "description": "Structured blocker outcome. Use partial_done_blocked when some work is complete, or needs_approval when a gated action requires permission."
+                        "description": "Use partial_done_blocked for partial work or needs_approval for a gated action."
                     },
                     "partial_work": {
-                        "type": "string",
-                        "description": "What you completed so far"
+                        "type": "string"
                     },
                     "exact_need": {
                         "type": "string",
-                        "description": "The exact input, approval, permission, or dependency needed to unblock the task"
+                        "description": "Exact input, authority, or dependency needed."
                     },
                     "next_step": {
                         "type": "string",
-                        "description": "What should happen immediately after the blocker is resolved"
+                        "description": "Next action after resolution."
                     },
                     "target": {
                         "type": "string",
-                        "description": "The target path, URL, system, or task artifact affected by the blocker"
+                        "description": "Affected path, URL, system, or artifact."
                     },
                     "consequence_if_not_provided": {
                         "type": "string",
-                        "description": "What will happen if the missing input or approval is not provided"
+                        "description": "Consequence if unresolved."
                     },
                     "artifacts": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Relevant artifacts or target paths already touched before the blocker"
+                        "description": "Relevant artifacts or paths."
                     },
                     "options": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Possible resolutions (if any)"
+                        "description": "Possible resolutions."
                     }
                 },
-                "required": ["reason"],
+                "required": ["reason", "blocker_class", "external_effect_state", "recovery_attempts"],
                 "additionalProperties": false
             }
         })
@@ -217,11 +388,10 @@ impl Tool for ReportBlockerTool {
             sanitize_mandate_blocker_args(&mut args);
         }
 
-        if is_self_resolvable_execution_preflight(&args) {
-            return Ok(
-                "Error: this is a recoverable internal execution preflight, not a human blocker. No task state changed and no process was started. Select one explicit bounded project directory, retry the command from there, and use another available inspection tool if needed."
-                    .to_string(),
-            );
+        if let Err(reason) = validate_blocker_boundary(&args) {
+            return Ok(format!(
+                "Error: blocker report rejected because {reason}. No task state changed. Continue the task autonomously: inspect current state, choose a safe in-scope RETRY, REPAIR, SUBSTITUTE, or RECONCILE action, and rerun the original verification before reporting a blocker."
+            ));
         }
 
         let outcome = classify_blocker_outcome(&args);
@@ -380,18 +550,12 @@ impl Tool for ReportBlockerTool {
             // so minutes of silence here cost real wall-clock time.
             if !suppress_immediate_notification {
                 if let Ok(Some(goal)) = self.state.get_goal(&task.goal_id).await {
-                    let mut message = format!(
-                        "\u{26a0}\u{fe0f} A step is blocked: {}\nStep: {}",
-                        args.reason, task.description
+                    let message = build_blocker_notification(
+                        &args.reason,
+                        &task.description,
+                        exact_need.as_deref(),
+                        &self.task_id,
                     );
-                    if let Some(need) = &exact_need {
-                        message.push_str(&format!("\nNeeded to continue: {}", need));
-                    }
-                    let short_id = self.task_id.chars().take(8).collect::<String>();
-                    message.push_str(&format!(
-                        "\nReply with /work unblock {} <resolution> after resolving it.",
-                        short_id
-                    ));
                     let entry = crate::traits::NotificationEntry::new(
                         &goal.id,
                         &goal.session_id,
@@ -485,7 +649,11 @@ mod tests {
         let result = tool
             .call(
                 &json!({
-                    "reason": "Missing API credentials"
+                    "reason": "Missing API credentials",
+                    "blocker_class": "external_dependency",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [],
+                    "exact_need": "Provide credentials for the requested API."
                 })
                 .to_string(),
             )
@@ -517,6 +685,9 @@ mod tests {
         tool.call(
             &json!({
                 "reason": "Docker daemon is not reachable",
+                "blocker_class": "external_dependency",
+                "external_effect_state": "none",
+                "recovery_attempts": [],
                 "exact_need": "Start Docker, then ask me to retry."
             })
             .to_string(),
@@ -535,10 +706,31 @@ mod tests {
         assert!(entry
             .message
             .contains("Start Docker, then ask me to retry."));
+        assert!(entry.message.starts_with("⚠️ **Action needed**"));
+        assert!(entry.message.contains("**Blocked:**"));
+        assert!(entry.message.contains("**Needed:**"));
+        assert!(entry.message.contains("**Resume:** `/work unblock"));
+    }
+
+    #[test]
+    fn blocker_notification_omits_a_long_task_prompt() {
+        let long_task = "Create and publish exactly one diary post. ".repeat(12);
+
+        let message = build_blocker_notification(
+            "The deploy command failed because a post ID was invalid.",
+            &long_task,
+            Some("Correct the repository build inconsistency."),
+            "60559600-abcd",
+        );
+
+        assert!(!message.contains("Create and publish"));
+        assert!(message.contains("**Blocked:** The deploy command failed"));
+        assert!(message.contains("**Needed:** Correct the repository"));
+        assert!(message.contains("`/work unblock 60559600 <resolution>`"));
     }
 
     #[tokio::test]
-    async fn recoverable_checkpoint_preflight_is_not_escalated_to_the_user() {
+    async fn operational_failure_without_recovery_evidence_is_not_escalated_to_the_user() {
         let (state, _goal_id, task_id) = setup_test_state().await;
         let tool = ReportBlockerTool::new(task_id.clone(), state.clone());
         let original_status = state.get_task(&task_id).await.unwrap().unwrap().status;
@@ -546,15 +738,22 @@ mod tests {
         let result = tool
             .call(
                 &json!({
-                    "reason": "The command surface refused an unbounded checkpoint at workspace container /Users/example/projects and the terminal call limit was reached.",
-                    "exact_need": "A bounded subdirectory under /Users/example/projects."
+                    "reason": "The build reports invalid frontmatter while a direct parser check reports a valid integer.",
+                    "blocker_class": "recovery_exhausted",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [{
+                        "action": "Parsed the current file directly",
+                        "outcome": "The id is a valid integer",
+                        "evidence": "Number.isInteger(data.id) returned true"
+                    }]
                 })
                 .to_string(),
             )
             .await
             .unwrap();
 
-        assert!(result.starts_with("Error: this is a recoverable internal execution preflight"));
+        assert!(result.starts_with("Error: blocker report rejected"));
+        assert!(result.contains("at least two bounded in-scope recovery attempts"));
         assert_eq!(
             state.get_task(&task_id).await.unwrap().unwrap().status,
             original_status
@@ -577,6 +776,20 @@ mod tests {
         tool.call(
             &json!({
                 "reason": "Browser verification is unavailable",
+                "blocker_class": "recovery_exhausted",
+                "external_effect_state": "none",
+                "recovery_attempts": [
+                    {
+                        "action": "Tried the browser verifier",
+                        "outcome": "Browser session was unavailable",
+                        "evidence": "Browser tool returned an unavailable-session error"
+                    },
+                    {
+                        "action": "Tried an authorized HTTP verification",
+                        "outcome": "No HTTP-capable tool was present",
+                        "evidence": "Executor tool inventory contained no HTTP client"
+                    }
+                ],
                 "exact_need": "Use another verification path."
             })
             .to_string(),
@@ -596,7 +809,9 @@ mod tests {
         let (state, _goal_id, task_id) = setup_test_state().await;
         let tool = ReportBlockerTool::new(task_id, state);
 
-        let semantics = tool.call_semantics(r#"{"reason":"OAuth authorization required"}"#);
+        let semantics = tool.call_semantics(
+            r#"{"reason":"OAuth authorization required","blocker_class":"external_dependency","external_effect_state":"none","recovery_attempts":[]}"#,
+        );
 
         assert_eq!(
             semantics.effect,
@@ -613,6 +828,9 @@ mod tests {
             .call(
                 &json!({
                     "reason": "Need clarification on API version",
+                    "blocker_class": "owner_input",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [],
                     "outcome": "partial_done_blocked",
                     "partial_work": "Set up project structure and dependencies",
                     "exact_need": "Choose between the v1 and v2 API contract.",
@@ -656,6 +874,9 @@ mod tests {
             .call(
                 &json!({
                     "reason": "Need approval to rotate the production credentials",
+                    "blocker_class": "missing_authority",
+                    "external_effect_state": "none",
+                    "recovery_attempts": [],
                     "outcome": "needs_approval",
                     "partial_work": "Validated the pending rotation script and staged the change plan",
                     "exact_need": "Owner approval to rotate the credentials in production.",

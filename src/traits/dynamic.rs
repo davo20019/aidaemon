@@ -106,6 +106,7 @@ pub struct DynamicCliAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliAgentInvocation {
     pub id: i64,
+    pub task_id: Option<String>,
     pub session_id: String,
     pub agent_name: String,
     pub prompt_summary: String,

@@ -71,17 +71,14 @@ impl Tool for HealthProbeTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "list", "delete", "pause", "resume", "run_now", "status"],
-                        "description": "Action"
+                        "enum": ["create", "list", "delete", "pause", "resume", "run_now", "status"]
                     },
                     "name": {
-                        "type": "string",
-                        "description": "Probe name"
+                        "type": "string"
                     },
                     "type": {
                         "type": "string",
-                        "enum": ["http", "port", "command", "file"],
-                        "description": "Probe type"
+                        "enum": ["http", "port", "command", "file"]
                     },
                     "target": {
                         "type": "string",
@@ -92,16 +89,13 @@ impl Tool for HealthProbeTool {
                         "description": "Natural schedule or 5-field cron"
                     },
                     "description": {
-                        "type": "string",
-                        "description": "Optional description"
+                        "type": "string"
                     },
                     "config": {
                         "type": "object",
-                        "description": "Probe config",
                         "properties": {
                             "timeout_secs": {
-                                "type": "integer",
-                                "description": "Timeout"
+                                "type": "integer"
                             },
                             "expected_status": {
                                 "type": "integer",
@@ -112,8 +106,7 @@ impl Tool for HealthProbeTool {
                                 "description": "Expected body text"
                             },
                             "method": {
-                                "type": "string",
-                                "description": "HTTP method"
+                                "type": "string"
                             },
                             "max_age_secs": {
                                 "type": "integer",
@@ -135,8 +128,7 @@ impl Tool for HealthProbeTool {
                         "description": "Latency warning threshold"
                     },
                     "id": {
-                        "type": "string",
-                        "description": "Probe ID"
+                        "type": "string"
                     },
                     "hours": {
                         "type": "integer",

@@ -917,7 +917,22 @@ pub(super) fn build_outcome_reconciliation_fallback_reply(reconciliation: &str) 
         .filter(|l| l.trim_start().starts_with("- ") || l.trim_start().starts_with("  -"))
         .map(|l| ITER_RE.replace_all(l, "").to_string())
         .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
-        .map(|l| format!("• {}", l.trim_start().trim_start_matches("- ").trim()))
+        .map(|l| {
+            let detail = l.trim_start().trim_start_matches("- ").trim();
+            let detail = match detail.rsplit_once(": ") {
+                Some((tool, error))
+                    if error.starts_with("##")
+                        || matches!(
+                            error.to_ascii_lowercase().as_str(),
+                            "error output" | "failure details" | "recovery options"
+                        ) =>
+                {
+                    format!("{tool}: No diagnostic details were captured.")
+                }
+                _ => detail.to_string(),
+            };
+            format!("• {detail}")
+        })
         .collect();
 
     if let Some(caps) = HEAD_RE.captures(reconciliation) {
@@ -1727,6 +1742,14 @@ Top-level keys: data
         assert!(!fallback.contains("attempts succeeded"));
         assert!(!fallback.contains("reconciliation"));
         assert!(fallback.contains("didn't go through") || fallback.contains("wasn't able"));
+    }
+
+    #[test]
+    fn fallback_reply_replaces_generic_error_heading_with_honest_detail_gap() {
+        let reconciliation = "[SYSTEM] External mutation attempt reconciliation: 0 of 1 attempts succeeded, 1 failed.\n  - cli_agent at iteration 3: ## Error Output";
+        let fallback = build_outcome_reconciliation_fallback_reply(reconciliation);
+        assert!(!fallback.contains("## Error Output"));
+        assert!(fallback.contains("cli_agent: No diagnostic details were captured."));
     }
 
     #[test]

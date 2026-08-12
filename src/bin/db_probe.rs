@@ -910,6 +910,10 @@ async fn main() -> anyhow::Result<()> {
         .find(|w| w[0] == "--repair-stale-cli")
         .map(|w| w[1].parse::<i64>())
         .transpose()?;
+    let retry_stalled_goal = args
+        .windows(2)
+        .find(|w| w[0] == "--retry-stalled-goal")
+        .map(|w| w[1].clone());
     let token_hours = args
         .windows(2)
         .find(|w| w[0] == "--token-hours")
@@ -964,6 +968,34 @@ async fn main() -> anyhow::Result<()> {
         .pragma("journal_mode", "WAL");
 
     let pool = SqlitePool::connect_with(opts).await?;
+
+    if let Some(goal_id) = retry_stalled_goal.as_deref() {
+        let result = sqlx::query(
+            r#"
+            UPDATE goals
+               SET status = 'active',
+                   dispatch_failures = 0,
+                   completed_at = NULL,
+                   updated_at = datetime('now')
+             WHERE id = ?
+               AND status = 'stalled'
+               AND EXISTS (
+                    SELECT 1
+                      FROM goal_schedules
+                     WHERE goal_schedules.goal_id = goals.id
+               )
+            "#,
+        )
+        .bind(goal_id)
+        .execute(&pool)
+        .await?;
+        anyhow::ensure!(
+            result.rows_affected() == 1,
+            "goal was not a stalled scheduled goal or did not exist"
+        );
+        println!("Reactivated stalled scheduled goal {goal_id}; dispatch_failures reset to 0.");
+        return Ok(());
+    }
 
     if args.iter().any(|a| a == "--dynamic-bots") {
         let rows = sqlx::query(

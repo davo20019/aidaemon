@@ -363,7 +363,9 @@ impl GoalRun {
             trigger_type: trigger_type.to_string(),
             schedule_id: None,
             root_task_id: None,
-            status: "running".to_string(),
+            // A run exists before any worker owns its root task. It becomes
+            // `running` atomically with the first successful task claim.
+            status: "pending".to_string(),
             outcome_summary: None,
             started_at: now.clone(),
             completed_at: None,
@@ -628,7 +630,8 @@ impl NotificationEntry {
             | "mandate_stopped"
             | "mandate_review_failed"
             | "mandate_reconciliation"
-            | "mandate_reconciliation_required" => "critical",
+            | "mandate_reconciliation_required"
+            | "node_monitor_alert" => "critical",
             _ => "status_update",
         };
         let expires_at = if priority == "status_update" {

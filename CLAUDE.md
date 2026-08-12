@@ -224,6 +224,34 @@ Substring matching with `.contains()` is appropriate for structural markers and
 protocol fragments such as `[tool_use:`, `[tool_call:`, `[INTENT_GATE]`, or for
 long fixed phrases where substring overlap is not a concern.
 
+### Prefer Structural Fixes Over Phrase Patches
+
+Do not fix autonomy, continuation, completion, delegation, retry, recovery, or
+routing incidents by adding the observed wording (or a list of its likely
+paraphrases) to a classifier. A report such as "the agent stopped when asked a
+short status question" is evidence of a missing lifecycle or state invariant,
+not a request to recognize that question's words.
+
+Trace the failure to the authoritative state boundary and repair the general
+contract there. Prefer persisted and typed signals such as request/task status,
+task IDs, tool receipts, outcome metadata, mutation effects, completion
+obligations, event relationships, and explicit protocol markers. For example,
+an unresolved request should retain its outstanding obligations across a
+related turn regardless of how that turn is phrased; a delegated background
+step should advance or re-enter its parent objective based on lifecycle state,
+not on notification prose.
+
+Natural-language matching is appropriate only when language is itself the
+feature (for example, an explicit command syntax) or as a broad advisory hint
+that cannot independently decide success, authority, completion, or whether an
+objective is abandoned. Making a one-off phrase list word-boundary-safe does
+not make it a structural fix.
+
+Regression tests for behavioral fixes should prove the invariant below the
+wording layer when possible: construct the typed state/contract directly,
+exercise at least one differently phrased continuation, and retain negative
+coverage for a genuinely separate request or an explicit user constraint.
+
 ## Test & Fixture Data Hygiene
 
 This project is open source and published. Never put real personal data into the

@@ -416,7 +416,7 @@ pub(super) struct LlmPhaseCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finalize_external_action_timeout_ack(
+async fn finalize_verified_external_action_ack(
     agent: &Agent,
     emitter: &crate::events::EventEmitter,
     task_id: &str,
@@ -447,7 +447,7 @@ async fn finalize_external_action_timeout_ack(
             emitter,
             task_id,
             TaskStatus::Completed,
-            TaskOutcome::Failed,
+            TaskOutcome::Succeeded,
             task_start,
             iteration,
             learning_ctx.tool_calls.len(),
@@ -457,7 +457,7 @@ async fn finalize_external_action_timeout_ack(
         .await;
 
     learning_ctx.completed_naturally = true;
-    learning_ctx.task_outcome = Some(TaskOutcome::Failed);
+    learning_ctx.task_outcome = Some(TaskOutcome::Succeeded);
     if agent.mandate_execution.is_none() {
         let learning_ctx_for_task = learning_ctx.clone();
         let state = agent.state.clone();
@@ -1051,10 +1051,40 @@ pub(super) async fn run_llm_phase(
             let _ = emitter
                 .emit(
                     EventType::Error,
-                    ErrorData::llm_error(error_message, Some(task_id.to_string()))
+                    ErrorData::llm_error(error_message.clone(), Some(task_id.to_string()))
                         .with_context("llm_call_failed"),
                 )
                 .await;
+            learning_ctx.errors.push((
+                format!("LLM call failed after verified work: {error_message}"),
+                false,
+            ));
+            if let Some(reply) = pending_external_action_ack.take() {
+                if let Some(last_error) = learning_ctx.errors.last_mut() {
+                    last_error.1 = true;
+                }
+                info!(
+                    session_id,
+                    iteration,
+                    error = %error_message,
+                    "Returning deterministic completion after post-action provider failure"
+                );
+                let reply =
+                    crate::agent::tool_execution_phase::user_facing_external_action_ack(&reply);
+                let result = finalize_verified_external_action_ack(
+                    services.agent,
+                    emitter,
+                    task_id,
+                    session_id,
+                    iteration,
+                    task_start,
+                    learning_ctx,
+                    model,
+                    reply,
+                )
+                .await;
+                return Ok(LlmPhaseOutcome::Return(result));
+            }
             return Err(error);
         }
         Err(_elapsed) => {
@@ -1127,7 +1157,7 @@ pub(super) async fn run_llm_phase(
                 // excerpts, keeps short prose results).
                 let reply =
                     crate::agent::tool_execution_phase::user_facing_external_action_ack(&reply);
-                let result = finalize_external_action_timeout_ack(
+                let result = finalize_verified_external_action_ack(
                     services.agent,
                     emitter,
                     task_id,

@@ -215,6 +215,63 @@ impl GoalTraceTool {
             out.push_str(&format!("- Task status mix: {}\n", status_str));
         }
 
+        if let Some(mandate) = self.state.get_mandate_for_goal(&goal.id).await? {
+            let today = chrono::Utc::now().date_naive().to_string();
+            let used_today = if goal.tokens_used_day == today {
+                goal.tokens_used_today.max(0)
+            } else {
+                0
+            };
+            let remaining = goal
+                .budget_daily
+                .map(|daily| daily.saturating_sub(used_today).max(0));
+            let can_fund_cycle = match (remaining, goal.budget_per_check) {
+                (Some(remaining), Some(per_cycle)) => remaining >= per_cycle.max(0),
+                _ => true,
+            };
+            let admission = if can_fund_cycle {
+                "ready".to_string()
+            } else {
+                let reset = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    chrono::Utc::now()
+                        .date_naive()
+                        .succ_opt()
+                        .expect("the next UTC date is representable")
+                        .and_hms_opt(0, 0, 0)
+                        .expect("UTC midnight is representable"),
+                    chrono::Utc,
+                );
+                format!("budget-blocked until {}", reset.to_rfc3339())
+            };
+            let latest_run = self.state.get_goal_runs(&goal.id).await?.into_iter().next();
+            let latest_decision = self
+                .state
+                .list_mandate_decisions(&mandate.id, 1)
+                .await?
+                .into_iter()
+                .next();
+            out.push_str(&format!(
+                "\n**Mandate Controller**\n\n- Mandate: {} [{} v{}]\n- Next review: {}\n- Review admission: {}\n- Token budget: {:?}/cycle, {:?}/UTC day, {} used today, {:?} remaining\n- Latest run: {}\n- Latest explicit decision: {}\n",
+                mandate.id,
+                mandate.status,
+                mandate.version,
+                mandate.next_review_at,
+                admission,
+                goal.budget_per_check,
+                goal.budget_daily,
+                used_today,
+                remaining,
+                latest_run.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |run| format!("{} ({})", run.id, run.status)
+                ),
+                latest_decision.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |decision| format!("{} ({})", decision.outcome.as_str(), decision.created_at)
+                ),
+            ));
+        }
+
         out.push_str("\n**Task Timeline**");
         for t in tasks.iter().take(max_tasks.clamp(1, 100)) {
             let activities = self.state.get_task_activities(&t.id).await?;

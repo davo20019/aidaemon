@@ -443,41 +443,6 @@ pub(crate) async fn generate_task_plan(
         success_criteria.clear();
     }
 
-    // For compound tasks (user asked to create+run, write+execute+fix, etc.),
-    // ensure the plan has enough steps. If the LLM collapsed everything into
-    // 1-2 steps, append execution/verification steps.
-    if mode.includes_step_plan() && steps.len() < 3 && looks_like_compound_task(user_text) {
-        let has_execution_step = steps.iter().any(|s| {
-            let d = s.description.to_lowercase();
-            ["run", "execute", "test"]
-                .iter()
-                .any(|word| crate::agent::contains_keyword_as_words(&d, word))
-        });
-        if !has_execution_step {
-            steps.push(TaskPlanStep {
-                description: "Run/execute the created artifact and capture output".to_string(),
-                tool_hint: Some("terminal".to_string()),
-            });
-        }
-        let has_fix_step = steps.iter().any(|s| {
-            let d = s.description.to_lowercase();
-            ["fix", "repair", "resolve"]
-                .iter()
-                .any(|word| crate::agent::contains_keyword_as_words(&d, word))
-        });
-        let lower = user_text.to_lowercase();
-        if !has_fix_step
-            && ["fix", "repair", "resolve"]
-                .iter()
-                .any(|word| crate::agent::contains_keyword_as_words(&lower, word))
-        {
-            steps.push(TaskPlanStep {
-                description: "Fix any issues found in the previous step".to_string(),
-                tool_hint: Some("edit_file".to_string()),
-            });
-        }
-    }
-
     steps.truncate(MAX_PLAN_STEPS);
 
     info!(
@@ -495,45 +460,6 @@ pub(crate) async fn generate_task_plan(
         task_shape: parsed.task_shape,
         mode,
     })
-}
-
-/// Detect compound tasks that involve multiple distinct actions.
-/// e.g., "create X then run it", "write a script and execute it, fix issues"
-fn looks_like_compound_task(user_text: &str) -> bool {
-    let lower = user_text.to_lowercase();
-
-    // Use word-boundary matching to avoid false positives from filenames
-    // like "checker.py" matching "check".
-    let has_word = |kw: &str| crate::agent::contains_keyword_as_words(&lower, kw);
-
-    // Count distinct action categories present
-    let create_actions = ["create", "write", "build", "make", "generate"];
-    let execute_actions = ["run", "execute", "test", "launch", "start"];
-    let fix_actions = ["fix", "repair", "resolve", "correct", "patch"];
-    // Multi-word phrases use .contains() since they're specific enough
-    let verify_phrases = ["show me", "show me the"];
-
-    let mut categories = 0u8;
-    if create_actions.iter().any(|a| has_word(a)) {
-        categories += 1;
-    }
-    if execute_actions.iter().any(|a| has_word(a)) {
-        categories += 1;
-    }
-    if fix_actions.iter().any(|a| has_word(a)) {
-        categories += 1;
-    }
-    if has_word("verify")
-        || has_word("check")
-        || has_word("display")
-        || has_word("report")
-        || verify_phrases.iter().any(|p| lower.contains(p))
-    {
-        categories += 1;
-    }
-
-    // Compound if 2+ distinct action categories
-    categories >= 2
 }
 
 /// Determine whether a turn bypasses the optional task-start assessment.
@@ -1036,45 +962,5 @@ mod tests {
         let mut plan_steps = steps;
         plan_steps.truncate(MAX_PLAN_STEPS);
         assert_eq!(plan_steps.len(), 7);
-    }
-
-    #[test]
-    fn test_compound_task_create_and_run() {
-        assert!(looks_like_compound_task(
-            "Create a Python script and run it to check all blog posts"
-        ));
-    }
-
-    #[test]
-    fn test_compound_task_create_run_fix() {
-        assert!(looks_like_compound_task(
-            "Write a checker script, execute it, and fix any issues found"
-        ));
-    }
-
-    #[test]
-    fn test_compound_task_build_and_verify() {
-        assert!(looks_like_compound_task(
-            "Build the project and show me the test results"
-        ));
-    }
-
-    #[test]
-    fn test_not_compound_simple_create() {
-        assert!(!looks_like_compound_task(
-            "Create a Python script at ~/projects/blog/tools/checker.py"
-        ));
-    }
-
-    #[test]
-    fn test_not_compound_simple_question() {
-        assert!(!looks_like_compound_task("What time is it in Tokyo?"));
-    }
-
-    #[test]
-    fn test_compound_task_generate_and_test() {
-        assert!(looks_like_compound_task(
-            "Generate unit tests for the router module, then run them"
-        ));
     }
 }

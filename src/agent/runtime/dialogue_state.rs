@@ -233,7 +233,7 @@ fn user_turn_weakly_references_existing_request(
     // genuinely pending work. An answered request must not capture an unrelated
     // short question during the linger TTL; ordinary transcript adjacency still
     // gives the model the preceding exchange without changing routing state.
-    if !state.open_request.as_ref().is_some_and(|request| {
+    let Some(open_request) = state.open_request.as_ref().filter(|request| {
         matches!(
             request.status,
             OpenRequestStatus::Open
@@ -241,7 +241,16 @@ fn user_turn_weakly_references_existing_request(
                 | OpenRequestStatus::PartiallyAnswered
                 | OpenRequestStatus::Blocked
         )
-    }) {
+    }) else {
+        return false;
+    };
+
+    // A concrete semantic scope that differs from the pending request is a
+    // standalone request, even when it is concise. Scope is persisted typed
+    // state; no follow-up phrase vocabulary is involved.
+    if infer_open_request_scope(trimmed)
+        .is_some_and(|current_scope| open_request.semantic_scope != Some(current_scope))
+    {
         return false;
     }
 
@@ -307,18 +316,25 @@ fn classify_user_turn(
         return UserTurnKind::Followup;
     }
 
-    let contract = infer_completion_contract(trimmed, alias_roots);
     if looks_like_explicit_task_switch(&lower)
         || looks_like_standalone_goal_request(&lower)
         || looks_like_self_contained_mutation_request(trimmed, &lower)
         || looks_like_short_command_request(trimmed)
-        || completion_contract_looks_actionable(&contract)
     {
         return UserTurnKind::NewRequest;
     }
 
+    // An unresolved request is the durable antecedent for a short, otherwise
+    // non-standalone turn. Resolve that state relationship before treating a
+    // generic question contract as a fresh request. This is intentionally
+    // independent of the words used in the follow-up.
     if user_turn_weakly_references_existing_request(state, trimmed, &lower) {
         return UserTurnKind::Followup;
+    }
+
+    let contract = infer_completion_contract(trimmed, alias_roots);
+    if completion_contract_looks_actionable(&contract) {
+        return UserTurnKind::NewRequest;
     }
 
     if state.open_request.as_ref().is_some_and(|request| {
@@ -1098,6 +1114,29 @@ mod tests {
         request.text = "Find my tax documents".to_string();
         state.open_request = Some(request);
         apply_user_message(&mut state, "u2", "hmm the second folder maybe", &[], now);
+        assert_eq!(
+            state.last_user_turn.as_ref().map(|turn| turn.kind),
+            Some(UserTurnKind::Followup)
+        );
+        assert_eq!(
+            state
+                .open_request
+                .as_ref()
+                .map(|request| request.user_message_id.as_str()),
+            Some("u1")
+        );
+    }
+
+    #[test]
+    fn unresolved_request_anchors_elliptical_question_by_state() {
+        let now = Utc::now();
+        let mut state = DialogueState::new("s1");
+        let mut request = request_with(OpenRequestStatus::PartiallyAnswered, now, None);
+        request.text = "Repair the failing job and verify the result".to_string();
+        state.open_request = Some(request);
+
+        apply_user_message(&mut state, "u2", "Fixed?", &[], now);
+
         assert_eq!(
             state.last_user_turn.as_ref().map(|turn| turn.kind),
             Some(UserTurnKind::Followup)

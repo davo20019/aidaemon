@@ -99,8 +99,11 @@ struct SetupLoginResult {
     urls: Vec<String>,
 }
 
-fn should_send_standalone_task_error(is_stale_watchdog: bool, has_live_surface: bool) -> bool {
-    !is_stale_watchdog && !has_live_surface
+fn should_send_standalone_task_error(
+    is_stale_watchdog: bool,
+    delivered_via_live_surface: bool,
+) -> bool {
+    !is_stale_watchdog && !delivered_via_live_surface
 }
 
 use crate::wizard::CloudflaredZoneValidation;
@@ -882,8 +885,8 @@ impl TelegramChannel {
 
         let (response, label) = if prefix == "goal" {
             match action {
-                "confirm" => (ApprovalResponse::AllowOnce, "Confirmed ✅".to_string()),
-                "cancel" => (ApprovalResponse::Deny, "Cancelled ❌".to_string()),
+                "confirm" => (ApprovalResponse::AllowOnce, "Goal approved ✅".to_string()),
+                "cancel" => (ApprovalResponse::Deny, "Goal cancelled".to_string()),
                 _ => {
                     let _ = bot
                         .answer_callback_query(q.id)
@@ -947,21 +950,32 @@ impl TelegramChannel {
 
         if let Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) = q.message {
             let original = m.text().unwrap_or("");
-            let updated = approval_render::finalize_approval_message(original, &response);
+            let updated = if prefix == "goal" {
+                let status = if matches!(response, ApprovalResponse::Deny) {
+                    "❌ Goal cancelled\nNothing was activated."
+                } else {
+                    "✅ Goal approved\nActivation is continuing now."
+                };
+                format!("{}\n\n{status}", original.trim_end())
+            } else {
+                approval_render::finalize_approval_message(original, &response)
+            };
             let _ = bot.edit_message_text(m.chat.id, m.id, updated).await;
 
             // Auto-dismiss the resolved card after a short delay so an answered
             // approval doesn't linger and get mistaken for one still awaiting a
             // response. This runs only after the user has responded, so a
             // still-pending prompt is never removed out from under them.
-            if let Some(delay) = Self::resolved_approval_dismiss_delay() {
-                let bot = bot.clone();
-                let chat_id = m.chat.id;
-                let msg_id = m.id;
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = bot.delete_message(chat_id, msg_id).await;
-                });
+            if prefix != "goal" {
+                if let Some(delay) = Self::resolved_approval_dismiss_delay() {
+                    let bot = bot.clone();
+                    let chat_id = m.chat.id;
+                    let msg_id = m.id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = bot.delete_message(chat_id, msg_id).await;
+                    });
+                }
             }
         }
 
@@ -4787,6 +4801,7 @@ impl TelegramChannel {
 
                 match result {
                     Ok(reply) => {
+                        let reply = crate::channels::prepare_chat_message(&reply);
                         // NOTE: Task intentionally stays "running" during response
                         // sending. This prevents a race condition where incoming
                         // messages see no running task (has_running_task = false),
@@ -4845,7 +4860,6 @@ impl TelegramChannel {
                         let error_msg = e.to_string();
                         let is_stale_watchdog =
                             error_msg.starts_with("Task auto-cancelled due to inactivity");
-                        let has_live_surface = live_owner.is_some() && live_sink.is_some();
                         // Cancellation: fail immediately and exit (queue already
                         // cleared by the /cancel handler).
                         if error_msg == "Task cancelled" {
@@ -4863,21 +4877,29 @@ impl TelegramChannel {
                         } else {
                             warn!("Agent error: {}", e);
                         }
-                        if let (Some(live_owner), Some(live_sink)) =
-                            (live_owner.as_ref(), live_sink.as_ref())
-                        {
-                            use crate::channels::live_status::SurfaceSink;
-                            let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
-                            let _ = live_owner
-                                .lock()
-                                .await
-                                .finalize_text(sink_ref, &format!("⚠️ {error_msg}"))
-                                .await;
-                            live_owner.lock().await.reset();
-                        } else if let Some(live_owner) = live_owner.as_ref() {
-                            live_owner.lock().await.reset();
-                        }
-                        if should_send_standalone_task_error(is_stale_watchdog, has_live_surface) {
+                        let delivered_via_live_surface =
+                            if let (Some(live_owner), Some(live_sink)) =
+                                (live_owner.as_ref(), live_sink.as_ref())
+                            {
+                                use crate::channels::live_status::SurfaceSink;
+                                let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
+                                let delivered = live_owner
+                                    .lock()
+                                    .await
+                                    .finalize_text(sink_ref, &format!("⚠️ {error_msg}"))
+                                    .await;
+                                live_owner.lock().await.reset();
+                                delivered
+                            } else if let Some(live_owner) = live_owner.as_ref() {
+                                live_owner.lock().await.reset();
+                                false
+                            } else {
+                                false
+                            };
+                        if should_send_standalone_task_error(
+                            is_stale_watchdog,
+                            delivered_via_live_surface,
+                        ) {
                             // No live "Working" surface exists to finalize, so
                             // deliver one standalone terminal error.
                             let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
@@ -6163,7 +6185,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_error_uses_exactly_one_delivery_surface() {
+    fn terminal_error_sends_standalone_unless_live_finalization_succeeded() {
         assert!(!should_send_standalone_task_error(false, true));
         assert!(should_send_standalone_task_error(false, false));
         assert!(!should_send_standalone_task_error(true, false));

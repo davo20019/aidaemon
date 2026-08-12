@@ -4,6 +4,8 @@
 //! `main_loop.rs` so they can be moved behind a dedicated gate.
 #![allow(dead_code)]
 
+use super::loop_utils::ToolFailureClass;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoppingCondition {
     HardIterationCap {
@@ -120,7 +122,7 @@ pub enum LoopControlDecision {
 
 /// Inputs for the unified loop-control evaluator.
 #[derive(Debug, Clone)]
-pub struct LoopControlInputs<'a> {
+pub struct LoopControlInputs {
     pub iteration: usize,
     pub hard_cap: Option<usize>,
     pub timeout_secs: Option<u64>,
@@ -129,26 +131,15 @@ pub struct LoopControlInputs<'a> {
     pub max_stall_iterations: usize,
     pub deferred_no_tool_streak: usize,
     pub deferred_no_tool_switch_threshold: usize,
-    pub deferred_no_tool_error_marker: &'a str,
     pub max_pre_tool_deferrals: usize,
     pub total_successful_tool_calls: usize,
-    pub recent_errors: &'a [(String, bool)],
+    pub recent_failure_class: Option<ToolFailureClass>,
+    pub empty_response_retry_pending: bool,
 }
 
-impl<'a> LoopControlInputs<'a> {
+impl LoopControlInputs {
     fn stall_limit_and_mode(&self) -> (usize, StallMode) {
-        let recent_errors = self
-            .recent_errors
-            .iter()
-            .rev()
-            .take(8)
-            .map(|(e, _)| e.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        if self.deferred_no_tool_streak >= self.deferred_no_tool_switch_threshold
-            || recent_errors.contains(self.deferred_no_tool_error_marker)
-        {
+        if self.deferred_no_tool_streak >= self.deferred_no_tool_switch_threshold {
             // Give extra room for deferred/no-tool recovery windows.
             return (
                 self.max_stall_iterations.saturating_add(3),
@@ -156,24 +147,14 @@ impl<'a> LoopControlInputs<'a> {
             );
         }
 
-        let transient_signals = recent_errors.contains("rate limit")
-            || recent_errors.contains("too many requests")
-            || recent_errors.contains("429")
-            || recent_errors.contains("timed out")
-            || recent_errors.contains("timeout")
-            || recent_errors.contains("network")
-            || recent_errors.contains("connection")
-            || recent_errors.contains("service unavailable")
-            || recent_errors.contains("bad gateway")
-            || recent_errors.contains("gateway timeout");
-        if transient_signals {
+        if self.recent_failure_class == Some(ToolFailureClass::Transient) {
             return (
                 self.max_stall_iterations.saturating_add(2),
                 StallMode::Transient,
             );
         }
 
-        if recent_errors.contains("empty_response(") || recent_errors.contains("empty response") {
+        if self.empty_response_retry_pending {
             return (
                 self.max_stall_iterations.saturating_add(2),
                 StallMode::EmptyResponse,
@@ -308,10 +289,10 @@ mod tests {
             max_stall_iterations: 3,
             deferred_no_tool_streak: 6,
             deferred_no_tool_switch_threshold: 2,
-            deferred_no_tool_error_marker: "deferred-action no-tool loop",
             max_pre_tool_deferrals: 6,
             total_successful_tool_calls: 0,
-            recent_errors: &[],
+            recent_failure_class: None,
+            empty_response_retry_pending: false,
         }
         .evaluate();
         assert_eq!(
@@ -325,7 +306,6 @@ mod tests {
 
     #[test]
     fn loop_control_uses_deferred_no_tool_stall_window() {
-        let errors = vec![("deferred-action no-tool loop".to_string(), false)];
         let out = LoopControlInputs {
             iteration: 5,
             hard_cap: None,
@@ -335,10 +315,10 @@ mod tests {
             max_stall_iterations: 3,
             deferred_no_tool_streak: 2,
             deferred_no_tool_switch_threshold: 2,
-            deferred_no_tool_error_marker: "deferred-action no-tool loop",
             max_pre_tool_deferrals: 99,
             total_successful_tool_calls: 2,
-            recent_errors: &errors,
+            recent_failure_class: None,
+            empty_response_retry_pending: false,
         }
         .evaluate();
         assert_eq!(
@@ -353,7 +333,6 @@ mod tests {
 
     #[test]
     fn loop_control_detects_transient_stall_mode() {
-        let errors = vec![("network timeout while calling tool".to_string(), false)];
         let out = LoopControlInputs {
             iteration: 5,
             hard_cap: None,
@@ -363,10 +342,10 @@ mod tests {
             max_stall_iterations: 3,
             deferred_no_tool_streak: 0,
             deferred_no_tool_switch_threshold: 2,
-            deferred_no_tool_error_marker: "deferred-action no-tool loop",
             max_pre_tool_deferrals: 6,
             total_successful_tool_calls: 1,
-            recent_errors: &errors,
+            recent_failure_class: Some(ToolFailureClass::Transient),
+            empty_response_retry_pending: false,
         }
         .evaluate();
         assert_eq!(

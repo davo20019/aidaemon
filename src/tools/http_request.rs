@@ -999,6 +999,17 @@ impl HttpRequestTool {
         Ok(Some(result))
     }
 
+    async fn refresh_expiring_oauth_profile(&self, profile_name: &str) -> anyhow::Result<bool> {
+        let gateway = self.oauth_gateway.read().await.clone();
+        let Some(gateway) = gateway else {
+            return Ok(false);
+        };
+        if gateway.get_provider(profile_name).await.is_none() {
+            return Ok(false);
+        }
+        gateway.refresh_access_token_if_needed(profile_name).await
+    }
+
     #[cfg(test)]
     fn oauth_refresh_attempt_count(&self) -> usize {
         self.oauth_refresh_attempts
@@ -1346,8 +1357,8 @@ impl HttpRequestTool {
         }
 
         // Step 5: Resolve auth profile and check domain
-        let profiles_snapshot = self.profiles.read().await.clone();
-        let profile = if let Some(name) = auth_profile_name {
+        let mut profiles_snapshot = self.profiles.read().await.clone();
+        let mut profile = if let Some(name) = auth_profile_name {
             let p = profiles_snapshot
                 .get(name)
                 .cloned()
@@ -1509,6 +1520,63 @@ impl HttpRequestTool {
             }
         }
 
+        // Refresh a known-expiring bearer before sending anything. Mandate
+        // requests deliberately are not replayed after a 401, so this preflight
+        // keeps long-running mandates healthy without weakening that rule.
+        if let Some(profile_name) = auth_profile_name {
+            let is_bearer_profile = profile.as_ref().is_some_and(|resolved| {
+                matches!(resolved.auth_type, crate::config::HttpAuthType::Bearer)
+            });
+            if is_bearer_profile {
+                match self.refresh_expiring_oauth_profile(profile_name).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        profiles_snapshot = self.profiles.read().await.clone();
+                        let Some(refreshed_profile) = profiles_snapshot.get(profile_name).cloned()
+                        else {
+                            anyhow::bail!(
+                                "OAuth profile '{}' disappeared after its token was refreshed",
+                                profile_name
+                            );
+                        };
+                        let request_host = parsed_url.host_str().unwrap_or("");
+                        if !refreshed_profile
+                            .allowed_domains
+                            .iter()
+                            .any(|domain| Self::domain_matches(request_host, domain))
+                        {
+                            return Ok((
+                                format!(
+                                    "Request blocked: domain '{}' is not in the refreshed allowed domains for profile '{}'",
+                                    request_host, profile_name
+                                ),
+                                None,
+                                None,
+                            ));
+                        }
+                        if mandate_execution && refreshed_profile.user_id.as_deref() != account_id {
+                            return Ok((
+                                format!(
+                                    "Request blocked: refreshed auth profile '{}' no longer matches the mandate-bound account_id.",
+                                    profile_name
+                                ),
+                                None,
+                                None,
+                            ));
+                        }
+                        profile = Some(refreshed_profile);
+                    }
+                    Err(error) => {
+                        anyhow::bail!(
+                            "OAuth access token for profile '{}' needs refresh before this request, but refresh failed: {}",
+                            profile_name,
+                            error
+                        );
+                    }
+                }
+            }
+        }
+
         // Step 9: Execute request, optionally refreshing OAuth-backed bearer auth once on 401.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -1538,7 +1606,7 @@ impl HttpRequestTool {
         if mandate_execution && response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(profile_name) = auth_profile_name {
                 oauth_retry_note = Some(format!(
-                    "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. Automatic OAuth refresh and request replay are disabled during mandate execution; the original 401 is returned for a later bounded decision cycle.",
+                    "HTTP 401 Unauthorized from the remote API while using auth_profile='{}'. Reactive OAuth refresh and request replay are disabled during mandate execution; the original 401 is returned for a later bounded decision cycle.",
                     profile_name
                 ));
             }
@@ -3141,7 +3209,7 @@ mod tests {
         );
         assert!(outcome
             .output
-            .contains("Automatic OAuth refresh and request replay are disabled"));
+            .contains("Reactive OAuth refresh and request replay are disabled"));
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3199,7 +3267,7 @@ mod tests {
         );
         assert!(outcome
             .output
-            .contains("Automatic OAuth refresh and request replay are disabled"));
+            .contains("Reactive OAuth refresh and request replay are disabled"));
         assert_eq!(
             request_count.load(std::sync::atomic::Ordering::SeqCst),
             1,

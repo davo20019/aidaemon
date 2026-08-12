@@ -2565,9 +2565,22 @@ async fn test_stalled_failing_approach_pivots_and_recovers() {
         successes: successes.clone(),
         fail_first: 4,
     });
-    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+    let mut harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
         .await
         .unwrap();
+    // Isolate pivot persistence from the independent execution-envelope
+    // backstop: this deliberately stubborn mock spends many model turns
+    // ignoring cooldown guidance before it accepts the pivot.
+    harness
+        .agent
+        .set_test_execution_budget_override(Some(crate::agent::ExecutionBudget {
+            max_steps: 100,
+            max_tokens: 0,
+            max_llm_calls: 100,
+            max_tool_calls: 100,
+            max_validation_rounds: 100,
+            max_wall_clock_ms: 600_000,
+        }));
     let response = harness
         .agent
         .handle_message(

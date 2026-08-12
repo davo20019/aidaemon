@@ -4,7 +4,7 @@
 //! budget. All items are moved verbatim — no logic changes. Visibility is
 //! `pub(super)` so `run.rs` can call them via `super::run_helpers::*`.
 
-use super::project_dir::{is_recognized_project_root, scope_allows_project_dir};
+use super::project_dir::scope_allows_project_dir;
 use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExecutionPlan};
 use crate::agent::prefix_fingerprint;
 use crate::agent::*;
@@ -17,18 +17,65 @@ const EXTERNAL_ACTION_ACK_MAX_CHARS: usize = 500;
 
 /// Extract a short error summary line from tool result text.
 pub(super) fn extract_error_summary_line(result_text: &str) -> Option<String> {
-    result_text
-        .lines()
-        .filter(|l| !crate::utils::is_internal_scaffolding_line(l))
-        .find(|l| {
-            l.contains("API ERROR")
-                || l.contains("Error")
-                || l.contains("error")
-                || l.contains("Forbidden")
-                || l.contains("Unauthorized")
-                || l.contains("BLOCKED")
+    let mut lines = Vec::new();
+    let mut in_recovery_section = false;
+    for raw in result_text.lines() {
+        if crate::utils::is_internal_scaffolding_line(raw) {
+            continue;
+        }
+        let line = raw.trim();
+        let label = line.trim_start_matches('#').trim().to_ascii_lowercase();
+        if line.starts_with('#') {
+            in_recovery_section =
+                matches!(label.as_str(), "recovery options" | "safe recovery options");
+            continue;
+        }
+        if in_recovery_section
+            || line.is_empty()
+            || matches!(
+                label.as_str(),
+                "error output" | "failure details" | "recovery options" | "safe recovery options"
+            )
+        {
+            continue;
+        }
+        lines.push(line);
+    }
+
+    // Prefer the concrete OS/API diagnostic over a wrapper such as
+    // "ERROR: CLI agent failed". In the live exit-127 incident, selecting the
+    // wrapper's own `## Error Output` heading erased the only actionable line.
+    const HIGH_SIGNAL: &[&str] = &[
+        "no such file or directory",
+        "command not found",
+        "permission denied",
+        "access denied",
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "timed out",
+        "connection refused",
+        "fatal:",
+        "panicked at",
+    ];
+    if let Some(line) = lines.iter().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        HIGH_SIGNAL.iter().any(|signal| lower.contains(signal))
+    }) {
+        return Some(line.chars().take(200).collect());
+    }
+
+    lines
+        .into_iter()
+        .find(|line| {
+            line.contains("API ERROR")
+                || line.contains("Error")
+                || line.contains("error")
+                || line.contains("Failed")
+                || line.contains("failed")
+                || line.contains("BLOCKED")
         })
-        .map(|l| l.chars().take(200).collect())
+        .map(|line| line.chars().take(200).collect())
 }
 
 pub(super) fn raw_internal_scope_violation(
@@ -342,7 +389,6 @@ pub(super) fn target_hint_allowed_for_step(
             allowed_target.value == candidate_target.value
                 || scope_allows_project_dir(&allowed_target.value, &candidate_target.value)
                 || allow_scaffold_parent_dir_for_target(tool_name, allowed_target, candidate_target)
-                || is_recognized_project_root(&candidate_target.value)
         }
         _ => false,
     }
@@ -629,6 +675,23 @@ pub(super) fn should_build_external_action_ack(result_text: &str) -> bool {
         && !lower.starts_with("failed to ")
 }
 
+pub(super) fn should_refresh_external_action_ack(
+    background_detached: bool,
+    semantics: &ToolCallSemantics,
+    tool_has_external_side_effect: bool,
+    verified_observation: bool,
+    successful_external_mutation_count: usize,
+    failed_external_mutation_count: usize,
+    result_text: &str,
+) -> bool {
+    !background_detached
+        && ((semantics.mutates_state() && tool_has_external_side_effect)
+            || (verified_observation
+                && successful_external_mutation_count > 0
+                && failed_external_mutation_count == 0))
+        && should_build_external_action_ack(result_text)
+}
+
 pub(super) fn tool_result_contains_verifiable_evidence(
     semantics: &ToolCallSemantics,
     result_text: &str,
@@ -859,6 +922,41 @@ mod tests {
     }
 
     #[test]
+    fn error_summary_prefers_cli_stderr_over_wrapper_heading() {
+        let result_text = "[UNTRUSTED EXTERNAL DATA from 'cli_agent']\n\
+ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
+## Failure Details\n\
+[stderr] env: claude: No such file or directory\n\n\
+## Safe Recovery Options\n\
+- Verify the configured executable path\n\
+[END UNTRUSTED EXTERNAL DATA]";
+        assert_eq!(
+            extract_error_summary_line(result_text).as_deref(),
+            Some("[stderr] env: claude: No such file or directory")
+        );
+    }
+
+    #[test]
+    fn error_summary_never_returns_an_error_section_heading() {
+        let result_text = "## Error Output\n\nERROR: process failed without diagnostics";
+        assert_eq!(
+            extract_error_summary_line(result_text).as_deref(),
+            Some("ERROR: process failed without diagnostics")
+        );
+    }
+
+    #[test]
+    fn error_summary_ignores_recovery_advice_after_failure_details() {
+        let result_text = "ERROR: CLI agent failed (exit code 1).\n\n\
+## Failure Details\nNo diagnostic output was captured.\n\n\
+## Safe Recovery Options\n- Verify authentication";
+        assert_eq!(
+            extract_error_summary_line(result_text).as_deref(),
+            Some("ERROR: CLI agent failed (exit code 1).")
+        );
+    }
+
+    #[test]
     fn error_summary_is_none_when_only_scaffolding_matches() {
         let result_text = format!(
             "{}\nplain output with no failures\n[SYSTEM] IMPORTANT — The error says: \"something\"\n",
@@ -873,7 +971,7 @@ mod tests {
         // `result_text` before this ack is built. If the ack's embedded
         // excerpt isn't filtered the same way `extract_error_summary_line`
         // is, the raw model-facing notice ships verbatim as the user-facing
-        // reply on LLM timeout (finalize_external_action_timeout_ack).
+        // reply on a post-action provider failure.
         let result_text = format!(
             "Deployed 3 services successfully.\n{}",
             crate::utils::truncation_notice(4000, 4265)
@@ -881,6 +979,38 @@ mod tests {
         let ack = build_external_action_completion_ack(&result_text);
         assert!(ack.contains("Deployed 3 services successfully."));
         assert!(!ack.contains("OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn verified_observation_restores_external_action_ack() {
+        let observation = ToolCallSemantics::observation();
+        assert!(should_refresh_external_action_ack(
+            false,
+            &observation,
+            false,
+            true,
+            1,
+            0,
+            "HTTP 200 OK",
+        ));
+        assert!(!should_refresh_external_action_ack(
+            false,
+            &observation,
+            false,
+            false,
+            1,
+            0,
+            "HTTP 200 OK",
+        ));
+        assert!(!should_refresh_external_action_ack(
+            false,
+            &observation,
+            false,
+            true,
+            1,
+            1,
+            "HTTP 200 OK",
+        ));
     }
 
     #[test]
@@ -1149,6 +1279,52 @@ mod tests {
         let args = r#"{"path":"/tmp/project-b/src/main.rs"}"#;
         let violation = target_scope_violation_for_tool_call("edit_file", args, &step_plan);
         assert!(violation.is_some());
+    }
+
+    #[test]
+    fn target_scope_violation_blocks_cli_agent_from_switching_projects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_a = dir.path().join("project-a");
+        let project_b = dir.path().join("project-b");
+        std::fs::create_dir_all(&project_a).expect("create project-a");
+        std::fs::create_dir_all(&project_b).expect("create project-b");
+        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n")
+            .expect("project-a marker");
+        std::fs::write(project_b.join("package.json"), r#"{"name":"b"}"#)
+            .expect("project-b marker");
+
+        let step_plan = StepExecutionPlan {
+            step_id: "step-1".to_string(),
+            description: "Modify only the selected project".to_string(),
+            plan_version: 1,
+            primary_tool: Some("cli_agent".to_string()),
+            expected_effect: ToolCallEffect::Mutation,
+            target_scope: TargetScope {
+                allowed_targets: vec![ToolTargetHint::new(
+                    ToolTargetHintKind::ProjectScope,
+                    project_a.to_string_lossy(),
+                )
+                .expect("scope target")],
+                hard_fail_outside_scope: true,
+            },
+            expected_targets: Vec::new(),
+            retry_policy: RetryPolicy {
+                max_attempts: 1,
+                allow_tool_invocation_retry: false,
+            },
+            approval_requirement: ApprovalRequirement::Required {
+                reason: "cross-project mutation".to_string(),
+            },
+            idempotency_key: None,
+        };
+        let args = serde_json::json!({
+            "action": "run",
+            "working_dir": project_b,
+            "prompt": "Edit and deploy the project"
+        })
+        .to_string();
+
+        assert!(target_scope_violation_for_tool_call("cli_agent", &args, &step_plan).is_some());
     }
 
     #[test]

@@ -102,6 +102,25 @@ pub const MUTATING_EXTERNAL_TOOLS: &[&str] = &["share_memory", "send_file"];
 #[allow(dead_code)]
 pub const MUTATING_HTTP_METHODS: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
 
+/// Tools worth exposing to a correction agent. This is only a coarse roster
+/// filter; every proposed call still passes through [`classify_action`]. Keeping
+/// tools that are categorically blocked out of the model's schema prevents them
+/// from consuming the bounded correction-attempt ledger before useful work.
+pub fn tool_may_be_offered_during_correction(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "terminal"
+            | "run_command"
+            | "read_file"
+            | "search_files"
+            | "git_info"
+            | "project_inspect"
+            | "http_request"
+            | "web_fetch"
+            | "web_search"
+    )
+}
+
 /// URL/hostname pattern: looks for `scheme://host` or bare hostnames with a dot.
 fn extract_network_target(cmd: &str) -> Option<String> {
     // Find `scheme://` and extract up to the next `/` or whitespace.
@@ -852,16 +871,16 @@ fn is_correction_safe_local_command(
             return Err(format!(
                 "`du` is not permitted in correction mode (it recursively sizes \
                  directories and is slow). To find large files use \
-                 `find {} -type f -size +1G -printf '%s\\t%p\\n'` (lists \
-                 \"<bytes>\\t<path>\" per file; pick the largest) instead.",
+                 `find {} -type f -size +1G -ls` (portable on macOS/BSD and GNU \
+                 find; includes byte size and path) instead.",
                 working_dir.display()
             ));
         }
         return Err(format!(
             "command '{}' is not in the correction-mode read-only allowlist \
              (allowed: pwd, ls, cat, head, tail, wc, grep, rg, find). To find large \
-             files use `find {} -type f -size +1G -printf '%s\\t%p\\n'` (lists \
-             \"<bytes>\\t<path>\" per file; pick the largest) instead.",
+             files use `find {} -type f -size +1G -ls` (portable on macOS/BSD \
+             and GNU find; includes byte size and path) instead.",
             base_cmd,
             working_dir.display()
         ));
@@ -870,12 +889,10 @@ fn is_correction_safe_local_command(
     // `find` must not use -exec, -delete, -ok, -fprintf, -fls, -fprint,
     // and must not scan broad/out-of-scope roots (I1 + I2).
     //
-    // Note on `-printf` vs `-fprintf`/`-fls`/`-fprint`: `-printf FORMAT` only
-    // prints file METADATA (size/path/times) to STDOUT — it is read-only and
-    // strictly less powerful than the already-allowed `cat`, so it is ALLOWED.
-    // The file-WRITING variants `-fprintf FILE`/`-fls FILE`/`-fprint FILE`
-    // redirect that output into a file, so they remain BLOCKED. `-exec`/`-ok`
-    // execute commands and `-delete` removes files, so they remain BLOCKED too.
+    // Portable `-ls` prints file metadata to stdout and is read-only. GNU-only
+    // `-printf` is also read-only and remains accepted for Linux callers, but
+    // remediation guidance uses `-ls` so the same command works on macOS/BSD.
+    // File-writing variants remain blocked, as do command execution and delete.
     if base_cmd == "find" {
         // I2: reject file-writing / executing / deleting find actions.
         for token in cmd.split_whitespace() {
@@ -1254,6 +1271,15 @@ mod tests {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    #[test]
+    fn correction_roster_excludes_categorically_blocked_tools() {
+        assert!(tool_may_be_offered_during_correction("terminal"));
+        assert!(tool_may_be_offered_during_correction("search_files"));
+        assert!(!tool_may_be_offered_during_correction("manage_goal_tasks"));
+        assert!(!tool_may_be_offered_during_correction("spawn_agent"));
+        assert!(!tool_may_be_offered_during_correction("write_file"));
     }
 
     fn mutating_caps() -> ToolCapabilities {
@@ -2773,10 +2799,9 @@ mod tests {
     }
 
     #[test]
-    fn test_block_reason_hints_use_printf_not_exec() {
-        // The worked-example in the block reasons must use the Allowed
-        // `-printf` form, NOT the (blocked) `-exec ls -lh {} +` form, so a
-        // model copying the hint is not blocked again.
+    fn test_block_reason_hints_use_portable_ls_not_exec() {
+        // Portable `find -ls`, not GNU-only `-printf` or blocked `-exec`, keeps
+        // model-copied remediation inside the sandbox on macOS and Linux.
         let du = extract_proposed_action(
             "terminal",
             r#"{"command":"du -sh /tmp/test-workdir"}"#,
@@ -2785,8 +2810,10 @@ mod tests {
         );
         let du_reason = blocked_reason(&du, &ctx_with(vec![]));
         assert!(
-            du_reason.contains("-printf") && !du_reason.contains("-exec"),
-            "du hint must use -printf and not -exec: {du_reason}"
+            du_reason.contains("-ls")
+                && !du_reason.contains("-printf")
+                && !du_reason.contains("-exec"),
+            "du hint must use portable -ls: {du_reason}"
         );
 
         let other = extract_proposed_action(
@@ -2797,8 +2824,10 @@ mod tests {
         );
         let other_reason = blocked_reason(&other, &ctx_with(vec![]));
         assert!(
-            other_reason.contains("-printf") && !other_reason.contains("-exec"),
-            "allowlist hint must use -printf and not -exec: {other_reason}"
+            other_reason.contains("-ls")
+                && !other_reason.contains("-printf")
+                && !other_reason.contains("-exec"),
+            "allowlist hint must use portable -ls: {other_reason}"
         );
     }
 

@@ -115,9 +115,9 @@ fn build_remediation_prompt(
          `~`, `$HOME`, or `~/*`; shorthand home references and unbounded root scans \
          are rejected by the safety sandbox and will fail. Deliver the answer.\n\
          Example of an allowed command for this goal: \
-         `find {scope} -type f -size +1G -printf '%s\\t%p\\n'` — this lists \
-         \"<bytes>\\t<path>\" for each file over the threshold; read the output \
-         and pick the largest. Adapt the size threshold and directory as needed. \
+         `find {scope} -type f -size +1G -ls` — the portable `-ls` action \
+         includes each file's byte size and path on both macOS/BSD and GNU find; \
+         read the output and pick the largest. Adapt the size threshold and directory as needed. \
          (Pipes and `-exec` are blocked in correction mode, so do not use them.)"
     )
 }
@@ -382,10 +382,9 @@ mod tests {
     }
 
     #[test]
-    fn test_remediation_prompt_example_uses_printf_not_exec() {
-        // The worked example must use the Allowed `-printf` form, NOT the
-        // (blocked) `-exec ls -lh {} +` form, so a model copying it is not
-        // blocked again by the correction sandbox.
+    fn test_remediation_prompt_example_uses_portable_ls_not_exec() {
+        // The worked example must use portable `find -ls`, NOT GNU-only
+        // `-printf` or the blocked `-exec ls -lh {} +` form.
         let scope = "/Users/synthetic/Documents";
         let prompt = build_remediation_prompt(
             "what's the biggest file?",
@@ -394,16 +393,16 @@ mod tests {
             std::path::Path::new(scope),
         );
         assert!(
-            prompt.contains("-printf"),
-            "prompt example must use -printf: {prompt}"
+            prompt.contains("-ls"),
+            "prompt example must use portable find -ls: {prompt}"
         );
         assert!(
-            !prompt.contains("-exec ls"),
-            "prompt example must not use the blocked -exec form: {prompt}"
+            !prompt.contains("-exec ls") && !prompt.contains("-printf"),
+            "prompt example must avoid blocked/GNU-only forms: {prompt}"
         );
         assert!(
-            prompt.contains(&format!("find {scope} -type f -size +1G -printf")),
-            "example must be the scoped -printf form: {prompt}"
+            prompt.contains(&format!("find {scope} -type f -size +1G -ls")),
+            "example must be the scoped portable -ls form: {prompt}"
         );
     }
 

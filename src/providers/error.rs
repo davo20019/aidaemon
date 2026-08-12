@@ -295,6 +295,8 @@ const PROVIDER_INFRA_ERROR_MARKERS: &[&str] = &[
     "llm provider is experiencing issues",
     "cannot reach llm provider",
     "falling back to previous model",
+    "our servers are currently overloaded",
+    "codex stream failed",
 ];
 
 /// True when an error string describes a transient/provider-infrastructure
@@ -408,6 +410,9 @@ mod tests {
         ));
         assert!(is_provider_infra_error_text(
             "Model not found. Falling back to previous model."
+        ));
+        assert!(is_provider_infra_error_text(
+            "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
         ));
     }
 

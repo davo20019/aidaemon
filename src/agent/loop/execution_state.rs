@@ -449,11 +449,19 @@ impl ExecutionState {
         self.llm_calls_used = self.llm_calls_used.saturating_add(1);
     }
 
-    pub fn begin_step(&mut self, plan: StepExecutionPlan) {
-        self.steps_used = self.steps_used.saturating_add(1);
-        self.attempt_count = self.attempt_count.saturating_add(1);
+    /// Make a compiled step available to preflight policy gates without
+    /// charging the execution budget. Cooldowns, repetition guards, and other
+    /// deterministic deferrals are not execution attempts.
+    pub fn stage_step(&mut self, plan: StepExecutionPlan) {
         self.last_tool_name = plan.primary_tool.clone();
         self.current_step = Some(plan);
+    }
+
+    /// Charge one attempt only when the staged step reaches actual or
+    /// synthetic tool execution.
+    pub fn begin_staged_step(&mut self) {
+        self.steps_used = self.steps_used.saturating_add(1);
+        self.attempt_count = self.attempt_count.saturating_add(1);
     }
 
     pub fn record_tool_call(&mut self) {

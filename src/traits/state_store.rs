@@ -649,6 +649,7 @@ pub trait DynamicCliAgentStore: Send + Sync {
     /// Log the start of a CLI agent invocation. Returns the invocation ID.
     async fn log_cli_agent_start(
         &self,
+        _task_id: Option<&str>,
         _session_id: &str,
         _agent_name: &str,
         _prompt_summary: &str,

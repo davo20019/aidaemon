@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use sha2::Digest;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{HttpAuthProfile, HttpAuthType, OAuthProviderConfig};
@@ -19,6 +19,25 @@ const RECENT_FLOW_RESULT_TTL_SECS: i64 = 900;
 const FLOW_EXPIRED_MESSAGE: &str = "OAuth flow expired (10 minutes). Please try again.";
 const INVALID_OR_USED_FLOW_MESSAGE: &str =
     "OAuth flow expired or was already used. Please start a new connection attempt.";
+const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 60;
+
+fn access_token_needs_refresh(
+    connection: &crate::traits::OAuthConnection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(expires_at) = connection.token_expires_at.as_deref() else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| {
+            expires_at.with_timezone(&chrono::Utc)
+                <= now + chrono::Duration::seconds(ACCESS_TOKEN_REFRESH_SKEW_SECS)
+        })
+        // Corrupt expiry metadata must not cause an unknown-age bearer to be
+        // loaded indefinitely. A bounded refresh either repairs it or leaves
+        // the profile unavailable with a visible warning.
+        .unwrap_or(true)
+}
 
 /// OAuth type enum.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +105,10 @@ pub struct OAuthGateway {
     state_store: Arc<dyn StateStore>,
     http_profiles: SharedHttpProfiles,
     callback_base_url: String,
+    /// Serializes token exchanges so concurrent authenticated requests cannot
+    /// race a rotating refresh token or overwrite a newer bearer with an older
+    /// response.
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl OAuthGateway {
@@ -101,6 +124,7 @@ impl OAuthGateway {
             state_store,
             http_profiles,
             callback_base_url,
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -728,6 +752,24 @@ impl OAuthGateway {
         match self.state_store.list_oauth_connections().await {
             Ok(connections) => {
                 for conn in connections {
+                    if access_token_needs_refresh(&conn, chrono::Utc::now()) {
+                        match self.refresh_token(&conn.service).await {
+                            Ok(_) => {
+                                info!(
+                                    service = %conn.service,
+                                    "Restored OAuth connection via proactive token refresh"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    service = %conn.service,
+                                    %error,
+                                    "Expired OAuth connection could not be refreshed; stale access token was not loaded"
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     let at_key = format!("oauth_{}_access_token", conn.service);
                     match crate::config::resolve_from_keychain(&at_key) {
                         Ok(token) => {
@@ -791,8 +833,29 @@ impl OAuthGateway {
         }
     }
 
-    /// Refresh an expired access token using the refresh token.
+    /// Refresh the bearer only when its durable expiry is inside the safety
+    /// window. The expiry is re-read while holding the refresh lock so a burst
+    /// of requests causes at most one token exchange.
+    pub async fn refresh_access_token_if_needed(&self, service: &str) -> anyhow::Result<bool> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let Some(connection) = self.state_store.get_oauth_connection(service).await? else {
+            return Ok(false);
+        };
+        if !access_token_needs_refresh(&connection, chrono::Utc::now()) {
+            return Ok(false);
+        }
+
+        self.refresh_token_locked(service).await?;
+        Ok(true)
+    }
+
+    /// Refresh an access token using the refresh token.
     pub async fn refresh_token(&self, service: &str) -> anyhow::Result<String> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        self.refresh_token_locked(service).await
+    }
+
+    async fn refresh_token_locked(&self, service: &str) -> anyhow::Result<String> {
         let provider = self
             .get_provider(service)
             .await
@@ -1032,6 +1095,29 @@ mod tests {
             profiles,
             "http://localhost:8080".to_string(),
         ))
+    }
+
+    #[test]
+    fn startup_refreshes_expired_or_invalid_expiry_but_preserves_nonexpiring_tokens() {
+        let now = chrono::Utc::now();
+        let mut connection = crate::traits::OAuthConnection {
+            id: 0,
+            service: "twitter".to_string(),
+            auth_type: "oauth2_pkce".to_string(),
+            username: None,
+            account_id: Some("synthetic-account".to_string()),
+            scopes: r#"["tweet.read"]"#.to_string(),
+            token_expires_at: Some((now - chrono::Duration::minutes(1)).to_rfc3339()),
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        assert!(access_token_needs_refresh(&connection, now));
+        connection.token_expires_at = Some("not-a-timestamp".to_string());
+        assert!(access_token_needs_refresh(&connection, now));
+        connection.token_expires_at = Some((now + chrono::Duration::minutes(5)).to_rfc3339());
+        assert!(!access_token_needs_refresh(&connection, now));
+        connection.token_expires_at = None;
+        assert!(!access_token_needs_refresh(&connection, now));
     }
 
     #[test]
@@ -1508,6 +1594,98 @@ mod tests {
             .allowed_domains
             .iter()
             .any(|domain| domain == "api.x.com"));
+    }
+
+    #[tokio::test]
+    async fn expired_token_preflight_is_serialized_and_preserves_account_binding() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        async fn token_handler(
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Json<serde_json::Value> {
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("refresh_token")
+            );
+            Json(serde_json::json!({
+                "access_token": "preflight-access",
+                "expires_in": 3600
+            }))
+        }
+
+        let app = Router::new().route("/oauth/token", post(token_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let gateway = test_gateway().await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "twitter".to_string(),
+                display_name: "Twitter/X".to_string(),
+                auth_type: OAuthType::OAuth2Pkce,
+                authorize_url: "https://twitter.com/i/oauth2/authorize".to_string(),
+                token_url: format!("http://{addr}/oauth/token"),
+                scopes: vec!["tweet.read".to_string()],
+                allowed_domains: vec!["api.twitter.com".to_string(), "api.x.com".to_string()],
+            })
+            .await;
+
+        let env_file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            env_file.path(),
+            "OAUTH_TWITTER_CLIENT_ID=abc\nOAUTH_TWITTER_CLIENT_SECRET=def\nOAUTH_TWITTER_REFRESH_TOKEN=refresh-123\n",
+        )
+        .unwrap();
+        let old_no_keychain = std::env::var("AIDAEMON_NO_KEYCHAIN").ok();
+        let old_runtime_env = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY).ok();
+        std::env::set_var("AIDAEMON_NO_KEYCHAIN", "1");
+        std::env::set_var(
+            crate::RUNTIME_ENV_FILE_ENV_KEY,
+            env_file.path().to_string_lossy().to_string(),
+        );
+
+        gateway
+            .state_store
+            .save_oauth_connection(&crate::traits::OAuthConnection {
+                id: 0,
+                service: "twitter".to_string(),
+                auth_type: "oauth2_pkce".to_string(),
+                username: None,
+                account_id: Some("stable-account-789".to_string()),
+                scopes: r#"["tweet.read"]"#.to_string(),
+                token_expires_at: Some(
+                    (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                ),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            gateway.refresh_access_token_if_needed("twitter"),
+            gateway.refresh_access_token_if_needed("twitter")
+        );
+
+        restore_env_var("AIDAEMON_NO_KEYCHAIN", old_no_keychain);
+        restore_env_var(crate::RUNTIME_ENV_FILE_ENV_KEY, old_runtime_env);
+
+        let refresh_results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            refresh_results
+                .into_iter()
+                .filter(|refreshed| *refreshed)
+                .count(),
+            1,
+            "concurrent expiry checks must perform exactly one token exchange"
+        );
+        let profiles = gateway.http_profiles.read().await;
+        let profile = profiles.get("twitter").expect("refreshed HTTP profile");
+        assert_eq!(profile.token.as_deref(), Some("preflight-access"));
+        assert_eq!(profile.user_id.as_deref(), Some("stable-account-789"));
     }
 
     #[tokio::test]

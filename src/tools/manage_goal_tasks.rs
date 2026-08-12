@@ -322,38 +322,30 @@ impl Tool for ManageGoalTasksTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create_task", "list_tasks", "update_task", "claim_task", "retry_task", "resolve_blocker", "complete_goal", "fail_goal"],
-                        "description": "Action to perform"
+                        "enum": ["create_task", "list_tasks", "update_task", "claim_task", "retry_task", "resolve_blocker", "complete_goal", "fail_goal"]
                     },
                     "task_id": {
-                        "type": "string",
-                        "description": "Task ID"
+                        "type": "string"
                     },
                     "description": {
-                        "type": "string",
-                        "description": "Task description"
+                        "type": "string"
                     },
                     "priority": {
                         "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": "Task priority"
+                        "enum": ["low", "medium", "high"]
                     },
                     "task_order": {
-                        "type": "integer",
-                        "description": "Execution order"
+                        "type": "integer"
                     },
                     "parallel_group": {
-                        "type": "string",
-                        "description": "Parallel group"
+                        "type": "string"
                     },
                     "depends_on": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Dependencies"
+                        "items": { "type": "string" }
                     },
                     "idempotent": {
-                        "type": "boolean",
-                        "description": "Safe to retry"
+                        "type": "boolean"
                     },
                     "status": {
                         "type": "string",
@@ -361,47 +353,43 @@ impl Tool for ManageGoalTasksTool {
                         "description": "New status (for update_task). Use superseded only when another named task replaced this task's required work."
                     },
                     "result": {
-                        "type": "string",
-                        "description": "Result text"
+                        "type": "string"
                     },
                     "error": {
-                        "type": "string",
-                        "description": "Error text"
+                        "type": "string"
                     },
                     "summary": {
-                        "type": "string",
-                        "description": "Goal summary"
+                        "type": "string"
                     },
                     "agent_id": {
-                        "type": "string",
-                        "description": "Agent ID"
+                        "type": "string"
                     },
                     "worker_profile": {
                         "type": "string",
-                        "description": "Named worker profile ID, such as profile-code or profile-review"
+                        "description": "Worker profile ID."
                     },
                     "workspace_policy": {
                         "type": "string",
                         "enum": ["shared", "isolated", "worktree"],
-                        "description": "Workspace policy: shared for an explicit existing project, isolated for a new project/directory, or worktree for parallel Git edits"
+                        "description": "shared, isolated, or Git worktree."
                     },
                     "artifacts": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Paths, URLs, commits, or messages produced by this task"
+                        "description": "Produced paths, URLs, commits, or messages."
                     },
                     "verification": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Checks performed and their outcomes"
+                        "description": "Checks and outcomes."
                     },
                     "remaining_risk": {
                         "type": "string",
-                        "description": "Known residual risk after this attempt"
+                        "description": "Residual risk."
                     },
                     "next_step": {
                         "type": "string",
-                        "description": "Explicit next action for a downstream worker or human"
+                        "description": "Next action."
                     }
                 },
                 "required": ["action"],

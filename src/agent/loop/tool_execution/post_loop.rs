@@ -33,6 +33,10 @@ pub(super) struct PostToolIterationState<'a> {
     pub fallback_expanded_once: &'a mut bool,
 }
 
+fn behavioral_supervision_enabled(tier: crate::agent::trust_tier::ModelTrustTier) -> bool {
+    matches!(tier, crate::agent::trust_tier::ModelTrustTier::Guided)
+}
+
 fn apply_read_saturation_controls(
     session_id: &str,
     pending_system_messages: &mut Vec<SystemDirective>,
@@ -212,9 +216,12 @@ pub(super) fn apply_post_tool_iteration_controls(
     // 3) read-saturation shaping,
     // 4) terminal-after-edit nudge.
 
-    // Escalating early-stop nudges: remind the LLM with increasing urgency
-    // to stop exploring and respond. After a hard threshold, strip tools
-    // entirely to force a text response on the next iteration.
+    let guided_supervision = behavioral_supervision_enabled(agent.trust_tier_for_model(model));
+
+    // Guided models receive escalating synthesis nudges. Autonomous frontier
+    // models keep self-directing while they are within the hard execution
+    // envelope; a raw activity count is not evidence that their work is stale.
+    // The hard force-text backstop below still applies to every tier.
     const NUDGE_INTERVAL: usize = 10;
     const FORCE_TEXT_BASE: usize = 40;
     const FORCE_TEXT_GOAL_BACKED: usize = 55;
@@ -223,7 +230,8 @@ pub(super) fn apply_post_tool_iteration_controls(
     } else {
         FORCE_TEXT_BASE
     };
-    if total_tool_calls_attempted > 0
+    if guided_supervision
+        && total_tool_calls_attempted > 0
         && total_tool_calls_attempted.is_multiple_of(NUDGE_INTERVAL)
         && total_tool_calls_attempted < force_text_at
     {
@@ -348,7 +356,7 @@ pub(super) fn apply_post_tool_iteration_controls(
         }
     }
 
-    if agent.trust_tier_for_model(model) == crate::agent::trust_tier::ModelTrustTier::Guided {
+    if guided_supervision {
         apply_read_saturation_controls(
             session_id,
             pending_system_messages,
@@ -365,23 +373,35 @@ pub(super) fn apply_post_tool_iteration_controls(
             recent_tool_names,
             iteration_had_tool_failures,
         );
+
+        apply_memory_search_saturation_controls(
+            session_id,
+            pending_system_messages,
+            tool_defs,
+            recent_tool_names,
+        );
+
+        apply_research_synthesis_nudge(session_id, pending_system_messages, recent_tool_names);
+
+        apply_build_fix_cycle_nudge(
+            session_id,
+            iteration,
+            pending_system_messages,
+            recent_tool_names,
+        );
     }
+}
 
-    apply_memory_search_saturation_controls(
-        session_id,
-        pending_system_messages,
-        tool_defs,
-        recent_tool_names,
-    );
+#[cfg(test)]
+mod autonomy_tests {
+    use super::*;
+    use crate::agent::trust_tier::ModelTrustTier;
 
-    apply_research_synthesis_nudge(session_id, pending_system_messages, recent_tool_names);
-
-    apply_build_fix_cycle_nudge(
-        session_id,
-        iteration,
-        pending_system_messages,
-        recent_tool_names,
-    );
+    #[test]
+    fn behavioral_supervision_is_guided_only() {
+        assert!(behavioral_supervision_enabled(ModelTrustTier::Guided));
+        assert!(!behavioral_supervision_enabled(ModelTrustTier::Autonomous));
+    }
 }
 
 fn apply_memory_search_saturation_controls(

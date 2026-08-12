@@ -109,6 +109,7 @@ fn prepare_turn_restart(
 
     *approach_pivots_used += 1;
     turn_state.stall.reset_for_pivot();
+    turn_state.failures.reset_for_pivot();
     turn_state
         .directives
         .push_system_message(SystemDirective::ApproachPivotRequired {
@@ -680,16 +681,6 @@ impl Agent {
                 .directives
                 .push_system_message(SystemDirective::EvidenceGroundingRequired);
         }
-        // Short approval of the assistant's own proposal ("Yes, read it"):
-        // anchor execution to the quoted proposal so the model carries out
-        // exactly what it offered instead of re-planning from scratch.
-        if let Some(proposal) =
-            super::tool_prelude_phase::approved_proposal_text(&turn_context)
-        {
-            turn_state
-                .directives
-                .push_system_message(SystemDirective::ApprovedProposalAnchor { proposal });
-        }
         // Only pin the model to the prior exchange for genuinely vague
         // challenges ("Are you sure?") — compound/new-task messages that merely
         // contain a challenge keyword must not be anchored away from their
@@ -1175,6 +1166,9 @@ impl Agent {
                     soft_limit_warned: stopping_budget.soft_limit_warned,
                     last_progress_summary: &mut last_progress_summary,
                     tool_failure_count: stopping_failures.tool_failure_count,
+                    last_failure_class: stopping_failures.last_failure_class,
+                    empty_response_retry_pending: stopping_recovery
+                        .empty_response_retry_pending,
                     policy_bundle: &mut policy_bundle,
                     user_text,
                     available_capabilities: &available_capabilities,
@@ -1542,6 +1536,7 @@ impl Agent {
                         .pending_reflection_recoveries,
                     tool_failure_patterns: tool_execution_failures.tool_failure_patterns,
                     last_tool_failure: tool_execution_failures.last_tool_failure,
+                    last_failure_class: tool_execution_failures.last_failure_class,
                     in_session_learned: tool_execution_reflection.in_session_learned,
                     unknown_tools: tool_execution_failures.unknown_tools,
                     recent_tool_calls: tool_execution_stall.recent_tool_calls,

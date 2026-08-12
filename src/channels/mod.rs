@@ -7,6 +7,7 @@ mod discord;
 mod formatting;
 mod hub;
 pub(crate) mod live_status;
+mod presentation;
 mod rate_limit;
 #[cfg(feature = "slack")]
 mod slack;
@@ -20,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "discord")]
 pub use discord::{spawn_discord_channel, DiscordChannel};
 pub use hub::{ChannelHub, SessionMap};
+pub(crate) use presentation::{prepare_chat_message, present_notification};
 #[cfg(feature = "slack")]
 pub use slack::{spawn_slack_channel, SlackChannel};
 pub use telegram::TelegramChannel;

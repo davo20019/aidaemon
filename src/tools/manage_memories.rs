@@ -367,7 +367,7 @@ fn manage_memories_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "health", "repair", "forget", "set_privacy", "search", "search_episodes", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"]
+                    "enum": ["list", "health", "repair", "forget", "set_privacy", "search", "search_episodes", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal", "create_scheduled_goal", "activate_scheduled", "list_scheduled", "list_scheduled_matching", "add_schedule", "cancel_scheduled", "pause_scheduled", "resume_scheduled", "retry_scheduled", "retry_failed_scheduled", "cancel_scheduled_matching", "retry_scheduled_matching", "diagnose_scheduled"]
                 },
                 "limit": { "type": "integer" },
                 "category": { "type": "string" },
@@ -1245,15 +1245,78 @@ impl Tool for ManageMemoriesTool {
                         )),
                     }
                 } else {
-                    // Fallback: text-based confirmation when no approval channel
+                    // The next owner turn is interpreted normally by the model.
+                    // It must resolve that natural-language intent to the typed,
+                    // session-scoped `activate_scheduled` or `cancel_scheduled`
+                    // action for this exact goal; no phrase router mutates state.
                     Ok(format!(
-                        "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. Reply **confirm** to activate or **cancel** to discard.",
+                        "Created scheduled goal {} (pending confirmation) with {} schedule(s). Next: {}. System timezone: {}. The owner may approve or decline it in natural language; resolve that decision using this exact goal ID.",
                         goal.id,
                         parsed.len(),
                         next_run,
                         tz_label
                     ))
                 }
+            }
+            "activate_scheduled" => {
+                let is_owner = args
+                    ._user_role
+                    .as_deref()
+                    .is_some_and(|role| role.eq_ignore_ascii_case("owner"));
+                if !is_owner {
+                    return Ok("Only the owner can activate scheduled goals.".to_string());
+                }
+                let session_id = args._session_id.as_deref().unwrap_or("").trim();
+                if session_id.is_empty() {
+                    return Ok(
+                        "Internal error: activate_scheduled requires _session_id.".to_string(),
+                    );
+                }
+                let goal_id = args.goal_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'goal_id' is required for activate_scheduled action")
+                })?;
+                let resolved_goal_id = match self.resolve_goal_id(goal_id).await {
+                    Ok(id) => id,
+                    Err(error) => return Ok(error.to_string()),
+                };
+                let Some(goal) = self.state.get_goal(&resolved_goal_id).await? else {
+                    return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
+                };
+                if goal.session_id != session_id {
+                    return Ok(format!(
+                        "Cannot activate scheduled goal {} from a different owner session.",
+                        resolved_goal_id
+                    ));
+                }
+                if goal.status != "pending_confirmation" {
+                    return Ok(format!(
+                        "Scheduled goal {} is not awaiting confirmation (current status: {}).",
+                        resolved_goal_id, goal.status
+                    ));
+                }
+                if !self.state.activate_goal(&resolved_goal_id).await? {
+                    return Ok(format!(
+                        "Scheduled goal {} was not activated because its state changed.",
+                        resolved_goal_id
+                    ));
+                }
+                let next_run = self
+                    .state
+                    .get_schedules_for_goal(&resolved_goal_id)
+                    .await?
+                    .iter()
+                    .filter_map(|schedule| {
+                        chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at).ok()
+                    })
+                    .min_by_key(|at| at.timestamp())
+                    .map(|at| {
+                        crate::cron_utils::humanize_run_time(at.with_timezone(&chrono::Local))
+                    })
+                    .unwrap_or_else(|| "unscheduled".to_string());
+                Ok(format!(
+                    "Activated scheduled goal {} (next run {}).",
+                    resolved_goal_id, next_run
+                ))
             }
             "list_scheduled" => {
                 let all_goals = self.state.get_scheduled_goals().await?;
@@ -1720,9 +1783,9 @@ impl Tool for ManageMemoriesTool {
                 let Some(mut goal) = self.state.get_goal(&resolved_goal_id).await? else {
                     return Ok(format!("Scheduled goal not found: {}", resolved_goal_id));
                 };
-                if goal.status != "failed" {
+                if !matches!(goal.status.as_str(), "failed" | "stalled") {
                     return Ok(format!(
-                        "Only failed scheduled goals can be retried (current status: {}).",
+                        "Only failed or stalled scheduled goals can be retried (current status: {}).",
                         goal.status
                     ));
                 }
@@ -1737,6 +1800,7 @@ impl Tool for ManageMemoriesTool {
                 }
                 goal.status = "active".to_string();
                 goal.completed_at = None;
+                goal.dispatch_failures = 0;
                 goal.updated_at = chrono::Utc::now().to_rfc3339();
                 self.state.update_goal(&goal).await?;
                 Ok(format!(
@@ -1750,16 +1814,16 @@ impl Tool for ManageMemoriesTool {
                 let mut matched: Vec<&crate::traits::Goal> = goals
                     .iter()
                     .filter(|g| {
-                        g.status == "failed"
+                        matches!(g.status.as_str(), "failed" | "stalled")
                             && (query.is_empty() || Self::goal_matches_query(g, query))
                     })
                     .collect();
                 if matched.is_empty() {
                     if query.is_empty() {
-                        return Ok("No failed scheduled goals to retry.".to_string());
+                        return Ok("No failed or stalled scheduled goals to retry.".to_string());
                     }
                     return Ok(format!(
-                        "No failed scheduled goals matched query '{}'.",
+                        "No failed or stalled scheduled goals matched query '{}'.",
                         query
                     ));
                 }
@@ -1778,6 +1842,7 @@ impl Tool for ManageMemoriesTool {
                     }
                     updated.status = "active".to_string();
                     updated.completed_at = None;
+                    updated.dispatch_failures = 0;
                     updated.updated_at = chrono::Utc::now().to_rfc3339();
                     match self.state.update_goal(&updated).await {
                         Ok(()) => {
@@ -1906,7 +1971,7 @@ impl Tool for ManageMemoriesTool {
 
                 let mut active_evergreen = self.state.count_active_evergreen_goals().await?;
                 for g in matched {
-                    if g.status != "failed" {
+                    if !matches!(g.status.as_str(), "failed" | "stalled") {
                         non_failed.push(format!("{} ({})", g.id, g.status));
                         continue;
                     }
@@ -1917,6 +1982,7 @@ impl Tool for ManageMemoriesTool {
                     }
                     updated.status = "active".to_string();
                     updated.completed_at = None;
+                    updated.dispatch_failures = 0;
                     updated.updated_at = chrono::Utc::now().to_rfc3339();
                     match self.state.update_goal(&updated).await {
                         Ok(()) => {
@@ -1930,7 +1996,7 @@ impl Tool for ManageMemoriesTool {
                 }
 
                 let mut out = format!(
-                    "retry_scheduled_matching('{}'): retried {}, non-failed {}, cap-blocked {}, errors {}.",
+                    "retry_scheduled_matching('{}'): retried {}, not-retryable {}, cap-blocked {}, errors {}.",
                     query,
                     retried.len(),
                     non_failed.len(),
@@ -1941,7 +2007,7 @@ impl Tool for ManageMemoriesTool {
                     out.push_str(&format!("\nRetried:\n- {}", retried.join("\n- ")));
                 }
                 if !non_failed.is_empty() {
-                    out.push_str(&format!("\nNot failed (unchanged):\n- {}", non_failed.join("\n- ")));
+                    out.push_str(&format!("\nNot failed/stalled (unchanged):\n- {}", non_failed.join("\n- ")));
                 }
                 if !cap_blocked.is_empty() {
                     out.push_str(&format!(
@@ -2107,7 +2173,7 @@ impl Tool for ManageMemoriesTool {
                     .run_now(goal_id, None)
                     .await
             }
-            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, diagnose_scheduled, or trigger_now.", other)),
+            other => Ok(format!("Unknown action: '{}'. Use list, forget, set_privacy, search, create_personal_goal, list_goals, complete_goal, abandon_goal, create_scheduled_goal, activate_scheduled, list_scheduled, list_scheduled_matching, add_schedule, cancel_scheduled, pause_scheduled, resume_scheduled, retry_scheduled, retry_failed_scheduled, cancel_scheduled_matching, retry_scheduled_matching, diagnose_scheduled, or trigger_now.", other)),
         }
     }
 
@@ -2747,7 +2813,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("Triggered manual run"));
+        assert!(result.contains("Queued manual run"));
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].context, goal.context);
@@ -2758,6 +2824,7 @@ mod tests {
             .unwrap()
             .expect("compatibility trigger creates an open goal run");
         assert_eq!(run.trigger_type, "manual");
+        assert_eq!(run.status, "pending");
         assert_eq!(run.root_task_id.as_deref(), Some(tasks[0].id.as_str()));
     }
 
@@ -2992,6 +3059,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_scheduled_reactivates_stalled_goal_and_resets_breaker() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+
+        let mut goal = Goal::new_continuous(
+            "Stalled synthetic blog goal",
+            "user-session",
+            Some(2000),
+            Some(20000),
+        );
+        goal.status = "stalled".to_string();
+        goal.dispatch_failures = 3;
+        let goal_id = goal.id.clone();
+        state.create_goal(&goal).await.unwrap();
+        add_schedule(&state, &goal.id, "0 12 * * *").await;
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "retry_scheduled",
+                    "goal_id": goal_id
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Retried scheduled goal"));
+        let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, "active");
+        assert_eq!(fetched.dispatch_failures, 0);
+    }
+
+    #[tokio::test]
     async fn retry_scheduled_rejects_non_failed_goal() {
         let state = setup_state().await;
         let tool = ManageMemoriesTool::new(state.clone());
@@ -3017,7 +3118,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("Only failed scheduled goals can be retried"));
+        assert!(result.contains("Only failed or stalled scheduled goals can be retried"));
         let fetched = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, "active");
     }
@@ -3348,6 +3449,86 @@ mod tests {
         assert_eq!(schedules.len(), 1);
         assert!(!schedules[0].is_one_shot);
         assert_eq!(schedules[0].cron_expr, "0 */6 * * *");
+    }
+
+    #[tokio::test]
+    async fn activate_scheduled_is_typed_owner_and_session_scoped() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state.clone());
+        tool.call(
+            &json!({
+                "action": "create_scheduled_goal",
+                "goal": "Review operational health",
+                "schedule": "every 6h",
+                "_user_role": "owner",
+                "_session_id": "owner-session"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let goal = state
+            .get_scheduled_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|goal| goal.description == "Review operational health")
+            .unwrap();
+
+        let wrong_session = tool
+            .call(
+                &json!({
+                    "action": "activate_scheduled",
+                    "goal_id": goal.id,
+                    "_user_role": "owner",
+                    "_session_id": "different-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(wrong_session.contains("different owner session"));
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "pending_confirmation"
+        );
+
+        let activated = tool
+            .call(
+                &json!({
+                    "action": "activate_scheduled",
+                    "goal_id": goal.id,
+                    "_user_role": "owner",
+                    "_session_id": "owner-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(activated.contains("Activated scheduled goal"));
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_scheduled_rejects_non_owner() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state);
+        let result = tool
+            .call(
+                &json!({
+                    "action": "activate_scheduled",
+                    "goal_id": "goal-id",
+                    "_user_role": "guest",
+                    "_session_id": "owner-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("Only the owner"));
     }
 
     #[tokio::test]

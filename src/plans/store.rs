@@ -151,9 +151,7 @@ impl PlanStore {
             if task_id.is_some() {
                 existing.task_id = task_id.map(|t| t.to_string());
             }
-            if existing.is_finished() {
-                existing.status = PlanStatus::Completed;
-            }
+            existing.sync_active_step();
             self.update(&existing).await?;
             Ok(existing)
         } else {
@@ -167,6 +165,7 @@ impl PlanStore {
             plan.steps = steps;
             plan.current_step = current_step;
             plan.task_id = task_id.map(|t| t.to_string());
+            plan.sync_active_step();
             self.create(&plan).await?;
             Ok(plan)
         }
@@ -404,10 +403,7 @@ impl PlanStore {
             return Ok(None);
         }
 
-        plan.updated_at = Utc::now();
-        if plan.is_finished() {
-            plan.status = PlanStatus::Completed;
-        }
+        plan.sync_active_step();
         self.update(&plan).await?;
         Ok(Some(plan))
     }

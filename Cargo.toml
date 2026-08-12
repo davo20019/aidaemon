@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon"
-version = "0.11.46"
+version = "0.11.48"
 edition = "2021"
 description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
 license = "MIT"
@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["ai", "daemon", "telegram", "llm", "mcp"]
 categories = ["command-line-utilities"]
 exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/"]
+
+[workspace]
+members = ["crates/node-protocol", "crates/node-sdk"]
+resolver = "2"
 
 [[bin]]
 name = "db_probe"
@@ -23,6 +27,7 @@ path = "src/bin/computer_use_probe.rs"
 required-features = ["computer_use-macos"]
 
 [dependencies]
+aidaemon-node-protocol = { path = "crates/node-protocol" }
 shell-words = "1.1"
 tokio = { version = "1", features = ["full"] }
 teloxide = { version = "0.17", features = ["macros", "webhooks-axum"] }
@@ -76,8 +81,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+serialport = { version = "4.8", default-features = false }
 hkdf = { version = "0.12", optional = true }
-p256 = { version = "0.13", features = ["ecdh"], optional = true }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 aes-gcm = { version = "0.10", optional = true }
 portable-pty = { version = "0.8", optional = true }
 
@@ -108,7 +114,6 @@ execution-docker = []
 terminal-bridge = [
     "dep:tokio-tungstenite",
     "dep:hkdf",
-    "dep:p256",
     "dep:aes-gcm",
     "dep:portable-pty",
 ]

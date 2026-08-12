@@ -138,88 +138,6 @@ pub(super) fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
     )
 }
 
-fn looks_like_tool_contract_error(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "missing required parameter",
-            "missing required field",
-            "invalid arguments",
-            "invalid argument",
-            "invalid json",
-            "invalid request format",
-            "failed to parse",
-            "parse error",
-            "expected object",
-            "schema mismatch",
-            "unexpected field",
-            "unknown action",
-            "requires `goal_id`",
-            "requires 'goal_id'",
-            "\"goal_id\" is required",
-            "tool-only parameters were embedded in the url",
-        ],
-    )
-}
-
-fn looks_like_environment_error(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "file not found",
-            "no such file",
-            "no such directory",
-            "does not exist",
-            "path is a directory",
-            "not a git repository",
-            "permission denied",
-            "operation not permitted",
-            "access denied",
-            "unauthorized",
-            "forbidden",
-            "missing auth",
-            "missing api key",
-            "credentials",
-            "command not found",
-            "service not running",
-            "not configured",
-        ],
-    )
-}
-
-fn metadata_indicates_tool_invocation_failure(metadata: &crate::traits::ToolCallMetadata) -> bool {
-    if metadata.timed_out {
-        return true;
-    }
-    metadata
-        .transport_error
-        .as_ref()
-        .is_some_and(|transport_err| {
-            let lower_err = transport_err.to_ascii_lowercase();
-            contains_any(
-                &lower_err,
-                &[
-                    "timed out",
-                    "timeout",
-                    "connection refused",
-                    "connection reset",
-                    "broken pipe",
-                    "network",
-                    "rate limit",
-                    "429",
-                    "503",
-                    "502",
-                    "504",
-                    "econnrefused",
-                    "econnreset",
-                    "etimedout",
-                    "ehostunreach",
-                    "dns",
-                ],
-            )
-        })
-}
-
 fn is_file_lookup_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -645,6 +563,9 @@ pub(super) fn classify_tool_result_failure_with_context(
     metadata: Option<&crate::traits::ToolCallMetadata>,
 ) -> Option<ToolFailureClass> {
     if let Some(meta) = metadata {
+        if let Some(status) = meta.outcome_status {
+            return failure_class_from_outcome_status(status);
+        }
         if let Some(ref transport_err) = meta.transport_error {
             // Tool Err results always set transport_error, but many are semantic
             // errors (wrong path, invalid args) not true transport failures.
@@ -789,10 +710,22 @@ pub(super) fn tool_outcome_evidence_source(
     crate::events::ToolOutcomeEvidenceSource::LegacyText
 }
 
+pub(super) fn failure_class_from_outcome_status(
+    outcome_status: ToolOutcomeStatus,
+) -> Option<ToolFailureClass> {
+    match outcome_status {
+        ToolOutcomeStatus::FailedRetryable => Some(ToolFailureClass::Transient),
+        ToolOutcomeStatus::FailedPermanent | ToolOutcomeStatus::Blocked => {
+            Some(ToolFailureClass::Semantic)
+        }
+        ToolOutcomeStatus::Succeeded
+        | ToolOutcomeStatus::CompletedWithNegativeResult
+        | ToolOutcomeStatus::Backgrounded => None,
+    }
+}
+
 pub(super) fn classify_execution_failure_kind(
-    tool_name: &str,
-    result_text: &str,
-    tool_arguments: Option<&str>,
+    outcome_status: ToolOutcomeStatus,
     metadata: Option<&crate::traits::ToolCallMetadata>,
     had_deterministic_contract_violation: bool,
 ) -> Option<ExecutionFailureKind> {
@@ -800,23 +733,15 @@ pub(super) fn classify_execution_failure_kind(
         return Some(ExecutionFailureKind::ToolContractFailure);
     }
 
-    let lower = strip_appended_diagnostics(result_text).to_ascii_lowercase();
-    if looks_like_tool_contract_error(&lower) {
-        return Some(ExecutionFailureKind::ToolContractFailure);
+    if !outcome_status.is_failure() {
+        return None;
     }
-    if looks_like_environment_error(&lower) {
-        return Some(ExecutionFailureKind::EnvironmentFailure);
-    }
-    if metadata.is_some_and(metadata_indicates_tool_invocation_failure) {
+    if outcome_status == ToolOutcomeStatus::FailedRetryable
+        || metadata.is_some_and(|meta| meta.timed_out || meta.transport_error.is_some())
+    {
         return Some(ExecutionFailureKind::ToolInvocationFailure);
     }
-
-    classify_tool_result_failure_with_context(tool_name, result_text, tool_arguments, metadata).map(
-        |failure_class| match failure_class {
-            ToolFailureClass::Transient => ExecutionFailureKind::ToolInvocationFailure,
-            ToolFailureClass::Semantic => ExecutionFailureKind::LogicFailure,
-        },
-    )
+    Some(ExecutionFailureKind::LogicFailure)
 }
 
 /// Extract the most informative error line from a tool error result.
@@ -1037,6 +962,7 @@ mod tool_error_detection_tests {
         classify_tool_result_failure_with_args, classify_tool_result_failure_with_context,
         ExecutionFailureKind, ToolFailureClass,
     };
+    use crate::traits::ToolOutcomeStatus;
 
     #[test]
     fn detects_prefixed_transient_error() {
@@ -1153,7 +1079,7 @@ mod tool_error_detection_tests {
         assert_eq!(classified, Some(ToolFailureClass::Semantic));
 
         let failure_kind =
-            classify_execution_failure_kind("manage_skills", result, None, None, false);
+            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, false);
         assert_eq!(failure_kind, Some(ExecutionFailureKind::LogicFailure));
     }
 
@@ -1179,7 +1105,11 @@ mod tool_error_detection_tests {
                 "{result}"
             );
             assert_eq!(
-                classify_execution_failure_kind("terminal", result, None, None, false),
+                classify_execution_failure_kind(
+                    ToolOutcomeStatus::FailedRetryable,
+                    None,
+                    false,
+                ),
                 Some(ExecutionFailureKind::ToolInvocationFailure),
                 "{result}"
             );
@@ -1413,27 +1343,17 @@ mod tool_error_detection_tests {
     }
 
     #[test]
-    fn execution_failure_kind_detects_tool_contract_errors() {
-        let classified = classify_execution_failure_kind(
-            "manage_memories",
-            r#"{"error":"invalid arguments: missing required field"}"#,
-            None,
-            None,
-            false,
-        );
+    fn execution_failure_kind_uses_typed_contract_violation() {
+        let classified =
+            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, true);
         assert_eq!(classified, Some(ExecutionFailureKind::ToolContractFailure));
     }
 
     #[test]
-    fn execution_failure_kind_detects_environment_errors() {
-        let classified = classify_execution_failure_kind(
-            "read_file",
-            "Error: File not found: /tmp/missing.txt",
-            None,
-            None,
-            false,
-        );
-        assert_eq!(classified, Some(ExecutionFailureKind::EnvironmentFailure));
+    fn permanent_failure_defaults_to_logic_replan_without_text_parsing() {
+        let classified =
+            classify_execution_failure_kind(ToolOutcomeStatus::FailedPermanent, None, false);
+        assert_eq!(classified, Some(ExecutionFailureKind::LogicFailure));
     }
 
     #[test]
@@ -1443,9 +1363,7 @@ mod tool_error_detection_tests {
             ..Default::default()
         };
         let classified = classify_execution_failure_kind(
-            "web_fetch",
-            "Error: connection refused",
-            None,
+            ToolOutcomeStatus::FailedRetryable,
             Some(&metadata),
             false,
         );
@@ -1462,9 +1380,7 @@ mod tool_error_detection_tests {
             ..Default::default()
         };
         let classified = classify_execution_failure_kind(
-            "terminal",
-            "tests failed",
-            None,
+            ToolOutcomeStatus::FailedPermanent,
             Some(&metadata),
             false,
         );

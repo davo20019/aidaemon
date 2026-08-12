@@ -352,6 +352,21 @@ impl ScheduledGoalRunsTool {
             _ => {}
         }
 
+        // Manual execution is an explicit request to resume this scheduled
+        // goal. A stalled/failed goal is otherwise invisible to the heartbeat
+        // dispatcher, which can strand the newly created task forever while
+        // its run misleadingly appears "running". Reactivate before checking
+        // for existing work so a repeated run_now repairs the original run
+        // instead of creating a duplicate.
+        let reactivated = matches!(goal.status.as_str(), "failed" | "stalled");
+        if reactivated {
+            let now = chrono::Utc::now().to_rfc3339();
+            goal.status = "active".to_string();
+            goal.completed_at = None;
+            goal.updated_at = now;
+            self.state.update_goal(&goal).await?;
+        }
+
         let existing_tasks = self.state.get_tasks_for_goal(&goal.id).await?;
         let open: Vec<&Task> = existing_tasks
             .iter()
@@ -364,11 +379,21 @@ impl ScheduledGoalRunsTool {
                 .map(|t| format!("{} ({})", Self::short_id(&t.id), t.status))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let run_id = self
+                .state
+                .get_current_goal_run(&goal.id)
+                .await?
+                .map(|run| run.id)
+                .unwrap_or_else(|| "unknown".to_string());
+            let action = if reactivated {
+                "Resumed the existing manual run by reactivating its stalled goal"
+            } else {
+                "Kept the existing open run"
+            };
             return Ok(format!(
-                "Skipped run_now for {}: goal already has {} open task(s): {}.",
-                resolved_goal_id,
-                open.len(),
-                preview
+                "{action}; no duplicate run was created.\n- Durable run ID: {run_id}\n- Open task(s): {}\n- Goal status: {}",
+                preview,
+                goal.status,
             ));
         }
 
@@ -398,11 +423,6 @@ impl ScheduledGoalRunsTool {
             started_at: None,
             completed_at: None,
         };
-
-        if goal.status == "failed" {
-            goal.status = "active".to_string();
-            goal.completed_at = None;
-        }
 
         let mut schedule_consumed = false;
         if let Some(sid) = schedule_id {
@@ -446,7 +466,8 @@ impl ScheduledGoalRunsTool {
                     .await?;
             }
         }
-        self.state
+        let run = self
+            .state
             .start_goal_run(&goal.id, "manual", schedule_id, Some(&task.id))
             .await?;
 
@@ -456,8 +477,8 @@ impl ScheduledGoalRunsTool {
         self.state.create_task(&task).await?;
 
         let mut out = format!(
-            "Triggered manual run for scheduled goal {}.\n- Created task: {}\n- Goal status: {}",
-            resolved_goal_id, task.id, goal.status
+            "Queued manual run for scheduled goal {}.\n- Durable run ID: {}\n- Created task: {}\n- Run status: {}\n- Goal status: {}",
+            resolved_goal_id, run.id, task.id, run.status, goal.status
         );
         if schedule_consumed {
             out.push_str("\n- One-shot schedule consumed: schedule deleted.");
@@ -960,7 +981,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.contains("Triggered manual run"));
+        assert!(result.contains("Queued manual run"));
 
         let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
         assert_eq!(tasks.len(), 1);
@@ -976,11 +997,94 @@ mod tests {
             .unwrap()
             .expect("manual trigger creates an open goal run");
         assert_eq!(run.trigger_type, "manual");
+        assert_eq!(run.status, "pending");
         assert_eq!(run.root_task_id.as_deref(), Some(tasks[0].id.as_str()));
         assert_eq!(
             state.get_tasks_for_goal_run(&run.id).await.unwrap()[0].id,
             tasks[0].id
         );
+    }
+
+    #[tokio::test]
+    async fn run_now_reactivates_stalled_goal_without_duplicate_run() {
+        let state = setup_state().await;
+        let tool = ScheduledGoalRunsTool::new(state.clone());
+
+        let mut goal = Goal::new_continuous(
+            "Publish one diary entry",
+            "user-session",
+            Some(1000),
+            Some(5000),
+        );
+        goal.status = "stalled".to_string();
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 */6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("every 6h".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: crate::cron_utils::compute_next_run("0 */6 * * *")
+                .unwrap()
+                .to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: format!("Manual scheduled run: {}", goal.description),
+            status: "pending".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: goal.context.clone(),
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+        let original_run = state
+            .start_goal_run(&goal.id, "manual", Some(&schedule.id), Some(&task.id))
+            .await
+            .unwrap();
+        state.create_task(&task).await.unwrap();
+
+        let result = tool
+            .call(
+                &json!({
+                    "action": "run_now",
+                    "goal_id": goal.id
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Resumed the existing manual run"));
+        assert!(result.contains("no duplicate run was created"));
+        assert!(result.contains(&original_run.id));
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(state.get_tasks_for_goal(&goal.id).await.unwrap().len(), 1);
+        assert_eq!(state.get_goal_runs(&goal.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

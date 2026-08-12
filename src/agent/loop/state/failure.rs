@@ -1,3 +1,4 @@
+use crate::agent::loop_utils::ToolFailureClass;
 use crate::agent::tool_execution_phase::ToolErrorEntry;
 use std::collections::{HashMap, HashSet};
 
@@ -11,10 +12,12 @@ pub(in crate::agent) struct FailureLedger {
     tool_transient_failure_count: HashMap<String, usize>,
     tool_cooldown_until_iteration: HashMap<String, usize>,
     unknown_tools: HashSet<String>,
+    last_failure_class: Option<ToolFailureClass>,
 }
 
 pub(in crate::agent) struct StoppingFailureState<'a> {
     pub tool_failure_count: &'a HashMap<String, usize>,
+    pub last_failure_class: Option<ToolFailureClass>,
 }
 
 pub(in crate::agent) struct ToolExecutionFailureState<'a> {
@@ -26,12 +29,27 @@ pub(in crate::agent) struct ToolExecutionFailureState<'a> {
     pub tool_failure_patterns: &'a mut HashMap<(String, String), usize>,
     pub last_tool_failure: &'a mut Option<(String, String)>,
     pub unknown_tools: &'a mut HashSet<String>,
+    pub last_failure_class: &'a mut Option<ToolFailureClass>,
 }
 
 impl FailureLedger {
+    /// Clear retry gates that belong to the abandoned approach. Durable error
+    /// history and the learning ledger still describe what failed, while a
+    /// genuinely new approach gets a fresh chance to use the same tool.
+    pub(in crate::agent) fn reset_for_pivot(&mut self) {
+        self.tool_failure_count.clear();
+        self.tool_failure_signatures.clear();
+        self.tool_failure_patterns.clear();
+        self.last_tool_failure = None;
+        self.tool_transient_failure_count.clear();
+        self.tool_cooldown_until_iteration.clear();
+        self.last_failure_class = None;
+    }
+
     pub(in crate::agent) fn for_stopping_phase(&self) -> StoppingFailureState<'_> {
         StoppingFailureState {
             tool_failure_count: &self.tool_failure_count,
+            last_failure_class: self.last_failure_class,
         }
     }
 
@@ -45,6 +63,7 @@ impl FailureLedger {
             tool_failure_patterns: &mut self.tool_failure_patterns,
             last_tool_failure: &mut self.last_tool_failure,
             unknown_tools: &mut self.unknown_tools,
+            last_failure_class: &mut self.last_failure_class,
         }
     }
 
@@ -198,6 +217,26 @@ mod tests {
 
         assert_eq!(ledger.transient_failure_count("web_fetch"), 1);
         assert_eq!(ledger.cooldown_until("web_fetch"), Some(7));
+        assert!(ledger.is_unknown_tool("missing_tool"));
+    }
+
+    #[test]
+    fn pivot_clears_retry_gates_but_preserves_unknown_tool_facts() {
+        let mut ledger = FailureLedger::default();
+        ledger.increment_failure("web_fetch");
+        ledger.increment_signature("web_fetch", "timeout");
+        ledger.increment_transient_failure("web_fetch");
+        ledger.set_cooldown_until("web_fetch", 7);
+        ledger.record_unknown_tool("missing_tool");
+        ledger.last_failure_class = Some(ToolFailureClass::Transient);
+
+        ledger.reset_for_pivot();
+
+        assert_eq!(ledger.failure_count("web_fetch"), 0);
+        assert_eq!(ledger.signature_count("web_fetch", "timeout"), 0);
+        assert_eq!(ledger.transient_failure_count("web_fetch"), 0);
+        assert_eq!(ledger.cooldown_until("web_fetch"), None);
+        assert_eq!(ledger.last_failure_class, None);
         assert!(ledger.is_unknown_tool("missing_tool"));
     }
 

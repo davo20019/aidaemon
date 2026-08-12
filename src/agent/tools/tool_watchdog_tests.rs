@@ -439,7 +439,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
 
     let result = harness
         .agent
-        .execute_tool_with_watchdog(
+        .execute_tool_with_watchdog_outcome(
             "slow_tool",
             "{}",
             &ToolExecCtx {
@@ -458,13 +458,18 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 mandate_tool_call_id: None,
             },
         )
-        .await;
+        .await
+        .expect("watchdog timeout should be returned as a typed tool outcome");
 
-    let err = result.expect_err("slow tool should time out");
     assert!(
-        err.to_string().contains("timed out"),
-        "timeout error expected, got: {}",
-        err
+        result.output.contains("timed out"),
+        "timeout result expected, got: {}",
+        result.output
+    );
+    assert!(result.metadata.timed_out);
+    assert_eq!(
+        result.metadata.outcome_status,
+        Some(crate::traits::ToolOutcomeStatus::FailedRetryable)
     );
 }
 

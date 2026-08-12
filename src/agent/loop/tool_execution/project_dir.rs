@@ -459,33 +459,6 @@ pub(super) fn maybe_inject_project_dir_into_tool_args(
     Some((updated, injected_dir))
 }
 
-/// Returns true when the candidate path is an existing directory that looks
-/// like a project root (contains a recognized project marker such as
-/// `package.json`, `Cargo.toml`, `wrangler.toml`, etc.).
-///
-/// Used to relax the project scope lock: when the bot intentionally navigates
-/// to a *different* but legitimate project, the scope lock should not block it.
-pub(super) fn is_recognized_project_root(candidate_path: &str) -> bool {
-    let backend = crate::execution::active_execution_backend();
-    if backend.kind() != crate::execution::BackendKind::Local {
-        return crate::execution::normalize_active_path_lexically(candidate_path).is_ok_and(
-            |candidate| {
-                let root = std::path::Path::new(backend.workspace_root().as_str());
-                let candidate = std::path::Path::new(candidate.as_str());
-                candidate.starts_with(root)
-                    && !crate::tools::fs_utils::path_points_to_file(candidate_path)
-            },
-        );
-    }
-    let Ok(path) = crate::tools::fs_utils::validate_path(candidate_path) else {
-        return false;
-    };
-    if !path.is_dir() {
-        return false;
-    }
-    crate::tools::fs_utils::find_nearest_project_root(&path).is_some_and(|root| root == path)
-}
-
 pub(super) fn scope_allows_project_dir(scope_path: &str, candidate_path: &str) -> bool {
     let backend = crate::execution::active_execution_backend();
     let (scope, candidate) = if backend.kind() == crate::execution::BackendKind::Local {
@@ -985,81 +958,6 @@ mod tests {
         );
         let extracted = project_dir_from_tool_args("edit_file", &args).expect("project dir");
         assert_eq!(extracted, root.to_string_lossy());
-    }
-
-    #[test]
-    fn is_recognized_project_root_allows_real_project() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_a = dir.path().join("project-a");
-        let project_b = dir.path().join("project-b");
-        std::fs::create_dir_all(&project_a).expect("create project-a");
-        std::fs::create_dir_all(&project_b).expect("create project-b");
-        // project-a has Cargo.toml
-        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
-        // project-b has package.json
-        std::fs::write(project_b.join("package.json"), r#"{"name":"b"}"#).expect("write");
-
-        assert!(is_recognized_project_root(
-            project_a.to_string_lossy().as_ref()
-        ));
-        assert!(is_recognized_project_root(
-            project_b.to_string_lossy().as_ref()
-        ));
-
-        // A random dir without project markers is NOT recognized
-        let random_dir = dir.path().join("random");
-        std::fs::create_dir_all(&random_dir).expect("create random");
-        assert!(!is_recognized_project_root(
-            random_dir.to_string_lossy().as_ref()
-        ));
-
-        // A non-existent dir is NOT recognized
-        let nonexistent = dir.path().join("nonexistent");
-        assert!(!is_recognized_project_root(
-            nonexistent.to_string_lossy().as_ref()
-        ));
-    }
-
-    #[test]
-    fn scope_violation_allows_switch_to_recognized_project_root() {
-        // Simulate: primary scope is project-a, bot tries to cd to project-b
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_a = dir.path().join("project-a");
-        let project_b = dir.path().join("project-b");
-        std::fs::create_dir_all(&project_a).expect("create project-a");
-        std::fs::create_dir_all(&project_b).expect("create project-b");
-        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
-        std::fs::write(project_b.join("package.json"), r#"{"name":"b"}"#).expect("write");
-
-        // project-b is outside project-a's scope
-        assert!(!scope_allows_project_dir(
-            project_a.to_string_lossy().as_ref(),
-            project_b.to_string_lossy().as_ref()
-        ));
-
-        // but project-b IS a recognized project root, so scope violation should not fire
-        assert!(is_recognized_project_root(
-            project_b.to_string_lossy().as_ref()
-        ));
-    }
-
-    #[test]
-    fn scope_violation_still_blocks_non_project_dirs() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let project_a = dir.path().join("project-a");
-        let random = dir.path().join("random-dir");
-        std::fs::create_dir_all(&project_a).expect("create project-a");
-        std::fs::create_dir_all(&random).expect("create random");
-        std::fs::write(project_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").expect("write");
-        // random has no project markers
-
-        assert!(!scope_allows_project_dir(
-            project_a.to_string_lossy().as_ref(),
-            random.to_string_lossy().as_ref()
-        ));
-        assert!(!is_recognized_project_root(
-            random.to_string_lossy().as_ref()
-        ));
     }
 
     proptest! {

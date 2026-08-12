@@ -181,7 +181,7 @@ mod live_status_surface_tests {
         hub.register_background_status_surface("telegram:synthetic-user-1", "m1")
             .await;
 
-        let ping = "✅ Done — finished in 1m 3s. Writing up the result now…";
+        let ping = "⏳ Background step finished in 1m 3s. Preparing your result now…";
         crate::tools::terminal::deliver_background_completion_ping(
             Some(&hub),
             None,
@@ -197,7 +197,8 @@ mod live_status_surface_tests {
             let messages = channel.messages.lock().await;
             assert_eq!(edits.len(), 1, "ping must edit the handoff bubble");
             assert_eq!(edits[0].0, "m1");
-            assert!(edits[0].1.contains("Done — finished in"));
+            assert!(edits[0].1.contains("Background step finished in"));
+            assert!(!edits[0].1.contains("Done"));
             assert!(messages.is_empty(), "no fresh message when the edit works");
         }
 

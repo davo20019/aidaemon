@@ -333,12 +333,26 @@ async fn correction_gate_for_tool_call(
         .map(|t| t.call_semantics(effective_arguments));
 
     // Step 4: build the ProposedAction.
-    let action = extract_proposed_action(
+    let mut action = extract_proposed_action(
         &tc.name,
         effective_arguments,
         capabilities.as_ref(),
         semantics.as_ref(),
     );
+
+    // The correction sandbox is the approval authority for these two tools
+    // when the owner enabled the explicit bypass. Normal terminal capability
+    // metadata still says `needs_approval=true` for broad paths; leaving that
+    // flag set would block the call before the sandbox could prove it is a
+    // scoped, read-only command and make `correction_bypass_enabled` inert.
+    // Unknown capabilities remain fail-closed, and all command/path/risk checks
+    // below still run before the one-shot preapproval reaches tool I/O.
+    if correction_ctx.bypass_approvals
+        && !action.unknown_capabilities
+        && matches!(tc.name.as_str(), "terminal" | "http_request")
+    {
+        action.needs_approval = false;
+    }
 
     // Step 5: compute the normalized attempt signature.
     let signature = crate::agent::correction_sandbox::normalized_attempt_signature(&action);
@@ -527,6 +541,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
     let mut pending_reflection_recoveries = std::mem::take(ctx.pending_reflection_recoveries);
     let mut tool_failure_patterns = std::mem::take(ctx.tool_failure_patterns);
     let mut last_tool_failure = std::mem::take(ctx.last_tool_failure);
+    let mut last_failure_class = std::mem::take(ctx.last_failure_class);
     let mut in_session_learned = std::mem::take(ctx.in_session_learned);
     let mut unknown_tools = std::mem::take(ctx.unknown_tools);
     let mut recent_tool_calls = std::mem::take(ctx.recent_tool_calls);
@@ -572,6 +587,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             *ctx.pending_reflection_recoveries = pending_reflection_recoveries;
             *ctx.tool_failure_patterns = tool_failure_patterns;
             *ctx.last_tool_failure = last_tool_failure;
+            *ctx.last_failure_class = last_failure_class;
             *ctx.in_session_learned = in_session_learned;
             *ctx.unknown_tools = unknown_tools;
             *ctx.recent_tool_calls = recent_tool_calls;
@@ -1140,7 +1156,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             tool_caps,
             allowed_project_scope,
         );
-        execution_state.begin_step(step_plan.clone());
+        execution_state.stage_step(step_plan.clone());
         if matches!(
             step_plan.approval_requirement,
             ApprovalRequirement::Required { .. }
@@ -1446,6 +1462,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     ReadDecision::Execute | ReadDecision::Unknown => None,
                 };
                 if let Some(result_text) = synthetic {
+                    execution_state.begin_staged_step();
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -1701,6 +1718,25 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         "[MANDATE AUTHORITY BLOCKED] `{}` cannot run in this decision cycle ({reason}). Record a current ACT, choose a permitted action, WAIT, or ASK the owner.",
                         tc.name
                     );
+                    // This branch exits before the common activity logger. Keep
+                    // gate denials in the durable task trace so owner-facing
+                    // diagnostics cannot report a silent or empty review.
+                    if let Some(ref tid) = agent.task_id {
+                        let activity = TaskActivity {
+                            id: 0,
+                            task_id: tid.clone(),
+                            activity_type: "tool_call".to_string(),
+                            tool_name: Some(tc.name.clone()),
+                            tool_args: Some(effective_arguments.chars().take(1000).collect()),
+                            result: Some(result_text.chars().take(2000).collect()),
+                            success: Some(false),
+                            tokens_used: None,
+                            created_at: Utc::now().to_rfc3339(),
+                        };
+                        if let Err(error) = agent.state.log_task_activity(&activity).await {
+                            warn!(task_id = %tid, %error, "Failed to log mandate gate denial");
+                        }
+                    }
                     let tool_msg = Message {
                         id: Uuid::new_v4().to_string(),
                         session_id: session_id.to_string(),
@@ -1763,6 +1799,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
             None => None,
         };
+        execution_state.begin_staged_step();
         let io = match prefetched {
             Some(io) => {
                 info!(
@@ -1932,26 +1969,20 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
         }
 
-        // Track tool failures across iterations using structured detection
-        // (prefixes, JSON error payloads, HTTP statuses, non-zero exit codes).
-        let failure_class = classify_tool_result_failure_with_context(
-            &tc.name,
-            &result_text,
-            Some(&effective_arguments),
-            Some(&result_metadata),
-        );
-        let execution_failure_kind = classify_execution_failure_kind(
-            &tc.name,
-            &result_text,
-            Some(&effective_arguments),
-            Some(&result_metadata),
-            false,
-        );
         let tool_outcome_status = classify_tool_outcome_status(
             &tc.name,
             &result_text,
             Some(&effective_arguments),
             Some(&result_metadata),
+        );
+        // All downstream recovery consumes the single typed outcome. Legacy
+        // tools may still be normalized at the compatibility boundary above,
+        // but retry/stall/replan logic never re-parses prose independently.
+        let failure_class = failure_class_from_outcome_status(tool_outcome_status);
+        let execution_failure_kind = classify_execution_failure_kind(
+            tool_outcome_status,
+            Some(&result_metadata),
+            false,
         );
         let outcome_evidence = tool_outcome_evidence_source(&result_metadata);
         let is_error = tool_outcome_status.is_failure();
@@ -2189,6 +2220,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             pending_reflection_recoveries: &mut pending_reflection_recoveries,
             tool_failure_patterns: &mut tool_failure_patterns,
             last_tool_failure: &mut last_tool_failure,
+            last_failure_class: &mut last_failure_class,
             in_session_learned: &mut in_session_learned,
             force_text_response: &mut force_text_response,
             pending_system_messages: &mut pending_system_messages,
@@ -2347,6 +2379,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     completion_progress.mark_successful_external_mutation();
                 }
             }
+            let mut verified_observation = false;
             if semantics.observes_state() {
                 let can_verify = tool_result_contains_verifiable_evidence(semantics, &result_text);
                 let matched_contract = observation_matches_completion_contract(
@@ -2355,9 +2388,10 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     &effective_arguments,
                     &result_text,
                 );
+                verified_observation = can_verify && matched_contract;
                 completion_progress.mark_observation(
                     &turn_context.completion_contract,
-                    can_verify && matched_contract,
+                    verified_observation,
                 );
             }
             // send_file success means the artifact was delivered to the
@@ -2374,11 +2408,15 @@ pub(in crate::agent) async fn run_tool_execution_phase(
             }
             if completion_progress.verification_pending {
                 pending_external_action_ack = None;
-            } else if !background_detached
-                && semantics.mutates_state()
-                && caps.external_side_effect
-                && should_build_external_action_ack(&result_text)
-            {
+            } else if should_refresh_external_action_ack(
+                background_detached,
+                semantics,
+                caps.external_side_effect,
+                verified_observation,
+                completion_progress.successful_external_mutation_count,
+                completion_progress.failed_external_mutation_count,
+                &result_text,
+            ) {
                 pending_external_action_ack =
                     Some(build_external_action_completion_ack(&result_text));
             }
@@ -2945,6 +2983,74 @@ mod correction_gate_tests {
             }
             CorrectionGateDecision::GiveUpToolResult { report } => {
                 panic!("pwd should be allowed but gave up: {}", report)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bypass_allows_sandbox_safe_terminal_that_normally_needs_approval() {
+        let state = temp_state().await;
+        let subject = make_subject("/tmp");
+        let config = crate::config::SelfCorrectionConfig {
+            enabled: true,
+            correction_bypass_enabled: true,
+            max_attempts: 3,
+            shadow_mode: false,
+        };
+        let correction_ctx = build_correction_execution_context(
+            &config,
+            state,
+            subject,
+            CorrectionDispatchMode::Deferred,
+        )
+        .expect("deferred correction context must be built");
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let tc = make_tc(
+            "terminal",
+            r#"{"command":"find /tmp -type f -size +1G -ls"}"#,
+        );
+        let mut caps = HashMap::new();
+        caps.insert(
+            "terminal".to_string(),
+            ToolCapabilities {
+                read_only: false,
+                external_side_effect: false,
+                needs_approval: true,
+                idempotent: false,
+                high_impact_write: false,
+            },
+        );
+        let emitter = make_emitter().await;
+
+        let decision = correction_gate_for_tool_call(
+            &harness.agent,
+            &tc,
+            &tc.arguments,
+            &correction_ctx,
+            &caps,
+            &emitter,
+            "task-test",
+            1,
+        )
+        .await
+        .expect("gate must not error");
+
+        match decision {
+            CorrectionGateDecision::Execute {
+                correction_preapproved,
+                suppress_trusted_session,
+                ..
+            } => {
+                assert!(correction_preapproved);
+                assert!(suppress_trusted_session);
+            }
+            CorrectionGateDecision::BlockedToolResult { redacted_reason } => {
+                panic!("safe scoped find should be preapproved: {redacted_reason}")
+            }
+            CorrectionGateDecision::GiveUpToolResult { report } => {
+                panic!("safe scoped find unexpectedly exhausted budget: {report}")
             }
         }
     }

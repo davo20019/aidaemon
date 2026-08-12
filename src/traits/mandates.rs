@@ -441,6 +441,19 @@ impl MandateOperationScope {
                     .to_string(),
             );
         }
+        let requires_bound_identity = self.tool == "http_request"
+            && self.target_prefixes.iter().any(|target| {
+                let Ok(url) = reqwest::Url::parse(target) else {
+                    return false;
+                };
+                matches!(url.host_str(), Some("api.x.com" | "api.twitter.com"))
+            });
+        if requires_bound_identity && (auth_targets != 1 || account_targets != 1) {
+            return Err(
+                "X API operation scopes require exact auth_profile: and account: identity targets in every authenticated operation"
+                    .to_string(),
+            );
+        }
         if self.mutation_effects.len() > MandateAuthority::EFFECT_NAMES.len() {
             return Err("operation scope mutation effects exceed their bounded size".to_string());
         }
@@ -977,6 +990,13 @@ pub enum MandateDecisionOutcome {
     Ask,
     Stop,
 }
+
+/// Runtime-authored rationale used when a mandate deliberator exits without
+/// committing a typed decision. This marker is deliberately exact and stable:
+/// finalization treats it as a failed review that must be surfaced and retried,
+/// never as a successful model-authored WAIT.
+pub const SAFE_FALLBACK_WAIT_RATIONALE: &str =
+    "The deliberator returned without committing an explicit decision; the runtime safely defaulted this cycle to WAIT.";
 
 /// Why a STOP decision may close a mandate. Evidence-dependent reasons must
 /// cite one or more current-run structured tool receipts.
@@ -1637,6 +1657,7 @@ pub enum MandateFinalizationRejectReason {
     InvalidRequest,
     DecisionMissing,
     InvalidDecisionState,
+    DeliberatorFailed,
 }
 
 impl MandateFinalizationRejectReason {
@@ -1645,6 +1666,7 @@ impl MandateFinalizationRejectReason {
             Self::InvalidRequest => "invalid_request",
             Self::DecisionMissing => "decision_missing",
             Self::InvalidDecisionState => "invalid_decision_state",
+            Self::DeliberatorFailed => "deliberator_failed",
         }
     }
 }
@@ -1802,8 +1824,20 @@ impl MandateRunNotification {
                 self.counts.never_dispatched_mutations,
                 self.counts.ambiguous_or_reserved_mutations,
             ),
+            MandateRunNotificationKind::ReviewFailed { reason }
+                if matches!(
+                    reason,
+                    MandateFinalizationRejectReason::DecisionMissing
+                        | MandateFinalizationRejectReason::DeliberatorFailed
+                ) =>
+            {
+                format!(
+                    "Mandate {mandate_ref} review {run_ref} was interrupted before a verified decision; reason={}. No action was authorized or executed. The mandate remains active and will retry automatically at its bounded review interval. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
+                    reason.as_str(),
+                )
+            }
             MandateRunNotificationKind::ReviewFailed { reason } => format!(
-                "Mandate {mandate_ref} could not verify review {run_ref}; reason={}. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
+                "Mandate {mandate_ref} could not verify review {run_ref}; reason={}. No action was authorized or executed. No generated task, tool, error, question, rationale, or external-response text is included. {inspect}",
                 reason.as_str(),
             ),
             MandateRunNotificationKind::ExecutionLeaseLost => format!(
@@ -1837,6 +1871,26 @@ impl MandateRunNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deliberator_failure_notice_explains_safe_automatic_retry() {
+        let notice = MandateRunNotification::new(
+            "08012d3d-synthetic",
+            1,
+            "goal-synthetic",
+            "566978b6-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ReviewFailed {
+                reason: MandateFinalizationRejectReason::DeliberatorFailed,
+            },
+            MandateRunProofCounts::default(),
+            "2026-08-11T12:00:00Z",
+        );
+        let message = notice.message();
+        assert!(message.contains("No action was authorized or executed"));
+        assert!(message.contains("remains active"));
+        assert!(message.contains("retry automatically"));
+    }
 
     #[test]
     fn mandate_status_legal_transition_matrix_is_explicit() {
@@ -2110,6 +2164,35 @@ mod tests {
             .target_prefixes
             .retain(|target| !target.starts_with("account:"));
         assert!(missing_account.validate().is_err());
+    }
+
+    #[test]
+    fn x_api_operation_scopes_require_bound_profile_and_account_identity() {
+        let unbound = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.x.com/2/users/me".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        let error = unbound.validate().unwrap_err();
+        assert!(error.contains("X API operation scopes require exact auth_profile"));
+
+        let mut bound = unbound;
+        bound
+            .target_prefixes
+            .push("auth_profile:twitter".to_string());
+        bound.target_prefixes.push("account:12345".to_string());
+        assert!(bound.validate().is_ok());
+
+        let public_api = MandateOperationScope {
+            tool: "http_request".to_string(),
+            operation: ToolCallOperation::Get,
+            kind: MandateOperationKind::Observation,
+            target_prefixes: vec!["https://api.example.test/v1/status".to_string()],
+            mutation_effects: Vec::new(),
+        };
+        assert!(public_api.validate().is_ok());
     }
 
     #[test]

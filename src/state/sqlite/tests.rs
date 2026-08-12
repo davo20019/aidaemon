@@ -2120,6 +2120,13 @@ async fn setup_mandate_token_budget_run(
         .start_goal_run(&goal.id, "mandate", None, None)
         .await
         .unwrap();
+    // Token-fence tests begin after dispatcher ownership. Production reaches
+    // this state through the first atomic task claim.
+    sqlx::query("UPDATE goal_runs SET status = 'running' WHERE id = ?")
+        .bind(&run.id)
+        .execute(&store.pool())
+        .await
+        .unwrap();
     (goal, mandate, run)
 }
 
@@ -2774,6 +2781,7 @@ async fn test_cli_agent_invocation_logging() {
     // Log a start
     let inv_id = store
         .log_cli_agent_start(
+            Some("task-test-1"),
             "session1",
             "claude",
             "Create a website",
@@ -2786,6 +2794,7 @@ async fn test_cli_agent_invocation_logging() {
     // Should appear in list
     let invocations = store.get_cli_agent_invocations(10).await.unwrap();
     assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].task_id.as_deref(), Some("task-test-1"));
     assert_eq!(invocations[0].session_id, "session1");
     assert_eq!(invocations[0].agent_name, "claude");
     assert_eq!(invocations[0].prompt_summary, "Create a website");
@@ -2817,7 +2826,7 @@ async fn test_cli_agent_invocation_limit() {
     // Log 5 invocations
     for i in 0..5 {
         store
-            .log_cli_agent_start("session1", "claude", &format!("Task {}", i), None)
+            .log_cli_agent_start(None, "session1", "claude", &format!("Task {}", i), None)
             .await
             .unwrap();
     }
@@ -2836,7 +2845,7 @@ async fn test_cli_agent_invocation_failure() {
     let (store, _db) = setup_test_store().await;
 
     let inv_id = store
-        .log_cli_agent_start("session1", "gemini", "Debug crash", None)
+        .log_cli_agent_start(None, "session1", "gemini", "Debug crash", None)
         .await
         .unwrap();
 
@@ -2856,7 +2865,7 @@ async fn test_cli_agent_invocation_cleanup_stale() {
     let (store, _db) = setup_test_store().await;
 
     let inv_id = store
-        .log_cli_agent_start("session1", "claude", "Long running task", None)
+        .log_cli_agent_start(None, "session1", "claude", "Long running task", None)
         .await
         .unwrap();
 

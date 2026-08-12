@@ -873,6 +873,7 @@ impl DiscordChannel {
                 let mut task_error: Option<String> = None;
                 match result {
                     Ok(reply) => {
+                        let reply = crate::channels::prepare_chat_message(&reply);
                         let chunks = split_message(&reply, 2000);
                         for chunk in &chunks {
                             if let Err(e) = channel_id.say(&http, chunk).await {

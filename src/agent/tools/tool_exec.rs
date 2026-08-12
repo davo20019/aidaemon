@@ -535,7 +535,18 @@ impl Agent {
                         timeout_secs = timeout_dur.as_secs(),
                         "Tool call timed out"
                     );
-                    anyhow::bail!("Tool '{}' timed out after {}s", name, timeout_dur.as_secs());
+                    Ok(crate::traits::ToolCallOutcome {
+                        output: format!(
+                            "Tool '{}' timed out after {}s",
+                            name,
+                            timeout_dur.as_secs()
+                        ),
+                        metadata: crate::traits::ToolCallMetadata {
+                            outcome_status: Some(crate::traits::ToolOutcomeStatus::FailedRetryable),
+                            timed_out: true,
+                            ..crate::traits::ToolCallMetadata::default()
+                        },
+                    })
                 }
             }
         } else {

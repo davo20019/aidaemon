@@ -630,6 +630,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cli_agent_invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
             session_id TEXT NOT NULL,
             agent_name TEXT NOT NULL,
             prompt_summary TEXT NOT NULL,
@@ -641,6 +642,15 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             success INTEGER,
             duration_secs REAL
         )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query("ALTER TABLE cli_agent_invocations ADD COLUMN task_id TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_cli_agent_invocations_task_id
+         ON cli_agent_invocations(task_id)",
     )
     .execute(pool)
     .await?;
@@ -3120,29 +3130,37 @@ async fn create_memory_fts(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-    // FTS shadow tables need their own secure-delete setting. This complements
-    // SQLite `PRAGMA secure_delete=ON` so explicit source deletion does not
-    // leave old terms in mergeable FTS segments.
-    let _ = sqlx::query(
-        "INSERT INTO memory_claims_fts(memory_claims_fts, rank)
-         VALUES('secure-delete', 1)",
-    )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
-        "INSERT INTO memory_spans_fts(memory_spans_fts, rank)
-         VALUES('secure-delete', 1)",
-    )
-    .execute(pool)
-    .await;
+    // FTS5 secure-delete corrupts external-content indexes under the
+    // multi-connection SQLCipher 3.51.2 workload used by the daemon (the same
+    // update sequence is healthy through a single connection). Keep the FTS
+    // projection in compatibility mode. The database remains encrypted and
+    // `PRAGMA secure_delete=ON` still scrubs ordinary SQLite pages; deleted FTS
+    // terms are made unqueryable by the standard tombstone/merge mechanism.
+    for table in ["memory_claims_fts", "memory_spans_fts"] {
+        sqlx::query(&format!(
+            "INSERT INTO {table}({table}, rank) VALUES('secure-delete', 0)"
+        ))
+        .execute(pool)
+        .await?;
+    }
+
+    // `UPDATE OF column` fires even when an UPSERT assigns the existing value.
+    // Repeated delete/reinsert churn of an unchanged row can corrupt FTS5
+    // secure-delete segments on SQLCipher's SQLite build. Replace legacy
+    // update triggers and suppress true no-op text updates.
+    for trigger in ["memory_claims_au", "memory_spans_au"] {
+        sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+            .execute(pool)
+            .await?;
+    }
 
     for statement in [
         "CREATE TRIGGER IF NOT EXISTS memory_claims_ai AFTER INSERT ON memory_claims BEGIN INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",
         "CREATE TRIGGER IF NOT EXISTS memory_claims_ad AFTER DELETE ON memory_claims BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); END",
-        "CREATE TRIGGER IF NOT EXISTS memory_claims_au AFTER UPDATE OF claim_text ON memory_claims BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",
+        "CREATE TRIGGER memory_claims_au AFTER UPDATE OF claim_text ON memory_claims WHEN old.claim_text IS NOT new.claim_text BEGIN INSERT INTO memory_claims_fts(memory_claims_fts, rowid, claim_text) VALUES ('delete', old.id, old.claim_text); INSERT INTO memory_claims_fts(rowid, claim_text) VALUES (new.id, new.claim_text); END",
         "CREATE TRIGGER IF NOT EXISTS memory_spans_ai AFTER INSERT ON memory_spans BEGIN INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END",
         "CREATE TRIGGER IF NOT EXISTS memory_spans_ad AFTER DELETE ON memory_spans BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); END",
-        "CREATE TRIGGER IF NOT EXISTS memory_spans_au AFTER UPDATE OF content ON memory_spans BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END",
+        "CREATE TRIGGER memory_spans_au AFTER UPDATE OF content ON memory_spans WHEN old.content IS NOT new.content BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END",
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
@@ -3173,6 +3191,135 @@ pub(crate) async fn rebuild_memory_fts_projections(pool: &SqlitePool) -> anyhow:
         .execute(pool)
         .await?;
     create_memory_fts(pool).await
+}
+
+#[cfg(test)]
+mod memory_fts_trigger_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn no_op_content_updates_do_not_churn_or_corrupt_secure_delete_indexes() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE memory_claims (
+                id INTEGER PRIMARY KEY,
+                claim_text TEXT NOT NULL
+             );
+             CREATE TABLE memory_spans (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        create_memory_fts(&pool).await.unwrap();
+        for table in ["memory_claims_fts_config", "memory_spans_fts_config"] {
+            let secure_delete: i64 =
+                sqlx::query_scalar(&format!("SELECT v FROM {table} WHERE k = 'secure-delete'"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(secure_delete, 0);
+        }
+        sqlx::query("INSERT INTO memory_claims(id, claim_text) VALUES (1, 'alpha claim')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO memory_spans(id, content) VALUES (1, 'alpha span')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claim_shadow_before: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length(block)), 0) FROM memory_claims_fts_data",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let span_shadow_before: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length(block)), 0) FROM memory_spans_fts_data",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..64 {
+            sqlx::query("UPDATE memory_claims SET claim_text = claim_text WHERE id = 1")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memory_spans SET content = content WHERE id = 1")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let claim_shadow_after: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length(block)), 0) FROM memory_claims_fts_data",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let span_shadow_after: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(length(block)), 0) FROM memory_spans_fts_data",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim_shadow_after, claim_shadow_before);
+        assert_eq!(span_shadow_after, span_shadow_before);
+
+        sqlx::query("UPDATE memory_claims SET claim_text = 'beta claim' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memory_spans SET content = 'beta span' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO memory_claims_fts(memory_claims_fts) VALUES('integrity-check')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO memory_spans_fts(memory_spans_fts) VALUES('integrity-check')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let beta_claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_claims_fts WHERE memory_claims_fts MATCH 'beta'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let beta_spans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_spans_fts WHERE memory_spans_fts MATCH 'beta'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((beta_claims, beta_spans), (1, 1));
+
+        for trigger in ["memory_claims_au", "memory_spans_au"] {
+            let sql: String =
+                sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?")
+                    .bind(trigger)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(sql.contains("WHEN old."), "trigger SQL: {sql}");
+            assert!(sql.contains(" IS NOT new."), "trigger SQL: {sql}");
+        }
+    }
 }
 
 #[cfg(test)]

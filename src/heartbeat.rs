@@ -22,10 +22,73 @@ use crate::types::{ChannelContext, UserRole};
 const TASK_ESCALATION_SETTLE_SECS: i64 = 8;
 const MANDATE_REVIEW_LEASE_SECS: i64 = 30 * 60;
 const MANDATE_REVIEW_BATCH_SIZE: i64 = 20;
+const MANDATE_DISPATCH_BUSY_RETRIES: u32 = 5;
+const MANDATE_DISPATCH_BUSY_RETRY_SECS: i64 = 30;
 
 fn mandate_retry_at(mandate: &Mandate, requested_secs: Option<i64>) -> String {
     let delay = mandate.clamp_review_secs(requested_secs);
     (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+}
+
+fn mandate_budget_retry_at(mandate: &Mandate, now: chrono::DateTime<Utc>) -> String {
+    let next_day = now
+        .date_naive()
+        .succ_opt()
+        .expect("the next UTC date is representable")
+        .and_hms_opt(0, 0, 0)
+        .expect("UTC midnight is representable");
+    let mut retry_at = chrono::DateTime::<Utc>::from_naive_utc_and_offset(next_day, Utc);
+    if let Some(expiry) = mandate
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    {
+        retry_at = retry_at.min(expiry);
+    }
+    retry_at.to_rfc3339()
+}
+
+fn mandate_transient_retry_at(mandate: &Mandate, now: chrono::DateTime<Utc>) -> String {
+    let mut retry_at = now + chrono::Duration::seconds(MANDATE_DISPATCH_BUSY_RETRY_SECS);
+    if let Some(expiry) = mandate
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    {
+        retry_at = retry_at.min(expiry);
+    }
+    retry_at.to_rfc3339()
+}
+
+fn sqlite_busy_code(value: &str) -> bool {
+    value
+        .parse::<i32>()
+        .ok()
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
+            if database.code().is_some_and(|code| sqlite_busy_code(&code)) {
+                return true;
+            }
+        }
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("sqlite_busy")
+            || message.split("code:").skip(1).any(|suffix| {
+                let code = suffix
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                sqlite_busy_code(&code)
+            })
+    })
 }
 
 fn mandate_review_task_description(mandate: &Mandate, goal_run_id: &str) -> String {
@@ -197,6 +260,36 @@ fn task_is_blocked_by_terminal_dependency(task: &crate::traits::Task) -> bool {
 fn task_blocks_schedule_fire(task: &crate::traits::Task) -> bool {
     matches!(task.status.as_str(), "pending" | "claimed" | "running")
         || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
+}
+
+fn task_blocks_later_schedule_fire(
+    run: &crate::traits::GoalRun,
+    task: &crate::traits::Task,
+) -> bool {
+    // A blocked scheduled run has no active worker and terminates that
+    // occurrence. Keeping it resumable is useful for explicit recovery, but it
+    // must not suppress every later occurrence of a recurring schedule. Manual
+    // blockers and blockers in a still-running scheduled occurrence remain open.
+    !(run.trigger_type == "scheduled" && run.status == "blocked") && task_blocks_schedule_fire(task)
+}
+
+fn task_is_terminal_schedule_failure(task: &crate::traits::Task) -> bool {
+    matches!(
+        task.status.as_str(),
+        "failed" | "interrupted" | "cancelled" | "blocked"
+    )
+}
+
+fn stranded_manual_run_matches_pending_tasks(
+    run: &crate::traits::GoalRun,
+    run_tasks: &[crate::traits::Task],
+    pending_tasks: &[&crate::traits::Task],
+) -> bool {
+    run.trigger_type == "manual"
+        && matches!(run.status.as_str(), "pending" | "running")
+        && pending_tasks
+            .iter()
+            .any(|pending| run_tasks.iter().any(|task| task.id == pending.id))
 }
 
 /// Runtime snapshot of a heartbeat background job.
@@ -1020,12 +1113,61 @@ impl HeartbeatCoordinator {
         }
 
         for (goal_id, tasks) in &goals_with_pending {
-            let goal = match self.state.get_goal(goal_id).await {
+            let mut goal = match self.state.get_goal(goal_id).await {
                 Ok(Some(g)) => g,
                 _ => continue,
             };
 
-            // Only care about active goals
+            // Self-heal the impossible state produced by older run_now code:
+            // a manual run with a pending root task attached to a stalled goal.
+            // The task dispatcher normally filters non-active goals, so without
+            // this invariant repair the run can say "running" forever despite
+            // never having acquired a worker.
+            if goal.status == "stalled" {
+                let stranded_run = match self.state.get_current_goal_run(goal_id).await {
+                    Ok(Some(run)) => {
+                        let run_tasks = self
+                            .state
+                            .get_tasks_for_goal_run(&run.id)
+                            .await
+                            .unwrap_or_default();
+                        stranded_manual_run_matches_pending_tasks(&run, &run_tasks, tasks)
+                            .then_some(run)
+                    }
+                    _ => None,
+                };
+                if let Some(run) = stranded_run {
+                    goal.status = "active".to_string();
+                    goal.completed_at = None;
+                    goal.updated_at = chrono::Utc::now().to_rfc3339();
+                    if let Err(error) = self.state.update_goal(&goal).await {
+                        error!(goal_id, %error, "Failed to reactivate stranded manual run");
+                        continue;
+                    }
+                    warn!(
+                        goal_id,
+                        run_id = %run.id,
+                        pending_count = tasks.len(),
+                        "Reactivated stranded manual run before dispatch"
+                    );
+                    let message = format!(
+                        "Recovered the existing manual run `{}`; it had been queued behind a stalled goal and never started. No duplicate was created. Starting it now, with progress updates enabled.",
+                        run.id
+                    );
+                    let entry = crate::traits::NotificationEntry::new(
+                        goal_id,
+                        &goal.session_id,
+                        "status_update",
+                        &message,
+                    );
+                    if let Err(error) = self.state.enqueue_notification(&entry).await {
+                        warn!(goal_id, %error, "Failed to enqueue manual-run recovery update");
+                    }
+                }
+            }
+
+            // Only active goals are dispatchable. Stalled non-manual work is
+            // intentionally left alone for explicit recovery.
             if goal.status != "active" {
                 continue;
             }
@@ -1723,7 +1865,9 @@ impl HeartbeatCoordinator {
                 }
             }
             let delivered = if let Some(hub) = self.hub.as_ref().and_then(|w| w.upgrade()) {
-                let message = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
+                let sanitized = crate::tools::sanitize::sanitize_user_facing_reply(&entry.message);
+                let message =
+                    crate::channels::present_notification(&entry.notification_type, &sanitized);
                 // A channel adapter is external I/O. It must never be allowed to
                 // pin the heartbeat forever because this same loop admits due
                 // schedules and dispatches pending tasks on the next tick.
@@ -1793,7 +1937,10 @@ impl HeartbeatCoordinator {
         for mandate in due {
             let mandate_id = mandate.id.clone();
             let lease_token = mandate.review_lease_token.clone();
-            if let Err(error) = self.dispatch_due_mandate(mandate.clone()).await {
+            if let Err(error) = self
+                .dispatch_due_mandate_with_busy_retry(mandate.clone())
+                .await
+            {
                 error!(
                     mandate_id,
                     goal_id = %mandate.goal_id,
@@ -1801,7 +1948,11 @@ impl HeartbeatCoordinator {
                     "Failed to dispatch due mandate review"
                 );
                 if let Some(token) = lease_token.as_deref() {
-                    let retry_at = mandate_retry_at(&mandate, Some(mandate.min_review_secs));
+                    let retry_at = if is_sqlite_busy_error(&error) {
+                        mandate_transient_retry_at(&mandate, chrono::Utc::now())
+                    } else {
+                        mandate_retry_at(&mandate, Some(mandate.min_review_secs))
+                    };
                     if let Err(release_error) = self
                         .state
                         .release_mandate_review_lease(&mandate.id, token, &retry_at)
@@ -1814,6 +1965,30 @@ impl HeartbeatCoordinator {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    async fn dispatch_due_mandate_with_busy_retry(&self, mandate: Mandate) -> anyhow::Result<()> {
+        let mut busy_retries = 0_u32;
+        loop {
+            match self.dispatch_due_mandate(mandate.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if busy_retries < MANDATE_DISPATCH_BUSY_RETRIES
+                        && is_sqlite_busy_error(&error) =>
+                {
+                    busy_retries += 1;
+                    let delay_ms = 100_u64 << (busy_retries - 1);
+                    warn!(
+                        mandate_id = %mandate.id,
+                        retry = busy_retries,
+                        delay_ms,
+                        "Retrying mandate dispatch after transient SQLite contention"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1905,13 +2080,14 @@ impl HeartbeatCoordinator {
             &goal.tokens_used_day,
             &budget_today,
         ) {
-            let retry_at = mandate_retry_at(&mandate, None);
+            let retry_at = mandate_budget_retry_at(&mandate, chrono::Utc::now());
             self.state
                 .release_mandate_review_lease(&mandate.id, lease_token, &retry_at)
                 .await?;
             info!(
                 mandate_id = %mandate.id,
                 goal_id = %goal.id,
+                retry_at = %retry_at,
                 "Deferred mandate review because its daily goal budget cannot fund a full cycle"
             );
             return Ok(());
@@ -2129,7 +2305,7 @@ impl HeartbeatCoordinator {
                 .get_tasks_for_goal_run(&run.id)
                 .await?
                 .iter()
-                .filter(|task| task_blocks_schedule_fire(task))
+                .filter(|task| task_blocks_later_schedule_fire(run, task))
                 .count();
         }
 
@@ -2282,7 +2458,9 @@ impl HeartbeatCoordinator {
             if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
                 let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
                 if !run_tasks.is_empty() {
-                    let active_or_human_blocked = run_tasks.iter().any(task_blocks_schedule_fire);
+                    let active_or_human_blocked = run_tasks
+                        .iter()
+                        .any(|task| task_blocks_later_schedule_fire(&open_run, task));
                     if active_or_human_blocked {
                         warn!(
                             goal_id = %goal.id,
@@ -2291,15 +2469,11 @@ impl HeartbeatCoordinator {
                         );
                         return Ok(());
                     }
-                    let status =
-                        if run_tasks.iter().any(|task| {
-                            matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
-                        }) || run_tasks.iter().any(task_is_blocked_by_terminal_dependency)
-                        {
-                            "failed"
-                        } else {
-                            "completed"
-                        };
+                    let status = if run_tasks.iter().any(task_is_terminal_schedule_failure) {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
                     let _ = self
                         .state
                         .finish_goal_run(
@@ -2561,6 +2735,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_open_manual_run_can_reactivate_stalled_pending_work() {
+        let pending = synthetic_task("manual root", "pending");
+        let candidates = vec![&pending];
+        let mut run = crate::traits::GoalRun::new("goal-1", "default", "manual");
+
+        assert!(stranded_manual_run_matches_pending_tasks(
+            &run,
+            std::slice::from_ref(&pending),
+            &candidates,
+        ));
+
+        run.trigger_type = "scheduled".to_string();
+        assert!(!stranded_manual_run_matches_pending_tasks(
+            &run,
+            std::slice::from_ref(&pending),
+            &candidates,
+        ));
+
+        run.trigger_type = "manual".to_string();
+        run.status = "completed".to_string();
+        assert!(!stranded_manual_run_matches_pending_tasks(
+            &run,
+            std::slice::from_ref(&pending),
+            &candidates,
+        ));
+
+        let other = synthetic_task("different task", "pending");
+        run.status = "pending".to_string();
+        assert!(!stranded_manual_run_matches_pending_tasks(
+            &run,
+            std::slice::from_ref(&other),
+            &candidates,
+        ));
+    }
+
+    #[test]
+    fn scheduled_blocker_only_retires_the_prior_scheduled_occurrence() {
+        let blocked = synthetic_task("scheduled blocker", "blocked");
+        let mut provider_blocked = blocked.clone();
+        provider_blocked.blocker = Some(
+            "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
+                .to_string(),
+        );
+        let pending = synthetic_task("still in flight", "pending");
+        let mut scheduled_run = crate::traits::GoalRun::new("goal-1", "default", "scheduled");
+        scheduled_run.status = "blocked".to_string();
+        let mut manual_run = crate::traits::GoalRun::new("goal-1", "default", "manual");
+        manual_run.status = "blocked".to_string();
+
+        assert!(!task_blocks_later_schedule_fire(&scheduled_run, &blocked,));
+        assert!(task_blocks_later_schedule_fire(&manual_run, &blocked));
+        assert!(!task_blocks_later_schedule_fire(
+            &scheduled_run,
+            &provider_blocked,
+        ));
+        assert!(task_blocks_later_schedule_fire(
+            &manual_run,
+            &provider_blocked,
+        ));
+        assert!(!task_blocks_later_schedule_fire(&scheduled_run, &pending,));
+
+        scheduled_run.status = "running".to_string();
+        assert!(task_blocks_later_schedule_fire(&scheduled_run, &blocked));
+        assert!(task_blocks_later_schedule_fire(&scheduled_run, &pending));
+        assert!(task_is_terminal_schedule_failure(&blocked));
+    }
+
     fn due_mandate_controller(session_id: &str) -> (Goal, Mandate) {
         let goal = Goal::new_continuous(
             "Steward an account autonomously",
@@ -2649,6 +2891,55 @@ mod tests {
             .unwrap()
             .review_lease_token
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn mandate_budget_deferral_waits_for_the_next_utc_reset() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let state: Arc<dyn StateStore> = Arc::new(
+            SqliteStateStore::new(
+                db_file.path().to_str().unwrap(),
+                100,
+                None,
+                Arc::new(EmbeddingService::new().unwrap()),
+            )
+            .await
+            .unwrap(),
+        );
+        let (mut goal, mandate) = due_mandate_controller("owner-session");
+        goal.tokens_used_today = 95_000;
+        goal.tokens_used_day = chrono::Utc::now().date_naive().to_string();
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now();
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.check_due_mandates().await;
+
+        assert!(state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .is_none());
+        let deferred = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert!(deferred.review_lease_token.is_none());
+        let retry_at = chrono::DateTime::parse_from_rfc3339(&deferred.next_review_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected_midnight = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            before
+                .date_naive()
+                .succ_opt()
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert_eq!(retry_at, expected_midnight);
     }
 
     #[tokio::test]
@@ -2866,6 +3157,36 @@ mod tests {
             "2026-06-27",
             today,
         ));
+    }
+
+    #[test]
+    fn mandate_sqlite_contention_uses_a_short_expiry_bounded_retry() {
+        assert!(is_sqlite_busy_error(&anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        )));
+        assert!(!is_sqlite_busy_error(&anyhow::anyhow!(
+            "controller goal is missing"
+        )));
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-04T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let goal = crate::traits::Goal::new_continuous("retry", "owner", None, None);
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "retry transient contention",
+            "owner",
+            crate::traits::MandateAuthority::default(),
+            1_800,
+            86_400,
+            1_800,
+        );
+        mandate.expires_at = Some("2026-08-04T05:00:20Z".to_string());
+        assert_eq!(
+            mandate_transient_retry_at(&mandate, now),
+            "2026-08-04T05:00:20+00:00"
+        );
     }
 
     async fn test_state_store() -> Arc<dyn StateStore> {
@@ -3583,6 +3904,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blocked_scheduled_run_does_not_coalesce_later_occurrence() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Daily synthetic journal", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: Some((now - chrono::Duration::minutes(2)).to_rfc3339()),
+            next_run_at: (now - chrono::Duration::minutes(1)).to_rfc3339(),
+            created_at: now_ts.clone(),
+            updated_at: now_ts.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let blocked_run = state
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        let blocked_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Review the latest synthetic repository work".to_string(),
+            status: "blocked".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: Some("No verifiable new material was available for this run".to_string()),
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: Some(now_ts.clone()),
+            completed_at: Some(now_ts),
+        };
+        state.create_task(&blocked_task).await.unwrap();
+        state
+            .finish_goal_run(
+                &blocked_run.id,
+                "blocked",
+                Some("This scheduled occurrence could not proceed."),
+            )
+            .await
+            .unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.fire_due_schedule(schedule).await.unwrap();
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|task| task.id == blocked_task.id));
+        assert!(tasks
+            .iter()
+            .any(|task| task.description.starts_with("Scheduled check:")));
+
+        let runs = state.get_goal_runs(&goal.id).await.unwrap();
+        let retired = runs
+            .iter()
+            .find(|run| run.id == blocked_run.id)
+            .expect("the prior run remains available as history");
+        assert_eq!(retired.status, "failed");
+        assert!(retired.completed_at.is_some());
+        assert_ne!(
+            state
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .expect("the later occurrence has an open run")
+                .id,
+            blocked_run.id
+        );
+    }
+
+    #[tokio::test]
     async fn test_open_run_blocker_coalesces_next_schedule_fire() {
         let state = test_state_store().await;
         let goal = Goal::new_continuous("Daily tweet", "session-1", None, None);
@@ -3662,6 +4072,100 @@ mod tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc)
                 > now
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_overload_blocker_does_not_coalesce_next_schedule_fire() {
+        let state = test_state_store().await;
+        let goal = Goal::new_continuous("Daily synthetic report", "session-1", None, None);
+        state.create_goal(&goal).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let now_ts = now.to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "* * * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("* * * * *".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: (now - chrono::Duration::minutes(2)).to_rfc3339(),
+            created_at: now_ts.clone(),
+            updated_at: now_ts.clone(),
+        };
+        state.create_goal_schedule(&schedule).await.unwrap();
+
+        let overloaded_run = state
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        let overloaded_task = Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            description: "Generate the scheduled report".to_string(),
+            status: "blocked".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: Some("synthetic-worker".to_string()),
+            context: None,
+            result: None,
+            error: None,
+            blocker: Some(
+                "LLM error: Codex stream failed: Our servers are currently overloaded. Please try again later."
+                    .to_string(),
+            ),
+            idempotent: true,
+            retry_count: 1,
+            max_retries: 1,
+            created_at: now_ts.clone(),
+            started_at: Some(now_ts.clone()),
+            completed_at: Some(now_ts),
+        };
+        state.create_task(&overloaded_task).await.unwrap();
+        state
+            .finish_goal_run(
+                &overloaded_run.id,
+                "blocked",
+                Some("The model service was overloaded."),
+            )
+            .await
+            .unwrap();
+        let blocked_before_fire = state
+            .get_current_goal_run(&goal.id)
+            .await
+            .unwrap()
+            .expect("the overloaded scheduled run should still be open");
+        assert_eq!(blocked_before_fire.id, overloaded_run.id);
+        assert_eq!(blocked_before_fire.status, "blocked");
+        assert!(blocked_before_fire.completed_at.is_none());
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let mut coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.tick().await.unwrap();
+
+        let runs = state.get_goal_runs(&goal.id).await.unwrap();
+        let prior_run = runs
+            .iter()
+            .find(|run| run.id == overloaded_run.id)
+            .expect("the overloaded run remains in history");
+        assert_eq!(prior_run.status, "failed");
+        assert!(prior_run.completed_at.is_some());
+
+        let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|task| task.id == overloaded_task.id));
+        assert!(
+            tasks
+                .iter()
+                .any(|task| task.description.starts_with("Scheduled check:")),
+            "a provider-overload blocker from the prior run must not suppress the next scheduled run"
         );
     }
 
@@ -3981,6 +4485,56 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].notification_type, "stalled");
         assert_eq!(notifications[0].goal_id, goal.id);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_recovers_stranded_manual_run_before_dispatch() {
+        let state = test_state_store().await;
+        let mut goal = Goal::new_continuous(
+            "Publish one diary entry",
+            "session-1",
+            Some(5_000),
+            Some(20_000),
+        );
+        goal.status = "stalled".to_string();
+        state.create_goal(&goal).await.unwrap();
+
+        let root = synthetic_task("manual root", "pending");
+        let mut root = Task {
+            goal_id: goal.id.clone(),
+            created_at: (chrono::Utc::now() - chrono::Duration::minutes(15)).to_rfc3339(),
+            ..root
+        };
+        root.id = uuid::Uuid::new_v4().to_string();
+        let run = state
+            .start_goal_run(&goal.id, "manual", None, Some(&root.id))
+            .await
+            .unwrap();
+        state.create_task(&root).await.unwrap();
+
+        let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+        let coordinator =
+            HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+        coordinator.dispatch_pending_tasks().await;
+
+        assert_eq!(
+            state.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        assert_eq!(
+            state.get_tasks_for_goal(&goal.id).await.unwrap()[0].status,
+            "pending"
+        );
+        assert_eq!(state.get_goal_runs(&goal.id).await.unwrap().len(), 1);
+        assert_eq!(state.get_goal_runs(&goal.id).await.unwrap()[0].id, run.id);
+
+        let notifications = state.get_pending_notifications(10).await.unwrap();
+        assert!(notifications
+            .iter()
+            .all(|entry| entry.notification_type != "status_update"));
+        assert!(notifications
+            .iter()
+            .any(|entry| entry.notification_type == "stalled"));
     }
 
     #[tokio::test]

@@ -85,6 +85,7 @@ pub async fn wire_hub_cycles(
     }
     if let Some(cat) = cli_agent_tool {
         cat.set_hub(Arc::downgrade(hub));
+        cat.set_agent(Arc::downgrade(agent));
     }
 
     // Give the agent a reference to the hub for background task notifications.

@@ -464,3 +464,77 @@ include_raw_tool_args = false
 # enabled = false                  # master switch — enables the correction retry loop
 # correction_bypass_enabled = false # allow trusted sessions to skip the correction gate
 # max_attempts = 3                 # maximum correction retries per task
+
+# Nodes are disabled by default. The Gateway binds only to loopback; publish
+# this narrow service through a separately managed HTTPS transport adapter.
+[nodes.gateway]
+enabled = false
+bind = "127.0.0.1"
+port = 8787
+session_ttl_seconds = 900
+challenge_ttl_seconds = 60
+heartbeat_interval_seconds = 30
+pairing_ttl_seconds = 600
+# Optional ordered HTTPS origins for this same Gateway instance. A typical
+# deployment lists the existing remote adapter first and a separately managed
+# split-DNS/LAN TLS adapter second. The listener itself remains loopback-only.
+# advertised_endpoints = ["https://nodes.example.com", "https://nodes-lan.example.com"]
+
+# Signed K10 application releases are offered only when all three gates pass:
+# this switch, the Device's observed firmware.ota capability, and the Node's
+# explicit receive_ota authorization. Keep the signing key offline; only its
+# compressed P-256 public key belongs here. Paths should identify one reviewed,
+# immutable release pair. The Gateway rechecks signature, size and SHA-256 at
+# startup and serves only the authenticated /node/v1 firmware route.
+[nodes.ota]
+enabled = false
+manifest_path = "~/.aidaemon/firmware/k10/manifest.json"
+image_path = "~/.aidaemon/firmware/k10/firmware.bin"
+release_public_key_sec1 = ""
+max_image_bytes = 2621440
+
+# Owner-initiated Node announcements are a separate opt-in. When disabled, the
+# tool is not registered and heartbeats instruct Devices not to poll an outbox.
+[nodes.announcements]
+enabled = false
+max_text_chars = 180
+max_audio_bytes = 1000000
+ttl_seconds = 120
+poll_interval_seconds = 3
+ack_wait_seconds = 12
+max_pending_per_node = 4
+
+# Deterministic environmental monitoring and owner alerts. This remains off
+# until explicitly enabled and creates no monitor or Node grant automatically.
+[nodes.monitoring]
+enabled = false
+history_hours = 24
+max_history_rows_per_capability = 2880
+event_retention_days = 30
+max_events_per_monitor = 1000
+scan_interval_seconds = 15
+max_monitors = 64
+max_duration_days = 365
+default_stale_after_seconds = 120
+default_offline_after_seconds = 120
+
+[nodes.limits]
+control_message_bytes = 16384
+audio_upload_bytes = 524288
+image_upload_bytes = 524288
+response_audio_bytes = 2097152
+text_chars = 4096
+requests_per_minute = 120
+turns_per_minute = 10
+media_bytes_per_minute = 2097152
+
+[nodes.retention]
+retain_raw_media = false
+media_dir = "~/.aidaemon/node-media"
+
+[nodes.speech]
+enabled = false
+provider = "macos_say"
+voice = "Samantha"
+sample_rate_hz = 22050
+timeout_seconds = 20

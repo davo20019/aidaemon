@@ -7,7 +7,8 @@
 //! sibling [`project_scope`](super::project_scope) module.
 
 use super::completion_contract::{
-    infer_completion_contract, scope_contract_for_delegated_executor,
+    infer_completion_contract, inherit_unfinished_request_contract,
+    scope_contract_for_delegated_executor,
 };
 use super::followup::{
     classify_followup_mode, find_previous_turns, has_project_scope_divergence_with_aliases,
@@ -21,9 +22,11 @@ use super::project_scope::{
 };
 use super::*;
 use crate::llm_markers::INTENT_GATE_MARKER;
+use crate::traits::OpenRequestStatus;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct TurnContext {
+    #[allow(dead_code)] // Retained as an inspectable trace of contract-inference input.
     pub goal_user_text: String,
     pub recent_messages: Vec<Value>,
     pub primary_project_scope: Option<String>,
@@ -36,6 +39,22 @@ pub(super) struct TurnContext {
 const GOAL_CONTEXT_RECENT_MESSAGES_LIMIT: usize = 6;
 const GOAL_CONTEXT_HINT_HISTORY_LIMIT: usize = 30;
 const GOAL_CONTEXT_MAX_PROJECT_SCOPES: usize = 6;
+
+fn unfinished_open_request(
+    state: Option<&crate::traits::DialogueState>,
+) -> Option<&crate::traits::OpenRequest> {
+    state
+        .and_then(|state| state.open_request.as_ref())
+        .filter(|request| {
+            matches!(
+                request.status,
+                OpenRequestStatus::Open
+                    | OpenRequestStatus::InProgress
+                    | OpenRequestStatus::PartiallyAnswered
+                    | OpenRequestStatus::Blocked
+            )
+        })
+}
 
 fn normalize_message_resources(msg: &Message) -> Message {
     let mut normalized = msg.with_inferred_annotations().into_owned();
@@ -268,12 +287,13 @@ impl Agent {
         // Dialogue ingestion already classified this exact persisted user turn.
         // Reuse that decision so dialogue state and prompt assembly cannot drift
         // into contradictory modes for the same message.
-        let mut followup_mode = self
+        let dialogue_state = self
             .state
             .get_dialogue_state(session_id)
             .await
             .ok()
-            .flatten()
+            .flatten();
+        let mut followup_mode = dialogue_state
             .as_ref()
             .and_then(|state| super::dialogue_state::resolved_followup_mode(state, stored_current))
             .unwrap_or(lexical_mode);
@@ -294,7 +314,10 @@ impl Agent {
         // Mismatch preflight: still used for project scope divergence detection
         // (affects scope extraction below), but no longer gates goal_user_text enrichment.
         if followup_mode != FollowupMode::NewTask {
-            let mismatch_preflight_drop = prev_user.as_deref().is_some_and(|prev| {
+            let request_anchor = unfinished_open_request(dialogue_state.as_ref())
+                .map(|request| request.text.as_str())
+                .or(prev_user.as_deref());
+            let mismatch_preflight_drop = request_anchor.is_some_and(|prev| {
                 has_project_scope_divergence_with_aliases(
                     prev,
                     &authored_current,
@@ -317,9 +340,11 @@ impl Agent {
         // conversation context separately; concatenating the previous request
         // here leaks stale instructions into contracts, schedules, and goals.
         if followup_mode != FollowupMode::NewTask {
-            if let Some(prev_user_text) = prev_user
-                .as_deref()
-                .filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
+            let request_anchor = unfinished_open_request(dialogue_state.as_ref())
+                .map(|request| request.text.as_str())
+                .or(prev_user.as_deref());
+            if let Some(prev_user_text) =
+                request_anchor.filter(|prev| !prev.trim().eq_ignore_ascii_case(stored_current))
             {
                 let mut combined = String::new();
                 combined.push_str("Original request:\n");
@@ -405,6 +430,14 @@ impl Agent {
         );
         let mut completion_contract =
             infer_completion_contract(&goal_user_text, &self.path_aliases.projects);
+        if followup_mode != FollowupMode::NewTask {
+            if let Some(request) = unfinished_open_request(dialogue_state.as_ref()) {
+                let unfinished_contract =
+                    infer_completion_contract(&request.text, &self.path_aliases.projects);
+                completion_contract =
+                    inherit_unfinished_request_contract(completion_contract, &unfinished_contract);
+            }
+        }
         if self.role() == crate::traits::AgentRole::Executor {
             completion_contract = scope_contract_for_delegated_executor(completion_contract);
         }
@@ -903,6 +936,61 @@ mod tests {
             "recent_messages should always be included regardless of classification"
         );
     }
+
+    #[tokio::test]
+    async fn unresolved_dialogue_state_carries_original_completion_obligations() {
+        use crate::testing::{setup_test_agent, MockProvider};
+        use crate::traits::{
+            DialogueState, DialogueStateStore, OpenRequest, OpenRequestStatus, UserTurnKind,
+            UserTurnSummary,
+        };
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("test harness");
+        let now = Utc::now();
+        let mut state = DialogueState::new("test-session");
+        state.open_request = Some(OpenRequest {
+            user_message_id: "request-1".to_string(),
+            text: "Fix the scheduler bug in this repository and verify the tests.".to_string(),
+            status: OpenRequestStatus::PartiallyAnswered,
+            task_id: Some("task-1".to_string()),
+            project_scope: None,
+            semantic_scope: None,
+            opened_at: now,
+            resolved_at: None,
+        });
+        state.last_user_turn = Some(UserTurnSummary {
+            message_id: "followup-1".to_string(),
+            kind: UserTurnKind::Followup,
+            text: "Fixed?".to_string(),
+        });
+        harness
+            .state
+            .upsert_dialogue_state(&state)
+            .await
+            .expect("persist dialogue state");
+
+        let turn_context = harness
+            .agent
+            .build_turn_context_from_recent_history("test-session", "Fixed?")
+            .await;
+
+        assert_eq!(turn_context.followup_mode, Some(FollowupMode::Followup));
+        assert!(turn_context
+            .goal_user_text
+            .contains(&state.open_request.unwrap().text));
+        assert_eq!(
+            turn_context.completion_contract.task_kind,
+            CompletionTaskKind::Diagnose
+        );
+        assert!(turn_context.completion_contract.expects_mutation);
+        assert!(turn_context
+            .completion_contract
+            .required_mutation_effects
+            .contains(crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE));
+    }
+
     #[tokio::test]
     async fn build_turn_context_does_not_reuse_old_local_scope_for_external_followup() {
         use crate::testing::{setup_test_agent, MockProvider};

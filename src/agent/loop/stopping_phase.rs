@@ -77,6 +77,8 @@ pub(super) struct StoppingPhaseCtx<'a> {
     pub soft_limit_warned: &'a mut bool,
     pub last_progress_summary: &'a mut Instant,
     pub tool_failure_count: &'a HashMap<String, usize>,
+    pub last_failure_class: Option<ToolFailureClass>,
+    pub empty_response_retry_pending: bool,
     pub policy_bundle: &'a mut PolicyBundle,
     pub user_text: &'a str,
     pub available_capabilities: &'a HashMap<String, ToolCapabilities>,
@@ -165,6 +167,8 @@ pub(super) async fn run_stopping_phase(
     let mut soft_limit_warned = *ctx.soft_limit_warned;
     let mut last_progress_summary = *ctx.last_progress_summary;
     let tool_failure_count = ctx.tool_failure_count;
+    let last_failure_class = ctx.last_failure_class;
+    let empty_response_retry_pending = ctx.empty_response_retry_pending;
     let mut policy_bundle = ctx.policy_bundle.clone();
     let user_text = ctx.user_text;
     let available_capabilities = ctx.available_capabilities;
@@ -460,107 +464,30 @@ pub(super) async fn run_stopping_phase(
 
     if agent.depth == 0 {
         if let Some(_background_ack) = pending_background_ack.take() {
-            // Detect multi-step user requests that imply work beyond just
-            // launching a background process.  When the user's message
-            // contains sequencing markers ("and then", "test it", etc.)
-            // AND we are well within budget, continue the loop so the
-            // agent can handle the remaining steps (e.g., test a server
-            // that was just launched in the background).
-            let user_implies_more_steps = {
-                let lower = user_text.trim().to_ascii_lowercase();
-                // Multi-step indicators: sequencing, testing, verification
-                let has_sequencing_keywords = lower.contains("and then")
-                    || lower.contains("then ")
-                    || lower.contains("after that")
-                    || lower.contains("also ")
-                    || lower.contains("test it")
-                    || lower.contains("test the")
-                    || lower.contains("test all")
-                    || lower.contains("verify")
-                    || lower.contains("check if")
-                    || lower.contains("make sure")
-                    || lower.contains("try it")
-                    || lower.contains("connect to")
-                    || lower.contains("show me")
-                    || lower.contains("kill the")
-                    || lower.contains("stop the")
-                    || lower.contains("when done")
-                    || lower.contains("when finished")
-                    || lower.contains("once it")
-                    || lower.contains("afterwards")
-                    || (lower.contains(" and ") && lower.len() > 60);
-
-                // Heuristic: multi-sentence instructions with action verbs
-                // indicate multiple steps even without explicit sequencing words.
-                // Count sentences that start with an imperative action verb.
-                let has_multi_sentence_actions = if !has_sequencing_keywords {
-                    let action_verbs = [
-                        "test",
-                        "run",
-                        "start",
-                        "stop",
-                        "kill",
-                        "create",
-                        "build",
-                        "deploy",
-                        "send",
-                        "show",
-                        "check",
-                        "verify",
-                        "curl",
-                        "open",
-                        "write",
-                        "read",
-                        "delete",
-                        "remove",
-                        "install",
-                        "setup",
-                        "set up",
-                        "configure",
-                        "execute",
-                        "launch",
-                        "use",
-                        "try",
-                        "make",
-                        "add",
-                        "update",
-                        "fetch",
-                        "call",
-                        "hit",
-                        "restart",
-                    ];
-                    let sentences: Vec<&str> = lower
-                        .split(['.', '!', '\n'])
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let action_sentence_count = sentences
-                        .iter()
-                        .filter(|s| {
-                            action_verbs.iter().any(|v| {
-                                s.starts_with(v)
-                                    || s.starts_with(&format!("- {}", v))
-                                    || s.starts_with(&format!("* {}", v))
-                            })
-                        })
-                        .count();
-                    // 3+ action sentences = multi-step request
-                    action_sentence_count >= 3
-                } else {
-                    false
-                };
-
-                has_sequencing_keywords || has_multi_sentence_actions
-            };
             let budget_cap = hard_cap.unwrap_or(60);
             let well_within_budget = total_successful_tool_calls < (budget_cap / 2);
+            let request_has_followup_work = [
+                "and then",
+                "after that",
+                "also",
+                "test it",
+                "test the",
+                "verify",
+                "check if",
+                "make sure",
+                "connect to",
+                "when done",
+                "when finished",
+            ]
+            .iter()
+            .any(|phrase| crate::agent::keyword_match(user_text, phrase));
 
-            if user_implies_more_steps && well_within_budget {
+            if request_has_followup_work && well_within_budget {
                 info!(
                     session_id,
                     iteration,
                     total_successful_tool_calls,
-                    "Background process launched but LLM indicates more work — continuing loop"
+                    "Background process launched with explicit follow-up work — continuing the loop"
                 );
                 // The tool execution phase already pushed BackgroundHandoff
                 // (which says "do NOT call additional tools") and set
@@ -1416,10 +1343,10 @@ pub(super) async fn run_stopping_phase(
         max_stall_iterations: MAX_STALL_ITERATIONS,
         deferred_no_tool_streak,
         deferred_no_tool_switch_threshold: DEFERRED_NO_TOOL_SWITCH_THRESHOLD,
-        deferred_no_tool_error_marker: DEFERRED_NO_TOOL_ERROR_MARKER,
         max_pre_tool_deferrals: MAX_PRE_TOOL_DEFERRALS,
         total_successful_tool_calls,
-        recent_errors: &learning_ctx.errors,
+        recent_failure_class: last_failure_class,
+        empty_response_retry_pending,
     }
     .evaluate();
 
@@ -1585,7 +1512,9 @@ pub(super) async fn run_stopping_phase(
 
             // Budget decision with graceful fallback to the in-memory counter.
             let may_pivot = match controller.pivot_budget(task_id).await {
-                Ok(crate::agent::self_correction::AttemptDecision::Proceed { .. }) => true,
+                Ok(crate::agent::self_correction::AttemptDecision::Proceed { .. }) => {
+                    approach_pivots_used < crate::agent::approach_pivot::MAX_APPROACH_PIVOTS
+                }
                 Ok(crate::agent::self_correction::AttemptDecision::StopBudget) => false,
                 Ok(crate::agent::self_correction::AttemptDecision::StopRepeat) => false,
                 Err(e) => {

@@ -1335,8 +1335,9 @@ async fn test_non_owner_cannot_schedule_goal() {
     );
 }
 
-/// Non-owner (Guest) saying "confirm" while Owner has pending goals should get
-/// an owner-only message and the goal should remain pending.
+/// Non-owner (Guest) saying "confirm" while Owner has pending goals must not
+/// mutate them or receive scheduling tools. Confirmation intent is resolved by
+/// the typed, owner-scoped tool rather than a phrase router.
 #[tokio::test]
 async fn test_non_owner_cannot_confirm_scheduled_goal() {
     let harness = setup_test_agent(MockProvider::new()).await.unwrap();
@@ -1360,11 +1361,11 @@ async fn test_non_owner_cannot_confirm_scheduled_goal() {
         .await
         .unwrap();
 
-    // Should get the owner-only message
+    assert!(!response.is_empty());
+    let call_log = harness.provider.call_log.lock().await;
     assert!(
-        response.contains("Only the owner"),
-        "Expected owner-only message, got: {}",
-        response
+        call_log.iter().all(|call| call.tools.is_empty()),
+        "Guest confirmation turns must not receive scheduling tools"
     );
 
     // Goal should still be pending_confirmation (not activated or cancelled)

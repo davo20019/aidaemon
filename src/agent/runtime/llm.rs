@@ -831,7 +831,7 @@ mod tests {
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
     use crate::traits::{
-        ChatOptions, Goal, Mandate, MandateAuthority, ModelProvider, ProviderResponse,
+        ChatOptions, Goal, Mandate, MandateAuthority, ModelProvider, ProviderResponse, Task,
     };
 
     struct ScriptedProvider {
@@ -1018,6 +1018,38 @@ mod tests {
             .start_goal_run(&goal.id, "mandate", None, None)
             .await
             .unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        harness
+            .state
+            .create_task(&Task {
+                id: task_id.clone(),
+                goal_id: goal.id.clone(),
+                description: "Own the synthetic mandate run".to_string(),
+                status: "pending".to_string(),
+                priority: "high".to_string(),
+                task_order: 0,
+                parallel_group: None,
+                depends_on: None,
+                agent_id: None,
+                context: None,
+                result: None,
+                error: None,
+                blocker: None,
+                idempotent: false,
+                retry_count: 0,
+                max_retries: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                started_at: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        harness
+            .state
+            .claim_task_with_lease(&task_id, "budget-test-worker", None, 300)
+            .await
+            .unwrap()
+            .expect("synthetic mandate task claim");
         harness
             .state
             .ensure_mandate_run_token_budget(&run.id, &mandate.id, mandate.version, 100)

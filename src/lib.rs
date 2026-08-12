@@ -29,6 +29,7 @@ mod logging;
 mod mandates;
 mod mcp;
 mod memory;
+pub mod nodes;
 mod oauth;
 #[allow(dead_code)]
 mod plans;
@@ -195,6 +196,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!("  auth logout openai    Disconnect the ChatGPT subscription");
                 println!("  dashboard             Open the authenticated local dashboard");
                 println!("  dashboard login-url   Print a local dashboard login URL");
+                println!("  node <command>        Pair, inspect, authorize, or revoke Nodes");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -255,6 +257,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "auth" => {
                 return handle_auth_command(&args[2..]);
+            }
+            "node" => {
+                return nodes::cli::handle_node_command(&args[2..], config_path.as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {

@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -31,8 +31,9 @@ use crate::llm_runtime::SharedLlmRuntime;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    DynamicCliAgent, ModelProvider, StateStore, Tool, ToolCapabilities, ToolTargetHint,
-    ToolTargetHintKind,
+    DynamicCliAgent, Message, ModelProvider, StateStore, Tool, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind,
+    ToolVerificationMode,
 };
 use crate::types::ApprovalResponse;
 use crate::types::StatusUpdate;
@@ -42,7 +43,17 @@ use crate::utils::{truncate_str, truncate_with_note};
 const BUFFER_CAP: usize = 1_048_576;
 
 /// Interval for emitting progress updates (avoid spamming the channel).
+#[cfg(test)]
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cadence for durable, chat-visible updates after a CLI task has detached from
+/// its original request. Foreground status streams remain more frequent.
+#[cfg(test)]
+const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const BACKGROUND_CHAT_PROGRESS_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Loop detection: window size for tracking recent lines
 const LOOP_DETECTION_WINDOW: usize = 100;
@@ -58,6 +69,79 @@ const MAX_PROMPT_SIZE: usize = 16384;
 
 /// Max git diff size to append to results (4 KB)
 const MAX_DIFF_SIZE: usize = 4096;
+
+fn format_background_progress(
+    tool_name: &str,
+    task_context: &str,
+    elapsed_secs: u64,
+    latest_activity: Option<&str>,
+) -> String {
+    let mut message = format!(
+        "Background task is still running ({}s).\nWorker: {}\nTask: {}",
+        elapsed_secs,
+        tool_name,
+        truncate_with_note(task_context, 240),
+    );
+    if let Some(activity) = latest_activity.filter(|activity| !activity.trim().is_empty()) {
+        message.push_str("\nLatest activity: ");
+        message.push_str(&truncate_with_note(activity.trim(), 240));
+    }
+    message
+}
+
+async fn deliver_cli_agent_notification(
+    hub: Option<&Arc<ChannelHub>>,
+    state: &Arc<dyn StateStore>,
+    goal_id: &str,
+    session_id: &str,
+    notification_type: &str,
+    message: &str,
+    context: &str,
+) -> bool {
+    if session_id.trim().is_empty() {
+        warn!("{context}: no session available; update dropped");
+        return false;
+    }
+
+    let message = crate::channels::present_notification(notification_type, message);
+    if let Some(hub) = hub {
+        match hub.send_text(session_id, &message).await {
+            Ok(()) => return true,
+            Err(e) => warn!(
+                session_id = %session_id,
+                goal_id = %goal_id,
+                notification_type = %notification_type,
+                error = %e,
+                "{context}: direct hub delivery failed"
+            ),
+        }
+    }
+
+    let queue_goal_id = if goal_id.trim().is_empty() {
+        "global"
+    } else {
+        goal_id
+    };
+    let entry = crate::traits::NotificationEntry::new(
+        queue_goal_id,
+        session_id,
+        notification_type,
+        &message,
+    );
+    match state.enqueue_notification(&entry).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                goal_id = %goal_id,
+                notification_type = %notification_type,
+                error = %e,
+                "{context}: enqueue fallback failed"
+            );
+            false
+        }
+    }
+}
 
 /// Tracks recent output lines to detect infinite loops
 struct LoopDetector {
@@ -149,9 +233,11 @@ struct RunningCliAgent {
 
 /// Finalized background CLI task output retained briefly so `action="check"`
 /// can still return results after automatic reaping.
+#[derive(Clone)]
 struct CompletedCliAgent {
     result: String,
     completed_at: Instant,
+    session_id: String,
 }
 
 /// A working directory claim with enough metadata to explain conflicts.
@@ -287,6 +373,10 @@ pub struct CliAgentTool {
     concurrency_limiter: Arc<Semaphore>,
     approval_tx: ApprovalBroker,
     hub: OnceLock<Weak<ChannelHub>>,
+    /// Re-enter the root agent when background delegation completes so the
+    /// delegated step advances the original user outcome instead of ending it.
+    agent: OnceLock<Weak<crate::agent::Agent>>,
+    reengagements: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
 async fn list_backend_files(
@@ -385,12 +475,195 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
 /// simply provide a prompt and still use a strong default.
 const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "gemini", "codex", "copilot", "aider"];
 
-/// Check if a command exists on the system.
-async fn command_exists(command: &str) -> bool {
-    active_execution_backend()
-        .executable_exists(command)
+fn env_wrapped_program_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--" => return (index + 1 < args.len()).then_some(index + 1),
+            "-u" | "--unset" | "-C" | "--chdir" => index += 2,
+            "-S" | "--split-string" => return None,
+            _ if arg.starts_with("--unset=") || arg.starts_with("--chdir=") => index += 1,
+            _ if arg.starts_with('-') => index += 1,
+            _ if arg
+                .split_once('=')
+                .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/')) =>
+            {
+                index += 1
+            }
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+fn is_env_launcher(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("env")
+}
+
+async fn executable_search_candidates(
+    backend: &SharedExecutionBackend,
+    executable: &str,
+) -> Vec<String> {
+    if executable.contains('/') || executable.contains('\\') {
+        return vec![executable.to_string()];
+    }
+
+    let mut candidates = vec![executable.to_string()];
+    if let Ok(home) = backend.home_dir().await {
+        for relative_dir in [
+            ".local/bin",
+            ".cargo/bin",
+            ".npm-global/bin",
+            "miniforge3/bin",
+            "anaconda3/bin",
+        ] {
+            candidates.push(
+                home.join(relative_dir)
+                    .join(executable)
+                    .as_str()
+                    .to_string(),
+            );
+        }
+    }
+    for system_dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        candidates.push(format!("{system_dir}/{executable}"));
+    }
+    candidates.dedup();
+    candidates
+}
+
+async fn resolve_executable(backend: &SharedExecutionBackend, executable: &str) -> Option<String> {
+    for candidate in executable_search_candidates(backend, executable).await {
+        if backend.executable_exists(&candidate).await.unwrap_or(false) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolve both the configured launcher and, for `/usr/bin/env` wrappers, the
+/// actual nested agent executable. GUI/launchd processes commonly lack user
+/// install directories such as `~/.local/bin` in PATH; accepting `env` alone
+/// used to defer that mistake until every invocation exited with code 127.
+async fn resolve_agent_launch(
+    backend: &SharedExecutionBackend,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>), String> {
+    let resolved_command = resolve_executable(backend, command)
         .await
-        .unwrap_or(false)
+        .ok_or_else(|| format!("launcher executable '{command}' was not found"))?;
+    let mut resolved_args = args.to_vec();
+
+    if is_env_launcher(&resolved_command) {
+        if let Some(index) = env_wrapped_program_index(&resolved_args) {
+            let nested = resolved_args[index].clone();
+            let resolved_nested = resolve_executable(backend, &nested).await.ok_or_else(|| {
+                format!(
+                    "wrapped CLI agent executable '{nested}' was not found in PATH or common user install directories"
+                )
+            })?;
+            resolved_args[index] = resolved_nested;
+        }
+    }
+
+    Ok((resolved_command, resolved_args))
+}
+
+fn format_cli_agent_failure(
+    tool_name: &str,
+    exit_code: Option<i32>,
+    display_output: &str,
+    max_output: usize,
+    diff_section: Option<&str>,
+) -> String {
+    let captured = truncate_with_note(display_output, max_output);
+    let details = if captured.trim().is_empty() {
+        "No stdout or stderr was captured. The process terminated before it produced diagnostics."
+            .to_string()
+    } else {
+        captured.trim_end().to_string()
+    };
+    let mut error_msg = format!(
+        "ERROR: CLI agent '{tool_name}' failed (exit code {}).\n\n## Failure Details\n{details}",
+        exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unavailable".to_string())
+    );
+    if let Some(diff) = diff_section {
+        error_msg.push_str(diff);
+    }
+    error_msg.push_str(
+        "\n\n## Safe Recovery Options\n\
+         - Verify the configured executable path and authentication\n\
+         - Try a different CLI agent\n\
+         - Inspect any reported file changes before deciding whether to revert them",
+    );
+    error_msg
+}
+
+fn cli_agent_exit_code(output: &str) -> Option<i32> {
+    let marker = "failed (exit code ";
+    let suffix = output.split_once(marker)?.1;
+    let raw = suffix.split_once(')')?.0.trim();
+    raw.strip_prefix("Some(")
+        .unwrap_or(raw)
+        .trim_end_matches(')')
+        .parse()
+        .ok()
+}
+
+fn failed_before_agent_launch(output: &str, exit_code: Option<i32>) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("could not start")
+        || (exit_code == Some(127)
+            && (lower.contains("[stderr] env:") || lower.contains("[stderr] /usr/bin/env:"))
+            && lower.contains("no such file or directory"))
+}
+
+fn delegated_prompt_requests_deployment(prompt: &str, system_instruction: Option<&str>) -> bool {
+    let combined = format!("{prompt}\n{}", system_instruction.unwrap_or_default());
+    let lower = combined.to_ascii_lowercase();
+    let explicitly_non_deploying = [
+        "do not deploy",
+        "don't deploy",
+        "without deploying",
+        "do not publish",
+        "don't publish",
+        "without publishing",
+        "do not release",
+        "don't release",
+        "without releasing",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    !explicitly_non_deploying
+        && ["deploy", "publish", "release"]
+            .iter()
+            .any(|keyword| crate::agent::keyword_match(&lower, keyword))
+}
+
+fn first_cli_failure_detail(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("[stderr]") && line.len() > "[stderr]".len())
+        .or_else(|| {
+            output.lines().map(str::trim).find(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with("[UNTRUSTED")
+                    && !line.starts_with("[END UNTRUSTED")
+            })
+        })
+        .unwrap_or("CLI agent process failed")
+        .chars()
+        .take(300)
+        .collect()
 }
 
 impl CliAgentTool {
@@ -451,7 +724,11 @@ impl CliAgentTool {
     }
 
     fn prune_completed_map(completed: &mut HashMap<String, CompletedCliAgent>) {
-        const COMPLETED_TTL: Duration = Duration::from_secs(10 * 60);
+        // Keep results for as long as dialogue-state can keep an unfinished
+        // request open. A ten-minute cache made ordinary delayed follow-ups
+        // lose successful delegated work and turn a recoverable typo into a
+        // dead end.
+        const COMPLETED_TTL: Duration = Duration::from_secs(12 * 60 * 60);
         const COMPLETED_CAP: usize = 128;
 
         completed.retain(|_, entry| entry.completed_at.elapsed() <= COMPLETED_TTL);
@@ -492,6 +769,24 @@ impl CliAgentTool {
             final_result.push_str(&diff);
         }
         final_result
+    }
+
+    fn build_background_reengagement_followup(
+        tool_name: &str,
+        task_id: &str,
+        task_context: &str,
+        status: &str,
+        output: &str,
+    ) -> String {
+        format!(
+            "[Background command completed]\n\
+             Command: `cli_agent {tool_name}`\n\
+             Runtime task ID: {task_id}\n\
+             Delegated step: {task_context}\n\
+             Exit status: {status}\n\
+             Output:\n{output}\n\n\
+             This delegated step was part of the user's previous unfinished request. Check the session history for the requested outcome and continue from this evidence. Delegated work is progress, not automatically fulfillment: complete every remaining implementation, action, validation, or delivery step that the original request requires. Do not merely announce that the delegated step ended, and do not ask the user to repeat the request."
+        )
     }
 
     fn tool_priority(name: &str) -> usize {
@@ -638,25 +933,28 @@ impl CliAgentTool {
             }
         }
 
-        // Run `which` checks in parallel for all candidates
-        let which_futures: Vec<_> = candidates
+        // Resolve launchers in parallel. This validates a nested executable in
+        // `env ... agent` configurations instead of merely proving that
+        // `/usr/bin/env` exists.
+        let backend = active_execution_backend();
+        let resolution_futures: Vec<_> = candidates
             .iter()
-            .map(|(_, command, _, _, _, _)| command_exists(command))
+            .map(|(_, command, args, _, _, _)| resolve_agent_launch(&backend, command, args))
             .collect();
-        let which_results = futures::future::join_all(which_futures).await;
+        let resolution_results = futures::future::join_all(resolution_futures).await;
 
         let mut tools = HashMap::new();
 
-        for (i, (name, command, args, description, timeout_override, max_output_override)) in
+        for (i, (name, command, _args, description, timeout_override, max_output_override)) in
             candidates.into_iter().enumerate()
         {
-            if which_results[i] {
-                info!(name = %name, command = %command, "CLI agent tool discovered");
+            if let Ok((resolved_command, resolved_args)) = &resolution_results[i] {
+                info!(name = %name, command = %resolved_command, "CLI agent tool discovered");
                 tools.insert(
                     name,
                     CliToolEntry {
-                        command,
-                        args,
+                        command: resolved_command.clone(),
+                        args: resolved_args.clone(),
                         description,
                         timeout: timeout_override
                             .map(Duration::from_secs)
@@ -666,7 +964,12 @@ impl CliAgentTool {
                     },
                 );
             } else {
-                info!(name = %name, command = %command, "CLI agent tool not found, skipping");
+                info!(
+                    name = %name,
+                    command = %command,
+                    error = %resolution_results[i].as_ref().unwrap_err(),
+                    "CLI agent tool not found, skipping"
+                );
             }
         }
 
@@ -674,7 +977,7 @@ impl CliAgentTool {
         tool_names.sort();
 
         let tool = CliAgentTool {
-            backend: active_execution_backend(),
+            backend,
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -688,6 +991,8 @@ impl CliAgentTool {
             concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Load dynamic agents from DB
@@ -701,8 +1006,16 @@ impl CliAgentTool {
         let _ = self.hub.set(hub);
     }
 
+    pub fn set_agent(&self, agent: Weak<crate::agent::Agent>) {
+        let _ = self.agent.set(agent);
+    }
+
     fn get_hub(&self) -> Option<Arc<ChannelHub>> {
         self.hub.get().and_then(|w| w.upgrade())
+    }
+
+    fn get_agent(&self) -> Option<Arc<crate::agent::Agent>> {
+        self.agent.get().and_then(|w| w.upgrade())
     }
 
     /// Load dynamically registered agents from the database.
@@ -713,15 +1026,23 @@ impl CliAgentTool {
                     if !agent.enabled {
                         continue;
                     }
-                    // Verify command still exists
-                    if !command_exists(&agent.command).await {
-                        info!(name = %agent.name, command = %agent.command, "Dynamic CLI agent command not found, skipping");
-                        continue;
-                    }
                     let args: Vec<String> =
                         serde_json::from_str(&agent.args_json).unwrap_or_default();
+                    let (command, args) =
+                        match resolve_agent_launch(&self.backend, &agent.command, &args).await {
+                            Ok(launch) => launch,
+                            Err(error) => {
+                                info!(
+                                    name = %agent.name,
+                                    command = %agent.command,
+                                    %error,
+                                    "Dynamic CLI agent command not found, skipping"
+                                );
+                                continue;
+                            }
+                        };
                     let entry = CliToolEntry {
-                        command: agent.command.clone(),
+                        command,
                         args,
                         description: agent.description.clone(),
                         timeout: agent
@@ -761,13 +1082,11 @@ impl CliAgentTool {
         timeout_secs: Option<u64>,
         max_output_chars: Option<usize>,
     ) -> anyhow::Result<String> {
-        // Validate command exists
-        if !command_exists(command).await {
-            return Ok(format!(
-                "Command '{}' not found on this system. Install it first.",
-                command
-            ));
-        }
+        let (resolved_command, resolved_args) =
+            match resolve_agent_launch(&self.backend, command, &args).await {
+                Ok(launch) => launch,
+                Err(error) => return Ok(format!("CLI agent configuration is invalid: {error}.")),
+            };
 
         // Save to database
         let dynamic = DynamicCliAgent {
@@ -785,8 +1104,8 @@ impl CliAgentTool {
 
         // Add to runtime map
         let entry = CliToolEntry {
-            command: command.to_string(),
-            args,
+            command: resolved_command,
+            args: resolved_args,
             description: description.to_string(),
             timeout: timeout_secs
                 .map(Duration::from_secs)
@@ -832,12 +1151,14 @@ impl CliAgentTool {
             self.state.update_dynamic_cli_agent(&agent).await?;
 
             if enabled {
-                // Re-add to runtime map if command exists
-                if command_exists(&agent.command).await {
-                    let args: Vec<String> =
-                        serde_json::from_str(&agent.args_json).unwrap_or_default();
+                let args: Vec<String> = serde_json::from_str(&agent.args_json).unwrap_or_default();
+                // Re-add to runtime map only after validating both a wrapper
+                // command and its nested agent executable.
+                if let Ok((command, args)) =
+                    resolve_agent_launch(&self.backend, &agent.command, &args).await
+                {
                     let entry = CliToolEntry {
-                        command: agent.command.clone(),
+                        command,
                         args,
                         description: agent.description.clone(),
                         timeout: agent
@@ -941,6 +1262,7 @@ impl CliAgentTool {
                 CompletedCliAgent {
                     result: final_result,
                     completed_at: Instant::now(),
+                    session_id: agent.session_id.clone(),
                 },
             );
             Self::prune_completed_map(&mut completed);
@@ -1265,6 +1587,30 @@ impl CliAgentTool {
         None
     }
 
+    /// Return the number of tracked or untracked entries in an existing Git
+    /// worktree. A non-repository (or an unavailable backend) is not classified
+    /// as dirty here; normal CLI-agent approval and execution policy still apply.
+    async fn dirty_worktree_entry_count(working_dir: &str) -> Option<usize> {
+        let directory = BackendPath::new(working_dir);
+        let status = crate::tools::fs_utils::run_cmd_backend(
+            "git status --porcelain=v1 --untracked-files=all",
+            Some(&directory),
+            10,
+        )
+        .await
+        .ok()?;
+        if status.exit_code != 0 {
+            return None;
+        }
+        Some(
+            status
+                .stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+        )
+    }
+
     /// Detect auth-related errors in output.
     fn detect_auth_error(output: &str, tool_name: &str) -> Option<String> {
         let auth_patterns = [
@@ -1383,7 +1729,7 @@ impl CliAgentTool {
         }
 
         // Get entry from the tools map (clone what we need, release lock)
-        let (command, mut args, timeout, max_output) = {
+        let (mut command, mut args, timeout, max_output) = {
             let tools = self.tools.read().unwrap();
             let entry = tools
                 .get(tool_name)
@@ -1424,30 +1770,37 @@ impl CliAgentTool {
             }
         }
 
-        // Re-check that command still exists
-        if !command_exists(&command).await {
-            // Auto-disable dynamic agents that disappeared
-            if let Ok(agents) = self.state.list_dynamic_cli_agents().await {
-                if let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name) {
-                    agent.enabled = false;
-                    let _ = self.state.update_dynamic_cli_agent(&agent).await;
+        // Re-check both the launcher and a wrapped nested executable. Agent
+        // binaries may move during self-update, and GUI daemon PATH values can
+        // differ from an interactive shell.
+        match resolve_agent_launch(&self.backend, &command, &args).await {
+            Ok((resolved_command, resolved_args)) => {
+                command = resolved_command;
+                args = resolved_args;
+            }
+            Err(error) => {
+                // Auto-disable dynamic agents that disappeared
+                if let Ok(agents) = self.state.list_dynamic_cli_agents().await {
+                    if let Some(mut agent) = agents.into_iter().find(|a| a.name == tool_name) {
+                        agent.enabled = false;
+                        let _ = self.state.update_dynamic_cli_agent(&agent).await;
+                    }
                 }
+                let message = format!(
+                    "ERROR: CLI agent '{tool_name}' could not start: {error}. \
+                 Re-register it with an absolute executable path or reinstall it."
+                );
+                if let Some(task_id) = delegated_task_id {
+                    Self::persist_delegated_cli_result_with_state(
+                        self.state.clone(),
+                        task_id,
+                        None,
+                        Some(&message),
+                    )
+                    .await;
+                }
+                return Ok(message);
             }
-            let message = format!(
-                "CLI agent '{}' command not found. It may have been uninstalled. \
-                 Use manage_cli_agents to remove it.",
-                tool_name
-            );
-            if let Some(task_id) = delegated_task_id {
-                Self::persist_delegated_cli_result_with_state(
-                    self.state.clone(),
-                    task_id,
-                    None,
-                    Some(&message),
-                )
-                .await;
-            }
-            return Ok(message);
         }
 
         let canonical_working_dir = match working_dir {
@@ -1584,6 +1937,7 @@ impl CliAgentTool {
         let invocation_id = self
             .state
             .log_cli_agent_start(
+                Some(&task_id),
                 session_id,
                 tool_name,
                 &prompt_summary,
@@ -1718,6 +2072,8 @@ impl CliAgentTool {
         let notify_goal_id = goal_id.map(|s| s.to_string()).unwrap_or_default();
         let notify_working_dir = canonical_working_dir.clone();
         let hub_for_completion = self.get_hub();
+        let agent_for_completion = self.get_agent();
+        let reengagements_for_completion = self.reengagements.clone();
         let task_id_for_notify = task_id.clone();
         let delegated_task_id_for_completion = delegated_task_id_owned.clone();
         let should_notify_for_task = Arc::clone(&should_notify);
@@ -1727,6 +2083,10 @@ impl CliAgentTool {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut last_progress = Instant::now();
+            let mut last_chat_progress = Instant::now();
+            let mut status_tick = tokio::time::interval(PROGRESS_INTERVAL);
+            status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            status_tick.tick().await; // consume the immediate first tick
             let started_at = Instant::now();
             let mut pending_lines: Vec<String> = Vec::new();
             let mut stdout_done = false;
@@ -1880,44 +2240,74 @@ impl CliAgentTool {
                             break;
                         }
                     }
+                    _ = status_tick.tick() => {}
                 }
 
                 // Emit progress updates at intervals
                 // Parse JSON lines to extract meaningful progress, filter raw JSON
                 if last_progress.elapsed() >= PROGRESS_INTERVAL {
-                    if let Some(ref tx) = status_tx_clone {
-                        let mut progress_items: Vec<String> = Vec::new();
-                        for line in &pending_lines {
-                            if looks_like_json(line) {
-                                // Try to extract meaningful progress from JSON
-                                if let Some(progress) = extract_progress_from_json(line) {
-                                    progress_items.push(progress.clone());
-                                    last_parsed_action = Some(progress);
-                                }
-                            } else {
-                                // Non-JSON line, include as-is
-                                progress_items.push(line.clone());
+                    let mut progress_items: Vec<String> = Vec::new();
+                    for line in &pending_lines {
+                        if looks_like_json(line) {
+                            // Try to extract meaningful progress from JSON
+                            if let Some(progress) = extract_progress_from_json(line) {
+                                progress_items.push(progress.clone());
+                                last_parsed_action = Some(progress);
                             }
-                        }
-
-                        let elapsed_secs = started_at.elapsed().as_secs();
-                        let chunk = if !progress_items.is_empty() {
-                            // Deduplicate consecutive items
-                            progress_items.dedup();
-                            progress_items.join("\n")
-                        } else if let Some(ref action) = last_parsed_action {
-                            // No new progress, but we have a last action - show heartbeat
-                            format!("⏳ {} ({}s)", action, elapsed_secs)
                         } else {
-                            // No parsed progress at all - show generic heartbeat
-                            format!("⏳ Working... ({}s)", elapsed_secs)
-                        };
+                            // Non-JSON line, include as-is
+                            progress_items.push(line.clone());
+                        }
+                    }
 
+                    let elapsed_secs = started_at.elapsed().as_secs();
+                    let chunk = if !progress_items.is_empty() {
+                        // Deduplicate consecutive items
+                        progress_items.dedup();
+                        progress_items.join("\n")
+                    } else if let Some(ref action) = last_parsed_action {
+                        // No new progress, but we have a last action - show heartbeat
+                        format!("⏳ {} ({}s)", action, elapsed_secs)
+                    } else {
+                        // No parsed progress at all - show generic heartbeat
+                        format!("⏳ Working... ({}s)", elapsed_secs)
+                    };
+
+                    if let Some(ref tx) = status_tx_clone {
                         let _ = tx.try_send(StatusUpdate::ToolProgress {
                             name: tool_name_owned.clone(),
                             chunk: truncate_with_note(&chunk, 500),
                         });
                     }
+
+                    if should_notify_for_task.load(Ordering::Relaxed)
+                        && last_chat_progress.elapsed() >= BACKGROUND_CHAT_PROGRESS_INTERVAL
+                    {
+                        let message = format_background_progress(
+                            &tool_name_owned,
+                            &task_context,
+                            elapsed_secs,
+                            Some(&chunk),
+                        );
+                        let hub = hub_for_completion.clone();
+                        let state = state_for_completion.clone();
+                        let goal_id = notify_goal_id.clone();
+                        let session_id = notify_session_id.clone();
+                        tokio::spawn(async move {
+                            deliver_cli_agent_notification(
+                                hub.as_ref(),
+                                &state,
+                                &goal_id,
+                                &session_id,
+                                "progress",
+                                &message,
+                                "cli_agent background progress notifier",
+                            )
+                            .await;
+                        });
+                        last_chat_progress = Instant::now();
+                    }
+
                     pending_lines.clear();
                     last_progress = Instant::now();
                 }
@@ -1960,7 +2350,7 @@ impl CliAgentTool {
             // Persist completion even if the caller timed out and moved the task to background.
             if invocation_id != 0 {
                 let duration = invocation_started_at.elapsed().as_secs_f64();
-                let (success, output_summary, structured_response, structured_error) =
+                let (success, persisted_output, structured_response, structured_error) =
                     if loop_detected {
                         (
                             false,
@@ -1976,14 +2366,12 @@ impl CliAgentTool {
                         if exit_code == Some(0) {
                             let result_text =
                                 extract_meaningful_output(&stdout_text, max_output_for_log);
-                            let summary: String = result_text.chars().take(200).collect();
-                            (true, summary, Some(result_text), None)
+                            (true, result_text.clone(), Some(result_text), None)
                         } else {
                             let auth_msg =
                                 CliAgentTool::detect_auth_error(&display_text, &tool_name_owned);
                             let summary_src = auth_msg.unwrap_or(display_text);
-                            let summary: String = summary_src.chars().take(200).collect();
-                            (false, summary, None, Some(summary_src))
+                            (false, summary_src.clone(), None, Some(summary_src))
                         }
                     };
 
@@ -1991,7 +2379,7 @@ impl CliAgentTool {
                     .log_cli_agent_complete(
                         invocation_id,
                         exit_code,
-                        &output_summary,
+                        &persisted_output,
                         success,
                         duration,
                     )
@@ -2023,6 +2411,7 @@ impl CliAgentTool {
                     };
 
                     let status_word = if success { "completed" } else { "failed" };
+                    let notification_summary: String = persisted_output.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
                         CliAgentTool::capture_git_diff(dir)
                             .await
@@ -2037,13 +2426,167 @@ impl CliAgentTool {
                         tool_name_owned,
                         duration_display,
                         task_context,
-                        output_summary,
+                        notification_summary,
                         diff_section.unwrap_or_default(),
                     );
+                    let notification_type = if success { "completed" } else { "failed" };
+                    let message =
+                        crate::channels::present_notification(notification_type, &message);
+
+                    // Direct channel delivery is intentionally not a second
+                    // agent turn, but the result must still enter the session's
+                    // hot history. Otherwise the very next user follow-up sees
+                    // the handoff acknowledgement but not the completed work.
+                    let continuity_output = format!(
+                        "Background CLI task {status_word}.\nTask ID: {task_id_for_notify}\nTask: {task_context}\nResult:\n{persisted_output}"
+                    );
+                    let continuity_message = Message {
+                        content: Some(crate::tools::sanitize::wrap_untrusted_output(
+                            "cli_agent",
+                            &continuity_output,
+                        )),
+                        importance: 0.8,
+                        ..Message::new_runtime(
+                            Uuid::new_v4().to_string(),
+                            notify_session_id.clone(),
+                            "assistant",
+                        )
+                    };
+                    if let Err(e) = state_for_completion
+                        .append_message(&continuity_message)
+                        .await
+                    {
+                        warn!(
+                            task_id = %task_id_for_notify,
+                            session_id = %notify_session_id,
+                            error = %e,
+                            "cli_agent background completion could not enter session history"
+                        );
+                    }
 
                     let mut delivered = false;
+                    if notify_goal_id.is_empty() && !notify_session_id.trim().is_empty() {
+                        let reengagement_allowed = {
+                            let mut log = reengagements_for_completion.lock().await;
+                            crate::tools::terminal::reengagement_allowed(
+                                &mut log,
+                                &notify_session_id,
+                                Instant::now(),
+                            )
+                        };
+                        if !reengagement_allowed {
+                            warn!(
+                                task_id = %task_id_for_notify,
+                                session_id = %notify_session_id,
+                                "cli_agent completion re-engagement budget exhausted; delivering raw result"
+                            );
+                        } else if let Some(ref agent) = agent_for_completion {
+                            let followup = CliAgentTool::build_background_reengagement_followup(
+                                &tool_name_owned,
+                                &task_id_for_notify,
+                                &task_context,
+                                status_word,
+                                &persisted_output,
+                            );
+                            let _slot = crate::tools::terminal::acquire_reengagement_slot().await;
+                            info!(
+                                task_id = %task_id_for_notify,
+                                session_id = %notify_session_id,
+                                "Re-engaging agent loop after CLI agent completion"
+                            );
+                            let continuation_started = Instant::now();
+                            let mut continuation_progress =
+                                tokio::time::interval(BACKGROUND_CHAT_PROGRESS_INTERVAL);
+                            continuation_progress
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            continuation_progress.tick().await;
+                            let mut continuation = std::pin::pin!(agent.handle_message(
+                                &notify_session_id,
+                                &followup,
+                                None,
+                                crate::types::UserRole::Owner,
+                                crate::types::ChannelContext::internal(),
+                                None,
+                            ));
+                            let continuation_result = loop {
+                                tokio::select! {
+                                    result = &mut continuation => break result,
+                                    _ = continuation_progress.tick() => {
+                                        let progress_message = format_background_progress(
+                                            "AIDaemon",
+                                            &task_context,
+                                            continuation_started.elapsed().as_secs(),
+                                            Some("Processing the delegated result and continuing the remaining work."),
+                                        );
+                                        deliver_cli_agent_notification(
+                                            hub_for_completion.as_ref(),
+                                            &state_for_completion,
+                                            &notify_goal_id,
+                                            &notify_session_id,
+                                            "progress",
+                                            &progress_message,
+                                            "cli_agent completion continuation progress notifier",
+                                        )
+                                        .await;
+                                    }
+                                }
+                            };
+                            match continuation_result {
+                                Ok(reply) if !reply.trim().is_empty() => {
+                                    let reply =
+                                        crate::tools::sanitize::sanitize_user_facing_reply(&reply);
+                                    if let Some(ref hub) = hub_for_completion {
+                                        match hub.send_text(&notify_session_id, &reply).await {
+                                            Ok(()) => delivered = true,
+                                            Err(e) => warn!(
+                                                task_id = %task_id_for_notify,
+                                                session_id = %notify_session_id,
+                                                error = %e,
+                                                "cli_agent continuation reply delivery failed"
+                                            ),
+                                        }
+                                    }
+                                    if !delivered {
+                                        let entry = crate::traits::NotificationEntry::new(
+                                            &notify_goal_id,
+                                            &notify_session_id,
+                                            "progress",
+                                            &reply,
+                                        );
+                                        match state_for_completion
+                                            .enqueue_notification(&entry)
+                                            .await
+                                        {
+                                            Ok(()) => delivered = true,
+                                            Err(e) => warn!(
+                                                task_id = %task_id_for_notify,
+                                                session_id = %notify_session_id,
+                                                error = %e,
+                                                "cli_agent continuation reply enqueue failed"
+                                            ),
+                                        }
+                                    }
+                                }
+                                Ok(_) => warn!(
+                                    task_id = %task_id_for_notify,
+                                    session_id = %notify_session_id,
+                                    "cli_agent completion re-engagement returned an empty reply"
+                                ),
+                                Err(e) => warn!(
+                                    task_id = %task_id_for_notify,
+                                    session_id = %notify_session_id,
+                                    error = %e,
+                                    "cli_agent completion re-engagement failed"
+                                ),
+                            }
+                        }
+                    }
+
                     if let Some(ref hub) = hub_for_completion {
-                        if let Err(e) = hub.send_text(&notify_session_id, &message).await {
+                        if delivered {
+                            // The continuation reply is the useful completion;
+                            // suppress the lower-level raw task notification.
+                        } else if let Err(e) = hub.send_text(&notify_session_id, &message).await {
                             warn!(
                                 task_id = %task_id_for_notify,
                                 session_id = %notify_session_id,
@@ -2056,9 +2599,13 @@ impl CliAgentTool {
                     }
 
                     if !delivered {
-                        let notification_type = if success { "completed" } else { "failed" };
+                        let queue_goal_id = if notify_goal_id.trim().is_empty() {
+                            "global"
+                        } else {
+                            &notify_goal_id
+                        };
                         let entry = crate::traits::NotificationEntry::new(
-                            &notify_goal_id,
+                            queue_goal_id,
                             &notify_session_id,
                             notification_type,
                             &message,
@@ -2211,23 +2758,12 @@ impl CliAgentTool {
                         return Ok(auth_msg);
                     }
 
-                    let mut error_msg = format!(
-                        "ERROR: CLI agent '{}' failed (exit code {:?}).\n\n## Error Output\n{}",
+                    let error_msg = format_cli_agent_failure(
                         tool_name,
                         exit_code,
-                        truncate_with_note(&display_output, max_output)
-                    );
-
-                    // Append diff even on failure (partial changes)
-                    if let Some(diff) = diff_section {
-                        error_msg.push_str(&diff);
-                    }
-
-                    error_msg.push_str(
-                        "\n\n## Recovery Options\n\
-                         - Try a different CLI agent\n\
-                         - Handle the task directly with your own tools\n\
-                         - Revert partial changes with `git checkout .` if needed",
+                        &display_output,
+                        max_output,
+                        diff_section.as_deref(),
                     );
 
                     if let Some(task_id) = delegated_task_id {
@@ -2354,16 +2890,102 @@ impl CliAgentTool {
     }
 
     /// Check on a background CLI agent task.
-    async fn handle_check(&self, task_id: &str) -> anyhow::Result<String> {
+    async fn handle_check(&self, task_id: &str, session_id: &str) -> anyhow::Result<String> {
         let running = self.running.lock().await;
 
         let Some(agent) = running.get(task_id) else {
             drop(running);
-            let mut completed = self.completed.lock().await;
-            if let Some(done) = completed.remove(task_id) {
+            if let Some(done) = self.completed.lock().await.get(task_id).cloned() {
                 return Ok(done.result);
             }
-            return Ok(format!("No running CLI agent with task_id '{}'", task_id));
+
+            if let Some(invocation) = self
+                .state
+                .get_cli_agent_invocations(128)
+                .await?
+                .into_iter()
+                .find(|invocation| invocation.task_id.as_deref() == Some(task_id))
+            {
+                let result = invocation
+                    .output_summary
+                    .as_deref()
+                    .unwrap_or("No persisted output was recorded.");
+                return Ok(format!(
+                    "CLI agent '{}' {}. Recovered durable result for task_id={task_id}.\n\nResult:\n{}",
+                    invocation.agent_name,
+                    if invocation.completed_at.is_some() {
+                        "finished"
+                    } else {
+                        "was started but has no recorded completion"
+                    },
+                    result
+                ));
+            }
+
+            // Background task identifiers are opaque. Models occasionally
+            // copy a provider thread UUID instead of the short runtime ID.
+            // Recover an unambiguous session-local task instead of converting
+            // that bookkeeping miss into an abandoned user objective.
+            let session_candidates = {
+                let running = self.running.lock().await;
+                let mut candidates = running
+                    .iter()
+                    .filter(|(_, agent)| agent.session_id == session_id)
+                    .map(|(id, agent)| {
+                        (
+                            id.clone(),
+                            format!("running — {}", agent.prompt_summary),
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                drop(running);
+
+                let completed = self.completed.lock().await;
+                candidates.extend(
+                    completed
+                        .iter()
+                        .filter(|(_, done)| done.session_id == session_id)
+                        .map(|(id, done)| {
+                            (
+                                id.clone(),
+                                "finished — result available".to_string(),
+                                Some(done.result.clone()),
+                            )
+                        }),
+                );
+                candidates
+            };
+
+            if session_candidates.len() == 1 {
+                let (recovered_id, status, result) = &session_candidates[0];
+                if let Some(result) = result {
+                    return Ok(format!(
+                        "Requested task_id '{task_id}' was not found. Recovered the only recent CLI task for this session instead (task_id={recovered_id}, {status}).\n\n{result}"
+                    ));
+                }
+                return Ok(format!(
+                    "Requested task_id '{task_id}' was not found. Recovered the only active CLI task for this session (task_id={recovered_id}, {status}). Use action=\"check\" with task_id=\"{recovered_id}\"."
+                ));
+            }
+
+            let candidate_lines = session_candidates
+                .iter()
+                .take(8)
+                .map(|(id, status, _)| format!("- task_id={id}: {status}"))
+                .collect::<Vec<_>>();
+            let recovery = if candidate_lines.is_empty() {
+                "No recent CLI tasks are tracked for this session. Start a new in-scope run or inspect durable invocation history; do not treat this lookup miss as completion."
+                    .to_string()
+            } else {
+                format!(
+                    "Recent CLI tasks for this session:\n{}\nCheck the matching task ID; do not treat this lookup miss as completion.",
+                    candidate_lines.join("\n")
+                )
+            };
+            return Ok(format!(
+                "No CLI agent task matched task_id '{task_id}'. {recovery}"
+            ));
         };
 
         let elapsed = agent.started_at.elapsed().as_secs();
@@ -2537,6 +3159,9 @@ struct CliAgentArgs {
     /// Injected by agent for role-aware safeguards.
     #[serde(default)]
     _user_role: Option<String>,
+    /// Injected by the runtime for owner-authorized scheduled automation.
+    #[serde(default)]
+    _trusted_session: bool,
 }
 
 fn non_empty_prompt_field(value: Option<&str>) -> Option<String> {
@@ -3047,6 +3672,93 @@ impl Tool for CliAgentTool {
         self.call_with_status(arguments, None).await
     }
 
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("run");
+        let mut semantics = match action {
+            "list" | "check" => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            // A delegated run may both inspect and change state. Keep the
+            // effect conservative for preflight policy, but omit a synthetic
+            // mutation-effect bit so a structured pre-launch failure can
+            // authoritatively downgrade the completed outcome to administrative.
+            "run" => ToolCallSemantics::observation_and_mutation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            "cancel" | "cancel_all" => ToolCallSemantics::mutation(),
+            _ => ToolCallSemantics::mutation(),
+        };
+        if let Some(working_dir) = parsed
+            .as_ref()
+            .and_then(|value| value.get("working_dir"))
+            .and_then(Value::as_str)
+        {
+            semantics = semantics.with_target_hint(ToolTargetHintKind::ProjectScope, working_dir);
+        }
+        semantics
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "run".to_string());
+        let output = CliAgentTool::call_with_status(self, arguments, status_tx).await?;
+        let exit_code = cli_agent_exit_code(&output);
+        let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
+        let policy_block = output.trim_start().starts_with("Blocked:");
+        let metadata = if exit_code.is_some() || prelaunch_failure || policy_block {
+            ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
+                exit_code,
+                transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
+                semantics: if prelaunch_failure || policy_block {
+                    ToolCallSemantics::administrative()
+                } else {
+                    ToolCallSemantics::default()
+                },
+                ..ToolCallMetadata::default()
+            }
+        } else if output.contains("started in background")
+            || output.contains("Moved to background")
+            || output.contains("still running")
+            || output.contains("only active CLI task for this session")
+        {
+            ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+                background_started: true,
+                completion_notifications_enabled: action == "run",
+                ..ToolCallMetadata::default()
+            }
+        } else if action == "check"
+            && (output.starts_with("No CLI agent task matched")
+                || output.starts_with("No running CLI agent"))
+        {
+            ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+                ..ToolCallMetadata::default()
+            }
+        } else {
+            ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                ..ToolCallMetadata::default()
+            }
+        };
+        Ok(ToolCallOutcome { output, metadata })
+    }
+
     async fn call_with_status(
         &self,
         arguments: &str,
@@ -3105,6 +3817,28 @@ impl Tool for CliAgentTool {
                     );
                     anyhow::bail!("Missing 'prompt' parameter for action=run");
                 };
+
+                if args._trusted_session
+                    && delegated_prompt_requests_deployment(
+                        &prompt,
+                        args.system_instruction.as_deref(),
+                    )
+                {
+                    let Some(working_dir) = args.working_dir.as_deref() else {
+                        return Ok(
+                            "Blocked: unattended deployment delegation requires an explicit working_dir so repository cleanliness can be verified."
+                                .to_string(),
+                        );
+                    };
+                    if let Some(entry_count) = Self::dirty_worktree_entry_count(working_dir)
+                        .await
+                        .filter(|count| *count > 0)
+                    {
+                        return Ok(format!(
+                            "Blocked: unattended deployment delegation found {entry_count} pre-existing changed or untracked worktree entries. Deploy from a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not published."
+                        ));
+                    }
+                }
 
                 let mut daemon_hits = detect_daemonization_primitives(&prompt);
                 if let Some(system_instruction) = args.system_instruction.as_deref() {
@@ -3178,7 +3912,7 @@ impl Tool for CliAgentTool {
                 let task_id = args.task_id.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("Missing 'task_id' parameter for action=check")
                 })?;
-                self.handle_check(task_id).await
+                self.handle_check(task_id, &session_id).await
             }
             "cancel" => {
                 let task_id = args.task_id.as_ref().ok_or_else(|| {
@@ -3209,6 +3943,92 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    #[test]
+    fn env_wrapper_finds_nested_program_after_unset_option() {
+        let args = vec![
+            "-u".to_string(),
+            "CLAUDECODE".to_string(),
+            "claude".to_string(),
+            "--print".to_string(),
+        ];
+        assert_eq!(env_wrapped_program_index(&args), Some(2));
+    }
+
+    #[test]
+    fn cli_failure_formatter_preserves_diagnostic_and_safe_recovery() {
+        let formatted = format_cli_agent_failure(
+            "claude",
+            Some(127),
+            "[stderr] env: claude: No such file or directory\n",
+            10_000,
+            None,
+        );
+        assert!(formatted.contains("exit code 127"));
+        assert!(formatted.contains("env: claude: No such file or directory"));
+        assert!(!formatted.contains("git checkout ."));
+    }
+
+    #[test]
+    fn exit_127_env_failure_is_identified_as_prelaunch() {
+        let output = "ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
+## Failure Details\n[stderr] env: claude: No such file or directory";
+        let exit_code = cli_agent_exit_code(output);
+        assert_eq!(exit_code, Some(127));
+        assert!(failed_before_agent_launch(output, exit_code));
+    }
+
+    #[test]
+    fn later_command_not_found_is_not_assumed_to_be_prelaunch() {
+        let output = "ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
+## Failure Details\n[stderr] sh: deploy-helper: command not found";
+        assert!(!failed_before_agent_launch(
+            output,
+            cli_agent_exit_code(output)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrapped_missing_executable_returns_structured_prelaunch_failure() {
+        let (tool, _db_file) = setup_echo_tool().await;
+        {
+            let mut tools = tool.tools.write().unwrap();
+            tools.insert(
+                "broken".to_string(),
+                CliToolEntry {
+                    command: "/usr/bin/env".to_string(),
+                    args: vec!["aidaemon-definitely-missing-cli".to_string()],
+                    description: "Broken test agent".to_string(),
+                    timeout: Duration::from_secs(10),
+                    max_output_chars: 10_000,
+                    is_dynamic: false,
+                },
+            );
+        }
+        tool.tool_names.write().unwrap().push("broken".to_string());
+
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "run",
+                    "tool": "broken",
+                    "prompt": "Inspect the repository"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+        assert!(outcome.metadata.transport_error.is_some());
+        assert!(!outcome.metadata.semantics.mutates_state());
+        assert!(outcome.output.contains("could not start"));
+        assert!(outcome.output.contains("aidaemon-definitely-missing-cli"));
+    }
+
     fn extract_task_id_from_background_message(msg: &str) -> String {
         let marker = "task_id=";
         let start = msg
@@ -3219,6 +4039,37 @@ mod tests {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .collect()
+    }
+
+    #[test]
+    fn background_cli_completion_reengages_the_original_outcome() {
+        let followup = CliAgentTool::build_background_reengagement_followup(
+            "codex",
+            "abc12345",
+            "Investigate the failure",
+            "completed",
+            "The root cause is in scheduler.rs",
+        );
+
+        assert!(followup.starts_with("[Background command completed]"));
+        assert!(followup.contains("Runtime task ID: abc12345"));
+        assert!(followup.contains("previous unfinished request"));
+        assert!(followup.contains("complete every remaining implementation"));
+        assert!(followup.contains("The root cause is in scheduler.rs"));
+    }
+
+    #[test]
+    fn background_progress_is_elapsed_state_not_prompt_wording() {
+        let message = format_background_progress(
+            "codex",
+            "Investigate an arbitrary unfinished operation",
+            240,
+            Some("Running focused validation"),
+        );
+
+        assert!(message.contains("still running (240s)"));
+        assert!(message.contains("Worker: codex"));
+        assert!(message.contains("Latest activity: Running focused validation"));
     }
 
     /// Create a CliAgentTool with `echo` registered as a test tool.
@@ -3273,6 +4124,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (tool, db_file)
@@ -3329,6 +4182,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (tool, db_file)
@@ -4515,6 +5370,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Run a command
@@ -4586,6 +5443,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Run a command that will exceed the short timeout and be moved to background,
@@ -4751,6 +5610,8 @@ mod tests {
             concurrency_limiter: Arc::new(Semaphore::new(3)),
             approval_tx,
             hub: OnceLock::new(),
+            agent: OnceLock::new(),
+            reengagements: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let resp = tool
@@ -4775,6 +5636,95 @@ mod tests {
         assert!(check.contains("finished"));
     }
 
+    #[tokio::test]
+    async fn check_with_wrong_id_recovers_only_session_task() {
+        let (tool, _db) = setup_bash_tool().await;
+        let started = tool
+            .call(
+                r#"{"action":"run","tool":"bash-agent","prompt":"echo recovered-result","async_mode":true,"_session_id":"session-recover"}"#,
+            )
+            .await
+            .unwrap();
+        let real_task_id = extract_task_id_from_background_message(&started);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let recovered = tool
+            .call(&format!(
+                r#"{{"action":"check","task_id":"provider-thread-uuid","_session_id":"session-recover"}}"#
+            ))
+            .await
+            .unwrap();
+
+        assert!(recovered.contains("Recovered the only recent CLI task"));
+        assert!(recovered.contains(&format!("task_id={real_task_id}")));
+        assert!(recovered.contains("recovered-result"));
+    }
+
+    #[tokio::test]
+    async fn missing_check_is_a_typed_negative_result() {
+        let (tool, _db) = setup_echo_tool().await;
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"check","task_id":"missing","_session_id":"empty-session"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert!(outcome
+            .output
+            .contains("do not treat this lookup miss as completion"));
+    }
+
+    #[tokio::test]
+    async fn async_run_reports_background_metadata_and_notifications() {
+        let (tool, _db) = setup_bash_tool().await;
+        let outcome = tool
+            .call_with_status_outcome(
+                r#"{"action":"run","tool":"bash-agent","prompt":"sleep 2","async_mode":true,"_session_id":"session-background"}"#,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Backgrounded)
+        );
+        assert!(outcome.metadata.background_started);
+        assert!(outcome.metadata.completion_notifications_enabled);
+
+        tool.handle_cancel_all("session-background").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_run_queues_chat_visible_progress_while_still_running() {
+        let (tool, _db) = setup_bash_tool().await;
+        let state = tool.state.clone();
+        tool.call(
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 1","async_mode":true,"_session_id":"session-progress"}"#,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let notifications = state.get_pending_notifications(20).await.unwrap();
+        assert!(
+            notifications.iter().any(|entry| {
+                entry.session_id == "session-progress"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("still running")
+            }),
+            "pending notifications: {notifications:?}"
+        );
+
+        tool.handle_cancel_all("session-progress").await.unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Git diff capture test
     // -----------------------------------------------------------------------
@@ -4784,6 +5734,22 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let result = CliAgentTool::capture_git_diff(tmp.path().to_str().unwrap()).await;
         assert!(result.is_none(), "Non-git directory should return None");
+    }
+
+    #[test]
+    fn deployment_prompt_detection_respects_explicit_negative_instructions() {
+        assert!(delegated_prompt_requests_deployment(
+            "Build, deploy, and verify the exact public URL",
+            None,
+        ));
+        assert!(delegated_prompt_requests_deployment(
+            "Prepare the artifact",
+            Some("Publish the release after tests pass"),
+        ));
+        assert!(!delegated_prompt_requests_deployment(
+            "Build locally but do not deploy",
+            None,
+        ));
     }
 
     #[tokio::test]
@@ -4828,6 +5794,8 @@ mod tests {
 
         // Modify the file (uncommitted change)
         std::fs::write(tmp.path().join("file.txt"), "modified content").unwrap();
+
+        assert_eq!(CliAgentTool::dirty_worktree_entry_count(dir).await, Some(1));
 
         let result = CliAgentTool::capture_git_diff(dir).await;
         assert!(result.is_some(), "Should capture uncommitted changes");
