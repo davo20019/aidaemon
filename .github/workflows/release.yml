@@ -147,7 +147,7 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -187,8 +187,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
-      - name: Publish
-        id: publish
+      - name: Publish workspace crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -199,51 +198,60 @@ jobs:
             exit 1
           fi
 
-          LOG_FILE="$(mktemp)"
+          manifest_version() {
+            awk '
+              /^\[package\]$/ { in_package=1; next }
+              /^\[/ && in_package { exit }
+              in_package && /^version = / {
+                gsub(/^version = "/, "", $0)
+                gsub(/"$/, "", $0)
+                print
+                exit
+              }
+            ' "$1"
+          }
 
-          set +e
-          cargo publish --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$LOG_FILE"
-          STATUS=${PIPESTATUS[0]}
-          set -e
+          publish_package() {
+            local package="$1"
+            local expected_version="$2"
+            local log_file
+            log_file="$(mktemp)"
 
-          if [ "$STATUS" -eq 0 ]; then
-            echo "result=published" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            set +e
+            cargo publish -p "$package" --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log_file"
+            local status=${PIPESTATUS[0]}
+            set -e
 
-          if grep -Eqi 'already (uploaded|exists|been uploaded)|crate version .* is already uploaded' "$LOG_FILE"; then
-            echo "result=already-published" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "::error::cargo publish failed for version ${{ steps.release_meta.outputs.crate_version }}."
-          exit "$STATUS"
-
-      - name: Verify crates.io version
-        env:
-          EXPECTED_VERSION: ${{ steps.release_meta.outputs.crate_version }}
-          PUBLISH_RESULT: ${{ steps.publish.outputs.result }}
-        run: |
-          set -euo pipefail
-
-          echo "Waiting for crates.io to report aidaemon ${EXPECTED_VERSION} (${PUBLISH_RESULT})."
-
-          for ATTEMPT in $(seq 1 30); do
-            REPORTED_VERSION="$(
-              python3 -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("https://crates.io/api/v1/crates/aidaemon", timeout=20)); print(payload["crate"]["max_version"])'
-            )"
-
-            if [ "$REPORTED_VERSION" = "$EXPECTED_VERSION" ]; then
-              echo "crates.io now reports aidaemon ${REPORTED_VERSION}."
-              exit 0
+            if [ "$status" -ne 0 ] && ! grep -Eqi 'already (uploaded|exists|been uploaded)|crate version .* is already uploaded' "$log_file"; then
+              echo "::error::cargo publish failed for ${package} ${expected_version}."
+              exit "$status"
             fi
 
-            echo "Attempt ${ATTEMPT}/30: crates.io reports ${REPORTED_VERSION}; waiting for ${EXPECTED_VERSION}."
-            sleep 10
-          done
+            for attempt in $(seq 1 30); do
+              local reported_version
+              reported_version="$(
+                CRATE_NAME="$package" python3 -c 'import json, os, urllib.request; url = "https://crates.io/api/v1/crates/" + os.environ["CRATE_NAME"]; payload = json.load(urllib.request.urlopen(url, timeout=20)); print(payload["crate"]["max_version"])' 2>/dev/null || true
+              )"
 
-          echo "::error::crates.io did not report aidaemon ${EXPECTED_VERSION} within 5 minutes."
-          exit 1
+              if [ "$reported_version" = "$expected_version" ]; then
+                echo "crates.io reports ${package} ${reported_version}."
+                return 0
+              fi
+
+              echo "Attempt ${attempt}/30: crates.io reports ${package} ${reported_version:-unavailable}; waiting for ${expected_version}."
+              sleep 10
+            done
+
+            echo "::error::crates.io did not report ${package} ${expected_version} within 5 minutes."
+            exit 1
+          }
+
+          PROTOCOL_VERSION="$(manifest_version crates/node-protocol/Cargo.toml)"
+          SDK_VERSION="$(manifest_version crates/node-sdk/Cargo.toml)"
+
+          publish_package "aidaemon-node-protocol" "$PROTOCOL_VERSION"
+          publish_package "aidaemon-node-sdk" "$SDK_VERSION"
+          publish_package "aidaemon" "${{ steps.release_meta.outputs.crate_version }}"
 
   update-homebrew:
     name: Update Homebrew Tap

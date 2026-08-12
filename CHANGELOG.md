@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-11
+
+### Added
+
+- **AIDaemon Nodes extend the daemon to trusted edge devices.** A versioned protocol, reusable Rust SDK, authenticated gateway, durable SQLite state, signed enrollment and credential rotation, session recovery, sensor reporting, streamed conversation turns, media transfer, and an acknowledged node outbox now form an end-to-end device platform.
+- **Node operations are available from development through production.** The release adds administrative CLI commands, a node simulator, K10 provisioning and Wi-Fi update utilities, environmental monitors with alert/recovery history, health inspection tools, spoken announcements, presentation-aware replies, retention maintenance, and signed OTA firmware offers.
+
+### Changed
+
+- **Agent work now follows durable outcomes across turns.** Typed completion obligations survive related follow-ups, task leads retain ownership of unfinished work, correction and recovery paths use persisted lifecycle state, and blocker reporting distinguishes genuine external dependencies from recoverable execution failures.
+- **CLI-agent and terminal execution are more resilient.** Background processes expose richer progress evidence, workload-aware stall contracts, bounded output and heartbeat handling, durable invocation recovery, and safer continuation after daemon restarts or transient failures.
+- **Goals, schedules, and mandates use tighter typed control.** Dispatch, review, notification, quota, and completion paths now preserve authoritative task state and mutation receipts while avoiding phrase-based completion or routing decisions.
+- **User-facing status and approval messages are easier to consume.** Telegram pagination, shared notification presentation, compact status surfaces, and response guidance reduce duplicated orchestration detail while retaining the evidence needed to verify work.
+- **Project guidance is resolved centrally at tool boundaries.** Nested instruction discovery and execution deferral now share one scoped resolver, reducing drift between direct and CLI-agent workflows while preserving workspace and authority constraints.
+
+### Fixed
+
+- **Short follow-ups no longer silently abandon unfinished requests.** Continuations inherit outstanding observation, mutation, and verification requirements from typed dialogue state unless the user replaces the request or explicitly narrows its authority.
+- **Background work no longer treats healthy long-running activity as a hang.** Terminal reaping considers CPU, I/O, output, workload class, and confirming samples before terminating work, while still enforcing hard bounds for generic stalled commands.
+
 ## [0.11.46] - 2026-08-03
 
 ### Fixed

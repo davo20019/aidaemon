@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.11.48"
+version = "0.12.0"
 dependencies = [
  "aes-gcm",
  "aidaemon-node-protocol",
