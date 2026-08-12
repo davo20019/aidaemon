@@ -107,6 +107,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
+      - name: Install macOS dependencies
+        if: matrix.os == 'macos-14'
+        run: brew install ffmpeg
+
       - name: Free disk space (ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
