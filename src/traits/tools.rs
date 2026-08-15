@@ -725,6 +725,49 @@ pub struct ToolResultProvenance {
     pub returned_end_line: Option<usize>,
 }
 
+/// Deterministic credential/target readiness checked immediately before an
+/// autonomous adapter is allowed to perform I/O. The accompanying durable
+/// receipt carries the mandate grant, which binds this record to the stable
+/// mandate identity and policy version without exposing credentials.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationPreflightStatus {
+    Ready,
+    Blocked,
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizationPreflightRecord {
+    pub schema_version: u16,
+    pub status: AuthorizationPreflightStatus,
+    pub intended_operation: String,
+    pub target_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Provider-declared OAuth scopes known at the readiness boundary. Static
+    /// non-OAuth profiles legitimately leave this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    pub checked_at: String,
+}
+
+impl AuthorizationPreflightRecord {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub const fn permits_io(&self) -> bool {
+        matches!(self.status, AuthorizationPreflightStatus::Ready)
+    }
+}
+
 impl ToolResultProvenance {
     pub fn from_authoritative_result(
         result: &str,
@@ -873,6 +916,10 @@ pub struct ToolCallMetadata {
     /// dispatcher so individual adapters cannot silently omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_provenance: Option<ToolResultProvenance>,
+    /// Exact pre-I/O authorization readiness for autonomous authenticated
+    /// adapters. It is persisted with the receipt and never contains secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_preflight: Option<AuthorizationPreflightRecord>,
     /// Optional final user-facing reply. When set, the root agent may close the
     /// turn directly from the tool result instead of running another LLM pass.
     #[serde(skip_serializing_if = "Option::is_none")]

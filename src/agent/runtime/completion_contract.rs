@@ -85,6 +85,12 @@ pub(super) fn parse_planned_forbidden_action(value: &str) -> Option<ForbiddenMut
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionContract {
+    /// Current task that owns every field, target, requirement, and constraint
+    /// in this contract. The container is the authoritative scope boundary: no
+    /// unbound or differently-bound contract may drive execution/finalization.
+    pub scope_task_id: Option<String>,
+    /// Explicit lineage for prior contracts adopted by a typed follow-up edge.
+    pub adopted_from_task_ids: Vec<String>,
     pub task_kind: CompletionTaskKind,
     pub expects_mutation: bool,
     /// Typed outcomes that must be observed before a mutating request is
@@ -124,12 +130,31 @@ impl CompletionContract {
             .first()
             .map(|target| target.value.clone())
     }
+
+    pub(super) fn adopt_for_task(&mut self, task_id: &str) {
+        if let Some(prior) = self
+            .scope_task_id
+            .as_deref()
+            .filter(|prior| *prior != task_id)
+        {
+            if !self.adopted_from_task_ids.iter().any(|id| id == prior) {
+                self.adopted_from_task_ids.push(prior.to_string());
+            }
+        }
+        self.scope_task_id = Some(task_id.to_string());
+    }
+
+    pub(super) fn belongs_to_task(&self, task_id: &str) -> bool {
+        self.scope_task_id.as_deref() == Some(task_id)
+    }
 }
 
 pub(super) fn persistable_completion_contract(
     contract: &CompletionContract,
 ) -> RequestCompletionContract {
     RequestCompletionContract {
+        scope_task_id: contract.scope_task_id.clone(),
+        adopted_from_task_ids: contract.adopted_from_task_ids.clone(),
         task_kind: match contract.task_kind {
             CompletionTaskKind::Conversational => RequestTaskKind::Conversational,
             CompletionTaskKind::Answer => RequestTaskKind::Answer,
@@ -184,6 +209,8 @@ pub(super) fn completion_contract_from_persisted(
     contract: &RequestCompletionContract,
 ) -> CompletionContract {
     CompletionContract {
+        scope_task_id: contract.scope_task_id.clone(),
+        adopted_from_task_ids: contract.adopted_from_task_ids.clone(),
         task_kind: match contract.task_kind {
             RequestTaskKind::Conversational => CompletionTaskKind::Conversational,
             RequestTaskKind::Answer => CompletionTaskKind::Answer,
@@ -242,6 +269,16 @@ pub(super) fn inherit_unfinished_request_contract(
     mut current: CompletionContract,
     unfinished: &CompletionContract,
 ) -> CompletionContract {
+    if let Some(origin) = unfinished.scope_task_id.as_ref() {
+        if !current.adopted_from_task_ids.contains(origin) {
+            current.adopted_from_task_ids.push(origin.clone());
+        }
+    }
+    for origin in &unfinished.adopted_from_task_ids {
+        if !current.adopted_from_task_ids.contains(origin) {
+            current.adopted_from_task_ids.push(origin.clone());
+        }
+    }
     let current_requires_execution = current.expects_mutation || current.requires_observation;
     let may_carry_mutation = !current.forbids_mutation;
 
@@ -496,6 +533,7 @@ fn structural_evidence_requirements(
                 purpose,
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
                 target: Some(RequestVerificationTarget {
                     kind: match target.kind {
                         VerificationTargetKind::Url => RequestVerificationTargetKind::Url,
@@ -513,17 +551,22 @@ pub(super) fn install_semantic_completion_contract(
     requirements: SemanticCompletionRequirements<'_>,
 ) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
-    let mut evidence_requirements = requirements.evidence_requirements.to_vec();
-    for structural in structural_evidence_requirements(&verification_targets) {
-        if !evidence_requirements.contains(&structural) {
-            evidence_requirements.push(structural);
-        }
-    }
+    let scope_task_id = contract.scope_task_id.take();
+    let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
+    // A complete semantic assessment is authoritative about material
+    // information needs. Keep exact resource identities as matching hints, but
+    // do not promote every path mentioned by the request into an independent
+    // content obligation. Paths also represent execution scope (for example a
+    // command's working directory), and treating those as requested evidence
+    // creates validation loops unrelated to the user's objective.
+    let evidence_requirements = requirements.evidence_requirements.to_vec();
     let scope = requirements.mutation_scope.trim().to_ascii_lowercase();
     let forbids_mutation = matches!(scope.as_str(), "read_only" | "read-only");
     let expects_mutation = requirements.expects_mutation && !forbids_mutation;
 
     *contract = CompletionContract {
+        scope_task_id,
+        adopted_from_task_ids,
         task_kind: requirements.task_kind,
         expects_mutation,
         required_mutation_effects: if expects_mutation {
@@ -561,9 +604,13 @@ pub(super) fn install_semantic_completion_contract(
 /// failed. Exact URLs and structurally resolved paths remain observable.
 pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
+    let scope_task_id = contract.scope_task_id.take();
+    let adopted_from_task_ids = std::mem::take(&mut contract.adopted_from_task_ids);
     let requires_observation = !verification_targets.is_empty();
     let evidence_requirements = structural_evidence_requirements(&verification_targets);
     *contract = CompletionContract {
+        scope_task_id,
+        adopted_from_task_ids,
         task_kind: if requires_observation {
             CompletionTaskKind::Check
         } else {
@@ -887,6 +934,11 @@ fn remove_scoped_negative_mutation_phrases(lower: &str) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CompletionProgress {
+    /// Stable namespace for every node in this task's completion graph.
+    /// Runtime-created graphs never use a process-global "current" request
+    /// node, so evidence from another task cannot become executable merely
+    /// because its local obligation label happens to match.
+    pub(in crate::agent) task_scope: String,
     pub observation_count: usize,
     pub mutation_count: usize,
     /// Effects observed from successful calls. This is separate from the raw
@@ -966,8 +1018,9 @@ pub(super) struct CompletionProgress {
 }
 
 impl CompletionProgress {
-    pub(super) fn new(contract: &CompletionContract) -> Self {
+    pub(super) fn new(contract: &CompletionContract, task_id: &str) -> Self {
         let mut progress = Self {
+            task_scope: format!("task:{task_id}"),
             verification_pending: contract.requires_observation,
             ..Self::default()
         };
@@ -982,14 +1035,15 @@ impl CompletionProgress {
     }
 
     fn initialize_proof_graph(&mut self, contract: &CompletionContract) -> Result<(), String> {
-        const REQUEST_ID: &str = "request:current";
+        let request_id = self.scoped_node_id("request");
         self.proof_graph.add_node(
-            REQUEST_ID,
+            request_id.clone(),
             ExecutionNodeKind::Request,
             ExecutionNodeState::Running,
         )?;
 
         if contract.expects_mutation {
+            let task_scope = self.task_scope.clone();
             let mut add_mutation_obligation = |id: String| -> Result<(), String> {
                 self.proof_graph.add_node(
                     id.clone(),
@@ -997,17 +1051,19 @@ impl CompletionProgress {
                     ExecutionNodeState::Pending,
                 )?;
                 self.proof_graph
-                    .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+                    .add_edge(&request_id, &id, ExecutionEdgeKind::Requires, None)?;
                 self.mutation_obligation_ids.push(id);
                 Ok(())
             };
 
             if contract.required_mutation_effects.is_empty() {
-                add_mutation_obligation("obligation:mutation:any".to_string())?;
+                add_mutation_obligation(format!("{task_scope}/obligation:mutation:any"))?;
             } else {
                 for (label, effect) in mutation_effect_obligations() {
                     if contract.required_mutation_effects.intersects(effect) {
-                        add_mutation_obligation(format!("obligation:mutation:{label}"))?;
+                        add_mutation_obligation(format!(
+                            "{task_scope}/obligation:mutation:{label}"
+                        ))?;
                     }
                 }
             }
@@ -1015,29 +1071,33 @@ impl CompletionProgress {
 
         if contract.requires_observation && !contract.evidence_requirements.is_empty() {
             for (index, _) in contract.evidence_requirements.iter().enumerate() {
-                let id = format!("obligation:evidence:{index}");
+                let id = self.scoped_node_id(&format!("obligation:evidence:{index}"));
                 self.proof_graph.add_node(
                     id.clone(),
                     ExecutionNodeKind::Obligation,
                     ExecutionNodeState::Pending,
                 )?;
                 self.proof_graph
-                    .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+                    .add_edge(&request_id, &id, ExecutionEdgeKind::Requires, None)?;
                 self.evidence_obligation_ids.push(id);
             }
         } else if contract.requires_observation {
-            let id = "obligation:verification".to_string();
+            let id = self.scoped_node_id("obligation:verification");
             self.proof_graph.add_node(
                 id.clone(),
                 ExecutionNodeKind::Obligation,
                 ExecutionNodeState::Pending,
             )?;
             self.proof_graph
-                .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+                .add_edge(&request_id, &id, ExecutionEdgeKind::Requires, None)?;
             self.verification_obligation_id = Some(id);
         }
 
         Ok(())
+    }
+
+    fn scoped_node_id(&self, local_id: &str) -> String {
+        format!("{}/{}", self.task_scope, local_id)
     }
 
     #[cfg(test)]
@@ -1054,7 +1114,7 @@ impl CompletionProgress {
         if !self.proof_graph_initialized {
             return None;
         }
-        let id = format!("receipt:{tool_call_id}");
+        let id = self.scoped_node_id(&format!("receipt:{tool_call_id}"));
         match self.proof_graph.add_node(
             id.clone(),
             ExecutionNodeKind::Receipt,
@@ -1093,7 +1153,7 @@ impl CompletionProgress {
         self.observed_mutation_effects = self.observed_mutation_effects.union(effects);
         if let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
             for (label, required_effect) in mutation_effect_obligations() {
-                let obligation_id = format!("obligation:mutation:{label}");
+                let obligation_id = self.scoped_node_id(&format!("obligation:mutation:{label}"));
                 let observed_matches = if required_effect == ToolMutationEffects::UNSPECIFIED {
                     !effects.is_empty()
                 } else {
@@ -1109,15 +1169,15 @@ impl CompletionProgress {
                     }
                 }
             }
-            let generic_id = "obligation:mutation:any";
+            let generic_id = self.scoped_node_id("obligation:mutation:any");
             if self.proof_graph_initialized
                 && self
                     .mutation_obligation_ids
                     .iter()
-                    .any(|id| id == generic_id)
+                    .any(|id| id == &generic_id)
             {
                 if let Err(error) = self.proof_graph.satisfy_with_evidence(
-                    generic_id,
+                    &generic_id,
                     &receipt_id,
                     Some(tool_call_id.to_string()),
                 ) {
@@ -1245,7 +1305,7 @@ impl CompletionProgress {
         if obligation_ids.is_empty() {
             return;
         }
-        let id = format!("verification:{tool_call_id}");
+        let id = self.scoped_node_id(&format!("verification:{tool_call_id}"));
         if let Err(error) = self.proof_graph.add_node(
             id.clone(),
             ExecutionNodeKind::Verification,
@@ -1270,6 +1330,14 @@ impl CompletionProgress {
             .iter()
             .filter(|id| self.proof_graph.state(id) == Some(ExecutionNodeState::Satisfied))
             .count()
+    }
+
+    pub(in crate::agent) fn completion_obligations_for_receipt(
+        &self,
+        tool_call_id: &str,
+    ) -> Vec<String> {
+        self.proof_graph
+            .obligations_satisfied_by_receipt(tool_call_id)
     }
 
     pub(in crate::agent) fn all_evidence_requirements_satisfied(&self) -> bool {
@@ -2268,6 +2336,8 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
             || signals.visible_state_problem));
 
     CompletionContract {
+        scope_task_id: None,
+        adopted_from_task_ids: Vec::new(),
         task_kind,
         expects_mutation,
         required_mutation_effects,
@@ -2299,6 +2369,8 @@ mod tests {
             value: "https://example.test/status".to_string(),
         };
         let mut contract = CompletionContract {
+            scope_task_id: Some("task-current".to_string()),
+            adopted_from_task_ids: Vec::new(),
             task_kind: CompletionTaskKind::Deliver,
             expects_mutation: true,
             required_mutation_effects: ToolMutationEffects::REMOTE_DEPLOY,
@@ -2354,6 +2426,7 @@ mod tests {
             purpose: crate::traits::EvidencePurpose::CurrentState,
             minimum_authority: crate::traits::EvidenceAuthority::Direct,
             temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            required_content_markers: Vec::new(),
             target: None,
         };
         let mut contract = CompletionContract::default();
@@ -2380,7 +2453,7 @@ mod tests {
         assert!(!contract.requires_observation);
         assert!(!contract.explicit_verification_requested);
         assert_eq!(contract.evidence_requirements, vec![requirement]);
-        let progress = CompletionProgress::new(&contract);
+        let progress = CompletionProgress::new(&contract, "test-task");
         assert!(!progress.verification_pending);
     }
 
@@ -2712,6 +2785,41 @@ mod tests {
     }
 
     #[test]
+    fn task_binding_requires_explicit_adoption_and_namespaces_proof_nodes() {
+        let mut prior = CompletionContract {
+            scope_task_id: Some("task-prior".to_string()),
+            required_response_fields: vec!["synthetic_field".to_string()],
+            requires_observation: true,
+            ..CompletionContract::default()
+        };
+        assert!(!prior.belongs_to_task("task-current"));
+
+        prior.adopt_for_task("task-current");
+        assert!(prior.belongs_to_task("task-current"));
+        assert_eq!(prior.adopted_from_task_ids, ["task-prior"]);
+
+        let current_progress = CompletionProgress::new(&prior, "task-current");
+        let other_progress = CompletionProgress::new(&prior, "task-other");
+        assert_ne!(current_progress.task_scope, other_progress.task_scope);
+        assert_eq!(
+            current_progress
+                .proof_graph
+                .node_kind("task:task-current/request"),
+            Some(ExecutionNodeKind::Request)
+        );
+        assert_eq!(
+            other_progress
+                .proof_graph
+                .node_kind("task:task-other/request"),
+            Some(ExecutionNodeKind::Request)
+        );
+        assert!(current_progress
+            .proof_graph
+            .node_kind("task:task-other/request")
+            .is_none());
+    }
+
+    #[test]
     fn current_observation_only_constraint_blocks_inherited_mutation() {
         let current = CompletionContract {
             task_kind: CompletionTaskKind::Check,
@@ -2836,7 +2944,7 @@ mod tests {
             .required_mutation_effects
             .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
 
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
         progress.mark_mutation(
             &contract,
             &ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),
@@ -2862,7 +2970,7 @@ mod tests {
     fn missing_existing_file_does_not_arm_authored_artifact_recovery() {
         let contract =
             infer_completion_contract("Send me the SOW PDF from the Lodestar project.", &[]);
-        let progress = CompletionProgress::new(&contract);
+        let progress = CompletionProgress::new(&contract, "test-task");
 
         assert!(!authored_artifact_still_needs_delivery_recovery(
             &contract, &progress
@@ -2949,7 +3057,7 @@ mod tests {
                 expects_mutation: true,
                 ..CompletionContract::default()
             };
-            let mut progress = CompletionProgress::new(&contract);
+            let mut progress = CompletionProgress::new(&contract, "test-task");
 
             assert!(!completion_contract_allows_force_text(&contract, &progress));
             progress.mutation_count = 1;
@@ -3005,7 +3113,7 @@ mod tests {
             "I still don't see the posts here: https://blog.aidaemon.ai",
             &[],
         );
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
         assert!(progress.verification_pending);
 
         progress.mark_observation(&contract, true);
@@ -3039,6 +3147,7 @@ mod tests {
                     purpose: EvidencePurpose::CurrentState,
                     minimum_authority: EvidenceAuthority::Direct,
                     temporal_scope: EvidenceTemporalScope::Current,
+                    required_content_markers: Vec::new(),
                     target: None,
                 },
                 RequestEvidenceRequirement {
@@ -3047,12 +3156,13 @@ mod tests {
                     purpose: EvidencePurpose::Attribution,
                     minimum_authority: EvidenceAuthority::Canonical,
                     temporal_scope: EvidenceTemporalScope::Historical,
+                    required_content_markers: Vec::new(),
                     target: None,
                 },
             ],
             ..CompletionContract::default()
         };
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
 
         progress.mark_observation_receipt(&contract, &[0], true, "external-state");
         assert_eq!(progress.observation_count, 1);
@@ -3093,6 +3203,7 @@ mod tests {
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
                 target: None,
             }],
             ..CompletionContract::default()
@@ -3107,7 +3218,7 @@ mod tests {
             EvidenceAuthority::Direct,
             EvidenceTemporalScope::Current,
         )]);
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
 
         // Runtime records the mutation first so it invalidates only evidence
         // from before this call. The same authoritative receipt then proves
@@ -3208,7 +3319,7 @@ mod tests {
             requires_observation: false,
             ..Default::default()
         };
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
         assert_eq!(progress.failed_external_mutation_count, 0);
         assert!(!progress.external_mutation_reconciliation_attempted);
 
@@ -3401,7 +3512,7 @@ mod tests {
         assert!(contract
             .required_mutation_effects
             .contains(ToolMutationEffects::LOCAL_SOURCE_WRITE));
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
         progress.mark_mutation(
             &contract,
             &ToolCallSemantics::observation_and_mutation_with(
@@ -3478,7 +3589,7 @@ mod tests {
         assert!(contract
             .required_mutation_effects
             .contains(ToolMutationEffects::REMOTE_DEPLOY));
-        let mut progress = CompletionProgress::new(&contract);
+        let mut progress = CompletionProgress::new(&contract, "test-task");
         progress.mark_mutation(
             &contract,
             &ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE),

@@ -5,20 +5,21 @@ use crate::traits::{
     MandateFinalizationRejectReason, MandateFinalizationStaleReason, MandateLearningNote,
     MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
     MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateOperatingUpdates,
-    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
-    MandateRunFinalizationResult, MandateRunProofCounts, MandateStatus, MandateStore,
-    MandateStrategyRevision, MandateStrategyRevisionKind, MandateSuspension, MandateSuspensionKind,
-    MandateTerminationKind, MandateWakeSignal, Task, SAFE_FALLBACK_WAIT_RATIONALE,
+    MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
+    MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
+    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
+    MandateStatus, MandateStore, MandateStrategyRevision, MandateStrategyRevisionKind,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal, Task,
+    SAFE_FALLBACK_WAIT_RATIONALE,
 };
 use sha2::{Digest, Sha256};
 
 const MANDATE_COLUMNS: &str =
     "id, goal_id, source_goal_id, objective, status, autonomy_mode, authority_json, strategy_json, \
-     suspension_json, constraints_json, \
+     objective_control_json, suspension_json, constraints_json, \
      success_criteria_json, stop_conditions_json, min_review_secs, max_review_secs, \
      default_review_secs, review_effort, next_review_at, review_lease_token, review_lease_expires_at, \
-     expires_at, confirmed_at, version, created_by_session, created_at, updated_at";
+     expires_at, confirmed_at, version, owner_principal_id, created_by_session, created_at, updated_at";
 
 const DECISION_COLUMNS: &str =
     "id, mandate_id, goal_run_id, mandate_version, outcome, activity_level, rationale, belief_snapshot, \
@@ -71,6 +72,10 @@ fn mandate_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Mandate> {
             .get::<Option<String>, _>("strategy_json")
             .map(|value| serde_json::from_str(&value))
             .transpose()?,
+        objective_control: row
+            .get::<Option<String>, _>("objective_control_json")
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
         suspension: row
             .get::<Option<String>, _>("suspension_json")
             .map(|value| serde_json::from_str(&value))
@@ -88,6 +93,7 @@ fn mandate_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Mandate> {
         expires_at: row.get("expires_at"),
         confirmed_at: row.get("confirmed_at"),
         version: row.get("version"),
+        owner_principal_id: row.get("owner_principal_id"),
         created_by_session: row.get("created_by_session"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -124,6 +130,27 @@ fn decision_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<MandateDec
         action_attempts: row.get("action_attempts"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn objective_measurement_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<MandateObjectiveMeasurement> {
+    Ok(MandateObjectiveMeasurement {
+        id: row.get("id"),
+        mandate_id: row.get("mandate_id"),
+        mandate_version: row.get("mandate_version"),
+        goal_run_id: row.get("goal_run_id"),
+        value_micros: row.get("value_micros"),
+        confidence_bps: u16::try_from(row.get::<i64, _>("confidence_bps"))?,
+        evidence_receipt_ids: serde_json::from_str(
+            &row.get::<String, _>("evidence_receipt_ids_json"),
+        )?,
+        attributed_intention_ids: serde_json::from_str(
+            &row.get::<String, _>("attributed_intention_ids_json"),
+        )?,
+        observed_at: row.get("observed_at"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -248,7 +275,24 @@ fn validate_mandate(mandate: &Mandate) -> anyhow::Result<()> {
         !mandate.created_by_session.trim().is_empty(),
         "mandate owner session is required"
     );
+    anyhow::ensure!(
+        mandate.owner_principal_id.starts_with("principal:")
+            && mandate.owner_principal_id.len() <= 256
+            && !mandate.owner_principal_id.chars().any(char::is_control),
+        "mandate owner principal is invalid"
+    );
     mandate.authority.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
+        "autopilot mandates require a validated objective control"
+    );
+    if let Some(control) = mandate.objective_control.as_ref() {
+        anyhow::ensure!(
+            control.measurement_cadence_secs >= mandate.min_review_secs
+                && control.measurement_cadence_secs <= mandate.max_review_secs,
+            "objective measurement cadence must fit inside the mandate review bounds"
+        );
+    }
     anyhow::ensure!(
         mandate.min_review_secs > 0
             && mandate.min_review_secs <= mandate.default_review_secs
@@ -407,6 +451,11 @@ fn validate_mutation_reservation(
 ) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
     let grant = &reservation.grant;
     validate_canonical_identifier("mandate id", &grant.mandate_id, 256)?;
+    validate_canonical_identifier("owner principal id", &grant.owner_principal_id, 256)?;
+    anyhow::ensure!(
+        grant.owner_principal_id.starts_with("principal:"),
+        "invalid mandate owner principal"
+    );
     validate_canonical_identifier("decision cycle id", &grant.decision_cycle_id, 256)?;
     anyhow::ensure!(grant.mandate_version > 0, "invalid mandate version");
     anyhow::ensure!(
@@ -608,12 +657,12 @@ async fn insert_mandate_row(
     sqlx::query(
         "INSERT INTO mandates (
             id, goal_id, source_goal_id, objective, status, autonomy_mode, authority_json, strategy_json,
-            suspension_json,
+            objective_control_json, suspension_json,
             constraints_json, success_criteria_json, stop_conditions_json,
             min_review_secs, max_review_secs, default_review_secs, review_effort, next_review_at,
             review_lease_token, review_lease_expires_at, expires_at, confirmed_at,
-            version, created_by_session, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            version, owner_principal_id, created_by_session, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&mandate.id)
     .bind(&mandate.goal_id)
@@ -625,6 +674,13 @@ async fn insert_mandate_row(
     .bind(
         mandate
             .strategy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+    )
+    .bind(
+        mandate
+            .objective_control
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
@@ -649,6 +705,7 @@ async fn insert_mandate_row(
     .bind(&mandate.expires_at)
     .bind(&mandate.confirmed_at)
     .bind(mandate.version)
+    .bind(&mandate.owner_principal_id)
     .bind(&mandate.created_by_session)
     .bind(&mandate.created_at)
     .bind(&mandate.updated_at)
@@ -1090,6 +1147,18 @@ impl MandateStore for SqliteStateStore {
         .await?;
 
         insert_mandate_row(&mut tx, mandate).await?;
+        sqlx::query(
+            "INSERT INTO mandate_principal_sessions
+                (principal_id, session_id, linked_at, linked_by_session)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(principal_id, session_id) DO NOTHING",
+        )
+        .bind(&mandate.owner_principal_id)
+        .bind(&mandate.created_by_session)
+        .bind(&mandate.created_at)
+        .bind(&mandate.created_by_session)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1122,7 +1191,12 @@ impl MandateStore for SqliteStateStore {
             qualified_columns("m", MANDATE_COLUMNS)
         );
         if session_id.is_some() {
-            query.push_str(" AND g.session_id = ?");
+            query.push_str(
+                " AND EXISTS (
+                    SELECT 1 FROM mandate_principal_sessions ps
+                    WHERE ps.principal_id = m.owner_principal_id AND ps.session_id = ?
+                )",
+            );
         }
         if !include_terminal {
             query.push_str(" AND m.status NOT IN ('completed', 'cancelled')");
@@ -1139,6 +1213,257 @@ impl MandateStore for SqliteStateStore {
         rows.iter().map(mandate_from_row).collect()
     }
 
+    async fn is_mandate_session_authorized(
+        &self,
+        mandate_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM mandates m
+                JOIN mandate_principal_sessions ps
+                  ON ps.principal_id = m.owner_principal_id
+                WHERE m.id = ? AND ps.session_id = ?
+            )",
+        )
+        .bind(mandate_id)
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
+    async fn transfer_mandate_ownership(
+        &self,
+        mandate_id: &str,
+        expected_version: i64,
+        from_session_id: &str,
+        to_session_id: &str,
+    ) -> anyhow::Result<bool> {
+        for (label, value) in [
+            ("mandate id", mandate_id),
+            ("source session", from_session_id),
+            ("target session", to_session_id),
+        ] {
+            anyhow::ensure!(
+                !value.trim().is_empty()
+                    && value.trim() == value
+                    && value.len() <= 256
+                    && !value.chars().any(char::is_control),
+                "invalid ownership transfer {label}"
+            );
+        }
+        anyhow::ensure!(
+            from_session_id != to_session_id,
+            "ownership transfer target must differ from the source session"
+        );
+        anyhow::ensure!(expected_version > 0, "mandate version must be positive");
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT m.goal_id, m.owner_principal_id
+             FROM mandates m
+             JOIN mandate_principal_sessions ps
+               ON ps.principal_id = m.owner_principal_id
+             WHERE m.id = ? AND m.version = ? AND ps.session_id = ?
+               AND m.status NOT IN ('completed', 'cancelled')",
+        )
+        .bind(mandate_id)
+        .bind(expected_version)
+        .bind(from_session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let goal_id: String = row.get("goal_id");
+        let principal_id: String = row.get("owner_principal_id");
+        let claimed_unresolved = invalidate_open_mandate_runs(&mut tx, &goal_id, &now).await?;
+        if claimed_unresolved > 0 {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "ownership cannot move while a dispatched mutation awaits reconciliation"
+            );
+        }
+        sqlx::query(
+            "INSERT INTO mandate_principal_sessions
+                (principal_id, session_id, linked_at, linked_by_session)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(principal_id, session_id) DO NOTHING",
+        )
+        .bind(&principal_id)
+        .bind(to_session_id)
+        .bind(&now)
+        .bind(from_session_id)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE mandates
+             SET created_by_session = ?, version = version + 1,
+                 review_lease_token = NULL, review_lease_expires_at = NULL,
+                 updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(to_session_id)
+        .bind(&now)
+        .bind(mandate_id)
+        .bind(expected_version)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "mandate version changed during transfer"
+        );
+        sqlx::query("UPDATE goals SET session_id = ?, updated_at = ? WHERE id = ?")
+            .bind(to_session_id)
+            .bind(&now)
+            .bind(&goal_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO work_channel_links (goal_id, channel_session_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(goal_id, channel_session_id) DO UPDATE SET updated_at = excluded.updated_at",
+        )
+        .bind(&goal_id)
+        .bind(to_session_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE notification_queue SET session_id = ?
+             WHERE goal_id = ? AND delivered_at IS NULL",
+        )
+        .bind(to_session_id)
+        .bind(&goal_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO mandate_ownership_transfers
+                (id, mandate_id, principal_id, from_session_id, to_session_id,
+                 from_version, to_version, transferred_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(mandate_id)
+        .bind(&principal_id)
+        .bind(from_session_id)
+        .bind(to_session_id)
+        .bind(expected_version)
+        .bind(expected_version + 1)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn record_mandate_objective_measurement(
+        &self,
+        measurement: &MandateObjectiveMeasurement,
+    ) -> anyhow::Result<()> {
+        measurement.validate().map_err(anyhow::Error::msg)?;
+        let observed_at = chrono::DateTime::parse_from_rfc3339(&measurement.observed_at)?
+            .with_timezone(&chrono::Utc);
+        anyhow::ensure!(
+            observed_at <= chrono::Utc::now() + chrono::Duration::minutes(5),
+            "objective measurement cannot be future-dated"
+        );
+        let mut tx = self.pool.begin().await?;
+        let run_started_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT gr.started_at
+             FROM mandates m
+             JOIN goal_runs gr ON gr.goal_id = m.goal_id
+             WHERE m.id = ? AND m.version = ? AND m.objective_control_json IS NOT NULL
+               AND m.status = 'active' AND m.confirmed_at IS NOT NULL
+               AND gr.id = ? AND gr.trigger_type = 'mandate' AND gr.status = 'running'",
+        )
+        .bind(&measurement.mandate_id)
+        .bind(measurement.mandate_version)
+        .bind(&measurement.goal_run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "objective measurement is not bound to a current controlled mandate run"
+            )
+        })?;
+        let run_started_at = chrono::DateTime::parse_from_rfc3339(&run_started_at)
+            .or_else(|_| chrono::DateTime::parse_from_str(&run_started_at, "%Y-%m-%d %H:%M:%S%#z"))?
+            .with_timezone(&chrono::Utc);
+        anyhow::ensure!(
+            observed_at >= run_started_at - chrono::Duration::minutes(5),
+            "objective measurement predates the current mandate run"
+        );
+        validate_current_run_receipt_refs(
+            &mut tx,
+            &measurement.goal_run_id,
+            &measurement.evidence_receipt_ids,
+        )
+        .await?;
+        for intention_id in &measurement.attributed_intention_ids {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM intentions
+                 WHERE id = ? AND mandate_id = ? AND goal_run_id <> ? LIMIT 1",
+            )
+            .bind(intention_id)
+            .bind(&measurement.mandate_id)
+            .bind(&measurement.goal_run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                exists.is_some(),
+                "objective measurement attribution must reference a prior intention from the same mandate"
+            );
+        }
+        sqlx::query(
+            "INSERT INTO mandate_objective_measurements
+                (id, mandate_id, mandate_version, goal_run_id, value_micros,
+                 confidence_bps, evidence_receipt_ids_json, attributed_intention_ids_json,
+                 observed_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&measurement.id)
+        .bind(&measurement.mandate_id)
+        .bind(measurement.mandate_version)
+        .bind(&measurement.goal_run_id)
+        .bind(measurement.value_micros)
+        .bind(i64::from(measurement.confidence_bps))
+        .bind(serde_json::to_string(&measurement.evidence_receipt_ids)?)
+        .bind(serde_json::to_string(
+            &measurement.attributed_intention_ids,
+        )?)
+        .bind(&measurement.observed_at)
+        .bind(&measurement.created_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_mandate_objective_measurements(
+        &self,
+        mandate_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<MandateObjectiveMeasurement>> {
+        let rows = sqlx::query(
+            "SELECT id, mandate_id, mandate_version, goal_run_id, value_micros,
+                    confidence_bps, evidence_receipt_ids_json,
+                    attributed_intention_ids_json, observed_at, created_at
+             FROM mandate_objective_measurements
+             WHERE mandate_id = ?
+             ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?",
+        )
+        .bind(mandate_id)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(objective_measurement_from_row).collect()
+    }
+
     async fn update_mandate(&self, mandate: &Mandate) -> anyhow::Result<()> {
         validate_mandate(mandate)?;
         let expected_version = mandate
@@ -1150,7 +1475,7 @@ impl MandateStore for SqliteStateStore {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE mandates
-             SET objective = ?, autonomy_mode = ?, authority_json = ?, strategy_json = ?, constraints_json = ?,
+             SET objective = ?, autonomy_mode = ?, authority_json = ?, strategy_json = ?, objective_control_json = ?, constraints_json = ?,
                  success_criteria_json = ?, stop_conditions_json = ?, min_review_secs = ?,
                  max_review_secs = ?, default_review_secs = ?, review_effort = ?, next_review_at = ?, expires_at = ?,
                  version = ?, review_lease_token = NULL, review_lease_expires_at = NULL,
@@ -1163,6 +1488,13 @@ impl MandateStore for SqliteStateStore {
         .bind(
             mandate
                 .strategy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .bind(
+            mandate
+                .objective_control
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
@@ -2304,12 +2636,88 @@ impl MandateStore for SqliteStateStore {
             &decision.evidence_receipt_ids,
         )
         .await?;
+        let current_measurement = if mandate.objective_control.is_some()
+            && matches!(
+                decision.outcome,
+                MandateDecisionOutcome::Act
+                    | MandateDecisionOutcome::Wait
+                    | MandateDecisionOutcome::Stop
+            ) {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT value_micros FROM mandate_objective_measurements
+                 WHERE mandate_id = ? AND mandate_version = ? AND goal_run_id = ?
+                 ORDER BY julianday(observed_at) DESC, id DESC LIMIT 1",
+            )
+            .bind(&mandate.id)
+            .bind(mandate.version)
+            .bind(&decision.goal_run_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        if mandate.objective_control.is_some()
+            && matches!(
+                decision.outcome,
+                MandateDecisionOutcome::Act | MandateDecisionOutcome::Wait
+            )
+        {
+            anyhow::ensure!(
+                current_measurement.is_some(),
+                "controlled mandate decisions require a receipt-backed metric measurement from the current run"
+            );
+        }
+        if decision.outcome == MandateDecisionOutcome::Wait {
+            if let Some(control) = mandate.objective_control.as_ref() {
+                let limit = i64::from(control.max_stagnant_measurements) + 1;
+                let values = sqlx::query_scalar::<_, i64>(
+                    "SELECT value_micros FROM (
+                         SELECT value_micros, observed_at, id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY goal_run_id
+                                    ORDER BY julianday(observed_at) DESC, id DESC
+                                ) AS run_rank
+                         FROM mandate_objective_measurements
+                         WHERE mandate_id = ?
+                     )
+                     WHERE run_rank = 1
+                     ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?",
+                )
+                .bind(&mandate.id)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+                if values.len() >= limit as usize {
+                    let newest = values[0];
+                    let oldest = *values.last().unwrap_or(&newest);
+                    let improvement = match control.direction {
+                        crate::traits::ObjectiveMetricDirection::AtLeast => {
+                            newest.saturating_sub(oldest)
+                        }
+                        crate::traits::ObjectiveMetricDirection::AtMost => {
+                            oldest.saturating_sub(newest)
+                        }
+                    };
+                    anyhow::ensure!(
+                        improvement >= control.minimum_effect_micros,
+                        "objective_control_stagnant: WAIT is not permitted after the configured no-progress window; choose a bounded ACT, ASK, or STOP decision"
+                    );
+                }
+            }
+        }
         if decision.outcome == MandateDecisionOutcome::Stop {
             let termination_kind = decision
                 .termination_kind
                 .ok_or_else(|| anyhow::anyhow!("STOP requires a typed termination_kind"))?;
             match termination_kind {
                 MandateTerminationKind::SuccessCriteriaSatisfied => {
+                    if let Some(control) = mandate.objective_control.as_ref() {
+                        anyhow::ensure!(
+                            current_measurement
+                                .is_some_and(|value| control.target_reached(value)),
+                            "success termination requires the current receipt-backed metric to reach the owner-confirmed target"
+                        );
+                    }
                     let matched = decision.termination_match.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("success termination requires termination_match")
                     })?;
@@ -2339,8 +2747,19 @@ impl MandateStore for SqliteStateStore {
             );
         }
 
-        let next_review_at =
+        let mut next_review_at =
             clamped_next_review_at(&mandate, decision.reconsider_at.as_deref(), now)?;
+        if decision.outcome != MandateDecisionOutcome::Stop {
+            if let Some(control) = mandate.objective_control.as_ref() {
+                let measurement_due =
+                    now + chrono::Duration::seconds(control.measurement_cadence_secs);
+                let selected = chrono::DateTime::parse_from_rfc3339(&next_review_at)?
+                    .with_timezone(&chrono::Utc);
+                if selected > measurement_due {
+                    next_review_at = measurement_due.to_rfc3339();
+                }
+            }
+        }
         let persisted_reconsider_at = if decision.outcome == MandateDecisionOutcome::Stop {
             None
         } else {
@@ -2917,6 +3336,7 @@ impl MandateStore for SqliteStateStore {
                     AND worker_attempt.task_id = worker.id
                     AND worker_attempt.goal_run_id = gr.id
                    WHERE m.id = dc.mandate_id
+                     AND m.owner_principal_id = ?
                      AND m.status = 'active' AND g.status = 'active'
                      AND m.confirmed_at IS NOT NULL
                      AND m.version = dc.mandate_version
@@ -2968,6 +3388,7 @@ impl MandateStore for SqliteStateStore {
         .bind(expected_attempts)
         .bind(reservation.grant.reserved_action_attempt)
         .bind(&reservation.task_id)
+        .bind(&reservation.grant.owner_principal_id)
         .bind(&reservation.root_task_id)
         .bind(&reservation.root_task_attempt_id)
         .bind(&reservation.root_task_attempt_id)
@@ -3048,6 +3469,7 @@ impl MandateStore for SqliteStateStore {
                 && claim.grant.reserved_action_attempt > 0,
             "mutation dispatch requires a positive metered grant"
         );
+        validate_canonical_identifier("owner principal id", &claim.grant.owner_principal_id, 256)?;
         anyhow::ensure!(
             claim.grant.action_digest.len() == 64
                 && claim
@@ -3121,6 +3543,7 @@ impl MandateStore for SqliteStateStore {
                     AND worker_attempt.task_id = worker.id
                     AND worker_attempt.goal_run_id = gr.id
                    WHERE m.id = ma.mandate_id
+                     AND m.owner_principal_id = ?
                      AND m.version = ma.mandate_version
                      AND m.status = 'active' AND m.confirmed_at IS NOT NULL
                      AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday(?))
@@ -3155,6 +3578,7 @@ impl MandateStore for SqliteStateStore {
         .bind(&claim.tool_name)
         .bind(claim.grant.reserved_action_attempt)
         .bind(&claim.grant.action_digest)
+        .bind(&claim.grant.owner_principal_id)
         .bind(&claim.claimed_at)
         .bind(&claim.claimed_at)
         .bind(&claim.claimed_at)
@@ -4058,8 +4482,8 @@ mod tests {
     use crate::traits::store_prelude::*;
     use crate::traits::{
         Goal, Intention, Mandate, MandateAuthority, MandateDecisionCycle, MandateMutationTarget,
-        MandateOperationKind, MandateOperationScope, MandateWakeSignalKind, Task,
-        ToolCallOperation,
+        MandateObjectiveControl, MandateOperationKind, MandateOperationScope,
+        MandateWakeSignalKind, ObjectiveMetricDirection, Task, ToolCallOperation,
     };
     use std::sync::Arc;
 
@@ -4109,11 +4533,31 @@ mod tests {
         (goal, mandate)
     }
 
+    fn objective_control() -> MandateObjectiveControl {
+        MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic useful interactions".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 10_000_000,
+            target_micros: 20_000_000,
+            direction: ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-analytics".to_string(),
+            measurement_cadence_secs: 3_600,
+            experiment_cohort: "synthetic-cohort-a".to_string(),
+            experiment_window_secs: 86_400,
+            minimum_effect_micros: 1_000_000,
+            max_stagnant_measurements: 3,
+            run_failure_budget: 3,
+            baseline_observed_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
     #[tokio::test]
     async fn structured_signal_wakes_only_matching_autopilot_once() {
         let (store, _database) = test_store().await;
         let (goal, mut mandate) = controller("owner-session", 0);
         mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
+        mandate.objective_control = Some(objective_control());
         mandate.authority = MandateAuthority::from_operation_scopes(
             true,
             vec![MandateOperationScope {
@@ -4328,6 +4772,7 @@ mod tests {
             grant: crate::traits::MandateAuthorityGrant {
                 mandate_id: mandate.id.clone(),
                 mandate_version: mandate.version,
+                owner_principal_id: mandate.owner_principal_id.clone(),
                 decision_cycle_id: decision.id.clone(),
                 action_digest: format!("{sequence:064x}"),
                 counts_toward_cycle_budget: true,
@@ -4511,6 +4956,127 @@ mod tests {
             .await
             .is_err());
         assert!(store.get_goal(&foreign_goal.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_preserves_principal_and_moves_runtime_route_atomically() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate) = controller("telegram:synthetic-owner-a", 1);
+        store
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        assert!(store
+            .transfer_mandate_ownership(
+                &mandate.id,
+                mandate.version,
+                "telegram:synthetic-owner-a",
+                "telegram:synthetic-owner-b",
+            )
+            .await
+            .unwrap());
+        let moved = store.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(moved.owner_principal_id, mandate.owner_principal_id);
+        assert_eq!(moved.created_by_session, "telegram:synthetic-owner-b");
+        assert_eq!(moved.version, mandate.version + 1);
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().session_id,
+            "telegram:synthetic-owner-b"
+        );
+        assert!(store
+            .is_mandate_session_authorized(&mandate.id, "telegram:synthetic-owner-b")
+            .await
+            .unwrap());
+        assert!(!store
+            .transfer_mandate_ownership(
+                &mandate.id,
+                mandate.version,
+                "telegram:synthetic-owner-a",
+                "telegram:synthetic-owner-c",
+            )
+            .await
+            .unwrap());
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mandate_ownership_transfers WHERE mandate_id = ?",
+        )
+        .bind(&mandate.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[tokio::test]
+    async fn objective_measurements_require_current_run_structured_receipts() {
+        let (store, _database) = test_store().await;
+        let (goal, mut mandate) = controller("owner-session", 1);
+        mandate.objective_control = Some(objective_control());
+        let run = claim_and_start_run(&store, &goal, &mandate).await;
+        let receipt_id = "synthetic-metric-receipt";
+        let task_id = run.root_task_id.as_deref().unwrap();
+        sqlx::query(
+            "INSERT INTO events
+                (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'http_request')",
+        )
+        .bind("owner-session")
+        .bind(
+            serde_json::json!({
+                "task_id": task_id,
+                "tool_call_id": receipt_id,
+                "name": "http_request",
+                "result": "synthetic metric value",
+                "success": true,
+                "duration_ms": 1,
+                "receipt": {
+                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "outcome_status": "succeeded",
+                    "outcome_evidence": "structured_metadata"
+                }
+            })
+            .to_string(),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let measurement = MandateObjectiveMeasurement::new(
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            12_000_000,
+            9_500,
+            vec![receipt_id.to_string()],
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        store
+            .record_mandate_objective_measurement(&measurement)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_mandate_objective_measurements(&mandate.id, 10)
+                .await
+                .unwrap(),
+            vec![measurement]
+        );
+
+        let unproven = MandateObjectiveMeasurement::new(
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            13_000_000,
+            9_500,
+            vec!["receipt-from-another-run".to_string()],
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        assert!(store
+            .record_mandate_objective_measurement(&unproven)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

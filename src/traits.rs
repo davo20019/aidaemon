@@ -37,9 +37,10 @@ pub use dynamic::{
 pub(crate) use goals::{task_execution_graph, ExpiredAttemptRecovery};
 pub use goals::{
     Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus, HandoffArtifact, NotificationEntry,
-    ScheduledRunHealth, ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch,
-    TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary,
-    WorkerProfile, DEFAULT_PROJECT_ID,
+    ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState, ScheduledRunHealth,
+    ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff,
+    TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
+    DEFAULT_PROJECT_ID,
 };
 #[allow(unused_imports)]
 pub use mandates::{
@@ -49,12 +50,13 @@ pub use mandates::{
     MandateMutationAttempt, MandateMutationAttemptStatus, MandateMutationDispatchClaim,
     MandateMutationEvidence, MandateMutationOutcomeProjection, MandateMutationQuotaBlockReason,
     MandateMutationQuotaState, MandateMutationReservation, MandateMutationTarget,
-    MandateOperatingUpdates, MandateOperationKind, MandateOperationScope,
-    MandateReconciliationReason, MandateReconciliationResolution, MandateRunFinalizationRequest,
-    MandateRunFinalizationResult, MandateRunNotification, MandateRunNotificationKind,
-    MandateRunProofCounts, MandateStatus, MandateStrategyRevision, MandateStrategyRevisionKind,
-    MandateStrategySnapshot, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
-    MandateWakeSignal, MandateWakeSignalKind, SAFE_FALLBACK_WAIT_RATIONALE,
+    MandateObjectiveControl, MandateObjectiveMeasurement, MandateOperatingUpdates,
+    MandateOperationKind, MandateOperationScope, MandateReconciliationReason,
+    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
+    MandateRunNotification, MandateRunNotificationKind, MandateRunProofCounts, MandateStatus,
+    MandateStrategyRevision, MandateStrategyRevisionKind, MandateStrategySnapshot,
+    MandateSuspension, MandateSuspensionKind, MandateTerminationKind, MandateWakeSignal,
+    MandateWakeSignalKind, ObjectiveMetricDirection, SAFE_FALLBACK_WAIT_RATIONALE,
 };
 #[allow(unused_imports)]
 pub use memory::{
@@ -72,14 +74,14 @@ pub use provider::{
 pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
-    semantics_for_exact_read_actions, AgentRole, DurableReplayDecision, EvidenceAuthority,
-    EvidencePurpose, EvidenceTemporalScope, ReadFileResultMetadata, ReadFileSelectionMetadata,
-    SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
-    ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext,
-    ToolMutationEffects, ToolOutcomeStatus, ToolResultCompleteness, ToolResultContentSource,
-    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
-    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
-    TruncationInfo,
+    semantics_for_exact_read_actions, AgentRole, AuthorizationPreflightRecord,
+    AuthorizationPreflightStatus, DurableReplayDecision, EvidenceAuthority, EvidencePurpose,
+    EvidenceTemporalScope, ReadFileResultMetadata, ReadFileSelectionMetadata, SpecialistKind, Tool,
+    ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome, ToolCallSemantics,
+    ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext, ToolMutationEffects,
+    ToolOutcomeStatus, ToolResultCompleteness, ToolResultContentSource, ToolResultPresentation,
+    ToolResultProvenance, ToolRole, ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope,
+    ToolTargetHint, ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 

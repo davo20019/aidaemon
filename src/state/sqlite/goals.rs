@@ -1320,6 +1320,45 @@ impl crate::traits::ScheduledRunStore for SqliteStateStore {
         }))
     }
 
+    async fn get_scheduled_recovery_state(
+        &self,
+        goal_id: &str,
+    ) -> anyhow::Result<Option<crate::traits::ScheduledRecoveryState>> {
+        let row = sqlx::query(
+            "SELECT goal_id, consecutive_failures, failure_budget, disposition,
+                    latest_failure_kind, last_failed_run_id, last_recovery_run_id, updated_at
+             FROM scheduled_recovery_state WHERE goal_id = ?",
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let disposition_raw: String = row.get("disposition");
+            let latest_failure_raw: Option<String> = row.get("latest_failure_kind");
+            Ok(crate::traits::ScheduledRecoveryState {
+                goal_id: row.get("goal_id"),
+                consecutive_failures: u16::try_from(row.get::<i64, _>("consecutive_failures"))?,
+                failure_budget: u16::try_from(row.get::<i64, _>("failure_budget"))?,
+                disposition: crate::traits::ScheduledRecoveryDisposition::parse(&disposition_raw)
+                    .ok_or_else(|| {
+                    anyhow::anyhow!("invalid scheduled recovery disposition `{disposition_raw}`")
+                })?,
+                latest_failure_kind: latest_failure_raw
+                    .as_deref()
+                    .map(|value| {
+                        crate::traits::ScheduledFailureKind::parse(value).ok_or_else(|| {
+                            anyhow::anyhow!("invalid scheduled failure kind `{value}`")
+                        })
+                    })
+                    .transpose()?,
+                last_failed_run_id: row.get("last_failed_run_id"),
+                last_recovery_run_id: row.get("last_recovery_run_id"),
+                updated_at: row.get("updated_at"),
+            })
+        })
+        .transpose()
+    }
+
     async fn delete_scheduled_run_state(&self, goal_id: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM scheduled_run_state WHERE goal_id = ?")
             .bind(goal_id)

@@ -2,7 +2,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::execution::active_execution_backend;
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolRole};
+use crate::traits::{
+    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
+    ToolOutcomeStatus, ToolRole,
+};
+use crate::types::StatusUpdate;
 
 use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
@@ -95,6 +99,20 @@ const SAFE_PREFIXES: &[&str] = &[
     "date",
     "uptime",
     "pwd",
+    // Pure output/status observations. Absolute paths are listed explicitly so
+    // an observational predicate such as `/usr/bin/false` is not mislabeled as
+    // a mutation or forced through an approval-only arbitrary shell path.
+    "printf",
+    "/usr/bin/printf",
+    "/bin/printf",
+    "echo",
+    "/bin/echo",
+    "true",
+    "/usr/bin/true",
+    "/bin/true",
+    "false",
+    "/usr/bin/false",
+    "/bin/false",
 ];
 
 #[async_trait]
@@ -165,6 +183,20 @@ impl Tool for RunCommandTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        Ok(self.run_outcome(arguments).await?.output)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.run_outcome(arguments).await
+    }
+}
+
+impl RunCommandTool {
+    async fn run_outcome(&self, arguments: &str) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
         let command = args["command"]
             .as_str()
@@ -227,8 +259,23 @@ impl Tool for RunCommandTool {
         }
 
         let result = fs_utils::run_cmd_backend(trimmed, Some(&dir), timeout).await?;
-
-        format_output(&result, trimmed, parse_format)
+        let output = format_output(&result, trimmed, parse_format)?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(if result.exit_code == 0 {
+                    ToolOutcomeStatus::Succeeded
+                } else {
+                    // A process that ran to completion produced an authoritative
+                    // observation even when its predicate/test was false. The
+                    // caller decides whether that negative result answers the
+                    // request; it is not a transport or invocation failure.
+                    ToolOutcomeStatus::CompletedWithNegativeResult
+                }),
+                exit_code: Some(result.exit_code),
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 }
 
@@ -383,6 +430,14 @@ mod tests {
         assert!(is_safe_command("ls -la"));
         assert!(is_safe_command("pytest tests/"));
         assert!(is_safe_command("go test ./..."));
+        for command in [
+            "printf synthetic-output",
+            "/usr/bin/printf synthetic-output",
+            "true",
+            "/usr/bin/false",
+        ] {
+            assert!(is_safe_command(command), "pure observation: {command}");
+        }
 
         // Unsafe
         assert!(!is_safe_command("rm -rf /"));
@@ -434,6 +489,22 @@ mod tests {
         let args = json!({"command": "ls"}).to_string();
         let result = RunCommandTool.call(&args).await.unwrap();
         assert!(result.contains("exit: 0"));
+    }
+
+    #[tokio::test]
+    async fn completed_negative_command_is_a_typed_observation() {
+        let args = json!({"command": "/usr/bin/false"}).to_string();
+        let outcome = RunCommandTool
+            .call_with_status_outcome(&args, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::CompletedWithNegativeResult)
+        );
+        assert_eq!(outcome.metadata.exit_code, Some(1));
+        assert!(outcome.output.contains("exit: 1"));
     }
 
     #[tokio::test]

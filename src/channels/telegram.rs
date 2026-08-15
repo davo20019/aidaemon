@@ -298,7 +298,9 @@ impl TelegramChannel {
         chat_id: ChatId,
         markdown: &str,
     ) -> anyhow::Result<()> {
-        send_full_or_expandable_reply(bot, chat_id, markdown).await
+        send_full_or_expandable_reply(bot, chat_id, markdown)
+            .await
+            .map(|_| ())
     }
 
     /// Persist the current allowed_user_ids list to config.toml.
@@ -4813,13 +4815,28 @@ impl TelegramChannel {
                 let mut task_error: Option<String> = None;
 
                 match result {
-                    Ok(reply) => {
-                        let reply = crate::channels::prepare_chat_message(&reply);
+                    Ok(envelope) => {
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "telegram",
+                                    crate::events::ResponseDeliveryState::Queued,
+                                    Vec::new(),
+                                    None,
+                                ),
+                            )
+                            .await;
+                        let reply = crate::channels::prepare_chat_message(&envelope.text);
                         // NOTE: Task intentionally stays "running" during response
                         // sending. This prevents a race condition where incoming
                         // messages see no running task (has_running_task = false),
                         // skip the queue, and spawn concurrent tasks — silently
                         // dropping themselves. Finalized below before queue check.
+                        let mut delivery_state =
+                            crate::events::ResponseDeliveryState::PlatformAcknowledged;
+                        let mut platform_message_ids = Vec::new();
+                        let mut delivery_error = None;
                         if !reply.trim().is_empty() {
                             let handled = if let (Some(live_owner), Some(live_sink)) =
                                 (live_owner.as_ref(), live_sink.as_ref())
@@ -4834,7 +4851,7 @@ impl TelegramChannel {
                             } else {
                                 false
                             };
-                            // A delivered background handoff ("⏳ Still on it — …")
+                            // A delivered background handoff ("⏳ **Still on it**")
                             // becomes the session's status surface: the terminal
                             // notifier EDITS it into the completion ping instead of
                             // stacking a third message. Registered before reset()
@@ -4844,16 +4861,33 @@ impl TelegramChannel {
                                     (status_hub.as_ref(), live_owner.as_ref())
                                 {
                                     if let Some(id) = live_owner.lock().await.surface_message_id() {
+                                        platform_message_ids.push(id.clone());
                                         hub.register_background_status_surface(&session_id, &id)
                                             .await;
                                     }
                                 }
                             }
+                            if handled {
+                                delivery_state = crate::events::ResponseDeliveryState::Edited;
+                                if platform_message_ids.is_empty() {
+                                    if let Some(live_owner) = live_owner.as_ref() {
+                                        if let Some(id) =
+                                            live_owner.lock().await.surface_message_id()
+                                        {
+                                            platform_message_ids.push(id);
+                                        }
+                                    }
+                                }
+                            }
                             if !handled {
-                                if let Err(e) =
-                                    send_full_or_expandable_reply(&bot, chat_id, &reply).await
-                                {
-                                    warn!("Failed to send Telegram message: {}", e);
+                                match send_full_or_expandable_reply(&bot, chat_id, &reply).await {
+                                    Ok(message_ids) => platform_message_ids.extend(message_ids),
+                                    Err(e) => {
+                                        warn!("Failed to send Telegram message: {}", e);
+                                        delivery_state =
+                                            crate::events::ResponseDeliveryState::Failed;
+                                        delivery_error = Some("telegram_send_failed".to_string());
+                                    }
                                 }
                             }
                         } else if let (Some(live_owner), Some(live_sink)) =
@@ -4865,6 +4899,17 @@ impl TelegramChannel {
                             let sink_ref: &dyn SurfaceSink = live_sink.as_ref();
                             live_owner.lock().await.finalize_done(sink_ref).await;
                         }
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "telegram",
+                                    delivery_state,
+                                    platform_message_ids,
+                                    delivery_error,
+                                ),
+                            )
+                            .await;
                         if let Some(live_owner) = live_owner.as_ref() {
                             live_owner.lock().await.reset();
                         }
@@ -5420,7 +5465,7 @@ async fn send_html_or_fallback(
     chat_id: ChatId,
     html: &str,
     plain: &str,
-) -> Result<(), teloxide::RequestError> {
+) -> Result<teloxide::types::Message, teloxide::RequestError> {
     match retry_telegram_rate_limit(|| {
         bot.send_message(chat_id, html)
             .parse_mode(ParseMode::Html)
@@ -5428,15 +5473,15 @@ async fn send_html_or_fallback(
     })
     .await
     {
-        Ok(_) => Ok(()),
+        Ok(message) => Ok(message),
         Err(e) => {
             warn!("HTML send failed, falling back to plain text: {}", e);
-            retry_telegram_rate_limit(|| {
+            let message = retry_telegram_rate_limit(|| {
                 bot.send_message(chat_id, plain)
                     .link_preview_options(disabled_link_preview())
             })
             .await?;
-            Ok(())
+            Ok(message)
         }
     }
 }
@@ -5464,21 +5509,25 @@ async fn send_markdown_chunks_or_fallback_result(
     bot: &Bot,
     chat_id: ChatId,
     markdown: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let html = markdown_to_telegram_html(markdown);
     let html_chunks = split_message(&html, 4096);
     let plain_chunks = split_message(&markdown_to_telegram_plain_fallback(markdown), 4096);
     let mut first_err: Option<anyhow::Error> = None;
+    let mut message_ids = Vec::new();
 
     for (i, html_chunk) in html_chunks.iter().enumerate() {
         let plain_chunk = plain_chunks
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or(html_chunk.as_str());
-        if let Err(e) = send_html_or_fallback(bot, chat_id, html_chunk, plain_chunk).await {
-            warn!("Failed to send Telegram message: {}", e);
-            if first_err.is_none() {
-                first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+        match send_html_or_fallback(bot, chat_id, html_chunk, plain_chunk).await {
+            Ok(message) => message_ids.push(message.id.to_string()),
+            Err(e) => {
+                warn!("Failed to send Telegram message: {}", e);
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+                }
             }
         }
     }
@@ -5486,7 +5535,7 @@ async fn send_markdown_chunks_or_fallback_result(
     if let Some(err) = first_err {
         return Err(err);
     }
-    Ok(())
+    Ok(message_ids)
 }
 
 /// Convert markdown to Telegram HTML and send with plain-text fallback.
@@ -5500,7 +5549,7 @@ async fn send_full_or_expandable_reply(
     bot: &Bot,
     chat_id: ChatId,
     markdown: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let plain = markdown_to_telegram_plain_fallback(markdown);
     if plain.chars().count() > TELEGRAM_EXPANDABLE_TRIGGER_CHARS {
         return send_expandable_blockquote_reply(bot, chat_id, markdown).await;
@@ -5512,23 +5561,27 @@ async fn send_expandable_blockquote_reply(
     bot: &Bot,
     chat_id: ChatId,
     markdown: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let html_body = markdown_to_telegram_html(markdown);
     let plain = markdown_to_telegram_plain_fallback(markdown);
     let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
     let html_chunks = split_message(&html_body, max_chunk);
     let plain_chunks = split_message(&plain, max_chunk);
     let mut first_err: Option<anyhow::Error> = None;
+    let mut message_ids = Vec::new();
     for (i, html_chunk) in html_chunks.iter().enumerate() {
         let wrapped = format!("<blockquote expandable>{}</blockquote>", html_chunk);
         let plain_chunk = plain_chunks
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or(html_chunk.as_str());
-        if let Err(e) = send_html_or_fallback(bot, chat_id, &wrapped, plain_chunk).await {
-            warn!("Failed to send expandable Telegram message: {}", e);
-            if first_err.is_none() {
-                first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+        match send_html_or_fallback(bot, chat_id, &wrapped, plain_chunk).await {
+            Ok(message) => message_ids.push(message.id.to_string()),
+            Err(e) => {
+                warn!("Failed to send expandable Telegram message: {}", e);
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("Failed to send Telegram message: {}", e));
+                }
             }
         }
     }
@@ -5536,7 +5589,7 @@ async fn send_expandable_blockquote_reply(
     if let Some(err) = first_err {
         return Err(err);
     }
-    Ok(())
+    Ok(message_ids)
 }
 
 /// Spawn a TelegramChannel in a background task.

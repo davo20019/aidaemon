@@ -16,7 +16,10 @@ mod db;
 mod duration_format;
 #[allow(dead_code)]
 mod events;
-pub use events::{EventType, TaskEndData, ToolCallData, UserMessageData};
+pub use events::{
+    CompletionProofReference, EventType, TaskCompletionProofData, TaskEndData, ToolCallData,
+    UserMessageData,
+};
 pub(crate) mod execution;
 mod execution_graph;
 mod execution_policy;

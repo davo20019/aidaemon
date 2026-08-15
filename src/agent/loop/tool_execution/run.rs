@@ -1786,6 +1786,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                                     "tool": tc.name,
                                     "mandate_id": grant.mandate_id,
                                     "mandate_version": grant.mandate_version,
+                                    "owner_principal_id": grant.owner_principal_id,
                                     "decision_cycle_id": grant.decision_cycle_id,
                                     "action_digest": grant.action_digest,
                                 }),
@@ -2341,6 +2342,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 &turn_context.completion_contract,
                 semantics,
                 &effective_arguments,
+                &result_text,
+                &result_metadata,
             )
         } else {
             Vec::new()
@@ -2405,6 +2408,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         format!("Matched evidence receipt from {}", tc.name),
                         json!({
                             "condition": "evidence_receipt_matched",
+                            "contract_scope_task_id": turn_context.completion_contract.scope_task_id,
+                            "contract_adopted_from_task_ids": turn_context.completion_contract.adopted_from_task_ids,
                             "tool": tc.name,
                             "tool_call_id": tc.id,
                             "matched_requirement_indices": matched_requirements,
@@ -2748,6 +2753,8 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .as_ref()
                 .and_then(|step| step.idempotency_key.clone()),
         );
+        receipt.completion_obligation_ids =
+            completion_progress.completion_obligations_for_receipt(&tc.id);
         receipt.mandate_authority = mandate_authority_grant.clone();
         let mandate_outcome_projection = mandate_authority_grant
             .as_ref()

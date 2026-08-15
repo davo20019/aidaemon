@@ -421,11 +421,12 @@ mod tests {
                 purpose: EvidencePurpose::Outcome,
                 minimum_authority: EvidenceAuthority::Direct,
                 temporal_scope: EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
                 target: None,
             }],
             ..CompletionContract::default()
         };
-        let mut completion = CompletionProgress::new(&contract);
+        let mut completion = CompletionProgress::new(&contract, "test-task");
         completion.verification_block_count = 7;
         completion.mark_mutation_receipt(
             &contract,

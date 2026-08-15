@@ -173,6 +173,10 @@ pub struct Mandate {
     /// objective is pursued, but it never contributes authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<MandateStrategySnapshot>,
+    /// Owner-confirmed measurable control loop. This is policy state, not a
+    /// promise that the external metric will improve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_control: Option<MandateObjectiveControl>,
     /// Typed reason for a non-active, non-terminal lifecycle state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspension: Option<MandateSuspension>,
@@ -199,6 +203,10 @@ pub struct Mandate {
     /// Authority epoch, incremented whenever owner-controlled configuration or
     /// lifecycle state changes so stale decisions and updates fail closed.
     pub version: i64,
+    /// Stable authorization principal. Session/bot routes may be linked or
+    /// moved without changing this identity or inferring equivalence from a
+    /// session-name suffix.
+    pub owner_principal_id: String,
     pub created_by_session: String,
     pub created_at: String,
     pub updated_at: String,
@@ -228,6 +236,7 @@ impl Mandate {
             autonomy_mode: MandateAutonomyMode::Bounded,
             authority,
             strategy: None,
+            objective_control: None,
             suspension: None,
             constraints: Vec::new(),
             success_criteria: Vec::new(),
@@ -244,6 +253,7 @@ impl Mandate {
             // controller must explicitly clear this proof before persistence.
             confirmed_at: Some(now.clone()),
             version: 1,
+            owner_principal_id: format!("principal:{}", uuid::Uuid::new_v4()),
             created_by_session: created_by_session.to_string(),
             created_at: now.clone(),
             updated_at: now,
@@ -316,6 +326,9 @@ impl Mandate {
         if let Some(strategy) = self.strategy.as_ref() {
             strategy.validate()?;
         }
+        if let Some(control) = self.objective_control.as_ref() {
+            control.validate()?;
+        }
         if let Some(suspension) = self.suspension.as_ref() {
             suspension.validate()?;
         }
@@ -345,6 +358,165 @@ impl Mandate {
                 "mandate constraints, success criteria, and stop conditions exceed their combined 8 KiB character/byte bound"
                     .to_string(),
             );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveMetricDirection {
+    AtLeast,
+    AtMost,
+}
+
+/// Stable, integer-valued control policy for a measurable ongoing objective.
+/// Values use caller-declared micro-units to avoid floating-point drift.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateObjectiveControl {
+    pub schema_version: u16,
+    pub metric_name: String,
+    pub unit: String,
+    pub baseline_micros: i64,
+    pub target_micros: i64,
+    pub direction: ObjectiveMetricDirection,
+    /// Exact analytics endpoint or stable metric-source resource identity.
+    pub measurement_source: String,
+    pub measurement_cadence_secs: i64,
+    /// Owner-confirmed experiment/cohort identity used to keep attributed
+    /// observations from silently mixing unrelated strategy populations.
+    pub experiment_cohort: String,
+    pub experiment_window_secs: i64,
+    pub minimum_effect_micros: i64,
+    pub max_stagnant_measurements: u16,
+    pub run_failure_budget: u16,
+    pub baseline_observed_at: String,
+}
+
+impl MandateObjectiveControl {
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || !canonical_text_within(&self.metric_name, 128)
+            || !canonical_text_within(&self.unit, 64)
+            || !canonical_text_within(&self.experiment_cohort, 128)
+        {
+            return Err("objective control metric metadata is invalid".to_string());
+        }
+        let target_is_valid = match self.direction {
+            ObjectiveMetricDirection::AtLeast => self.target_micros > self.baseline_micros,
+            ObjectiveMetricDirection::AtMost => self.target_micros < self.baseline_micros,
+        };
+        if !target_is_valid || self.minimum_effect_micros <= 0 {
+            return Err(
+                "objective control target must advance from baseline in its declared direction and minimum_effect_micros must be positive"
+                    .to_string(),
+            );
+        }
+        let source_valid = reqwest::Url::parse(&self.measurement_source)
+            .ok()
+            .is_some_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+            || self
+                .measurement_source
+                .strip_prefix("metric_source:")
+                .is_some_and(canonical_scoped_resource_suffix);
+        if !source_valid {
+            return Err(
+                "objective control measurement_source must be an HTTPS URL or exact metric_source resource identity"
+                    .to_string(),
+            );
+        }
+        if !(60..=30 * 24 * 60 * 60).contains(&self.measurement_cadence_secs)
+            || self.experiment_window_secs < self.measurement_cadence_secs
+            || self.experiment_window_secs > 90 * 24 * 60 * 60
+            || !(1..=20).contains(&self.max_stagnant_measurements)
+            || !(1..=10).contains(&self.run_failure_budget)
+            || chrono::DateTime::parse_from_rfc3339(&self.baseline_observed_at).is_err()
+        {
+            return Err("objective control cadence, experiment, failure-budget, or baseline timestamp is invalid".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn target_reached(&self, value_micros: i64) -> bool {
+        match self.direction {
+            ObjectiveMetricDirection::AtLeast => value_micros >= self.target_micros,
+            ObjectiveMetricDirection::AtMost => value_micros <= self.target_micros,
+        }
+    }
+}
+
+/// One immutable observation in the objective's control loop. Receipt IDs
+/// prove the measurement and attribution IDs link it to bounded experiments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateObjectiveMeasurement {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub goal_run_id: String,
+    pub value_micros: i64,
+    pub confidence_bps: u16,
+    pub evidence_receipt_ids: Vec<String>,
+    #[serde(default)]
+    pub attributed_intention_ids: Vec<String>,
+    pub observed_at: String,
+    pub created_at: String,
+}
+
+impl MandateObjectiveMeasurement {
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        goal_run_id: &str,
+        value_micros: i64,
+        confidence_bps: u16,
+        evidence_receipt_ids: Vec<String>,
+        observed_at: &str,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            goal_run_id: goal_run_id.to_string(),
+            value_micros,
+            confidence_bps,
+            evidence_receipt_ids,
+            attributed_intention_ids: Vec::new(),
+            observed_at: observed_at.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn with_attributed_intention_ids(mut self, intention_ids: Vec<String>) -> Self {
+        self.attributed_intention_ids = intention_ids;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mandate_version <= 0
+            || self.confidence_bps > 10_000
+            || self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self.attributed_intention_ids.len() > 16
+            || chrono::DateTime::parse_from_rfc3339(&self.observed_at).is_err()
+        {
+            return Err("objective measurement metadata is invalid".to_string());
+        }
+        for id in self
+            .evidence_receipt_ids
+            .iter()
+            .chain(&self.attributed_intention_ids)
+        {
+            if !canonical_text_within(id, 256) {
+                return Err("objective measurement identifiers are invalid".to_string());
+            }
         }
         Ok(())
     }
@@ -1762,6 +1934,10 @@ impl Intention {
 pub struct MandateAuthorityGrant {
     pub mandate_id: String,
     pub mandate_version: i64,
+    /// Stable owner identity at the exact policy version that authorized this
+    /// action. Session routing never substitutes for this principal binding.
+    #[serde(default)]
+    pub owner_principal_id: String,
     pub decision_cycle_id: String,
     pub action_digest: String,
     pub counts_toward_cycle_budget: bool,
@@ -2668,6 +2844,35 @@ mod tests {
             mandate.review_secs_for_activity(MandateActivityLevel::Urgent),
             15 * 60
         );
+    }
+
+    #[test]
+    fn objective_control_enforces_direction_cadence_and_target() {
+        let mut control = MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic conversions".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 5_000_000,
+            target_micros: 8_000_000,
+            direction: ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-analytics".to_string(),
+            measurement_cadence_secs: 3_600,
+            experiment_cohort: "synthetic-cohort-a".to_string(),
+            experiment_window_secs: 86_400,
+            minimum_effect_micros: 500_000,
+            max_stagnant_measurements: 3,
+            run_failure_budget: 3,
+            baseline_observed_at: "2026-08-15T00:00:00Z".to_string(),
+        };
+        assert!(control.validate().is_ok());
+        assert!(!control.target_reached(7_999_999));
+        assert!(control.target_reached(8_000_000));
+
+        control.target_micros = control.baseline_micros;
+        assert!(control.validate().is_err());
+        control.target_micros = 8_000_000;
+        control.experiment_window_secs = control.measurement_cadence_secs - 1;
+        assert!(control.validate().is_err());
     }
 
     #[test]

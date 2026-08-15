@@ -102,6 +102,16 @@ pub(crate) trait HistorySearchStore: crate::traits::EpisodeStore {
         radius: usize,
         scope: &HistoryScope,
     ) -> anyhow::Result<Vec<HistoryMessage>>;
+    async fn history_event_for_message_id(
+        &self,
+        message_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Option<i64>>;
+    async fn history_turn(
+        &self,
+        turn_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryMessage>>;
     async fn history_page(
         &self,
         anchor: i64,
@@ -151,6 +161,22 @@ impl HistorySearchStore for crate::state::SqliteStateStore {
         scope: &HistoryScope,
     ) -> anyhow::Result<Vec<HistoryMessage>> {
         context(&self.pool(), event_id, radius, scope).await
+    }
+
+    async fn history_event_for_message_id(
+        &self,
+        message_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Option<i64>> {
+        event_for_message_id(&self.pool(), message_id, scope).await
+    }
+
+    async fn history_turn(
+        &self,
+        turn_id: &str,
+        scope: &HistoryScope,
+    ) -> anyhow::Result<Vec<HistoryMessage>> {
+        turn(&self.pool(), turn_id, scope).await
     }
 
     async fn history_page(
@@ -862,6 +888,55 @@ pub(crate) async fn open(
         .map(row_to_message))
 }
 
+pub(crate) async fn event_for_message_id(
+    pool: &SqlitePool,
+    message_id: &str,
+    scope: &HistoryScope,
+) -> anyhow::Result<Option<i64>> {
+    ensure_scope(scope)?;
+    anyhow::ensure!(
+        !message_id.trim().is_empty() && message_id.len() <= 256,
+        "message_id must be a bounded canonical identifier"
+    );
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT h.event_id FROM history_message_index h
+         WHERE h.message_id = ",
+    );
+    qb.push_bind(message_id.to_string());
+    qb.push(" AND h.event_id <= ");
+    qb.push_bind(scope.snapshot_max_event_id);
+    push_scope(&mut qb, scope, "h");
+    qb.push(" ORDER BY h.event_id DESC LIMIT 1");
+    Ok(qb.build_query_scalar().fetch_optional(pool).await?)
+}
+
+pub(crate) async fn turn(
+    pool: &SqlitePool,
+    turn_id: &str,
+    scope: &HistoryScope,
+) -> anyhow::Result<Vec<HistoryMessage>> {
+    ensure_scope(scope)?;
+    anyhow::ensure!(
+        !turn_id.trim().is_empty() && turn_id.len() <= 256,
+        "turn_id must be a bounded canonical identifier"
+    );
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT h.event_id, h.session_id, h.task_id, h.turn_id, h.message_id,
+                h.role, h.created_at, h.source_kind,
+                json_extract(e.data, '$.content') AS content,
+                NULL AS lexical_rank
+         FROM history_message_index h JOIN events e ON e.id=h.event_id
+         WHERE h.turn_id = ",
+    );
+    qb.push_bind(turn_id.to_string());
+    qb.push(" AND h.event_id <= ");
+    qb.push_bind(scope.snapshot_max_event_id);
+    push_scope(&mut qb, scope, "h");
+    qb.push(" ORDER BY h.event_id ASC LIMIT 100");
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_message).collect())
+}
+
 pub(crate) async fn page(
     pool: &SqlitePool,
     anchor_event_id: i64,
@@ -1167,6 +1242,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_message_and_turn_selectors_preserve_authorized_scope() {
+        let pool = pool().await;
+        let user = insert(&pool, "slack:C1", "user", "synthetic question").await;
+        let assistant = insert(&pool, "slack:C1", "assistant", "synthetic answer").await;
+        let foreign = insert(&pool, "slack:C2", "user", "foreign question").await;
+        for id in [user, assistant, foreign] {
+            project_event(&pool, id).await.unwrap();
+        }
+        let mut scope = private_scope(foreign);
+        scope.session_id = "slack:C1".to_string();
+        scope.visibility = ChannelVisibility::PrivateGroup;
+        scope.channel_id = Some("slack:C1".to_string());
+
+        assert_eq!(
+            event_for_message_id(&pool, "slack:C1-user", &scope)
+                .await
+                .unwrap(),
+            Some(user)
+        );
+        assert!(event_for_message_id(&pool, "slack:C2-user", &scope)
+            .await
+            .unwrap()
+            .is_none());
+        let selected_turn = turn(&pool, "turn-1", &scope).await.unwrap();
+        assert_eq!(selected_turn.len(), 2);
+        assert_eq!(selected_turn[0].event_id, user);
+        assert_eq!(selected_turn[1].event_id, assistant);
+        assert!(selected_turn
+            .iter()
+            .all(|message| message.session_id == "slack:C1"));
     }
 
     #[tokio::test]

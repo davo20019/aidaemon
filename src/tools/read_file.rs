@@ -60,6 +60,10 @@ impl Tool for ReadFileTool {
                     }
                 },
                 "required": ["path"],
+                "allOf": [
+                    {"not": {"required": ["tail_lines", "start_line"]}},
+                    {"not": {"required": ["tail_lines", "end_line"]}}
+                ],
                 "additionalProperties": false
             }
         })
@@ -120,6 +124,32 @@ impl ReadFileTool {
             .or_else(|| args["file"].as_str())
             .or_else(|| args["filename"].as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
+
+        let has_start = args.get("start_line").is_some_and(|value| !value.is_null());
+        let has_end = args.get("end_line").is_some_and(|value| !value.is_null());
+        let tail_value = args
+            .get("tail_lines")
+            .or_else(|| args.get("last_lines"))
+            .or_else(|| args.get("last_n_lines"));
+        let has_tail = tail_value.is_some_and(|value| !value.is_null());
+        anyhow::ensure!(
+            !(has_tail && (has_start || has_end)),
+            "read_file range modes are mutually exclusive: use start_line/end_line or tail_lines, not both"
+        );
+        let requested_start = args.get("start_line").and_then(Value::as_u64);
+        let requested_end = args.get("end_line").and_then(Value::as_u64);
+        anyhow::ensure!(
+            requested_start.is_none_or(|line| line > 0)
+                && requested_end.is_none_or(|line| line > 0),
+            "read_file line numbers are 1-based and must be positive"
+        );
+        anyhow::ensure!(
+            match (requested_start, requested_end) {
+                (Some(start), Some(end)) => end >= start,
+                _ => true,
+            },
+            "read_file end_line must be greater than or equal to start_line"
+        );
 
         let backend = active_execution_backend();
         let path = backend.resolve_path(path_str).await?;
@@ -186,10 +216,8 @@ impl ReadFileTool {
             .map(|n| n as usize)
             .unwrap_or(usize::MAX);
 
-        let tail_lines = args["tail_lines"]
-            .as_u64()
-            .or_else(|| args["last_lines"].as_u64())
-            .or_else(|| args["last_n_lines"].as_u64())
+        let tail_lines = tail_value
+            .and_then(Value::as_u64)
             // Be tolerant of older/smaller models that emit zero to mean
             // "no tail selection". The schema prevents new strict calls from
             // doing so, while this fallback avoids a useless retry loop.
@@ -807,6 +835,22 @@ mod tests {
         assert!(result.contains("lines 2-4 of 5"));
         assert!(!result.contains("| a"));
         assert!(!result.contains("| e"));
+    }
+
+    #[tokio::test]
+    async fn conflicting_range_modes_fail_without_reading() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc\n").unwrap();
+        let args = json!({
+            "path": f.path().to_str().unwrap(),
+            "start_line": 1,
+            "end_line": 2,
+            "tail_lines": 1
+        })
+        .to_string();
+
+        let error = ReadFileTool.call(&args).await.unwrap_err().to_string();
+        assert!(error.contains("range modes are mutually exclusive"));
     }
 
     #[tokio::test]

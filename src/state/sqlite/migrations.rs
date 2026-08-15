@@ -1597,6 +1597,44 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS scheduled_recovery_state (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            failure_budget INTEGER NOT NULL DEFAULT 3 CHECK (failure_budget BETWEEN 1 AND 10),
+            disposition TEXT NOT NULL DEFAULT 'healthy'
+                CHECK (disposition IN ('healthy', 'recovering', 'escalated')),
+            latest_failure_kind TEXT,
+            last_failed_run_id TEXT REFERENCES goal_runs(id) ON DELETE SET NULL,
+            last_recovery_run_id TEXT REFERENCES goal_runs(id) ON DELETE SET NULL,
+            updated_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS goal_run_recovery_links (
+            failed_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            recovery_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            outcome_status TEXT NOT NULL
+                CHECK (outcome_status IN ('recovering', 'verified', 'failed')),
+            proof_receipt_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (failed_run_id, recovery_run_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS scheduled_recovery_paused_schedules (
+            schedule_id TEXT PRIMARY KEY REFERENCES goal_schedules(id) ON DELETE CASCADE,
+            goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            paused_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     // Columns on goals added via ALTER for older migrated databases.
     let _ =
@@ -1700,6 +1738,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
                 CHECK (autonomy_mode IN ('bounded', 'autopilot')),
             authority_json TEXT NOT NULL,
             strategy_json TEXT,
+            objective_control_json TEXT,
             suspension_json TEXT,
             constraints_json TEXT NOT NULL DEFAULT '[]',
             success_criteria_json TEXT NOT NULL DEFAULT '[]',
@@ -1716,9 +1755,84 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
             expires_at TEXT,
             confirmed_at TEXT,
             version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            owner_principal_id TEXT NOT NULL,
             created_by_session TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN owner_principal_id TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN objective_control_json TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "UPDATE mandates SET owner_principal_id = 'principal:' || id
+         WHERE owner_principal_id IS NULL OR trim(owner_principal_id) = ''",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_principal_sessions (
+            principal_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            linked_by_session TEXT NOT NULL,
+            PRIMARY KEY (principal_id, session_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO mandate_principal_sessions
+            (principal_id, session_id, linked_at, linked_by_session)
+         SELECT owner_principal_id, created_by_session, created_at, created_by_session
+         FROM mandates",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_principal_sessions_session
+         ON mandate_principal_sessions(session_id, principal_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_objective_measurements (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            goal_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
+            value_micros INTEGER NOT NULL,
+            confidence_bps INTEGER NOT NULL CHECK (confidence_bps BETWEEN 0 AND 10000),
+            evidence_receipt_ids_json TEXT NOT NULL,
+            attributed_intention_ids_json TEXT NOT NULL DEFAULT '[]',
+            observed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (mandate_id, goal_run_id, observed_at)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_measurements_recent
+         ON mandate_objective_measurements(mandate_id, observed_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_ownership_transfers (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL,
+            from_session_id TEXT NOT NULL,
+            to_session_id TEXT NOT NULL,
+            from_version INTEGER NOT NULL,
+            to_version INTEGER NOT NULL,
+            transferred_at TEXT NOT NULL
         )",
     )
     .execute(pool)
@@ -3607,11 +3721,12 @@ mod mandate_ledger_upgrade_tests {
                 (id, goal_id, objective, status, authority_json,
                  constraints_json, success_criteria_json, stop_conditions_json,
                  min_review_secs, max_review_secs, default_review_secs,
-                 next_review_at, confirmed_at, version, created_by_session)
+                 next_review_at, confirmed_at, version, owner_principal_id,
+                 created_by_session)
              VALUES ('mandate', 'goal', 'upgrade fixture', 'active', '{}',
                      '[]', '[]', '[]', 60, 3600, 300,
                      '2026-08-02T12:00:00Z', '2026-08-02T11:00:00Z', 1,
-                     'owner-session')",
+                     'principal:upgrade-fixture', 'owner-session')",
         )
         .execute(&pool)
         .await

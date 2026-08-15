@@ -55,6 +55,12 @@ pub struct RequestEvidenceRequirement {
     pub purpose: EvidencePurpose,
     pub minimum_authority: EvidenceAuthority,
     pub temporal_scope: EvidenceTemporalScope,
+    /// Exact field/key tokens whose presence must be proven by a content
+    /// observation. These are typed evidence constraints, not completion
+    /// phrases. Older persisted contracts omit them and retain scope-level
+    /// matching behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_content_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<RequestVerificationTarget>,
 }
@@ -64,6 +70,15 @@ pub struct RequestEvidenceRequirement {
 /// from replaying natural-language phrase rules on a later turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestCompletionContract {
+    /// Task whose lifecycle owns every executable obligation in this contract.
+    /// Legacy rows omit this value and must be explicitly adopted before use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_task_id: Option<String>,
+    /// Prior task contracts deliberately adopted into this task by the typed
+    /// dialogue relationship. This is audit lineage, not an authorization to
+    /// execute arbitrary obligations from history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopted_from_task_ids: Vec<String>,
     pub task_kind: RequestTaskKind,
     pub expects_mutation: bool,
     pub required_mutation_effects: ToolMutationEffects,

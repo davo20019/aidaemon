@@ -906,13 +906,20 @@ fn requirement_target_matches(
 }
 
 /// Return the exact material evidence obligations supported by one successful
-/// observation receipt. Matching is entirely typed except for exact URL/path
-/// identity, which is compared against structured call arguments.
+/// observation receipt. Resource identity and requested content markers come
+/// from the typed contract; neither a path mention nor tool capability alone
+/// can close a field-level content obligation.
 pub(super) fn matching_evidence_requirement_indices(
     contract: &CompletionContract,
     semantics: &ToolCallSemantics,
     raw_arguments: &str,
+    result_text: &str,
+    metadata: &crate::traits::ToolCallMetadata,
 ) -> Vec<usize> {
+    let read_receipt_is_compatible = metadata
+        .read_file
+        .as_ref()
+        .is_none_or(|read| read_receipt_covers_requested_selection(raw_arguments, read));
     contract
         .evidence_requirements
         .iter()
@@ -921,11 +928,115 @@ pub(super) fn matching_evidence_requirement_indices(
             let capability_matches = semantics.evidence.iter().any(|capability| {
                 crate::agent::inquiry::capability_supports_requirement(capability, requirement)
             });
-            (capability_matches
+            (read_receipt_is_compatible
+                && capability_matches
+                && requirement
+                    .required_content_markers
+                    .iter()
+                    .all(|marker| crate::agent::keyword_match(result_text, marker))
                 && requirement_target_matches(requirement, semantics, raw_arguments))
             .then_some(index)
         })
         .collect()
+}
+
+/// A read receipt may close a content obligation only when the tool actually
+/// returned the range selected by the call. This is intentionally based on
+/// typed request/result metadata; a path mention or prose summary is never
+/// enough to turn a partial/tail read into evidence for a bounded range.
+fn read_receipt_covers_requested_selection(
+    raw_arguments: &str,
+    read: &crate::traits::ReadFileResultMetadata,
+) -> bool {
+    use crate::traits::ReadFileSelectionMetadata;
+
+    if read.truncated || !read_receipt_has_complete_content(read) {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw_arguments) else {
+        return false;
+    };
+    let requested_start = args.get("start_line").and_then(serde_json::Value::as_u64);
+    let requested_end = args.get("end_line").and_then(serde_json::Value::as_u64);
+    let requested_tail = args
+        .get("tail_lines")
+        .or_else(|| args.get("last_lines"))
+        .or_else(|| args.get("last_n_lines"))
+        .and_then(serde_json::Value::as_u64);
+
+    if requested_tail.is_some() && (requested_start.is_some() || requested_end.is_some()) {
+        return false;
+    }
+
+    match (
+        requested_start,
+        requested_end,
+        requested_tail,
+        &read.selection,
+    ) {
+        (None, None, None, ReadFileSelectionMetadata::Full) => {
+            read.total_lines == 0
+                || read.returned_start_line == Some(1)
+                    && read.returned_end_line == Some(read.total_lines)
+        }
+        (
+            start,
+            end,
+            None,
+            ReadFileSelectionMetadata::BoundedRange {
+                start_line,
+                end_line,
+            },
+        ) => {
+            let requested_start = start.unwrap_or(1) as usize;
+            let requested_end = end.unwrap_or(u64::MAX) as usize;
+            *start_line == requested_start
+                && *end_line == requested_end
+                && read
+                    .returned_start_line
+                    .is_some_and(|line| line <= requested_start)
+                && read
+                    .returned_end_line
+                    .is_some_and(|line| line >= requested_end)
+        }
+        (start, None, None, ReadFileSelectionMetadata::OpenEndedRange { start_line }) => {
+            let requested_start = start.unwrap_or(1) as usize;
+            *start_line == requested_start
+                && read
+                    .returned_start_line
+                    .is_some_and(|line| line <= requested_start)
+                && read.returned_end_line == Some(read.total_lines)
+        }
+        (None, None, Some(count), ReadFileSelectionMetadata::Tail { requested_lines }) => {
+            *requested_lines == count as usize
+                && (read.total_lines == 0
+                    || read.returned_end_line == Some(read.total_lines)
+                        && read
+                            .returned_start_line
+                            .zip(read.returned_end_line)
+                            .is_some_and(|(start, end)| {
+                                end.saturating_sub(start).saturating_add(1)
+                                    == (count as usize).min(read.total_lines)
+                            }))
+        }
+        _ => false,
+    }
+}
+
+fn read_receipt_has_complete_content(read: &crate::traits::ReadFileResultMetadata) -> bool {
+    if read.total_lines == 0 {
+        return read.selected_lines.is_empty()
+            && read.returned_start_line.is_none()
+            && read.returned_end_line.is_none();
+    }
+    read.returned_start_line
+        .zip(read.returned_end_line)
+        .is_some_and(|(start, end)| {
+            start > 0
+                && end >= start
+                && end <= read.total_lines
+                && read.selected_lines.len() == end - start + 1
+        })
 }
 #[cfg(test)]
 mod tests {
@@ -951,6 +1062,7 @@ mod tests {
                     purpose: EvidencePurpose::CurrentState,
                     minimum_authority: EvidenceAuthority::Direct,
                     temporal_scope: EvidenceTemporalScope::Current,
+                    required_content_markers: vec!["state_key".to_string()],
                     target: None,
                 },
                 RequestEvidenceRequirement {
@@ -959,6 +1071,7 @@ mod tests {
                     purpose: EvidencePurpose::Attribution,
                     minimum_authority: EvidenceAuthority::Canonical,
                     temporal_scope: EvidenceTemporalScope::Historical,
+                    required_content_markers: Vec::new(),
                     target: None,
                 },
             ],
@@ -972,9 +1085,23 @@ mod tests {
             ),
         );
         assert_eq!(
-            matching_evidence_requirement_indices(&contract, &external, "{}"),
+            matching_evidence_requirement_indices(
+                &contract,
+                &external,
+                "{}",
+                "synthetic state_key current state",
+                &crate::traits::ToolCallMetadata::default(),
+            ),
             [0]
         );
+        assert!(matching_evidence_requirement_indices(
+            &contract,
+            &external,
+            "{}",
+            "synthetic response without the requested field",
+            &crate::traits::ToolCallMetadata::default(),
+        )
+        .is_empty());
 
         let trace = ToolCallSemantics::observation().with_evidence(
             crate::agent::inquiry::evidence_capabilities_for_tool_call(
@@ -983,9 +1110,95 @@ mod tests {
             ),
         );
         assert_eq!(
-            matching_evidence_requirement_indices(&contract, &trace, "{}"),
+            matching_evidence_requirement_indices(
+                &contract,
+                &trace,
+                "{}",
+                "synthetic attribution record",
+                &crate::traits::ToolCallMetadata::default(),
+            ),
             [1]
         );
+    }
+
+    fn read_receipt(
+        selection: crate::traits::ReadFileSelectionMetadata,
+        start: usize,
+        end: usize,
+        total: usize,
+        truncated: bool,
+    ) -> crate::traits::ReadFileResultMetadata {
+        crate::traits::ReadFileResultMetadata {
+            display_path: "/tmp/synthetic.toml".to_string(),
+            canonical_path: "/tmp/synthetic.toml".to_string(),
+            selection,
+            returned_start_line: Some(start),
+            returned_end_line: Some(end),
+            total_lines: total,
+            file_size: 100,
+            modified: None,
+            selected_lines: (start..=end)
+                .map(|line| format!("synthetic line {line}"))
+                .collect(),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn read_receipt_must_cover_the_exact_requested_range() {
+        use crate::traits::ReadFileSelectionMetadata;
+
+        let bounded = read_receipt(
+            ReadFileSelectionMetadata::BoundedRange {
+                start_line: 1,
+                end_line: 12,
+            },
+            1,
+            12,
+            40,
+            false,
+        );
+        assert!(read_receipt_covers_requested_selection(
+            r#"{"path":"/tmp/synthetic.toml","start_line":1,"end_line":12}"#,
+            &bounded,
+        ));
+        assert!(!read_receipt_covers_requested_selection(
+            r#"{"path":"/tmp/synthetic.toml","start_line":1,"end_line":12,"tail_lines":1}"#,
+            &bounded,
+        ));
+        let mut unavailable_content = bounded.clone();
+        unavailable_content.selected_lines.clear();
+        assert!(!read_receipt_covers_requested_selection(
+            r#"{"path":"/tmp/synthetic.toml","start_line":1,"end_line":12}"#,
+            &unavailable_content,
+        ));
+
+        let tail = read_receipt(
+            ReadFileSelectionMetadata::Tail { requested_lines: 1 },
+            40,
+            40,
+            40,
+            false,
+        );
+        assert!(!read_receipt_covers_requested_selection(
+            r#"{"path":"/tmp/synthetic.toml","start_line":1,"end_line":12}"#,
+            &tail,
+        ));
+
+        let truncated = read_receipt(
+            ReadFileSelectionMetadata::BoundedRange {
+                start_line: 1,
+                end_line: 12,
+            },
+            1,
+            12,
+            40,
+            true,
+        );
+        assert!(!read_receipt_covers_requested_selection(
+            r#"{"path":"/tmp/synthetic.toml","start_line":1,"end_line":12}"#,
+            &truncated,
+        ));
     }
 
     #[test]

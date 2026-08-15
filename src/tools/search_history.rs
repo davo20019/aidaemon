@@ -285,9 +285,32 @@ impl SearchHistoryTool {
                 }
             }
             "open" => {
-                let event_id =
-                    anchor.ok_or_else(|| anyhow::anyhow!("event_id is required for open"))?;
-                response.messages = self.state.history_context(event_id, radius, &scope).await?;
+                let selector_count = usize::from(anchor.is_some())
+                    + usize::from(args.message_id.is_some())
+                    + usize::from(args.turn_id.is_some());
+                anyhow::ensure!(
+                    selector_count == 1,
+                    "open requires exactly one of event_id, message_id, or turn_id"
+                );
+                if let Some(turn_id) = args.turn_id.as_deref() {
+                    response.messages = self.state.history_turn(turn_id, &scope).await?;
+                } else {
+                    let event_id = match (anchor, args.message_id.as_deref()) {
+                        (Some(event_id), None) => event_id,
+                        (None, Some(message_id)) => self
+                            .state
+                            .history_event_for_message_id(message_id, &scope)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "message_id was not found in the authorized retained history"
+                                )
+                            })?,
+                        _ => unreachable!("selector count was validated above"),
+                    };
+                    response.messages =
+                        self.state.history_context(event_id, radius, &scope).await?;
+                }
             }
             "page" => {
                 response.messages = self
@@ -360,6 +383,8 @@ struct SearchHistoryArgs {
     action: String,
     query: Option<String>,
     event_id: Option<i64>,
+    message_id: Option<String>,
+    turn_id: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
     context: Option<usize>,
@@ -446,6 +471,8 @@ impl Tool for SearchHistoryTool {
                     },
                     "query": { "type": "string", "description": "Words to find; FTS syntax is treated as literal terms" },
                     "event_id": { "type": "integer", "description": "Authorized anchor event for open" },
+                    "message_id": { "type": "string", "maxLength": 256, "description": "Stable canonical message ID for open" },
+                    "turn_id": { "type": "string", "maxLength": 256, "description": "Stable canonical turn ID; open returns the whole authorized turn" },
                     "cursor": { "type": "string", "description": "Opaque signed cursor returned by a prior call" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
                     "context": { "type": "integer", "minimum": 0, "maximum": 4 },

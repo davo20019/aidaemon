@@ -444,7 +444,7 @@ impl Agent {
         let mut inherited_completion_contract = false;
         if followup_mode != FollowupMode::NewTask {
             if let Some(request) = unfinished_open_request(dialogue_state.as_ref()) {
-                let unfinished_contract = request
+                let mut unfinished_contract = request
                     .completion_contract
                     .as_ref()
                     .map(completion_contract_from_persisted)
@@ -454,6 +454,12 @@ impl Agent {
                             &self.path_aliases.projects,
                         )
                     });
+                // Legacy persisted contracts predate container-level lineage.
+                // The open-request lifecycle already owns an exact task edge,
+                // so upgrade that authoritative relationship before adoption.
+                if unfinished_contract.scope_task_id.is_none() {
+                    unfinished_contract.scope_task_id = request.task_id.clone();
+                }
                 inherited_completion_contract = request.completion_contract.is_some();
                 completion_contract =
                     inherit_unfinished_request_contract(completion_contract, &unfinished_contract);
@@ -607,6 +613,23 @@ impl Agent {
                         .collect::<Vec<_>>()
                 })
         });
+        let referenced_receipts = if normalized_msg
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty())
+            && tool_calls.is_none()
+        {
+            match emitter.task_id() {
+                Some(task_id) => self
+                    .event_store
+                    .task_completion_proof_references(task_id)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         emitter
             .emit(
                 EventType::AssistantResponse,
@@ -619,6 +642,8 @@ impl Agent {
                     output_tokens,
                     annotations: normalized_msg.annotations.clone(),
                     turn_id: turn_id.clone(),
+                    task_id: emitter.task_id().map(str::to_string),
+                    referenced_receipts,
                 },
             )
             .await?;
@@ -981,6 +1006,8 @@ mod tests {
             project_scope: None,
             semantic_scope: None,
             completion_contract: Some(crate::traits::RequestCompletionContract {
+                scope_task_id: Some("task-1".to_string()),
+                adopted_from_task_ids: Vec::new(),
                 task_kind: crate::traits::RequestTaskKind::Diagnose,
                 expects_mutation: true,
                 required_mutation_effects: crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
@@ -1053,6 +1080,8 @@ mod tests {
             project_scope: None,
             semantic_scope: Some(crate::traits::ToolSemanticScope::ExternalRemote),
             completion_contract: Some(crate::traits::RequestCompletionContract {
+                scope_task_id: Some("task-1".to_string()),
+                adopted_from_task_ids: Vec::new(),
                 task_kind: crate::traits::RequestTaskKind::Find,
                 expects_mutation: false,
                 required_mutation_effects: crate::traits::ToolMutationEffects::NONE,

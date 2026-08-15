@@ -410,6 +410,31 @@ impl WorkCoordinationStore for SqliteStateStore {
         } else {
             Some(chrono::Utc::now().to_rfc3339())
         };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query(
+            "SELECT gr.goal_id, gr.status AS prior_status, gr.trigger_type, gr.root_task_id,
+                    g.goal_type, g.session_id,
+                    EXISTS(SELECT 1 FROM goal_schedules s WHERE s.goal_id = gr.goal_id) AS has_schedule,
+                    json_extract(t.context, '$.recovery_for_run') AS recovery_for_run
+             FROM goal_runs gr
+             JOIN goals g ON g.id = gr.goal_id
+             LEFT JOIN tasks t ON t.id = gr.root_task_id
+             WHERE gr.id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(run) = run else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let goal_id: String = run.get("goal_id");
+        let prior_status: String = run.get("prior_status");
+        let goal_type: String = run.get("goal_type");
+        let session_id: String = run.get("session_id");
+        let has_schedule = run.get::<i64, _>("has_schedule") != 0;
+        let recovery_for_run: Option<String> = run.get("recovery_for_run");
         let result = sqlx::query(
             "UPDATE goal_runs
              SET status = ?, outcome_summary = ?, completed_at = ?,
@@ -420,9 +445,256 @@ impl WorkCoordinationStore for SqliteStateStore {
         .bind(summary)
         .bind(completed_at)
         .bind(run_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let scheduled_objective = goal_type == "continuous" && has_schedule;
+        if scheduled_objective {
+            let failure_budget = sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(
+                    (SELECT json_extract(objective_control_json, '$.run_failure_budget')
+                     FROM mandates WHERE goal_id = ?),
+                    3
+                 )",
+            )
+            .bind(&goal_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .clamp(1, 10);
+            let recovery_proof_receipt_ids = if recovery_for_run.is_some() {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT json_extract(e.data, '$.tool_call_id') FROM events e
+                     JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+                     WHERE t.goal_run_id = ? AND e.event_type = 'tool_result'
+                       AND json_extract(t.context, '$.terminal_recovery') = 1
+                       AND json_extract(t.context, '$.recovery_for_run') = ?
+                       AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
+                       AND json_extract(e.data, '$.receipt.outcome_evidence')
+                           IN ('tool_reported', 'structured_metadata', 'durable_replay')",
+                )
+                .bind(run_id)
+                .bind(recovery_for_run.as_deref())
+                .fetch_all(&mut *tx)
+                .await?
+            } else {
+                Vec::new()
+            };
+            let recovery_completion_verified =
+                recovery_for_run.is_none() || !recovery_proof_receipt_ids.is_empty();
+
+            if status == "completed" && recovery_completion_verified {
+                sqlx::query(
+                    "INSERT INTO scheduled_recovery_state
+                        (goal_id, consecutive_failures, failure_budget, disposition,
+                         latest_failure_kind, last_failed_run_id, last_recovery_run_id, updated_at)
+                     VALUES (?, 0, ?, 'healthy', NULL, NULL, ?, ?)
+                     ON CONFLICT(goal_id) DO UPDATE SET
+                        consecutive_failures = 0,
+                        failure_budget = excluded.failure_budget,
+                        disposition = 'healthy',
+                        latest_failure_kind = NULL,
+                        last_recovery_run_id = COALESCE(excluded.last_recovery_run_id,
+                                                        scheduled_recovery_state.last_recovery_run_id),
+                        updated_at = excluded.updated_at",
+                )
+                .bind(&goal_id)
+                .bind(failure_budget)
+                .bind(recovery_for_run.as_ref().map(|_| run_id))
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+                // Resume only schedules this state machine paused. An owner's
+                // independent pause is never silently reversed.
+                sqlx::query(
+                    "UPDATE goal_schedules SET is_paused = 0, updated_at = ?
+                     WHERE id IN (
+                         SELECT schedule_id FROM scheduled_recovery_paused_schedules
+                         WHERE goal_id = ?
+                     )",
+                )
+                .bind(&now)
+                .bind(&goal_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM scheduled_recovery_paused_schedules WHERE goal_id = ?")
+                    .bind(&goal_id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else if (matches!(status, "failed" | "blocked")
+                || status == "completed" && !recovery_completion_verified)
+                && !(prior_status == "blocked" && status == "blocked")
+            {
+                let authorization_blocked = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM events e
+                     JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+                     WHERE t.goal_run_id = ? AND e.event_type = 'tool_result'
+                       AND json_extract(e.data, '$.receipt.authorization_preflight.status')
+                           IN ('blocked', 'unverifiable') LIMIT 1",
+                )
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                let retryable_tool = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM events e
+                     JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+                     WHERE t.goal_run_id = ? AND e.event_type = 'tool_result'
+                       AND json_extract(e.data, '$.receipt.outcome_status') = 'failed_retryable'
+                     LIMIT 1",
+                )
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                let permanent_tool = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM events e
+                     JOIN tasks t ON t.id = json_extract(e.data, '$.task_id')
+                     WHERE t.goal_run_id = ? AND e.event_type = 'tool_result'
+                       AND json_extract(e.data, '$.receipt.outcome_status')
+                           IN ('failed_permanent', 'blocked') LIMIT 1",
+                )
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                let task_failed = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM tasks WHERE goal_run_id = ?
+                       AND (status IN ('failed', 'interrupted')
+                            OR error IS NOT NULL OR blocker IS NOT NULL) LIMIT 1",
+                )
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                let failure_kind = if authorization_blocked {
+                    crate::traits::ScheduledFailureKind::AuthorizationBlocked
+                } else if retryable_tool {
+                    crate::traits::ScheduledFailureKind::RetryableTool
+                } else if permanent_tool {
+                    crate::traits::ScheduledFailureKind::PermanentTool
+                } else if task_failed {
+                    crate::traits::ScheduledFailureKind::TaskFailed
+                } else {
+                    crate::traits::ScheduledFailureKind::OutcomeUnproven
+                };
+                let previous_failures = sqlx::query_scalar::<_, i64>(
+                    "SELECT consecutive_failures FROM scheduled_recovery_state
+                     WHERE goal_id = ?",
+                )
+                .bind(&goal_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or(0);
+                let consecutive_failures = previous_failures.saturating_add(1);
+                let escalated = consecutive_failures >= failure_budget;
+                let newly_escalated = escalated && previous_failures < failure_budget;
+                let disposition = if escalated {
+                    crate::traits::ScheduledRecoveryDisposition::Escalated
+                } else {
+                    crate::traits::ScheduledRecoveryDisposition::Recovering
+                };
+                sqlx::query(
+                    "INSERT INTO scheduled_recovery_state
+                        (goal_id, consecutive_failures, failure_budget, disposition,
+                         latest_failure_kind, last_failed_run_id, last_recovery_run_id, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(goal_id) DO UPDATE SET
+                        consecutive_failures = excluded.consecutive_failures,
+                        failure_budget = excluded.failure_budget,
+                        disposition = excluded.disposition,
+                        latest_failure_kind = excluded.latest_failure_kind,
+                        last_failed_run_id = excluded.last_failed_run_id,
+                        last_recovery_run_id = COALESCE(excluded.last_recovery_run_id,
+                                                        scheduled_recovery_state.last_recovery_run_id),
+                        updated_at = excluded.updated_at",
+                )
+                .bind(&goal_id)
+                .bind(consecutive_failures)
+                .bind(failure_budget)
+                .bind(disposition.as_str())
+                .bind(failure_kind.as_str())
+                .bind(run_id)
+                .bind(recovery_for_run.as_ref().map(|_| run_id))
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+
+                if newly_escalated {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO scheduled_recovery_paused_schedules
+                            (schedule_id, goal_id, paused_at)
+                         SELECT id, goal_id, ? FROM goal_schedules
+                         WHERE goal_id = ? AND is_paused = 0",
+                    )
+                    .bind(&now)
+                    .bind(&goal_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE goal_schedules SET is_paused = 1, updated_at = ?
+                         WHERE goal_id = ?",
+                    )
+                    .bind(&now)
+                    .bind(&goal_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let notification_id = format!(
+                        "scheduled-recovery-budget:{}:{}",
+                        goal_id, consecutive_failures
+                    );
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO notification_queue
+                            (id, goal_id, session_id, notification_type, priority, message,
+                             created_at, delivered_at, attempts, expires_at, task_id, action_token)
+                         VALUES (?, ?, ?, 'escalation', 'critical', ?, ?, NULL, 0, NULL, NULL, NULL)",
+                    )
+                    .bind(notification_id)
+                    .bind(&goal_id)
+                    .bind(&session_id)
+                    .bind(format!(
+                        "Scheduled objective paused after {consecutive_failures} consecutive failed runs (budget {failure_budget}; typed cause {}). The parent objective remains active for explicit recovery.",
+                        failure_kind.as_str()
+                    ))
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            if let Some(failed_run_id) = recovery_for_run.as_deref() {
+                let link_status = if status == "completed" && recovery_completion_verified {
+                    "verified"
+                } else if matches!(status, "completed" | "failed" | "cancelled") {
+                    "failed"
+                } else {
+                    "recovering"
+                };
+                sqlx::query(
+                    "INSERT INTO goal_run_recovery_links
+                        (failed_run_id, recovery_run_id, outcome_status,
+                         proof_receipt_ids_json, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(failed_run_id, recovery_run_id) DO UPDATE SET
+                        outcome_status = excluded.outcome_status,
+                        proof_receipt_ids_json = excluded.proof_receipt_ids_json,
+                        updated_at = excluded.updated_at",
+                )
+                .bind(failed_run_id)
+                .bind(run_id)
+                .bind(link_status)
+                .bind(serde_json::to_string(&recovery_proof_receipt_ids)?)
+                .bind(&now)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn claim_task_with_lease(
@@ -1733,7 +2005,7 @@ mod tests {
     use super::*;
     use crate::memory::embeddings::EmbeddingService;
     use crate::traits::store_prelude::*;
-    use crate::traits::{Goal, Task};
+    use crate::traits::{Goal, GoalSchedule, Task};
     use std::sync::Arc;
 
     async fn test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
@@ -2409,5 +2681,172 @@ mod tests {
         assert_eq!(goals.len(), 1);
         assert!(goals[0].run_id.is_none());
         assert_eq!(goals[0].done, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduled_failure_budget_escalates_and_resumes_only_owned_pauses() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("publish synthetic report", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let active_schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 6 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let owner_paused_schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            is_paused: true,
+            ..active_schedule.clone()
+        };
+        store.create_goal_schedule(&active_schedule).await.unwrap();
+        store
+            .create_goal_schedule(&owner_paused_schedule)
+            .await
+            .unwrap();
+
+        for expected_failures in 1..=3 {
+            let run = store
+                .start_goal_run(&goal.id, "scheduled", Some(&active_schedule.id), None)
+                .await
+                .unwrap();
+            assert!(store
+                .finish_goal_run(&run.id, "failed", Some("synthetic failed run"))
+                .await
+                .unwrap());
+            let recovery = store
+                .get_scheduled_recovery_state(&goal.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovery.consecutive_failures, expected_failures);
+            assert_eq!(
+                recovery.latest_failure_kind,
+                Some(crate::traits::ScheduledFailureKind::OutcomeUnproven)
+            );
+        }
+
+        let escalated = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            escalated.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Escalated
+        );
+        let schedules = store.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(schedules.iter().all(|schedule| schedule.is_paused));
+        assert_eq!(
+            store.get_goal(&goal.id).await.unwrap().unwrap().status,
+            "active"
+        );
+        assert!(store
+            .get_pending_notifications(20)
+            .await
+            .unwrap()
+            .iter()
+            .any(|notification| {
+                notification.goal_id == goal.id && notification.notification_type == "escalation"
+            }));
+
+        let recovery_run = store
+            .start_goal_run(&goal.id, "scheduled", Some(&active_schedule.id), None)
+            .await
+            .unwrap();
+        let mut recovery_task = task(&goal.id, "verify synthetic recovery", None);
+        recovery_task.context = Some(
+            serde_json::json!({
+                "recovery_for_run": escalated.last_failed_run_id,
+                "terminal_recovery": true
+            })
+            .to_string(),
+        );
+        store.create_task(&recovery_task).await.unwrap();
+        sqlx::query("UPDATE goal_runs SET root_task_id = ? WHERE id = ?")
+            .bind(&recovery_task.id)
+            .bind(&recovery_run.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let proof_receipt_id = "synthetic-recovery-proof";
+        sqlx::query(
+            "INSERT INTO events
+                (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'http_request')",
+        )
+        .bind(&goal.session_id)
+        .bind(
+            serde_json::json!({
+                "task_id": recovery_task.id,
+                "tool_call_id": proof_receipt_id,
+                "receipt": {
+                    "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                    "outcome_status": "succeeded",
+                    "outcome_evidence": "structured_metadata"
+                }
+            })
+            .to_string(),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&recovery_task.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store
+            .finish_goal_run(
+                &recovery_run.id,
+                "completed",
+                Some("synthetic verified recovery"),
+            )
+            .await
+            .unwrap());
+        let healthy = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.consecutive_failures, 0);
+        assert_eq!(
+            healthy.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Healthy
+        );
+        let recovery_link: (String, String) = sqlx::query_as(
+            "SELECT outcome_status, proof_receipt_ids_json
+             FROM goal_run_recovery_links WHERE recovery_run_id = ?",
+        )
+        .bind(&recovery_run.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(recovery_link.0, "verified");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&recovery_link.1).unwrap(),
+            vec![proof_receipt_id]
+        );
+        let schedules = store.get_schedules_for_goal(&goal.id).await.unwrap();
+        assert!(
+            !schedules
+                .iter()
+                .find(|schedule| schedule.id == active_schedule.id)
+                .unwrap()
+                .is_paused
+        );
+        assert!(
+            schedules
+                .iter()
+                .find(|schedule| schedule.id == owner_paused_schedule.id)
+                .unwrap()
+                .is_paused
+        );
     }
 }

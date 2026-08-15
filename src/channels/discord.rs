@@ -835,14 +835,46 @@ impl DiscordChannel {
 
                 let mut task_error: Option<String> = None;
                 match result {
-                    Ok(reply) => {
-                        let reply = crate::channels::prepare_chat_message(&reply);
+                    Ok(envelope) => {
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "discord",
+                                    crate::events::ResponseDeliveryState::Queued,
+                                    Vec::new(),
+                                    None,
+                                ),
+                            )
+                            .await;
+                        let reply = crate::channels::prepare_chat_message(&envelope.text);
                         let chunks = split_message(&reply, 2000);
+                        let mut platform_message_ids = Vec::new();
+                        let mut failed = false;
                         for chunk in &chunks {
-                            if let Err(e) = channel_id.say(&http, chunk).await {
-                                warn!("Failed to send Discord message: {}", e);
+                            match channel_id.say(&http, chunk).await {
+                                Ok(message) => platform_message_ids.push(message.id.to_string()),
+                                Err(e) => {
+                                    failed = true;
+                                    warn!("Failed to send Discord message: {}", e);
+                                }
                             }
                         }
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "discord",
+                                    if failed {
+                                        crate::events::ResponseDeliveryState::Failed
+                                    } else {
+                                        crate::events::ResponseDeliveryState::PlatformAcknowledged
+                                    },
+                                    platform_message_ids,
+                                    failed.then(|| "discord_send_failed".to_string()),
+                                ),
+                            )
+                            .await;
                     }
                     Err(e) => {
                         let error_msg = e.to_string();

@@ -223,6 +223,11 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
                 || summary_len > 240
                 || requirement.acceptable_scopes.is_empty()
                 || requirement.acceptable_scopes.len() > 3
+                || requirement.required_content_markers.len() > 16
+                || requirement.required_content_markers.iter().any(|marker| {
+                    let trimmed = marker.trim();
+                    trimmed.is_empty() || trimmed != marker || marker.chars().count() > 128
+                })
                 // Exact targets come only from structural request parsing.
                 || requirement.target.is_some()
         })
@@ -565,7 +570,8 @@ pub(crate) async fn generate_task_plan(
                  \"acceptable_scopes\": [\"external_remote\"],\n\
                  \"purpose\": \"current_state|historical_record|content|outcome|attribution|causal_explanation\",\n\
                  \"minimum_authority\": \"advisory|direct|canonical\",\n\
-                 \"temporal_scope\": \"current|historical|both\"\n\
+                 \"temporal_scope\": \"current|historical|both\",\n\
+                 \"required_content_markers\": [\"exact requested field or key token\"]\n\
                }}\n\
              ],\n\
              \"project_reference\": null\n\
@@ -640,6 +646,10 @@ pub(crate) async fn generate_task_plan(
            return 1-8 entries. Describe evidence needs, never tool names or execution steps.\n\
          - acceptable_scopes lists alternative authoritative domains for that ONE need. When two \
            domains establish different facts, create two requirements rather than treating them as alternatives.\n\
+         - required_content_markers contains exact field names, keys, headings, or stable identifiers from \
+           the CURRENT request that must be present in a content observation for that requirement to be \
+           satisfied. Use [] when presence of a particular content token is not part of the evidence need. \
+           Do not invent values or use answer prose as markers.\n\
          - A current state observation proves only current state/content/outcome. It does not by itself \
            prove who performed an action, why it happened, what the agent previously decided, or whether \
            a historical claim came from autonomous execution. Attribution, causal explanation, and prior \
@@ -1104,6 +1114,7 @@ mod tests {
                 purpose: crate::traits::EvidencePurpose::Content,
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
                 target: None,
             }]),
             project_reference: None,
@@ -1193,6 +1204,7 @@ mod tests {
                 purpose: crate::traits::EvidencePurpose::HistoricalRecord,
                 minimum_authority: crate::traits::EvidenceAuthority::Canonical,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                required_content_markers: Vec::new(),
                 target: None,
             }]);
         assert!(planned_contract_is_complete(&exact_history));
@@ -1295,6 +1307,7 @@ mod tests {
                 purpose: crate::traits::EvidencePurpose::CurrentState,
                 minimum_authority: crate::traits::EvidenceAuthority::Direct,
                 temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                required_content_markers: Vec::new(),
                 target: None,
             }]),
             project_reference: None,

@@ -1740,7 +1740,8 @@ mod tests {
     async fn mandate_context_uses_only_built_in_policy_prompt_inputs() {
         use crate::testing::{setup_test_agent, MockProvider};
         use crate::traits::{
-            ConversationSummary, Fact, Goal, Mandate, MandateAuthority, MandateStore, TaskAttempt,
+            ConversationSummary, Fact, Goal, Mandate, MandateAuthority, MandateObjectiveControl,
+            MandateStore, ObjectiveMetricDirection, TaskAttempt,
         };
         use crate::types::{ChannelContext, FactPrivacy, UserRole};
 
@@ -1838,6 +1839,22 @@ mod tests {
         mandate.id = "mandate-privacy".to_string();
         mandate.version = 1;
         mandate.autonomy_mode = crate::traits::MandateAutonomyMode::Autopilot;
+        mandate.objective_control = Some(MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic public engagement".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 1_000_000,
+            target_micros: 2_000_000,
+            direction: ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-public-analytics".to_string(),
+            measurement_cadence_secs: 3_600,
+            experiment_cohort: "synthetic-public-cohort".to_string(),
+            experiment_window_secs: 86_400,
+            minimum_effect_micros: 100_000,
+            max_stagnant_measurements: 3,
+            run_failure_budget: 3,
+            baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
+        });
         mandate.constraints = vec!["OWNER POLICY CONSTRAINT SENTINEL".to_string()];
         mandate.success_criteria = vec!["OWNER POLICY SUCCESS SENTINEL".to_string()];
         mandate.stop_conditions = vec!["OWNER POLICY STOP SENTINEL".to_string()];

@@ -690,6 +690,8 @@ pub(super) async fn run_completion_phase(
                         "Draft omitted grounded response-contract fields".to_string(),
                         json!({
                             "condition": "response_contract_incomplete",
+                            "contract_scope_task_id": turn_context.completion_contract.scope_task_id,
+                            "contract_adopted_from_task_ids": turn_context.completion_contract.adopted_from_task_ids,
                             "missing_fields": missing_response_fields,
                             "retry": 1,
                         }),

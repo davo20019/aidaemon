@@ -248,6 +248,7 @@ pub(crate) fn authorize_mandate_action(
     MandateAuthorityDecision::Allow(MandateAuthorityGrant {
         mandate_id: mandate.id.clone(),
         mandate_version: mandate.version,
+        owner_principal_id: mandate.owner_principal_id.clone(),
         decision_cycle_id: decision_cycle.id.clone(),
         action_digest,
         counts_toward_cycle_budget: call_mutates,

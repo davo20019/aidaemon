@@ -19,6 +19,14 @@ use super::{
 };
 use crate::traits::{Message, TokenUsage};
 
+#[derive(Debug, Clone)]
+pub struct GeneratedResponseRef {
+    pub response_id: String,
+    pub task_id: String,
+    pub turn_id: Option<String>,
+    pub referenced_receipts: Vec<super::CompletionProofReference>,
+}
+
 /// The event store backed by SQLite.
 pub struct EventStore {
     pool: SqlitePool,
@@ -353,6 +361,126 @@ impl WriteConsistencyReport {
 }
 
 impl EventStore {
+    pub async fn event_watermark(&self) -> anyhow::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM events")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Return the exact generated-response identity for a completed agent
+    /// handoff. The immutable pre-dispatch watermark is the selector; content
+    /// is only an integrity check. This prevents an identical historical reply
+    /// from being attributed to the current delivery.
+    pub async fn generated_response_after(
+        &self,
+        session_id: &str,
+        event_watermark: i64,
+        content: &str,
+    ) -> anyhow::Result<Option<GeneratedResponseRef>> {
+        let row = sqlx::query(
+            "SELECT id, task_id, turn_id, data
+             FROM events
+             WHERE session_id = ? AND id > ? AND event_type = 'assistant_response'
+               AND json_type(data, '$.message_id') = 'text'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(event_watermark)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let raw: String = row.get("data");
+        let data: serde_json::Value = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            data.get("content").and_then(serde_json::Value::as_str) == Some(content),
+            "latest generated response after dispatch does not match returned content"
+        );
+        let response_id = data
+            .get("message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("assistant response is missing message_id"))?
+            .to_string();
+        let task_id = row
+            .try_get::<Option<String>, _>("task_id")?
+            .or_else(|| {
+                data.get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| anyhow::anyhow!("assistant response is missing task_id"))?;
+        let referenced_receipts = data
+            .get("referenced_receipts")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        Ok(Some(GeneratedResponseRef {
+            response_id,
+            task_id,
+            turn_id: row.try_get("turn_id")?,
+            referenced_receipts,
+        }))
+    }
+
+    /// All durable structured receipts recorded under one exact task. The
+    /// response and TaskEnd proof graphs both use this projection so audit
+    /// cannot drift between two independent correlation rules.
+    pub async fn task_completion_proof_references(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Vec<super::CompletionProofReference>> {
+        let rows = sqlx::query(
+            "SELECT json_extract(data, '$.tool_call_id') AS receipt_id,
+                    json_extract(data, '$.receipt.result_provenance.result_id') AS result_id,
+                    json_extract(data, '$.receipt.completion_obligation_ids') AS obligation_ids
+             FROM events
+             WHERE event_type = 'tool_result' AND task_id = ?
+               AND json_extract(data, '$.receipt.schema_version') IS NOT NULL
+               AND json_array_length(
+                    COALESCE(json_extract(data, '$.receipt.completion_obligation_ids'), '[]')
+                   ) > 0
+             ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut seen = std::collections::HashSet::new();
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let receipt_id = row.try_get::<String, _>("receipt_id").ok()?;
+                seen.insert(receipt_id.clone())
+                    .then(|| super::CompletionProofReference {
+                        receipt_id,
+                        result_id: row.try_get("result_id").ok().flatten(),
+                        obligation_ids: row
+                            .try_get::<Option<String>, _>("obligation_ids")
+                            .ok()
+                            .flatten()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .unwrap_or_default(),
+                    })
+            })
+            .collect())
+    }
+
+    pub async fn task_response_message_ids(&self, task_id: &str) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT json_extract(data, '$.message_id')
+             FROM events
+             WHERE event_type = 'assistant_response' AND task_id = ?
+               AND json_type(data, '$.message_id') = 'text'
+             ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Create a new EventStore with the given database pool.
     /// This also runs migrations to create/update the events table.
     pub async fn new(pool: SqlitePool) -> anyhow::Result<Self> {
@@ -1283,6 +1411,7 @@ impl EventStore {
                     // Watchdog-synthesized TaskEnd has no in-process turn
                     // context; legacy/unscoped => None.
                     turn_id: None,
+                    completion_proof: None,
                     harness_eval: None,
                 })?,
             );
@@ -2065,6 +2194,10 @@ impl EventEmitter {
         self.current_task_id = task_id;
     }
 
+    pub fn task_id(&self) -> Option<&str> {
+        self.current_task_id.as_deref()
+    }
+
     /// Emit an event with the current context
     pub async fn emit<T: serde::Serialize>(
         &self,
@@ -2133,6 +2266,98 @@ mod tests {
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         let store = EventStore::new(pool).await.expect("init event store");
         (store, db_file)
+    }
+
+    #[tokio::test]
+    async fn generated_response_identity_is_bounded_by_dispatch_watermark() {
+        let (store, _database) = setup_store().await;
+        let content = "synthetic identical response";
+        for (task_id, message_id) in [("task-old", "response-old")] {
+            store
+                .append(Event::new(
+                    "session-a",
+                    EventType::AssistantResponse,
+                    json!({
+                        "task_id": task_id,
+                        "turn_id": "turn-old",
+                        "message_id": message_id,
+                        "content": content,
+                        "model": "test",
+                        "referenced_receipts": []
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+        let watermark = store.event_watermark().await.unwrap();
+        store
+            .append(Event::new(
+                "session-a",
+                EventType::AssistantResponse,
+                json!({
+                    "task_id": "task-current",
+                    "turn_id": "turn-current",
+                    "message_id": "response-current",
+                    "content": content,
+                    "model": "test",
+                    "referenced_receipts": []
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let generated = store
+            .generated_response_after("session-a", watermark, content)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generated.response_id, "response-current");
+        assert_eq!(generated.task_id, "task-current");
+        assert_eq!(generated.turn_id.as_deref(), Some("turn-current"));
+    }
+
+    #[tokio::test]
+    async fn completion_proof_references_only_graph_satisfying_receipts() {
+        let (store, _database) = setup_store().await;
+        for (call_id, obligations) in [
+            ("receipt-incidental", json!([])),
+            (
+                "receipt-proof",
+                json!(["task:synthetic-task/obligation:evidence:0"]),
+            ),
+        ] {
+            store
+                .append(Event::new(
+                    "session-a",
+                    EventType::ToolResult,
+                    json!({
+                        "task_id": "synthetic-task",
+                        "tool_call_id": call_id,
+                        "name": "read_file",
+                        "result": "synthetic",
+                        "success": true,
+                        "duration_ms": 1,
+                        "receipt": {
+                            "schema_version": crate::events::ToolReceiptV1::SCHEMA_VERSION,
+                            "result_provenance": {"result_id": format!("result:{call_id}")},
+                            "completion_obligation_ids": obligations
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let proof = store
+            .task_completion_proof_references("synthetic-task")
+            .await
+            .unwrap();
+        assert_eq!(proof.len(), 1);
+        assert_eq!(proof[0].receipt_id, "receipt-proof");
+        assert_eq!(
+            proof[0].obligation_ids,
+            ["task:synthetic-task/obligation:evidence:0"]
+        );
     }
 
     #[tokio::test]
@@ -2327,6 +2552,7 @@ mod tests {
             summary: summary.map(str::to_string),
             efficiency: None,
             turn_id: None,
+            completion_proof: None,
             harness_eval: None,
         };
         append_event_at(

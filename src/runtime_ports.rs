@@ -107,13 +107,55 @@ pub(crate) struct InboundMessageRequest {
     pub heartbeat: Option<Arc<AtomicU64>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AgentResponseEnvelope {
+    pub response_id: String,
+    pub task_id: String,
+    pub turn_id: Option<String>,
+    pub text: String,
+    pub referenced_receipts: Vec<crate::events::CompletionProofReference>,
+}
+
+impl AgentResponseEnvelope {
+    pub(crate) fn delivery(
+        &self,
+        platform: &str,
+        state: crate::events::ResponseDeliveryState,
+        platform_message_ids: Vec<String>,
+        error_code: Option<String>,
+    ) -> crate::events::ResponseDeliveryData {
+        debug_assert!(self
+            .referenced_receipts
+            .iter()
+            .all(|reference| !reference.receipt_id.trim().is_empty()));
+        crate::events::ResponseDeliveryData {
+            response_id: self.response_id.clone(),
+            task_id: self.task_id.clone(),
+            turn_id: self.turn_id.clone(),
+            platform: platform.to_string(),
+            state,
+            platform_message_ids,
+            error_code,
+            occurred_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 /// The only agent capability chat transports need.
 #[async_trait]
 pub(crate) trait AgentIngress: Send + Sync {
     async fn handle_inbound_message(
         &self,
         request: InboundMessageRequest,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<AgentResponseEnvelope>;
+
+    async fn record_response_delivery(
+        &self,
+        _session_id: &str,
+        _delivery: crate::events::ResponseDeliveryData,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Agent administration surface used by shared channel commands.

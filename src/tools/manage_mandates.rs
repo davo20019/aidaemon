@@ -12,8 +12,9 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
     Intention, Mandate, MandateActivityLevel, MandateAuthority, MandateAutonomyMode,
-    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateOperatingUpdates,
-    MandateOperationScope, MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
+    MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateObjectiveControl,
+    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateOperationScope,
+    MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
     MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
     MandateTerminationKind, StateStore, Tool, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
@@ -486,14 +487,25 @@ impl ManageMandatesTool {
         if success_criteria.is_empty() {
             missing.push("success_criteria");
         }
+        if autonomy_mode.is_autopilot() && args.objective_control.is_none() {
+            missing.push("objective_control");
+        }
+        let control_validation = args
+            .objective_control
+            .as_ref()
+            .and_then(|control| control.validate().err());
         let validation_error = authority.validate().err();
-        let ready_to_confirm = missing.is_empty() && validation_error.is_none();
+        let ready_to_confirm =
+            missing.is_empty() && validation_error.is_none() && control_validation.is_none();
         Ok(serde_json::to_string_pretty(&json!({
             "execution_mode": "ongoing_mandate",
             "writes_performed": false,
             "ready_to_confirm": ready_to_confirm,
             "required_inputs": missing,
-            "validation_status": validation_error.as_deref().unwrap_or("ready"),
+            "validation_status": validation_error
+                .as_deref()
+                .or(control_validation.as_deref())
+                .unwrap_or("ready"),
             "proposal": {
                 "objective": objective,
                 "autonomy_mode": autonomy_mode,
@@ -504,6 +516,7 @@ impl ManageMandatesTool {
                     "skill_name": value.skill_name,
                     "content_sha256": value.content_sha256,
                 })),
+                "objective_control": args.objective_control,
                 "authority": authority,
                 "resource_policy": {
                     "review_effort": capacity.display_mode(),
@@ -540,7 +553,9 @@ impl ManageMandatesTool {
         anyhow::ensure!(!raw_id.is_empty(), "mandate_id must not be empty");
         if let Some(mandate) = self.state.get_mandate(raw_id).await? {
             anyhow::ensure!(
-                mandate.created_by_session == owner_session,
+                self.state
+                    .is_mandate_session_authorized(&mandate.id, owner_session)
+                    .await?,
                 "mandate not found in this owner session"
             );
             return Ok(mandate);
@@ -668,6 +683,14 @@ impl ManageMandatesTool {
         mandate.success_criteria = clean_strings(args.success_criteria.as_deref());
         mandate.stop_conditions = clean_strings(args.stop_conditions.as_deref());
         mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
+        mandate.objective_control = args.objective_control.clone();
+        if let Some(control) = mandate.objective_control.as_ref() {
+            control.validate().map_err(anyhow::Error::msg)?;
+        }
+        anyhow::ensure!(
+            !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
+            "autopilot mandates require an explicit objective_control with baseline, target, measurement source/cadence, experiment window, and failure budget"
+        );
         mandate.review_effort = capacity.display_mode().to_string();
         validate_policy_text(
             &mandate.constraints,
@@ -936,6 +959,11 @@ impl ManageMandatesTool {
                         "exact_policy": "Call get with section=policy before constructing an update."
                     },
                     "strategy": strategy,
+                    "objective_control": mandate.objective_control,
+                    "recent_objective_measurements": self
+                        .state
+                        .list_mandate_objective_measurements(&mandate.id, 10)
+                        .await?,
                     "latest_goal_run": latest_goal_run,
                     "latest_decision": latest_decision,
                     "latest_intention": latest_intention,
@@ -962,6 +990,7 @@ impl ManageMandatesTool {
                 "stop_conditions": mandate.stop_conditions,
                 "review_effort": mandate.review_effort,
                 "strategy": strategy,
+                "objective_control": mandate.objective_control,
             }),
             "history" => {
                 let limit = args.limit.unwrap_or(3).clamp(1, 10);
@@ -1177,6 +1206,72 @@ impl ManageMandatesTool {
         Ok(format!("Mandate {} is now {}.", mandate.id, current.status))
     }
 
+    async fn transfer_owner(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be transferred by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let owner = Self::owner_session(args)?;
+        let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
+        let target = required_trimmed(args.target_session_id.as_deref(), "target_session_id")?;
+        anyhow::ensure!(
+            target != owner && target.len() <= 256 && !target.chars().any(char::is_control),
+            "target_session_id must be a different bounded session identity"
+        );
+        let known_target = self
+            .state
+            .load_session_channels()
+            .await?
+            .into_iter()
+            .any(|(session_id, _)| session_id == target);
+        anyhow::ensure!(
+            known_target,
+            "target_session_id is not a registered channel session; send a message from that session first"
+        );
+        let mandate = self.resolve_owned_mandate(id, owner).await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.approval_tx
+            .send(ApprovalRequest {
+                command: format!("Transfer mandate {} to session {}", mandate.id, target),
+                session_id: owner.to_string(),
+                risk_level: RiskLevel::High,
+                warnings: vec![
+                    "The target session will be linked to this stable owner principal and become the primary route for the mandate, its schedules, pending notices, and future reviews. Open runs will be invalidated first.".to_string(),
+                    "No session-name similarity is used as proof of ownership.".to_string(),
+                ],
+                permission_mode: PermissionMode::Cautious,
+                response_tx,
+                kind: ApprovalKind::GoalConfirmation,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("ownership transfer confirmation failed: {error}"))?;
+        match response_rx.await {
+            Ok(
+                ApprovalResponse::AllowOnce
+                | ApprovalResponse::AllowSession
+                | ApprovalResponse::AllowAlways,
+            ) => {
+                anyhow::ensure!(
+                    self.state
+                        .transfer_mandate_ownership(&mandate.id, mandate.version, owner, target,)
+                        .await?,
+                    "mandate authority changed before ownership could transfer"
+                );
+                Ok(format!(
+                    "Mandate {} now routes through {} under the same stable principal at policy version {}.",
+                    mandate.id,
+                    target,
+                    mandate.version + 1
+                ))
+            }
+            Ok(ApprovalResponse::Deny) | Err(_) => {
+                Ok("Mandate ownership transfer cancelled.".to_string())
+            }
+        }
+    }
+
     async fn update(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
         if !Self::is_private_owner_control(args) {
             return Ok(
@@ -1209,7 +1304,8 @@ impl ManageMandatesTool {
             || args.budget_per_cycle.is_some()
             || args.budget_daily.is_some()
             || args.strategy_skill.is_some()
-            || args.clear_strategy.unwrap_or(false);
+            || args.clear_strategy.unwrap_or(false)
+            || args.objective_control.is_some();
         anyhow::ensure!(has_change, "update requires at least one changed field");
         anyhow::ensure!(
             !mandate.status.is_terminal(),
@@ -1302,6 +1398,14 @@ impl ManageMandatesTool {
         } else if args.strategy_skill.is_some() {
             mandate.strategy = self.strategy_snapshot(args.strategy_skill.as_deref())?;
         }
+        if let Some(control) = args.objective_control.as_ref() {
+            control.validate().map_err(anyhow::Error::msg)?;
+            mandate.objective_control = Some(control.clone());
+        }
+        anyhow::ensure!(
+            !mandate.autonomy_mode.is_autopilot() || mandate.objective_control.is_some(),
+            "autopilot mandates require an explicit objective_control"
+        );
         validate_policy_text(
             &mandate.constraints,
             &mandate.success_criteria,
@@ -1428,6 +1532,54 @@ impl ManageMandatesTool {
         Ok(format!(
             "Updated mandate {} to policy version {} in {} mode with {} review effort and automatically managed capacity. In-flight decisions on older versions are revoked; the next review is due now.",
             mandate.id, mandate.version, mandate.autonomy_mode, capacity.display_mode(),
+        ))
+    }
+
+    async fn record_measurement(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_internal(args) {
+            return Ok(
+                "record_measurement is reserved for the internal mandate deliberator.".to_string(),
+            );
+        }
+        let goal_id = required_trimmed(args._goal_id.as_deref(), "internal _goal_id")?;
+        let goal_run_id = required_trimmed(args._goal_run_id.as_deref(), "internal _goal_run_id")?;
+        let mandate = self
+            .state
+            .get_mandate_for_goal(goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current goal is not a mandate controller"))?;
+        anyhow::ensure!(
+            mandate.is_active() && mandate.objective_control.is_some(),
+            "mandate has no active objective control"
+        );
+        let value_micros = args
+            .measurement_value_micros
+            .ok_or_else(|| anyhow::anyhow!("measurement_value_micros is required"))?;
+        let receipts = clean_strings(args.evidence_receipt_ids.as_deref());
+        let observed_at = args
+            .measurement_observed_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let measurement = MandateObjectiveMeasurement::new(
+            &mandate.id,
+            mandate.version,
+            goal_run_id,
+            value_micros,
+            args.measurement_confidence_bps.unwrap_or(10_000),
+            receipts,
+            &observed_at,
+        )
+        .with_attributed_intention_ids(clean_strings(args.attributed_intention_ids.as_deref()));
+        self.state
+            .record_mandate_objective_measurement(&measurement)
+            .await?;
+        let target_reached = mandate
+            .objective_control
+            .as_ref()
+            .is_some_and(|control| control.target_reached(value_micros));
+        Ok(format!(
+            "Objective measurement {} recorded for mandate {} (target_reached={target_reached}).",
+            measurement.id, mandate.id
         ))
     }
 
@@ -1743,6 +1895,7 @@ struct ManageMandatesArgs {
     mandate_id: Option<String>,
     objective: Option<String>,
     autonomy_mode: Option<String>,
+    objective_control: Option<MandateObjectiveControl>,
     source_goal_id: Option<String>,
     allow_observations: Option<bool>,
     operation_scopes: Option<Vec<MandateOperationScope>>,
@@ -1776,6 +1929,10 @@ struct ManageMandatesArgs {
     rationale: Option<String>,
     observations: Option<Vec<String>>,
     evidence_receipt_ids: Option<Vec<String>>,
+    measurement_value_micros: Option<i64>,
+    measurement_confidence_bps: Option<u16>,
+    measurement_observed_at: Option<String>,
+    attributed_intention_ids: Option<Vec<String>>,
     question: Option<String>,
     termination_kind: Option<String>,
     termination_match: Option<String>,
@@ -1792,6 +1949,7 @@ struct ManageMandatesArgs {
     strategy_confidence_bps: Option<u16>,
     guidance: Option<String>,
     reconciliation_resolution: Option<String>,
+    target_session_id: Option<String>,
     #[serde(default)]
     _session_id: Option<String>,
     #[serde(default)]
@@ -1832,6 +1990,7 @@ impl ManageMandatesArgs {
         trim_optional(&mut self.outcome);
         trim_optional(&mut self.activity_level);
         trim_optional(&mut self.rationale);
+        trim_optional(&mut self.measurement_observed_at);
         trim_optional(&mut self.question);
         trim_optional(&mut self.termination_kind);
         trim_optional(&mut self.termination_match);
@@ -1845,6 +2004,7 @@ impl ManageMandatesArgs {
         trim_optional(&mut self.strategy_kind);
         trim_optional(&mut self.guidance);
         trim_optional(&mut self.reconciliation_resolution);
+        trim_optional(&mut self.target_session_id);
 
         if self.action == "update" {
             // These are creation metadata, not authority. A monolithic tool
@@ -1859,21 +2019,151 @@ impl ManageMandatesArgs {
     }
 }
 
+fn bounded_text(max_length: usize) -> Value {
+    json!({ "type": "string", "maxLength": max_length })
+}
+
+fn text_enum(values: &[&str]) -> Value {
+    json!({ "type": "string", "enum": values })
+}
+
+fn integer_min(minimum: i64) -> Value {
+    json!({ "type": "integer", "minimum": minimum })
+}
+
+fn integer_range(minimum: i64, maximum: i64) -> Value {
+    json!({ "type": "integer", "minimum": minimum, "maximum": maximum })
+}
+
+fn bounded_text_array(max_items: usize, max_length: usize) -> Value {
+    json!({
+        "type": "array",
+        "maxItems": max_items,
+        "items": bounded_text(max_length)
+    })
+}
+
+fn described(mut schema: Value, description: &str) -> Value {
+    schema["description"] = Value::String(description.to_string());
+    schema
+}
+
+const MANAGE_MANDATE_ACTIONS: &[&str] = &[
+    "draft",
+    "create",
+    "list",
+    "get",
+    "update",
+    "transfer_owner",
+    "pause",
+    "resume",
+    "answer_question",
+    "resolve_reconciliation",
+    "cancel",
+    "record_measurement",
+    "record_decision",
+    "list_intentions",
+];
+const OBJECTIVE_CONTROL_REQUIRED: &[&str] = &[
+    "schema_version",
+    "metric_name",
+    "unit",
+    "baseline_micros",
+    "target_micros",
+    "direction",
+    "measurement_source",
+    "measurement_cadence_secs",
+    "experiment_cohort",
+    "experiment_window_secs",
+    "minimum_effect_micros",
+    "max_stagnant_measurements",
+    "run_failure_budget",
+    "baseline_observed_at",
+];
+const OPERATION_SCOPE_REQUIRED: &[&str] = &[
+    "tool",
+    "operation",
+    "kind",
+    "target_prefixes",
+    "allowed_query_params",
+    "mutation_effects",
+];
+const MANDATE_OUTCOMES: &[&str] = &["act", "wait", "ask", "stop"];
+const ACTIVITY_LEVELS: &[&str] = &["quiet", "active", "urgent"];
+const TERMINATION_KINDS: &[&str] = &[
+    "success_criteria_satisfied",
+    "stop_condition_met",
+    "safety_termination",
+];
+const STRATEGY_KINDS: &[&str] = &["reinforce", "explore", "avoid", "retire"];
+const RECONCILIATION_RESOLUTIONS: &[&str] = &[
+    "confirmed_effect_occurred",
+    "confirmed_no_effect",
+    "abandon_attempt",
+];
+const HTTP_TOOLS: &[&str] = &["http_request", "web_fetch"];
+const HTTP_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+const OPERATION_KINDS: &[&str] = &["observation", "mutation"];
+const MUTATION_EFFECTS: &[&str] = &["remote_mutation", "external_delivery"];
+const OBJECTIVE_DIRECTIONS: &[&str] = &["at_least", "at_most"];
+const AUTONOMY_MODES: &[&str] = &["bounded", "autopilot"];
+const PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
+const REVIEW_EFFORTS: &[&str] = &["efficient", "balanced", "thorough"];
+const GET_SECTIONS: &[&str] = &["summary", "policy", "history"];
+const OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION: &str =
+    "Autopilot control loop; integers use the declared micro-unit.";
+const FIXED_DEADLINE_DESCRIPTION: &str =
+    "RFC3339 fixed deadline. Supported by both create and update.";
+const STOP_ONLY_DESCRIPTION: &str = "STOP only; omit for ACT, WAIT, and ASK.";
+const VALUE_CRITERION_DESCRIPTION: &str =
+    "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective.";
+const EXPECTED_BENEFIT_DESCRIPTION: &str = "ACT: benefit of acting now instead of waiting.";
+const RISK_DESCRIPTION: &str = "ACT: expected cost or downside, or why none is material.";
+const INVALIDATION_DESCRIPTION: &str =
+    "ACT: evidence making the intervention unsafe or not worthwhile.";
+const TRANSFER_SESSION_DESCRIPTION: &str =
+    "transfer_owner only; exact registered destination session";
+
 fn op_schema() -> Value {
     json!({
         "type": "array", "minItems": 1, "maxItems": 64,
         "items": { "type": "object",
             "properties": {
-                "tool": { "type": "string", "enum": ["http_request", "web_fetch"] },
-                "operation": { "type": "string", "enum": ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] },
-                "kind": { "type": "string", "enum": ["observation", "mutation"] },
+                "tool": text_enum(HTTP_TOOLS),
+                "operation": text_enum(HTTP_METHODS),
+                "kind": text_enum(OPERATION_KINDS),
                 "target_prefixes": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 2048 } },
                 "allowed_query_params": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 128 } },
-                "mutation_effects": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["remote_mutation", "external_delivery"] } }
+                "mutation_effects": { "type": "array", "maxItems": 2, "items": text_enum(MUTATION_EFFECTS) }
             },
-            "required": ["tool", "operation", "kind", "target_prefixes", "allowed_query_params", "mutation_effects"],
+            "required": OPERATION_SCOPE_REQUIRED,
             "additionalProperties": false
         }
+    })
+}
+
+fn objective_control_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": OBJECTIVE_CONTROL_SCHEMA_DESCRIPTION,
+        "properties": {
+            "schema_version": { "type": "integer", "enum": [1] },
+            "metric_name": bounded_text(128),
+            "unit": bounded_text(64),
+            "baseline_micros": { "type": "integer" },
+            "target_micros": { "type": "integer" },
+            "direction": text_enum(OBJECTIVE_DIRECTIONS),
+            "measurement_source": bounded_text(2048),
+            "measurement_cadence_secs": integer_range(60, 2592000),
+            "experiment_cohort": bounded_text(128),
+            "experiment_window_secs": integer_range(60, 7776000),
+            "minimum_effect_micros": integer_min(1),
+            "max_stagnant_measurements": integer_range(1, 20),
+            "run_failure_budget": integer_range(1, 10),
+            "baseline_observed_at": { "type": "string" }
+        },
+        "required": OBJECTIVE_CONTROL_REQUIRED,
+        "additionalProperties": false
     })
 }
 
@@ -1894,21 +2184,23 @@ impl Tool for ManageMandatesTool {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["draft", "create", "list", "get", "update", "pause", "resume", "answer_question", "resolve_reconciliation", "cancel", "record_decision", "list_intentions"] },
-                    "mandate_id": { "type": "string", "maxLength": 256 }, "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT }, "autonomy_mode": { "type": "string", "enum": ["bounded", "autopilot"] }, "source_goal_id": { "type": "string", "maxLength": 256, "description": SOURCE_GOAL_FIELD_DESCRIPTION },
+                    "action": text_enum(MANAGE_MANDATE_ACTIONS),
+                    "mandate_id": bounded_text(256), "objective": bounded_text(MAX_OBJECTIVE_TEXT), "autonomy_mode": text_enum(AUTONOMY_MODES), "objective_control": objective_control_schema(), "source_goal_id": described(bounded_text(256), SOURCE_GOAL_FIELD_DESCRIPTION),
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
-                    "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 }, "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 }, "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
-                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": CONSTRAINT_FIELD_DESCRIPTION } }, "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": SUCCESS_FIELD_DESCRIPTION } }, "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": STOP_FIELD_DESCRIPTION } },
-                    "strategy_skill": { "type": "string", "maxLength": 256 }, "clear_strategy": { "type": "boolean" }, "min_review_minutes": { "type": "integer", "minimum": 1 }, "max_review_minutes": { "type": "integer", "minimum": 1 }, "default_review_minutes": { "type": "integer", "minimum": 1 },
-                    "duration_minutes": { "type": "integer", "minimum": 1, "description": DURATION_FIELD_DESCRIPTION }, "expires_at": { "type": "string", "description": "RFC3339 fixed deadline. Supported by both create and update." }, "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": PRIORITY_FIELD_DESCRIPTION }, "review_effort": { "type": "string", "enum": ["efficient", "balanced", "thorough"] },
-                    "include_terminal": { "type": "boolean" }, "section": { "type": "string", "enum": ["summary", "policy", "history"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
-                    "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] }, "activity_level": { "type": "string", "enum": ["quiet", "active", "urgent"] }, "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
-                    "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } }, "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } }, "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
-                    "termination_kind": { "type": "string", "enum": ["success_criteria_satisfied", "stop_condition_met", "safety_termination"], "description": "STOP only; omit for ACT, WAIT, and ASK." }, "termination_match": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": "STOP only; omit for ACT, WAIT, and ASK." }, "reconsider_minutes": { "type": "integer", "minimum": 1 },
-                    "intention": { "type": "string", "maxLength": MAX_INTENTION_TEXT }, "value_criterion": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT, "description": "ACT: exact owner-confirmed success criterion advanced; legacy uses the exact objective." }, "expected_benefit": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: benefit of acting now instead of waiting." }, "risk": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: expected cost or downside, or why none is material." }, "invalidation_criteria": { "type": "string", "maxLength": MAX_INTENTION_METADATA_TEXT, "description": "ACT: evidence making the intervention unsafe or not worthwhile." },
-                    "learning_note": { "type": "string", "maxLength": MAX_LEARNING_NOTE_TEXT }, "learning_evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } }, "strategy_key": { "type": "string", "maxLength": 64 },
-                    "strategy_kind": { "type": "string", "enum": ["reinforce", "explore", "avoid", "retire"] }, "strategy_confidence_bps": { "type": "integer", "minimum": 0, "maximum": 10000 }, "guidance": { "type": "string", "maxLength": MAX_GUIDANCE_ENTRY_TEXT }, "reconciliation_resolution": { "type": "string", "enum": ["confirmed_effect_occurred", "confirmed_no_effect", "abandon_attempt"] }
+                    "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
+                    "constraints": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), CONSTRAINT_FIELD_DESCRIPTION), "success_criteria": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), SUCCESS_FIELD_DESCRIPTION), "stop_conditions": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), STOP_FIELD_DESCRIPTION),
+                    "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": integer_min(1),
+                    "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
+                    "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
+                    "outcome": text_enum(MANDATE_OUTCOMES), "activity_level": text_enum(ACTIVITY_LEVELS), "rationale": bounded_text(MAX_RATIONALE_TEXT),
+                    "observations": bounded_text_array(MAX_OBSERVATIONS, MAX_OBSERVATION_TEXT), "evidence_receipt_ids": bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), "question": bounded_text(MAX_QUESTION_TEXT),
+                    "measurement_value_micros": { "type": "integer" }, "measurement_confidence_bps": integer_range(0, 10000), "measurement_observed_at": { "type": "string" }, "attributed_intention_ids": bounded_text_array(16, 256),
+                    "termination_kind": described(text_enum(TERMINATION_KINDS), STOP_ONLY_DESCRIPTION), "termination_match": described(bounded_text(MAX_POLICY_ENTRY_TEXT), STOP_ONLY_DESCRIPTION), "reconsider_minutes": integer_min(1),
+                    "intention": bounded_text(MAX_INTENTION_TEXT), "value_criterion": described(bounded_text(MAX_OBJECTIVE_TEXT), VALUE_CRITERION_DESCRIPTION), "expected_benefit": described(bounded_text(MAX_INTENTION_METADATA_TEXT), EXPECTED_BENEFIT_DESCRIPTION), "risk": described(bounded_text(MAX_INTENTION_METADATA_TEXT), RISK_DESCRIPTION), "invalidation_criteria": described(bounded_text(MAX_INTENTION_METADATA_TEXT), INVALIDATION_DESCRIPTION),
+                    "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT), "learning_evidence_receipt_ids": bounded_text_array(MAX_EVIDENCE_RECEIPTS, 256), "strategy_key": bounded_text(64),
+                    "target_session_id": described(bounded_text(256), TRANSFER_SESSION_DESCRIPTION),
+                    "strategy_kind": text_enum(STRATEGY_KINDS), "strategy_confidence_bps": integer_range(0, 10000), "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -1925,10 +2217,12 @@ impl Tool for ManageMandatesTool {
             "list" => self.list(&args).await,
             "get" => self.get(&args).await,
             "update" => self.update(&args).await,
+            "transfer_owner" => self.transfer_owner(&args).await,
             "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
                 self.transition(&args, &args.action).await
             }
             "record_decision" => self.record_decision(&args).await,
+            "record_measurement" => self.record_measurement(&args).await,
             "list_intentions" => self.list_intentions(&args).await,
             other => anyhow::bail!("unknown manage_mandates action `{other}`"),
         }
@@ -1978,7 +2272,7 @@ impl Tool for ManageMandatesTool {
             });
         match action.as_deref() {
             Some("draft" | "list" | "get" | "list_intentions") => ToolCallSemantics::observation(),
-            Some("record_decision") => ToolCallSemantics::administrative(),
+            Some("record_decision" | "record_measurement") => ToolCallSemantics::administrative(),
             _ => ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION),
         }
     }
@@ -3049,6 +3343,22 @@ mod tests {
                     "action":"create",
                     "objective":"Maintain the synthetic account without routine hand-holding",
                     "autonomy_mode":"autopilot",
+                    "objective_control": {
+                        "schema_version": 1,
+                        "metric_name": "synthetic useful interactions",
+                        "unit": "count",
+                        "baseline_micros": 10000000,
+                        "target_micros": 20000000,
+                        "direction": "at_least",
+                        "measurement_source": "metric_source:synthetic-analytics",
+                        "measurement_cadence_secs": 3600,
+                        "experiment_cohort": "synthetic-cohort-a",
+                        "experiment_window_secs": 86400,
+                        "minimum_effect_micros": 1000000,
+                        "max_stagnant_measurements": 3,
+                        "run_failure_budget": 3,
+                        "baseline_observed_at": "2026-08-15T00:00:00Z"
+                    },
                     "operation_scopes":[{
                         "tool":"http_request",
                         "operation":"POST",

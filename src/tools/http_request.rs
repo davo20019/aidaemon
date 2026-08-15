@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
 use tracing::warn;
 
@@ -14,9 +15,10 @@ use crate::tools::terminal::ApprovalRequest;
 use crate::tools::web_fetch::validate_url_for_ssrf;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolExecutionContext, ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind,
-    ToolVerificationMode, TruncationInfo,
+    AuthorizationPreflightRecord, AuthorizationPreflightStatus, Tool, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolExecutionContext,
+    ToolMutationEffects, ToolOutcomeStatus, ToolTargetHintKind, ToolVerificationMode,
+    TruncationInfo,
 };
 use crate::types::{ApprovalResponse, StatusUpdate};
 
@@ -1014,6 +1016,197 @@ impl HttpRequestTool {
         gateway.refresh_access_token_if_needed(profile_name).await
     }
 
+    /// Prove the exact account/profile/target binding before autonomous I/O.
+    /// The record contains only non-secret identifiers and digests and is later
+    /// persisted beside the dispatcher-issued mandate authority grant.
+    async fn mandate_authorization_preflight(
+        &self,
+        arguments: &str,
+    ) -> AuthorizationPreflightRecord {
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let method = parsed
+            .as_ref()
+            .and_then(|args| args.get("method"))
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "unknown".to_string());
+        let canonical_url = parsed.as_ref().and_then(Self::canonical_url_from_args);
+        let target_digest = canonical_url
+            .as_ref()
+            .map(|url| format!("sha256:{:x}", Sha256::digest(url.as_str().as_bytes())))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let auth_profile = parsed
+            .as_ref()
+            .and_then(|args| args.get("auth_profile"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let account_id = parsed
+            .as_ref()
+            .and_then(|args| args.get("account_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let make = |status, reason_code: Option<&str>| AuthorizationPreflightRecord {
+            schema_version: AuthorizationPreflightRecord::SCHEMA_VERSION,
+            status,
+            intended_operation: method.clone(),
+            target_digest: target_digest.clone(),
+            auth_profile: auth_profile.clone(),
+            account_id: account_id.clone(),
+            authorized_scopes: Vec::new(),
+            credential_generation: None,
+            refresh_result: None,
+            reason_code: reason_code.map(str::to_string),
+            checked_at: checked_at.clone(),
+        };
+
+        let Some(url) = canonical_url else {
+            return make(
+                AuthorizationPreflightStatus::Unverifiable,
+                Some("invalid_target"),
+            );
+        };
+        let Some(profile_name) = auth_profile.as_deref() else {
+            if account_id.is_some() {
+                return make(
+                    AuthorizationPreflightStatus::Blocked,
+                    Some("credential_profile_missing"),
+                );
+            }
+            // Anonymous mandate observations still receive a typed target and
+            // operation preflight; there is simply no credential binding.
+            return make(AuthorizationPreflightStatus::Ready, None);
+        };
+        let mut profile = match self.profiles.read().await.get(profile_name).cloned() {
+            Some(profile) => profile,
+            None => {
+                return make(
+                    AuthorizationPreflightStatus::Blocked,
+                    Some("credential_profile_missing"),
+                )
+            }
+        };
+        if !profile
+            .allowed_domains
+            .iter()
+            .any(|domain| Self::domain_matches(url.host_str().unwrap_or_default(), domain))
+        {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_target_mismatch"),
+            );
+        }
+        let expected_account = account_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && value.trim() == *value);
+        let configured_account = profile
+            .user_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && value.trim() == *value);
+        if expected_account.is_none() {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_account_missing"),
+            );
+        }
+        if configured_account.is_none() {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_profile_account_missing"),
+            );
+        }
+        if expected_account != configured_account {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_account_mismatch"),
+            );
+        }
+
+        let refresh_result = if matches!(profile.auth_type, crate::config::HttpAuthType::Bearer) {
+            match self.refresh_expiring_oauth_profile(profile_name).await {
+                Ok(true) => {
+                    let Some(refreshed) = self.profiles.read().await.get(profile_name).cloned()
+                    else {
+                        return make(
+                            AuthorizationPreflightStatus::Unverifiable,
+                            Some("credential_refresh_lost_profile"),
+                        );
+                    };
+                    profile = refreshed;
+                    "refreshed"
+                }
+                Ok(false) => "validated_current",
+                Err(_) => {
+                    return make(
+                        AuthorizationPreflightStatus::Blocked,
+                        Some("credential_refresh_failed"),
+                    )
+                }
+            }
+        } else {
+            "not_applicable"
+        };
+        if profile.user_id.as_deref() != expected_account {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_account_changed_after_refresh"),
+            );
+        }
+        let present = |value: Option<&str>| {
+            value.is_some_and(|value| !value.trim().is_empty() && value.trim() == value)
+        };
+        let credentials_ready = match profile.auth_type {
+            crate::config::HttpAuthType::Oauth1a => {
+                present(profile.api_key.as_deref())
+                    && present(profile.api_secret.as_deref())
+                    && present(profile.access_token.as_deref())
+                    && present(profile.access_token_secret.as_deref())
+            }
+            crate::config::HttpAuthType::Bearer => present(profile.token.as_deref()),
+            crate::config::HttpAuthType::Header => {
+                present(profile.header_name.as_deref()) && present(profile.header_value.as_deref())
+            }
+            crate::config::HttpAuthType::Basic => {
+                present(profile.username.as_deref()) && present(profile.password.as_deref())
+            }
+        };
+        if !credentials_ready {
+            return make(
+                AuthorizationPreflightStatus::Blocked,
+                Some("credential_material_missing"),
+            );
+        }
+        let generation_material = format!(
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            profile.auth_type,
+            profile.allowed_domains.join(","),
+            profile.user_id.as_deref().unwrap_or_default(),
+            profile.api_key.as_deref().unwrap_or_default(),
+            profile.api_secret.as_deref().unwrap_or_default(),
+            profile.access_token.as_deref().unwrap_or_default(),
+            profile.access_token_secret.as_deref().unwrap_or_default(),
+            profile.token.as_deref().unwrap_or_default(),
+            profile.header_name.as_deref().unwrap_or_default(),
+            profile.header_value.as_deref().unwrap_or_default(),
+            profile.username.as_deref().unwrap_or_default(),
+            profile.password.as_deref().unwrap_or_default(),
+        );
+        let mut ready = make(AuthorizationPreflightStatus::Ready, None);
+        if let Some(gateway) = self.oauth_gateway.read().await.clone() {
+            if let Some(provider) = gateway.get_provider(profile_name).await {
+                ready.authorized_scopes = provider.scopes;
+                ready.authorized_scopes.sort();
+                ready.authorized_scopes.dedup();
+            }
+        }
+        ready.credential_generation = Some(format!(
+            "sha256:{:x}",
+            Sha256::digest(generation_material.as_bytes())
+        ));
+        ready.refresh_result = Some(refresh_result.to_string());
+        ready
+    }
+
     #[cfg(test)]
     fn oauth_refresh_attempt_count(&self) -> usize {
         self.oauth_refresh_attempts
@@ -1958,6 +2151,51 @@ impl Tool for HttpRequestTool {
         exec_ctx: ToolExecutionContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let _ = status_tx;
+        let authorization_preflight = if exec_ctx.mandate_execution {
+            Some(self.mandate_authorization_preflight(arguments).await)
+        } else {
+            None
+        };
+        if let Some(preflight) = authorization_preflight
+            .as_ref()
+            .filter(|preflight| !preflight.permits_io())
+        {
+            let reason_code = preflight.reason_code.as_deref().unwrap_or("unverifiable");
+            let recovery = match reason_code {
+                "credential_account_missing" => {
+                    "; autonomous authenticated requests require a non-empty top-level `account_id`"
+                }
+                "credential_profile_account_missing" => {
+                    "; the selected auth profile has no valid configured user_id"
+                }
+                "credential_account_mismatch" => {
+                    "; the requested account_id does not match the configured user_id"
+                }
+                "credential_profile_missing" => {
+                    "; configure the exact auth profile before retrying"
+                }
+                "credential_target_mismatch" => {
+                    "; the selected credential profile is not authorized for this target"
+                }
+                "credential_material_missing" => {
+                    "; reconnect or repair the selected credential profile before retrying"
+                }
+                "credential_refresh_failed" => {
+                    "; refresh or reconnect the selected credential profile before retrying"
+                }
+                _ => "; inspect the typed preflight record before retrying",
+            };
+            return Ok(ToolCallOutcome {
+                output: format!(
+                    "Request blocked by autonomous authorization preflight: {reason_code}{recovery}"
+                ),
+                metadata: ToolCallMetadata {
+                    outcome_status: Some(ToolOutcomeStatus::Blocked),
+                    authorization_preflight,
+                    ..Default::default()
+                },
+            });
+        }
         let (output, http_status, truncation) = self
             .execute(
                 arguments,
@@ -1974,6 +2212,7 @@ impl Tool for HttpRequestTool {
                 }),
                 http_status,
                 truncation,
+                authorization_preflight,
                 ..Default::default()
             },
         })
@@ -2156,6 +2395,93 @@ mod tests {
         profile.allowed_domains = vec!["localhost".to_string()];
         profile.user_id = Some("12345".to_string());
         profile
+    }
+
+    #[tokio::test]
+    async fn autonomous_preflight_binds_exact_profile_account_and_target() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut profiles = HashMap::new();
+        profiles.insert("synthetic-social".to_string(), make_oauth_profile());
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(profiles)), ApprovalBroker::new(tx));
+
+        let ready = tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.x.com/2/users/me","auth_profile":"synthetic-social","account_id":"12345"}"#,
+            )
+            .await;
+        assert_eq!(ready.status, AuthorizationPreflightStatus::Ready);
+        assert!(ready.credential_generation.is_some());
+        assert!(ready.target_digest.starts_with("sha256:"));
+
+        let wrong_account = tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.x.com/2/users/me","auth_profile":"synthetic-social","account_id":"67890"}"#,
+            )
+            .await;
+        assert_eq!(wrong_account.status, AuthorizationPreflightStatus::Blocked);
+        assert_eq!(
+            wrong_account.reason_code.as_deref(),
+            Some("credential_account_mismatch")
+        );
+
+        let wrong_target = tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.example.test/v1/me","auth_profile":"synthetic-social","account_id":"12345"}"#,
+            )
+            .await;
+        assert_eq!(wrong_target.status, AuthorizationPreflightStatus::Blocked);
+        assert_eq!(
+            wrong_target.reason_code.as_deref(),
+            Some("credential_target_mismatch")
+        );
+
+        let missing = tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.x.com/2/users/me","auth_profile":"missing","account_id":"12345"}"#,
+            )
+            .await;
+        assert_eq!(missing.status, AuthorizationPreflightStatus::Blocked);
+        assert_eq!(
+            missing.reason_code.as_deref(),
+            Some("credential_profile_missing")
+        );
+
+        let account_without_profile = tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.x.com/2/users/me","account_id":"12345"}"#,
+            )
+            .await;
+        assert_eq!(
+            account_without_profile.status,
+            AuthorizationPreflightStatus::Blocked
+        );
+        assert_eq!(
+            account_without_profile.reason_code.as_deref(),
+            Some("credential_profile_missing")
+        );
+
+        let mut missing_token_profiles = HashMap::new();
+        let mut missing_secret = make_oauth_profile();
+        missing_secret.access_token_secret = None;
+        missing_token_profiles.insert("synthetic-social".to_string(), missing_secret);
+        let (missing_tx, _missing_rx) = tokio::sync::mpsc::channel(1);
+        let missing_token_tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(missing_token_profiles)),
+            ApprovalBroker::new(missing_tx),
+        );
+        let missing_material = missing_token_tool
+            .mandate_authorization_preflight(
+                r#"{"method":"GET","url":"https://api.x.com/2/users/me","auth_profile":"synthetic-social","account_id":"12345"}"#,
+            )
+            .await;
+        assert_eq!(
+            missing_material.status,
+            AuthorizationPreflightStatus::Blocked
+        );
+        assert_eq!(
+            missing_material.reason_code.as_deref(),
+            Some("credential_material_missing")
+        );
     }
 
     async fn spawn_counting_status_server(
@@ -2561,13 +2887,14 @@ mod tests {
     #[tokio::test]
     async fn mandate_authenticated_mutation_requires_exact_configured_account_before_io() {
         let cases = [
-            ("exact", Some("12345"), Some("12345"), 1_usize, None),
+            ("exact", Some("12345"), Some("12345"), 1_usize, None, None),
             (
                 "missing-argument",
                 None,
                 Some("12345"),
                 0,
                 Some("require a non-empty top-level `account_id`"),
+                Some("credential_account_missing"),
             ),
             (
                 "mismatch",
@@ -2575,6 +2902,7 @@ mod tests {
                 Some("12345"),
                 0,
                 Some("does not match the configured user_id"),
+                Some("credential_account_mismatch"),
             ),
             (
                 "unconfigured-profile",
@@ -2582,11 +2910,18 @@ mod tests {
                 None,
                 0,
                 Some("has no valid configured user_id"),
+                Some("credential_profile_account_missing"),
             ),
         ];
 
-        for (case, supplied_account, configured_account, expected_requests, blocked_message) in
-            cases
+        for (
+            case,
+            supplied_account,
+            configured_account,
+            expected_requests,
+            blocked_message,
+            reason_code,
+        ) in cases
         {
             let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
             let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
@@ -2634,6 +2969,15 @@ mod tests {
             );
             if let Some(message) = blocked_message {
                 assert!(outcome.metadata.http_status.is_none(), "case={case}");
+                assert_eq!(
+                    outcome
+                        .metadata
+                        .authorization_preflight
+                        .as_ref()
+                        .and_then(|record| record.reason_code.as_deref()),
+                    reason_code,
+                    "case={case}"
+                );
                 assert!(
                     outcome.output.contains(message),
                     "case={case}: {}",
@@ -2647,19 +2991,21 @@ mod tests {
 
     #[tokio::test]
     async fn mandate_authenticated_observation_uses_exact_account_preapproval() {
-        for (case, supplied_account, expected_requests, blocked_message) in [
-            ("exact", Some("12345"), 1_usize, None),
+        for (case, supplied_account, expected_requests, blocked_message, reason_code) in [
+            ("exact", Some("12345"), 1_usize, None, None),
             (
                 "missing-account",
                 None,
                 0,
                 Some("require a non-empty top-level `account_id`"),
+                Some("credential_account_missing"),
             ),
             (
                 "wrong-account",
                 Some("99999"),
                 0,
                 Some("does not match the configured user_id"),
+                Some("credential_account_mismatch"),
             ),
         ] {
             let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
@@ -2705,6 +3051,15 @@ mod tests {
                 "case={case}"
             );
             if let Some(message) = blocked_message {
+                assert_eq!(
+                    outcome
+                        .metadata
+                        .authorization_preflight
+                        .as_ref()
+                        .and_then(|record| record.reason_code.as_deref()),
+                    reason_code,
+                    "case={case}"
+                );
                 assert!(
                     outcome.output.contains(message),
                     "case={case}: {}",

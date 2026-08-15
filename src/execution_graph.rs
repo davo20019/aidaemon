@@ -279,6 +279,21 @@ impl ExecutionGraph {
         self.set_state(obligation_id, ExecutionNodeState::Satisfied)
     }
 
+    /// Exact obligations closed by one durable tool receipt. The receipt ID is
+    /// stored on `Satisfies` edges even when the graph evidence node is a
+    /// verification wrapper, so callers never infer proof from prose or from
+    /// mere task-local tool activity.
+    pub(crate) fn obligations_satisfied_by_receipt(&self, receipt_id: &str) -> Vec<String> {
+        self.edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == ExecutionEdgeKind::Satisfies
+                    && edge.evidence_id.as_deref() == Some(receipt_id)
+            })
+            .map(|edge| edge.to.clone())
+            .collect()
+    }
+
     pub(crate) fn invalidate(
         &mut self,
         invalidator_id: &str,

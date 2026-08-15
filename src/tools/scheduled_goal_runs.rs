@@ -631,6 +631,20 @@ impl ScheduledGoalRunsTool {
             blocked
         );
 
+        if let Some(recovery) = self.state.get_scheduled_recovery_state(&goal.id).await? {
+            out.push_str(&format!(
+                "- Recovery: {} (failures {}/{}, latest cause {}, last failed run {}, last recovery run {})\n",
+                recovery.disposition.as_str(),
+                recovery.consecutive_failures,
+                recovery.failure_budget,
+                recovery
+                    .latest_failure_kind
+                    .map_or("none", crate::traits::ScheduledFailureKind::as_str),
+                recovery.last_failed_run_id.as_deref().unwrap_or("none"),
+                recovery.last_recovery_run_id.as_deref().unwrap_or("none")
+            ));
+        }
+
         let schedules = self.state.get_schedules_for_goal(&goal.id).await?;
         let coalesces = schedules.iter().any(|s| s.fire_policy != "always_fire");
         let mut tasks_by_run = Vec::with_capacity(runs.len());

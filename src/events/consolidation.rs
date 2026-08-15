@@ -1757,6 +1757,7 @@ mod tests {
                     summary: Some("release verified".to_string()),
                     efficiency: None,
                     turn_id: None,
+                    completion_proof: None,
                     harness_eval: None,
                 })
                 .expect("serialize task end"),
@@ -1939,6 +1940,7 @@ mod tests {
                 summary: Some("Agent stopped due to repetitive terminal loop".to_string()),
                 efficiency: None,
                 turn_id: None,
+                completion_proof: None,
                 harness_eval: None,
             })
             .expect("serialize task end"),
@@ -2032,6 +2034,7 @@ mod tests {
                 summary: None,
                 efficiency: None,
                 turn_id: None,
+                completion_proof: None,
                 harness_eval: None,
             })
             .expect("serialize task end"),

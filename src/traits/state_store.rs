@@ -972,6 +972,46 @@ pub trait MandateStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Authorize one exact presentation session through the mandate's stable
+    /// principal mapping. Session-string similarity is never sufficient.
+    async fn is_mandate_session_authorized(
+        &self,
+        _mandate_id: &str,
+        _session_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Atomically bind a verified target session to the stable principal and
+    /// move the mandate's delivery/controller route. The authority epoch is
+    /// advanced and all open runs are invalidated before the move commits.
+    async fn transfer_mandate_ownership(
+        &self,
+        _mandate_id: &str,
+        _expected_version: i64,
+        _from_session_id: &str,
+        _to_session_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Append one receipt-backed metric observation for the exact current
+    /// mandate run and policy version.
+    async fn record_mandate_objective_measurement(
+        &self,
+        _measurement: &super::MandateObjectiveMeasurement,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("mandate objective measurements are not supported by this store")
+    }
+
+    async fn list_mandate_objective_measurements(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<super::MandateObjectiveMeasurement>> {
+        Ok(Vec::new())
+    }
+
     /// Optimistic owner-policy update. `mandate.version` must be exactly one
     /// greater than the currently stored version.
     async fn update_mandate(&self, _mandate: &super::Mandate) -> anyhow::Result<()> {
@@ -1435,6 +1475,13 @@ pub trait ScheduledRunStore: Send + Sync {
         &self,
         _goal_id: &str,
     ) -> anyhow::Result<Option<super::ScheduledRunState>> {
+        Ok(None)
+    }
+
+    async fn get_scheduled_recovery_state(
+        &self,
+        _goal_id: &str,
+    ) -> anyhow::Result<Option<super::ScheduledRecoveryState>> {
         Ok(None)
     }
 

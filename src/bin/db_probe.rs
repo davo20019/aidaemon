@@ -418,6 +418,50 @@ mod tests {
         );
         assert_eq!(handholding_detail_label(None, None), "detail=-");
     }
+
+    #[test]
+    fn completion_claim_requires_exact_response_receipt_and_obligation_edges() {
+        let receipt = aidaemon::CompletionProofReference {
+            receipt_id: "tool-call-synthetic".to_string(),
+            result_id: Some("sha256:synthetic".to_string()),
+            obligation_ids: vec!["task:task-synthetic/evidence:0".to_string()],
+        };
+        let task = FabricationTask {
+            session_id: "telegram:synthetic-user-1".to_string(),
+            last_ts: "2026-08-15T00:00:00Z".to_string(),
+            last_reply: "I published the synthetic result.".to_string(),
+            response_id: "response-synthetic".to_string(),
+            referenced_receipts: vec![receipt.clone()],
+            tool_calls: 1,
+        };
+        let mut proof = aidaemon::TaskCompletionProofData {
+            schema_version: 1,
+            task_id: "task-synthetic".to_string(),
+            request_turn_id: Some("turn-synthetic".to_string()),
+            response_message_ids: vec![task.response_id.clone()],
+            receipt_refs: vec![receipt],
+            closed_at: "2026-08-15T00:00:01Z".to_string(),
+        };
+
+        assert!(completion_claim_has_closed_proof(
+            "task-synthetic",
+            &task,
+            Some(&proof)
+        ));
+        proof.response_message_ids = vec!["different-response".to_string()];
+        assert!(!completion_claim_has_closed_proof(
+            "task-synthetic",
+            &task,
+            Some(&proof)
+        ));
+        proof.response_message_ids = vec![task.response_id.clone()];
+        proof.receipt_refs[0].obligation_ids.clear();
+        assert!(!completion_claim_has_closed_proof(
+            "task-synthetic",
+            &task,
+            Some(&proof)
+        ));
+    }
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
@@ -669,19 +713,48 @@ struct FabricationTask {
     session_id: String,
     last_ts: String,
     last_reply: String,
+    response_id: String,
+    referenced_receipts: Vec<aidaemon::CompletionProofReference>,
     tool_calls: i64,
 }
 
+fn completion_claim_has_closed_proof(
+    task_id: &str,
+    task: &FabricationTask,
+    proof: Option<&aidaemon::TaskCompletionProofData>,
+) -> bool {
+    let Some(proof) = proof else {
+        return false;
+    };
+    if proof.task_id != task_id
+        || task.response_id.is_empty()
+        || task.referenced_receipts.is_empty()
+        || !proof.response_message_ids.contains(&task.response_id)
+    {
+        return false;
+    }
+    task.referenced_receipts.iter().all(|response_ref| {
+        !response_ref.obligation_ids.is_empty()
+            && proof.receipt_refs.iter().any(|closed_ref| {
+                closed_ref.receipt_id == response_ref.receipt_id
+                    && closed_ref.result_id == response_ref.result_id
+                    && response_ref
+                        .obligation_ids
+                        .iter()
+                        .all(|id| closed_ref.obligation_ids.contains(id))
+            })
+    })
+}
+
 /// Post-hoc fabrication audit: for each task in the window, fold all
-/// `assistant_response` events into (final non-empty reply, total tool calls),
-/// then flag tasks whose final reply claims a side-effecting action
-/// ([`claims_completion_action`]) while the task made zero tool calls. This is
-/// the trace-based replacement for the predict-ahead `needs_tools` keyword
-/// guard: it does not guess intent up front, it verifies the outcome.
+/// `assistant_response` events into the final non-empty reply and its explicit
+/// proof references, then validate those references against the exact task-end
+/// proof graph. Claim wording and tool counts remain legacy triage signals;
+/// only response/receipt/obligation graph edges constitute closed proof.
 async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
     let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
     println!("== Fabrication Audit (Last {} Hours) ==", hours);
-    println!("(final reply claims an action AND the task made zero tool calls)\n");
+    println!("(action claims must reference receipts closed by the exact task-end proof graph)\n");
 
     let rows = sqlx::query(
         r#"
@@ -689,7 +762,9 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
           created_at,
           session_id,
           json_extract(data, '$.task_id') AS task_id,
+          COALESCE(json_extract(data, '$.message_id'), '') AS response_id,
           COALESCE(json_extract(data, '$.content'), '') AS content,
+          COALESCE(json_extract(data, '$.referenced_receipts'), '[]') AS referenced_receipts,
           COALESCE(json_array_length(json_extract(data, '$.tool_calls')), 0) AS tool_calls
         FROM events
         WHERE event_type = 'assistant_response'
@@ -708,12 +783,20 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
         let task_id: String = row.get("task_id");
         let content: String = row.get("content");
         let tool_calls: i64 = row.get("tool_calls");
+        let response_id: String = row.get("response_id");
+        let referenced_receipts = row
+            .try_get::<String, _>("referenced_receipts")
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
         let created_at: String = row.get("created_at");
         let session_id: String = row.get("session_id");
         let entry = tasks.entry(task_id).or_insert_with(|| FabricationTask {
             session_id,
             last_ts: String::new(),
             last_reply: String::new(),
+            response_id: String::new(),
+            referenced_receipts: Vec::new(),
             tool_calls: 0,
         });
         entry.tool_calls += tool_calls;
@@ -721,30 +804,73 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
         if !content.trim().is_empty() {
             entry.last_ts = created_at;
             entry.last_reply = content;
+            entry.response_id = response_id;
+            entry.referenced_receipts = referenced_receipts;
+        }
+    }
+
+    let proof_rows = sqlx::query(
+        r#"
+        SELECT
+          json_extract(data, '$.task_id') AS task_id,
+          json_extract(data, '$.completion_proof') AS completion_proof
+        FROM events
+        WHERE event_type = 'task_end'
+          AND created_at >= ?
+          AND json_extract(data, '$.task_id') IS NOT NULL
+          AND json_extract(data, '$.completion_proof') IS NOT NULL
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    let mut proofs = std::collections::HashMap::new();
+    for row in proof_rows {
+        let task_id: String = row.get("task_id");
+        let raw: String = row.get("completion_proof");
+        if let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
+            proofs.insert(task_id, proof);
         }
     }
 
     let total = tasks.len();
     let mut claim_tasks = 0usize;
-    let mut candidates: Vec<(String, &FabricationTask, &'static str)> = Vec::new();
+    let mut proven_claims = 0usize;
+    let mut candidates: Vec<(String, &FabricationTask, &'static str, &'static str)> = Vec::new();
     for (id, task) in &tasks {
         if let Some(label) = claims_completion_action(&task.last_reply) {
             claim_tasks += 1;
-            if task.tool_calls == 0 {
-                candidates.push((id.clone(), task, label));
+            let proof = proofs.get(id);
+            if completion_claim_has_closed_proof(id, task, proof) {
+                proven_claims += 1;
+            } else {
+                let reason = if task.referenced_receipts.is_empty() {
+                    if task.tool_calls == 0 {
+                        "legacy_zero_tool_calls"
+                    } else {
+                        "missing_response_receipt_refs"
+                    }
+                } else if proof.is_none() {
+                    "missing_task_end_proof"
+                } else {
+                    "response_task_proof_mismatch"
+                };
+                candidates.push((id.clone(), task, label, reason));
             }
         }
     }
 
     println!("- tasks with a final reply:            {}", total);
     println!("- ...claiming a side-effect action:    {}", claim_tasks);
+    println!("- ...with closed structural proof:     {}", proven_claims);
     println!(
-        "- ...with ZERO tool calls (candidates): {}",
+        "- ...without closed proof (candidates): {}",
         candidates.len()
     );
     if claim_tasks > 0 {
         println!(
-            "- fabrication rate (candidates / claims): {:.0}%",
+            "- unproven-claim rate:                  {:.0}%",
             candidates.len() as f64 / claim_tasks as f64 * 100.0
         );
     }
@@ -752,9 +878,9 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
     candidates.sort_by(|a, b| b.1.last_ts.cmp(&a.1.last_ts));
     println!("\nCandidates (newest first):");
     if candidates.is_empty() {
-        println!("- none — every action claim was backed by a tool call");
+        println!("- none — every action claim has an exact closed proof graph");
     }
-    for (id, task, label) in &candidates {
+    for (id, task, label, reason) in &candidates {
         let snippet: String = task
             .last_reply
             .chars()
@@ -762,11 +888,14 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
             .collect::<String>()
             .replace('\n', " ");
         println!(
-            "- [{}] claim={} task={} session={}\n    \"{}\"",
+            "- [{}] claim={} reason={} task={} session={} tool_calls={} refs={}\n    \"{}\"",
             task.last_ts,
             label,
+            reason,
             &id[..id.len().min(8)],
             task.session_id,
+            task.tool_calls,
+            task.referenced_receipts.len(),
             snippet,
         );
     }
@@ -1775,7 +1904,8 @@ async fn main() -> anyhow::Result<()> {
         println!("\n== Task {} Full Event Stream ==", task_id);
         let rows = sqlx::query(
             r#"
-            SELECT id, event_type, tool_name, created_at, substr(data, 1, 600) AS data_preview
+            SELECT id, event_type, tool_name, created_at, data,
+                   substr(data, 1, 600) AS data_preview
             FROM events
             WHERE task_id = ?
             ORDER BY id ASC
@@ -1785,6 +1915,8 @@ async fn main() -> anyhow::Result<()> {
         .fetch_all(&pool)
         .await?;
         for row in rows {
+            let raw_data = row.get::<String, _>("data");
+            let parsed = serde_json::from_str::<serde_json::Value>(&raw_data).ok();
             println!(
                 "- id={} type={} tool={:?} at={}\n  data={}",
                 row.get::<i64, _>("id"),
@@ -1797,6 +1929,35 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .replace('\n', " ")
             );
+            if let Some(data) = parsed.as_ref() {
+                if let Some(receipt) = data.get("receipt") {
+                    println!(
+                        "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={}",
+                        data.get("tool_call_id").and_then(|value| value.as_str()).unwrap_or("none"),
+                        receipt.get("outcome_status").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                        receipt.get("outcome_evidence").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                        receipt.get("exit_code").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt.get("http_status").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt.pointer("/result_provenance/result_id").and_then(|value| value.as_str()).unwrap_or("none"),
+                        receipt.pointer("/result_provenance/model_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                        receipt.pointer("/result_provenance/durable_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                        receipt.pointer("/authorization_preflight/status").and_then(|value| value.as_str()).unwrap_or("none"),
+                    );
+                }
+                let metadata = data.get("metadata");
+                let contract_scope = metadata
+                    .and_then(|value| value.get("contract_scope_task_id"))
+                    .and_then(|value| value.as_str());
+                let adopted =
+                    metadata.and_then(|value| value.get("contract_adopted_from_task_ids"));
+                if contract_scope.is_some() || adopted.is_some() {
+                    println!(
+                        "  contract_lineage: scope_task_id={} adopted_from={}",
+                        contract_scope.unwrap_or("unbound"),
+                        adopted.map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                    );
+                }
+            }
         }
 
         println!("\n== Task {} LLM Calls ==", task_id);

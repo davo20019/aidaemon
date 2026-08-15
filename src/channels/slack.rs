@@ -2378,8 +2378,19 @@ impl SlackChannel {
                 let mut task_error: Option<String> = None;
 
                 match result {
-                    Ok(reply) => {
-                        let reply = crate::channels::prepare_chat_message(&reply);
+                    Ok(envelope) => {
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "slack",
+                                    crate::events::ResponseDeliveryState::Queued,
+                                    Vec::new(),
+                                    None,
+                                ),
+                            )
+                            .await;
+                        let reply = crate::channels::prepare_chat_message(&envelope.text);
                         // NOTE: Task intentionally stays "running" during response
                         // sending to prevent a race where incoming messages skip the
                         // queue. Finalized below before queue check.
@@ -2387,16 +2398,44 @@ impl SlackChannel {
                         // Restore @DisplayName → <@USERID> for proper Slack mentions
                         let mrkdwn = restore_mentions_from_cache(&mrkdwn, &user_cache_snapshot);
                         let chunks = split_message(&mrkdwn, MAX_MESSAGE_LEN);
+                        let mut platform_message_ids = Vec::new();
+                        let mut failed = false;
                         for chunk in &chunks {
-                            let _ = slack_post_message(
+                            match slack_post_message(
                                 &http,
                                 &bot_token,
                                 &reply_channel,
                                 chunk,
                                 reply_thread_ts.as_deref(),
                             )
-                            .await;
+                            .await
+                            {
+                                Ok(response) => {
+                                    if let Some(ts) = response.get("ts").and_then(Value::as_str) {
+                                        platform_message_ids.push(ts.to_string());
+                                    }
+                                }
+                                Err(error) => {
+                                    failed = true;
+                                    warn!(%error, "Failed to send Slack response");
+                                }
+                            }
                         }
+                        let _ = agent
+                            .record_response_delivery(
+                                &session_id,
+                                envelope.delivery(
+                                    "slack",
+                                    if failed {
+                                        crate::events::ResponseDeliveryState::Failed
+                                    } else {
+                                        crate::events::ResponseDeliveryState::PlatformAcknowledged
+                                    },
+                                    platform_message_ids,
+                                    failed.then(|| "slack_send_failed".to_string()),
+                                ),
+                            )
+                            .await;
                     }
                     Err(e) => {
                         let error_msg = e.to_string();

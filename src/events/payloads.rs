@@ -107,6 +107,55 @@ pub struct AssistantResponseData {
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Task that generated this response. `EventEmitter` injects this field at
+    /// the write boundary when the caller omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Durable execution receipts the runtime used to close this response.
+    /// This is a graph edge, not a claim inferred later from response prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_receipts: Vec<CompletionProofReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionProofReference {
+    pub receipt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    /// Task-scoped obligation nodes this exact receipt closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDeliveryState {
+    Queued,
+    Sent,
+    PlatformAcknowledged,
+    Edited,
+    Failed,
+    Rendered,
+    Read,
+}
+
+/// One immutable transport transition for a generated assistant response.
+/// Unsupported states simply remain absent; a successful API call records
+/// `PlatformAcknowledged`, while transports with weaker APIs can stop at
+/// `Sent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseDeliveryData {
+    pub response_id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub platform: String,
+    pub state: ResponseDeliveryState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platform_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub occurred_at: String,
 }
 
 /// Tool call information (subset of ToolCall for storage)
@@ -241,6 +290,11 @@ pub struct ToolReceiptV1 {
     /// Schema-v1 rows deserialize to an explicit unavailable provenance.
     #[serde(default)]
     pub result_provenance: crate::traits::ToolResultProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_preflight: Option<crate::traits::AuthorizationPreflightRecord>,
+    /// Exact task-scoped proof-graph obligations closed by this receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completion_obligation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
     /// Exact owner-mandate grant checked for this call. This is an audit fact,
@@ -250,7 +304,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 2;
+    pub const SCHEMA_VERSION: u16 = 3;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -272,6 +326,8 @@ impl ToolReceiptV1 {
             http_status: metadata.http_status,
             truncation: metadata.truncation.clone(),
             result_provenance: metadata.result_provenance.clone().unwrap_or_default(),
+            authorization_preflight: metadata.authorization_preflight.clone(),
+            completion_obligation_ids: Vec::new(),
             semantics: metadata.semantics.clone(),
             mandate_authority: None,
         }
@@ -294,6 +350,7 @@ impl ToolReceiptV1 {
                 provenance.source = crate::traits::ToolResultContentSource::DurableReplay;
                 provenance
             }),
+            authorization_preflight: self.authorization_preflight.clone(),
             semantics: self.semantics.clone(),
             ..ToolCallMetadata::default()
         }
@@ -844,9 +901,26 @@ pub struct TaskEndData {
     /// For recovery TaskEnd this is the interrupted task's ORIGINAL turn_id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Closed task proof graph. Legacy and watchdog-synthesized ends may omit
+    /// it, which is explicitly different from an empty proof set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_proof: Option<TaskCompletionProofData>,
     /// Per-task harness effectiveness snapshot (routing, progress, quality, cost).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_eval: Option<HarnessEvalSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskCompletionProofData {
+    pub schema_version: u16,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_refs: Vec<CompletionProofReference>,
+    pub closed_at: String,
 }
 
 impl TaskEndData {
@@ -1539,6 +1613,7 @@ mod tests {
                 reasons: vec!["1 fallback(s)".to_string()],
             }),
             turn_id: None,
+            completion_proof: None,
             harness_eval: None,
         };
 
@@ -1589,6 +1664,8 @@ mod tests {
             output_tokens: None,
             annotations: vec![],
             turn_id: Some("t1".to_string()),
+            task_id: Some("task-1".to_string()),
+            referenced_receipts: Vec::new(),
         };
         let back: AssistantResponseData =
             serde_json::from_value(serde_json::to_value(&ar).unwrap()).unwrap();
@@ -1653,6 +1730,7 @@ mod tests {
             summary: None,
             efficiency: None,
             turn_id: Some("t1".to_string()),
+            completion_proof: None,
             harness_eval: None,
         };
         let back: TaskEndData = serde_json::from_value(serde_json::to_value(&te).unwrap()).unwrap();
@@ -1733,7 +1811,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
-        assert_eq!(roundtrip.schema_version, 2);
+        assert_eq!(roundtrip.schema_version, 3);
         assert!(roundtrip
             .context_header()
             .contains("durable_view=truncated"));

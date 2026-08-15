@@ -1120,6 +1120,22 @@ impl Agent {
         if let Some(ref snapshot) = harness_eval_snapshot {
             super::policy_metrics::record_harness_eval_task(snapshot);
         }
+        let completion_proof = crate::events::TaskCompletionProofData {
+            schema_version: 1,
+            task_id: task_id.to_string(),
+            request_turn_id: turn_id.clone(),
+            response_message_ids: self
+                .event_store
+                .task_response_message_ids(task_id)
+                .await
+                .unwrap_or_default(),
+            receipt_refs: self
+                .event_store
+                .task_completion_proof_references(task_id)
+                .await
+                .unwrap_or_default(),
+            closed_at: chrono::Utc::now().to_rfc3339(),
+        };
         let _ = emitter
             .emit(
                 EventType::TaskEnd,
@@ -1134,6 +1150,7 @@ impl Agent {
                     summary,
                     efficiency,
                     turn_id,
+                    completion_proof: Some(completion_proof),
                     harness_eval: harness_eval_snapshot,
                 },
             )

@@ -201,6 +201,8 @@ pub enum EventType {
     UserMessage,
     /// Assistant generated a response
     AssistantResponse,
+    /// An assistant response advanced through a channel transport lifecycle.
+    ResponseDelivery,
 
     // === Tool Lifecycle ===
     /// Tool execution started

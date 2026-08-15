@@ -205,6 +205,11 @@ impl Agent {
         // From this point onward, use exactly what was persisted so matching,
         // rendering, routing, and dialogue projection share one source of truth.
         let user_text = canonical_user_text.as_str();
+        // Bind the complete obligation container to this task before planning,
+        // tool selection, or finalization can consume it. A genuine follow-up
+        // records the prior task as explicit adoption lineage; a new request
+        // receives a fresh, single-task scope below.
+        turn_context.completion_contract.adopt_for_task(&task_id);
         let followup_mode = turn_context
             .followup_mode
             .map(|mode| mode.as_str())
@@ -386,7 +391,7 @@ impl Agent {
                 )
                 .await;
                 if let Some(ref plan) = plan_opt {
-                    let before_contract = turn_context.completion_contract.clone();
+                    let mut before_contract = turn_context.completion_contract.clone();
                     if let Some(shape) = plan.task_shape.as_ref().filter(|shape| {
                         matches!(
                             shape
@@ -416,6 +421,26 @@ impl Agent {
                                     turn_context.followup_mode = Some(
                                         crate::agent::followup::FollowupMode::NewTask,
                                     );
+                                    // Bootstrap deliberately treats an unresolved
+                                    // request as a provisional antecedent. Once the
+                                    // typed semantic assessment says this is a new
+                                    // request, rebuild every hard obligation from
+                                    // the current authored turn. Merely changing the
+                                    // mode is insufficient: otherwise response
+                                    // fields, targets, and evidence requirements
+                                    // inferred from the old request remain executable.
+                                    turn_context.completion_contract =
+                                        crate::agent::completion_contract::infer_structural_completion_contract(
+                                            user_text,
+                                            &self.path_aliases.projects,
+                                        );
+                                    turn_context
+                                        .completion_contract
+                                        .adopt_for_task(&task_id);
+                                    turn_context.goal_user_text = user_text.to_string();
+                                    turn_context.inherited_completion_contract = false;
+                                    before_contract =
+                                        turn_context.completion_contract.clone();
                                     if plan
                                         .contract
                                         .as_ref()
@@ -702,7 +727,9 @@ impl Agent {
 
         // Derive all contract-dependent state exactly once from that finalized
         // value so loop control, progress tracking, budgets, and telemetry agree.
-        let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
+        debug_assert!(turn_context.completion_contract.belongs_to_task(&task_id));
+        let mut completion_progress =
+            CompletionProgress::new(&turn_context.completion_contract, &task_id);
         if turn_context.completion_contract.forbids_tool_use {
             tool_defs.clear();
             let outstanding_needs = turn_context

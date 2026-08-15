@@ -115,17 +115,47 @@ impl AgentIngress for Agent {
     async fn handle_inbound_message(
         &self,
         request: InboundMessageRequest,
-    ) -> anyhow::Result<String> {
-        self.handle_message_with_attachments(
-            &request.session_id,
-            &request.user_text,
-            &request.attachments,
-            request.status_tx,
-            request.user_role,
-            request.channel_ctx,
-            request.heartbeat,
-        )
-        .await
+    ) -> anyhow::Result<crate::runtime_ports::AgentResponseEnvelope> {
+        let response_event_watermark = self.event_store.event_watermark().await?;
+        let text = self
+            .handle_message_with_attachments(
+                &request.session_id,
+                &request.user_text,
+                &request.attachments,
+                request.status_tx,
+                request.user_role,
+                request.channel_ctx,
+                request.heartbeat,
+            )
+            .await?;
+        let generated = self
+            .event_store
+            .generated_response_after(&request.session_id, response_event_watermark, &text)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("generated response lacks a durable identity"))?;
+        Ok(crate::runtime_ports::AgentResponseEnvelope {
+            response_id: generated.response_id,
+            task_id: generated.task_id,
+            turn_id: generated.turn_id,
+            text,
+            referenced_receipts: generated.referenced_receipts,
+        })
+    }
+
+    async fn record_response_delivery(
+        &self,
+        session_id: &str,
+        delivery: crate::events::ResponseDeliveryData,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            delivery.task_id.trim() != "" && delivery.response_id.trim() != "",
+            "delivery event requires generated response and task identities"
+        );
+        crate::events::EventEmitter::new(self.event_store.clone(), session_id.to_string())
+            .with_task_id(delivery.task_id.clone())
+            .emit(crate::events::EventType::ResponseDelivery, delivery)
+            .await?;
+        Ok(())
     }
 }
 

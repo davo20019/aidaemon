@@ -48,6 +48,80 @@ pub struct ScheduledRunState {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledFailureKind {
+    RetryableTool,
+    PermanentTool,
+    AuthorizationBlocked,
+    TaskFailed,
+    OutcomeUnproven,
+}
+
+impl ScheduledFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryableTool => "retryable_tool",
+            Self::PermanentTool => "permanent_tool",
+            Self::AuthorizationBlocked => "authorization_blocked",
+            Self::TaskFailed => "task_failed",
+            Self::OutcomeUnproven => "outcome_unproven",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "retryable_tool" => Some(Self::RetryableTool),
+            "permanent_tool" => Some(Self::PermanentTool),
+            "authorization_blocked" => Some(Self::AuthorizationBlocked),
+            "task_failed" => Some(Self::TaskFailed),
+            "outcome_unproven" => Some(Self::OutcomeUnproven),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledRecoveryDisposition {
+    Healthy,
+    Recovering,
+    Escalated,
+}
+
+impl ScheduledRecoveryDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovering => "recovering",
+            Self::Escalated => "escalated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "healthy" => Some(Self::Healthy),
+            "recovering" => Some(Self::Recovering),
+            "escalated" => Some(Self::Escalated),
+            _ => None,
+        }
+    }
+}
+
+/// Cross-run failure-budget state for one parent scheduled objective. Unlike
+/// `ScheduledRunState`, this survives individual run teardown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledRecoveryState {
+    pub goal_id: String,
+    pub consecutive_failures: u16,
+    pub failure_budget: u16,
+    pub disposition: ScheduledRecoveryDisposition,
+    pub latest_failure_kind: Option<ScheduledFailureKind>,
+    pub last_failed_run_id: Option<String>,
+    pub last_recovery_run_id: Option<String>,
+    pub updated_at: String,
+}
+
 // ==================== Goals + Tasks Data Model ====================
 
 /// A goal — a tracked, potentially long-running objective.
