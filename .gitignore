@@ -79,6 +79,7 @@ docs/
 
 # Scratch/exploration directories
 crates-explorer/
+/task-b54761baeef2/
 
 # Misc scratch files
 hello_world.php

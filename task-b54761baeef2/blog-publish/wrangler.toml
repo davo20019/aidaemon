@@ -1,7 +1,0 @@
-name = "blog-aidaemon-ai"
-compatibility_date = "2024-01-01"
-
-[assets]
-directory = "./dist"
-not_found_handling = "single-page-application"
-workers_dev = false
