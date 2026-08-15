@@ -84,6 +84,8 @@ pub(super) struct ToolExecCtx<'a> {
     /// Actual dispatcher-owned call identity carried independently from the
     /// grant so the final ledger claim cannot validate a grant against itself.
     pub mandate_tool_call_id: Option<&'a str>,
+    /// Rust-side hard boundary inherited from the request contract.
+    pub mutation_forbidden: bool,
 }
 
 async fn scoped_workspace_arguments(
@@ -778,6 +780,7 @@ impl Agent {
                 correction_preapproved: false,
                 mandate_preapproved,
                 mandate_execution: under_mandate,
+                mutation_forbidden: ctx.mutation_forbidden,
             };
             let result = call_scoped_builtin_file_tool(
                 name,
@@ -827,6 +830,7 @@ impl Agent {
                     correction_preapproved: ctx.correction_preapproved,
                     mandate_preapproved,
                     mandate_execution: under_mandate,
+                    mutation_forbidden: ctx.mutation_forbidden,
                 };
                 let result = tool
                     .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)
@@ -898,6 +902,7 @@ impl Agent {
                     correction_preapproved: false,
                     mandate_preapproved,
                     mandate_execution: under_mandate,
+                    mutation_forbidden: ctx.mutation_forbidden,
                 };
                 return tool
                     .call_with_execution_context(&enriched_args, ctx.status_tx.clone(), exec_ctx)

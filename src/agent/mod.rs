@@ -289,6 +289,8 @@ pub(crate) mod audio;
 pub(in crate::agent) mod eval;
 #[path = "loop/hand_holding_telemetry.rs"]
 mod hand_holding_telemetry;
+#[path = "loop/inquiry.rs"]
+mod inquiry;
 #[path = "loop/llm_phase.rs"]
 mod llm_phase;
 #[path = "loop/main_loop.rs"]
@@ -351,7 +353,7 @@ pub(in crate::agent) use tool_result_notices::ToolResultNotice;
 mod policy_metrics;
 pub use policy_metrics::{
     apply_bounded_autotune_from_failure_ratio, init_policy_tunables_once, policy_autotune_snapshot,
-    policy_metrics_snapshot,
+    policy_metrics_boot_id, policy_metrics_snapshot,
 };
 // `PolicyAutotuneSnapshot` is part of the public surface but currently has no
 // in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).

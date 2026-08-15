@@ -773,11 +773,10 @@ impl BrowserTool {
             );
         }
 
-        let risk_level = if point_of_action {
-            RiskLevel::High
-        } else {
-            RiskLevel::Medium
-        };
+        // Even the reusable ordinary-mutation prompt grants control over a
+        // logged-in browser session, so it is a real authority boundary rather
+        // than a medium-risk informational interruption.
+        let risk_level = RiskLevel::High;
         let mut warnings = Vec::new();
         if risk.sensitive {
             warnings.push("This can read or access private data on the page.".to_string());

@@ -237,6 +237,10 @@ pub struct ToolReceiptV1 {
     pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
+    /// Completeness, range, source, and stable digest of the result body.
+    /// Schema-v1 rows deserialize to an explicit unavailable provenance.
+    #[serde(default)]
+    pub result_provenance: crate::traits::ToolResultProvenance,
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,
     /// Exact owner-mandate grant checked for this call. This is an audit fact,
@@ -246,7 +250,7 @@ pub struct ToolReceiptV1 {
 }
 
 impl ToolReceiptV1 {
-    pub const SCHEMA_VERSION: u16 = 1;
+    pub const SCHEMA_VERSION: u16 = 2;
 
     pub fn from_metadata(
         metadata: &ToolCallMetadata,
@@ -267,6 +271,7 @@ impl ToolReceiptV1 {
             transport_error: metadata.transport_error.clone(),
             http_status: metadata.http_status,
             truncation: metadata.truncation.clone(),
+            result_provenance: metadata.result_provenance.clone().unwrap_or_default(),
             semantics: metadata.semantics.clone(),
             mandate_authority: None,
         }
@@ -284,9 +289,50 @@ impl ToolReceiptV1 {
             transport_error: self.transport_error.clone(),
             http_status: self.http_status,
             truncation: self.truncation.clone(),
+            result_provenance: Some({
+                let mut provenance = self.result_provenance.clone();
+                provenance.source = crate::traits::ToolResultContentSource::DurableReplay;
+                provenance
+            }),
             semantics: self.semantics.clone(),
             ..ToolCallMetadata::default()
         }
+    }
+
+    /// Compact trusted control-plane header prepended when a durable tool
+    /// result is reconstructed for a later model turn.
+    pub fn context_header(&self) -> String {
+        let provenance = &self.result_provenance;
+        let requested = match provenance.requested_range.as_ref() {
+            Some(crate::traits::ReadFileSelectionMetadata::Full) => "full".to_string(),
+            Some(crate::traits::ReadFileSelectionMetadata::BoundedRange {
+                start_line,
+                end_line,
+            }) => format!("lines:{start_line}-{end_line}"),
+            Some(crate::traits::ReadFileSelectionMetadata::OpenEndedRange { start_line }) => {
+                format!("lines:{start_line}-end")
+            }
+            Some(crate::traits::ReadFileSelectionMetadata::Tail { requested_lines }) => {
+                format!("tail:{requested_lines}")
+            }
+            None => "not_applicable".to_string(),
+        };
+        let returned = match (provenance.returned_start_line, provenance.returned_end_line) {
+            (Some(start), Some(end)) => format!("lines:{start}-{end}"),
+            _ => "not_applicable".to_string(),
+        };
+        let result_id = provenance.result_id.as_deref().unwrap_or("unavailable");
+        format!(
+            "[Tool receipt v{}: outcome={}; result_id={}; source={}; model_view={}; durable_view={}; requested_range={}; returned_range={}]",
+            self.schema_version,
+            self.outcome_status.as_str(),
+            result_id,
+            provenance.source.as_str(),
+            provenance.model_view_completeness.as_str(),
+            provenance.durable_view_completeness.as_str(),
+            requested,
+            returned,
+        )
     }
 }
 
@@ -592,6 +638,19 @@ pub struct PolicyMetricsData {
     pub harness_eval_overall_avg: f64,
 }
 
+/// Durable cumulative policy counters for one daemon boot. Consumers select
+/// the latest snapshot per `boot_id`; summing every row would double count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyMetricsSnapshotData {
+    pub schema_version: u16,
+    pub boot_id: String,
+    pub metrics: PolicyMetricsData,
+}
+
+impl PolicyMetricsSnapshotData {
+    pub const SCHEMA_VERSION: u16 = 1;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmPayloadInvalidMetric {
     pub provider: String,
@@ -739,6 +798,21 @@ pub struct TaskStartData {
     /// Turn ID (globally-unique UUID = this turn's opening user-message id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+}
+
+/// Typed audit record for a tool attempt that conflicts with a grounded
+/// current-request capability constraint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConstraintViolationData {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub constraint_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prohibited_scope: Option<crate::traits::ToolSemanticScope>,
+    pub attempted_tool: String,
+    pub prevented: bool,
+    pub side_effect_outcome: String,
 }
 
 /// Data for TaskEnd event
@@ -923,6 +997,10 @@ pub struct ContractFulfillmentPayload {
     pub verification_required: bool,
     pub verification_count: u32,
     pub verification_blocks: u32,
+    #[serde(default)]
+    pub evidence_requirements_total: u32,
+    #[serde(default)]
+    pub evidence_requirements_satisfied: u32,
     #[serde(default)]
     pub fulfilled: bool,
 }
@@ -1624,6 +1702,22 @@ mod tests {
             outcome_status: Some(ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
             http_status: Some(201),
+            result_provenance: Some(crate::traits::ToolResultProvenance {
+                result_id: Some("sha256:synthetic".to_string()),
+                sha256: Some("synthetic".to_string()),
+                source: crate::traits::ToolResultContentSource::ToolOutput,
+                model_view_completeness: crate::traits::ToolResultCompleteness::Complete,
+                durable_view_completeness: crate::traits::ToolResultCompleteness::Truncated,
+                authoritative_chars: 100,
+                model_visible_chars: 100,
+                durable_chars: 40,
+                requested_range: Some(crate::traits::ReadFileSelectionMetadata::BoundedRange {
+                    start_line: 4,
+                    end_line: 12,
+                }),
+                returned_start_line: Some(4),
+                returned_end_line: Some(9),
+            }),
             semantics: ToolCallSemantics::mutation_with(
                 crate::traits::ToolMutationEffects::REMOTE_DEPLOY,
             ),
@@ -1639,6 +1733,16 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
+        assert_eq!(roundtrip.schema_version, 2);
+        assert!(roundtrip
+            .context_header()
+            .contains("durable_view=truncated"));
+        assert!(roundtrip
+            .context_header()
+            .contains("requested_range=lines:4-12"));
+        assert!(roundtrip
+            .context_header()
+            .contains("returned_range=lines:4-9"));
         let replay = roundtrip.to_metadata();
         assert!(replay.receipt_replayed);
         assert_eq!(replay.outcome_status, Some(ToolOutcomeStatus::Succeeded));

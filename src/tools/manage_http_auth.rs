@@ -871,7 +871,6 @@ impl ManageHttpAuthTool {
         url: Option<&str>,
         method: Option<&str>,
         timeout_secs: Option<u64>,
-        session_id: &str,
     ) -> anyhow::Result<String> {
         let mut doc = self.load_config_doc().await?;
         let Some(_) = Self::profile_table(&doc, profile_name) else {
@@ -948,31 +947,10 @@ impl ManageHttpAuthTool {
             ));
         }
 
-        let approval_description = format!(
-            "Verify manual API auth profile '{}' with {} {}",
-            profile_name, verify_method, url
-        );
-        match self
-            .request_approval(
-                session_id,
-                &approval_description,
-                RiskLevel::Medium,
-                vec![
-                    "Authenticated HTTP probe to external API".to_string(),
-                    "Read-only verification request".to_string(),
-                ],
-            )
-            .await?
-        {
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-            ApprovalResponse::Deny => {
-                return Ok("Verification probe denied by user.".to_string());
-            }
-        }
-
         let client = reqwest::Client::builder()
+            // Verification is an exact read-only probe. Do not let it leave
+            // the profile-bound origin through a redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(
                 timeout_secs
                     .unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS)
@@ -1149,17 +1127,11 @@ impl Tool for ManageHttpAuthTool {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
                 )?;
-                let session_id = if args._session_id.is_empty() {
-                    "unknown"
-                } else {
-                    args._session_id.as_str()
-                };
                 self.handle_verify(
                     &profile,
                     args.url.as_deref(),
                     args.method.as_deref(),
                     args.timeout_secs,
-                    session_id,
                 )
                 .await
             }

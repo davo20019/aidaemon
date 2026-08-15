@@ -15,8 +15,8 @@ use crate::execution_graph::{
     ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeState,
 };
 use crate::traits::{
-    RequestCompletionContract, RequestForbiddenAction, RequestTaskKind, RequestVerificationTarget,
-    RequestVerificationTargetKind,
+    RequestCompletionContract, RequestEvidenceRequirement, RequestForbiddenAction, RequestTaskKind,
+    RequestVerificationTarget, RequestVerificationTargetKind,
 };
 use crate::traits::{ToolCallSemantics, ToolMutationEffects};
 
@@ -94,6 +94,13 @@ pub(super) struct CompletionContract {
     /// Unlike `expects_mutation = false`, this is a hard negative obligation:
     /// mutation attempts are contract violations and must be blocked.
     pub forbids_mutation: bool,
+    /// Explicit, grounded prohibition on every tool call for this request.
+    pub forbids_tool_use: bool,
+    /// Explicit, grounded capability deny-set for this request. Enforcement
+    /// happens both when definitions are offered and again before dispatch.
+    pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
+    /// Grounded output labels that checklist/progress surfaces cannot satisfy.
+    pub required_response_fields: Vec<String>,
     /// Operation-specific negative obligations. These do not turn an otherwise
     /// mutating task into a report-only task; they block only the named action.
     pub forbidden_mutation_actions: Vec<ForbiddenMutationAction>,
@@ -104,6 +111,9 @@ pub(super) struct CompletionContract {
     pub minimum_sources: usize,
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
+    /// Material information needs whose typed evidence must be closed before
+    /// successful completion. Empty retains legacy generic-observation behavior.
+    pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     pub connected_content_mode: super::intent_routing::ConnectedContentMode,
     pub verification_targets: Vec<VerificationTarget>,
 }
@@ -134,6 +144,9 @@ pub(super) fn persistable_completion_contract(
         expects_mutation: contract.expects_mutation,
         required_mutation_effects: contract.required_mutation_effects,
         forbids_mutation: contract.forbids_mutation,
+        forbids_tool_use: contract.forbids_tool_use,
+        forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
+        required_response_fields: contract.required_response_fields.clone(),
         forbidden_actions: contract
             .forbidden_mutation_actions
             .iter()
@@ -152,6 +165,7 @@ pub(super) fn persistable_completion_contract(
         minimum_sources: contract.minimum_sources,
         requires_primary_sources: contract.requires_primary_sources,
         requires_exact_history: contract.requires_exact_history,
+        evidence_requirements: contract.evidence_requirements.clone(),
         verification_targets: contract
             .verification_targets
             .iter()
@@ -184,6 +198,9 @@ pub(super) fn completion_contract_from_persisted(
         expects_mutation: contract.expects_mutation,
         required_mutation_effects: contract.required_mutation_effects,
         forbids_mutation: contract.forbids_mutation,
+        forbids_tool_use: contract.forbids_tool_use,
+        forbidden_tool_scopes: contract.forbidden_tool_scopes.clone(),
+        required_response_fields: contract.required_response_fields.clone(),
         forbidden_mutation_actions: contract
             .forbidden_actions
             .iter()
@@ -202,6 +219,7 @@ pub(super) fn completion_contract_from_persisted(
         minimum_sources: contract.minimum_sources,
         requires_primary_sources: contract.requires_primary_sources,
         requires_exact_history: contract.requires_exact_history,
+        evidence_requirements: contract.evidence_requirements.clone(),
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets: contract
             .verification_targets
@@ -238,6 +256,11 @@ pub(super) fn inherit_unfinished_request_contract(
 
     current.requires_observation |= unfinished.requires_observation;
     current.explicit_verification_requested |= unfinished.explicit_verification_requested;
+    for requirement in &unfinished.evidence_requirements {
+        if !current.evidence_requirements.contains(requirement) {
+            current.evidence_requirements.push(requirement.clone());
+        }
+    }
 
     if !current_requires_execution
         && (current.expects_mutation || current.requires_observation)
@@ -251,6 +274,25 @@ pub(super) fn inherit_unfinished_request_contract(
     // observation-only constraint, while operation-specific exclusions remain.
     if !current.expects_mutation {
         current.forbids_mutation |= unfinished.forbids_mutation;
+    }
+    // A current explicit prohibition wins. An older prohibition is inherited
+    // only while this related continuation has no positive execution request.
+    if !current_requires_execution {
+        current.forbids_tool_use |= unfinished.forbids_tool_use;
+    }
+    for scope in &unfinished.forbidden_tool_scopes {
+        if !current.forbidden_tool_scopes.contains(scope) {
+            current.forbidden_tool_scopes.push(*scope);
+        }
+    }
+    for field in &unfinished.required_response_fields {
+        if !current.required_response_fields.contains(field) {
+            current.required_response_fields.push(field.clone());
+        }
+    }
+    if current.forbids_tool_use {
+        current.requires_observation = false;
+        current.explicit_verification_requested = false;
     }
     for action in &unfinished.forbidden_mutation_actions {
         if !current.forbidden_mutation_actions.contains(action) {
@@ -424,6 +466,46 @@ pub(super) struct SemanticCompletionRequirements<'a> {
     pub minimum_sources: usize,
     pub requires_primary_sources: bool,
     pub requires_exact_history: bool,
+    pub evidence_requirements: &'a [RequestEvidenceRequirement],
+    pub forbids_tool_use: bool,
+    pub forbidden_tool_scopes: &'a [crate::traits::ToolSemanticScope],
+    pub required_response_fields: &'a [String],
+}
+
+fn structural_evidence_requirements(
+    targets: &[VerificationTarget],
+) -> Vec<RequestEvidenceRequirement> {
+    targets
+        .iter()
+        .map(|target| {
+            let (summary, scope, purpose) = match target.kind {
+                VerificationTargetKind::Url => (
+                    "Observe the exact external resource named by the request",
+                    crate::traits::ToolSemanticScope::ExternalRemote,
+                    crate::traits::EvidencePurpose::CurrentState,
+                ),
+                VerificationTargetKind::Path => (
+                    "Observe the exact workspace resource named by the request",
+                    crate::traits::ToolSemanticScope::LocalWorkspace,
+                    crate::traits::EvidencePurpose::Content,
+                ),
+            };
+            RequestEvidenceRequirement {
+                summary: summary.to_string(),
+                acceptable_scopes: vec![scope],
+                purpose,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                target: Some(RequestVerificationTarget {
+                    kind: match target.kind {
+                        VerificationTargetKind::Url => RequestVerificationTargetKind::Url,
+                        VerificationTargetKind::Path => RequestVerificationTargetKind::Path,
+                    },
+                    value: target.value.clone(),
+                }),
+            }
+        })
+        .collect()
 }
 
 pub(super) fn install_semantic_completion_contract(
@@ -431,6 +513,12 @@ pub(super) fn install_semantic_completion_contract(
     requirements: SemanticCompletionRequirements<'_>,
 ) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
+    let mut evidence_requirements = requirements.evidence_requirements.to_vec();
+    for structural in structural_evidence_requirements(&verification_targets) {
+        if !evidence_requirements.contains(&structural) {
+            evidence_requirements.push(structural);
+        }
+    }
     let scope = requirements.mutation_scope.trim().to_ascii_lowercase();
     let forbids_mutation = matches!(scope.as_str(), "read_only" | "read-only");
     let expects_mutation = requirements.expects_mutation && !forbids_mutation;
@@ -444,20 +532,26 @@ pub(super) fn install_semantic_completion_contract(
             ToolMutationEffects::NONE
         },
         forbids_mutation,
+        forbids_tool_use: requirements.forbids_tool_use,
+        forbidden_tool_scopes: requirements.forbidden_tool_scopes.to_vec(),
+        required_response_fields: requirements.required_response_fields.to_vec(),
         forbidden_mutation_actions: if scope == "scoped" {
             requirements.forbidden_actions.to_vec()
         } else {
             Vec::new()
         },
-        requires_observation: requirements.requires_observation,
+        requires_observation: !requirements.forbids_tool_use
+            && (requirements.requires_observation || !evidence_requirements.is_empty()),
         requires_reverification_after_mutation: expects_mutation
             && requirements.requires_observation,
         // This now records a semantic observation obligation, not an English
         // verification-phrase match.
-        explicit_verification_requested: requirements.requires_observation,
+        explicit_verification_requested: !requirements.forbids_tool_use
+            && requirements.requires_observation,
         minimum_sources: requirements.minimum_sources,
         requires_primary_sources: requirements.requires_primary_sources,
         requires_exact_history: requirements.requires_exact_history,
+        evidence_requirements,
         connected_content_mode: super::intent_routing::ConnectedContentMode::None,
         verification_targets,
     };
@@ -468,6 +562,7 @@ pub(super) fn install_semantic_completion_contract(
 pub(super) fn retain_structural_completion_contract(contract: &mut CompletionContract) {
     let verification_targets = std::mem::take(&mut contract.verification_targets);
     let requires_observation = !verification_targets.is_empty();
+    let evidence_requirements = structural_evidence_requirements(&verification_targets);
     *contract = CompletionContract {
         task_kind: if requires_observation {
             CompletionTaskKind::Check
@@ -476,6 +571,7 @@ pub(super) fn retain_structural_completion_contract(contract: &mut CompletionCon
         },
         requires_observation,
         explicit_verification_requested: requires_observation,
+        evidence_requirements,
         verification_targets,
         ..CompletionContract::default()
     };
@@ -816,6 +912,10 @@ pub(super) struct CompletionProgress {
     /// gets reset), this counter only increments and is used as a safety valve
     /// to prevent infinite verification loops.
     pub verification_block_count: usize,
+    /// Count of compatible verification tool calls that actually executed
+    /// while an observation obligation was pending. Completion blocks are
+    /// tracked separately and must never masquerade as exhausted retries.
+    pub verification_attempt_count: usize,
     /// Count of times the response-quality nudge has been injected.
     /// Used to prevent infinite nudge loops — only fire once.
     pub quality_nudge_count: usize,
@@ -845,6 +945,9 @@ pub(super) struct CompletionProgress {
     /// Count of bounded retries issued because a mandate task lead attempted
     /// to finish without an exact durable decision for its current run.
     pub mandate_decision_retry_count: usize,
+    /// Bounded retry for a model-authored final response that omitted grounded
+    /// user-requested output labels.
+    pub response_contract_retry_count: usize,
     /// True when the coreference grounding gate already fired this turn
     /// (a pronoun-referent follow-up that was anchored to the prior exchange).
     /// When set, the denial gate must NOT also fire — coreference gate takes
@@ -857,6 +960,9 @@ pub(super) struct CompletionProgress {
     pub(in crate::agent) proof_graph_initialized: bool,
     pub(in crate::agent) mutation_obligation_ids: Vec<String>,
     pub(in crate::agent) verification_obligation_id: Option<String>,
+    /// One proof-graph obligation per `CompletionContract::evidence_requirements`
+    /// entry, preserving index alignment for receipt matching.
+    pub(in crate::agent) evidence_obligation_ids: Vec<String>,
 }
 
 impl CompletionProgress {
@@ -907,7 +1013,19 @@ impl CompletionProgress {
             }
         }
 
-        if contract.requires_observation {
+        if contract.requires_observation && !contract.evidence_requirements.is_empty() {
+            for (index, _) in contract.evidence_requirements.iter().enumerate() {
+                let id = format!("obligation:evidence:{index}");
+                self.proof_graph.add_node(
+                    id.clone(),
+                    ExecutionNodeKind::Obligation,
+                    ExecutionNodeState::Pending,
+                )?;
+                self.proof_graph
+                    .add_edge(REQUEST_ID, &id, ExecutionEdgeKind::Requires, None)?;
+                self.evidence_obligation_ids.push(id);
+            }
+        } else if contract.requires_observation {
             let id = "obligation:verification".to_string();
             self.proof_graph.add_node(
                 id.clone(),
@@ -1010,12 +1128,32 @@ impl CompletionProgress {
         if contract.requires_reverification_after_mutation {
             self.verification_pending = true;
             if self.proof_graph_initialized {
-                if let (Some(receipt_id), Some(obligation_id)) = (
-                    self.record_receipt_node(tool_call_id),
-                    self.verification_obligation_id.as_deref(),
-                ) {
-                    if let Err(error) = self.proof_graph.invalidate(&receipt_id, obligation_id) {
-                        tracing::warn!(%error, "Verification invalidation was rejected");
+                if let Some(receipt_id) = self.record_receipt_node(tool_call_id) {
+                    let mut invalidated = self
+                        .verification_obligation_id
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    invalidated.extend(
+                        contract
+                            .evidence_requirements
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, requirement)| {
+                                matches!(
+                                    requirement.temporal_scope,
+                                    crate::traits::EvidenceTemporalScope::Current
+                                        | crate::traits::EvidenceTemporalScope::Both
+                                )
+                                .then(|| self.evidence_obligation_ids.get(index).cloned())
+                                .flatten()
+                            }),
+                    );
+                    for obligation_id in invalidated {
+                        if let Err(error) = self.proof_graph.invalidate(&receipt_id, &obligation_id)
+                        {
+                            tracing::warn!(%error, %obligation_id, "Verification invalidation was rejected");
+                        }
                     }
                 }
             }
@@ -1025,61 +1163,135 @@ impl CompletionProgress {
     #[cfg(test)]
     pub(super) fn mark_observation(&mut self, contract: &CompletionContract, matched_target: bool) {
         let evidence_id = self.next_evidence_id("synthetic-verification");
-        self.mark_observation_receipt(contract, matched_target, &evidence_id);
+        let matched_requirements = if matched_target {
+            (0..contract.evidence_requirements.len()).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.mark_observation_receipt(
+            contract,
+            &matched_requirements,
+            matched_target,
+            &evidence_id,
+        );
     }
 
     pub(super) fn mark_observation_receipt(
         &mut self,
         contract: &CompletionContract,
-        matched_target: bool,
+        matched_requirement_indices: &[usize],
+        generic_match: bool,
         tool_call_id: &str,
     ) {
         self.observation_count = self.observation_count.saturating_add(1);
         if !contract.requires_observation {
             return;
         }
-        if matched_target || contract.verification_targets.is_empty() {
+
+        if !contract.evidence_requirements.is_empty() {
+            let obligation_ids = matched_requirement_indices
+                .iter()
+                .filter_map(|index| self.evidence_obligation_ids.get(*index))
+                .filter(|id| self.proof_graph.state(id) != Some(ExecutionNodeState::Satisfied))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !obligation_ids.is_empty() {
+                self.verification_count = self.verification_count.saturating_add(1);
+                self.record_verification_evidence(tool_call_id, &obligation_ids);
+            }
+            self.verification_pending = self
+                .evidence_obligation_ids
+                .iter()
+                .any(|id| self.proof_graph.state(id) != Some(ExecutionNodeState::Satisfied));
+        } else if generic_match || contract.verification_targets.is_empty() {
             self.verification_pending = false;
             self.verification_count = self.verification_count.saturating_add(1);
-            self.record_verification_evidence(tool_call_id);
+            let obligation_ids = self
+                .verification_obligation_id
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            self.record_verification_evidence(tool_call_id, &obligation_ids);
+        }
+    }
+
+    pub(super) fn mark_verification_attempt(&mut self) {
+        if self.verification_pending {
+            self.verification_attempt_count = self.verification_attempt_count.saturating_add(1);
         }
     }
 
     /// Mark a successful delivery receipt as direct verification. This keeps
     /// delivery semantics structural without special-casing response text.
     pub(super) fn mark_delivery_verified(&mut self, tool_call_id: &str) {
-        if self.verification_pending {
+        // Delivery proves the legacy generic verification obligation. Typed
+        // inquiry needs require an explicitly compatible evidence capability.
+        if self.verification_pending && self.evidence_obligation_ids.is_empty() {
             self.verification_pending = false;
             self.verification_count = self.verification_count.saturating_add(1);
-            self.record_verification_evidence(tool_call_id);
+            let obligation_ids = self
+                .verification_obligation_id
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            self.record_verification_evidence(tool_call_id, &obligation_ids);
         }
     }
 
-    fn record_verification_evidence(&mut self, tool_call_id: &str) {
+    fn record_verification_evidence(&mut self, tool_call_id: &str, obligation_ids: &[String]) {
         if !self.proof_graph_initialized {
             return;
         }
-        let Some(obligation_id) = self.verification_obligation_id.clone() else {
+        if obligation_ids.is_empty() {
             return;
-        };
-        let id = format!("verification:{tool_call_id}");
-        let result = self
-            .proof_graph
-            .add_node(
-                id.clone(),
-                ExecutionNodeKind::Verification,
-                ExecutionNodeState::Satisfied,
-            )
-            .and_then(|()| {
-                self.proof_graph.satisfy_with_evidence(
-                    &obligation_id,
-                    &id,
-                    Some(tool_call_id.to_string()),
-                )
-            });
-        if let Err(error) = result {
-            tracing::warn!(%error, "Completion proof graph rejected verification evidence");
         }
+        let id = format!("verification:{tool_call_id}");
+        if let Err(error) = self.proof_graph.add_node(
+            id.clone(),
+            ExecutionNodeKind::Verification,
+            ExecutionNodeState::Satisfied,
+        ) {
+            tracing::warn!(%error, "Completion proof graph rejected verification evidence");
+            return;
+        }
+        for obligation_id in obligation_ids {
+            if let Err(error) = self.proof_graph.satisfy_with_evidence(
+                obligation_id,
+                &id,
+                Some(tool_call_id.to_string()),
+            ) {
+                tracing::warn!(%error, %obligation_id, "Completion proof graph rejected verification evidence");
+            }
+        }
+    }
+
+    pub(in crate::agent) fn satisfied_evidence_requirements(&self) -> usize {
+        self.evidence_obligation_ids
+            .iter()
+            .filter(|id| self.proof_graph.state(id) == Some(ExecutionNodeState::Satisfied))
+            .count()
+    }
+
+    pub(in crate::agent) fn all_evidence_requirements_satisfied(&self) -> bool {
+        !self.evidence_obligation_ids.is_empty()
+            && self.satisfied_evidence_requirements() == self.evidence_obligation_ids.len()
+    }
+
+    pub(super) fn outstanding_evidence_requirements<'a>(
+        &self,
+        contract: &'a CompletionContract,
+    ) -> Vec<&'a RequestEvidenceRequirement> {
+        contract
+            .evidence_requirements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, requirement)| {
+                self.evidence_obligation_ids
+                    .get(index)
+                    .filter(|id| self.proof_graph.state(id) != Some(ExecutionNodeState::Satisfied))
+                    .map(|_| requirement)
+            })
+            .collect()
     }
 
     pub(super) fn mark_failed_external_mutation(&mut self) {
@@ -2060,6 +2272,9 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         expects_mutation,
         required_mutation_effects,
         forbids_mutation,
+        forbids_tool_use: false,
+        forbidden_tool_scopes: Vec::new(),
+        required_response_fields: Vec::new(),
         forbidden_mutation_actions,
         requires_observation,
         requires_reverification_after_mutation,
@@ -2067,6 +2282,7 @@ pub(super) fn infer_completion_contract(text: &str, alias_roots: &[String]) -> C
         minimum_sources: 0,
         requires_primary_sources: false,
         requires_exact_history: false,
+        evidence_requirements: Vec::new(),
         connected_content_mode,
         verification_targets,
     }
@@ -2087,6 +2303,9 @@ mod tests {
             expects_mutation: true,
             required_mutation_effects: ToolMutationEffects::REMOTE_DEPLOY,
             forbids_mutation: true,
+            forbids_tool_use: false,
+            forbidden_tool_scopes: Vec::new(),
+            required_response_fields: Vec::new(),
             forbidden_mutation_actions: vec![ForbiddenMutationAction::Deploy],
             requires_observation: true,
             requires_reverification_after_mutation: true,
@@ -2094,6 +2313,7 @@ mod tests {
             minimum_sources: 3,
             requires_primary_sources: true,
             requires_exact_history: true,
+            evidence_requirements: Vec::new(),
             connected_content_mode: super::super::intent_routing::ConnectedContentMode::DeliverOnly,
             verification_targets: vec![target.clone()],
         };
@@ -2110,6 +2330,10 @@ mod tests {
                 minimum_sources: 0,
                 requires_primary_sources: false,
                 requires_exact_history: false,
+                evidence_requirements: &[],
+                forbids_tool_use: false,
+                forbidden_tool_scopes: &[],
+                required_response_fields: &[],
             },
         );
 
@@ -2120,6 +2344,44 @@ mod tests {
         assert_eq!(contract.minimum_sources, 0);
         assert!(!contract.requires_exact_history);
         assert_eq!(contract.verification_targets, vec![target]);
+    }
+
+    #[test]
+    fn explicit_no_tool_contract_keeps_limitations_without_verification_loop() {
+        let requirement = RequestEvidenceRequirement {
+            summary: "Establish the current synthetic release".to_string(),
+            acceptable_scopes: vec![crate::traits::ToolSemanticScope::ExternalRemote],
+            purpose: crate::traits::EvidencePurpose::CurrentState,
+            minimum_authority: crate::traits::EvidenceAuthority::Direct,
+            temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+            target: None,
+        };
+        let mut contract = CompletionContract::default();
+        install_semantic_completion_contract(
+            &mut contract,
+            SemanticCompletionRequirements {
+                expects_mutation: false,
+                requires_observation: true,
+                task_kind: CompletionTaskKind::Answer,
+                required_mutation_effects: ToolMutationEffects::NONE,
+                mutation_scope: "allowed",
+                forbidden_actions: &[],
+                minimum_sources: 0,
+                requires_primary_sources: false,
+                requires_exact_history: false,
+                evidence_requirements: std::slice::from_ref(&requirement),
+                forbids_tool_use: true,
+                forbidden_tool_scopes: &[],
+                required_response_fields: &[],
+            },
+        );
+
+        assert!(contract.forbids_tool_use);
+        assert!(!contract.requires_observation);
+        assert!(!contract.explicit_verification_requested);
+        assert_eq!(contract.evidence_requirements, vec![requirement]);
+        let progress = CompletionProgress::new(&contract);
+        assert!(!progress.verification_pending);
     }
 
     #[test]
@@ -2758,6 +3020,108 @@ mod tests {
         progress.mark_observation(&contract, true);
         assert!(!progress.verification_pending);
         assert_eq!(progress.verification_count, 2);
+    }
+
+    #[test]
+    fn every_material_evidence_obligation_requires_compatible_receipt_credit() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolSemanticScope,
+        };
+
+        let contract = CompletionContract {
+            task_kind: CompletionTaskKind::Check,
+            requires_observation: true,
+            explicit_verification_requested: true,
+            evidence_requirements: vec![
+                RequestEvidenceRequirement {
+                    summary: "Observe current external state".to_string(),
+                    acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+                    purpose: EvidencePurpose::CurrentState,
+                    minimum_authority: EvidenceAuthority::Direct,
+                    temporal_scope: EvidenceTemporalScope::Current,
+                    target: None,
+                },
+                RequestEvidenceRequirement {
+                    summary: "Establish historical execution attribution".to_string(),
+                    acceptable_scopes: vec![ToolSemanticScope::GoalState],
+                    purpose: EvidencePurpose::Attribution,
+                    minimum_authority: EvidenceAuthority::Canonical,
+                    temporal_scope: EvidenceTemporalScope::Historical,
+                    target: None,
+                },
+            ],
+            ..CompletionContract::default()
+        };
+        let mut progress = CompletionProgress::new(&contract);
+
+        progress.mark_observation_receipt(&contract, &[0], true, "external-state");
+        assert_eq!(progress.observation_count, 1);
+        assert_eq!(progress.satisfied_evidence_requirements(), 1);
+        assert!(progress.verification_pending);
+        assert!(!progress.all_evidence_requirements_satisfied());
+
+        // Another successful current-state observation cannot close the
+        // separate historical-attribution obligation.
+        progress.mark_observation_receipt(&contract, &[], true, "more-current-state");
+        assert_eq!(progress.observation_count, 2);
+        assert_eq!(progress.satisfied_evidence_requirements(), 1);
+        assert!(progress.verification_pending);
+
+        progress.mark_observation_receipt(&contract, &[1], false, "canonical-trace");
+        assert_eq!(progress.satisfied_evidence_requirements(), 2);
+        assert!(progress.all_evidence_requirements_satisfied());
+        assert!(!progress.verification_pending);
+    }
+
+    #[test]
+    fn combined_delivery_and_observation_receipt_survives_mutation_invalidation_order() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolEvidenceCapability,
+            ToolSemanticScope, ToolVerificationMode,
+        };
+
+        let contract = CompletionContract {
+            task_kind: CompletionTaskKind::Deliver,
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::EXTERNAL_DELIVERY,
+            requires_observation: true,
+            requires_reverification_after_mutation: true,
+            explicit_verification_requested: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Confirm playback completed".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+                purpose: EvidencePurpose::Outcome,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let receipt_semantics = ToolCallSemantics::observation_and_mutation_with(
+            ToolMutationEffects::EXTERNAL_DELIVERY,
+        )
+        .with_verification_mode(ToolVerificationMode::ResultContent)
+        .with_evidence(vec![ToolEvidenceCapability::new(
+            ToolSemanticScope::ExternalRemote,
+            &[EvidencePurpose::Outcome],
+            EvidenceAuthority::Direct,
+            EvidenceTemporalScope::Current,
+        )]);
+        let mut progress = CompletionProgress::new(&contract);
+
+        // Runtime records the mutation first so it invalidates only evidence
+        // from before this call. The same authoritative receipt then proves
+        // the post-mutation playback outcome.
+        progress.mark_mutation_receipt(&contract, &receipt_semantics, "audio-receipt-1");
+        assert!(progress.verification_pending);
+        progress.mark_verification_attempt();
+        progress.mark_observation_receipt(&contract, &[0], true, "audio-receipt-1");
+
+        assert!(mutation_contract_fulfilled(&contract, &progress));
+        assert!(progress.all_evidence_requirements_satisfied());
+        assert!(!progress.verification_pending);
+        assert_eq!(progress.verification_count, 1);
+        assert_eq!(progress.verification_attempt_count, 1);
     }
     #[test]
     fn verification_targets_do_not_resolve_plain_word_nicknames_without_local_scope_cues() {

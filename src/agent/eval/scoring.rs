@@ -111,7 +111,11 @@ pub fn contract_is_fulfilled(contract: &ContractSnapshot) -> bool {
     let mut passed = 0_u32;
     if contract.requires_observation {
         checks += 1;
-        if contract.observation_count > 0 {
+        if if contract.evidence_requirements_total > 0 {
+            contract.evidence_requirements_satisfied == contract.evidence_requirements_total
+        } else {
+            contract.observation_count > 0
+        } {
             passed += 1;
         }
     }
@@ -151,7 +155,11 @@ pub fn compute_contract_fulfillment(contract: &ContractSnapshot, outcome: TaskOu
     let mut passed = 0_u32;
     if contract.requires_observation {
         checks += 1;
-        if contract.observation_count > 0 {
+        if if contract.evidence_requirements_total > 0 {
+            contract.evidence_requirements_satisfied == contract.evidence_requirements_total
+        } else {
+            contract.observation_count > 0
+        } {
             passed += 1;
         }
     }
@@ -356,6 +364,20 @@ mod tests {
         };
         assert!(!contract_is_fulfilled(&contract));
         contract.mutation_count = 1;
+        assert!(contract_is_fulfilled(&contract));
+    }
+
+    #[test]
+    fn raw_observation_count_does_not_replace_material_evidence_closure() {
+        let mut contract = ContractSnapshot {
+            requires_observation: true,
+            observation_count: 4,
+            evidence_requirements_total: 2,
+            evidence_requirements_satisfied: 1,
+            ..Default::default()
+        };
+        assert!(!contract_is_fulfilled(&contract));
+        contract.evidence_requirements_satisfied = 2;
         assert!(contract_is_fulfilled(&contract));
     }
 

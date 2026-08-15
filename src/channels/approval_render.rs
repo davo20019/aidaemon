@@ -269,7 +269,7 @@ pub(super) fn build_goal_confirmation_keyboard(
     match style {
         GoalConfirmationStyle::Standard => InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback(
-                "Approve goal ✅",
+                "Approve & activate ✅",
                 format!("goal:confirm:{approval_id}"),
             ),
             InlineKeyboardButton::callback("Cancel", format!("goal:cancel:{approval_id}")),
@@ -293,22 +293,26 @@ pub(super) fn build_goal_confirmation_keyboard(
 fn goal_detail_section(detail: &str) -> (&'static str, &str) {
     for (prefix, heading) in [
         ("Objective:", "🎯 Objective"),
-        ("Constraints:", "🛡️ Guardrails"),
+        ("Constraints:", "🛡️ Rules it must follow"),
         ("Success criteria:", "✅ Success means"),
         ("Stop conditions:", "🛑 Stops when"),
+        ("Guidance:", "🧭 Guidance"),
         ("Pinned strategy:", "🧭 Strategy"),
+        ("Access summary:", "🔑 What it can do"),
         ("Observations allowed:", "👁️ Read access"),
         ("Allowed mutation effects:", "✍️ External changes"),
         ("Allowed targets:", "🎯 Allowed targets"),
         ("Exact operation scopes:", "🔧 Operation scope"),
-        ("Mutation limits:", "📏 Action limits"),
-        ("Review interval:", "🔄 Review timing"),
-        ("Expiration:", "⏱️ Duration"),
-        ("Autonomy mode:", "🚀 Operating mode"),
+        ("Mutation limits:", "📏 Activity limits"),
+        ("Review interval:", "🔄 Check-in timing"),
+        ("Expiration:", "⏱️ Ends"),
+        ("Autonomy mode:", "🤖 How it works"),
         ("Owner checkpoints:", "🙋 Owner checkpoints"),
         ("Recovery policy:", "♻️ Recovery"),
         ("Confirmation binding:", "🔏 Confirmation binding"),
         ("Review effort:", "🧠 Review effort"),
+        ("Review depth:", "🧠 Decision checks"),
+        ("Policy reference:", "🔏 Approval scope"),
         ("Resolved token budgets:", "🧮 Compute budget"),
     ] {
         if let Some(value) = detail.strip_prefix(prefix) {
@@ -382,7 +386,7 @@ pub(super) fn build_goal_confirmation_pages(
         .enumerate()
         .map(|(index, chunk)| {
             let title = match style {
-                GoalConfirmationStyle::Standard => "🔐 Review goal",
+                GoalConfirmationStyle::Standard => "🔐 Review plan",
                 GoalConfirmationStyle::Autopilot => "🚀 Enable Autopilot",
             };
             let mut page = if page_count == 1 {
@@ -393,7 +397,7 @@ pub(super) fn build_goal_confirmation_pages(
             if index + 1 == page_count {
                 page.push_str(match style {
                     GoalConfirmationStyle::Standard => {
-                        "\n\nReady to proceed? Approve this exact goal or cancel it below."
+                        "\n\nReady to proceed? Approve and activate this plan, or cancel below."
                     }
                     GoalConfirmationStyle::Autopilot => {
                         "\n\nReady to proceed? Enable this exact Autopilot policy or cancel below."
@@ -478,7 +482,7 @@ mod tests {
         assert!(pages
             .last()
             .unwrap()
-            .contains("Approve this exact goal or cancel it"));
+            .contains("Approve and activate this plan, or cancel"));
         assert!(pages.iter().any(|page| page.contains("<unescaped>")));
     }
 
@@ -494,11 +498,16 @@ mod tests {
         let pages =
             build_goal_confirmation_pages(description, &details, GoalConfirmationStyle::Standard);
         let rendered = pages.join("\n");
-        assert!(rendered.starts_with("🔐 Review goal before activation"));
+        assert!(rendered.starts_with("🔐 Review plan before activation"));
         assert_eq!(rendered.matches("Steward the synthetic account").count(), 1);
-        assert!(rendered.contains("🛡️ Guardrails\n1. Verify identity.\n2. Never retry"));
-        assert!(rendered.contains("⏱️ Duration"));
+        assert!(rendered.contains("🛡️ Rules it must follow\n1. Verify identity.\n2. Never retry"));
+        assert!(rendered.contains("⏱️ Ends"));
         assert!(rendered.contains("Nothing starts until you approve this goal."));
+
+        let keyboard =
+            build_goal_confirmation_keyboard("approval-1", GoalConfirmationStyle::Standard);
+        let serialized = serde_json::to_string(&keyboard).unwrap();
+        assert!(serialized.contains("Approve & activate"));
     }
 
     #[test]

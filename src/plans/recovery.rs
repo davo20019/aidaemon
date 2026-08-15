@@ -54,7 +54,7 @@ impl PlanRecovery {
         for mut plan in in_progress_plans {
             // If all steps are already done, mark as completed instead of paused
             if plan.is_finished() {
-                plan.status = PlanStatus::Completed;
+                plan.status = plan.resolved_status();
                 plan.updated_at = Utc::now();
                 match self.plan_store.update(&plan).await {
                     Ok(()) => {

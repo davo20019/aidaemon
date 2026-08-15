@@ -35,7 +35,7 @@ impl ShareMemoryTool {
             .send(ApprovalRequest {
                 command: description.to_string(),
                 session_id: session_id.to_string(),
-                risk_level: RiskLevel::Medium,
+                risk_level: RiskLevel::High,
                 warnings: vec![
                     "This will make this memory visible across all channels".to_string(),
                 ],

@@ -312,7 +312,32 @@ fn negative_contract_block_reason(
     tool_call: &ToolCall,
     is_side_effecting: bool,
 ) -> Option<String> {
+    if contract.forbids_tool_use {
+        return Some("all tool use".to_string());
+    }
     if contract.forbids_mutation {
+        // Shell is open-ended. An otherwise-unclassified command is not
+        // mutation evidence; defer it to terminal's async semantic effect gate,
+        // which receives this same hard contract and blocks before process I/O
+        // unless the full command is proven observational.
+        let opaque_shell_observation_candidate =
+            matches!(tool_call.name.as_str(), "terminal" | "run_command")
+                && serde_json::from_str::<Value>(&tool_call.arguments)
+                    .ok()
+                    .and_then(|args| {
+                        ["command", "cmd", "script"]
+                            .iter()
+                            .find_map(|key| args.get(*key).and_then(Value::as_str))
+                            .map(crate::tools::command_semantics::classify_shell_command)
+                    })
+                    .is_some_and(|semantics| {
+                        semantics.mutates_state()
+                            && semantics.mutation_effects
+                                == crate::traits::ToolMutationEffects::UNSPECIFIED
+                    });
+        if opaque_shell_observation_candidate {
+            return None;
+        }
         if is_side_effecting || matches!(tool_call.name.as_str(), "spawn_agent" | "cli_agent") {
             return Some("all mutation".to_string());
         }
@@ -614,13 +639,16 @@ fn should_run_pre_execution_gating(tc: &ToolCall) -> bool {
     if tc.name == "terminal" {
         if let Ok(args) = serde_json::from_str::<Value>(&tc.arguments) {
             let action = args.get("action").and_then(|a| a.as_str()).unwrap_or("run");
-            if action == "run" {
-                if let Some(command) = args.get("command").and_then(|c| c.as_str()) {
-                    let assessment = crate::tools::command_risk::classify_command(command);
-                    if assessment.level == crate::tools::command_risk::RiskLevel::Safe {
-                        return false;
-                    }
-                }
+            if action == "run"
+                && args
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| !command.trim().is_empty())
+            {
+                // Terminal owns semantic effect assessment plus hard safety
+                // boundaries. A second keyword-based planning gate only adds
+                // latency and can disagree with the authoritative decision.
+                return false;
             }
         }
     }
@@ -874,7 +902,8 @@ pub(super) async fn run_tool_prelude_phase(
     });
     let enforce_negative_contract =
         if let Some((blocked, restriction)) = negative_contract_match.as_ref() {
-            turn_context.completion_contract.forbids_mutation
+            turn_context.completion_contract.forbids_tool_use
+                || turn_context.completion_contract.forbids_mutation
                 || agent
                     .supervision_gate_enforced_with_context(
                         "scoped_negative_contract",
@@ -917,7 +946,28 @@ pub(super) async fn run_tool_prelude_phase(
                 }),
             )
             .await;
-        let notice = if turn_context.completion_contract.forbids_mutation {
+        if turn_context.completion_contract.forbids_tool_use {
+            emitter
+                .emit(
+                    crate::events::EventType::UserConstraintViolation,
+                    crate::events::UserConstraintViolationData {
+                        task_id: task_id.to_string(),
+                        turn_id: None,
+                        constraint_kind: "all_tool_use_forbidden".to_string(),
+                        prohibited_scope: None,
+                        attempted_tool: blocked.name.clone(),
+                        prevented: true,
+                        side_effect_outcome: "not_started".to_string(),
+                    },
+                )
+                .await?;
+        }
+        let notice = if turn_context.completion_contract.forbids_tool_use {
+            format!(
+                "[SYSTEM] Blocked `{}` before execution: the current request explicitly forbids all tool use. No side effect started. Answer directly from available context or state the exact unavailable evidence.",
+                blocked.name
+            )
+        } else if turn_context.completion_contract.forbids_mutation {
             format!(
                 "[SYSTEM] Blocked `{}`: this task has an explicit read-only/report-only contract. \
                  Do not modify files, create artifacts, deploy, publish, post, send, or otherwise \
@@ -1955,14 +2005,15 @@ mod tests {
         };
         assert!(!super::should_run_pre_execution_gating(&safe_tc));
 
-        // Critical terminal command -> SHOULD run gating
+        // Every valid terminal run uses the terminal tool's own semantic and
+        // hard-safety gates, regardless of command wording.
         let crit_tc = ToolCall {
             id: "tc_2".to_string(),
             name: "terminal".to_string(),
             arguments: r#"{"action": "run", "command": "rm -rf /"}"#.to_string(),
             extra_content: None,
         };
-        assert!(super::should_run_pre_execution_gating(&crit_tc));
+        assert!(!super::should_run_pre_execution_gating(&crit_tc));
 
         // Malformed arguments -> SHOULD run gating (fail safe)
         let malformed_tc = ToolCall {

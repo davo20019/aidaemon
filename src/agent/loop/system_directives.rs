@@ -92,6 +92,22 @@ pub(in crate::agent) enum SystemDirective {
     CompletionVerificationRequired {
         target_hint: Option<String>,
     },
+    /// Material evidence obligations remain open. This is rendered from typed
+    /// inquiry state, never inferred from the wording of a draft response.
+    InquiryEvidenceRequired {
+        outstanding_needs: Vec<String>,
+        candidate_tools: Vec<String>,
+    },
+    /// The validated request explicitly prohibits every tool call. Any live
+    /// evidence needs remain descriptive limitations, not loop obligations.
+    ToolUseForbiddenByRequest {
+        outstanding_needs: Vec<String>,
+    },
+    /// The draft omitted labels from the grounded user-authored output
+    /// contract. Progress/checklist state cannot satisfy these fields.
+    OutputContractIncomplete {
+        missing_fields: Vec<String>,
+    },
     DeferredToolCallRequired,
     DeferredProvideConcreteResults,
     StructuredToolResultSynthesis {
@@ -313,6 +329,10 @@ impl SystemDirective {
                 truncated_tail
             ),
             Self::ToolModeDisabledPlainText => "[SYSTEM] Tool mode is disabled for this turn. Respond with plain text only. Do NOT emit tool calls.".to_string(),
+            Self::OutputContractIncomplete { missing_fields } => format!(
+                "[SYSTEM] Your draft did not satisfy the current request's output contract. The substantive final answer must include each exact requested label and either its supported value or an explicit unavailable/blocker marker. Missing labels: {}. A checklist or claim that fields were reported is not an answer.",
+                missing_fields.join(", ")
+            ),
             Self::ApproachPivotRequired {
                 attempt,
                 failure_record,
@@ -443,6 +463,46 @@ impl SystemDirective {
                 format!(
                     "[SYSTEM] You have not yet verified the requested outcome{}. Before answering, run a read-only verification step that checks the actual result. If you changed something, re-check after the change. Do NOT claim success until that verification is done.",
                     target
+                )
+            }
+            Self::InquiryEvidenceRequired {
+                outstanding_needs,
+                candidate_tools,
+            } => {
+                let needs = outstanding_needs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, need)| format!("{}. {}", index + 1, need))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let candidates = if candidate_tools.is_empty() {
+                    "Use the available read-only tools whose typed evidence capabilities match each need."
+                        .to_string()
+                } else {
+                    format!(
+                        "Relevant available evidence surfaces include: {}. Choose by the exact need and tool schema; this is a recommendation, not a required tool sequence.",
+                        candidate_tools.join(", ")
+                    )
+                };
+                format!(
+                    "[SYSTEM] MATERIAL EVIDENCE STILL REQUIRED:\n{}\n\n{}\n\
+                     A successful call closes only the needs supported by its typed receipt. \
+                     Advisory memory cannot prove canonical history; current state cannot prove attribution or cause. \
+                     Continue until every material need has compatible evidence, or report the exact unresolved need as unknown/partial after the available in-scope sources are exhausted.",
+                    needs, candidates
+                )
+            }
+            Self::ToolUseForbiddenByRequest { outstanding_needs } => {
+                let limitation = if outstanding_needs.is_empty() {
+                    "No live evidence is required for this conceptual response.".to_string()
+                } else {
+                    format!(
+                        "The following claims would require evidence that cannot be retrieved under this constraint: {}.",
+                        outstanding_needs.join("; ")
+                    )
+                };
+                format!(
+                    "[SYSTEM] The current user explicitly prohibited tool use. No tools are available for this turn and you MUST NOT request or simulate one. Answer directly from the supplied conversation/context. {limitation} If a requested current fact cannot be established, say exactly that live evidence would be required; do not enter a verification loop or return generic blocked boilerplate."
                 )
             }
             Self::DeferredToolCallRequired => "[SYSTEM] HARD REQUIREMENT: your next reply MUST include at least one tool call. Do NOT return planning text like \"I'll do X\". Text-only replies are invalid for this request.".to_string(),

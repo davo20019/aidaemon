@@ -27,7 +27,7 @@ pub use conversation::{
 pub use dialogue::{
     ActiveTaskRef, ActiveTaskStatus, AssistantTurnKind, AssistantTurnSummary, DialogueState,
     OpenQuestion, OpenRequest, OpenRequestStatus, QuestionKind, RequestCompletionContract,
-    RequestForbiddenAction, RequestTaskKind, RequestVerificationTarget,
+    RequestEvidenceRequirement, RequestForbiddenAction, RequestTaskKind, RequestVerificationTarget,
     RequestVerificationTargetKind, UserTurnKind, UserTurnSummary,
 };
 pub use dynamic::{
@@ -72,12 +72,14 @@ pub use provider::{
 pub use self_correction::*;
 #[allow(unused_imports)]
 pub use tools::{
-    semantics_for_exact_read_actions, AgentRole, DurableReplayDecision, ReadFileResultMetadata,
-    ReadFileSelectionMetadata, SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata,
-    ToolCallOperation, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolExecutionContext,
-    ToolMutationEffects, ToolOutcomeStatus, ToolResultPresentation, ToolRole,
-    ToolSemanticAffordances, ToolSemanticFacet, ToolSemanticScope, ToolTargetHint,
-    ToolTargetHintKind, ToolVerificationMode, TruncationInfo,
+    semantics_for_exact_read_actions, AgentRole, DurableReplayDecision, EvidenceAuthority,
+    EvidencePurpose, EvidenceTemporalScope, ReadFileResultMetadata, ReadFileSelectionMetadata,
+    SpecialistKind, Tool, ToolCallEffect, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability, ToolExecutionContext,
+    ToolMutationEffects, ToolOutcomeStatus, ToolResultCompleteness, ToolResultContentSource,
+    ToolResultPresentation, ToolResultProvenance, ToolRole, ToolSemanticAffordances,
+    ToolSemanticFacet, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind, ToolVerificationMode,
+    TruncationInfo,
 };
 pub use trigger_event::TriggerEvent;
 

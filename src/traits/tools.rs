@@ -278,6 +278,132 @@ pub enum ToolSemanticScope {
     HostLocal,
 }
 
+impl ToolSemanticScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GoalState => "goal_state",
+            Self::UserMemory => "user_memory",
+            Self::ConversationHistory => "conversation_history",
+            Self::ExternalRemote => "external_remote",
+            Self::LocalWorkspace => "local_workspace",
+            Self::HostLocal => "host_local",
+        }
+    }
+}
+
+/// The kind of claim an observation can support. These are evidence roles,
+/// not request-language keywords or tool names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidencePurpose {
+    CurrentState,
+    HistoricalRecord,
+    Content,
+    Outcome,
+    Attribution,
+    CausalExplanation,
+}
+
+impl EvidencePurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentState => "current_state",
+            Self::HistoricalRecord => "historical_record",
+            Self::Content => "content",
+            Self::Outcome => "outcome",
+            Self::Attribution => "attribution",
+            Self::CausalExplanation => "causal_explanation",
+        }
+    }
+}
+
+/// Strength of the source behind an observation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAuthority {
+    /// A compressed memory, model-derived summary, or other discovery lead.
+    Advisory,
+    /// A direct observation of the resource being discussed.
+    Direct,
+    /// The daemon's authoritative ledger for the historical fact in question.
+    Canonical,
+}
+
+impl EvidenceAuthority {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Advisory => 0,
+            Self::Direct => 1,
+            Self::Canonical => 2,
+        }
+    }
+
+    pub const fn satisfies(self, required: Self) -> bool {
+        self.rank() >= required.rank()
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Direct => "direct",
+            Self::Canonical => "canonical",
+        }
+    }
+}
+
+/// Time coverage of an observation surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceTemporalScope {
+    Current,
+    Historical,
+    Both,
+}
+
+impl EvidenceTemporalScope {
+    pub const fn satisfies(self, required: Self) -> bool {
+        matches!(required, Self::Both) && matches!(self, Self::Both)
+            || matches!(required, Self::Current) && matches!(self, Self::Current | Self::Both)
+            || matches!(required, Self::Historical) && matches!(self, Self::Historical | Self::Both)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Historical => "historical",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// Claim-support metadata for one successful tool result. Unlike
+/// [`ToolCapabilities`], this describes what information the result can prove,
+/// not whether executing the tool is safe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolEvidenceCapability {
+    pub scope: ToolSemanticScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purposes: Vec<EvidencePurpose>,
+    pub authority: EvidenceAuthority,
+    pub temporal_scope: EvidenceTemporalScope,
+}
+
+impl ToolEvidenceCapability {
+    pub fn new(
+        scope: ToolSemanticScope,
+        purposes: &[EvidencePurpose],
+        authority: EvidenceAuthority,
+        temporal_scope: EvidenceTemporalScope,
+    ) -> Self {
+        Self {
+            scope,
+            purposes: purposes.to_vec(),
+            authority,
+            temporal_scope,
+        }
+    }
+}
+
 /// Fine-grained semantic capability advertised by a tool.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -357,6 +483,11 @@ pub struct ToolCallSemantics {
     /// language action inferred by the policy layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<ToolCallOperation>,
+    /// Typed claim-support affordances for this exact call/result. These are
+    /// persisted in the durable receipt so recovery and completion do not have
+    /// to reconstruct evidence from prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ToolEvidenceCapability>,
 }
 
 impl ToolCallSemantics {
@@ -431,6 +562,11 @@ impl ToolCallSemantics {
         self
     }
 
+    pub fn with_evidence(mut self, evidence: Vec<ToolEvidenceCapability>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+
     pub fn observes_state(&self) -> bool {
         self.effect.observes_state()
     }
@@ -449,6 +585,7 @@ impl ToolCallSemantics {
             && self.mutation_effects.is_empty()
             && self.target_hints.is_empty()
             && self.operation.is_none()
+            && self.evidence.is_empty()
     }
 
     pub fn merge_missing_from(&mut self, fallback: Self) {
@@ -466,6 +603,9 @@ impl ToolCallSemantics {
         }
         if self.operation.is_none() {
             self.operation = fallback.operation;
+        }
+        if self.evidence.is_empty() {
+            self.evidence = fallback.evidence;
         }
     }
 }
@@ -512,6 +652,131 @@ pub struct TruncationInfo {
     pub remediation_hint: Option<String>,
 }
 
+/// Whether a particular retained view contains the authoritative tool result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultCompleteness {
+    Complete,
+    Truncated,
+    #[default]
+    Unavailable,
+}
+
+impl ToolResultCompleteness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Truncated => "truncated",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Origin of the bytes represented by a durable observation receipt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultContentSource {
+    ToolOutput,
+    DurableReplay,
+    SpillPreview,
+    PersistentSummary,
+    #[default]
+    Unavailable,
+}
+
+impl ToolResultContentSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolOutput => "tool_output",
+            Self::DurableReplay => "durable_replay",
+            Self::SpillPreview => "spill_preview",
+            Self::PersistentSummary => "persistent_summary",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Content provenance shared by live completion and durable continuation.
+/// The digest is computed over the authoritative pre-compression result; the
+/// view-specific fields state exactly what the model and event log retained.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolResultProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub source: ToolResultContentSource,
+    #[serde(default)]
+    pub model_view_completeness: ToolResultCompleteness,
+    #[serde(default)]
+    pub durable_view_completeness: ToolResultCompleteness,
+    #[serde(default)]
+    pub authoritative_chars: usize,
+    #[serde(default)]
+    pub model_visible_chars: usize,
+    #[serde(default)]
+    pub durable_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_range: Option<ReadFileSelectionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_start_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_end_line: Option<usize>,
+}
+
+impl ToolResultProvenance {
+    pub fn from_authoritative_result(
+        result: &str,
+        metadata: &ToolCallMetadata,
+        source: ToolResultContentSource,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let sha256 = format!("{:x}", Sha256::digest(result.as_bytes()));
+        let chars = result.chars().count();
+        let tool_truncated = metadata.truncation.is_some()
+            || metadata
+                .read_file
+                .as_ref()
+                .is_some_and(|read| read.truncated);
+        let completeness = if tool_truncated {
+            ToolResultCompleteness::Truncated
+        } else {
+            ToolResultCompleteness::Complete
+        };
+        let read = metadata.read_file.as_ref();
+        Self {
+            result_id: Some(format!("sha256:{sha256}")),
+            sha256: Some(sha256),
+            source,
+            model_view_completeness: completeness,
+            durable_view_completeness: completeness,
+            authoritative_chars: chars,
+            model_visible_chars: chars,
+            durable_chars: chars,
+            requested_range: read.map(|read| read.selection.clone()),
+            returned_start_line: read.and_then(|read| read.returned_start_line),
+            returned_end_line: read.and_then(|read| read.returned_end_line),
+        }
+    }
+
+    pub fn mark_model_view_truncated(&mut self, visible_result: &str) {
+        self.model_visible_chars = visible_result.chars().count();
+        self.model_view_completeness = ToolResultCompleteness::Truncated;
+    }
+
+    pub fn record_durable_view(&mut self, durable_result: &str, is_summary: bool) {
+        self.durable_chars = durable_result.chars().count();
+        if is_summary {
+            self.durable_view_completeness = ToolResultCompleteness::Truncated;
+            self.source = ToolResultContentSource::PersistentSummary;
+        } else {
+            self.durable_view_completeness = self.model_view_completeness;
+        }
+    }
+}
+
 /// Structured outcome of a tool invocation. This separates transport/execution
 /// success from the domain result: a test runner can execute correctly while
 /// reporting failing tests, and a lookup can complete with no matches.
@@ -527,6 +792,17 @@ pub enum ToolOutcomeStatus {
 }
 
 impl ToolOutcomeStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::CompletedWithNegativeResult => "completed_with_negative_result",
+            Self::FailedRetryable => "failed_retryable",
+            Self::FailedPermanent => "failed_permanent",
+            Self::Blocked => "blocked",
+            Self::Backgrounded => "backgrounded",
+        }
+    }
+
     pub fn satisfies_requested_condition(self) -> bool {
         matches!(self, Self::Succeeded)
     }
@@ -593,6 +869,10 @@ pub struct ToolCallMetadata {
     /// model-visible text by the loop after ledger/classifier consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
+    /// Strong provenance for the result body. Populated centrally by the tool
+    /// dispatcher so individual adapters cannot silently omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_provenance: Option<ToolResultProvenance>,
     /// Optional final user-facing reply. When set, the root agent may close the
     /// turn directly from the tool result instead of running another LLM pass.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -820,6 +1100,9 @@ pub struct ToolExecutionContext {
     /// one target-bound call from following redirects outside the target that
     /// was evaluated by the mandate authority kernel.
     pub mandate_execution: bool,
+    /// Hard negative task contract propagated from the validated request.
+    /// Open-ended adapters must prove an operation is observational before I/O.
+    pub mutation_forbidden: bool,
 }
 
 /// A tool-owned decision about whether a previously successful durable receipt

@@ -418,8 +418,8 @@ async function fetchWriteConsistency() {
     html += '<tr><td>Consistency Gate</td><td>' + gateBadge + '</td></tr>';
     html += '<tr><td>Event Rows</td><td class="mono">' + fmtNum(d.conversation_event_rows) + '</td></tr>';
     html += '<tr><td>Missing Message IDs</td><td class="mono">' + fmtNum(d.missing_message_id_events) + '</td></tr>';
-    html += '<tr><td>Global Delta</td><td class="mono">' + fmtNum(d.global_delta) + '</td></tr>';
-    html += '<tr><td>Sessions with Drift</td><td class="mono">' + fmtNum(d.session_mismatch_count) + '</td></tr>';
+    html += '<tr><td>Event / Stable-ID Delta</td><td class="mono">' + fmtNum(d.global_delta) + '</td></tr>';
+    html += '<tr><td>Sessions with ID Drift</td><td class="mono">' + fmtNum(d.session_mismatch_count) + '</td></tr>';
     html += '<tr><td>Stale Task Starts</td><td class="mono">' + fmtNum(d.stale_task_starts) + '</td></tr>';
     if (thresholds.max_abs_global_delta != null) {
       html += '<tr><td>Gate Thresholds</td><td class="mono">delta&lt;=' + fmtNum(thresholds.max_abs_global_delta)
@@ -440,7 +440,7 @@ async function fetchWriteConsistency() {
     const drifts = d.top_session_drifts || [];
     if (drifts.length) {
       html += '<div style="margin-top:.75rem"></div>';
-      html += '<table><tr><th>Session</th><th>Messages</th><th>Events</th><th>Delta</th></tr>';
+      html += '<table><tr><th>Session</th><th>Stable IDs</th><th>Events</th><th>Delta</th></tr>';
       for (const r of drifts) {
         html += '<tr>'
           + '<td class="mono truncate">' + esc(r.session_id) + '</td>'

@@ -2190,7 +2190,7 @@ impl ManageSkillsTool {
             .send(ApprovalRequest {
                 command: description.to_string(),
                 session_id: session_id.to_string(),
-                risk_level: RiskLevel::Medium,
+                risk_level: RiskLevel::High,
                 warnings: vec![
                     "This will add a new skill that can influence AI behavior".to_string()
                 ],

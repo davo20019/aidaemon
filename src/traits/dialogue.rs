@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::tools::ToolMutationEffects;
-use super::tools::ToolSemanticScope;
+use super::tools::{
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ToolMutationEffects,
+    ToolSemanticScope,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +44,21 @@ pub struct RequestVerificationTarget {
     pub value: String,
 }
 
+/// One material information need that must be supported before a request can
+/// complete successfully. The natural-language summary guides investigation;
+/// the typed fields are the completion invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestEvidenceRequirement {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptable_scopes: Vec<ToolSemanticScope>,
+    pub purpose: EvidencePurpose,
+    pub minimum_authority: EvidenceAuthority,
+    pub temporal_scope: EvidenceTemporalScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RequestVerificationTarget>,
+}
+
 /// Durable semantic obligations for an unresolved request. These values come
 /// from a validated task assessment or structural resource identity, never
 /// from replaying natural-language phrase rules on a later turn.
@@ -51,6 +68,16 @@ pub struct RequestCompletionContract {
     pub expects_mutation: bool,
     pub required_mutation_effects: ToolMutationEffects,
     pub forbids_mutation: bool,
+    /// The current request explicitly forbids every tool/lookup path.
+    #[serde(default)]
+    pub forbids_tool_use: bool,
+    /// Capability domains the current request explicitly excludes while
+    /// leaving unrelated tools available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_tool_scopes: Vec<ToolSemanticScope>,
+    /// Exact user-authored labels required in the substantive final answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_response_fields: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_actions: Vec<RequestForbiddenAction>,
     pub requires_observation: bool,
@@ -62,6 +89,10 @@ pub struct RequestCompletionContract {
     pub requires_primary_sources: bool,
     #[serde(default)]
     pub requires_exact_history: bool,
+    /// Material claim-support obligations. Legacy rows omit this field and
+    /// retain the older generic-observation behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_requirements: Vec<RequestEvidenceRequirement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_targets: Vec<RequestVerificationTarget>,
 }

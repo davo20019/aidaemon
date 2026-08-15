@@ -118,6 +118,11 @@ pub(in crate::agent) enum ToolResultNotice {
         prior_signature_failures: usize,
         prior_transient_failures: usize,
     },
+    AggregateSemanticErrorLimitBlocked {
+        tool_name: String,
+        aggregate_failures: usize,
+        prior_transient_failures: usize,
+    },
     WebSearchBudgetBlocked {
         prior_calls: usize,
     },
@@ -441,6 +446,17 @@ Do NOT repeat the same call. Change approach, reduce scope, or tell the user wha
                  answer the user with what you have.",
                 tool_name, prior_signature_failures, prior_transient_failures
             ),
+            Self::AggregateSemanticErrorLimitBlocked {
+                tool_name,
+                aggregate_failures,
+                prior_transient_failures,
+            } => format!(
+                "[SYSTEM] Tool '{}' has hit the aggregate semantic error limit ({} failures across differing signatures) \
+                 (and {} transient failures). \
+                 Do not call it again in this task. Use a different approach or \
+                 answer the user with what you have.",
+                tool_name, aggregate_failures, prior_transient_failures
+            ),
             Self::WebSearchBudgetBlocked { prior_calls } => format!(
                 "[SYSTEM] You have already called web_search {} times. \
                  Synthesize your answer from the results you have.",
@@ -540,6 +556,18 @@ mod tests {
         assert!(rendered.contains("Detected transient failure for `web_fetch`"));
         assert!(rendered.contains("until iteration 7"));
         assert!(rendered.contains("cooldown 2 iterations"));
+    }
+
+    #[test]
+    fn aggregate_semantic_limit_does_not_claim_one_repeated_signature() {
+        let rendered = ToolResultNotice::AggregateSemanticErrorLimitBlocked {
+            tool_name: "manage_mandates".to_string(),
+            aggregate_failures: 6,
+            prior_transient_failures: 1,
+        }
+        .render();
+        assert!(rendered.contains("6 failures across differing signatures"));
+        assert!(!rendered.contains("same failure signature"));
     }
 
     #[test]

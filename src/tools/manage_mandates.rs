@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,8 +15,8 @@ use crate::traits::{
     MandateDecisionCycle, MandateDecisionOutcome, MandateLearningNote, MandateOperatingUpdates,
     MandateOperationScope, MandateReconciliationResolution, MandateStatus, MandateStrategyRevision,
     MandateStrategyRevisionKind, MandateStrategySnapshot, MandateSuspensionKind,
-    MandateTerminationKind, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolRole,
+    MandateTerminationKind, StateStore, Tool, ToolCallMetadata, ToolCallOperation, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus, ToolRole,
 };
 use crate::types::{ApprovalKind, ApprovalResponse};
 
@@ -47,7 +48,14 @@ const MAX_GUIDANCE_ENTRY_TEXT: usize = 1024;
 const MAX_GUIDANCE_TEXT: usize = 8 * 1024;
 const MAX_LEARNING_NOTE_TEXT: usize = 1024;
 const MAX_EVIDENCE_RECEIPTS: usize = 16;
-const CREATE_ONLY_FIELD_DESCRIPTION: &str = "Create only; update rejects.";
+const SOURCE_GOAL_FIELD_DESCRIPTION: &str = "Create only. Optional provenance link to a personal goal created in this exact private owner session; omit it when no compatible goal exists. Updates preserve the existing binding and ignore this field.";
+const DURATION_FIELD_DESCRIPTION: &str = "Create only, relative to activation. Updates ignore this field; use expires_at to change an existing mandate's expiry.";
+const PRIORITY_FIELD_DESCRIPTION: &str = "Create only controller scheduling priority. Updates preserve the existing priority and ignore this field.";
+const CONSTRAINT_FIELD_DESCRIPTION: &str = "Owner-facing guardrail. Use one short plain-language rule per item; split compound rules and avoid implementation jargon.";
+const SUCCESS_FIELD_DESCRIPTION: &str =
+    "Owner-facing, observable success measure. Use one short plain-language result per item.";
+const STOP_FIELD_DESCRIPTION: &str =
+    "Owner-facing reason to stop. Use one short plain-language condition per item.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewEffort {
@@ -335,79 +343,61 @@ impl ManageMandatesTool {
                 "Success criteria: {}",
                 display_policy(&mandate.success_criteria)
             ),
-            "Value contract: every ACT must cite one exact success criterion, current-run evidence, expected benefit, assessed risk, and invalidation criteria; activity alone is not success."
-                .to_string(),
             format!("Stop conditions: {}", display_policy(&mandate.stop_conditions)),
             format!(
-                "Pinned strategy: {}",
+                "Guidance: {}",
                 mandate.strategy.as_ref().map_or_else(
-                    || "none".to_string(),
-                    |strategy| format!(
-                        "{} (sha256:{})",
-                        strategy.skill_name,
-                        &strategy.content_sha256[..12]
-                    )
+                    || "No additional playbook".to_string(),
+                    |strategy| strategy.description.trim().to_string()
                 )
             ),
+            format!("Access summary: {}", display_access_summary(&mandate.authority)),
             format!(
-                "Observations allowed: {}; exact observation/action tools: {}",
-                mandate.authority.allow_observations,
-                display_allowlist(&mandate.authority.allowed_tools)
-            ),
-            format!(
-                "Allowed mutation effects: {}",
-                display_allowlist(&mandate.authority.allowed_mutation_effects)
-            ),
-            format!(
-                "Allowed targets: {}",
-                display_target_scope(&mandate.authority.allowed_target_prefixes)
-            ),
-            format!(
-                "Exact operation scopes: {}",
-                serde_json::to_string(&mandate.authority.operation_scopes)
-                    .unwrap_or_else(|_| "unavailable".to_string())
-            ),
-            format!(
-                "Mutation limits: {} per decision cycle; {} per rolling 24 hours; minimum spacing {} seconds",
+                "Mutation limits: Up to {} change{} per review and {} in any 24 hours. At least {} between changes.",
                 mandate.authority.max_mutating_actions_per_cycle,
+                if mandate.authority.max_mutating_actions_per_cycle == 1 { "" } else { "s" },
                 mandate.authority.max_mutating_actions_per_rolling_24h,
-                mandate.authority.min_seconds_between_mutations
+                display_duration(mandate.authority.min_seconds_between_mutations.into())
             ),
             format!(
-                "Review interval: {}–{} minutes (default {})",
-                mandate.min_review_secs / 60,
-                mandate.max_review_secs / 60,
-                mandate.default_review_secs / 60
+                "Review interval: Usually every {}; may vary from {} to {}.",
+                display_duration(mandate.default_review_secs),
+                display_duration(mandate.min_review_secs),
+                display_duration(mandate.max_review_secs)
             ),
             format!(
                 "Expiration: {}",
                 activation_duration_secs.map_or_else(
-                    || mandate.expires_at.as_deref().unwrap_or("none").to_string(),
-                    |duration_secs| format!("{duration_secs} seconds after actual activation")
+                    || display_expiration(mandate.expires_at.as_deref()),
+                    |duration_secs| format!("{} after activation", display_duration(duration_secs))
                 )
             ),
             format!(
-                "Review effort: {}; capacity is {} from cadence with internal runaway protection",
-                capacity.display_mode(),
-                if capacity.automatically_managed() {
-                    "automatically managed"
-                } else {
-                    "legacy custom"
+                "Review depth: {}",
+                friendly_review_effort(capacity.display_mode())
+            ),
+            format!(
+                "Autonomy mode: {}",
+                match mandate.autonomy_mode {
+                    MandateAutonomyMode::Bounded => {
+                        "Bounded — works independently only within the rules shown here"
+                    }
+                    MandateAutonomyMode::Autopilot => {
+                        "Autopilot — handles routine decisions within the rules shown here"
+                    }
                 }
             ),
-            format!("Autonomy mode: {}", mandate.autonomy_mode),
             format!(
-                "Confirmation binding: mandate {} policy version {}; exact accounts, operations, targets, limits, and guardrails shown here",
-                mandate.id, proposed_policy_version
+                "Policy reference: Version {proposed_policy_version}. Approval applies only to the rules and limits summarized here."
             ),
         ];
         if mandate.autonomy_mode.is_autopilot() {
             warnings.push(
-                "Owner checkpoints: only a new account, tool, operation, effect, target, query scope, destructive action, spending authority, private-data scope, or genuinely owner-only judgment requires another confirmation or question. Routine reviews and in-envelope actions do not."
+                "Owner checkpoints: It will ask before using a new account, capability, destination, sensitive data, spending authority, destructive action, or a judgment only you can make."
                     .to_string(),
             );
             warnings.push(
-                "Recovery policy: retry safe internal failures, resume after restart, reconcile durable receipts, and never blindly repeat an externally ambiguous mutation."
+                "Recovery policy: It may retry safe internal failures and resume after restart, but it will never blindly repeat an external action when the result is unclear."
                     .to_string(),
             );
         }
@@ -539,25 +529,6 @@ impl ManageMandatesTool {
                 "Supply every required input, then draft again before create."
             }
         }))?)
-    }
-
-    fn reject_create_only_update_fields(args: &ManageMandatesArgs) -> anyhow::Result<()> {
-        let mut fields = Vec::new();
-        if args.source_goal_id.is_some() {
-            fields.push("source_goal_id");
-        }
-        if args.priority.is_some() {
-            fields.push("priority");
-        }
-        if args.duration_minutes.is_some() {
-            fields.push("duration_minutes");
-        }
-        anyhow::ensure!(
-            fields.is_empty(),
-            "update does not support these create-only fields: {}; create a new mandate to change them",
-            fields.join(", ")
-        );
-        Ok(())
     }
 
     async fn resolve_owned_mandate(
@@ -1213,7 +1184,6 @@ impl ManageMandatesTool {
                     .to_string(),
             );
         }
-        Self::reject_create_only_update_fields(args)?;
         let owner = Self::owner_session(args)?;
         let id = required_trimmed(args.mandate_id.as_deref(), "mandate_id")?;
         let mut mandate = self.resolve_owned_mandate(id, owner).await?;
@@ -1836,6 +1806,59 @@ struct ManageMandatesArgs {
     _task_attempt_id: Option<String>,
 }
 
+impl ManageMandatesArgs {
+    /// Normalize compatibility noise from structured-tool providers before any
+    /// action-specific validation. Some providers materialize every optional
+    /// scalar using an empty string or its schema minimum. Those placeholders
+    /// are not evidence that the caller intended to change a field.
+    fn normalize_for_action(&mut self) {
+        fn trim_optional(value: &mut Option<String>) {
+            let normalized = value
+                .take()
+                .map(|raw| raw.trim().to_string())
+                .filter(|raw| !raw.is_empty());
+            *value = normalized;
+        }
+
+        trim_optional(&mut self.mandate_id);
+        trim_optional(&mut self.objective);
+        trim_optional(&mut self.autonomy_mode);
+        trim_optional(&mut self.source_goal_id);
+        trim_optional(&mut self.strategy_skill);
+        trim_optional(&mut self.expires_at);
+        trim_optional(&mut self.priority);
+        trim_optional(&mut self.review_effort);
+        trim_optional(&mut self.section);
+        trim_optional(&mut self.outcome);
+        trim_optional(&mut self.activity_level);
+        trim_optional(&mut self.rationale);
+        trim_optional(&mut self.question);
+        trim_optional(&mut self.termination_kind);
+        trim_optional(&mut self.termination_match);
+        trim_optional(&mut self.intention);
+        trim_optional(&mut self.value_criterion);
+        trim_optional(&mut self.expected_benefit);
+        trim_optional(&mut self.risk);
+        trim_optional(&mut self.invalidation_criteria);
+        trim_optional(&mut self.learning_note);
+        trim_optional(&mut self.strategy_key);
+        trim_optional(&mut self.strategy_kind);
+        trim_optional(&mut self.guidance);
+        trim_optional(&mut self.reconciliation_resolution);
+
+        if self.action == "update" {
+            // These are creation metadata, not authority. A monolithic tool
+            // schema is exposed to providers that populate all optional fields,
+            // so presence cannot safely mean "change requested" on update.
+            // Preserve the existing values and use the update-native expires_at
+            // field for expiry changes.
+            self.source_goal_id = None;
+            self.priority = None;
+            self.duration_minutes = None;
+        }
+    }
+}
+
 fn op_schema() -> Value {
     json!({
         "type": "array", "minItems": 1, "maxItems": 64,
@@ -1872,13 +1895,13 @@ impl Tool for ManageMandatesTool {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["draft", "create", "list", "get", "update", "pause", "resume", "answer_question", "resolve_reconciliation", "cancel", "record_decision", "list_intentions"] },
-                    "mandate_id": { "type": "string", "maxLength": 256 }, "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT }, "autonomy_mode": { "type": "string", "enum": ["bounded", "autopilot"] }, "source_goal_id": { "type": "string", "maxLength": 256, "description": CREATE_ONLY_FIELD_DESCRIPTION },
+                    "mandate_id": { "type": "string", "maxLength": 256 }, "objective": { "type": "string", "maxLength": MAX_OBJECTIVE_TEXT }, "autonomy_mode": { "type": "string", "enum": ["bounded", "autopilot"] }, "source_goal_id": { "type": "string", "maxLength": 256, "description": SOURCE_GOAL_FIELD_DESCRIPTION },
                     "allow_observations": { "type": "boolean" },
                     "operation_scopes": op_schema(),
                     "max_mutating_actions_per_cycle": { "type": "integer", "minimum": 0, "maximum": 24 }, "max_mutating_actions_per_rolling_24h": { "type": "integer", "minimum": 0, "maximum": 24 }, "min_seconds_between_mutations": { "type": "integer", "minimum": 0 },
-                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } }, "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } }, "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT } },
+                    "constraints": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": CONSTRAINT_FIELD_DESCRIPTION } }, "success_criteria": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": SUCCESS_FIELD_DESCRIPTION } }, "stop_conditions": { "type": "array", "maxItems": MAX_POLICY_ENTRIES, "items": { "type": "string", "maxLength": MAX_POLICY_ENTRY_TEXT, "description": STOP_FIELD_DESCRIPTION } },
                     "strategy_skill": { "type": "string", "maxLength": 256 }, "clear_strategy": { "type": "boolean" }, "min_review_minutes": { "type": "integer", "minimum": 1 }, "max_review_minutes": { "type": "integer", "minimum": 1 }, "default_review_minutes": { "type": "integer", "minimum": 1 },
-                    "duration_minutes": { "type": "integer", "minimum": 1, "description": CREATE_ONLY_FIELD_DESCRIPTION }, "expires_at": { "type": "string" }, "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": CREATE_ONLY_FIELD_DESCRIPTION }, "review_effort": { "type": "string", "enum": ["efficient", "balanced", "thorough"] },
+                    "duration_minutes": { "type": "integer", "minimum": 1, "description": DURATION_FIELD_DESCRIPTION }, "expires_at": { "type": "string", "description": "RFC3339 fixed deadline. Supported by both create and update." }, "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": PRIORITY_FIELD_DESCRIPTION }, "review_effort": { "type": "string", "enum": ["efficient", "balanced", "thorough"] },
                     "include_terminal": { "type": "boolean" }, "section": { "type": "string", "enum": ["summary", "policy", "history"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "outcome": { "type": "string", "enum": ["act", "wait", "ask", "stop"] }, "activity_level": { "type": "string", "enum": ["quiet", "active", "urgent"] }, "rationale": { "type": "string", "maxLength": MAX_RATIONALE_TEXT },
                     "observations": { "type": "array", "maxItems": MAX_OBSERVATIONS, "items": { "type": "string", "maxLength": MAX_OBSERVATION_TEXT } }, "evidence_receipt_ids": { "type": "array", "maxItems": MAX_EVIDENCE_RECEIPTS, "items": { "type": "string", "maxLength": 256 } }, "question": { "type": "string", "maxLength": MAX_QUESTION_TEXT },
@@ -1894,7 +1917,8 @@ impl Tool for ManageMandatesTool {
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageMandatesArgs = serde_json::from_str(arguments)?;
+        let mut args: ManageMandatesArgs = serde_json::from_str(arguments)?;
+        args.normalize_for_action();
         match args.action.as_str() {
             "draft" => self.draft(&args).await,
             "create" => self.create(&args).await,
@@ -1908,6 +1932,35 @@ impl Tool for ManageMandatesTool {
             "list_intentions" => self.list_intentions(&args).await,
             other => anyhow::bail!("unknown manage_mandates action `{other}`"),
         }
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.call(arguments).await?;
+        let trimmed = output.trim_start();
+        let outcome_status = if trimmed.starts_with("Mandates can only")
+            || trimmed.starts_with("Mandate authority can only")
+            || trimmed.starts_with("Mandate intentions can only")
+        {
+            ToolOutcomeStatus::Blocked
+        } else if trimmed.contains("confirmation was declined")
+            || trimmed.starts_with("Mandate update cancelled")
+            || trimmed.contains("pending mandate was cancelled")
+        {
+            ToolOutcomeStatus::CompletedWithNegativeResult
+        } else {
+            ToolOutcomeStatus::Succeeded
+        };
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(outcome_status),
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 
     fn tool_role(&self) -> ToolRole {
@@ -2344,20 +2397,188 @@ fn append_owner_guidance(existing: Option<&str>, guidance: &str) -> anyhow::Resu
     Ok(serde_json::to_string(&context)?)
 }
 
-fn display_allowlist(values: &[String]) -> String {
-    if values.is_empty() {
-        "none (controller protocol only)".to_string()
-    } else {
-        values.join(", ")
+fn display_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds == 0 {
+        return "no delay".to_string();
+    }
+    if seconds % 86_400 == 0 {
+        let days = seconds / 86_400;
+        return format!("{days} day{}", if days == 1 { "" } else { "s" });
+    }
+    if seconds % 3_600 == 0 {
+        let hours = seconds / 3_600;
+        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
+    }
+    if seconds % 60 == 0 {
+        let minutes = seconds / 60;
+        return format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" });
+    }
+    format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+}
+
+fn display_expiration(expires_at: Option<&str>) -> String {
+    let Some(expires_at) = expires_at else {
+        return "No automatic end date".to_string();
+    };
+    chrono::DateTime::parse_from_rfc3339(expires_at).map_or_else(
+        |_| "At the configured end date".to_string(),
+        |value| {
+            value
+                .with_timezone(&chrono::Utc)
+                .format("%B %-d, %Y at %-I:%M %p UTC")
+                .to_string()
+        },
+    )
+}
+
+fn friendly_review_effort(value: &str) -> &str {
+    match value {
+        "efficient" => "Light — faster checks for straightforward decisions",
+        "balanced" => "Balanced — standard checks before acting",
+        "thorough" => "Thorough — extra care before acting",
+        _ => "Custom decision checks",
     }
 }
 
-fn display_target_scope(values: &[String]) -> String {
-    if values.is_empty() {
-        "none configured (mutation authority requires explicit targets)".to_string()
-    } else {
-        values.join(", ")
+fn operation_target_label(scope: &MandateOperationScope) -> String {
+    let url = scope
+        .target_prefixes
+        .iter()
+        .find_map(|target| reqwest::Url::parse(target).ok());
+    let Some(url) = url else {
+        return match scope.kind {
+            crate::traits::MandateOperationKind::Observation => "approved information".to_string(),
+            crate::traits::MandateOperationKind::Mutation => "the approved destination".to_string(),
+        };
+    };
+
+    let host = url.host_str().unwrap_or("the approved service");
+    let path = url.path().trim_end_matches('/');
+    if matches!(host, "api.x.com" | "api.twitter.com") {
+        if path == "/2/tweets" {
+            return match scope.kind {
+                crate::traits::MandateOperationKind::Observation => {
+                    "read public posts on X".to_string()
+                }
+                crate::traits::MandateOperationKind::Mutation => {
+                    "publish public posts and replies on X".to_string()
+                }
+            };
+        }
+        if path == "/2/tweets/search/recent" {
+            return "search recent public posts on X".to_string();
+        }
+        if path.ends_with("/mentions") {
+            return "read mentions of the connected X account".to_string();
+        }
+        if path.starts_with("/2/users/") && path.ends_with("/tweets") {
+            return "read posts from the connected X account".to_string();
+        }
     }
+
+    let destination = if path.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}{path}")
+    };
+    match (scope.kind, scope.operation) {
+        (crate::traits::MandateOperationKind::Observation, _) => {
+            format!("read information from {destination}")
+        }
+        (_, ToolCallOperation::Post) => format!("create content at {destination}"),
+        (_, ToolCallOperation::Put | ToolCallOperation::Patch) => {
+            format!("update content at {destination}")
+        }
+        (_, ToolCallOperation::Delete) => format!("delete content at {destination}"),
+        _ => format!("use {destination}"),
+    }
+}
+
+fn display_access_summary(authority: &MandateAuthority) -> String {
+    let mut reads = BTreeSet::new();
+    let mut changes = BTreeSet::new();
+    let mut account_ids = BTreeSet::new();
+    let mut connection_names = BTreeSet::new();
+
+    for scope in &authority.operation_scopes {
+        let label = operation_target_label(scope);
+        match scope.kind {
+            crate::traits::MandateOperationKind::Observation => {
+                reads.insert(label);
+            }
+            crate::traits::MandateOperationKind::Mutation => {
+                changes.insert(label);
+            }
+        }
+        for target in &scope.target_prefixes {
+            if let Some(account) = target.strip_prefix("account:") {
+                account_ids.insert(account.to_string());
+            } else if let Some(profile) = target.strip_prefix("auth_profile:") {
+                connection_names.insert(match profile {
+                    "twitter" | "x" => "X".to_string(),
+                    other => other.replace(['_', '-'], " "),
+                });
+            }
+        }
+    }
+
+    // Older persisted mandates may predate tuple-scoped policy. Keep their
+    // confirmation truthful without surfacing adapter names or raw target data.
+    if authority.operation_scopes.is_empty() {
+        if authority.allow_observations {
+            reads.insert("approved sources only".to_string());
+        }
+        if authority.max_mutating_actions_per_cycle > 0
+            && !authority.allowed_mutation_effects.is_empty()
+        {
+            changes.insert("approved destinations only".to_string());
+        }
+        for target in &authority.allowed_target_prefixes {
+            if let Some(account) = target.strip_prefix("account:") {
+                account_ids.insert(account.to_string());
+            } else if let Some(profile) = target.strip_prefix("auth_profile:") {
+                connection_names.insert(match profile {
+                    "twitter" | "x" => "X".to_string(),
+                    other => other.replace(['_', '-'], " "),
+                });
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    if reads.is_empty() {
+        lines.push("Read: No autonomous read access".to_string());
+    } else {
+        lines.push(format!(
+            "Read: {}",
+            reads.into_iter().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if changes.is_empty() {
+        lines.push("Change: No external changes".to_string());
+    } else {
+        lines.push(format!(
+            "Change: {}",
+            changes.into_iter().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if !account_ids.is_empty() {
+        let service = if connection_names.is_empty() {
+            "saved connection".to_string()
+        } else {
+            format!(
+                "saved {} connection",
+                connection_names.into_iter().collect::<Vec<_>>().join("/")
+            )
+        };
+        lines.push(format!(
+            "Account: Only account {} through the {service}",
+            account_ids.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    lines.push("Everything else remains blocked".to_string());
+    lines.join("\n")
 }
 
 fn display_policy(values: &[String]) -> String {
@@ -2366,10 +2587,9 @@ fn display_policy(values: &[String]) -> String {
     } else {
         values
             .iter()
-            .enumerate()
-            .map(|(index, value)| format!("{}. {}", index + 1, value))
+            .map(|value| format!("• {}", value.replace("; ", ";\n  ↳ ")))
             .collect::<Vec<_>>()
-            .join(" | ")
+            .join("\n")
     }
 }
 
@@ -2378,6 +2598,78 @@ mod tests {
     use super::*;
     use crate::testing::{setup_test_agent, MockProvider};
     use crate::traits::store_prelude::*;
+
+    #[test]
+    fn confirmation_access_summary_translates_scopes_without_leaking_adapter_json() {
+        let mut authority = MandateAuthority::default();
+        authority.operation_scopes = serde_json::from_value(json!([
+            {
+                "tool": "http_request",
+                "operation": "GET",
+                "kind": "observation",
+                "target_prefixes": [
+                    "https://api.x.com/2/users/12345/mentions",
+                    "auth_profile:twitter",
+                    "account:12345"
+                ],
+                "allowed_query_params": ["max_results"],
+                "mutation_effects": []
+            },
+            {
+                "tool": "http_request",
+                "operation": "GET",
+                "kind": "observation",
+                "target_prefixes": [
+                    "https://api.x.com/2/tweets/search/recent",
+                    "auth_profile:twitter",
+                    "account:12345"
+                ],
+                "allowed_query_params": ["query"],
+                "mutation_effects": []
+            },
+            {
+                "tool": "http_request",
+                "operation": "POST",
+                "kind": "mutation",
+                "target_prefixes": [
+                    "https://api.x.com/2/tweets",
+                    "auth_profile:twitter",
+                    "account:12345"
+                ],
+                "allowed_query_params": [],
+                "mutation_effects": ["remote_mutation", "external_delivery"]
+            }
+        ]))
+        .unwrap();
+
+        let summary = display_access_summary(&authority);
+        assert!(summary.contains("read mentions of the connected X account"));
+        assert!(summary.contains("search recent public posts on X"));
+        assert!(summary.contains("publish public posts and replies on X"));
+        assert!(summary.contains("Only account 12345 through the saved X connection"));
+        for internal_term in [
+            "http_request",
+            "api.x.com",
+            "auth_profile",
+            "allowed_query_params",
+            "mutation_effects",
+        ] {
+            assert!(!summary.contains(internal_term), "leaked {internal_term}");
+        }
+    }
+
+    #[test]
+    fn confirmation_policy_is_scannable_plain_text() {
+        let rendered = display_policy(&[
+            "Use only the connected account; never impersonate a person; never buy engagement"
+                .to_string(),
+            "Do not disclose private information".to_string(),
+        ]);
+        assert!(rendered.starts_with("• Use only the connected account"));
+        assert!(rendered.contains("\n  ↳ never impersonate a person"));
+        assert!(rendered.contains("\n• Do not disclose private information"));
+        assert!(!rendered.contains(" | "));
+    }
 
     #[test]
     fn clean_strings_removes_empty_constraints() {
@@ -2675,17 +2967,24 @@ mod tests {
         let request = approval_rx.recv().await.expect("confirmation request");
         assert!(matches!(request.kind, ApprovalKind::GoalConfirmation));
         assert!(request.command.contains("Steward @aidaemon_ai"));
-        assert!(request
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("http_request")));
         assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Review effort: balanced") && warning.contains("automatically managed")
+            warning.contains("Access summary:")
+                && warning.contains("publish public posts and replies on X")
+                && warning.contains("Only account 12345 through the saved X connection")
         }));
         assert!(request
             .warnings
             .iter()
-            .any(|warning| warning == "Expiration: 3600 seconds after actual activation"));
+            .any(|warning| warning == "Review depth: Balanced — standard checks before acting"));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| warning == "Expiration: 1 hour after activation"));
+        assert!(request.warnings.iter().all(|warning| {
+            !warning.contains("http_request")
+                && !warning.contains("auth_profile:")
+                && !warning.contains("api.x.com")
+        }));
         assert!(request.warnings.iter().any(|warning| {
             warning.contains("Timing normalized")
                 && warning.contains("expires_at value was ignored")
@@ -2773,20 +3072,22 @@ mod tests {
         let request = approval_rx.recv().await.expect("autopilot confirmation");
         assert!(matches!(request.kind, ApprovalKind::AutopilotConfirmation));
         assert!(request.command.starts_with("Enable Autopilot:"));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Autonomy mode: Autopilot")
+                && warning.contains("handles routine decisions")
+        }));
+        assert!(request.warnings.iter().any(|warning| {
+            warning.contains("Policy reference: Version 2")
+                && warning.contains("rules and limits summarized here")
+        }));
+        assert!(request.warnings.iter().any(|warning| {
+            warning
+                .contains("Only account synthetic-1 through the saved synthetic social connection")
+        }));
         assert!(request
             .warnings
             .iter()
-            .any(|warning| warning == "Autonomy mode: autopilot"));
-        assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Confirmation binding:") && warning.contains("policy version 2")
-        }));
-        assert!(request.warnings.iter().any(|warning| {
-            warning.contains("account:synthetic-1")
-                && warning.contains("https://api.example.test/v1/posts")
-        }));
-        assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Review effort: thorough") && warning.contains("automatically managed")
-        }));
+            .any(|warning| warning == "Review depth: Thorough — extra care before acting"));
         assert!(request
             .warnings
             .iter()
@@ -2861,14 +3162,13 @@ mod tests {
             "Constraints:",
             "Success criteria:",
             "Stop conditions:",
-            "Pinned strategy:",
-            "Observations allowed: false",
-            "Allowed mutation effects:",
-            "Allowed targets:",
+            "Guidance:",
+            "Access summary:",
             "Mutation limits:",
             "Review interval:",
             "Expiration:",
-            "Review effort:",
+            "Review depth:",
+            "Policy reference:",
         ] {
             assert!(
                 request
@@ -2876,6 +3176,20 @@ mod tests {
                     .iter()
                     .any(|warning| warning.contains(expected)),
                 "missing confirmation field {expected}"
+            );
+        }
+        let rendered = request.warnings.join("\n");
+        for internal_term in [
+            "sha256:",
+            "Allowed targets:",
+            "Exact operation scopes:",
+            "allowed_query_params",
+            "mutation_effects",
+            "Confirmation binding:",
+        ] {
+            assert!(
+                !rendered.contains(internal_term),
+                "confirmation leaked internal term {internal_term}"
             );
         }
 
@@ -3134,11 +3448,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_and_documents_create_only_fields() {
+    async fn update_ignores_provider_filled_create_only_fields() {
+        let mut args: ManageMandatesArgs = serde_json::from_str(
+            r#"{
+                "action":"update",
+                "mandate_id":"mandate-1",
+                "source_goal_id":"",
+                "priority":"critical",
+                "duration_minutes":1,
+                "expires_at":"2027-02-15T13:31:00Z"
+            }"#,
+        )
+        .unwrap();
+        args.normalize_for_action();
+        assert_eq!(args.source_goal_id, None);
+        assert_eq!(args.priority, None);
+        assert_eq!(args.duration_minutes, None);
+        assert_eq!(args.expires_at.as_deref(), Some("2027-02-15T13:31:00Z"));
+
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
         let tool = ManageMandatesTool::new(harness.state, ApprovalBroker::new(approval_tx));
-
         let schema = tool.schema();
         for field in ["source_goal_id", "priority", "duration_minutes"] {
             let description = schema["parameters"]["properties"][field]["description"]
@@ -3147,29 +3477,60 @@ mod tests {
             assert!(description.contains("Create only"), "{field}");
             let description = description.to_ascii_lowercase();
             assert!(description.contains("update"), "{field}");
-            assert!(description.contains("reject"), "{field}");
+            assert!(description.contains("ignore"), "{field}");
         }
+    }
 
-        let error = tool
-            .call(
-                r#"{
-                    "action":"update",
-                    "mandate_id":"not-consulted",
-                    "source_goal_id":"source-goal",
-                    "priority":"critical",
-                    "duration_minutes":60,
-                    "_session_id":"owner-session",
-                    "_user_role":"owner",
-                    "_channel_visibility":"private"
-                }"#,
+    #[tokio::test]
+    async fn policy_get_reports_typed_success_when_policy_mentions_unauthorized_behavior() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Inspect a mandate policy",
+            "owner-session",
+            Some(100_000),
+            Some(1_000_000),
+        );
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Review a bounded source",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            4 * 60 * 60,
+        );
+        mandate
+            .stop_conditions
+            .push("Any unauthorized API behavior.".to_string());
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+
+        let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
+        let tool = ManageMandatesTool::new(state, ApprovalBroker::new(approval_tx));
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "get",
+                    "mandate_id": mandate.id,
+                    "section": "policy",
+                    "_session_id": "owner-session",
+                    "_user_role": "owner",
+                    "_channel_visibility": "private"
+                })
+                .to_string(),
+                None,
             )
             .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("create-only fields"));
-        for field in ["source_goal_id", "priority", "duration_minutes"] {
-            assert!(message.contains(field), "{field}");
-        }
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert!(outcome.output.contains("unauthorized API behavior"));
     }
 
     #[tokio::test]
@@ -3206,6 +3567,10 @@ mod tests {
                     "action": "update",
                     "mandate_id": mandate_id,
                     "review_effort": "thorough",
+                    "source_goal_id": "",
+                    "priority": "critical",
+                    "duration_minutes": 1,
+                    "expires_at": "2099-02-15T13:31:00Z",
                     "_session_id": "owner-session",
                     "_user_role": "owner",
                     "_channel_visibility": "private"
@@ -3218,9 +3583,10 @@ mod tests {
             .recv()
             .await
             .expect("budget update confirmation");
-        assert!(request.warnings.iter().any(|warning| {
-            warning.contains("Review effort: thorough") && warning.contains("automatically managed")
-        }));
+        assert!(request
+            .warnings
+            .iter()
+            .any(|warning| { warning == "Review depth: Thorough — extra care before acting" }));
         request
             .response_tx
             .send(ApprovalResponse::AllowOnce)
@@ -3231,9 +3597,15 @@ mod tests {
         let updated_goal = state.get_goal(&goal.id).await.unwrap().unwrap();
         assert_eq!(updated_goal.budget_per_check, Some(500_000));
         assert_eq!(updated_goal.budget_daily, Some(4_000_000));
+        assert_eq!(updated_goal.priority, goal.priority);
         let updated_mandate = state.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(updated_mandate.version, mandate.version + 1);
         assert_eq!(updated_mandate.review_effort, "thorough");
+        assert_eq!(updated_mandate.source_goal_id, mandate.source_goal_id);
+        assert_eq!(
+            updated_mandate.expires_at.as_deref(),
+            Some("2099-02-15T13:31:00Z")
+        );
     }
 
     #[tokio::test]

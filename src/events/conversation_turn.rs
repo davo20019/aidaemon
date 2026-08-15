@@ -147,6 +147,21 @@ fn attachments_from_event_data(data: &Value) -> Vec<MessageAttachment> {
         .unwrap_or_default()
 }
 
+fn tool_result_content_with_receipt(data: &Value) -> String {
+    let result = data
+        .get("result")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let Some(receipt) = data
+        .get("receipt")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<super::ToolReceiptV1>(value).ok())
+    else {
+        return result.to_string();
+    };
+    format!("{}\n{}", receipt.context_header(), result)
+}
+
 /// Project a single canonical conversation event into an event-native turn.
 pub fn turn_from_event(
     event_id: i64,
@@ -203,12 +218,7 @@ pub fn turn_from_event(
             created_at,
             role: ConversationTurnRole::Tool,
             message_id,
-            content: Some(
-                data.get("result")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
+            content: Some(tool_result_content_with_receipt(data)),
             tool_call_id: Some(
                 data.get("tool_call_id")
                     .and_then(|v| v.as_str())
@@ -282,6 +292,45 @@ mod tests {
         assert_eq!(turn.turn_id.as_deref(), Some("turn-9"));
         let msg = turn.into_message();
         assert_eq!(msg.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn reconstructed_tool_result_exposes_durable_receipt_state() {
+        let data = json!({
+            "message_id": "tool-message-1",
+            "tool_call_id": "tool-call-1",
+            "name": "read_file",
+            "result": "synthetic content",
+            "receipt": {
+                "schema_version": 2,
+                "outcome_status": "succeeded",
+                "outcome_evidence": "structured_metadata",
+                "timed_out": false,
+                "background_started": false,
+                "detached": false,
+                "completion_notifications_enabled": false,
+                "result_provenance": {
+                    "result_id": "sha256:synthetic",
+                    "sha256": "synthetic",
+                    "source": "tool_output",
+                    "model_view_completeness": "complete",
+                    "durable_view_completeness": "truncated",
+                    "authoritative_chars": 40,
+                    "model_visible_chars": 40,
+                    "durable_chars": 17,
+                    "requested_range": "full",
+                    "returned_start_line": 1,
+                    "returned_end_line": 3
+                },
+                "semantics": {}
+            }
+        });
+        let turn = turn_from_event(1, "synthetic-session", "tool_result", &data, Utc::now())
+            .expect("tool turn");
+        let content = turn.content.expect("tool content");
+        assert!(content.contains("Tool receipt v2"));
+        assert!(content.contains("durable_view=truncated"));
+        assert!(content.ends_with("synthetic content"));
     }
 
     #[test]

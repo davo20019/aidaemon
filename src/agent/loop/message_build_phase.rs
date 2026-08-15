@@ -128,8 +128,8 @@ fn compact_parent_answer(content: &str, max_chars: usize) -> String {
 
 /// Provider-valid shell for the immediately preceding turn when its complete
 /// archived rendering cannot fit even the low-water window. Retain the human
-/// request, final answer, and delivery evidence; discard tool protocol and
-/// binary observations. This is intentionally not used for older turns.
+/// request, final answer, and a bounded set of tool observations. This is
+/// intentionally not used for older turns.
 fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
     let prior_user = turn_messages.iter().rev().find_map(|message| {
         if message.role != "user" {
@@ -166,17 +166,12 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
         let content = compact_parent_text(&primary, COMPACT_PARENT_DELIVERY_CHARS, false);
         (!content.is_empty()).then_some(content)
     });
-    let mut retrieval_evidence: Vec<(String, String)> = turn_messages
+    let mut observation_evidence: Vec<(String, String)> = turn_messages
         .iter()
         .rev()
         .filter_map(|message| {
             let tool_name = message.tool_name.as_deref()?;
-            if message.role != "tool"
-                || !matches!(
-                    tool_name,
-                    "manage_memories" | "search_history" | "web_search"
-                )
-            {
+            if message.role != "tool" {
                 return None;
             }
             let primary = message.primary_content().unwrap_or_default();
@@ -185,7 +180,7 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
         })
         .take(COMPACT_PARENT_RETRIEVAL_ITEMS)
         .collect();
-    retrieval_evidence.reverse();
+    observation_evidence.reverse();
 
     let mut compact = Vec::with_capacity(2);
     if let Some(prior_user) = prior_user {
@@ -196,7 +191,7 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
     }
 
     let mut assistant_lines = vec![
-        "[Immediate prior turn retained in compact form; binary observations and tool protocol omitted.]"
+        "[Immediate prior turn retained in compact form; tool protocol omitted and observations are explicitly bounded.]"
             .to_string(),
     ];
     if let Some(prior_assistant) = prior_assistant {
@@ -205,10 +200,10 @@ fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
     if let Some(delivery_evidence) = delivery_evidence {
         assistant_lines.push(format!("Delivery evidence: {delivery_evidence}"));
     }
-    if !retrieval_evidence.is_empty() {
-        assistant_lines.push("Prior retrieval evidence:".to_string());
+    if !observation_evidence.is_empty() {
+        assistant_lines.push("Prior bounded tool evidence:".to_string());
         assistant_lines.extend(
-            retrieval_evidence
+            observation_evidence
                 .into_iter()
                 .map(|(tool, evidence)| format!("- {tool}: {evidence}")),
         );
@@ -871,9 +866,41 @@ pub(super) async fn run_message_build_phase(
         &render_options,
     );
 
+    // The channel UI may retain more turns than the active model window. Make
+    // that boundary explicit so absence from this request is never interpreted
+    // as evidence that an earlier visible result did not exist.
+    let oldest_retained_turn_seq = archived_renders
+        .first()
+        .map(|render| render.turn_seq)
+        .unwrap_or(current_turn.turn_seq);
+    let exact_older_history_omitted = match agent
+        .event_store
+        .get_recent_turns_page(session_id, Some(oldest_retained_turn_seq), 1)
+        .await
+    {
+        Ok(older) => !older.is_empty(),
+        Err(error) => {
+            warn!(
+                session_id,
+                %error,
+                "Could not determine exact older-history availability"
+            );
+            false
+        }
+    };
+
     // Step 6 (assembly, part 1): archived turns first, then the current turn.
     // Pillar A tail + core insertion happen further below, unchanged.
     let mut messages: Vec<Value> = Vec::new();
+    if exact_older_history_omitted {
+        let summary_boundary = ctx.summary_last_message_id.unwrap_or("none");
+        messages.push(json!({
+            "role": "system",
+            "content": format!(
+                "[Context availability: exact_older_turns=omitted; omitted_before_turn_seq={oldest_retained_turn_seq}; reason=context_window_or_summary_boundary; summary_last_message_id={summary_boundary}; visible_channel_history_may_be_larger=true] Older exact conversation turns are outside the active model window. A missing prior detail is unavailable in this context, not disproven. State that limitation explicitly unless canonical history evidence is already supplied in the retained context."
+            )
+        }));
+    }
     let exact_parent_found = archived_renders
         .iter()
         .any(|render| render.contains_prior_assistant);
@@ -1724,9 +1751,11 @@ mod tests {
         assert!(serialized.contains("Create a two-page PDF"));
         assert!(serialized.contains("Headless WordPress in the Age of AI Agents"));
         assert!(serialized.contains("Headless-WordPress-AI-Agents.pdf"));
-        assert!(!serialized.contains("SCREENSHOT_STATE"));
+        assert!(serialized.contains("Prior bounded tool evidence"));
+        assert!(serialized.contains("SCREENSHOT_STATE"));
+        assert!(serialized.contains("..."));
         assert!(!serialized.contains("large-preview.png"));
-        assert!(serialized.len() < 4_000, "compact shell was {serialized}");
+        assert!(serialized.len() < 6_000, "compact shell was {serialized}");
         assert!(compact.iter().all(|message| {
             matches!(
                 message.get("role").and_then(Value::as_str),

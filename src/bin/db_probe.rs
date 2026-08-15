@@ -1523,7 +1523,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let reconciliation = telemetry_reconciliation_counts(&token_call_ids, &event_rows);
     println!(
-        "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} legacy_token_rows={} legacy_event_rows={}",
+        "- token_rows={} llm_events={} llm_events_token_usage_present={} correlated={} token_only={} event_only={} duplicate_token_rows={} duplicate_event_rows={} unattributed_legacy_token_rows={} unattributed_legacy_event_rows={}",
         token_call_ids.len(),
         llm_rows.len(),
         events_with_usage,

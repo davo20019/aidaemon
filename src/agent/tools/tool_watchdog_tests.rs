@@ -396,6 +396,7 @@ fn mandate_tool_ctx<'a>(
         suppress_trusted_session: false,
         mandate_authority: grant,
         mandate_tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
+        mutation_forbidden: false,
     }
 }
 
@@ -456,6 +457,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -500,6 +502,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -536,6 +539,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -573,6 +577,7 @@ async fn execute_tool_watchdog_injects_project_scope_into_spawn_agent() {
                 suppress_trusted_session: false,
             mandate_authority: None,
             mandate_tool_call_id: None,
+            mutation_forbidden: false,
             },
         )
         .await
@@ -623,6 +628,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         suppress_trusted_session: false,
         mandate_authority: grant,
         mandate_tool_call_id: grant.and_then(|value| value.tool_call_id.as_deref()),
+        mutation_forbidden: false,
     };
 
     let executor_read = harness
@@ -903,6 +909,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
                 suppress_trusted_session: false,
                 mandate_authority: Some(&grant),
                 mandate_tool_call_id: grant.tool_call_id.as_deref(),
+                mutation_forbidden: false,
             },
         )
         .await

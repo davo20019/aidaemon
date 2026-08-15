@@ -113,7 +113,7 @@ impl MockProvider {
         self
     }
 
-    /// Helper for a complete schema-v2 semantic assessment used by tests.
+    /// Helper for a complete semantic assessment used by tests.
     pub fn semantic_task_assessment(
         task_kind: &str,
         expects_mutation: bool,
@@ -122,9 +122,33 @@ impl MockProvider {
         request_relationship: &str,
         semantic_scope: &str,
     ) -> ProviderResponse {
+        let evidence_requirements = if requires_observation {
+            let (scope, purpose, authority, temporal_scope) = match semantic_scope {
+                "conversation_history" => (
+                    "conversation_history",
+                    "historical_record",
+                    "canonical",
+                    "historical",
+                ),
+                "goal_state" => ("goal_state", "current_state", "canonical", "current"),
+                "user_memory" => ("user_memory", "current_state", "advisory", "current"),
+                "external_remote" => ("external_remote", "current_state", "direct", "current"),
+                "local_workspace" => ("local_workspace", "current_state", "direct", "current"),
+                _ => ("host_local", "current_state", "direct", "current"),
+            };
+            vec![json!({
+                "summary": "Establish the synthetic task's material state",
+                "acceptable_scopes": [scope],
+                "purpose": purpose,
+                "minimum_authority": authority,
+                "temporal_scope": temporal_scope
+            })]
+        } else {
+            Vec::new()
+        };
         Self::text_response(
             &json!({
-                "schema_version": 2,
+                "schema_version": 6,
                 "goal": "Synthetic typed task assessment",
                 "steps": [],
                 "success_criteria": [],
@@ -137,9 +161,13 @@ impl MockProvider {
                     "mutation_scope": "allowed",
                     "forbidden_actions": [],
                     "constraint_evidence": [],
+                    "tool_scope": "allowed",
+                    "tool_constraint_evidence": [],
+                    "required_response_fields": [],
                     "minimum_sources": 0,
                     "requires_primary_sources": false,
                     "requires_exact_history": false,
+                    "evidence_requirements": evidence_requirements,
                     "project_reference": null
                 },
                 "task_shape": {

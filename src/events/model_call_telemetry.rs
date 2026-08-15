@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::traits::{ProviderResponse, TokenUsage, TokenUsageStore};
 
-use super::{EventEmitter, EventStore, EventType, LlmCallData};
+use super::{EventEmitter, EventStore, LlmCallData};
 
 /// Input for a single model-call telemetry recording operation.
 #[derive(Debug, Clone)]
@@ -24,7 +24,7 @@ pub struct ModelCallTelemetryInput {
 /// Record detailed `llm_call` event and optional correlated `token_usage` row.
 pub async fn record_model_call_telemetry(
     emitter: &EventEmitter,
-    state: &dyn TokenUsageStore,
+    _state: &dyn TokenUsageStore,
     mut input: ModelCallTelemetryInput,
 ) {
     let call_id = input
@@ -39,49 +39,18 @@ pub async fn record_model_call_telemetry(
         .or_else(|| input.llm_call.call_purpose.clone());
     input.llm_call.token_usage_present = input.token_usage.is_some();
 
-    let event_result = emitter.emit(EventType::LlmCall, input.llm_call).await;
-
-    let token_result = if let Some(ref usage) = input.token_usage {
-        state
-            .record_token_usage(&input.session_id, usage, Some(&call_id))
-            .await
-    } else {
-        Ok(())
-    };
-
-    match (&event_result, &token_result) {
-        (Ok(_), Ok(_)) => {}
-        (Ok(_), Err(e)) => {
-            warn!(
-                call_id = %call_id,
-                session_id = %input.session_id,
-                task_id = %input.task_id,
-                call_purpose = ?input.call_purpose,
-                error = %e,
-                "Model-call telemetry: token_usage write failed after llm_call event succeeded"
-            );
-        }
-        (Err(e), Ok(_)) => {
-            warn!(
-                call_id = %call_id,
-                session_id = %input.session_id,
-                task_id = %input.task_id,
-                call_purpose = ?input.call_purpose,
-                error = %e,
-                "Model-call telemetry: llm_call event failed after token_usage write succeeded"
-            );
-        }
-        (Err(e1), Err(e2)) => {
-            warn!(
-                call_id = %call_id,
-                session_id = %input.session_id,
-                task_id = %input.task_id,
-                call_purpose = ?input.call_purpose,
-                event_error = %e1,
-                token_error = %e2,
-                "Model-call telemetry: both llm_call event and token_usage writes failed"
-            );
-        }
+    if let Err(error) = emitter
+        .emit_model_call_with_token_usage(input.llm_call, input.token_usage.as_ref(), &call_id)
+        .await
+    {
+        warn!(
+            call_id = %call_id,
+            session_id = %input.session_id,
+            task_id = %input.task_id,
+            call_purpose = ?input.call_purpose,
+            error = %error,
+            "Model-call telemetry transaction failed; neither canonical event nor token projection committed"
+        );
     }
 }
 

@@ -952,7 +952,65 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     .map(|affordances| affordances.scope)
             })
             .or_else(|| fallback_tool_semantic_scope(&tc.name));
+        if let Some(prohibited_scope) = tool_semantic_scope.filter(|scope| {
+            turn_context
+                .completion_contract
+                .forbidden_tool_scopes
+                .contains(scope)
+        }) {
+            *tool_call_count.entry(tc.name.clone()).or_insert(0) += 1;
+            emitter
+                .emit(
+                    crate::events::EventType::UserConstraintViolation,
+                    crate::events::UserConstraintViolationData {
+                        task_id: task_id.to_string(),
+                        turn_id: None,
+                        constraint_kind: "forbidden_tool_scope".to_string(),
+                        prohibited_scope: Some(prohibited_scope),
+                        attempted_tool: tc.name.clone(),
+                        prevented: true,
+                        side_effect_outcome: "not_started".to_string(),
+                    },
+                )
+                .await?;
+            let result_text = format!(
+                "[SYSTEM] Current-request capability constraint blocked `{}` before execution: `{}` is prohibited for this turn. No side effect started.",
+                tc.name,
+                prohibited_scope.as_str()
+            );
+            let tool_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: "tool".to_string(),
+                content: Some(result_text),
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls_json: None,
+                created_at: Utc::now(),
+                importance: 0.2,
+                ..Message::runtime_defaults()
+            };
+            agent
+                .append_tool_message_with_result_event(
+                    emitter,
+                    &tool_msg,
+                    false,
+                    0,
+                    Some("blocked_by_current_request_constraint".to_string()),
+                    Some(task_id),
+                )
+                .await?;
+            iteration_had_tool_failures = true;
+            continue;
+        }
+        let supports_material_evidence =
+            crate::agent::inquiry::tool_call_supports_any_requirement(
+                &tc.name,
+                &tc.arguments,
+                &turn_context.completion_contract.evidence_requirements,
+            );
         if semantic_scope_blocks_tool(active_dialogue_scope, tool_semantic_scope)
+            && !supports_material_evidence
             && agent
                 .supervision_gate_enforced_with_context(
                     "dialogue_semantic_scope_gate",
@@ -964,6 +1022,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         "tool": tc.name,
                         "active_scope": active_dialogue_scope.map(|scope| format!("{scope:?}")),
                         "tool_scope": tool_semantic_scope.map(|scope| format!("{scope:?}")),
+                        "supports_material_evidence": supports_material_evidence,
                     }),
                 )
                 .await
@@ -1859,6 +1918,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                         suppress_trusted_session: io_suppress_trusted_session,
                         mandate_authority: mandate_authority_grant.as_ref(),
                         mandate_execution: is_mandate_execution,
+                        mutation_forbidden: turn_context.completion_contract.forbids_mutation,
                     },
                 )
                 .await
@@ -1897,6 +1957,7 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                             suppress_trusted_session: false,
                             mandate_authority: None,
                             mandate_tool_call_id: None,
+                            mutation_forbidden: turn_context.completion_contract.forbids_mutation,
                         },
                     )
                     .await;
@@ -1922,6 +1983,29 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     );
                 }
             }
+        }
+        if result_metadata.semantics.evidence.is_empty() {
+            result_metadata.semantics.evidence =
+                crate::agent::inquiry::evidence_capabilities_for_tool_call(
+                    &tc.name,
+                    &effective_arguments,
+                );
+        }
+        if result_metadata.semantics.evidence.is_empty()
+            && result_metadata.semantics.observes_state()
+        {
+            result_metadata.semantics.evidence =
+                crate::agent::inquiry::evidence_capabilities_from_target_hints(
+                    &result_metadata.semantics.target_hints,
+                );
+        }
+        if result_metadata.semantics.observes_state()
+            && !result_metadata.semantics.evidence.is_empty()
+            && result_metadata.semantics.verification_mode
+                == crate::traits::ToolVerificationMode::None
+        {
+            result_metadata.semantics.verification_mode =
+                crate::traits::ToolVerificationMode::ResultContent;
         }
         execution_state.record_tool_result_presentation(&result_metadata, &result_text);
         if result_metadata.presentation
@@ -2016,6 +2100,25 @@ pub(in crate::agent) async fn run_tool_execution_phase(
         let outcome_evidence = tool_outcome_evidence_source(&result_metadata);
         let is_error = tool_outcome_status.is_failure();
         let outcome_satisfied = tool_outcome_status.satisfies_requested_condition();
+
+        // Record mutation before any observation carried by the same receipt.
+        // A mutation deliberately invalidates older current-state evidence;
+        // processing a combined receipt in the opposite order would
+        // immediately invalidate its own post-action observation.
+        if outcome_satisfied && result_metadata.semantics.mutates_state() {
+            completion_progress.mark_mutation_receipt(
+                &turn_context.completion_contract,
+                &result_metadata.semantics,
+                &tc.id,
+            );
+            let caps = available_capabilities
+                .get(&tc.name)
+                .copied()
+                .unwrap_or_default();
+            if caps.external_side_effect {
+                completion_progress.mark_successful_external_mutation();
+            }
+        }
 
         // ── Correction gate finalization (Step 13) ───────────────────────────
         // Record transport-level executed vs failure AFTER io completes and
@@ -2220,6 +2323,102 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 .await;
         }
 
+        // Credit compatible evidence before any specialized result-learning
+        // path can return directly. A substantive negative lookup is still a
+        // valid observation of absence, but only for needs supported by this
+        // exact tool operation's evidence metadata.
+        let mut verified_observation = false;
+        let semantics = &result_metadata.semantics;
+        let matched_contract = semantics.observes_state()
+            && observation_matches_completion_contract(
+                &turn_context.completion_contract,
+                semantics,
+                &effective_arguments,
+                &result_text,
+            );
+        let matched_requirements = if semantics.observes_state() {
+            matching_evidence_requirement_indices(
+                &turn_context.completion_contract,
+                semantics,
+                &effective_arguments,
+            )
+        } else {
+            Vec::new()
+        };
+        let compatible_verification_attempt = turn_context
+            .completion_contract
+            .requires_observation
+            && completion_progress.verification_pending
+            && semantics.observes_state()
+            && if turn_context
+                .completion_contract
+                .evidence_requirements
+                .is_empty()
+            {
+                matched_contract
+            } else {
+                !matched_requirements.is_empty()
+            };
+        if compatible_verification_attempt {
+            completion_progress.mark_verification_attempt();
+        }
+        let observation_result_available = matches!(
+            tool_outcome_status,
+            crate::traits::ToolOutcomeStatus::Succeeded
+                | crate::traits::ToolOutcomeStatus::CompletedWithNegativeResult
+        );
+        if observation_result_available && semantics.observes_state() {
+            let can_verify = tool_result_contains_verifiable_evidence(semantics, &result_text);
+            verified_observation = can_verify
+                && if turn_context
+                    .completion_contract
+                    .evidence_requirements
+                    .is_empty()
+                {
+                    matched_contract
+                } else {
+                    !matched_requirements.is_empty()
+                };
+            if can_verify {
+                completion_progress.mark_observation_receipt(
+                    &turn_context.completion_contract,
+                    &matched_requirements,
+                    matched_contract,
+                    &tc.id,
+                );
+                let matched_requirement_summaries = matched_requirements
+                    .iter()
+                    .filter_map(|index| {
+                        turn_context
+                            .completion_contract
+                            .evidence_requirements
+                            .get(*index)
+                            .map(|requirement| requirement.summary.clone())
+                    })
+                    .collect::<Vec<_>>();
+                agent
+                    .emit_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::EvidenceGate,
+                        format!("Matched evidence receipt from {}", tc.name),
+                        json!({
+                            "condition": "evidence_receipt_matched",
+                            "tool": tc.name,
+                            "tool_call_id": tc.id,
+                            "matched_requirement_indices": matched_requirements,
+                            "matched_requirement_summaries": matched_requirement_summaries,
+                            "evidence_capabilities": semantics.evidence,
+                            "requirements_satisfied": completion_progress.satisfied_evidence_requirements(),
+                            "requirements_total": turn_context.completion_contract.evidence_requirements.len(),
+                            "verification_pending": completion_progress.verification_pending,
+                        }),
+                    )
+                    .await;
+            }
+        }
+
         let learning_env = ResultLearningEnv {
             attempted_required_file_recheck,
             send_file_key,
@@ -2408,33 +2607,6 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                 evidence_state.records.len() > evidence_count_before,
             );
             validation_state.clear_loop_repetition_reason();
-            if semantics.mutates_state() {
-                completion_progress.mark_mutation_receipt(
-                    &turn_context.completion_contract,
-                    semantics,
-                    &tc.id,
-                );
-                // Track external mutation success for the completion gate
-                if caps.external_side_effect {
-                    completion_progress.mark_successful_external_mutation();
-                }
-            }
-            let mut verified_observation = false;
-            if semantics.observes_state() {
-                let can_verify = tool_result_contains_verifiable_evidence(semantics, &result_text);
-                let matched_contract = observation_matches_completion_contract(
-                    &turn_context.completion_contract,
-                    semantics,
-                    &effective_arguments,
-                    &result_text,
-                );
-                verified_observation = can_verify && matched_contract;
-                completion_progress.mark_observation_receipt(
-                    &turn_context.completion_contract,
-                    verified_observation,
-                    &tc.id,
-                );
-            }
             // send_file success means the artifact was delivered to the
             // user — this IS verification.  Clear the pending flag so the
             // completion gate doesn't block a perfectly successful task.
@@ -2555,6 +2727,17 @@ pub(in crate::agent) async fn run_tool_execution_phase(
                     committed_non_action_decision = Some((outcome, result_text.clone()));
                 }
             }
+        }
+        let durable_result_is_summary = result_metadata.persistent_output.is_some();
+        let durable_result_for_receipt = result_metadata
+            .persistent_output
+            .as_deref()
+            .unwrap_or(&result_text);
+        if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+            provenance.record_durable_view(
+                durable_result_for_receipt,
+                durable_result_is_summary,
+            );
         }
         let mut receipt = crate::events::ToolReceiptV1::from_metadata(
             &result_metadata,

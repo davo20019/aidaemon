@@ -143,7 +143,7 @@ impl TaskPlan {
                 step.started_at.get_or_insert_with(Utc::now);
             }
         } else if self.is_finished() {
-            self.status = PlanStatus::Completed;
+            self.status = self.resolved_status();
         }
         self.updated_at = Utc::now();
     }
@@ -172,6 +172,26 @@ impl TaskPlan {
                     | StepStatus::Deferred
             )
         })
+    }
+
+    /// Derive the terminal plan state from typed step outcomes. A deferred
+    /// item is resolved for scheduling purposes but is not successful work.
+    pub fn resolved_status(&self) -> PlanStatus {
+        if self
+            .steps
+            .iter()
+            .any(|step| step.status == StepStatus::Failed)
+        {
+            PlanStatus::Failed
+        } else if self
+            .steps
+            .iter()
+            .any(|step| step.status == StepStatus::Deferred)
+        {
+            PlanStatus::PartiallyCompleted
+        } else {
+            PlanStatus::Completed
+        }
     }
 
     /// Validate the persisted step dependency graph.
@@ -263,7 +283,7 @@ impl TaskPlan {
             self.updated_at = Utc::now();
             true
         } else if self.is_finished() {
-            self.status = PlanStatus::Completed;
+            self.status = self.resolved_status();
             self.updated_at = Utc::now();
             false
         } else {
@@ -327,7 +347,17 @@ impl TaskPlan {
                 "⏸️ Task paused",
                 "Work will continue when the task resumes.",
             ),
-            PlanStatus::Completed => ("✅ Task complete", "All planned steps are resolved."),
+            // A completed checklist means the execution plan is resolved. It
+            // is not the durable task terminal: the final assistant response
+            // and TaskEnd event are still outstanding at this point.
+            PlanStatus::Completed => (
+                "✅ Planned steps complete",
+                "Finalizing the response and task outcome…",
+            ),
+            PlanStatus::PartiallyCompleted => (
+                "⚠️ Plan ended with unresolved steps",
+                "The final response must explain each deferred item and its blocker.",
+            ),
             PlanStatus::Failed => ("❌ Task stopped", "The plan could not be completed."),
             PlanStatus::Abandoned => ("⏹️ Task cancelled", "No more work is in progress."),
         };
@@ -521,6 +551,8 @@ pub enum PlanStatus {
     Paused,
     /// All steps completed successfully
     Completed,
+    /// Scheduling is resolved, but one or more requested steps were deferred.
+    PartiallyCompleted,
     /// Unrecoverable failure
     Failed,
     /// User explicitly cancelled
@@ -763,11 +795,51 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_does_not_announce_durable_task_completion() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["observe result".into()],
+            "track_requirements",
+        );
+        plan.steps[0].status = StepStatus::Completed;
+        plan.status = PlanStatus::Completed;
+
+        let checklist = plan.render_compact_checklist();
+        assert!(checklist.starts_with("✅ Planned steps complete"));
+        assert!(checklist.contains("Finalizing the response and task outcome"));
+        assert!(!checklist.contains("Task complete"));
+    }
+
+    #[test]
+    fn deferred_steps_resolve_to_partial_plan_with_visible_blocker_requirement() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec!["first action".into(), "second action".into()],
+            "track_requirements",
+        );
+        for step in &mut plan.steps {
+            step.status = StepStatus::Deferred;
+        }
+        plan.sync_active_step();
+
+        assert_eq!(plan.status, PlanStatus::PartiallyCompleted);
+        let checklist = plan.render_compact_checklist();
+        assert!(checklist.starts_with("⚠️ Plan ended with unresolved steps"));
+        assert!(checklist.contains("explain each deferred item and its blocker"));
+        assert!(!checklist.contains("Planned steps complete"));
+    }
+
+    #[test]
     fn test_plan_status_is_incomplete() {
         assert!(PlanStatus::Planning.is_incomplete());
         assert!(PlanStatus::InProgress.is_incomplete());
         assert!(PlanStatus::Paused.is_incomplete());
         assert!(!PlanStatus::Completed.is_incomplete());
+        assert!(!PlanStatus::PartiallyCompleted.is_incomplete());
         assert!(!PlanStatus::Failed.is_incomplete());
         assert!(!PlanStatus::Abandoned.is_incomplete());
     }

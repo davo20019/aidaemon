@@ -174,18 +174,21 @@ fn completion_contract_is_fulfilled(
         return false;
     }
 
-    let observation_is_hard_requirement =
-        contract.explicit_verification_requested || !contract.verification_targets.is_empty();
+    let observation_is_hard_requirement = contract.explicit_verification_requested
+        || !contract.verification_targets.is_empty()
+        || !contract.evidence_requirements.is_empty();
     if observation_is_hard_requirement
         && contract.requires_observation
-        && progress.observation_count == 0
+        && if contract.evidence_requirements.is_empty() {
+            progress.observation_count == 0
+        } else {
+            !progress.all_evidence_requirements_satisfied()
+        }
     {
         return false;
     }
     let verification_required = contract.explicit_verification_requested;
-    if verification_required
-        && (progress.verification_count == 0 || progress.verification_block_count > 2)
-    {
+    if verification_required && progress.verification_count == 0 {
         return false;
     }
     true
@@ -395,6 +398,56 @@ mod tests {
         .derive_outcome();
 
         assert_eq!(outcome, TaskOutcome::Partial);
+    }
+
+    #[test]
+    fn fulfilled_verification_is_success_even_after_multiple_completion_blocks() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            ToolCallSemantics, ToolMutationEffects, ToolSemanticScope,
+        };
+
+        let validation = ValidationState::default();
+        let execution = empty_execution_state();
+        let contract = CompletionContract {
+            expects_mutation: true,
+            required_mutation_effects: ToolMutationEffects::EXTERNAL_DELIVERY,
+            requires_observation: true,
+            requires_reverification_after_mutation: true,
+            explicit_verification_requested: true,
+            evidence_requirements: vec![RequestEvidenceRequirement {
+                summary: "Confirm delivery outcome".to_string(),
+                acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+                purpose: EvidencePurpose::Outcome,
+                minimum_authority: EvidenceAuthority::Direct,
+                temporal_scope: EvidenceTemporalScope::Current,
+                target: None,
+            }],
+            ..CompletionContract::default()
+        };
+        let mut completion = CompletionProgress::new(&contract);
+        completion.verification_block_count = 7;
+        completion.mark_mutation_receipt(
+            &contract,
+            &ToolCallSemantics::observation_and_mutation_with(
+                ToolMutationEffects::EXTERNAL_DELIVERY,
+            ),
+            "delivery-receipt-1",
+        );
+        completion.mark_observation_receipt(&contract, &[0], true, "delivery-receipt-1");
+
+        let outcome = TaskOutcomeDerivation::from_completion_state(
+            &validation,
+            &execution,
+            &completion,
+            &contract,
+            true,
+            false,
+            None,
+        )
+        .derive_outcome();
+
+        assert_eq!(outcome, TaskOutcome::Succeeded);
     }
 
     #[test]

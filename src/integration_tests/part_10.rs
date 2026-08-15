@@ -409,10 +409,11 @@ async fn test_executor_mode_retains_tools() {
 }
 
 /// Scenario: Turn 1 makes tool calls, Turn 2 asks a different question.
-/// The tool intermediates from Turn 1 should be collapsed so they don't
-/// pollute Turn 2's context and confuse the LLM (context bleeding bug).
+/// The immediately preceding turn keeps bounded receipt-bearing tool evidence
+/// so a follow-up can distinguish observed facts from the assistant's prose.
+/// Older turns are still collapsed by the archived renderer.
 #[tokio::test]
-async fn test_old_tool_intermediates_collapsed_in_follow_up() {
+async fn test_immediate_parent_tool_evidence_is_bounded_in_follow_up() {
     let provider = MockProvider::with_responses(vec![
         // Turn 1: tool call + final response
         MockProvider::tool_call_response("system_info", "{}"),
@@ -438,7 +439,8 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         .unwrap();
     assert_eq!(r1, "Your system has 16GB RAM and an M1 chip.");
 
-    // Turn 2: different topic — should NOT include Turn 1's tool intermediates
+    // Turn 2: different topic. The immediately preceding tool result remains
+    // available, but only through the adjacent turn's bounded evidence form.
     let r2 = harness
         .agent
         .handle_message(
@@ -453,28 +455,32 @@ async fn test_old_tool_intermediates_collapsed_in_follow_up() {
         .unwrap();
     assert_eq!(r2, "Mia is your cat.");
 
-    // Verify Turn 2's messages: Prior 1 tool results should be summarized (not
-    // dropped) by age-based clearing. Prior 2+ tool results would be dropped.
+    // Verify Turn 2's messages: Prior 1 tool results retain their strong
+    // receipt and are bounded. Prior 2+ tool results use compact summaries.
     let call_log = harness.provider.call_log.lock().await;
     let turn2_call = call_log.last().unwrap();
     let turn2_msgs = &turn2_call.messages;
 
     // Tool results from Turn 1 (the "Prior 1" interaction) should be present
-    // but with summarized content instead of verbose output.
+    // with their receipt identity rather than being converted into prose.
     let tool_msgs: Vec<&serde_json::Value> = turn2_msgs
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .collect();
-    // Prior 1 tool results are summarized, not dropped
+    assert!(!tool_msgs.is_empty(), "adjacent evidence must be retained");
     for tool_msg in &tool_msgs {
         let content = tool_msg
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        // Summarized tool results are compact 1-liners (tool_name: args -> outcome)
         assert!(
-            content.len() < 200,
-            "Prior 1 tool result should be summarized (compact), got: {}",
+            content.contains("[Tool receipt v2:"),
+            "Prior 1 tool result should retain its receipt, got: {}",
+            content
+        );
+        assert!(
+            content.chars().count() <= 4_000,
+            "Prior 1 tool evidence should be bounded, got: {}",
             content
         );
     }

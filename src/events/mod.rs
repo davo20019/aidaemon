@@ -245,6 +245,11 @@ pub enum EventType {
     PolicyDecision,
     /// Structured decision-point emission for self-diagnosis flight recorder.
     DecisionPoint,
+    /// Cumulative policy counters checkpointed with a process boot identity.
+    PolicyMetricsSnapshot,
+    /// A current-request capability prohibition was attempted. The payload
+    /// records whether enforcement prevented any side effect.
+    UserConstraintViolation,
 
     // === Task Lifecycle ===
     /// A task (user request) started processing

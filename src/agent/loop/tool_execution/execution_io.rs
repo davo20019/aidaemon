@@ -38,6 +38,7 @@ pub(super) struct ToolExecutionIoCtx<'a> {
     /// Mandate results must remain bounded inline; spilling would create an
     /// ungranted local file containing potentially sensitive observations.
     pub mandate_execution: bool,
+    pub mutation_forbidden: bool,
 }
 
 fn should_replay_durable_result(
@@ -347,6 +348,7 @@ pub(super) async fn execute_tool_call_io(
                 suppress_trusted_session: ctx.suppress_trusted_session,
                 mandate_authority: ctx.mandate_authority,
                 mandate_tool_call_id: Some(tc.id.as_str()),
+                mutation_forbidden: ctx.mutation_forbidden,
             },
         )
         .await;
@@ -361,6 +363,15 @@ pub(super) async fn execute_tool_call_io(
         Ok(outcome) => {
             result_metadata = outcome.metadata;
             let text = outcome.output;
+            if result_metadata.result_provenance.is_none() {
+                result_metadata.result_provenance = Some(
+                    crate::traits::ToolResultProvenance::from_authoritative_result(
+                        &text,
+                        &result_metadata,
+                        crate::traits::ToolResultContentSource::ToolOutput,
+                    ),
+                );
+            }
             // Sanitize and wrap untrusted tool outputs
             if !crate::tools::sanitize::is_trusted_tool(&tc.name) {
                 let body = if result_metadata.untrusted_verbatim {
@@ -387,6 +398,16 @@ pub(super) async fn execute_tool_call_io(
             format!("Error: {}", e)
         }
     };
+
+    if result_metadata.result_provenance.is_none() {
+        result_metadata.result_provenance = Some(
+            crate::traits::ToolResultProvenance::from_authoritative_result(
+                &result_text,
+                &result_metadata,
+                crate::traits::ToolResultContentSource::ToolOutput,
+            ),
+        );
+    }
 
     if result_is_err && tc.name == "edit_file" {
         if let Some(recovered_text) =
@@ -427,6 +448,9 @@ pub(super) async fn execute_tool_call_io(
                 "{}\n\n[... cli_agent error output truncated ({} chars total) ...]\n\n{}",
                 head, char_len, tail
             );
+            if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+                provenance.mark_model_view_truncated(&result_text);
+            }
         }
     }
 
@@ -454,6 +478,9 @@ pub(super) async fn execute_tool_call_io(
                         }
                         .render()
                     );
+                }
+                if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+                    provenance.mark_model_view_truncated(&result_text);
                 }
             }
         } else {
@@ -530,6 +557,14 @@ pub(super) async fn execute_tool_call_io(
                     max_chars,
                 ),
             };
+            if over_cap && !keep_inline {
+                if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+                    provenance.mark_model_view_truncated(&result_text);
+                    if was_spilled {
+                        provenance.source = crate::traits::ToolResultContentSource::SpillPreview;
+                    }
+                }
+            }
             // Record how the harness transformed the result before the model saw
             // it — spill/compress/kept-inline + how many chars were hidden. This
             // is the mutation that caused the read_file/terminal derailment and
@@ -560,6 +595,12 @@ pub(super) async fn execute_tool_call_io(
                     )
                     .await;
             }
+        }
+    }
+
+    if let Some(provenance) = result_metadata.result_provenance.as_mut() {
+        if provenance.model_view_completeness != crate::traits::ToolResultCompleteness::Truncated {
+            provenance.model_visible_chars = result_text.chars().count();
         }
     }
 
@@ -679,6 +720,7 @@ async fn maybe_retry_edit_file_not_found_recovery(
         suppress_trusted_session: ctx.suppress_trusted_session,
         mandate_authority: None,
         mandate_tool_call_id: None,
+        mutation_forbidden: ctx.mutation_forbidden,
     };
 
     // Deterministic self-recovery path:

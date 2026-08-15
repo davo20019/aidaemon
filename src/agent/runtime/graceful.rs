@@ -1138,6 +1138,16 @@ impl Agent {
                 },
             )
             .await;
+        // Counters remain lock-free on hot paths. Checkpoint their cumulative
+        // value at the authoritative task boundary so restarts do not erase
+        // longitudinal policy telemetry. Readers select the latest row per
+        // boot_id rather than summing cumulative rows.
+        let _ = emitter
+            .emit(
+                EventType::PolicyMetricsSnapshot,
+                super::policy_metrics::durable_policy_metrics_snapshot(),
+            )
+            .await;
         if let Err(err) = super::dialogue_state::record_dialogue_task_end(
             self,
             emitter.session_id(),

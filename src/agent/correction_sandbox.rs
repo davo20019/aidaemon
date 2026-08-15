@@ -518,22 +518,18 @@ fn classify_terminal_action(
     };
 
     // Hard block for destructive patterns.
-    if let Some(reason) = crate::tools::command_risk::hard_block_reason(cmd) {
+    if let Some(reason) = crate::tools::command_risk::hard_block_reason(
+        cmd,
+        ctx.working_dir.to_string_lossy().as_ref(),
+    ) {
         return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&format!(
             "destructive command: {reason}"
         )));
     }
 
-    // Risk level must be Safe.
-    let risk = crate::tools::command_risk::classify_command(cmd);
-    if risk.level != crate::tools::command_risk::RiskLevel::Safe {
-        return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&format!(
-            "terminal command risk level '{}' is not safe for autonomous correction",
-            risk.level
-        )));
-    }
-
-    // Correction-specific read-only local allowlist.
+    // Correction-specific read-only local capability boundary. This is the
+    // authoritative contract for autonomous correction; do not layer the
+    // open-ended keyword risk score on top of it.
     if let Err(reason) = is_correction_safe_local_command(cmd, &ctx.working_dir) {
         return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&reason));
     }
@@ -577,22 +573,16 @@ fn classify_run_command_action(
     };
 
     // Hard block.
-    if let Some(reason) = crate::tools::command_risk::hard_block_reason(cmd) {
+    if let Some(reason) = crate::tools::command_risk::hard_block_reason(
+        cmd,
+        ctx.working_dir.to_string_lossy().as_ref(),
+    ) {
         return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&format!(
             "destructive command: {reason}"
         )));
     }
 
-    // Risk level must be Safe.
-    let risk = crate::tools::command_risk::classify_command(cmd);
-    if risk.level != crate::tools::command_risk::RiskLevel::Safe {
-        return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&format!(
-            "run_command risk level '{}' is not safe for autonomous correction",
-            risk.level
-        )));
-    }
-
-    // Must match run_command's own safe prefix list.
+    // Must match run_command's explicit read-only capability boundary.
     if !crate::tools::run_command::is_run_command_safe(cmd) {
         return ActionVerdict::Blocked(crate::tools::sanitize::redact_secrets(&format!(
             "run_command '{}' is not in the safe prefix list",

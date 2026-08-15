@@ -511,6 +511,10 @@ async fn setup_tools_phase(
     )
     .await?;
 
+    if let Some(terminal) = &terminal_tool {
+        terminal.set_command_risk_runtime(llm_runtime.clone());
+    }
+
     let startup_tools::OptionalToolsOutcome {
         has_cli_agents: _has_cli_agents,
         inbox_dir,

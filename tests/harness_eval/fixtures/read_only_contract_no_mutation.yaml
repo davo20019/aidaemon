@@ -1,17 +1,22 @@
 name: read_only_contract_no_mutation
-description: Explicit no-write request remains observational and never reaches mutation tools
+description: Explicit no-write request observes current state and never reaches mutation tools
 session_id: eval_read_only_contract_01
-user_text: Cargo.toml package name? Read only; don't modify.
+user_text: What operating system is this running? Read only; don't modify.
 orchestrator: true
 mock_responses:
-  - text: I inspected Cargo.toml without modifying anything.
+  - tool_call:
+      name: system_info
+      arguments: '{}'
+  - text: The current operating system details are in the observed system information. I did not modify anything.
 expect:
   tools_required_predicted: false
+  tools_in_order:
+    - system_info
   tools_not_used:
     - write_file
     - terminal
-  outcome: failed
-  stop_reason: error
+  outcome: succeeded
+  stop_reason: completed
   llm_calls_max: 7
-  tool_calls_max: 0
+  tool_calls_max: 1
   forbidden_mutation_attempts_max: 0

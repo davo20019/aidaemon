@@ -9,6 +9,8 @@ use crate::execution_policy::PolicyBundle;
 use crate::llm_markers::INTENT_GATE_MARKER;
 use crate::traits::ProviderResponse;
 
+const MAX_VERIFICATION_ATTEMPTS: usize = 2;
+
 pub(super) struct CompletionCtx<'a> {
     pub resp: &'a mut ProviderResponse,
     pub emitter: &'a crate::events::EventEmitter,
@@ -661,6 +663,53 @@ pub(super) async fn run_completion_phase(
         // bounce model-authored pastes — a daemon-built reply is deliberate,
         // already policy-gated at its build site.
         let model_authored_reply = reply.clone();
+
+        let missing_response_fields = turn_context
+            .completion_contract
+            .required_response_fields
+            .iter()
+            .filter(|field| {
+                !reply
+                    .to_lowercase()
+                    .contains(&field.trim().to_lowercase())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_response_fields.is_empty() {
+            if completion_progress.response_contract_retry_count == 0 {
+                completion_progress.response_contract_retry_count = 1;
+                pending_system_messages.push(SystemDirective::OutputContractIncomplete {
+                    missing_fields: missing_response_fields.clone(),
+                });
+                agent
+                    .emit_warning_decision_point(
+                        emitter,
+                        task_id,
+                        iteration,
+                        DecisionType::PostExecutionValidation,
+                        "Draft omitted grounded response-contract fields".to_string(),
+                        json!({
+                            "condition": "response_contract_incomplete",
+                            "missing_fields": missing_response_fields,
+                            "retry": 1,
+                        }),
+                    )
+                    .await;
+                return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+            }
+
+            validation_state.record_failure(ValidationFailure::SuccessCriteriaUnmatched);
+            let unavailable = missing_response_fields
+                .iter()
+                .map(|field| format!("{}: unavailable in the generated answer", field.trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            reply = if reply.trim().is_empty() {
+                unavailable
+            } else {
+                format!("{unavailable}\n\n{reply}")
+            };
+        }
 
         // A mandate task lead's prose is never the authoritative decision.
         // Give a missing typed commit one bounded correction turn, then fail
@@ -1765,6 +1814,44 @@ pub(super) async fn run_completion_phase(
                     false,
                     total_successful_tool_calls,
                 );
+                let outstanding_requirements = completion_progress
+                    .outstanding_evidence_requirements(&turn_context.completion_contract)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let outstanding_evidence = outstanding_requirements
+                    .iter()
+                    .map(crate::agent::inquiry::describe_requirement)
+                    .collect::<Vec<_>>();
+                let visible_tool_names = tool_defs
+                    .iter()
+                    .filter_map(|definition| {
+                        definition
+                            .get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .collect::<Vec<_>>();
+                let candidate_verification_tools =
+                    crate::agent::inquiry::candidate_tools_for_requirements(
+                        &outstanding_requirements,
+                        visible_tool_names.iter().copied(),
+                    );
+                let visible_evidence_catalog_is_complete = visible_tool_names
+                    .iter()
+                    .all(|name| crate::agent::inquiry::has_static_evidence_model(name));
+                let typed_verification_unavailable = !outstanding_requirements.is_empty()
+                    && candidate_verification_tools.is_empty()
+                    && visible_evidence_catalog_is_complete;
+                let missing_evidence_requirement = if outstanding_evidence.is_empty() {
+                    "A successful read-only verification against the requested target or output."
+                        .to_string()
+                } else {
+                    format!(
+                        "Compatible evidence is still required for: {}",
+                        outstanding_evidence.join("; ")
+                    )
+                };
                 execution_state.record_validation_round();
                 validation_state.record_failure(ValidationFailure::VerificationPending);
                 execution_state.mark_persisted_now();
@@ -1796,8 +1883,8 @@ pub(super) async fn run_completion_phase(
                                 Some(execution_state),
                                 false,
                                 "I used the current validation budget and still do not have a confirmed final result.",
-                                "A narrower scope, explicit permission to keep validating, or the exact verification target I should confirm.",
-                                "I will spend the next validation pass on a concrete re-check and then report the confirmed outcome.",
+                                &missing_evidence_requirement,
+                                "Start a new attempt with a concrete re-check before reporting the outcome.",
                             );
                         terminal_cause = cause;
                         request
@@ -1822,12 +1909,15 @@ pub(super) async fn run_completion_phase(
                                 "validation_rounds_used": execution_state.validation_rounds_used,
                                 "validation_round_budget": execution_state.budget.max_validation_rounds,
                                 "execution_id": execution_state.execution_id,
+                                "outstanding_evidence": outstanding_evidence,
                             }),
                         )
                         .await;
                     reply = request.render_user_message();
                     pending_external_action_ack = None;
-                } else if completion_progress.verification_block_count >= 2 {
+                } else if completion_progress.verification_attempt_count
+                    >= MAX_VERIFICATION_ATTEMPTS
+                {
                     // A bounded retry may end in an honest partial result only
                     // when concrete work exists. With no successful execution,
                     // the typed terminal cause must remain a failure.
@@ -1835,9 +1925,9 @@ pub(super) async fn run_completion_phase(
                             ReplayNoteCategory::ValidationFailure,
                             "verification_stall_escape",
                             if has_concrete_progress {
-                                "Verification stalled 2+ times; returning an honest partial result without claiming verification."
+                                "Two compatible verification calls completed without satisfying the obligation; returning an honest partial result."
                             } else {
-                                "Verification stalled 2+ times without concrete progress; failing the attempt."
+                                "Two compatible verification calls completed without concrete progress; failing the attempt."
                             }
                             .to_string(),
                             true,
@@ -1855,6 +1945,7 @@ pub(super) async fn run_completion_phase(
                             .to_string(),
                             json!({
                                 "verification_block_count": completion_progress.verification_block_count,
+                                "verification_attempt_count": completion_progress.verification_attempt_count,
                                 "stall_count": stall_count,
                             }),
                         )
@@ -1863,6 +1954,7 @@ pub(super) async fn run_completion_phase(
                         session_id,
                         iteration,
                         verification_block_count = completion_progress.verification_block_count,
+                        verification_attempt_count = completion_progress.verification_attempt_count,
                         "Verification retries exhausted; suppressing unverified completion claim"
                     );
                     let (request, cause) = build_terminal_verification_request(
@@ -1871,13 +1963,16 @@ pub(super) async fn run_completion_phase(
                         Some(execution_state),
                         has_concrete_progress,
                         "I completed part of the request, but I could not obtain the required final verification receipt.",
-                        "A successful read-only verification against the requested target or output.",
-                        "Once that check succeeds, I can report the outcome as verified.",
+                        &missing_evidence_requirement,
+                        "Start a new attempt and run a compatible verification check before reporting success.",
                     );
                     terminal_cause = cause;
                     reply = request.render_user_message();
                     pending_external_action_ack = None;
-                } else if tool_defs.is_empty() || force_text_response {
+                } else if tool_defs.is_empty()
+                    || force_text_response
+                    || typed_verification_unavailable
+                {
                     validation_state.note_retry(LoopRepetitionReason::VerificationPending);
                     learning_ctx.record_replay_note(
                             ReplayNoteCategory::ValidationFailure,
@@ -1899,8 +1994,8 @@ pub(super) async fn run_completion_phase(
                         Some(execution_state),
                         has_concrete_progress,
                         "I completed part of the request, but the final outcome still needs a read-only verification step.",
-                        "A final read-only verification against the current target/output.",
-                        "Once verification is available, I will run that check and then report the confirmed result.",
+                        &missing_evidence_requirement,
+                        "Start a new attempt when a compatible verification check is available.",
                     );
                     terminal_cause = cause;
                     agent.emit_warning_decision_point(
@@ -1921,7 +2016,10 @@ pub(super) async fn run_completion_phase(
                                 "request": request.clone(),
                                 "force_text_response": force_text_response,
                                 "tools_available": !tool_defs.is_empty(),
+                                "compatible_verification_tools": candidate_verification_tools,
+                                "visible_evidence_catalog_is_complete": visible_evidence_catalog_is_complete,
                                 "stall_count": stall_count,
+                                "outstanding_evidence": outstanding_evidence,
                             }),
                         )
                         .await;
@@ -1930,7 +2028,7 @@ pub(super) async fn run_completion_phase(
                             iteration,
                             stall_count,
                             force_text_response,
-                            "Completion verification required but tools unavailable; clearing guard"
+                            "Completion evidence remained open with tools unavailable; returning a typed partial or failure"
                         );
                     reply = request.render_user_message();
                     pending_external_action_ack = None;
@@ -1964,6 +2062,7 @@ pub(super) async fn run_completion_phase(
                                 "completed_tool_calls": learning_ctx.tool_calls.len(),
                                 "verification_pending": completion_progress.verification_pending,
                                 "verification_block_count": completion_progress.verification_block_count,
+                                "verification_attempt_count": completion_progress.verification_attempt_count,
                             }),
                         )
                         .await;
@@ -1972,55 +2071,37 @@ pub(super) async fn run_completion_phase(
                         .verification_block_count
                         .saturating_add(1);
 
-                    // Bound retries, then preserve a partial result only when
-                    // concrete work exists. Never clear missing verification
-                    // merely because the model stalled.
-                    if completion_progress.verification_block_count >= 2 {
-                        learning_ctx.record_replay_note(
-                                ReplayNoteCategory::ValidationFailure,
-                                "verification_stall_escape",
-                                if has_concrete_progress {
-                                    "Verification stalled 2+ times; returning a partial result without claiming success."
-                                } else {
-                                    "Verification stalled 2+ times without concrete progress; failing the attempt."
-                                }
-                                .to_string(),
-                                true,
-                            );
-                        warn!(
-                                session_id,
-                                iteration,
-                                verification_block_count = completion_progress.verification_block_count,
-                                "Verification retries exhausted in blocking branch; preserving evidence-based outcome"
-                            );
-                        let (request, cause) = build_terminal_verification_request(
-                            turn_context,
-                            learning_ctx,
-                            Some(execution_state),
-                            has_concrete_progress,
-                            "I completed part of the request, but the required verification still has no successful receipt.",
-                            "A successful read-only verification against the requested target or output.",
-                            "Once that check succeeds, I can report the outcome as verified.",
-                        );
-                        terminal_cause = cause;
-                        reply = request.render_user_message();
-                        pending_external_action_ack = None;
-                    } else {
-                        consecutive_clean_iterations = 0;
+                    // A blocked completion is not a verification attempt. Keep
+                    // directing the model toward compatible evidence until an
+                    // actual attempt budget or the validation-round budget is
+                    // exhausted.
+                    consecutive_clean_iterations = 0;
+                    if outstanding_requirements.is_empty() {
                         pending_system_messages.push(
                             SystemDirective::CompletionVerificationRequired {
-                                target_hint: turn_context.completion_contract.primary_target_hint(),
+                                target_hint: turn_context
+                                    .completion_contract
+                                    .primary_target_hint(),
                             },
                         );
-                        warn!(
-                            session_id,
-                            iteration,
-                            stall_count,
-                            verification_block_count = completion_progress.verification_block_count,
-                            "Blocking completion until request outcome verification is performed"
-                        );
-                        return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
+                    } else {
+                        pending_system_messages.push(SystemDirective::InquiryEvidenceRequired {
+                            outstanding_needs: outstanding_requirements
+                                .iter()
+                                .map(crate::agent::inquiry::describe_requirement)
+                                .collect(),
+                            candidate_tools: candidate_verification_tools,
+                        });
                     }
+                    warn!(
+                        session_id,
+                        iteration,
+                        stall_count,
+                        verification_block_count = completion_progress.verification_block_count,
+                        verification_attempt_count = completion_progress.verification_attempt_count,
+                        "Blocking completion until request outcome verification is performed"
+                    );
+                    return Ok(Some(ResponsePhaseOutcome::ContinueLoop));
                 }
             }
         }
@@ -2101,7 +2182,7 @@ pub(super) async fn run_completion_phase(
                 learning_ctx,
                 Some(execution_state),
                 "I do not have a successful typed receipt for the requested side effect, so I cannot claim it completed.",
-                "After the action succeeds, I will verify the resulting state before reporting completion.",
+                "Start a new attempt, retry the action, and verify its resulting state before reporting completion.",
             );
             reply = request.render_user_message();
             pending_external_action_ack = None;
@@ -3036,7 +3117,7 @@ pub(super) async fn run_completion_phase(
                 learning_ctx,
                 Some(execution_state),
                 "I could not establish the exact earlier wording from immediate context or a successful retained-history lookup, so I will not guess it.",
-                "Once that lookup is available, I can quote or summarize the exact earlier condition.",
+                "Start a new attempt when retained-history lookup is available.",
             );
             reply = request.render_user_message();
             completion_progress.verification_pending = true;
@@ -3082,7 +3163,7 @@ pub(super) async fn run_completion_phase(
                     format!(
                         "I could not satisfy the requested evidence threshold: {sources_read} qualifying source page(s) were read and {sources_cited} were cited, out of {required} required."
                     ),
-                    "Once those sources are available, I can complete the comparison without overstating verification.",
+                    "Start a new attempt when the required sources can be retrieved.",
                 );
                 reply = request.render_user_message();
                 completion_progress.verification_pending = true;
@@ -3162,7 +3243,7 @@ pub(super) async fn run_completion_phase(
                     learning_ctx,
                     Some(execution_state),
                     "I could not verify whether the task still has a pending approval, so I cannot safely report the action as completed.",
-                    "Once approval state is available, I will continue or report the resulting receipts.",
+                    "Start a new attempt after approval state can be read reliably.",
                 );
                 reply = request.render_user_message();
                 completion_progress.verification_pending = true;

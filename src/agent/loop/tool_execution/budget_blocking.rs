@@ -229,6 +229,9 @@ pub(super) async fn maybe_block_tool_by_budget(
     let trust_tier = agent.trust_tier_for_model(ctx.model);
     let caps = tool_budget_caps(trust_tier);
     let failure_limit = semantic_failure_limit(&tc.name);
+    let repeated_signature_limit_hit = prior_signature_failures >= failure_limit;
+    let aggregate_failure_limit_hit =
+        !repeated_signature_limit_hit && aggregate_failures >= AGGREGATE_TOOL_FAILURE_LIMIT;
     let blocked = if ctx.unknown_tools.contains(&tc.name) {
         // Tool doesn't exist — block immediately, no retries.
         Some(
@@ -237,7 +240,7 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if prior_signature_failures >= failure_limit {
+    } else if repeated_signature_limit_hit {
         Some(
             ToolResultNotice::SemanticErrorLimitBlocked {
                 tool_name: tc.name.clone(),
@@ -246,14 +249,14 @@ pub(super) async fn maybe_block_tool_by_budget(
             }
             .render(),
         )
-    } else if aggregate_failures >= AGGREGATE_TOOL_FAILURE_LIMIT {
+    } else if aggregate_failure_limit_hit {
         // Stuck in a loop: this tool keeps failing with differing error messages
         // (so the per-signature limit never trips), often interleaved with other
         // tools' successes (so stall_count keeps resetting). Cool it down.
         Some(
-            ToolResultNotice::SemanticErrorLimitBlocked {
+            ToolResultNotice::AggregateSemanticErrorLimitBlocked {
                 tool_name: tc.name.clone(),
-                prior_signature_failures: aggregate_failures,
+                aggregate_failures,
                 prior_transient_failures,
             }
             .render(),
@@ -318,6 +321,18 @@ pub(super) async fn maybe_block_tool_by_budget(
     let Some(result_text) = blocked else {
         return Ok(ToolBlockKind::NotBlocked);
     };
+    let reported_semantic_failures = if aggregate_failure_limit_hit {
+        aggregate_failures
+    } else {
+        prior_signature_failures
+    };
+    let semantic_failure_scope = if aggregate_failure_limit_hit {
+        "aggregate_differing_signatures"
+    } else if repeated_signature_limit_hit {
+        "repeated_signature"
+    } else {
+        "not_semantic_limit"
+    };
 
     agent
         .persist_gate_fire(
@@ -336,7 +351,8 @@ pub(super) async fn maybe_block_tool_by_budget(
         task_id = %ctx.task_id,
         iteration = ctx.iteration,
         tool = %tc.name,
-        semantic_failures = prior_signature_failures,
+        semantic_failures = reported_semantic_failures,
+        semantic_failure_scope,
         transient_failures = prior_transient_failures,
         calls = prior_calls,
         "Blocking repeated tool call"
@@ -350,7 +366,9 @@ pub(super) async fn maybe_block_tool_by_budget(
             format!("Blocked tool {} due to repeated failures/calls", tc.name),
             json!({
                 "tool": tc.name,
-                "prior_semantic_failures": prior_signature_failures,
+                "prior_semantic_failures": reported_semantic_failures,
+                "semantic_failure_scope": semantic_failure_scope,
+                "aggregate_semantic_failures": aggregate_failures,
                 "prior_transient_failures": prior_transient_failures,
                 "prior_calls": prior_calls
             }),

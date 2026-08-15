@@ -216,7 +216,10 @@ impl HumanInterventionRequest {
                 "This attempt ended without verified success; no action is required from you."
                     .to_string(),
             );
-            lines.push(format!("Next safe step: {}", self.next_step));
+            lines.push(format!(
+                "Next safe step for a future attempt: {}",
+                self.next_step
+            ));
         }
 
         lines.join("\n")
@@ -797,10 +800,21 @@ pub(crate) fn summarize_partial_result_with_plan(
         } else if !learning_ctx.tool_calls.is_empty() {
             let summary = post_task::categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
             if summary.trim().is_empty() {
-                format!(
-                    "Completed {} tool action(s).",
-                    learning_ctx.tool_calls.len()
-                )
+                let successful = learning_ctx
+                    .tool_calls
+                    .iter()
+                    .filter(|call| !call.ends_with(" [FAILED]"))
+                    .count();
+                let failed = learning_ctx.tool_calls.len().saturating_sub(successful);
+                match (successful, failed) {
+                    (0, failed) => format!("No tool action succeeded; {failed} attempt(s) failed."),
+                    (successful, 0) => {
+                        format!("Completed {successful} successful tool action(s).")
+                    }
+                    (successful, failed) => format!(
+                    "Completed {successful} successful tool action(s); {failed} attempt(s) failed."
+                ),
+                }
             } else {
                 summary.trim().to_string()
             }
@@ -1047,6 +1061,63 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("Next step after approval")));
+    }
+
+    #[test]
+    fn agent_side_terminal_message_does_not_promise_automatic_continuation() {
+        let request = HumanInterventionRequest {
+            outcome: ValidationOutcome::PartialDoneBlocked,
+            approval_state: ApprovalState::NotNeeded,
+            action_requested: "Verify playback".to_string(),
+            target: None,
+            reason: "No authoritative receipt was available.".to_string(),
+            exact_need: "A playback receipt.".to_string(),
+            next_step: "Start a new attempt and run the playback check.".to_string(),
+            consequence_if_not_provided: None,
+            partial_result: None,
+            user_action_required: false,
+        };
+
+        let rendered = request.render_user_message();
+
+        assert!(rendered.contains("This attempt ended without verified success"));
+        assert!(rendered.contains("Next safe step for a future attempt:"));
+        assert!(!rendered.contains("What I will do next:"));
+        assert!(!rendered.contains("Once that check succeeds, I can report"));
+    }
+
+    #[test]
+    fn partial_summary_distinguishes_successful_and_failed_tool_attempts() {
+        let turn_context = TurnContext::default();
+        let learning_ctx = LearningContext {
+            user_text: "Deliver and verify a synthetic announcement.".to_string(),
+            intent_domains: Vec::new(),
+            tool_calls: vec![
+                "send_node_audio(synthetic-node-1)".to_string(),
+                "read_node_health(synthetic-node-1) [FAILED]".to_string(),
+            ],
+            errors: Vec::new(),
+            first_error: None,
+            recovery_actions: Vec::new(),
+            start_time: Utc::now(),
+            completed_naturally: false,
+            explicit_positive_signals: 0,
+            explicit_negative_signals: 0,
+            task_outcome: None,
+            replay_notes: Vec::new(),
+        };
+
+        let partial = summarize_partial_result_with_plan(
+            &turn_context,
+            &learning_ctx,
+            None,
+            "Verification unavailable.".to_string(),
+        );
+
+        assert_eq!(
+            partial.completed_work_summary,
+            "Completed 1 successful tool action(s); 1 attempt(s) failed."
+        );
     }
 
     #[test]

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Autonomy completion now follows typed request obligations instead of checklist prose.** Grounded no-tool and capability-specific constraints are enforced before tool selection and again at dispatch, required response fields receive one bounded correction, completed negative observations are reportable evidence, deferred-only plans resolve as partial, and blocked/replanning passes no longer consume verification attempts.
+- **Tool evidence now remains durable, bounded, and auditable across continuations.** Receipt schema v2 records stable result digests, model/durable completeness, requested and returned read ranges, and content provenance; adjacent turns retain bounded receipt-bearing evidence while explicit context-cutoff markers distinguish unavailable history from disproven facts.
+- **Autonomy telemetry and observation policy now preserve lifecycle truth.** Model-call events and token projections commit atomically, policy counters checkpoint per daemon boot, active tasks no longer disappear after one hour, write-consistency reports compare stable message identities, user capability violations emit typed events, and read-only shell requests admit only structurally or semantically proven observation commands.
+- **Mandate confirmations now speak to people instead of exposing authorization internals.** Owner approval cards summarize readable actions, account boundaries, limits, timing, success measures, and stop conditions while keeping raw adapter names, endpoint/query JSON, hashes, and internal IDs out of chat. Policy fields now request short one-rule-per-line language, and activation buttons clearly describe their effect across Telegram, Slack, and Discord.
+- **Confirmed mandate expansions no longer derail on structured-provider defaults or policy prose.** Update calls ignore create-only placeholder fields while preserving the existing source binding and accepting a fixed expiry, personal-goal listings identify exact-session mandate-compatible sources, and mandate/memory tools report typed outcomes so words such as `unauthorized` or `rate limits` inside successful data cannot consume retry budgets. Aggregate watchdog lockouts now accurately distinguish failures across different signatures from one repeatedly identical error.
+
 ## [0.12.1] - 2026-08-15
 
 ### Added

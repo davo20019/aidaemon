@@ -17,7 +17,7 @@ use super::{
     InteractionResolvedData, LlmCallData, PolicyDecisionData, ResourceRegisteredData, TaskEndData,
     TaskStatus, ToolResultData,
 };
-use crate::traits::Message;
+use crate::traits::{Message, TokenUsage};
 
 /// The event store backed by SQLite.
 pub struct EventStore {
@@ -456,6 +456,62 @@ impl EventStore {
             }
         }
         Ok(event_id)
+    }
+
+    /// Atomically append the canonical model-call event and its aggregate
+    /// token-usage projection. Keeping both writes on this store's shared
+    /// SQLite transaction prevents token-only and event-only telemetry rows.
+    pub async fn append_llm_call_with_token_usage(
+        &self,
+        event: Event,
+        usage: Option<&TokenUsage>,
+        call_id: &str,
+    ) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            event.event_type == EventType::LlmCall,
+            "atomic model telemetry append requires an llm_call event"
+        );
+        anyhow::ensure!(!call_id.trim().is_empty(), "model call_id is required");
+
+        let data_json = serde_json::to_string(&event.data)?;
+        let created_at_str = event.created_at.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name, turn_id)
+            VALUES (?, 'llm_call', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&event.session_id)
+        .bind(&data_json)
+        .bind(&created_at_str)
+        .bind(&event.task_id)
+        .bind(&event.tool_name)
+        .bind(&event.turn_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(usage) = usage {
+            sqlx::query(
+                "INSERT INTO token_usage (
+                    session_id, model, input_tokens, output_tokens,
+                    cached_input_tokens, cache_creation_input_tokens, call_id, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&event.session_id)
+            .bind(&usage.model)
+            .bind(i64::from(usage.input_tokens))
+            .bind(i64::from(usage.output_tokens))
+            .bind(usage.cached_input_tokens.map(i64::from))
+            .bind(usage.cache_creation_input_tokens.map(i64::from))
+            .bind(call_id)
+            .bind(&created_at_str)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(result.last_insert_rowid())
     }
 
     /// Mark events as consolidated
@@ -1063,49 +1119,68 @@ impl EventStore {
         Ok(events.into_iter().next())
     }
 
-    /// Get the current active task (TaskStart without matching TaskEnd)
+    /// Get the current active task (TaskStart without matching TaskEnd).
+    ///
+    /// This intentionally has no wall-clock cutoff. Activity age is a stale
+    /// task policy concern, not an identity concern: a long-running task must
+    /// remain resumable until its matching terminal event exists.
     pub async fn get_active_task(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
-        // Get all task events in the last hour
-        let since = Utc::now() - Duration::hours(1);
-        let since_str = since.to_rfc3339();
-
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
-            FROM events
-            WHERE session_id = ? AND event_type IN ('task_start', 'task_end') AND created_at >= ?
-            ORDER BY created_at DESC
+            SELECT start.id, start.session_id, start.event_type, start.data,
+                   start.created_at, start.consolidated_at, start.task_id,
+                   start.tool_name, start.turn_id
+            FROM events AS start
+            WHERE start.session_id = ?
+              AND start.event_type = 'task_start'
+              AND start.task_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM events AS terminal
+                  WHERE terminal.session_id = start.session_id
+                    AND terminal.task_id = start.task_id
+                    AND terminal.event_type = 'task_end'
+              )
+            ORDER BY start.id DESC
+            LIMIT 1
             "#,
         )
         .bind(session_id)
-        .bind(&since_str)
         .fetch_all(&self.pool)
         .await?;
 
-        let events = self.rows_to_events(rows)?;
+        Ok(self.rows_to_events(rows)?.into_iter().next())
+    }
 
-        // Find TaskStart without matching TaskEnd
-        let mut ended_tasks: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for event in &events {
-            if event.event_type == EventType::TaskEnd {
-                if let Some(task_id) = &event.task_id {
-                    ended_tasks.insert(task_id.clone());
-                }
-            }
-        }
-
-        for event in events {
-            if event.event_type == EventType::TaskStart {
-                if let Some(task_id) = &event.task_id {
-                    if !ended_tasks.contains(task_id) {
-                        return Ok(Some(event));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+    /// Latest cumulative policy-counter checkpoint for every daemon boot.
+    /// Each boot emits cumulative values, so returning only its newest row is
+    /// essential to avoid double counting.
+    pub async fn latest_policy_metrics_by_boot(
+        &self,
+    ) -> anyhow::Result<Vec<crate::events::PolicyMetricsSnapshotData>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT e.data
+            FROM events AS e
+            JOIN (
+                SELECT json_extract(data, '$.boot_id') AS boot_id, MAX(id) AS latest_id
+                FROM events
+                WHERE event_type = 'policy_metrics_snapshot'
+                  AND json_valid(data)
+                  AND json_extract(data, '$.boot_id') IS NOT NULL
+                GROUP BY json_extract(data, '$.boot_id')
+            ) AS latest ON latest.latest_id = e.id
+            ORDER BY e.id DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.get("data");
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
     }
 
     /// Reconcile stale TaskStart events that never received a matching TaskEnd.
@@ -1685,9 +1760,14 @@ impl EventStore {
     }
 
     /// Return canonical write-path consistency metrics from the event stream.
+    ///
+    /// `messages` was intentionally removed when events became canonical. The
+    /// projection measured here is therefore the stable `message_id` identity
+    /// carried by each conversation event. A non-zero delta identifies missing
+    /// or duplicate identities without reviving the obsolete dual-write path.
     pub async fn write_consistency_report(
         &self,
-        _top_n_sessions: usize,
+        top_n_sessions: usize,
     ) -> anyhow::Result<WriteConsistencyReport> {
         let conversation_event_rows: i64 = sqlx::query_scalar(
             r#"
@@ -1699,6 +1779,83 @@ impl EventStore {
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0);
+
+        let stable_message_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT session_id,
+                       CAST(json_extract(data, '$.message_id') AS TEXT) AS message_id
+                FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                  AND json_extract(data, '$.message_id') IS NOT NULL
+                  AND TRIM(CAST(json_extract(data, '$.message_id') AS TEXT)) != ''
+                GROUP BY session_id, message_id
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let session_mismatch_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT session_id,
+                       COUNT(*) AS event_rows,
+                       COUNT(DISTINCT CASE
+                           WHEN json_extract(data, '$.message_id') IS NOT NULL
+                            AND TRIM(CAST(json_extract(data, '$.message_id') AS TEXT)) != ''
+                           THEN CAST(json_extract(data, '$.message_id') AS TEXT)
+                       END) AS message_rows
+                FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                GROUP BY session_id
+                HAVING event_rows != message_rows
+            )
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let top_session_drifts = if top_n_sessions == 0 {
+            Vec::new()
+        } else {
+            sqlx::query(
+                r#"
+                SELECT session_id,
+                       COUNT(*) AS event_rows,
+                       COUNT(DISTINCT CASE
+                           WHEN json_extract(data, '$.message_id') IS NOT NULL
+                            AND TRIM(CAST(json_extract(data, '$.message_id') AS TEXT)) != ''
+                           THEN CAST(json_extract(data, '$.message_id') AS TEXT)
+                       END) AS message_rows
+                FROM events
+                WHERE event_type IN ('user_message', 'assistant_response', 'tool_result')
+                GROUP BY session_id
+                HAVING event_rows != message_rows
+                ORDER BY ABS(event_rows - message_rows) DESC, session_id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(top_n_sessions as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let message_rows = row.get::<i64, _>("message_rows");
+                let event_rows = row.get::<i64, _>("event_rows");
+                SessionWriteDrift {
+                    session_id: row.get("session_id"),
+                    message_rows: to_u64(message_rows),
+                    event_rows: to_u64(event_rows),
+                    delta: event_rows - message_rows,
+                }
+            })
+            .collect()
+        };
 
         let missing_message_id_events: i64 = sqlx::query_scalar(
             r#"
@@ -1742,10 +1899,10 @@ impl EventStore {
             generated_at: Utc::now().to_rfc3339(),
             conversation_event_rows: to_u64(conversation_event_rows),
             missing_message_id_events: to_u64(missing_message_id_events),
-            global_delta: 0,
-            session_mismatch_count: 0,
+            global_delta: conversation_event_rows - stable_message_rows,
+            session_mismatch_count: to_u64(session_mismatch_count),
             stale_task_starts: to_u64(stale_task_starts),
-            top_session_drifts: Vec::new(),
+            top_session_drifts,
         })
     }
 
@@ -1929,6 +2086,30 @@ impl EventEmitter {
         self.store.append(event).await
     }
 
+    /// Emit an `llm_call` event and correlated token projection as one durable
+    /// transaction. This is intentionally specialized so unrelated event
+    /// writers cannot accidentally couple themselves to the projection table.
+    pub async fn emit_model_call_with_token_usage(
+        &self,
+        mut data: LlmCallData,
+        usage: Option<&TokenUsage>,
+        call_id: &str,
+    ) -> anyhow::Result<i64> {
+        if data.task_id.trim().is_empty() {
+            if let Some(task_id) = &self.current_task_id {
+                data.task_id = task_id.clone();
+            }
+        }
+        let event = Event::new(
+            &self.session_id,
+            EventType::LlmCall,
+            serde_json::to_value(data)?,
+        );
+        self.store
+            .append_llm_call_with_token_usage(event, usage, call_id)
+            .await
+    }
+
     /// Get the underlying store
     pub fn store(&self) -> Arc<EventStore> {
         self.store.clone()
@@ -1988,6 +2169,98 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.iter().find(|e| e.id == id).unwrap().turn_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_call_and_token_projection_commit_atomically() {
+        let (store, _db) = setup_store().await;
+        sqlx::query(
+            "CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cached_input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                call_id TEXT,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("token projection table");
+
+        let call_id = "synthetic-call-atomic";
+        let event = Event::new(
+            "synthetic-session",
+            EventType::LlmCall,
+            json!({
+                "call_id": call_id,
+                "task_id": "synthetic-task",
+                "model": "synthetic-model",
+                "latency_ms": 1,
+                "token_usage_present": true
+            }),
+        );
+        let usage = TokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            model: "synthetic-model".to_string(),
+            ..TokenUsage::default()
+        };
+
+        store
+            .append_llm_call_with_token_usage(event, Some(&usage), call_id)
+            .await
+            .expect("atomic telemetry append");
+
+        let event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = 'llm_call'")
+                .fetch_one(&store.pool)
+                .await
+                .expect("event count");
+        let token_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM token_usage WHERE call_id = ?")
+                .bind(call_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("token count");
+        assert_eq!((event_count, token_count), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn model_call_event_rolls_back_when_token_projection_fails() {
+        let (store, _db) = setup_store().await;
+        let call_id = "synthetic-call-rollback";
+        let event = Event::new(
+            "synthetic-session",
+            EventType::LlmCall,
+            json!({
+                "call_id": call_id,
+                "task_id": "synthetic-task",
+                "model": "synthetic-model",
+                "latency_ms": 1,
+                "token_usage_present": true
+            }),
+        );
+        let usage = TokenUsage {
+            input_tokens: 3,
+            output_tokens: 2,
+            model: "synthetic-model".to_string(),
+            ..TokenUsage::default()
+        };
+
+        assert!(store
+            .append_llm_call_with_token_usage(event, Some(&usage), call_id)
+            .await
+            .is_err());
+        let event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = 'llm_call'")
+                .fetch_one(&store.pool)
+                .await
+                .expect("event count");
+        assert_eq!(event_count, 0, "failed projection must roll back event");
     }
 
     async fn append_event_at(
@@ -2548,7 +2821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_consistency_report_uses_event_stream_only() {
+    async fn write_consistency_report_compares_events_with_stable_message_ids() {
         let (store, _db_file) = setup_store().await;
         let now = Utc::now();
 
@@ -2576,7 +2849,7 @@ mod tests {
         assert!(report.top_session_drifts.is_empty());
         assert!(
             report.evaluate_gate().passed,
-            "event-only mode should pass with complete message IDs"
+            "canonical events should pass with unique stable message IDs"
         );
     }
 
@@ -2603,12 +2876,105 @@ mod tests {
 
         assert_eq!(report.conversation_event_rows, 1);
         assert_eq!(report.missing_message_id_events, 1);
-        assert_eq!(report.global_delta, 0);
-        assert_eq!(report.session_mismatch_count, 0);
-        assert!(report.top_session_drifts.is_empty());
+        assert_eq!(report.global_delta, 1);
+        assert_eq!(report.session_mismatch_count, 1);
+        assert_eq!(report.top_session_drifts.len(), 1);
+        assert_eq!(report.top_session_drifts[0].session_id, "s-drift");
+        assert_eq!(report.top_session_drifts[0].message_rows, 0);
+        assert_eq!(report.top_session_drifts[0].event_rows, 1);
+        assert_eq!(report.top_session_drifts[0].delta, 1);
         assert!(
             !report.evaluate_gate().passed,
             "default gate should fail when event payloads are missing message_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_consistency_report_detects_duplicate_stable_message_ids_and_honors_limit() {
+        let (store, _db_file) = setup_store().await;
+        for (session, message_id) in [
+            ("s-duplicate-a", "same-a"),
+            ("s-duplicate-a", "same-a"),
+            ("s-duplicate-b", "same-b"),
+            ("s-duplicate-b", "same-b"),
+        ] {
+            append_event_at(
+                &store,
+                session,
+                EventType::UserMessage,
+                json!({
+                    "content": "synthetic event",
+                    "message_id": message_id,
+                    "has_attachments": false
+                }),
+                Utc::now(),
+            )
+            .await;
+        }
+
+        let report = store
+            .write_consistency_report(1)
+            .await
+            .expect("write consistency");
+        assert_eq!(report.conversation_event_rows, 4);
+        assert_eq!(report.global_delta, 2);
+        assert_eq!(report.session_mismatch_count, 2);
+        assert_eq!(report.top_session_drifts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_task_does_not_expire_after_one_hour() {
+        let (store, _db_file) = setup_store().await;
+        append_task_start(
+            &store,
+            "s-long-task",
+            "task-long-running",
+            Utc::now() - Duration::hours(3),
+        )
+        .await;
+
+        let active = store
+            .get_active_task("s-long-task")
+            .await
+            .expect("active task lookup")
+            .expect("old unresolved task remains active");
+        assert_eq!(active.task_id.as_deref(), Some("task-long-running"));
+    }
+
+    #[tokio::test]
+    async fn policy_metric_history_keeps_only_latest_cumulative_snapshot_per_boot() {
+        let (store, _db_file) = setup_store().await;
+        for (boot_id, samples) in [("boot-a", 1_u64), ("boot-b", 4), ("boot-a", 7)] {
+            let mut metrics = crate::agent::policy_metrics_snapshot();
+            metrics.tool_exposure_samples = samples;
+            append_event_at(
+                &store,
+                "synthetic-policy-session",
+                EventType::PolicyMetricsSnapshot,
+                serde_json::to_value(crate::events::PolicyMetricsSnapshotData {
+                    schema_version: crate::events::PolicyMetricsSnapshotData::SCHEMA_VERSION,
+                    boot_id: boot_id.to_string(),
+                    metrics,
+                })
+                .expect("serialize policy snapshot"),
+                Utc::now(),
+            )
+            .await;
+        }
+
+        let snapshots = store
+            .latest_policy_metrics_by_boot()
+            .await
+            .expect("durable policy history");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.boot_id == "boot-a")
+                .expect("boot-a")
+                .metrics
+                .tool_exposure_samples,
+            7
         );
     }
 

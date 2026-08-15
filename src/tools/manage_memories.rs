@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::ApprovalBroker;
 use crate::traits::{
-    semantics_for_exact_read_actions, StateStore, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
+    semantics_for_exact_read_actions, StateStore, Tool, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
 };
 use crate::types::{ApprovalKind, ApprovalResponse, ChannelVisibility, FactPrivacy};
 
@@ -891,19 +891,42 @@ impl Tool for ManageMemoriesTool {
             }
             "list_goals" => {
                 let limit = args.limit.unwrap_or(50).clamp(1, 200) as i64;
-                let goals = self.state.get_active_personal_goals(limit).await?;
+                let mut goals = self.state.get_active_personal_goals(limit).await?;
                 if goals.is_empty() {
                     return Ok("No active personal goals.".to_string());
                 }
 
+                let owner_session = args
+                    ._session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty());
+                goals.sort_by_key(|goal| {
+                    if owner_session.is_some_and(|session| goal.session_id == session) {
+                        0
+                    } else {
+                        1
+                    }
+                });
+
                 let mut output =
                     format!("**Active Personal Goals** ({} goals)\n\n", goals.len());
+                output.push_str(
+                    "Only goals marked `mandate-source compatible` may be supplied as a new mandate's source_goal_id. Existing mandates retain their current source; omit source_goal_id when creating a mandate without compatible provenance.\n\n",
+                );
                 for g in &goals {
                     let notes_count = g.progress_notes.as_ref().map_or(0, |n| n.len());
                     let age_str = Self::format_age(&g.created_at);
+                    let compatibility = if owner_session
+                        .is_some_and(|session| g.session_id == session)
+                    {
+                        "mandate-source compatible"
+                    } else {
+                        "not compatible with this mandate owner session"
+                    };
                     output.push_str(&format!(
-                        "- **[ID: {}]** {} (priority: {}, created: {}, {} progress notes)\n",
-                        g.id, g.description, g.priority, age_str, notes_count
+                        "- **[ID: {}]** {} (priority: {}, created: {}, {} progress notes; {})\n",
+                        g.id, g.description, g.priority, age_str, notes_count, compatibility
                     ));
                 }
                 Ok(output)
@@ -2177,6 +2200,33 @@ impl Tool for ManageMemoriesTool {
         }
     }
 
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let output = self.call(arguments).await?;
+        let trimmed = output.trim_start();
+        let outcome_status = if trimmed.starts_with("Internal error:")
+            || trimmed.starts_with("Invalid priority")
+            || trimmed.starts_with("Unknown action:")
+            || trimmed.starts_with("Personal goal not found:")
+        {
+            ToolOutcomeStatus::FailedPermanent
+        } else if trimmed.starts_with("No matching") {
+            ToolOutcomeStatus::CompletedWithNegativeResult
+        } else {
+            ToolOutcomeStatus::Succeeded
+        };
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(outcome_status),
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
+
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities {
             read_only: false,
@@ -3314,6 +3364,65 @@ mod tests {
         assert_eq!(goals[0].priority, "medium");
         assert_eq!(goals[0].status, "active");
         assert_eq!(goals[0].session_id, "owner-session");
+    }
+
+    #[tokio::test]
+    async fn created_goal_with_rate_limit_language_reports_typed_success() {
+        let state = setup_state().await;
+        let tool = ManageMemoriesTool::new(state);
+
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "action": "create_personal_goal",
+                    "goal": "Steward a synthetic account under owner-confirmed rate limits",
+                    "_session_id": "owner-session"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert!(outcome.output.starts_with("Created personal goal "));
+    }
+
+    #[tokio::test]
+    async fn list_goals_marks_only_same_session_sources_as_mandate_compatible() {
+        let state = setup_state().await;
+        let compatible = crate::traits::Goal::new_personal("Compatible goal", "owner-session");
+        let foreign = crate::traits::Goal::new_personal("Foreign goal", "other-session");
+        state.create_goal(&foreign).await.unwrap();
+        state.create_goal(&compatible).await.unwrap();
+        let tool = ManageMemoriesTool::new(state);
+
+        let output = tool
+            .call(
+                &json!({
+                    "action": "list_goals",
+                    "limit": 10,
+                    "_session_id": "owner-session"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let compatible_line = output
+            .lines()
+            .find(|line| line.contains("Compatible goal"))
+            .unwrap();
+        let foreign_line = output
+            .lines()
+            .find(|line| line.contains("Foreign goal"))
+            .unwrap();
+        assert!(compatible_line.contains("mandate-source compatible"));
+        assert!(foreign_line.contains("not compatible"));
+        assert!(output.find("Compatible goal") < output.find("Foreign goal"));
     }
 
     #[tokio::test]

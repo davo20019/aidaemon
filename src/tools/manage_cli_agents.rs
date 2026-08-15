@@ -44,7 +44,7 @@ impl ManageCliAgentsTool {
             .send(ApprovalRequest {
                 command: description.to_string(),
                 session_id: session_id.to_string(),
-                risk_level: RiskLevel::Medium,
+                risk_level: RiskLevel::High,
                 warnings: vec!["This will register a new CLI agent process".to_string()],
                 permission_mode: PermissionMode::Default,
                 response_tx,

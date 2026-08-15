@@ -139,6 +139,7 @@ async fn test_model_supplied_correction_preapproval_json_key_does_not_preapprove
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -195,6 +196,7 @@ async fn test_dispatcher_correction_preapproval_context_reaches_tool_once() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -241,6 +243,7 @@ async fn test_no_correction_preapproval_key_is_injected_into_args() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -296,6 +299,7 @@ async fn test_channel_context_trusted_does_not_bypass_correction_gate() {
                 suppress_trusted_session: true,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -360,6 +364,7 @@ async fn test_scheduled_trust_does_not_bypass_correction_gate() {
                 suppress_trusted_session: true,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -502,6 +507,7 @@ async fn test_error_after_allowed_call_no_residue() {
                 suppress_trusted_session: true,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await;
@@ -535,6 +541,7 @@ async fn test_error_after_allowed_call_no_residue() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await;
@@ -605,6 +612,7 @@ async fn test_panic_no_residue() {
                 suppress_trusted_session: true,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await;
@@ -638,6 +646,7 @@ async fn test_panic_no_residue() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await;
@@ -686,6 +695,7 @@ async fn test_later_correction_call_reclassified_after_block() {
                 suppress_trusted_session: true,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await
@@ -721,6 +731,7 @@ async fn test_later_correction_call_reclassified_after_block() {
                 suppress_trusted_session: false,
                 mandate_authority: None,
                 mandate_tool_call_id: None,
+                mutation_forbidden: false,
             },
         )
         .await

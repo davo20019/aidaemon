@@ -13,5 +13,7 @@ mod types;
 pub(in crate::agent) use project_dir::project_instruction_targets_for_tool_call;
 pub(in crate::agent) use reflection::{PendingReflectionRecovery, ToolErrorEntry};
 pub(in crate::agent) use run::run_tool_execution_phase;
-pub(in crate::agent) use run_helpers::user_facing_external_action_ack;
+pub(in crate::agent) use run_helpers::{
+    fallback_tool_semantic_scope, user_facing_external_action_ack,
+};
 pub(in crate::agent) use types::ToolExecutionCtx;

@@ -99,6 +99,7 @@ pub(super) async fn prefetch_read_only_batch(
             suppress_trusted_session: false,
             mandate_authority: None,
             mandate_execution: false,
+            mutation_forbidden: false,
         };
         let io = execute_tool_call_io(agent, tc, &io_ctx).await;
         (

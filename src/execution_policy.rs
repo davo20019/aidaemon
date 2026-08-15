@@ -129,6 +129,38 @@ impl PolicyBundle {
             confidence: clamp01(confidence),
         }
     }
+
+    /// Merge semantic, evidence-derived uncertainty after task assessment.
+    /// This never changes approval authority. Material multi-source inquiries
+    /// receive full verification and enough context/tool runway to close their
+    /// evidence obligations rather than being optimized as a quick lookup.
+    pub fn apply_epistemic_uncertainty(&mut self, score: f32) -> bool {
+        let score = clamp01(score);
+        if score <= self.uncertainty_score {
+            return false;
+        }
+        self.uncertainty_score = score;
+        self.confidence = self.confidence.min(1.0 - score);
+        if score >= 0.55 {
+            let strong = ExecutionPolicy::for_profile(ModelProfile::Strong);
+            self.policy.model_profile = ModelProfile::Strong;
+            self.policy.verify_level = VerifyLevel::Full;
+            self.policy.context_budget = self.policy.context_budget.max(strong.context_budget);
+            self.policy.tool_budget = self.policy.tool_budget.max(strong.tool_budget);
+            self.policy.policy_rev = self.policy.policy_rev.saturating_add(1);
+            if !self
+                .policy
+                .escalation_reasons
+                .iter()
+                .any(|reason| reason == "material_evidence_inquiry")
+            {
+                self.policy
+                    .escalation_reasons
+                    .push("material_evidence_inquiry".to_string());
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +327,19 @@ mod tests {
         assert_eq!(policy.model_profile, ModelProfile::Strong);
         assert!(!policy.escalate("already_max"));
         assert_eq!(policy.model_profile, ModelProfile::Strong);
+    }
+
+    #[test]
+    fn epistemic_uncertainty_enables_full_verification_without_changing_authority() {
+        let mut bundle = PolicyBundle::from_scores(0.1, 0.0, 1.0);
+        let approval = bundle.policy.approval_mode;
+        assert!(bundle.apply_epistemic_uncertainty(0.7));
+        assert_eq!(bundle.uncertainty_score, 0.7);
+        assert_eq!(bundle.confidence, 0.3);
+        assert_eq!(bundle.policy.model_profile, ModelProfile::Strong);
+        assert_eq!(bundle.policy.verify_level, VerifyLevel::Full);
+        assert_eq!(bundle.policy.approval_mode, approval);
+        assert!(bundle.policy.tool_budget >= 60);
     }
 
     #[test]

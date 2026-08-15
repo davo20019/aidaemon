@@ -26,9 +26,10 @@ use crate::events::TerminalState;
 use crate::traits::AttachmentProvenance;
 
 /// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-/// v5: a structurally referenced parent turn gets its own high-fidelity mode;
-/// ordinary archived turns remain aggressively compact.
-pub(crate) const RENDERER_VERSION: u32 = 5;
+/// v6: a structurally referenced parent turn retains bounded receipt-bearing
+/// tool evidence; ordinary archived turns remain aggressively compact.
+pub(crate) const RENDERER_VERSION: u32 = 6;
+const MAX_ADJACENT_TOOL_RESULT_CHARS: usize = 4_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderOptions {
@@ -117,6 +118,20 @@ fn truncate_old_assistant(content: &str) -> String {
     } else {
         content.to_string()
     }
+}
+
+fn retain_adjacent_tool_result(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= MAX_ADJACENT_TOOL_RESULT_CHARS {
+        return content.to_string();
+    }
+    let head_chars = (MAX_ADJACENT_TOOL_RESULT_CHARS * 2) / 3;
+    let tail_chars = MAX_ADJACENT_TOOL_RESULT_CHARS.saturating_sub(head_chars);
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content.chars().skip(total - tail_chars).collect();
+    format!(
+        "{head}\n[Adjacent tool evidence truncated: retained {MAX_ADJACENT_TOOL_RESULT_CHARS}/{total} characters]\n{tail}"
+    )
 }
 
 /// Truncation for the winning assistant message of an archived turn.
@@ -547,8 +562,12 @@ fn render_archived(
                     .unwrap_or_default();
                 let tool_name = m.tool_name.as_deref().unwrap_or("unknown");
                 let result = m.content.as_deref().unwrap_or("");
-                let summary = summarize_tool_result(tool_name, &args_json, result);
-                let mut obj = json!({ "role": "tool", "content": summary });
+                let retained = if preserve_winning_assistant {
+                    retain_adjacent_tool_result(result)
+                } else {
+                    summarize_tool_result(tool_name, &args_json, result)
+                };
+                let mut obj = json!({ "role": "tool", "content": retained });
                 attach_tool_routing(&mut obj, m);
                 out.push(obj);
                 append_tool_observation_messages(&mut out, m, options, &mut vision_skipped, true);
@@ -1203,5 +1222,50 @@ mod tests {
             &RenderOptions::default(),
         );
         assert!(out[0]["content"].is_string());
+    }
+
+    #[test]
+    fn adjacent_mode_retains_bounded_receipt_bearing_tool_evidence() {
+        let receipt = "[Tool receipt v2: outcome=succeeded; result_id=sha256:synthetic; source=tool_output; model_view=complete; durable_view=complete; requested_range=not_applicable; returned_range=not_applicable]";
+        let evidence = format!("{receipt}\nfirst-value\n{}\nlast-value", "x".repeat(5_000));
+        let turn = vec![
+            user("Generate the synthetic values"),
+            assistant_empty_with_tool_call(),
+            tool("terminal", "c1", &evidence),
+            assistant("The values were generated."),
+        ];
+
+        let adjacent = render_turn(
+            &turn,
+            RenderMode::Adjacent {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let content = adjacent
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("adjacent tool evidence");
+        assert!(content.contains(receipt));
+        assert!(content.contains("first-value"));
+        assert!(content.contains("last-value"));
+        assert!(content.contains("Adjacent tool evidence truncated"));
+
+        let archived = render_turn(
+            &turn,
+            RenderMode::Archived {
+                terminal_state: TerminalState::Completed,
+            },
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        let archived_content = archived
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("archived tool summary");
+        assert_ne!(archived_content, content);
     }
 }

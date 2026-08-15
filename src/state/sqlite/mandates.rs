@@ -372,7 +372,7 @@ async fn validate_current_run_receipt_refs(
              WHERE e.event_type = 'tool_result'
                AND t.goal_run_id = ?
                AND json_extract(e.data, '$.tool_call_id') = ?
-               AND json_extract(e.data, '$.receipt.schema_version') = 1
+               AND json_extract(e.data, '$.receipt.schema_version') = ?
                AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
                AND json_extract(e.data, '$.receipt.outcome_evidence')
                    IN ('tool_reported', 'structured_metadata')
@@ -380,6 +380,7 @@ async fn validate_current_run_receipt_refs(
         )
         .bind(goal_run_id)
         .bind(receipt_id)
+        .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION))
         .fetch_optional(&mut *connection)
         .await?;
         anyhow::ensure!(
@@ -675,7 +676,7 @@ async fn validate_source_goal(
     );
     anyhow::ensure!(
         source.get::<String, _>("session_id") == owner_session_id,
-        "source personal goal must belong to the mandate owner session"
+        "source personal goal belongs to a different owner session; choose a goal marked mandate-source compatible or omit source_goal_id"
     );
     Ok(())
 }
@@ -2597,7 +2598,7 @@ impl MandateStore for SqliteStateStore {
                  WHERE m.id = ? AND gr.trigger_type = 'mandate'
                    AND e.event_type = 'tool_result'
                    AND json_extract(e.data, '$.tool_call_id') = ?
-                   AND json_extract(e.data, '$.receipt.schema_version') = 1
+                   AND json_extract(e.data, '$.receipt.schema_version') = ?
                    AND json_extract(e.data, '$.receipt.outcome_status') = 'succeeded'
                    AND json_extract(e.data, '$.receipt.outcome_evidence')
                        IN ('tool_reported', 'structured_metadata')
@@ -2605,6 +2606,7 @@ impl MandateStore for SqliteStateStore {
             )
             .bind(&note.mandate_id)
             .bind(receipt_id)
+            .bind(i64::from(crate::events::ToolReceiptV1::SCHEMA_VERSION))
             .fetch_optional(&mut *tx)
             .await?;
             anyhow::ensure!(
@@ -3204,7 +3206,7 @@ impl MandateStore for SqliteStateStore {
         validate_timestamp("mutation outcome completed_at", &projection.completed_at)?;
         if projection.status == MandateMutationAttemptStatus::Succeeded {
             anyhow::ensure!(
-                projection.receipt_schema_version == 1
+                projection.receipt_schema_version == crate::events::ToolReceiptV1::SCHEMA_VERSION
                     && projection.outcome_evidence.is_some()
                     && !projection.timed_out
                     && !projection.background_started
@@ -4362,7 +4364,7 @@ mod tests {
             task_attempt_id: reservation.task_attempt_id.clone(),
             tool_call_id: reservation.tool_call_id.clone(),
             status,
-            receipt_schema_version: 1,
+            receipt_schema_version: crate::events::ToolReceiptV1::SCHEMA_VERSION,
             outcome_evidence: Some(MandateMutationEvidence::StructuredMetadata),
             timed_out: false,
             background_started: false,

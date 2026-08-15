@@ -46,6 +46,16 @@ impl std::fmt::Display for RiskLevel {
     }
 }
 
+impl RiskLevel {
+    /// Whether this risk level represents an action that should interrupt the
+    /// owner for approval. Safe and medium operations may still be observable
+    /// or locally mutating, but they are not dangerous enough to justify
+    /// blocking an otherwise authorized task.
+    pub const fn requires_owner_approval(self) -> bool {
+        matches!(self, Self::High | Self::Critical)
+    }
+}
+
 /// Least-privilege access granted to one collaborator for one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

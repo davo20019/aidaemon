@@ -323,7 +323,7 @@ impl HttpRequestTool {
         is_session_approved: bool,
         is_trusted_session: bool,
     ) -> bool {
-        risk != RiskLevel::Safe && !is_session_approved && !is_trusted_session
+        risk.requires_owner_approval() && !is_session_approved && !is_trusted_session
     }
 
     async fn is_session_approved(&self, session_id: &str, approval_key: &str) -> bool {
@@ -902,10 +902,14 @@ impl HttpRequestTool {
         idempotent && status.is_server_error()
     }
 
-    fn classify_risk(method: &str, has_auth: bool) -> RiskLevel {
+    fn classify_risk(method: &str, has_body: bool) -> RiskLevel {
         match method {
-            "GET" | "HEAD" if !has_auth => RiskLevel::Safe,
-            "GET" | "HEAD" => RiskLevel::Medium,
+            // Authentication does not make an observation dangerous by itself.
+            // By the time this runs, credential-bearing requests have already
+            // passed profile/domain binding, HTTPS, SSRF, header, and secret
+            // checks. The configured service is exactly where those credentials
+            // are meant to be sent.
+            "GET" | "HEAD" if !has_body => RiskLevel::Safe,
             _ => RiskLevel::High,
         }
     }
@@ -1459,7 +1463,7 @@ impl HttpRequestTool {
         //   c) an ordinary (non-mandate) request is session-approved, OR
         //   d) an ordinary request has trusted scheduled-task context.
         let risk = if method_override_headers.is_empty() && authority_override_headers.is_empty() {
-            Self::classify_risk(&method, profile.is_some())
+            Self::classify_risk(&method, body.is_some_and(|value| !value.is_empty()))
         } else {
             RiskLevel::High
         };
@@ -2325,6 +2329,11 @@ mod tests {
             false
         ));
         assert!(!HttpRequestTool::requires_runtime_approval(
+            RiskLevel::Medium,
+            false,
+            false
+        ));
+        assert!(!HttpRequestTool::requires_runtime_approval(
             RiskLevel::High,
             true,
             false
@@ -2745,6 +2754,7 @@ mod tests {
                     correction_preapproved: true,
                     mandate_preapproved: false,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
                 false,
             ),
@@ -2964,6 +2974,7 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: true,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             )
             .await
@@ -3001,6 +3012,7 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             )
             .await
@@ -3046,6 +3058,7 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             )
             .await
@@ -3139,6 +3152,7 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: false,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             )
             .await
@@ -3185,6 +3199,7 @@ mod tests {
                     // authenticated observation, including its stable account.
                     mandate_preapproved: true,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             ),
         )
@@ -3250,6 +3265,7 @@ mod tests {
                     correction_preapproved: false,
                     mandate_preapproved: true,
                     mandate_execution: true,
+                    mutation_forbidden: false,
                 },
             ),
         )
@@ -3410,22 +3426,47 @@ mod tests {
             HttpRequestTool::classify_risk("HEAD", false),
             RiskLevel::Safe
         );
-        assert_eq!(
-            HttpRequestTool::classify_risk("GET", true),
-            RiskLevel::Medium
-        );
+        assert_eq!(HttpRequestTool::classify_risk("GET", true), RiskLevel::High);
         assert_eq!(
             HttpRequestTool::classify_risk("POST", false),
             RiskLevel::High
         );
         assert_eq!(
-            HttpRequestTool::classify_risk("POST", true),
+            HttpRequestTool::classify_risk("DELETE", false),
             RiskLevel::High
         );
-        assert_eq!(
-            HttpRequestTool::classify_risk("DELETE", true),
-            RiskLevel::High
+    }
+
+    #[tokio::test]
+    async fn ordinary_authenticated_get_does_not_request_approval() {
+        let (url, request_count, server) = spawn_counting_status_server("204 No Content").await;
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
+        drop(approval_rx);
+        let mut profiles = HashMap::new();
+        profiles.insert("local_oauth".to_string(), make_local_bearer_profile());
+        let tool = HttpRequestTool::new(
+            Arc::new(RwLock::new(profiles)),
+            ApprovalBroker::new(approval_tx),
         );
+
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({
+                    "method": "GET",
+                    "url": url,
+                    "auth_profile": "local_oauth",
+                    "_session_id": "telegram:synthetic-owner"
+                })
+                .to_string(),
+                None,
+            )
+            .await
+            .expect("an allowlisted authenticated observation must run without approval");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(outcome.metadata.http_status, Some(204));
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

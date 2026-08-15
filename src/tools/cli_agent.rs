@@ -2611,7 +2611,6 @@ impl CliAgentTool {
                                 status_word,
                                 &persisted_output,
                             );
-                            let _slot = crate::tools::terminal::acquire_reengagement_slot().await;
                             info!(
                                 task_id = %task_id_for_notify,
                                 session_id = %notify_session_id,
@@ -2623,15 +2622,19 @@ impl CliAgentTool {
                             continuation_progress
                                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             continuation_progress.tick().await;
-                            let mut continuation =
-                                std::pin::pin!(agent.continue_conversation(ConversationRequest {
-                                    session_id: notify_session_id.clone(),
-                                    user_text: followup,
-                                    status_tx: None,
-                                    user_role: crate::types::UserRole::Owner,
-                                    channel_ctx: crate::types::ChannelContext::internal(),
-                                    heartbeat: None,
-                                },));
+                            let mut continuation = std::pin::pin!(
+                                crate::tools::terminal::run_background_continuation(
+                                    agent.as_ref(),
+                                    ConversationRequest {
+                                        session_id: notify_session_id.clone(),
+                                        user_text: followup,
+                                        status_tx: None,
+                                        user_role: crate::types::UserRole::Owner,
+                                        channel_ctx: crate::types::ChannelContext::internal(),
+                                        heartbeat: None,
+                                    },
+                                )
+                            );
                             let continuation_result = loop {
                                 tokio::select! {
                                     result = &mut continuation => break result,

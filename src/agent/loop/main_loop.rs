@@ -20,6 +20,40 @@ fn build_stuck_no_output_fallback(_user_text: &str) -> String {
         .to_string()
 }
 
+/// Build assessment context only when the dialogue lifecycle says the current
+/// request depends on an earlier exchange. New tasks already carry their full
+/// authored request separately; feeding unrelated history into their hard
+/// completion contract can manufacture stale observation or mutation duties.
+fn task_assessment_conversation_context(
+    followup_mode: Option<FollowupMode>,
+    session_summary: Option<&str>,
+    recent_messages: &[Value],
+) -> Option<String> {
+    if !matches!(
+        followup_mode,
+        Some(FollowupMode::Followup | FollowupMode::ClarificationAnswer)
+    ) {
+        return None;
+    }
+
+    let mut ctx_parts = Vec::new();
+    if let Some(summary) = session_summary.filter(|summary| !summary.is_empty()) {
+        ctx_parts.push(format!("[Session Summary] {summary}"));
+    }
+    for msg in recent_messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if !content.is_empty() {
+            ctx_parts.push(format!(
+                "- {}: {}",
+                role.chars().next().unwrap_or('?').to_uppercase(),
+                content
+            ));
+        }
+    }
+    (!ctx_parts.is_empty()).then(|| ctx_parts.join("\n"))
+}
+
 /// Enter one agent-loop iteration and update the state that is common to every
 /// phase path. Keeping this boundary small avoids threading the full turn
 /// context through another driver object while making iteration entry explicit.
@@ -269,8 +303,8 @@ impl Agent {
         let task_plan = {
             use super::bootstrap_phase::task_planning::{
                 generate_task_plan, planned_contract_is_complete, planned_contract_is_confident,
-                planned_mutation_constraints_are_grounded, planning_skip_reason,
-                TaskAssessmentMode,
+                planned_mutation_constraints_are_grounded, planned_tool_constraints_are_grounded,
+                planned_response_fields_are_grounded, planning_skip_reason, TaskAssessmentMode,
             };
             let model_trust_tier = self.trust_tier_for_model(&model);
             let planner_trust_tier = model_trust_tier.as_str();
@@ -309,33 +343,13 @@ impl Agent {
                 .await;
                 None
             } else {
-                // Build conversation context from recent messages for the assessment.
-                // This ensures it sees the same narrative as the main LLM,
-                // preventing intent loss across multi-hop follow-ups.
-                let planner_context = {
-                    let mut ctx_parts = Vec::new();
-                    if let Some(ref summary) = session_summary {
-                        if !summary.summary.is_empty() {
-                            ctx_parts.push(format!("[Session Summary] {}", summary.summary));
-                        }
-                    }
-                    for msg in &turn_context.recent_messages {
-                        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if !content.is_empty() {
-                            ctx_parts.push(format!(
-                                "- {}: {}",
-                                role.chars().next().unwrap_or('?').to_uppercase(),
-                                content
-                            ));
-                        }
-                    }
-                    if ctx_parts.is_empty() {
-                        None
-                    } else {
-                        Some(ctx_parts.join("\n"))
-                    }
-                };
+                // Preserve prior narrative for genuine multi-hop follow-ups,
+                // but keep a lifecycle-classified new request contract-local.
+                let planner_context = task_assessment_conversation_context(
+                    turn_context.followup_mode,
+                    session_summary.as_ref().map(|summary| summary.summary.as_str()),
+                    &turn_context.recent_messages,
+                );
                 let planner_model = llm_router
                     .as_ref()
                     .map(|router| router.select(crate::router::Tier::Primary))
@@ -442,6 +456,12 @@ impl Agent {
                             .unwrap_or_default();
                         let declares_negative_scope =
                             matches!(scope.as_str(), "read_only" | "read-only" | "scoped");
+                        let forbids_tool_use = signals
+                            .tool_scope
+                            .as_deref()
+                            .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"));
+                        let has_tool_constraints =
+                            forbids_tool_use || !signals.forbidden_tool_scopes.is_empty();
                         let confident = planned_contract_is_confident(
                             signals,
                             plan.task_shape.as_ref(),
@@ -451,8 +471,17 @@ impl Agent {
                             signals,
                             user_text,
                         );
+                        let tool_constraint_grounded =
+                            planned_tool_constraints_are_grounded(signals, user_text);
+                        let response_fields_grounded =
+                            planned_response_fields_are_grounded(signals, user_text);
 
-                        if confident && complete && (!declares_negative_scope || grounded) {
+                        if confident
+                            && complete
+                            && (!declares_negative_scope || grounded)
+                            && (!has_tool_constraints || tool_constraint_grounded)
+                            && response_fields_grounded
+                        {
                             let planned_kind = signals
                                 .task_kind
                                 .as_deref()
@@ -500,6 +529,13 @@ impl Agent {
                                     requires_exact_history: signals
                                         .requires_exact_history
                                         .unwrap_or(false),
+                                    evidence_requirements: signals
+                                        .evidence_requirements
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                    forbids_tool_use,
+                                    forbidden_tool_scopes: &signals.forbidden_tool_scopes,
+                                    required_response_fields: &signals.required_response_fields,
                                 },
                             );
                             if turn_context.inherited_completion_contract
@@ -593,6 +629,43 @@ impl Agent {
                                 );
                             metadata["assessment_mode"] = json!(plan.mode.as_str());
                             metadata["task_shape"] = json!(plan.task_shape.as_ref());
+                            metadata["completion_contract"] = json!({
+                                "task_kind": format!(
+                                    "{:?}",
+                                    turn_context.completion_contract.task_kind
+                                )
+                                .to_ascii_lowercase(),
+                                "expects_mutation": turn_context
+                                    .completion_contract
+                                    .expects_mutation,
+                                "required_mutation_effects": turn_context
+                                    .completion_contract
+                                    .required_mutation_effects,
+                                "requires_observation": turn_context
+                                    .completion_contract
+                                    .requires_observation,
+                                "requires_reverification_after_mutation": turn_context
+                                    .completion_contract
+                                    .requires_reverification_after_mutation,
+                                "explicit_verification_requested": turn_context
+                                    .completion_contract
+                                    .explicit_verification_requested,
+                                "evidence_requirements": turn_context
+                                    .completion_contract
+                                    .evidence_requirements,
+                                "forbidden_actions": turn_context
+                                    .completion_contract
+                                    .forbidden_mutation_actions
+                                    .iter()
+                                    .map(|action| action.as_str())
+                                    .collect::<Vec<_>>(),
+                                "forbidden_tool_scopes": turn_context
+                                    .completion_contract
+                                    .forbidden_tool_scopes,
+                                "required_response_fields": turn_context
+                                    .completion_contract
+                                    .required_response_fields,
+                            });
                             metadata
                         },
                     )
@@ -630,6 +703,127 @@ impl Agent {
         // Derive all contract-dependent state exactly once from that finalized
         // value so loop control, progress tracking, budgets, and telemetry agree.
         let mut completion_progress = CompletionProgress::new(&turn_context.completion_contract);
+        if turn_context.completion_contract.forbids_tool_use {
+            tool_defs.clear();
+            let outstanding_needs = turn_context
+                .completion_contract
+                .evidence_requirements
+                .iter()
+                .map(crate::agent::inquiry::describe_requirement)
+                .collect();
+            turn_state.directives.push_system_message(
+                SystemDirective::ToolUseForbiddenByRequest { outstanding_needs },
+            );
+        } else if !turn_context
+            .completion_contract
+            .forbidden_tool_scopes
+            .is_empty()
+        {
+            let forbidden_scopes = &turn_context.completion_contract.forbidden_tool_scopes;
+            tool_defs.retain(|definition| {
+                let Some(name) = definition
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return false;
+                };
+                let scope = self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name() == name && tool.is_available())
+                    .and_then(|tool| {
+                        tool.semantic_affordances()
+                            .map(|affordances| affordances.scope)
+                    })
+                    .or_else(|| {
+                        super::tool_execution_phase::fallback_tool_semantic_scope(name)
+                    });
+                !scope.is_some_and(|scope| forbidden_scopes.contains(&scope))
+            });
+        }
+        let epistemic_uncertainty = crate::agent::inquiry::epistemic_uncertainty(
+            &turn_context.completion_contract.evidence_requirements,
+        );
+        if policy_bundle.apply_epistemic_uncertainty(epistemic_uncertainty) {
+            let guided_model = self.trust_tier_for_model(&model)
+                == crate::agent::trust_tier::ModelTrustTier::Guided;
+            let model_override_active = if epistemic_uncertainty >= 0.55 && guided_model {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.model_override.read(),
+                )
+                .await
+                .map(|guard| *guard)
+                .unwrap_or(true)
+            } else {
+                true
+            };
+            if epistemic_uncertainty >= 0.55 && guided_model && !model_override_active {
+                if let Some(router) = llm_router.as_ref() {
+                    model = router
+                        .select_for_profile(policy_bundle.policy.model_profile)
+                        .to_string();
+                }
+            }
+            if epistemic_uncertainty >= 0.55
+                && guided_model
+                && self.policy_config.tool_filter_enforce
+            {
+                tool_defs = self.filter_tool_definitions_for_policy(
+                    &base_tool_defs,
+                    &available_capabilities,
+                    &policy_bundle.policy,
+                    policy_bundle.risk_score,
+                    false,
+                );
+            }
+            self.emit_decision_point(
+                &emitter,
+                &task_id,
+                0,
+                DecisionType::ExecutionPlanningGate,
+                "Applied evidence-derived epistemic uncertainty".to_string(),
+                json!({
+                    "condition": "epistemic_uncertainty_applied",
+                    "uncertainty_score": policy_bundle.uncertainty_score,
+                    "evidence_requirement_count": turn_context.completion_contract.evidence_requirements.len(),
+                    "verify_level": policy_bundle.policy.verify_level,
+                    "tool_budget": policy_bundle.policy.tool_budget,
+                    "visible_tool_count": tool_defs.len(),
+                    "selected_model": model,
+                }),
+            )
+            .await;
+        }
+        if !turn_context.completion_contract.forbids_tool_use
+            && !turn_context
+            .completion_contract
+            .evidence_requirements
+            .is_empty()
+        {
+            let candidate_tools = crate::agent::inquiry::candidate_tools_for_requirements(
+                &turn_context.completion_contract.evidence_requirements,
+                tool_defs.iter().filter_map(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                }),
+            );
+            let outstanding_needs = turn_context
+                .completion_contract
+                .evidence_requirements
+                .iter()
+                .map(crate::agent::inquiry::describe_requirement)
+                .collect();
+            turn_state.directives.push_system_message(
+                SystemDirective::InquiryEvidenceRequired {
+                    outstanding_needs,
+                    candidate_tools,
+                },
+            );
+        }
         harness_eval.set_completion_context(
             format!("{:?}", turn_context.completion_contract.task_kind).to_lowercase(),
             turn_context
@@ -1807,6 +2001,34 @@ mod characterization_tests;
 #[cfg(test)]
 mod stuck_fallback_tests {
     use super::*;
+
+    #[test]
+    fn new_task_assessment_excludes_unrelated_recent_context() {
+        let recent = vec![json!({
+            "role": "assistant",
+            "content": "The previous device check requires live health evidence."
+        })];
+        assert_eq!(
+            task_assessment_conversation_context(
+                Some(FollowupMode::NewTask),
+                Some("Prior device discussion"),
+                &recent,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn followup_assessment_retains_the_preceding_exchange() {
+        let recent = vec![json!({
+            "role": "user",
+            "content": "Check the first device."
+        })];
+        let context =
+            task_assessment_conversation_context(Some(FollowupMode::Followup), None, &recent)
+                .expect("follow-up context");
+        assert!(context.contains("Check the first device."));
+    }
 
     #[test]
     fn fallback_does_not_infer_missing_details_from_request_wording() {

@@ -1415,7 +1415,7 @@ impl Channel for DiscordChannel {
             GoalConfirmationStyle::Autopilot => "autopilot",
         };
         let approve_label = match style {
-            GoalConfirmationStyle::Standard => "Approve goal",
+            GoalConfirmationStyle::Standard => "Approve & activate",
             GoalConfirmationStyle::Autopilot => "Enable Autopilot",
         };
         let page_count = pages.len();

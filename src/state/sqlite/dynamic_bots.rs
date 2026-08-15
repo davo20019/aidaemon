@@ -21,26 +21,32 @@ impl crate::traits::DynamicBotStore for SqliteStateStore {
         .await?;
         let row_id = result.last_insert_rowid();
 
-        // Try to move the bot_token to keychain
-        let bot_token_key = format!("dynamic_bot_{}_bot_token", row_id);
-        if crate::config::store_in_keychain(&bot_token_key, &bot.bot_token).is_ok() {
-            // Replace plaintext with keychain reference
-            let _ = sqlx::query("UPDATE dynamic_bots SET bot_token = ? WHERE id = ?")
-                .bind(format!("keychain:{}", bot_token_key))
-                .bind(row_id)
-                .execute(&self.pool)
-                .await;
-        }
-
-        // Try to move the app_token to keychain (Slack bots)
-        if let Some(ref app_tok) = bot.app_token {
-            let app_token_key = format!("dynamic_bot_{}_app_token", row_id);
-            if crate::config::store_in_keychain(&app_token_key, app_tok).is_ok() {
-                let _ = sqlx::query("UPDATE dynamic_bots SET app_token = ? WHERE id = ?")
-                    .bind(format!("keychain:{}", app_token_key))
+        // Unit/integration tests use ephemeral databases and must never open
+        // the user's OS credential store. Dedicated config tests cover the
+        // keychain adapter; production builds retain the secure migration.
+        #[cfg(not(test))]
+        {
+            // Try to move the bot_token to keychain
+            let bot_token_key = format!("dynamic_bot_{}_bot_token", row_id);
+            if crate::config::store_in_keychain(&bot_token_key, &bot.bot_token).is_ok() {
+                // Replace plaintext with keychain reference
+                let _ = sqlx::query("UPDATE dynamic_bots SET bot_token = ? WHERE id = ?")
+                    .bind(format!("keychain:{}", bot_token_key))
                     .bind(row_id)
                     .execute(&self.pool)
                     .await;
+            }
+
+            // Try to move the app_token to keychain (Slack bots)
+            if let Some(ref app_tok) = bot.app_token {
+                let app_token_key = format!("dynamic_bot_{}_app_token", row_id);
+                if crate::config::store_in_keychain(&app_token_key, app_tok).is_ok() {
+                    let _ = sqlx::query("UPDATE dynamic_bots SET app_token = ? WHERE id = ?")
+                        .bind(format!("keychain:{}", app_token_key))
+                        .bind(row_id)
+                        .execute(&self.pool)
+                        .await;
+                }
             }
         }
 
@@ -103,9 +109,13 @@ impl crate::traits::DynamicBotStore for SqliteStateStore {
     }
 
     async fn delete_dynamic_bot(&self, id: i64) -> anyhow::Result<()> {
-        // Clean up keychain entries for this bot
-        let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_bot_token", id));
-        let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_app_token", id));
+        // Clean up keychain entries for this bot. Test builds never create
+        // them and must not touch the user's credential store.
+        #[cfg(not(test))]
+        {
+            let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_bot_token", id));
+            let _ = crate::config::delete_from_keychain(&format!("dynamic_bot_{}_app_token", id));
+        }
 
         sqlx::query("DELETE FROM dynamic_bots WHERE id = ?")
             .bind(id)

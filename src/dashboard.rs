@@ -727,6 +727,17 @@ async fn api_writes_consistency(State(state): State<DashboardState>) -> Json<ser
 
 async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let metrics = agent::policy_metrics_snapshot();
+    let durable_boot_snapshots = if let Some(store) = &state.event_store {
+        match store.latest_policy_metrics_by_boot().await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                warn!(%error, "Failed to load durable policy metric snapshots");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let autotune = agent::policy_autotune_snapshot(state.policy_uncertainty_threshold);
     let avg_tools_before = if metrics.tool_exposure_samples > 0 {
         metrics.tool_exposure_before_sum as f64 / metrics.tool_exposure_samples as f64
@@ -768,7 +779,9 @@ async fn api_policy_metrics(State(state): State<DashboardState>) -> Json<serde_j
         "llm_payload_invalid_total": metrics.llm_payload_invalid_total,
         "llm_payload_invalid_breakdown": metrics.llm_payload_invalid_breakdown,
         "harness_eval_tasks_total": metrics.harness_eval_tasks_total,
-        "harness_eval_overall_avg": metrics.harness_eval_overall_avg
+        "harness_eval_overall_avg": metrics.harness_eval_overall_avg,
+        "current_boot_id": agent::policy_metrics_boot_id(),
+        "durable_boot_snapshots": durable_boot_snapshots
     }))
 }
 

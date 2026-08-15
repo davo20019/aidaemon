@@ -23,6 +23,7 @@ use crate::events::{
 use crate::execution::{
     active_execution_backend, BackendKind, ExecutionRequest, ProcessHandle, SharedExecutionBackend,
 };
+use crate::llm_runtime::SharedLlmRuntime;
 use crate::runtime_ports::{ConversationRequest, ConversationRuntime, OutboundRouter};
 use crate::traits::{
     StateStore, Tool, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
@@ -33,10 +34,11 @@ use crate::types::{ApprovalResponse, MediaKind, MediaMessage, StatusUpdate};
 use crate::utils::{truncate_str, truncate_with_note};
 
 use super::command_patterns::{find_matching_pattern, record_approval, record_denial};
-use super::command_risk::{classify_command, hard_block_reason, PermissionMode, RiskLevel};
+use super::command_risk::{approval_floor_reason, hard_block_reason, PermissionMode, RiskLevel};
 use super::command_semantics::classify_shell_command;
 use super::daemon_guard::detect_daemonization_primitives;
 use super::process_control::{send_sigkill, send_sigterm};
+use super::semantic_command_risk::assess_command;
 
 /// Max bytes per stream buffer (1 MB) to prevent unbounded memory growth.
 const BUFFER_CAP: usize = 1_048_576;
@@ -47,6 +49,12 @@ const BACKGROUND_PROGRESS_INTERVAL_SECS: u64 = 35;
 /// Maximum number of periodic progress pings before going silent.
 /// Prevents notification spam for long-running processes (servers, daemons).
 const MAX_BACKGROUND_PROGRESS_PINGS: u32 = 3;
+
+/// Maximum wall time for a background completion to re-enter the agent loop.
+/// The raw command/worker result is always delivered when this budget expires,
+/// so a slow model or a wedged continuation can never strand the user's final
+/// answer or monopolize the global re-engagement serializer indefinitely.
+const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A disowned background process (notifier-active, non-detached) that makes no
 /// progress (no CPU time, disk I/O, output growth, or process-tree change) for
@@ -869,6 +877,10 @@ pub struct TerminalTool {
     /// [`SelfCorrectionConfig::default`] unless wired via
     /// [`TerminalTool::with_self_correction`].
     self_correction: SelfCorrectionConfig,
+    /// Configured model runtime used to assess novel shell commands by their
+    /// complete effects. Deterministic checks remain a non-downgradable safety
+    /// floor; invalid/unavailable model assessments fail closed to approval.
+    command_risk_runtime: OnceLock<SharedLlmRuntime>,
 }
 
 /// Check if a command string contains shell operators.
@@ -1596,6 +1608,23 @@ fn summarize_progress_output(output: &str) -> String {
     }
 }
 
+/// One deterministic transition after the frequent progress-ping budget is
+/// exhausted. This deliberately does not re-enter the agent loop: doing that
+/// from inside the process-monitoring `select!` used to block observation of
+/// the process exit and could strand the promised final result.
+fn format_background_monitoring_notice(elapsed_secs: u64, output: &str) -> String {
+    let mut message = format!(
+        "ℹ️ Still running after {}. Frequent progress updates are now paused, but completion monitoring remains active. The process may be stalled or long-lived; when it exits—or if the watchdog stops it—you'll receive a final closeout.",
+        humanize_elapsed(elapsed_secs)
+    );
+    let latest = summarize_progress_output(output);
+    if !latest.trim().is_empty() {
+        message.push_str(" Latest output:\n");
+        message.push_str(&latest);
+    }
+    message
+}
+
 /// Format combined stdout/stderr output. Returns the (untruncated-notice)
 /// text plus structured [`TruncationInfo`] when the output was cut down.
 /// Callers decide how the notice reaches the model: foreground call sites
@@ -1750,8 +1779,44 @@ fn format_background_continuation_failure(unchecked: &[String]) -> String {
 static REENGAGE_SERIALIZER: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
 
+#[cfg(test)]
 pub(crate) async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
     REENGAGE_SERIALIZER.lock().await
+}
+
+/// Run one background completion continuation under the shared serializer and
+/// a single wall-clock budget that includes waiting for the serializer. This is
+/// the authoritative boundary for terminal and delegated CLI completions.
+pub(crate) async fn run_background_continuation(
+    agent: &dyn ConversationRuntime,
+    request: ConversationRequest,
+) -> anyhow::Result<String> {
+    run_background_continuation_with_timeout(agent, request, BACKGROUND_CONTINUATION_TIMEOUT).await
+}
+
+async fn run_background_continuation_with_timeout(
+    agent: &dyn ConversationRuntime,
+    request: ConversationRequest,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let session_id = request.session_id.clone();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let _slot = tokio::time::timeout_at(deadline, REENGAGE_SERIALIZER.lock())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Background continuation for session {session_id} timed out waiting for its execution slot after {}s",
+                timeout.as_secs()
+            )
+        })?;
+    tokio::time::timeout_at(deadline, agent.continue_conversation(request))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Background continuation for session {session_id} timed out after {}s",
+                timeout.as_secs()
+            )
+        })?
 }
 
 /// Build the internal follow-up that re-engages the agent loop after a
@@ -1900,6 +1965,7 @@ impl TerminalTool {
             inbox_dir: std::env::temp_dir(),
             outbox_dirs: Vec::new(),
             self_correction: SelfCorrectionConfig::default(),
+            command_risk_runtime: OnceLock::new(),
         }
     }
 
@@ -1930,6 +1996,16 @@ impl TerminalTool {
     pub fn with_state(mut self, state: Arc<dyn StateStore>) -> Self {
         self.state = Some(state);
         self
+    }
+
+    /// Enable semantic risk assessment for novel terminal commands. This is
+    /// wired after provider startup so model hot-swaps remain visible through
+    /// the shared runtime.
+    pub fn set_command_risk_runtime(&self, runtime: SharedLlmRuntime) {
+        assert!(
+            self.command_risk_runtime.set(runtime).is_ok(),
+            "TerminalTool::set_command_risk_runtime called more than once"
+        );
     }
 
     /// Set channel hub reference for immediate background progress/completion delivery.
@@ -3784,13 +3860,11 @@ impl TerminalTool {
 
                                         ping_count += 1;
                                         if ping_count > MAX_BACKGROUND_PROGRESS_PINGS {
-                                            // Periodic pings are exhausted. Liveness alone does
-                                            // not identify the process: it may be stalled,
-                                            // awaiting input, or intentionally long-lived. Re-
-                                            // engage the agent ONCE with the command/output so it
-                                            // can inspect the evidence, report an accurate status,
-                                            // and close out the original task; then stay silent and
-                                            // keep waiting for completion.
+                                            // Periodic pings are exhausted. Send one deterministic
+                                            // transition and keep this loop dedicated to process
+                                            // monitoring. Liveness alone cannot identify whether the
+                                            // process is stalled, awaiting input, or intentionally
+                                            // long-lived.
                                             if !still_running_notice_sent {
                                                 still_running_notice_sent = true;
                                                 let elapsed_secs =
@@ -3803,106 +3877,11 @@ impl TerminalTool {
                                                     &stderr_buf.lock().await,
                                                 )
                                                 .to_string();
-                                                // Background delivery bypasses the agent
-                                                // loop entirely (this feeds a synthesized
-                                                // re-engagement message or a direct
-                                                // fallback notice), so the truncation
-                                                // notice is rendered inline here
-                                                // immediately.
-                                                let (formatted, truncation) =
-                                                    format_output(&stdout, &stderr, max_output_chars);
-                                                let mut with_notice = formatted;
-                                                if let Some(info) = truncation {
-                                                    with_notice.push('\n');
-                                                    with_notice.push_str(
-                                                        &crate::utils::render_truncation_notice(&info),
-                                                    );
-                                                }
-                                                let output = truncate_with_note(&with_notice, 2500);
-                                                let reengage_budget_ok = {
-                                                    let mut log =
-                                                        reengagements_for_notify.lock().await;
-                                                    reengagement_allowed(
-                                                        &mut log,
-                                                        &session_for_notify,
-                                                        Instant::now(),
-                                                    )
-                                                };
-                                                let mut delivered = false;
-                                                if !reengage_budget_ok {
-                                                    warn!(
-                                                        pid,
-                                                        session_id = %session_for_notify,
-                                                        command = %command_for_notify,
-                                                        "Still-running re-engagement budget exhausted; delivering fallback notice instead"
-                                                    );
-                                                } else if let Some(ref agent) = agent_for_notify {
-                                                    let followup = format!(
-                                                        "[Background command still running]\n\
-                                                         Command: `{}`\n\
-                                                         Running for: {}\n\
-                                                         Output so far:\n{}\n\n\
-                                                         This process is still alive after repeated checks. It may be \
-                                                         stalled, awaiting input, or intentionally long-lived; do not \
-                                                         infer that it is a server or watcher from liveness alone. \
-                                                         It keeps running in the background (pid={}); use the terminal \
-                                                         tool with action=\"check\" or action=\"kill\" if needed, but \
-                                                         do NOT re-run the command and do NOT wait for it to finish. \
-                                                         This command was part of your previous task: check your \
-                                                         session history and inspect the command/output before naming \
-                                                         its type. Tell the user the evidence-backed current status \
-                                                         and complete any remaining steps of that task now.",
-                                                        command_summary,
-                                                        humanize_elapsed(elapsed_secs),
-                                                        output,
-                                                        pid
-                                                    );
-                                                    let _reengage_slot =
-                                                        acquire_reengagement_slot().await;
-                                                    info!(
-                                                        pid,
-                                                        session_id = %session_for_notify,
-                                                        command = %command_for_notify,
-                                                        "Re-engaging agent loop for long-running background command"
-                                                    );
-                                                    match agent
-                                                        .continue_conversation(ConversationRequest {
-                                                            session_id: session_for_notify.clone(),
-                                                            user_text: followup,
-                                                            status_tx: None,
-                                                            user_role: crate::types::UserRole::Owner,
-                                                            channel_ctx: crate::types::ChannelContext::internal(),
-                                                            heartbeat: None,
-                                                        })
-                                                        .await
-                                                    {
-                                                        Ok(reply) if !reply.trim().is_empty() => {
-                                                            if let Some(ref hub) = hub_for_notify {
-                                                                match hub
-                                                                    .send_text(
-                                                                        &session_for_notify,
-                                                                        &reply,
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    Ok(()) => delivered = true,
-                                                                    Err(e) => warn!(
-                                                                        pid,
-                                                                        error = %e,
-                                                                        "Failed to deliver agent still-running follow-up"
-                                                                    ),
-                                                                }
-                                                            }
-                                                        }
-                                                        Ok(_) => {}
-                                                        Err(e) => warn!(
-                                                            pid,
-                                                            error = %e,
-                                                            "Agent re-engagement failed for long-running background command"
-                                                        ),
-                                                    }
-                                                }
-                                                if !delivered {
+                                                // Keep process-exit monitoring responsive. A
+                                                // still-running status does not need model
+                                                // interpretation and must never occupy the
+                                                // completion notifier's `select!` loop.
+                                                {
                                                     let mut combined = stdout;
                                                     if !stderr.is_empty() {
                                                         if !combined.is_empty() {
@@ -3910,10 +3889,9 @@ impl TerminalTool {
                                                         }
                                                         combined.push_str(&stderr);
                                                     }
-                                                    let fallback = format!(
-                                                        "ℹ️ Still running after {} — the process may be stalled or long-lived, but its type cannot be inferred from liveness alone. It remains in the background; I'll send a final update if it stops. Latest output:\n{}",
-                                                        humanize_elapsed(elapsed_secs),
-                                                        summarize_progress_output(&combined)
+                                                    let fallback = format_background_monitoring_notice(
+                                                        elapsed_secs,
+                                                        &combined,
                                                     );
                                                     let mut fallback_delivered = false;
                                                     if let Some(ref hub) = hub_for_notify {
@@ -4123,14 +4101,25 @@ impl TerminalTool {
                                     // churn. If that call is unavailable, fall back to the raw
                                     // result so the answer is never lost.
                                     let interpreted = match agent_for_notify {
-                                        Some(ref agent) => {
-                                            agent
-                                                .interpret_background_result(
-                                                    &command_for_notify,
-                                                    output_trimmed,
-                                                )
-                                                .await
-                                        }
+                                        Some(ref agent) => match tokio::time::timeout(
+                                            BACKGROUND_CONTINUATION_TIMEOUT,
+                                            agent.interpret_background_result(
+                                                &command_for_notify,
+                                                output_trimmed,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(interpreted) => interpreted,
+                                            Err(_) => {
+                                                warn!(
+                                                    pid,
+                                                    session_id = %session_for_notify,
+                                                    "Background-result interpretation timed out; delivering raw result"
+                                                );
+                                                None
+                                            }
+                                        },
                                         None => None,
                                     };
                                     let message = match interpreted {
@@ -4253,18 +4242,15 @@ impl TerminalTool {
                                             &output,
                                             &completion_unchecked_requirements,
                                         );
-                                        // Serialize with any other in-flight re-engagement:
-                                        // completions must process one at a time, not as
-                                        // concurrent racing loops.
-                                        let _reengage_slot = acquire_reengagement_slot().await;
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
                                             command = %command_for_notify,
                                             "Re-engaging agent loop to process background command output"
                                         );
-                                        match agent
-                                            .continue_conversation(ConversationRequest {
+                                        match run_background_continuation(
+                                            agent.as_ref(),
+                                            ConversationRequest {
                                                 session_id: session_for_notify.clone(),
                                                 user_text: followup,
                                                 status_tx: None,
@@ -4272,8 +4258,9 @@ impl TerminalTool {
                                                 channel_ctx: crate::types::ChannelContext::internal(
                                                 ),
                                                 heartbeat: None,
-                                            })
-                                            .await
+                                            },
+                                        )
+                                        .await
                                         {
                                             Ok(reply) => {
                                                 // Defense-in-depth: the re-engaged loop reads session
@@ -4671,6 +4658,7 @@ impl TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         correction_preapproved: bool,
+        mutation_forbidden: bool,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: TerminalArgs = serde_json::from_str(arguments)?;
 
@@ -4713,6 +4701,68 @@ impl TerminalTool {
                 let command = command.trim();
                 if command.is_empty() {
                     anyhow::bail!("command must not be empty for action=\"run\"");
+                }
+
+                let command_semantics =
+                    crate::tools::command_semantics::classify_shell_command(command);
+                let mut precomputed_semantic_assessment = None;
+                if mutation_forbidden && command_semantics.mutates_state() {
+                    let opaque =
+                        command_semantics.mutation_effects == ToolMutationEffects::UNSPECIFIED;
+                    if !opaque {
+                        return Ok(ToolCallOutcome {
+                            output: "Blocked by the explicit read-only contract: the command has a known mutation effect. Use an observational command or ask the user to change the constraint.".to_string(),
+                            metadata: ToolCallMetadata {
+                                outcome_status: Some(ToolOutcomeStatus::Blocked),
+                                semantics: command_semantics,
+                                ..ToolCallMetadata::default()
+                            },
+                        });
+                    }
+                    let Some(runtime) = self.command_risk_runtime.get() else {
+                        return Ok(ToolCallOutcome {
+                            output: "Blocked by the explicit read-only contract: this command's effects are ambiguous and semantic assessment is unavailable.".to_string(),
+                            metadata: ToolCallMetadata {
+                                outcome_status: Some(ToolOutcomeStatus::Blocked),
+                                semantics: command_semantics,
+                                ..ToolCallMetadata::default()
+                            },
+                        });
+                    };
+                    match assess_command(
+                        runtime,
+                        command,
+                        &self.backend,
+                        &args._session_id,
+                        self.state.as_ref(),
+                        self.event_store.clone(),
+                    )
+                    .await
+                    {
+                        Ok(semantic) if semantic.observation_only => {
+                            precomputed_semantic_assessment = Some(semantic);
+                        }
+                        Ok(_) => {
+                            return Ok(ToolCallOutcome {
+                                output: "Blocked by the explicit read-only contract: semantic effect assessment did not prove that every command effect is observational.".to_string(),
+                                metadata: ToolCallMetadata {
+                                    outcome_status: Some(ToolOutcomeStatus::Blocked),
+                                    semantics: command_semantics,
+                                    ..ToolCallMetadata::default()
+                                },
+                            });
+                        }
+                        Err(error) => {
+                            return Ok(ToolCallOutcome {
+                                output: format!("Blocked by the explicit read-only contract: semantic effect assessment failed closed ({error})."),
+                                metadata: ToolCallMetadata {
+                                    outcome_status: Some(ToolOutcomeStatus::Blocked),
+                                    semantics: command_semantics,
+                                    ..ToolCallMetadata::default()
+                                },
+                            });
+                        }
+                    }
                 }
 
                 if let Some((pattern, path)) = detect_unscoped_recursive_grep(command) {
@@ -4842,11 +4892,14 @@ impl TerminalTool {
                     }
                 }
 
-                // Classify command risk
-                let mut assessment = classify_command(command);
+                let deterministic_approval_floor = approval_floor_reason(command);
+                let mut approval_risk = RiskLevel::High;
+                let mut approval_warnings = Vec::new();
 
                 // Deterministic hard block for irreversible broad-path deletes.
-                if let Some(reason) = hard_block_reason(command) {
+                if let Some(reason) =
+                    hard_block_reason(command, self.backend.workspace_root().as_str())
+                {
                     warn!(
                         session_id = %args._session_id,
                         task_id = ?args._task_id,
@@ -4858,46 +4911,6 @@ impl TerminalTool {
                         "{} Use scoped, non-destructive commands instead.",
                         reason
                     )));
-                }
-
-                // Check for learned patterns and potentially lower risk
-                if let Some(ref pool) = self.pool {
-                    if let Ok(Some((pattern, similarity))) =
-                        find_matching_pattern(pool, command).await
-                    {
-                        if pattern.is_trusted()
-                            && similarity >= 0.9
-                            && assessment.level != RiskLevel::Critical
-                        {
-                            // Trusted pattern with high similarity - lower risk by one level
-                            let original_level = assessment.level;
-                            assessment.level = match assessment.level {
-                                RiskLevel::Critical => RiskLevel::High,
-                                RiskLevel::High => RiskLevel::Medium,
-                                RiskLevel::Medium => RiskLevel::Safe,
-                                RiskLevel::Safe => RiskLevel::Safe,
-                            };
-                            if assessment.level != original_level {
-                                assessment.warnings.push(format!(
-                                    "Risk lowered: similar to trusted pattern '{}' (approved {}x)",
-                                    pattern.pattern, pattern.approval_count
-                                ));
-                                info!(
-                                    command = %command,
-                                    pattern = %pattern.pattern,
-                                    original_risk = %original_level,
-                                    new_risk = %assessment.level,
-                                    "Lowered risk based on learned pattern"
-                                );
-                            }
-                        } else if pattern.denial_count > pattern.approval_count {
-                            // Pattern is frequently denied - add warning
-                            assessment.warnings.push(format!(
-                                "Similar commands have been denied {}x",
-                                pattern.denial_count
-                            ));
-                        }
-                    }
                 }
 
                 // Check if this is a trusted session (explicitly set by ChannelContext,
@@ -4913,7 +4926,7 @@ impl TerminalTool {
                 }
 
                 if args.detach && !daemonization_approved {
-                    assessment.warnings.push(
+                    approval_warnings.push(
                         "Detached execution requested (process may outlive task boundaries)."
                             .to_string(),
                     );
@@ -4928,7 +4941,10 @@ impl TerminalTool {
                 //   3. _untrusted_source       → external triggers always re-prompt
                 //   4. detach && !is_allowed   → novel detached commands re-prompt
                 //   5. _trusted_session        → scheduled tasks skip prompt
-                //   6. !is_allowed             → normal allowlist check
+                //   6. explicit allowlist      → prior owner grant
+                //   7. protected credential path → non-downgradable approval floor
+                //   8. semantic model          → approve only dangerous effects
+                //   9. classifier failure      → fail closed to approval
                 let is_allowed = self.is_allowed(command).await;
                 let needs_approval = if daemonization_approved {
                     false
@@ -4941,7 +4957,9 @@ impl TerminalTool {
                     false
                 } else if args._untrusted_source {
                     // External triggers always need approval regardless of mode
-                    info!(command = %command, risk = %assessment.level, "Forcing approval: untrusted source");
+                    approval_warnings
+                        .push("Command originated from an untrusted external trigger.".to_string());
+                    info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
                     true
                 } else if args.detach && !is_allowed {
                     // Allowlisted commands (permanent or session approvals)
@@ -4953,17 +4971,92 @@ impl TerminalTool {
                     // Trusted scheduled tasks bypass approval
                     info!(command = %command, session = %args._session_id, "Auto-approved: trusted scheduled task");
                     false
+                } else if is_allowed {
+                    info!(command = %command, "Auto-approved: explicit command grant");
+                    false
+                } else if let Some(reason) = deterministic_approval_floor {
+                    approval_warnings.push(reason);
+                    true
+                } else if let Some(semantic) = precomputed_semantic_assessment {
+                    approval_risk = semantic.risk_level;
+                    approval_warnings = semantic.warnings;
+                    semantic.requires_approval
+                } else if let Some(runtime) = self.command_risk_runtime.get() {
+                    match assess_command(
+                        runtime,
+                        command,
+                        &self.backend,
+                        &args._session_id,
+                        self.state.as_ref(),
+                        self.event_store.clone(),
+                    )
+                    .await
+                    {
+                        Ok(semantic) => {
+                            approval_risk = semantic.risk_level;
+                            approval_warnings = semantic.warnings;
+                            if semantic.requires_approval {
+                                info!(
+                                    command = %command,
+                                    risk = %approval_risk,
+                                    "Semantic command assessment requires owner approval"
+                                );
+                                true
+                            } else {
+                                info!(
+                                    command = %command,
+                                    risk = %approval_risk,
+                                    "Auto-approved by semantic command assessment"
+                                );
+                                false
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                command = %command,
+                                %error,
+                                "Semantic command assessment failed; requesting approval"
+                            );
+                            approval_risk = RiskLevel::Critical;
+                            approval_warnings.push(format!(
+                                "Semantic safety assessment unavailable; failed closed: {}",
+                                error
+                            ));
+                            true
+                        }
+                    }
                 } else {
-                    !is_allowed
+                    approval_risk = RiskLevel::Critical;
+                    approval_warnings.push(
+                        "Semantic safety assessment is not configured; failed closed.".to_string(),
+                    );
+                    true
                 };
 
                 if needs_approval {
+                    // Approval history is useful context for the owner, but it
+                    // never changes the semantic decision or lowers risk.
+                    if let Some(ref pool) = self.pool {
+                        if let Ok(Some((pattern, similarity))) =
+                            find_matching_pattern(pool, command).await
+                        {
+                            approval_warnings.push(format!(
+                                "Similar command history: '{}' (similarity {:.0}%, approvals {}, denials {}, confidence {:.0}%, trusted {})",
+                                pattern.pattern,
+                                similarity * 100.0,
+                                pattern.approval_count,
+                                pattern.denial_count,
+                                pattern.confidence() * 100.0,
+                                pattern.is_trusted(),
+                            ));
+                        }
+                    }
                     match self
                         .request_approval(
                             &args._session_id,
                             command,
-                            assessment.level,
-                            assessment.warnings.clone(),
+                            approval_risk,
+                            approval_warnings.clone(),
                             args._task_id.as_deref(),
                         )
                         .await
@@ -5145,13 +5238,13 @@ impl Tool for TerminalTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the configured execution workspace. If a command is not pre-approved for that backend, the user will be asked to authorize it."
+        "Execute a shell command in the configured execution workspace. Novel commands are semantically assessed; only dangerous or uncertain effects require owner approval."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "terminal",
-            "description": "Run shell commands in the configured local, Docker, or SSH execution workspace. Commands may require backend-scoped user approval. Long-running commands can be checked or killed later; use write_file instead of shell redirection for file creation. If a command chain (&&, ||, ;, |) contains ANY dangerous segment, refuse the ENTIRE chain and ask which specific operation the user wants — never split a chain to run only the \"safe\" parts.",
+            "description": "Run shell commands in local, Docker, or SSH workspaces. Dangerous or uncertain commands require owner approval. Check or kill long-running commands later; use write_file instead of shell redirection. If a chain (&&, ||, ;, |) has a dangerous segment, refuse the whole chain and ask which operation the user wants.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -5232,7 +5325,8 @@ impl Tool for TerminalTool {
         arguments: &str,
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.execute_terminal(arguments, status_tx, false).await
+        self.execute_terminal(arguments, status_tx, false, false)
+            .await
     }
 
     async fn call_with_execution_context(
@@ -5255,8 +5349,13 @@ impl Tool for TerminalTool {
         } else {
             false
         };
-        self.execute_terminal(arguments, status_tx, correction_preapproved)
-            .await
+        self.execute_terminal(
+            arguments,
+            status_tx,
+            correction_preapproved,
+            exec_ctx.mutation_forbidden,
+        )
+        .await
     }
 
     async fn on_task_end(&self, task_id: &str, _session_id: &str) -> anyhow::Result<()> {
@@ -5274,12 +5373,182 @@ impl Tool for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderKind;
+    use crate::llm_runtime::SharedLlmRuntime;
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
+    use crate::testing::MockProvider;
     use crate::traits::{NotificationStore, StateStore, Tool};
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    fn semantic_runtime(provider: Arc<MockProvider>) -> SharedLlmRuntime {
+        SharedLlmRuntime::new(
+            provider,
+            None,
+            ProviderKind::OpenaiCompatible,
+            "mock-semantic-risk".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn semantic_safe_command_runs_without_owner_approval() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Prints a literal string"]}"#,
+            ),
+        ]));
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+
+        let output = tool
+            .call(
+                r#"{"action":"run","command":"echo semantic-ok","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("semantic-ok"), "{output}");
+        assert!(!output.contains("approval"), "{output}");
+        assert_eq!(provider.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_dangerous_command_requests_owner_approval() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":true,"risk_level":"high","effects":["external_mutation"],"reasons":["Pushes commits to a remote repository"]}"#,
+            ),
+        ]));
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        tool.set_command_risk_runtime(semantic_runtime(provider));
+
+        let call = tool.call(
+            r#"{"action":"run","command":"git push synthetic-remote main","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+        );
+        let respond = async {
+            let request = approval_rx.recv().await.expect("approval request");
+            assert_eq!(request.risk_level, RiskLevel::High);
+            assert!(request
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("external_mutation")));
+            request.response_tx.send(ApprovalResponse::Deny).unwrap();
+        };
+        let (output, ()) = tokio::join!(call, respond);
+        assert!(output.unwrap().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn read_only_contract_allows_semantically_proven_novel_observation() {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let provider = Arc::new(MockProvider::with_responses(vec![
+            MockProvider::text_response(
+                r#"{"dangerous":false,"risk_level":"safe","effects":["observation"],"reasons":["Generates a bounded numeric sequence on stdout"]}"#,
+            ),
+        ]));
+        let tool = TerminalTool::new(
+            vec![],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        tool.set_command_risk_runtime(semantic_runtime(provider.clone()));
+
+        let outcome = tool
+            .call_with_execution_context(
+                r#"{"action":"run","command":"seq 1 3","_session_id":"telegram:synthetic-owner","_user_role":"Owner"}"#,
+                None,
+                ToolExecutionContext {
+                    mutation_forbidden: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read-only observation executes");
+        assert!(outcome.output.contains("1\n2\n3"), "{}", outcome.output);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert_eq!(provider.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_contract_blocks_known_mutation_before_process_io() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("must-not-exist.txt");
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_url = format!("sqlite:{}", db_file.path().display());
+        let pool = SqlitePool::connect(&db_url).await.unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!("touch {}", target.display()),
+            "_session_id": "telegram:synthetic-owner",
+            "_user_role": "Owner"
+        })
+        .to_string();
+
+        let outcome = tool
+            .call_with_execution_context(
+                &args,
+                None,
+                ToolExecutionContext {
+                    mutation_forbidden: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("contract block is a typed tool outcome");
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
+        assert!(!target.exists(), "blocked command must never spawn");
+    }
 
     #[test]
     fn system_events_ui_scripting_detected() {
@@ -5305,6 +5574,47 @@ mod tests {
             r#"osascript -e 'display notification "build done"'"#
         ));
         assert!(!is_system_events_ui_scripting("ls -la ~/projects"));
+    }
+
+    struct PendingConversationRuntime;
+
+    #[async_trait::async_trait]
+    impl ConversationRuntime for PendingConversationRuntime {
+        async fn continue_conversation(
+            &self,
+            _request: ConversationRequest,
+        ) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn background_continuation_has_a_wall_clock_bound() {
+        let request = ConversationRequest {
+            session_id: "telegram:synthetic-timeout".to_string(),
+            user_text: "synthetic completion".to_string(),
+            status_tx: None,
+            user_role: crate::types::UserRole::Owner,
+            channel_ctx: crate::types::ChannelContext::internal(),
+            heartbeat: None,
+        };
+        let error = run_background_continuation_with_timeout(
+            &PendingConversationRuntime,
+            request,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("pending continuation must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn monitoring_notice_is_terminally_honest() {
+        let notice = format_background_monitoring_notice(170, "192.0.2.31\n192.0.2.32\n192.0.2.45");
+        assert!(notice.contains("Frequent progress updates are now paused"));
+        assert!(notice.contains("completion monitoring remains active"));
+        assert!(notice.contains("192.0.2.45"));
+        assert!(!notice.contains("running in the background now"));
     }
 
     #[tokio::test]
@@ -6911,12 +7221,8 @@ mod tests {
         );
     }
 
-    /// A background command that never exits (dev server, watcher) must not
-    /// dead-end the conversation: once periodic pings are exhausted, the
-    /// notifier sends a one-time "still running" notice (via agent
-    /// re-engagement, or the queued fallback when no agent is wired) so the
-    /// user learns the process is long-lived instead of waiting forever for
-    /// a completion notification that never comes.
+    /// Once periodic pings are exhausted, the notifier must send one
+    /// deterministic transition and remain responsive to process completion.
     #[tokio::test]
     async fn test_background_terminal_long_running_emits_still_running_notice() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
@@ -6941,31 +7247,33 @@ mod tests {
         .await
         .with_state(state.clone() as Arc<dyn StateStore>);
 
-        // Mimic a dev server: readiness output early, then alive without
-        // new output and without exiting.
+        // Stay alive past the frequent-ping budget, then finish. The final
+        // output must still arrive after the one-time monitoring transition.
         let response = tool
             .call(
-                r#"{"action":"run","command":"echo server-ready; sleep 60","_session_id":"sess_server","_user_role":"Owner"}"#,
+                r#"{"action":"run","command":"echo scan-ready; sleep 6; echo scan-finished","_session_id":"sess_server","_user_role":"Owner"}"#,
             )
             .await
             .unwrap();
         assert!(response.contains("Moved to background (pid="));
-        let pid: u32 = response
-            .split("pid=")
-            .nth(1)
-            .and_then(|s| s.split(')').next())
-            .and_then(|s| s.parse().ok())
-            .expect("pid in background ack");
 
         let mut saw_still_running_notice = false;
+        let mut saw_final_output = false;
         for _ in 0..80 {
             let pending = state.get_pending_notifications(50).await.unwrap();
-            if pending.iter().any(|entry| {
+            saw_still_running_notice |= pending.iter().any(|entry| {
                 entry.session_id == "sess_server"
                     && entry.notification_type == "progress"
-                    && entry.message.contains("long-lived")
-            }) {
-                saw_still_running_notice = true;
+                    && entry
+                        .message
+                        .contains("completion monitoring remains active")
+            });
+            saw_final_output |= pending.iter().any(|entry| {
+                entry.session_id == "sess_server"
+                    && entry.notification_type == "progress"
+                    && entry.message.contains("scan-finished")
+            });
+            if saw_still_running_notice && saw_final_output {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6974,14 +7282,10 @@ mod tests {
             saw_still_running_notice,
             "expected a one-time still-running notice after pings are exhausted"
         );
-
-        // Clean up the fake server.
-        let _ = tool
-            .call(&format!(
-                r#"{{"action":"kill","pid":{},"_session_id":"sess_server","_user_role":"Owner"}}"#,
-                pid
-            ))
-            .await;
+        assert!(
+            saw_final_output,
+            "expected final output after the monitoring transition"
+        );
     }
 
     #[tokio::test]

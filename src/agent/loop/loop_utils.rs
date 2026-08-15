@@ -433,6 +433,42 @@ fn manage_memories_read_output_is_report(result_text: &str, tool_arguments: Opti
         && !trimmed.starts_with("Blocked:")
 }
 
+fn successful_management_output_is_structural(
+    tool_name: &str,
+    result_text: &str,
+    tool_arguments: Option<&str>,
+) -> bool {
+    let action = tool_arguments
+        .and_then(|args| serde_json::from_str::<Value>(args).ok())
+        .and_then(|args| {
+            args.get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let cleaned = strip_appended_diagnostics(result_text);
+    let trimmed = cleaned.trim_start();
+    if trimmed.starts_with("ERROR:")
+        || trimmed.starts_with("Error:")
+        || trimmed.starts_with("Failed to ")
+        || trimmed.starts_with("Request blocked:")
+        || trimmed.starts_with("Blocked:")
+    {
+        return false;
+    }
+
+    match (tool_name, action.as_deref()) {
+        // These actions return policy/user data. Words such as "unauthorized",
+        // "invalid", or "rate limits" inside that data are not execution
+        // failures. Current tools emit a typed outcome; this compatibility path
+        // also keeps legacy receipts and direct classifier callers safe.
+        ("manage_mandates", Some("draft" | "list" | "get" | "list_intentions")) => true,
+        ("manage_memories", Some("create_personal_goal")) => {
+            trimmed.starts_with("Created personal goal ")
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
@@ -493,6 +529,10 @@ pub(super) fn classify_tool_result_failure(
             if let Some(kind) = classify_json_error(&value) {
                 return Some(kind);
             }
+            // Valid structured output with no error-bearing value is a
+            // successful data result. Do not scan JSON field names such as
+            // `watchdog_timeout_seconds` as if they were failure prose.
+            return None;
         }
     }
 
@@ -534,6 +574,9 @@ pub(super) fn classify_tool_result_failure_with_args(
     result_text: &str,
     tool_arguments: Option<&str>,
 ) -> Option<ToolFailureClass> {
+    if successful_management_output_is_structural(tool_name, result_text, tool_arguments) {
+        return None;
+    }
     if tool_name == "manage_memories"
         && manage_memories_read_output_is_report(result_text, tool_arguments)
     {
@@ -1283,6 +1326,46 @@ mod tool_error_detection_tests {
         assert_eq!(
             super::classify_tool_outcome_status("terminal", "success", None, Some(&metadata)),
             crate::traits::ToolOutcomeStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn mandate_policy_words_do_not_turn_a_successful_get_into_a_failure() {
+        let result =
+            r#"{"stop_conditions":["Any unauthorized API behavior or account-security concern."]}"#;
+        assert_eq!(
+            classify_tool_result_failure_with_args(
+                "manage_mandates",
+                result,
+                Some(r#"{"action":"get","section":"policy"}"#),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn benign_json_timeout_field_does_not_become_a_transient_failure() {
+        let result = r#"{
+            "connection_state": "recently_connected",
+            "recovery": {"watchdog_timeout_seconds": 90, "watchdog_ready": true}
+        }"#;
+        assert_eq!(
+            classify_tool_result_failure("read_node_health", result),
+            None
+        );
+    }
+
+    #[test]
+    fn created_goal_text_can_describe_rate_limits_without_becoming_transient() {
+        let result =
+            "Created personal goal goal-1: Steward an account under confirmed rate limits.";
+        assert_eq!(
+            classify_tool_result_failure_with_args(
+                "manage_memories",
+                result,
+                Some(r#"{"action":"create_personal_goal"}"#),
+            ),
+            None
         );
     }
 

@@ -468,6 +468,19 @@ impl PolicyRuntimeTunables {
 }
 
 static POLICY_TUNABLES: Lazy<PolicyRuntimeTunables> = Lazy::new(PolicyRuntimeTunables::new);
+static POLICY_METRICS_BOOT_ID: Lazy<String> = Lazy::new(|| uuid::Uuid::new_v4().to_string());
+
+pub fn policy_metrics_boot_id() -> &'static str {
+    POLICY_METRICS_BOOT_ID.as_str()
+}
+
+pub fn durable_policy_metrics_snapshot() -> crate::events::PolicyMetricsSnapshotData {
+    crate::events::PolicyMetricsSnapshotData {
+        schema_version: crate::events::PolicyMetricsSnapshotData::SCHEMA_VERSION,
+        boot_id: policy_metrics_boot_id().to_string(),
+        metrics: policy_metrics_snapshot(),
+    }
+}
 
 pub fn policy_metrics_snapshot() -> PolicyMetricsData {
     PolicyMetricsData {

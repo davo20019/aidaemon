@@ -46,6 +46,23 @@ pub(crate) struct PlannedContractSignals {
     /// negative mutation constraint.
     #[serde(default)]
     pub constraint_evidence: Vec<String>,
+    /// `allowed` or `forbidden`. This is independent of mutation scope: a
+    /// user can request a conceptual or evidence-limited answer while also
+    /// prohibiting every tool call.
+    #[serde(default)]
+    pub tool_scope: Option<String>,
+    /// Capability domains explicitly forbidden for this request while other
+    /// tools remain allowed. This is a typed deny-set, not a tool-name list.
+    #[serde(default)]
+    pub forbidden_tool_scopes: Vec<crate::traits::ToolSemanticScope>,
+    /// Exact current-user spans grounding either `tool_scope=forbidden` or
+    /// every entry in `forbidden_tool_scopes`.
+    #[serde(default)]
+    pub tool_constraint_evidence: Vec<String>,
+    /// Exact user-authored labels that a substantive final response must
+    /// contain (for example requested report fields or fixed verdict labels).
+    #[serde(default)]
+    pub required_response_fields: Vec<String>,
     /// Typed evidence requirements consumed directly by completion checks.
     #[serde(default)]
     pub minimum_sources: Option<u8>,
@@ -53,6 +70,10 @@ pub(crate) struct PlannedContractSignals {
     pub requires_primary_sources: Option<bool>,
     #[serde(default)]
     pub requires_exact_history: Option<bool>,
+    /// Independently material information needs. The assessor describes the
+    /// evidence; it never chooses or authorizes a tool.
+    #[serde(default)]
+    pub evidence_requirements: Option<Vec<crate::traits::RequestEvidenceRequirement>>,
     /// Exact user-authored path or project name selected semantically for this
     /// turn. The runtime resolves and validates it before changing scope.
     #[serde(default)]
@@ -116,6 +137,8 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         || signals.minimum_sources.is_none()
         || signals.requires_primary_sources.is_none()
         || signals.requires_exact_history.is_none()
+        || signals.evidence_requirements.is_none()
+        || signals.tool_scope.is_none()
         || signals
             .task_kind
             .as_deref()
@@ -157,6 +180,32 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
     {
         return false;
     }
+    let tool_scope = signals
+        .tool_scope
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(tool_scope.as_str(), "allowed" | "forbidden")
+        || tool_scope == "allowed"
+            && signals.forbidden_tool_scopes.is_empty()
+            && !signals.tool_constraint_evidence.is_empty()
+        || tool_scope == "allowed"
+            && !signals.forbidden_tool_scopes.is_empty()
+            && signals.tool_constraint_evidence.is_empty()
+        || tool_scope == "forbidden"
+            && (signals.tool_constraint_evidence.is_empty()
+                || !signals.forbidden_tool_scopes.is_empty())
+    {
+        return false;
+    }
+    if signals.required_response_fields.len() > 20
+        || signals.required_response_fields.iter().any(|field| {
+            let len = field.trim().chars().count();
+            len == 0 || len > 80
+        })
+    {
+        return false;
+    }
     let minimum_sources = signals.minimum_sources.unwrap_or_default();
     if minimum_sources > 20
         || (signals.requires_primary_sources == Some(true) && minimum_sources == 0)
@@ -164,13 +213,70 @@ pub(crate) fn planned_contract_is_complete(signals: &PlannedContractSignals) -> 
         return false;
     }
 
-    match signals.required_effects.as_deref() {
-        Some(effects) if expects_mutation => {
-            !effects.is_empty() && crate::agent::parse_planned_mutation_effects(effects).is_some()
-        }
-        Some(effects) => effects.is_empty(),
-        None => false,
+    let evidence_requirements = signals.evidence_requirements.as_deref().unwrap_or_default();
+    if evidence_requirements.len() > 8
+        || signals.requires_observation == Some(true) && evidence_requirements.is_empty()
+        || signals.requires_observation == Some(false) && !evidence_requirements.is_empty()
+        || evidence_requirements.iter().any(|requirement| {
+            let summary_len = requirement.summary.trim().chars().count();
+            summary_len == 0
+                || summary_len > 240
+                || requirement.acceptable_scopes.is_empty()
+                || requirement.acceptable_scopes.len() > 3
+                // Exact targets come only from structural request parsing.
+                || requirement.target.is_some()
+        })
+    {
+        return false;
     }
+    if signals.requires_exact_history == Some(true)
+        && !evidence_requirements.iter().any(|requirement| {
+            requirement
+                .acceptable_scopes
+                .contains(&crate::traits::ToolSemanticScope::ConversationHistory)
+                && requirement.purpose == crate::traits::EvidencePurpose::HistoricalRecord
+                && requirement.minimum_authority == crate::traits::EvidenceAuthority::Canonical
+        })
+    {
+        return false;
+    }
+
+    let Some(effect_names) = signals.required_effects.as_deref() else {
+        return false;
+    };
+    if !expects_mutation {
+        return effect_names.is_empty();
+    }
+    let Some(effects) = crate::agent::parse_planned_mutation_effects(effect_names) else {
+        return false;
+    };
+    if effects.is_empty() {
+        return false;
+    }
+
+    // The current bitset represents one set of required outcomes, so it cannot
+    // distinguish a generic remote mutation from a second, independent remote
+    // outcome. Reject broad+specific combinations rather than demanding two
+    // receipts for one delivery/deployment. A richer obligation list can model
+    // genuinely independent outcomes in the future.
+    if effects.contains(crate::traits::ToolMutationEffects::REMOTE_MUTATION)
+        && effects.intersects(
+            crate::traits::ToolMutationEffects::REMOTE_DEPLOY
+                .union(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY),
+        )
+    {
+        return false;
+    }
+    if signals
+        .task_kind
+        .as_deref()
+        .and_then(crate::agent::parse_planned_task_kind)
+        == Some(crate::agent::CompletionTaskKind::Deliver)
+        && !effects.contains(crate::traits::ToolMutationEffects::EXTERNAL_DELIVERY)
+    {
+        return false;
+    }
+    true
 }
 
 pub(crate) fn planned_mutation_constraints_are_grounded(
@@ -212,6 +318,40 @@ pub(crate) fn planned_mutation_constraints_are_grounded(
         })
 }
 
+pub(crate) fn planned_tool_constraints_are_grounded(
+    signals: &PlannedContractSignals,
+    current_user_text: &str,
+) -> bool {
+    let forbids_all = signals
+        .tool_scope
+        .as_deref()
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("forbidden"));
+    if !forbids_all && signals.forbidden_tool_scopes.is_empty() {
+        return false;
+    }
+    let current_lower = current_user_text.to_lowercase();
+    !signals.tool_constraint_evidence.is_empty()
+        && signals.tool_constraint_evidence.iter().all(|evidence| {
+            let evidence = evidence.trim();
+            !evidence.is_empty()
+                && evidence.chars().count() <= 500
+                && current_lower.contains(&evidence.to_lowercase())
+        })
+}
+
+pub(crate) fn planned_response_fields_are_grounded(
+    signals: &PlannedContractSignals,
+    current_user_text: &str,
+) -> bool {
+    let current_lower = current_user_text.to_lowercase();
+    signals.required_response_fields.iter().all(|field| {
+        let field = field.trim();
+        !field.is_empty()
+            && field.chars().count() <= 80
+            && current_lower.contains(&field.to_lowercase())
+    })
+}
+
 /// How much task scaffolding the active model needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskAssessmentMode {
@@ -251,7 +391,7 @@ struct TaskPlanResponse {
     task_shape: Option<PlannedTaskShape>,
 }
 
-const TASK_CONTRACT_SCHEMA_VERSION: u16 = 2;
+const TASK_CONTRACT_SCHEMA_VERSION: u16 = 6;
 
 const fn task_contract_schema_version() -> u16 {
     TASK_CONTRACT_SCHEMA_VERSION
@@ -399,7 +539,7 @@ pub(crate) async fn generate_task_plan(
          User request: \"{user_text}\"\n\n\
          Return exactly this JSON shape:\n\
          {{\n\
-           \"schema_version\": 2,\n\
+           \"schema_version\": 6,\n\
            \"goal\": \"one-line semantic summary\",\n\
            \"steps\": [],\n\
            \"success_criteria\": [],\n\
@@ -412,9 +552,22 @@ pub(crate) async fn generate_task_plan(
              \"mutation_scope\": \"allowed|read_only|scoped\",\n\
              \"forbidden_actions\": [\"deploy\"],\n\
              \"constraint_evidence\": [\"exact verbatim span from the current user request\"],\n\
+             \"tool_scope\": \"allowed|forbidden\",\n\
+             \"forbidden_tool_scopes\": [\"user_memory\"],\n\
+             \"tool_constraint_evidence\": [\"exact verbatim span prohibiting all tools or a capability domain\"],\n\
+             \"required_response_fields\": [\"exact user-authored output label\"],\n\
              \"minimum_sources\": 0,\n\
              \"requires_primary_sources\": false,\n\
              \"requires_exact_history\": false,\n\
+             \"evidence_requirements\": [\n\
+               {{\n\
+                 \"summary\": \"material fact that must be established\",\n\
+                 \"acceptable_scopes\": [\"external_remote\"],\n\
+                 \"purpose\": \"current_state|historical_record|content|outcome|attribution|causal_explanation\",\n\
+                 \"minimum_authority\": \"advisory|direct|canonical\",\n\
+                 \"temporal_scope\": \"current|historical|both\"\n\
+               }}\n\
+             ],\n\
              \"project_reference\": null\n\
            }},\n\
            \"task_shape\": {{\n\
@@ -447,22 +600,55 @@ pub(crate) async fn generate_task_plan(
          - request_relationship is semantic: use continuation only when this turn advances, \
            retries, or asks about an unresolved prior request; clarification_answer only when \
            it answers the currently pending assistant question; otherwise use new_request.\n\
-         - semantic_scope names the typed resource domain, or none. It is independent of \
-           request_relationship and must reflect the current request rather than keyword overlap.\n\
+         - semantic_scope names the primary typed resource domain, or none. It is independent of \
+           request_relationship and must reflect the current request rather than keyword overlap. \
+           Multi-domain evidence belongs in evidence_requirements, not in this singular routing hint.\n\
          - expects_mutation=true only when completion changes files or external state. \
            Text generated in the reply is not a mutation.\n\
-         - requires_observation=true when live files, commands, web pages, APIs, or \
-           current state must be read.\n\
+         - requires_observation=true whenever completion depends on retrieving evidence: live files, \
+           commands, web pages, APIs, memory, conversation history, task/goal/mandate ledgers, or \
+           current state. It must be true exactly when evidence_requirements is non-empty.\n\
+         - tool_scope=forbidden only when the CURRENT user request explicitly prohibits every \
+           tool, lookup, search, browse, or execution path. Preserve requires_observation and \
+           evidence_requirements when live evidence would normally be needed; this lets the main \
+           model state the exact evidence limitation without violating the constraint; set \
+           forbidden_tool_scopes=[].\n\
+         - When the CURRENT request prohibits only a capability domain, keep tool_scope=allowed \
+           and add its typed scope to forbidden_tool_scopes. For example, a no-memory constraint \
+           denies user_memory without denying conversation_history or local_workspace. Never infer \
+           a deny-set from the topic or an older turn. tool_constraint_evidence must quote exact \
+           current-user spans for either kind of prohibition. Otherwise use tool_scope=allowed, \
+           forbidden_tool_scopes=[], and tool_constraint_evidence=[].\n\
+         - required_response_fields contains exact, short labels from the CURRENT user request \
+           that must appear in the final answer (requested report keys, columns, verdict labels, \
+           or fixed line prefixes). Do not paraphrase, invent, or copy labels from prior tasks; \
+           use [] when the user did not specify an output contract.\n\
          - required_effects names the successful effects completion must prove. Valid \
            values are local_source_write, repository_write, remote_mutation, \
            remote_deploy, external_delivery, process_state, configuration, and \
            destructive. Use [] when expects_mutation=false. A build cache or installed \
-           dependency is not a local_source_write.\n\
+           dependency is not a local_source_write. Use the narrowest applicable effect: \
+           do not add remote_mutation merely because a remote_deploy or external_delivery \
+           occurs. Every deliver task must include external_delivery.\n\
          - minimum_sources is the explicit number of distinct source pages required by the \
            request, or 0 when there is no numeric threshold. Set requires_primary_sources \
            only when those sources must be primary.\n\
          - requires_exact_history=true only when completion requires canonical earlier \
            conversation wording rather than ordinary conversational context.\n\
+         - evidence_requirements contains one entry for every independently material fact the \
+           final answer must establish. Return [] exactly when requires_observation=false; otherwise \
+           return 1-8 entries. Describe evidence needs, never tool names or execution steps.\n\
+         - acceptable_scopes lists alternative authoritative domains for that ONE need. When two \
+           domains establish different facts, create two requirements rather than treating them as alternatives.\n\
+         - A current state observation proves only current state/content/outcome. It does not by itself \
+           prove who performed an action, why it happened, what the agent previously decided, or whether \
+           a historical claim came from autonomous execution. Attribution, causal explanation, and prior \
+           execution require a separate historical requirement against an appropriate canonical ledger.\n\
+         - Semantic memory and summaries are advisory discovery evidence. Use minimum_authority=advisory \
+           only when a summary is genuinely sufficient; use direct for live resources and canonical for exact \
+           conversation, task, goal, mandate, or execution-history facts.\n\
+         - Split compound questions into material needs. Do not stop at the first answerable clause, and do \
+           not add speculative needs unrelated to what the user asked.\n\
          - project_reference is null unless the current request identifies a project or \
            filesystem scope. Otherwise copy only the exact user-authored path or project \
            name; never invent or expand a path.\n\
@@ -905,16 +1091,125 @@ mod tests {
             mutation_scope: Some("allowed".to_string()),
             forbidden_actions: Vec::new(),
             constraint_evidence: Vec::new(),
+            tool_scope: Some("allowed".to_string()),
+            forbidden_tool_scopes: Vec::new(),
+            tool_constraint_evidence: Vec::new(),
+            required_response_fields: Vec::new(),
             minimum_sources: Some(0),
             requires_primary_sources: Some(false),
             requires_exact_history: Some(false),
+            evidence_requirements: Some(vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Inspect the current source".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+                purpose: crate::traits::EvidencePurpose::Content,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                target: None,
+            }]),
             project_reference: None,
         };
         assert!(planned_contract_is_complete(&complete));
 
+        let mut no_tools = complete.clone();
+        no_tools.expects_mutation = Some(false);
+        no_tools.required_effects = Some(Vec::new());
+        no_tools.task_kind = Some("answer".to_string());
+        no_tools.tool_scope = Some("forbidden".to_string());
+        no_tools.tool_constraint_evidence = vec!["without using tools".to_string()];
+        assert!(planned_contract_is_complete(&no_tools));
+        assert!(planned_tool_constraints_are_grounded(
+            &no_tools,
+            "Answer this without using tools"
+        ));
+        assert!(!planned_tool_constraints_are_grounded(
+            &no_tools,
+            "Answer this from live sources"
+        ));
+
+        let mut no_memory = complete.clone();
+        no_memory.forbidden_tool_scopes = vec![crate::traits::ToolSemanticScope::UserMemory];
+        no_memory.tool_constraint_evidence = vec!["do not use memory".to_string()];
+        assert!(planned_contract_is_complete(&no_memory));
+        assert!(planned_tool_constraints_are_grounded(
+            &no_memory,
+            "Inspect the project, but do not use memory"
+        ));
+        assert!(!planned_tool_constraints_are_grounded(
+            &no_memory,
+            "Inspect the project"
+        ));
+
+        let mut report_contract = complete.clone();
+        report_contract.required_response_fields =
+            vec!["owner".to_string(), "credential_status".to_string()];
+        assert!(planned_response_fields_are_grounded(
+            &report_contract,
+            "Report owner and credential_status."
+        ));
+        assert!(!planned_response_fields_are_grounded(
+            &report_contract,
+            "Report readiness."
+        ));
+
         let mut partial = complete.clone();
         partial.required_effects = None;
         assert!(!planned_contract_is_complete(&partial));
+
+        let mut overlapping_remote_effects = complete.clone();
+        overlapping_remote_effects.task_kind = Some("deliver".to_string());
+        overlapping_remote_effects.required_effects = Some(vec![
+            "remote_mutation".to_string(),
+            "external_delivery".to_string(),
+        ]);
+        assert!(
+            !planned_contract_is_complete(&overlapping_remote_effects),
+            "generic and specific remote outcomes cannot become duplicate obligations"
+        );
+
+        let mut delivery_without_delivery_effect = complete.clone();
+        delivery_without_delivery_effect.task_kind = Some("deliver".to_string());
+        delivery_without_delivery_effect.required_effects =
+            Some(vec!["remote_mutation".to_string()]);
+        assert!(
+            !planned_contract_is_complete(&delivery_without_delivery_effect),
+            "a delivery contract must require an external delivery receipt"
+        );
+
+        let mut coherent_delivery = complete.clone();
+        coherent_delivery.task_kind = Some("deliver".to_string());
+        coherent_delivery.required_effects = Some(vec!["external_delivery".to_string()]);
+        assert!(planned_contract_is_complete(&coherent_delivery));
+
+        let mut exact_history = complete.clone();
+        exact_history.requires_exact_history = Some(true);
+        assert!(
+            !planned_contract_is_complete(&exact_history),
+            "a workspace observation cannot prove exact conversation history"
+        );
+        exact_history.evidence_requirements =
+            Some(vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Retrieve the exact earlier exchange".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::ConversationHistory],
+                purpose: crate::traits::EvidencePurpose::HistoricalRecord,
+                minimum_authority: crate::traits::EvidenceAuthority::Canonical,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Historical,
+                target: None,
+            }]);
+        assert!(planned_contract_is_complete(&exact_history));
+
+        let mut model_invented_target = exact_history;
+        model_invented_target
+            .evidence_requirements
+            .as_mut()
+            .unwrap()[0]
+            .target = Some(crate::traits::RequestVerificationTarget {
+            kind: crate::traits::RequestVerificationTargetKind::Path,
+            value: "/tmp/model-invented".to_string(),
+        });
+        assert!(
+            !planned_contract_is_complete(&model_invented_target),
+            "exact resource identity must come from structural parsing"
+        );
 
         let mut malformed_constraint = complete;
         malformed_constraint.forbidden_actions = vec!["deploy".to_string()];
@@ -987,9 +1282,21 @@ mod tests {
             mutation_scope: Some("read_only".to_string()),
             forbidden_actions: vec!["deploy".to_string()],
             constraint_evidence: vec!["do not deploy".to_string()],
+            tool_scope: Some("allowed".to_string()),
+            forbidden_tool_scopes: Vec::new(),
+            tool_constraint_evidence: Vec::new(),
+            required_response_fields: Vec::new(),
             minimum_sources: Some(0),
             requires_primary_sources: Some(false),
             requires_exact_history: Some(false),
+            evidence_requirements: Some(vec![crate::traits::RequestEvidenceRequirement {
+                summary: "Inspect the current local state".to_string(),
+                acceptable_scopes: vec![crate::traits::ToolSemanticScope::LocalWorkspace],
+                purpose: crate::traits::EvidencePurpose::CurrentState,
+                minimum_authority: crate::traits::EvidenceAuthority::Direct,
+                temporal_scope: crate::traits::EvidenceTemporalScope::Current,
+                target: None,
+            }]),
             project_reference: None,
         };
         assert!(!planned_mutation_constraints_are_grounded(

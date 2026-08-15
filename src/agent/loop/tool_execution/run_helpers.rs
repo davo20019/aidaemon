@@ -9,7 +9,10 @@ use crate::agent::execution_state::{extract_target_hints_from_arguments, StepExe
 use crate::agent::prefix_fingerprint;
 use crate::agent::*;
 use crate::events::{Event, EventType, ToolCallData, ToolResultData};
-use crate::traits::{ToolCallSemantics, ToolSemanticScope, ToolTargetHint, ToolTargetHintKind};
+use crate::traits::{
+    RequestEvidenceRequirement, RequestVerificationTargetKind, ToolCallSemantics,
+    ToolSemanticScope, ToolTargetHint, ToolTargetHintKind,
+};
 use crate::utils::{truncate_str, truncate_with_note};
 
 const TOOL_COMPLETE_SUMMARY_MAX_CHARS: usize = 140;
@@ -116,7 +119,7 @@ pub(super) fn raw_internal_scope_violation(
     None
 }
 
-pub(super) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
+pub(in crate::agent) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope> {
     match tool_name {
         "web_search" | "web_fetch" | "http_request" | "browser" => {
             Some(ToolSemanticScope::ExternalRemote)
@@ -125,8 +128,13 @@ pub(super) fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemant
         | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
         "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
         "remember_fact" | "manage_memories" | "share_memory" => Some(ToolSemanticScope::UserMemory),
-        "scheduled_goals" | "manage_goal_tasks" => Some(ToolSemanticScope::GoalState),
-        "system_info" => Some(ToolSemanticScope::HostLocal),
+        "scheduled_goals"
+        | "scheduled_goal_runs"
+        | "manage_goal_tasks"
+        | "goal_trace"
+        | "tool_trace"
+        | "manage_mandates" => Some(ToolSemanticScope::GoalState),
+        "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
         _ => None,
     }
 }
@@ -864,6 +872,61 @@ pub(super) fn observation_matches_completion_contract(
             .any(|haystack| verification_target_matches_haystack(target, haystack))
     })
 }
+
+fn requirement_target_matches(
+    requirement: &RequestEvidenceRequirement,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+) -> bool {
+    let Some(target) = requirement.target.as_ref() else {
+        return true;
+    };
+    let contract_target = VerificationTarget {
+        kind: match target.kind {
+            RequestVerificationTargetKind::Url => VerificationTargetKind::Url,
+            RequestVerificationTargetKind::Path => VerificationTargetKind::Path,
+        },
+        value: target.value.clone(),
+    };
+    if semantics
+        .target_hints
+        .iter()
+        .any(|hint| tool_target_hint_matches_contract_target(hint, &contract_target))
+    {
+        return true;
+    }
+
+    let mut haystacks = vec![raw_arguments.to_string()];
+    if let Some(command) = extract_command_from_args(raw_arguments) {
+        haystacks.push(command);
+    }
+    haystacks
+        .iter()
+        .any(|haystack| verification_target_matches_haystack(&contract_target, haystack))
+}
+
+/// Return the exact material evidence obligations supported by one successful
+/// observation receipt. Matching is entirely typed except for exact URL/path
+/// identity, which is compared against structured call arguments.
+pub(super) fn matching_evidence_requirement_indices(
+    contract: &CompletionContract,
+    semantics: &ToolCallSemantics,
+    raw_arguments: &str,
+) -> Vec<usize> {
+    contract
+        .evidence_requirements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, requirement)| {
+            let capability_matches = semantics.evidence.iter().any(|capability| {
+                crate::agent::inquiry::capability_supports_requirement(capability, requirement)
+            });
+            (capability_matches
+                && requirement_target_matches(requirement, semantics, raw_arguments))
+            .then_some(index)
+        })
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +934,59 @@ mod tests {
         default_execution_budget, BudgetTier, ExecutionPersistence, ExecutionState, RetryPolicy,
     };
     use crate::traits::ToolCallEffect;
+
+    #[test]
+    fn receipt_matching_separates_current_state_from_historical_attribution() {
+        use crate::traits::{
+            EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, RequestEvidenceRequirement,
+            ToolSemanticScope,
+        };
+
+        let contract = CompletionContract {
+            requires_observation: true,
+            evidence_requirements: vec![
+                RequestEvidenceRequirement {
+                    summary: "Observe current remote state".to_string(),
+                    acceptable_scopes: vec![ToolSemanticScope::ExternalRemote],
+                    purpose: EvidencePurpose::CurrentState,
+                    minimum_authority: EvidenceAuthority::Direct,
+                    temporal_scope: EvidenceTemporalScope::Current,
+                    target: None,
+                },
+                RequestEvidenceRequirement {
+                    summary: "Determine who executed the earlier action".to_string(),
+                    acceptable_scopes: vec![ToolSemanticScope::GoalState],
+                    purpose: EvidencePurpose::Attribution,
+                    minimum_authority: EvidenceAuthority::Canonical,
+                    temporal_scope: EvidenceTemporalScope::Historical,
+                    target: None,
+                },
+            ],
+            ..CompletionContract::default()
+        };
+
+        let external = ToolCallSemantics::observation().with_evidence(
+            crate::agent::inquiry::evidence_capabilities_for_tool_call(
+                "http_request",
+                r#"{"method":"GET","url":"https://example.test/feed"}"#,
+            ),
+        );
+        assert_eq!(
+            matching_evidence_requirement_indices(&contract, &external, "{}"),
+            [0]
+        );
+
+        let trace = ToolCallSemantics::observation().with_evidence(
+            crate::agent::inquiry::evidence_capabilities_for_tool_call(
+                "goal_trace",
+                r#"{"action":"tool_trace","task_id":"synthetic-task"}"#,
+            ),
+        );
+        assert_eq!(
+            matching_evidence_requirement_indices(&contract, &trace, "{}"),
+            [1]
+        );
+    }
 
     #[test]
     fn error_summary_skips_harness_truncation_notice() {

@@ -5,7 +5,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
-use crate::traits::{Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole};
+use crate::traits::{
+    EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, Tool, ToolCallMetadata,
+    ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolEvidenceCapability,
+    ToolMutationEffects, ToolOutcomeStatus, ToolRole, ToolSemanticScope, ToolVerificationMode,
+};
 
 const FRESH_READING_SECONDS: i64 = 90;
 const FRESH_NODE_SECONDS: i64 = 90;
@@ -35,6 +39,89 @@ impl ManageNodeMonitorsTool {
 impl SendNodeAudioTool {
     pub fn new(announcements: super::announcement::NodeAnnouncementService) -> Self {
         Self { announcements }
+    }
+
+    async fn execute_delivery(&self, arguments: &str) -> anyhow::Result<(String, String)> {
+        let args: SendNodeAudioArgs = serde_json::from_str(arguments)
+            .context("send_node_audio arguments must be valid JSON")?;
+        anyhow::ensure!(
+            args.user_role
+                .as_deref()
+                .is_some_and(|role| role.eq_ignore_ascii_case("owner")),
+            "Only the AIdaemon owner may send Node audio"
+        );
+        let delivery = self
+            .announcements
+            .queue_and_wait(args.node.as_deref(), &args.text)
+            .await?;
+        let now = Utc::now();
+        let last_seen_age_seconds = delivery
+            .queued
+            .last_seen_at
+            .map(|seen| (now - seen).num_seconds().max(0));
+        let (status, acknowledged_at, detail_code) = delivery
+            .receipt
+            .as_ref()
+            .map(|receipt| {
+                (
+                    receipt.status.as_str(),
+                    Some(receipt.acknowledged_at.to_rfc3339()),
+                    receipt.detail_code.as_deref(),
+                )
+            })
+            .unwrap_or(("queued", None, None));
+        let output = serde_json::to_string_pretty(&json!({
+            "node": delivery.queued.display_name,
+            "delivery_id": delivery.queued.cursor,
+            "delivery_status": status,
+            "acknowledged_at": acknowledged_at,
+            "detail_code": detail_code,
+            "audio_bytes": delivery.queued.size_bytes,
+            "expires_at": delivery.queued.expires_at.to_rfc3339(),
+            "node_last_seen_age_seconds": last_seen_age_seconds,
+            "interpretation": if status == "played" {
+                "The Device acknowledged completed playback."
+            } else if status == "queued" {
+                "The announcement is queued but playback has not been acknowledged; do not claim that it played."
+            } else {
+                "The Device acknowledged the announcement without successful playback."
+            }
+        }))?;
+        Ok((output, status.to_string()))
+    }
+}
+
+fn node_evidence(purposes: &[EvidencePurpose]) -> Vec<ToolEvidenceCapability> {
+    vec![ToolEvidenceCapability::new(
+        ToolSemanticScope::ExternalRemote,
+        purposes,
+        EvidenceAuthority::Direct,
+        EvidenceTemporalScope::Current,
+    )]
+}
+
+fn node_observation_semantics(purposes: &[EvidencePurpose]) -> ToolCallSemantics {
+    ToolCallSemantics::observation()
+        .with_verification_mode(ToolVerificationMode::ResultContent)
+        .with_evidence(node_evidence(purposes))
+}
+
+fn node_audio_receipt_semantics() -> ToolCallSemantics {
+    ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+        .with_verification_mode(ToolVerificationMode::ResultContent)
+        .with_evidence(node_evidence(&[EvidencePurpose::Outcome]))
+}
+
+fn node_audio_outcome_status(status: &str) -> ToolOutcomeStatus {
+    match status {
+        "played" => ToolOutcomeStatus::Succeeded,
+        // Queuing changed outbox state, but it did not establish completed
+        // playback and should remain an explicit incomplete domain result.
+        "queued" => ToolOutcomeStatus::CompletedWithNegativeResult,
+        // The Device explicitly rejected or failed playback. Retrying the same
+        // non-idempotent delivery automatically would be unsafe.
+        "failed" | "dismissed" => ToolOutcomeStatus::FailedPermanent,
+        _ => ToolOutcomeStatus::FailedPermanent,
     }
 }
 
@@ -178,6 +265,10 @@ impl Tool for ReadNodeSensorsTool {
         }
     }
 
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
+    }
+
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
         let args: ReadNodeSensorsArgs = serde_json::from_str(if arguments.trim().is_empty() {
             "{}"
@@ -229,6 +320,21 @@ impl Tool for ReadNodeSensorsTool {
             "interpretation": "These are the latest Device-reported ambient readings. A stale reading must be described as stale, not current."
         }))?)
     }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        Ok(ToolCallOutcome {
+            output: self.call(arguments).await?,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
 }
 
 #[async_trait]
@@ -266,6 +372,10 @@ impl Tool for ReadNodeHealthTool {
             idempotent: true,
             high_impact_write: false,
         }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        node_observation_semantics(&[EvidencePurpose::CurrentState, EvidencePurpose::Content])
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
@@ -306,6 +416,21 @@ impl Tool for ReadNodeHealthTool {
             "current_authorizations": health.authorizations,
             "interpretation": "This is the latest authenticated Runtime report stored by AIdaemon. Capability absence means the Node did not report that protocol control; it does not prove the physical hardware lacks it. Authorization absence means the gateway has not granted that action. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
         }))?)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        Ok(ToolCallOutcome {
+            output: self.call(arguments).await?,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                semantics: self.call_semantics(arguments),
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 }
 
@@ -352,55 +477,27 @@ impl Tool for SendNodeAudioTool {
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+        node_audio_receipt_semantics()
     }
 
     async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: SendNodeAudioArgs = serde_json::from_str(arguments)
-            .context("send_node_audio arguments must be valid JSON")?;
-        anyhow::ensure!(
-            args.user_role
-                .as_deref()
-                .is_some_and(|role| role.eq_ignore_ascii_case("owner")),
-            "Only the AIdaemon owner may send Node audio"
-        );
-        let delivery = self
-            .announcements
-            .queue_and_wait(args.node.as_deref(), &args.text)
-            .await?;
-        let now = Utc::now();
-        let last_seen_age_seconds = delivery
-            .queued
-            .last_seen_at
-            .map(|seen| (now - seen).num_seconds().max(0));
-        let (status, acknowledged_at, detail_code) = delivery
-            .receipt
-            .as_ref()
-            .map(|receipt| {
-                (
-                    receipt.status.as_str(),
-                    Some(receipt.acknowledged_at.to_rfc3339()),
-                    receipt.detail_code.as_deref(),
-                )
-            })
-            .unwrap_or(("queued", None, None));
-        Ok(serde_json::to_string_pretty(&json!({
-            "node": delivery.queued.display_name,
-            "delivery_id": delivery.queued.cursor,
-            "delivery_status": status,
-            "acknowledged_at": acknowledged_at,
-            "detail_code": detail_code,
-            "audio_bytes": delivery.queued.size_bytes,
-            "expires_at": delivery.queued.expires_at.to_rfc3339(),
-            "node_last_seen_age_seconds": last_seen_age_seconds,
-            "interpretation": if status == "played" {
-                "The Device acknowledged completed playback."
-            } else if status == "queued" {
-                "The announcement is queued but playback has not been acknowledged; do not claim that it played."
-            } else {
-                "The Device acknowledged the announcement without successful playback."
-            }
-        }))?)
+        Ok(self.execute_delivery(arguments).await?.0)
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<crate::types::StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let (output, status) = self.execute_delivery(arguments).await?;
+        Ok(ToolCallOutcome {
+            output,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(node_audio_outcome_status(&status)),
+                semantics: node_audio_receipt_semantics(),
+                ..ToolCallMetadata::default()
+            },
+        })
     }
 }
 
@@ -565,6 +662,40 @@ impl Tool for ManageNodeMonitorsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn played_audio_receipt_is_authoritative_delivery_and_outcome_evidence() {
+        assert_eq!(
+            node_audio_outcome_status("played"),
+            ToolOutcomeStatus::Succeeded
+        );
+        let semantics = node_audio_receipt_semantics();
+        assert!(semantics.observes_state());
+        assert!(semantics.mutates_state());
+        assert!(semantics
+            .mutation_effects
+            .contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+        assert!(semantics.can_verify_with_result_content());
+        assert!(semantics.evidence.iter().any(|capability| {
+            capability.scope == ToolSemanticScope::ExternalRemote
+                && capability.purposes.contains(&EvidencePurpose::Outcome)
+                && capability.authority == EvidenceAuthority::Direct
+        }));
+    }
+
+    #[test]
+    fn incomplete_audio_receipts_do_not_satisfy_completed_playback() {
+        assert_eq!(
+            node_audio_outcome_status("queued"),
+            ToolOutcomeStatus::CompletedWithNegativeResult
+        );
+        for status in ["failed", "dismissed"] {
+            assert_eq!(
+                node_audio_outcome_status(status),
+                ToolOutcomeStatus::FailedPermanent
+            );
+        }
+    }
 
     #[tokio::test]
     async fn rejects_non_owner_before_reading_node_state() {

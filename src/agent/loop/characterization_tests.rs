@@ -6,8 +6,10 @@ use crate::testing::{
     MockTool,
 };
 use crate::traits::{
-    ChatOptions, ProviderResponse, ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata,
-    ToolCallOutcome, ToolCallSemantics, ToolChoiceMode, ToolTargetHintKind, ToolVerificationMode,
+    ChatOptions, EvidenceAuthority, EvidencePurpose, EvidenceTemporalScope, ProviderResponse,
+    ResponseMode, TokenUsage, Tool, ToolCall, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics,
+    ToolChoiceMode, ToolEvidenceCapability, ToolMutationEffects, ToolOutcomeStatus,
+    ToolSemanticScope, ToolTargetHintKind, ToolVerificationMode,
 };
 use crate::types::{ChannelContext, StatusUpdate, UserRole};
 use async_trait::async_trait;
@@ -15,6 +17,272 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+#[tokio::test]
+async fn explicit_no_tool_current_fact_returns_direct_limitation_with_zero_offered_tools() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 6,
+            "goal": "Explain the evidence boundary for a current fact",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "answer",
+                "expects_mutation": false,
+                "requires_observation": true,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "forbidden",
+                "tool_constraint_evidence": ["Do not use any tools"],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [{
+                    "summary": "Establish the current synthetic language release",
+                    "acceptable_scopes": ["external_remote"],
+                    "purpose": "current_state",
+                    "minimum_authority": "direct",
+                    "temporal_scope": "current"
+                }],
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false,
+                "request_relationship": "new_request",
+                "semantic_scope": "external_remote"
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "I cannot establish the current release from the supplied context; that would require live evidence, which you asked me not to retrieve.",
+    )])
+    .with_task_assessments(vec![assessment]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "synthetic-no-tool-session",
+            "What is the current synthetic language release? Do not use any tools.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(reply.contains("require live evidence"));
+    let calls = harness.provider.call_log.lock().await;
+    assert_eq!(calls.len(), 1, "no verification recovery call should occur");
+    assert!(
+        calls[0].tools.is_empty(),
+        "the hard no-tool contract removes all tool definitions"
+    );
+}
+
+#[tokio::test]
+async fn grounded_output_contract_retries_checklist_style_claim_and_returns_actual_fields() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 6,
+            "goal": "Return the requested readiness fields",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "answer",
+                "expects_mutation": false,
+                "requires_observation": false,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "forbidden",
+                "forbidden_tool_scopes": [],
+                "tool_constraint_evidence": ["Do not use tools"],
+                "required_response_fields": ["owner", "credential_status"],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false,
+                "request_relationship": "new_request",
+                "semantic_scope": "none"
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("The requested fields have been reported."),
+        MockProvider::text_response(
+            "owner: unavailable from supplied context\ncredential_status: unavailable from supplied context",
+        ),
+    ])
+    .with_task_assessments(vec![assessment]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "synthetic-output-contract",
+            "Report owner and credential_status. Do not use tools.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(reply.contains("owner:"));
+    assert!(reply.contains("credential_status:"));
+    assert_eq!(harness.provider.call_count().await, 2);
+}
+
+#[tokio::test]
+async fn capability_specific_deny_set_hides_memory_without_disabling_other_tools() {
+    let assessment = MockProvider::text_response(
+        &json!({
+            "schema_version": 6,
+            "goal": "Explain the synthetic concept without memory",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "answer",
+                "expects_mutation": false,
+                "requires_observation": false,
+                "required_effects": [],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "allowed",
+                "forbidden_tool_scopes": ["user_memory"],
+                "tool_constraint_evidence": ["Do not use memory"],
+                "required_response_fields": [],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [],
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "continue_inline_after_background_start": false,
+                "request_relationship": "new_request",
+                "semantic_scope": "none"
+            }
+        })
+        .to_string(),
+    );
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "A synthetic explanation that does not depend on personal memory.",
+    )])
+    .with_task_assessments(vec![assessment]);
+    let harness = setup_test_agent(provider).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "synthetic-no-memory",
+            "Explain the synthetic concept. Do not use memory.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(reply.contains("does not depend on personal memory"));
+    let calls = harness.provider.call_log.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0]
+        .tools
+        .iter()
+        .all(|tool| tool["function"]["name"] != "manage_memories"));
+    assert!(
+        !calls[0].tools.is_empty(),
+        "a scoped memory prohibition must not become an all-tool prohibition"
+    );
+}
+
+#[tokio::test]
+async fn completed_negative_observation_is_reportable_without_verification_retry() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_command_probe", "{}"),
+        MockProvider::text_response(
+            "The probe completed with exit code 127: the synthetic executable was not found.",
+        ),
+    ])
+    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
+        "check",
+        false,
+        true,
+        &[],
+        "new_request",
+        "host_local",
+    )]);
+    let probe = MockTool::new(
+        "synthetic_command_probe",
+        "Observe whether a synthetic command is available",
+        "exit_code: 127\nsynthetic-command: command not found",
+    )
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+        exit_code: Some(127),
+        semantics: ToolCallSemantics::observation()
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_evidence(vec![ToolEvidenceCapability::new(
+                ToolSemanticScope::HostLocal,
+                &[EvidencePurpose::CurrentState, EvidencePurpose::Outcome],
+                EvidenceAuthority::Direct,
+                EvidenceTemporalScope::Current,
+            )]),
+        ..ToolCallMetadata::default()
+    });
+    let harness =
+        setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![Arc::new(probe)], None)
+            .await
+            .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "synthetic-negative-observation",
+            "Check whether the synthetic command is available and report the result.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(reply.contains("exit code 127"));
+    assert!(reply.contains("not found"));
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "a completed negative observation closes the evidence obligation"
+    );
+}
 
 #[tokio::test]
 #[ignore = "tokens_failed_tasks_total / no_progress_iterations_total not yet wired to agent loop"]
@@ -282,6 +550,89 @@ impl Tool for CountingSendFileTool {
     }
 }
 
+struct PlayedNodeAudioTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl PlayedNodeAudioTool {
+    fn receipt_semantics() -> ToolCallSemantics {
+        ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::EXTERNAL_DELIVERY)
+            .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_evidence(vec![ToolEvidenceCapability::new(
+                ToolSemanticScope::ExternalRemote,
+                &[EvidencePurpose::Outcome],
+                EvidenceAuthority::Direct,
+                EvidenceTemporalScope::Current,
+            )])
+    }
+}
+
+#[async_trait]
+impl Tool for PlayedNodeAudioTool {
+    fn name(&self) -> &str {
+        "send_node_audio"
+    }
+
+    fn description(&self) -> &str {
+        "Mock node audio delivery with an authoritative playback receipt"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "send_node_audio",
+            "description": "Deliver audio to a synthetic node",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string"},
+                    "text": {"type": "string"}
+                },
+                "required": ["node", "text"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn call(&self, _arguments: &str) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "node_id": "synthetic-node-1",
+            "delivery_status": "played",
+            "playback_complete": true
+        })
+        .to_string())
+    }
+
+    async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        _status_tx: Option<tokio::sync::mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        Ok(ToolCallOutcome {
+            output: self.call(arguments).await?,
+            metadata: ToolCallMetadata {
+                outcome_status: Some(ToolOutcomeStatus::Succeeded),
+                semantics: Self::receipt_semantics(),
+                ..ToolCallMetadata::default()
+            },
+        })
+    }
+
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: false,
+            idempotent: false,
+            high_impact_write: false,
+        }
+    }
+
+    fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
+        Self::receipt_semantics()
+    }
+}
+
 struct BackgroundDetachTool;
 
 #[async_trait]
@@ -451,6 +802,16 @@ impl Tool for MockRemoteObservationTool {
         let url = args["url"].as_str().unwrap_or("https://example.com/status");
         ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent)
+            .with_evidence(vec![crate::traits::ToolEvidenceCapability::new(
+                crate::traits::ToolSemanticScope::ExternalRemote,
+                &[
+                    crate::traits::EvidencePurpose::CurrentState,
+                    crate::traits::EvidencePurpose::Content,
+                    crate::traits::EvidencePurpose::Outcome,
+                ],
+                crate::traits::EvidenceAuthority::Direct,
+                crate::traits::EvidenceTemporalScope::Current,
+            )])
             .with_target_hint(ToolTargetHintKind::Url, url)
     }
 }
@@ -891,6 +1252,91 @@ async fn background_ack_characterization_keeps_tools_available_for_unfulfilled_c
             })
         }),
         "background detach should carry a handoff directive into the forced text pass"
+    );
+}
+
+#[tokio::test]
+async fn played_node_audio_receipt_closes_delivery_and_outcome_contract_in_one_call() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "send_node_audio",
+            r#"{"node":"synthetic-node-1","text":"Dinner is ready."}"#,
+        ),
+        MockProvider::text_response("The audio was delivered and playback completed."),
+    ])
+    .with_task_assessments(vec![MockProvider::text_response(
+        &json!({
+            "schema_version": 6,
+            "goal": "Deliver a spoken message and confirm playback",
+            "steps": [],
+            "success_criteria": [],
+            "contract": {
+                "confidence": "high",
+                "task_kind": "deliver",
+                "expects_mutation": true,
+                "requires_observation": true,
+                "required_effects": ["external_delivery"],
+                "mutation_scope": "allowed",
+                "forbidden_actions": [],
+                "constraint_evidence": [],
+                "tool_scope": "allowed",
+                "tool_constraint_evidence": [],
+                "minimum_sources": 0,
+                "requires_primary_sources": false,
+                "requires_exact_history": false,
+                "evidence_requirements": [{
+                    "summary": "Confirm the spoken message playback outcome",
+                    "acceptable_scopes": ["external_remote"],
+                    "purpose": "outcome",
+                    "minimum_authority": "direct",
+                    "temporal_scope": "current"
+                }],
+                "project_reference": null
+            },
+            "task_shape": {
+                "execution_mode": "inline",
+                "confidence": "high",
+                "independent_workstreams": 1,
+                "requires_background_continuation": false,
+                "request_relationship": "new_request",
+                "semantic_scope": "external_remote"
+            }
+        })
+        .to_string(),
+    )]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![Arc::new(PlayedNodeAudioTool {
+            calls: calls.clone(),
+        }) as Arc<dyn Tool>],
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "played_node_audio_receipt",
+            "Have synthetic-node-1 say that dinner is ready and confirm it played.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "The audio was delivered and playback completed.");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the playback receipt should fulfill both obligations without a second verification call"
+    );
+    assert_eq!(
+        harness.provider.call_log.lock().await.len(),
+        2,
+        "the fulfilled receipt should proceed directly to the final response"
     );
 }
 
@@ -1444,7 +1890,7 @@ async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation()
     ])
     .with_task_assessments(vec![MockProvider::text_response(
         r#"{
-                "schema_version": 2,
+                "schema_version": 6,
                 "goal": "Update remote status",
                 "steps": [],
                 "success_criteria": [],
@@ -1457,9 +1903,18 @@ async fn ungrounded_negative_classifier_output_cannot_block_requested_mutation()
                     "mutation_scope": "read_only",
                     "forbidden_actions": [],
                     "constraint_evidence": ["change locally but don't deploy"],
+                    "tool_scope": "allowed",
+                    "tool_constraint_evidence": [],
                     "minimum_sources": 0,
                     "requires_primary_sources": false,
                     "requires_exact_history": false,
+                    "evidence_requirements": [{
+                        "summary": "Observe the current remote status",
+                        "acceptable_scopes": ["external_remote"],
+                        "purpose": "current_state",
+                        "minimum_authority": "direct",
+                        "temporal_scope": "current"
+                    }],
                     "project_reference": null
                 },
                 "task_shape": {
